@@ -113,6 +113,7 @@ pub struct SseParser {
     event: Option<String>,
     data: String,
     data_seen: bool,
+    overflow: bool,
 }
 
 impl SseParser {
@@ -121,15 +122,20 @@ impl SseParser {
         Self::default()
     }
 
+    fn reset_frame(&mut self) {
+        self.event = None;
+        self.data.clear();
+        self.data_seen = false;
+        self.overflow = false;
+    }
+
     /// Feed a decoded chunk and return every frame completed by a blank line.
     pub fn feed(&mut self, chunk: &str) -> Vec<SseFrame> {
         let mut frames = Vec::new();
         if self.buffer.len().saturating_add(chunk.len()) > MAX_SSE_BUFFER {
             // A peer must not be able to grow this buffer without bound.
             self.buffer.clear();
-            self.event = None;
-            self.data.clear();
-            self.data_seen = false;
+            self.reset_frame();
             return frames;
         }
         self.buffer.push_str(chunk);
@@ -146,20 +152,19 @@ impl SseParser {
 
     fn handle_line(&mut self, line: &str, frames: &mut Vec<SseFrame>) {
         if line.is_empty() {
-            if self.data.is_empty() {
-                self.event = None;
-                self.data.clear();
+            if self.overflow || self.data.is_empty() {
+                self.reset_frame();
             } else {
                 frames.push(SseFrame {
                     id: self.last_id,
                     event: self.event.take(),
                     data: std::mem::take(&mut self.data),
                 });
+                self.data_seen = false;
             }
-            self.data_seen = false;
             return;
         }
-        if line.starts_with(':') {
+        if self.overflow || line.starts_with(':') {
             return;
         }
         let Some((field, value)) = line.split_once(':') else {
@@ -174,6 +179,16 @@ impl SseParser {
             }
             "event" => self.event = Some(value.to_owned()),
             "data" => {
+                let extra = usize::from(self.data_seen).saturating_add(value.len());
+                if self.data.len().saturating_add(extra) > MAX_SSE_BUFFER {
+                    // Drop oversized multi-line frames without OOMing or returning
+                    // a truncated half-payload; parsing resumes at the next blank line.
+                    self.event = None;
+                    self.data.clear();
+                    self.data_seen = false;
+                    self.overflow = true;
+                    return;
+                }
                 if self.data_seen {
                     self.data.push('\n');
                 }
@@ -261,8 +276,6 @@ fn stream_once(
     if !status.is_success() {
         return StreamEnd::Disconnected;
     }
-    // A successful connect resets the retry schedule for the next failure.
-    *backoff = 0;
     if !emit(sender, wake, EventUpdate::Connected) {
         return StreamEnd::ReceiverGone;
     }
@@ -278,6 +291,9 @@ fn stream_once(
         match reader.read(&mut chunk) {
             Ok(0) => return StreamEnd::Disconnected,
             Ok(read) => {
+                // Only reset reconnect backoff once the peer delivers bytes, so an
+                // immediate HTTP 200 + EOF loop keeps backing off.
+                *backoff = 0;
                 let text = decoder.push(&chunk[..read]);
                 if text.is_empty() {
                     continue;
@@ -702,6 +718,62 @@ mod tests {
 
         assert!(updates.contains(&EventUpdate::Unauthorized), "{updates:?}");
         assert!(!updates.contains(&EventUpdate::Connected), "{updates:?}");
+    }
+
+    #[test]
+    fn parser_caps_accumulated_data_across_chunks_and_recovers() {
+        let mut parser = SseParser::new();
+        let line = format!("data: {}\n", "a".repeat(16 * 1024));
+        for _ in 0..=20 {
+            assert!(parser.feed(&line).is_empty());
+        }
+        assert!(parser.feed("\n").is_empty(), "oversized frame is dropped");
+        let frames = parser.feed("id: 12\ndata: {\"ok\":true}\n\n");
+        assert_eq!(
+            frames,
+            vec![SseFrame {
+                id: Some(12),
+                event: None,
+                data: "{\"ok\":true}".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn immediate_eof_after_200_preserves_backoff() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint =
+            crate::validate_endpoint(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+        });
+        let credentials = Credentials {
+            endpoint,
+            token: secrecy::SecretString::new("synthetic-eof-token-0123456789abcdef".into()),
+        };
+        let client = build_client(&credentials.endpoint).unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let stop = AtomicBool::new(false);
+        let mut cursor = 0;
+        let mut backoff = 3;
+        let end = stream_once(
+            &client,
+            &credentials,
+            &mut cursor,
+            &tx,
+            &|| {},
+            &stop,
+            &mut backoff,
+        );
+        server.join().unwrap();
+        assert!(matches!(end, StreamEnd::Disconnected));
+        assert_eq!(backoff, 3);
     }
 
     fn read_request(stream: &mut TcpStream) -> String {

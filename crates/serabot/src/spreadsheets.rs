@@ -317,7 +317,7 @@ fn analyze_range(
         } else {
             truncate_chars(&normalized, MAX_LABEL_CHARS)
         };
-        let signals = detect_signals(&header_text);
+        let signals = detect_header_signals(&header_text);
         currencies.extend(signals.currencies.iter().cloned());
         units.extend(signals.units.iter().cloned());
 
@@ -408,8 +408,12 @@ fn analyze_range(
                         None => {
                             state.non_numeric += 1;
                             if state.non_numeric_example.is_none() {
-                                state.non_numeric_example =
-                                    Some(format!("{address}: non-finite number"));
+                                let reason = if value.is_finite() {
+                                    "outside Decimal range"
+                                } else {
+                                    "non-finite number"
+                                };
+                                state.non_numeric_example = Some(format!("{address}: {reason}"));
                             }
                         }
                     }
@@ -447,6 +451,12 @@ fn analyze_range(
                     }
                     match parse_quantity(text, &signals) {
                         Some(quantity) => {
+                            if quantity.accounting_parens {
+                                let note = "parenthesized value interpreted as negative";
+                                if noted.insert(note.to_string()) {
+                                    warnings.push(format!("sheet '{name}'!{address}: {note}"));
+                                }
+                            }
                             if quantity.ambiguous_grouping {
                                 state.ambiguous_numbers.push(format!(
                                     "{address}: '{}' read as {}",
@@ -801,21 +811,51 @@ struct Signals {
 }
 
 fn detect_signals(text: &str) -> Signals {
+    detect_signals_inner(text, false)
+}
+
+fn detect_header_signals(text: &str) -> Signals {
+    detect_signals_inner(text, true)
+}
+
+fn detect_signals_inner(text: &str, header: bool) -> Signals {
     let mut signals = Signals::default();
     let lower = text.to_lowercase();
-    let tokens: Vec<&str> = lower
-        .split(|value: char| !value.is_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .collect();
+    let mut token_spans: Vec<(usize, usize, &str)> = Vec::new();
+    let mut span_start: Option<usize> = None;
+    for (byte_index, ch) in lower.char_indices() {
+        if ch.is_alphanumeric() {
+            if span_start.is_none() {
+                span_start = Some(byte_index);
+            }
+        } else if let Some(start) = span_start.take() {
+            token_spans.push((start, byte_index, &lower[start..byte_index]));
+        }
+    }
+    if let Some(start) = span_start {
+        token_spans.push((start, lower.len(), &lower[start..]));
+    }
 
     let mut matched_currencies = BTreeSet::new();
     let mut matched_units = BTreeSet::new();
-    for token in &tokens {
+    for (start, end, token) in token_spans {
+        let before = lower[..start].chars().next_back();
+        let after = lower[end..].chars().next();
+        let bracketed = matches!(
+            (before, after),
+            (Some('('), Some(')')) | (Some('['), Some(']'))
+        );
         for candidate in token_variants(token) {
             if let Some(code) = currency_code(&candidate) {
                 matched_currencies.insert(code.to_string());
             }
             if let Some(unit) = unit_code(&candidate) {
+                // Single-letter unit abbreviations (h, d, j, m) in headers match
+                // ordinary prose/acronyms like "R&D" or "H&M" unless paired with
+                // digits ("8h") or explicitly bracketed ("Duration (h)").
+                if header && candidate.chars().count() == 1 && candidate == token && !bracketed {
+                    continue;
+                }
                 matched_units.insert(unit.to_string());
             }
         }
@@ -892,6 +932,8 @@ fn unit_code(token: &str) -> Option<&'static str> {
         "km" | "kilometre" | "kilometres" | "kilomètre" | "kilomètres" | "chilometri"
         | "chilometro" => Some("km"),
         "m" | "meter" | "meters" | "metre" | "metres" | "metro" | "metri" => Some("m"),
+        "min" | "mins" | "minute" | "minutes" => Some("minutes"),
+        "sec" | "secs" | "second" | "seconds" => Some("seconds"),
         "pc" | "pcs" | "piece" | "pieces" | "pièce" | "pièces" | "pezzo" | "pezzi" | "unite"
         | "unites" | "unita" | "unità" | "unit" | "units" => Some("pieces"),
         _ => None,
@@ -902,20 +944,35 @@ fn unit_code(token: &str) -> Option<&'static str> {
 struct Quantity {
     amount: Decimal,
     ambiguous_grouping: bool,
+    accounting_parens: bool,
 }
 
 fn parse_quantity(text: &str, signals: &Signals) -> Option<Quantity> {
-    let run = numeric_run(text)?;
+    let trimmed = text.trim();
+    let (candidate, accounting_parens) =
+        match trimmed.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+            Some(inner) if !inner.contains(['(', ')']) => (inner.trim(), true),
+            _ => (trimmed, false),
+        };
+    let run = numeric_run(candidate)?;
     let number = parse_number(run)?;
-    if !leftover_is_qualifier(text, run) {
+    if !leftover_is_qualifier(candidate, run) {
         return None;
     }
     if signals.currencies.len() > 1 || signals.units.len() > 1 {
         return None;
     }
+    let has_explicit_sign = run.trim_start().starts_with(['-', '+']);
+    let accounting_negative = accounting_parens && !has_explicit_sign && !number.amount.is_zero();
+    let amount = if accounting_negative {
+        -number.amount
+    } else {
+        number.amount
+    };
     Some(Quantity {
-        amount: number.amount,
+        amount,
         ambiguous_grouping: number.ambiguous,
+        accounting_parens: accounting_negative,
     })
 }
 
@@ -1315,6 +1372,7 @@ fn has_token(text: &str, words: &[&str]) -> bool {
 /// `Ore`, `Days`, ...) or as a suffix on every value (`8h`, `2 days`). Negative
 /// values, mixed units and unparseable rows are rejected.
 pub fn parse_timesheet_rows(input: &str) -> Result<TimesheetSummary> {
+    let input = input.strip_prefix('\u{feff}').unwrap_or(input);
     if input.trim().is_empty() {
         return Err(SeraError::Validation("timesheet is empty".into()));
     }
@@ -2036,5 +2094,89 @@ Total;;3,0
         }
         let error = parse_timesheet_rows(&input).expect_err("row cap must reject");
         assert!(error.to_string().contains("row limit"), "{error}");
+    }
+
+    #[test]
+    fn ignores_single_letter_units_in_headers() {
+        let mut range = Range::new((0, 0), (2, 2));
+        range.set_value((0, 0), Data::String("R&D Budget".into()));
+        range.set_value((0, 1), Data::String("M. Smith".into()));
+        range.set_value((0, 2), Data::String("Duration (h)".into()));
+        range.set_value((1, 0), Data::Float(100.0));
+        range.set_value((1, 1), Data::Float(50.0));
+        range.set_value((1, 2), Data::Float(8.0));
+        range.set_value((2, 0), Data::Float(20.0));
+        range.set_value((2, 1), Data::Float(25.0));
+        range.set_value((2, 2), Data::Float(4.0));
+
+        let (summary, _warnings) = summarize("Headers", &range, None);
+        let summary = summary.expect("sheet summarizes");
+        assert!(summary.numeric_totals.contains_key("R&D Budget"));
+        assert!(summary.numeric_totals.contains_key("M. Smith"));
+        assert!(summary.numeric_totals.contains_key("Duration (h) [hours]"));
+        assert!(!summary.units.contains("days"));
+        assert!(!summary.units.contains("m"));
+        assert!(summary.units.contains("hours"));
+    }
+
+    #[test]
+    fn captures_minutes_in_duration_column() {
+        let mut range = Range::new((0, 0), (2, 1));
+        range.set_value((0, 0), Data::String("Task".into()));
+        range.set_value((0, 1), Data::String("Duration".into()));
+        range.set_value((1, 1), Data::String("30 minutes".into()));
+        range.set_value((2, 1), Data::String("15 mins".into()));
+
+        let (summary, _warnings) = summarize("Minutes", &range, None);
+        let summary = summary.expect("sheet summarizes");
+        let mins = summary
+            .numeric_totals
+            .get("Duration [minutes]")
+            .expect("minutes total");
+        assert_eq!(mins.sum, decimal("45"));
+        assert!(summary.units.contains("minutes"));
+    }
+
+    #[test]
+    fn parses_utf8_bom_csv_timesheet_with_quotes() {
+        let input = "\u{feff}\"Person\",\"Project\",\"Hours\"\n\"Alice\",\"Grant, Phase 1\",4\n";
+        let summary = parse_timesheet_rows(input).expect("BOM CSV timesheet parses");
+        assert_eq!(summary.entries, 1);
+        assert_eq!(summary.total, decimal("4"));
+        assert_eq!(
+            summary.per_project.get("Grant, Phase 1").copied(),
+            Some(decimal("4"))
+        );
+    }
+
+    #[test]
+    fn warns_on_out_of_range_float_and_parenthesized_amount() {
+        let mut range = Range::new((0, 0), (3, 1));
+        range.set_value((0, 0), Data::String("Item".into()));
+        range.set_value((0, 1), Data::String("Amount".into()));
+        range.set_value((1, 1), Data::Float(1e40));
+        range.set_value((2, 1), Data::String("($1,234.56)".into()));
+        range.set_value((3, 1), Data::String("$2,000.00".into()));
+
+        let (summary, warnings) = summarize("Ledger", &range, None);
+        let summary = summary.expect("sheet summarizes");
+        let total = summary
+            .numeric_totals
+            .get("Amount [USD]")
+            .expect("USD total");
+        assert_eq!(total.sum, decimal("765.44"));
+        assert_eq!(total.count, 2);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("outside Decimal range")),
+            "expected outside Decimal range warning, got {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("parenthesized value interpreted as negative")),
+            "expected parenthesized negative warning, got {warnings:?}"
+        );
     }
 }

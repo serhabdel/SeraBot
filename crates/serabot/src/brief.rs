@@ -18,10 +18,10 @@ use rusqlite::params;
 
 use crate::error::Result;
 use crate::store::Store;
-use crate::util::truncate_chars;
+use crate::util::{redact_url_queries, truncate_chars};
 
 const MAX_GROUP_ITEMS: usize = 20;
-const MAX_SOURCE_WARNINGS: usize = 20;
+const MAX_SOURCE_WARNINGS: usize = 200;
 const MAX_BRIEF_CHARS: usize = 8000;
 const MAX_TITLE_CHARS: usize = 160;
 const MAX_SOURCE_CHARS: usize = 60;
@@ -46,6 +46,7 @@ struct OpportunityItem {
     title: String,
     source: String,
     url: Option<String>,
+    withdrawn: bool,
 }
 
 /// A built brief plus the counts behind the optional silent-when-empty rule.
@@ -90,20 +91,62 @@ pub fn build_brief_report(
     );
     let cutoff = utc_string(now - lookback);
 
+    let yesterday = (today - Duration::days(1)).format("%Y-%m-%d").to_string();
+    let window_end = (today + Duration::days(8)).format("%Y-%m-%d").to_string();
+
     let mut overdue = Vec::new();
     let mut due_soon = Vec::new();
     {
-        let mut statement = connection.prepare(
+        let mut collect_deadline = |row: DeadlineRow| {
+            if let Some(item) = deadline_item(row, now, tz, today) {
+                if item.overdue {
+                    overdue.push(item);
+                } else {
+                    due_soon.push(item);
+                }
+            }
+        };
+
+        // Fetch upcoming / boundary deadlines separately from older overdue rows so
+        // a large historical backlog of overdue items never starves `Due soon`.
+        let mut upcoming_stmt = connection.prepare(
             "SELECT d.due_date, d.due_time, d.timezone, d.precision,
                     o.title, o.source
              FROM deadlines d
              JOIN opportunities o ON o.id = d.opportunity_id
              WHERE d.user_id = ?1 AND o.user_id = ?1
                AND d.status <> 'superseded' AND o.status <> 'withdrawn'
+               AND d.due_date >= ?2 AND d.due_date <= ?3
              ORDER BY d.due_date ASC, d.due_time ASC
              LIMIT 500",
         )?;
-        let rows = statement.query_map(params![user_id], |row| {
+        let upcoming_rows =
+            upcoming_stmt.query_map(params![user_id, yesterday, window_end], |row| {
+                Ok(DeadlineRow {
+                    due_date: row.get(0)?,
+                    due_time: row.get(1)?,
+                    stored_timezone: row.get(2)?,
+                    precision: row.get(3)?,
+                    title: row.get(4)?,
+                    source: row.get(5)?,
+                })
+            })?;
+        for row in upcoming_rows {
+            collect_deadline(row?);
+        }
+
+        let mut overdue_stmt = connection.prepare(
+            "SELECT d.due_date, d.due_time, d.timezone, d.precision,
+                    o.title, o.source
+             FROM deadlines d
+             JOIN opportunities o ON o.id = d.opportunity_id
+             WHERE d.user_id = ?1 AND o.user_id = ?1
+               AND d.status <> 'superseded' AND o.status <> 'withdrawn'
+               AND d.due_date < ?2
+             ORDER BY d.due_date DESC, d.due_time DESC
+             LIMIT 500",
+        )?;
+        let overdue_rows = overdue_stmt.query_map(params![user_id, yesterday], |row| {
             Ok(DeadlineRow {
                 due_date: row.get(0)?,
                 due_time: row.get(1)?,
@@ -113,26 +156,21 @@ pub fn build_brief_report(
                 source: row.get(5)?,
             })
         })?;
-        for row in rows {
-            if let Some(item) = deadline_item(row?, now, tz, today) {
-                if item.overdue {
-                    overdue.push(item);
-                } else {
-                    due_soon.push(item);
-                }
-            }
+        for row in overdue_rows {
+            collect_deadline(row?);
         }
     }
-    overdue.sort_by_key(|item| item.sort_key.clone());
-    due_soon.sort_by_key(|item| item.sort_key.clone());
+    overdue.sort_by(|left, right| right.sort_key.cmp(&left.sort_key));
+    due_soon.sort_by(|left, right| left.sort_key.cmp(&right.sort_key));
 
     let mut new_items = Vec::new();
     let mut changed_items = Vec::new();
     {
         let mut statement = connection.prepare(
-            "SELECT title, source, url, revision
+            "SELECT title, source, url, revision, status
              FROM opportunities
-             WHERE user_id = ?2 AND status <> 'withdrawn' AND last_seen >= ?1
+             WHERE user_id = ?2 AND last_seen >= ?1
+               AND (status <> 'withdrawn' OR revision > 1)
              ORDER BY last_seen DESC, title ASC
              LIMIT 200",
         )?;
@@ -142,11 +180,17 @@ pub fn build_brief_report(
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
             ))
         })?;
         for row in rows {
-            let (title, source, url, revision) = row?;
-            let item = OpportunityItem { title, source, url };
+            let (title, source, url, revision, status) = row?;
+            let item = OpportunityItem {
+                title,
+                source,
+                url,
+                withdrawn: status == "withdrawn",
+            };
             if revision <= 1 {
                 new_items.push(item);
             } else {
@@ -218,6 +262,11 @@ pub fn build_brief_report(
 
     if out.chars().count() > MAX_BRIEF_CHARS {
         let mut truncated = truncate_chars(&out, MAX_BRIEF_CHARS - 20);
+        if let Some(last_newline) = truncated.rfind('\n')
+            && last_newline > 0
+        {
+            truncated.truncate(last_newline);
+        }
         truncated.push_str("\n[brief truncated]\n");
         return Ok(BriefReport {
             text: truncated,
@@ -248,8 +297,13 @@ fn deadline_item(
         .and_then(|value| value.parse::<Tz>().ok())
         .unwrap_or(tz);
 
-    let (display, sort_key, overdue, due_soon) = if precision == "datetime" {
-        let value = time.and_then(|time| resolve_local(date.and_time(time), stored_tz))?;
+    let resolved_datetime = if precision == "datetime" {
+        time.and_then(|time| resolve_local(date.and_time(time), stored_tz))
+    } else {
+        None
+    };
+
+    let (display, sort_key, overdue, due_soon) = if let Some(value) = resolved_datetime {
         // Convert to the configured display timezone, regardless of
         // the timezone the source used.
         let local = value.with_timezone(&tz);
@@ -283,14 +337,21 @@ fn deadline_item(
 }
 
 fn opportunity_line(item: &OpportunityItem) -> String {
-    let mut line = format!(
+    let mut line = String::new();
+    if item.withdrawn {
+        line.push_str("[withdrawn] ");
+    }
+    line.push_str(&format!(
         "{} [{}]",
         truncate_chars(&one_line(&item.title), MAX_TITLE_CHARS),
         truncate_chars(&one_line(&item.source), MAX_SOURCE_CHARS)
-    );
+    ));
     if let Some(url) = &item.url {
-        line.push(' ');
-        line.push_str(&truncate_chars(&one_line(url), 200));
+        let cleaned = redact_url_queries(&one_line(url));
+        if !cleaned.is_empty() {
+            line.push(' ');
+            line.push_str(&truncate_chars(&cleaned, 240));
+        }
     }
     line
 }
@@ -305,7 +366,8 @@ fn source_warnings(
     let mut statement = connection.prepare(
         "SELECT source,
                 MAX(CASE WHEN ok = 1 THEN COALESCE(finished_at, started_at) END),
-                MAX(CASE WHEN ok = 0 THEN started_at END)
+                MAX(CASE WHEN ok = 0 AND (finished_at IS NOT NULL OR error IS NOT NULL)
+                         THEN COALESCE(finished_at, started_at) END)
          FROM source_runs
          WHERE user_id = ?1
          GROUP BY source
@@ -378,7 +440,7 @@ fn push_section(
     out.push_str(&format!("\n{} ({})\n", title, total));
     for line in lines.into_iter().take(MAX_GROUP_ITEMS) {
         out.push_str("- ");
-        out.push_str(&truncate_chars(&line, 400));
+        out.push_str(&truncate_chars(&line, 520));
         out.push('\n');
     }
     if total > MAX_GROUP_ITEMS {
@@ -742,5 +804,111 @@ mod tests {
         assert!(admin_brief.contains("Admin Tender"), "{admin_brief}");
         assert!(admin_brief.contains("stale-admin"), "{admin_brief}");
         assert!(admin_brief.contains("Due soon"), "{admin_brief}");
+    }
+
+    #[test]
+    fn large_overdue_backlog_does_not_starve_due_soon() {
+        let store = store();
+        let user = admin(&store);
+        let now = Utc.with_ymd_and_hms(2026, 10, 28, 10, 0, 0).unwrap();
+        let opportunity = insert_opportunity(
+            &store,
+            &user,
+            "portal",
+            "Backlog Tender",
+            1,
+            now - Duration::days(30),
+        );
+        for i in 0..520 {
+            let past = (now - Duration::days(10 + i))
+                .format("%Y-%m-%d")
+                .to_string();
+            insert_deadline(
+                &store,
+                &user,
+                &opportunity,
+                &past,
+                None,
+                Some("Europe/Rome"),
+                "date",
+            );
+        }
+        insert_deadline(
+            &store,
+            &user,
+            &opportunity,
+            "2026-10-30",
+            None,
+            Some("Europe/Rome"),
+            "date",
+        );
+
+        let brief = build_brief(&store, &user, now, rome(), 24).unwrap();
+        assert!(brief.contains("Due soon (next 7 days) (1)"), "{brief}");
+        assert!(brief.contains("2026-10-30"), "{brief}");
+        assert!(brief.contains("Overdue ("), "{brief}");
+        // Most recent overdue items appear first instead of 2-year-old items.
+        assert!(brief.contains("2026-10-18"), "{brief}");
+    }
+
+    #[test]
+    fn inflight_source_run_is_not_reported_as_failure() {
+        let store = store();
+        let user = admin(&store);
+        let now = Utc.with_ymd_and_hms(2026, 10, 28, 10, 0, 0).unwrap();
+        insert_source_run(
+            &store,
+            &user,
+            "active-feed",
+            true,
+            now - Duration::hours(2),
+            Some(now - Duration::hours(2)),
+        );
+        // Simulate an in-flight run: ok = 0, finished_at = NULL, error = NULL.
+        let connection = store.connection().unwrap();
+        connection
+            .execute(
+                "INSERT INTO source_runs(id, source, started_at, finished_at, ok, error, items_seen, user_id)
+                 VALUES (?1, 'active-feed', ?2, NULL, 0, NULL, 0, ?3)",
+                params![new_id(), utc_string(now - Duration::minutes(1)), user],
+            )
+            .unwrap();
+        drop(connection);
+
+        let brief = build_brief(&store, &user, now, rome(), 24).unwrap();
+        assert!(!brief.contains("Source warnings"), "{brief}");
+        assert!(!brief.contains("last run failed"), "{brief}");
+    }
+
+    #[test]
+    fn withdrawn_change_is_shown_and_url_queries_are_redacted() {
+        let store = store();
+        let user = admin(&store);
+        let now = Utc.with_ymd_and_hms(2026, 10, 28, 10, 0, 0).unwrap();
+        let connection = store.connection().unwrap();
+        connection
+            .execute(
+                "INSERT INTO opportunities(
+                    id, source, external_id, title, summary, url, status,
+                    evidence, revision, first_seen, last_seen, user_id
+                 ) VALUES (?1, 'portal', 'ext-w', 'Tender W (cancelled)', '',
+                           'https://portal.example/item?token=secret123', 'withdrawn', '',
+                           2, ?2, ?2, ?3)",
+                params![new_id(), utc_string(now - Duration::minutes(5)), user],
+            )
+            .unwrap();
+        drop(connection);
+
+        let brief = build_brief(&store, &user, now, rome(), 24).unwrap();
+        assert!(brief.contains("Changed (1)"), "{brief}");
+        assert!(
+            brief.contains("[withdrawn] Tender W (cancelled)"),
+            "{brief}"
+        );
+        assert!(
+            brief.contains("https://portal.example/item?[redacted]"),
+            "{brief}"
+        );
+        assert!(!brief.contains("secret123"), "{brief}");
     }
 }

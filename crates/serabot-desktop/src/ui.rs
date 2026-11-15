@@ -167,17 +167,42 @@ const PROVIDER_KINDS: [&str; 20] = [
 ];
 
 /// Global key bindings, installed once in the WebView.
-/// Cmd/Ctrl+K focuses the sidebar search; Esc closes the topmost sheet, menu
-/// or pop. A pointerdown outside a `.menu-wrap` closes the menu/pop it owns
-/// through its trigger (or hidden `.escape-close`), so the Rust-side open
-/// signal stays in sync instead of only the CSS class changing.
+/// Cmd/Ctrl+K focuses the active screen's primary search input before falling
+/// back to `#global-search`; Esc closes the topmost sheet, menu or pop. A
+/// pointerdown outside a `.menu-wrap` closes the menu/pop it owns through its
+/// trigger (or hidden `.escape-close`), so the Rust-side open signal stays in
+/// sync instead of only the CSS class changing.
 const GLOBAL_KEYS_JS: &str = r#"(function () {
   if (window.__serabotKeys) { return; }
   window.__serabotKeys = true;
+  function findPrimarySearch() {
+    var selectors = [
+      '.sheet.open input[type="search"]',
+      'main .pane [id$="-search"]',
+      '#approvals-search',
+      'main .pane .mp-search',
+      'main .pane .tasks-search',
+      'main .pane .wf-search',
+      'main .pane .logs-search',
+      '#vault-domain-filter',
+      'main .pane input[type="search"]',
+      '#global-search'
+    ];
+    for (var i = 0; i < selectors.length; i += 1) {
+      var list = document.querySelectorAll(selectors[i]);
+      for (var j = 0; j < list.length; j += 1) {
+        var el = list[j];
+        if (!el.disabled && (el.offsetParent !== null || el.getClientRects().length > 0)) {
+          return el;
+        }
+      }
+    }
+    return document.getElementById('global-search');
+  }
   window.addEventListener('keydown', function (event) {
     var mod = event.ctrlKey || event.metaKey;
     if (mod && (event.key === 'k' || event.key === 'K')) {
-      var search = document.getElementById('global-search');
+      var search = findPrimarySearch();
       if (search) {
         event.preventDefault();
         search.focus();
@@ -1300,5 +1325,24 @@ break
             Some("Clicked on the page")
         );
         assert_eq!(tool_sentence("deck_build", "x", false), None);
+    }
+
+    #[test]
+    fn global_keys_targets_active_screen_search_before_sidebar() {
+        for selector in [
+            "#approvals-search",
+            ".mp-search",
+            ".tasks-search",
+            ".wf-search",
+            ".logs-search",
+            "#vault-domain-filter",
+            "input[type=\"search\"]",
+            "#global-search",
+        ] {
+            assert!(GLOBAL_KEYS_JS.contains(selector), "missing {selector}");
+        }
+        let approvals = GLOBAL_KEYS_JS.find("#approvals-search").unwrap();
+        let fallback = GLOBAL_KEYS_JS.rfind("#global-search").unwrap();
+        assert!(approvals < fallback);
     }
 }

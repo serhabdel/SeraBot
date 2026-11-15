@@ -283,6 +283,7 @@ impl Edit {
                 let sheet_index = resolve_sheet(workbook, sheet, &label)?;
                 let cell = resolve_cell(address, &label)?;
                 // A date keeps the cell's other formatting and only gains the date format.
+                // A formula keeps any pre-existing cell formatting (currency, borders, etc.).
                 let style = match value {
                     CellValue::Date(_) => {
                         let current = workbook
@@ -292,6 +293,9 @@ impl Edit {
                             style.num_fmt = NumFmt::new(DATE_NUMBER_FORMAT);
                         })
                     }
+                    CellValue::Formula(_) => workbook
+                        .sheet(sheet_index)
+                        .map_or(StyleId::DEFAULT, |sheet| sheet.style_id(cell)),
                     _ => StyleId::DEFAULT,
                 };
                 let sheet = workbook.sheet_mut(sheet_index).ok_or_else(missing_sheet)?;
@@ -543,7 +547,8 @@ impl Edit {
                 let sheet_index = resolve_sheet(workbook, sheet, &label)?;
                 let sheet = workbook.sheet_mut(sheet_index).ok_or_else(missing_sheet)?;
                 sheet.cells.shift_rows(at, i64::from(count));
-                shift_merges_rows(sheet, at, i64::from(count));
+                shift_lines_insert(&mut sheet.rows, at, count);
+                adjust_merges_insert(&mut sheet.merges, at, count, true);
                 Ok(())
             }
             Edit::DeleteRows { sheet, at, count } => {
@@ -556,7 +561,8 @@ impl Edit {
                     .cells
                     .take_range(RangeRef::rows(at, end.saturating_sub(1)));
                 sheet.cells.shift_rows(end, -i64::from(count));
-                shift_merges_rows(sheet, end, -i64::from(count));
+                shift_lines_delete(&mut sheet.rows, at, count);
+                adjust_merges_delete(&mut sheet.merges, at, count, true);
                 Ok(())
             }
             Edit::InsertColumns { sheet, at, count } => {
@@ -565,7 +571,8 @@ impl Edit {
                 let sheet_index = resolve_sheet(workbook, sheet, &label)?;
                 let sheet = workbook.sheet_mut(sheet_index).ok_or_else(missing_sheet)?;
                 sheet.cells.shift_cols(at, i64::from(count));
-                shift_merges_cols(sheet, at, i64::from(count));
+                shift_lines_insert(&mut sheet.cols, at, count);
+                adjust_merges_insert(&mut sheet.merges, at, count, false);
                 Ok(())
             }
             Edit::DeleteColumns { sheet, at, count } => {
@@ -578,7 +585,8 @@ impl Edit {
                     .cells
                     .take_range(RangeRef::cols(at, end.saturating_sub(1)));
                 sheet.cells.shift_cols(end, -i64::from(count));
-                shift_merges_cols(sheet, end, -i64::from(count));
+                shift_lines_delete(&mut sheet.cols, at, count);
+                adjust_merges_delete(&mut sheet.merges, at, count, false);
                 Ok(())
             }
             Edit::AddChart {
@@ -594,10 +602,19 @@ impl Edit {
             } => {
                 let kind = parse_chart_kind(&format!("{label}.kind"), kind)?;
                 let anchor = resolve_cell(anchor, &format!("{label}.anchor"))?;
-                if values.trim().is_empty() {
-                    return Err(SeraError::Validation(format!(
-                        "{label}.values must name a range such as Budget!C2:C13"
-                    )));
+                check_chart_ref(&format!("{label}.values"), values)?;
+                if let Some(cats) = categories.as_deref() {
+                    check_chart_ref(&format!("{label}.categories"), cats)?;
+                }
+                for (field, value) in [
+                    ("title", title.as_deref()),
+                    ("series_name", series_name.as_deref()),
+                    ("x_title", x_title.as_deref()),
+                    ("y_title", y_title.as_deref()),
+                ] {
+                    if let Some(text) = value {
+                        check_line(&format!("{label}.{field}"), text, MAX_TEXT_CHARS)?;
+                    }
                 }
                 let id = workbook.next_object_id();
                 let sheet_index = resolve_sheet(workbook, sheet, &label)?;
@@ -837,7 +854,11 @@ pub fn import(bytes: &[u8]) -> Result<Workbook> {
 /// still names the cell it came from. Formulas are emitted as their text, never
 /// evaluated.
 pub fn plain_text(bytes: &[u8], max_chars: usize) -> Result<String> {
+    const TRAILER: &str = "[more cells not shown: text limit reached]\n";
     let (workbook, _) = load(bytes)?;
+    if max_chars == 0 {
+        return Ok(String::new());
+    }
     let mut out = String::new();
     // Characters written and cells visited so far. A sparse sheet visits only
     // its stored cells, and the cell budget bounds that work too.
@@ -853,7 +874,12 @@ pub fn plain_text(bytes: &[u8], max_chars: usize) -> Result<String> {
             continue;
         };
         let header = format!("# {}\n", sheet.name);
-        written += header.chars().count();
+        let header_chars = header.chars().count();
+        if written + header_chars > max_chars {
+            cut = true;
+            break;
+        }
+        written += header_chars;
         out.push_str(&header);
         for (cell_ref, cell) in sheet.cells.iter_range(used) {
             if written >= max_chars || visited >= PLAIN_TEXT_MAX_CELLS {
@@ -874,12 +900,38 @@ pub fn plain_text(bytes: &[u8], max_chars: usize) -> Result<String> {
                 continue;
             }
             let line = format!("{}!{}: {value}\n", sheet.name, cell_ref.a1());
-            written += line.chars().count();
+            let line_chars = line.chars().count();
+            let remaining = max_chars.saturating_sub(written);
+            if line_chars > remaining {
+                if remaining > 2 {
+                    let clipped = crate::util::truncate_chars(&line, remaining - 2);
+                    written += clipped.chars().count() + 2;
+                    out.push_str(&clipped);
+                    out.push_str("…\n");
+                }
+                cut = true;
+                break;
+            }
+            written += line_chars;
             out.push_str(&line);
         }
     }
     if cut {
-        out.push_str("[more cells not shown: text limit reached]\n");
+        let trailer = if max_chars < TRAILER.chars().count() {
+            crate::util::truncate_chars(TRAILER, max_chars)
+        } else {
+            TRAILER.to_string()
+        };
+        let target = max_chars.saturating_sub(trailer.chars().count());
+        if out.chars().count() > target {
+            let prefix = crate::util::truncate_chars(&out, target);
+            let snapped = match prefix.rfind('\n') {
+                Some(idx) => &prefix[..=idx],
+                None => prefix.as_str(),
+            };
+            out = snapped.to_string();
+        }
+        out.push_str(&trailer);
     }
     Ok(out)
 }
@@ -1310,7 +1362,7 @@ fn write_literal(
                         expr: None,
                         array: None,
                     })),
-                    style: StyleId::DEFAULT,
+                    style: date_style,
                 },
             );
             Ok(())
@@ -1772,27 +1824,88 @@ fn range_cells(range: RangeRef) -> Vec<CellRef> {
     cells
 }
 
-fn shift_index(value: u32, delta: i64) -> u32 {
-    let shifted = i64::from(value) + delta;
-    shifted.clamp(0, i64::from(u32::MAX)) as u32
+fn shift_lines_insert<V>(map: &mut std::collections::BTreeMap<u32, V>, at: u32, count: u32) {
+    let entries = std::mem::take(map);
+    for (index, info) in entries {
+        let next = if index >= at {
+            match index.checked_add(count) {
+                Some(shifted) => shifted,
+                None => continue,
+            }
+        } else {
+            index
+        };
+        map.insert(next, info);
+    }
 }
 
-fn shift_merges_rows(sheet: &mut Sheet, from: u32, delta: i64) {
-    for merge in &mut sheet.merges {
-        if merge.start.row >= from {
-            merge.start.row = shift_index(merge.start.row, delta);
-            merge.end.row = shift_index(merge.end.row, delta);
+fn shift_lines_delete<V>(map: &mut std::collections::BTreeMap<u32, V>, at: u32, count: u32) {
+    let del_end = at.saturating_add(count);
+    let entries = std::mem::take(map);
+    for (index, info) in entries {
+        if index < at {
+            map.insert(index, info);
+        } else if index >= del_end {
+            map.insert(index - count, info);
         }
     }
 }
 
-fn shift_merges_cols(sheet: &mut Sheet, from: u32, delta: i64) {
-    for merge in &mut sheet.merges {
-        if merge.start.col >= from {
-            merge.start.col = shift_index(merge.start.col, delta);
-            merge.end.col = shift_index(merge.end.col, delta);
+fn adjust_merges_insert(merges: &mut [RangeRef], at: u32, count: u32, rows: bool) {
+    for merge in merges {
+        let (start, end) = if rows {
+            (&mut merge.start.row, &mut merge.end.row)
+        } else {
+            (&mut merge.start.col, &mut merge.end.col)
+        };
+        if *start >= at {
+            *start = start.saturating_add(count);
+            *end = end.saturating_add(count);
+        } else if *end >= at {
+            *end = end.saturating_add(count);
         }
     }
+}
+
+fn adjust_merges_delete(merges: &mut Vec<RangeRef>, at: u32, count: u32, rows: bool) {
+    let del_end = at.saturating_add(count);
+    merges.retain_mut(|merge| {
+        let (start, end) = if rows {
+            (&mut merge.start.row, &mut merge.end.row)
+        } else {
+            (&mut merge.start.col, &mut merge.end.col)
+        };
+        if *end < at {
+            return true;
+        }
+        if *start >= del_end {
+            *start -= count;
+            *end -= count;
+            return true;
+        }
+        if *start >= at && *end < del_end {
+            return false;
+        }
+        if *start < at && *end < del_end {
+            *end = at - 1;
+        } else if *start >= at && *end >= del_end {
+            *start = at;
+            *end -= count;
+        } else {
+            *end -= count;
+        }
+        !merge.is_single()
+    });
+}
+
+fn check_chart_ref(label: &str, value: &str) -> Result<()> {
+    check_line(label, value, MAX_FORMULA_CHARS)?;
+    if value.contains('[') || value.contains(']') {
+        return Err(SeraError::Validation(format!(
+            "{label} must not contain '[' or ']': external and structured references are not accepted"
+        )));
+    }
+    Ok(())
 }
 
 fn check_merge_range(label: &str, value: &str) -> Result<RangeRef> {
@@ -1877,10 +1990,16 @@ fn calls_function(text: &str, name: &str) -> bool {
     while let Some(offset) = upper.get(from..).and_then(|rest| rest.find(name)) {
         let start = from + offset;
         let end = start + name.len();
-        let boundary_before = upper
-            .as_bytes()
-            .get(start.wrapping_sub(1))
-            .is_none_or(|byte| !is_identifier_byte(*byte));
+        let boundary_before = match upper[..start].strip_suffix("_XLFN.") {
+            Some(before_prefix) => before_prefix
+                .as_bytes()
+                .last()
+                .is_none_or(|byte| !is_identifier_byte(*byte)),
+            None => upper
+                .as_bytes()
+                .get(start.wrapping_sub(1))
+                .is_none_or(|byte| !is_identifier_byte(*byte)),
+        };
         let boundary_after = upper
             .get(end..)
             .is_none_or(|rest| rest.trim_start().starts_with('('));
@@ -2072,6 +2191,8 @@ struct RawEdit {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
+    row: Option<u32>,
+    #[serde(default)]
     rows: Option<u32>,
     #[serde(default)]
     columns: Option<u32>,
@@ -2207,7 +2328,7 @@ impl TryFrom<RawEdit> for Edit {
                 check_fields("set_row_height", &["row", "height"], &raw)?;
                 Ok(Edit::SetRowHeight {
                     sheet: require_sheet(&raw, "set_row_height")?,
-                    row: require(raw.rows, "row", "set_row_height")?,
+                    row: require(raw.row, "row", "set_row_height")?,
                     height: require(raw.height, "height", "set_row_height")?,
                 })
             }
@@ -2361,6 +2482,7 @@ fn check_fields(op: &str, allowed: &[&str], raw: &RawEdit) -> std::result::Resul
         ("width", raw.width.is_some()),
         ("range", raw.range.is_some()),
         ("name", raw.name.is_some()),
+        ("row", raw.row.is_some()),
         ("rows", raw.rows.is_some()),
         ("columns", raw.columns.is_some()),
         ("at", raw.at.is_some()),
@@ -4216,6 +4338,167 @@ mod tests {
         let tool = XlsxBuildTool::new(artifacts, store);
         let args = json!({"spec": {"title": "x", "sheets": [], "attachments": ["a.bin"]}});
         assert!(tool.execute(args, &context("xlsx_build")).await.is_err());
+    }
+
+    #[test]
+    fn sets_row_height_via_json() {
+        let built = build(&spec()).unwrap();
+        let parsed: Edit = serde_json::from_value(json!({
+            "op": "set_row_height",
+            "sheet": "Summary",
+            "row": 2,
+            "height": 28.0
+        }))
+        .expect("set_row_height JSON must deserialize");
+        let edited = apply_edits(&built, &[parsed]).expect("set_row_height succeeds");
+        let (workbook, _) = load(&edited).unwrap();
+        let sheet = workbook.sheet(0).unwrap();
+        assert_eq!(sheet.rows.get(&1).and_then(|r| r.size), Some(28.0f32));
+    }
+
+    #[test]
+    fn preserves_style_on_set_value_formula() {
+        let built = build(&spec()).unwrap();
+        let formatted = apply_edits(
+            &built,
+            &[Edit::SetNumberFormat {
+                sheet: "Summary".into(),
+                address: "B2".into(),
+                format: "#,##0.00".into(),
+            }],
+        )
+        .unwrap();
+        let with_formula = apply_edits(
+            &formatted,
+            &[Edit::SetValue {
+                sheet: "Summary".into(),
+                address: "B2".into(),
+                value: CellValue::Formula("=10+20".into()),
+            }],
+        )
+        .unwrap();
+        let (workbook, _) = load(&with_formula).unwrap();
+        let sheet = workbook.sheet(0).unwrap();
+        let cell_ref = CellRef::parse("B2").unwrap();
+        let style = workbook.styles.get(sheet.style_id(cell_ref));
+        assert_eq!(style.num_fmt, NumFmt::new("#,##0.00"));
+        assert_eq!(
+            sheet
+                .cells
+                .get(cell_ref)
+                .and_then(|c| c.formula.as_ref())
+                .map(|f| f.text.as_str()),
+            Some("10+20")
+        );
+    }
+
+    #[test]
+    fn shifts_row_heights_col_widths_and_merges_on_insert_delete() {
+        let built = build(&spec()).unwrap();
+        let prepared = apply_edits(
+            &built,
+            &[
+                Edit::SetRowHeight {
+                    sheet: "Summary".into(),
+                    row: 2,
+                    height: 32.0,
+                },
+                Edit::SetColumnWidth {
+                    sheet: "Summary".into(),
+                    column: "B".into(),
+                    width: 24.0,
+                },
+                Edit::MergeCells {
+                    sheet: "Summary".into(),
+                    range: "B2:D3".into(),
+                },
+            ],
+        )
+        .unwrap();
+        let shifted = apply_edits(
+            &prepared,
+            &[
+                Edit::InsertRows {
+                    sheet: "Summary".into(),
+                    at: 2,
+                    count: 1,
+                },
+                Edit::InsertColumns {
+                    sheet: "Summary".into(),
+                    at: 3,
+                    count: 1,
+                },
+                Edit::DeleteRows {
+                    sheet: "Summary".into(),
+                    at: 3,
+                    count: 1,
+                },
+            ],
+        )
+        .unwrap();
+        let (workbook, _) = load(&shifted).unwrap();
+        let sheet = workbook.sheet(0).unwrap();
+        // Row 2 moved to 3 on insert, then deleted -> row height 2 and 3 are gone.
+        assert!(!sheet.rows.contains_key(&1));
+        assert!(!sheet.rows.contains_key(&2));
+        // Column B (index 1) stayed before col C insert (at index 2).
+        assert_eq!(points_to_chars(f64::from(sheet.col_width(1))), 24.0);
+        // Merge was B2:D3 -> insert row at 2 => B3:D4 -> insert col at C => B3:E4 -> delete row 3 => B3:E3.
+        assert_eq!(sheet.merges.len(), 1);
+        assert_eq!(sheet.merges[0], RangeRef::parse("B3:E3").unwrap());
+    }
+
+    #[test]
+    fn rejects_xlfn_remote_formulas_and_unsafe_chart_refs() {
+        let built = build(&spec()).unwrap();
+        let xlfn = apply_edits(
+            &built,
+            &[Edit::SetFormula {
+                sheet: "Summary".into(),
+                address: "B2".into(),
+                formula: "=_xlfn.WEBSERVICE(\"https://evil.example\")".into(),
+            }],
+        );
+        assert!(xlfn.is_err(), "_xlfn.WEBSERVICE must be rejected");
+
+        let chart_ext = apply_edits(
+            &built,
+            &[Edit::AddChart {
+                sheet: "Summary".into(),
+                anchor: "D2".into(),
+                kind: "column".into(),
+                title: Some("Chart".into()),
+                categories: None,
+                values: "[external.xlsx]Sheet1!A1:A3".into(),
+                series_name: None,
+                x_title: None,
+                y_title: None,
+            }],
+        );
+        assert!(chart_ext.is_err(), "external chart values must be rejected");
+    }
+
+    #[test]
+    fn plain_text_strictly_respects_max_chars() {
+        let mut s = spec();
+        s.sheets[0].rows = (0..30)
+            .map(|i| {
+                vec![
+                    CellValue::Text(format!("Item number {i} with longer description text")),
+                    CellValue::Number(f64::from(i) * 100.0),
+                    CellValue::Date("2026-06-01".into()),
+                ]
+            })
+            .collect();
+        let built = build(&s).unwrap();
+        for limit in [0usize, 25, 80, 200] {
+            let text = plain_text(&built, limit).unwrap();
+            assert!(
+                text.chars().count() <= limit,
+                "plain_text exceeded limit {limit}: got {} chars: {text:?}",
+                text.chars().count()
+            );
+        }
     }
 
     /// Appends a stored (uncompressed) entry to a zip package, so tests can build a package

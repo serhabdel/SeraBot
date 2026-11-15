@@ -479,13 +479,7 @@ impl Updater {
             let _ = fs::remove_file(&part);
             return Err(UpdateError::HashMismatch);
         }
-        if destination.exists() {
-            let _ = fs::remove_file(destination);
-        }
-        fs::rename(&part, destination).map_err(|_| {
-            let _ = fs::remove_file(&part);
-            UpdateError::Storage
-        })?;
+        replace_from_part(&part, destination)?;
         Ok(total)
     }
 
@@ -501,7 +495,9 @@ impl Updater {
                 continue;
             };
             let ours = name.starts_with("serabot-desktop-")
-                && (name.ends_with(".exe") || name.ends_with(".exe.part"));
+                && (name.ends_with(".exe")
+                    || name.ends_with(".exe.part")
+                    || name.ends_with(".exe.bak"));
             if ours && path != keep && path.is_file() {
                 let _ = fs::remove_file(&path);
             }
@@ -714,6 +710,34 @@ fn spawn_detached(info: &UpdateInfo) -> Result<(), String> {
 #[cfg(not(windows))]
 fn spawn_detached(_info: &UpdateInfo) -> Result<(), String> {
     Err("Updates can only be installed on Windows.".to_owned())
+}
+
+fn replace_from_part(part: &Path, destination: &Path) -> Result<(), UpdateError> {
+    let backup = PathBuf::from(format!("{}.bak", destination.display()));
+    let backed_up = if destination.exists() {
+        if backup.exists() {
+            let _ = fs::remove_file(&backup);
+        }
+        if fs::rename(destination, &backup).is_ok() {
+            true
+        } else {
+            let _ = fs::remove_file(destination);
+            false
+        }
+    } else {
+        false
+    };
+    if fs::rename(part, destination).is_err() {
+        let _ = fs::remove_file(part);
+        if backed_up {
+            let _ = fs::rename(&backup, destination);
+        }
+        return Err(UpdateError::Storage);
+    }
+    if backed_up {
+        let _ = fs::remove_file(&backup);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -994,5 +1018,23 @@ mod tests {
         };
         let error = spawn_apply(&info).unwrap_err();
         assert!(error.contains("SHA-256") || error.contains("Windows"));
+    }
+
+    #[test]
+    fn replace_from_part_preserves_existing_destination_on_rename_failure() {
+        let dir = temp_dir("safe-replace");
+        let dest = dir.join("serabot-desktop-1.0.0.exe");
+        let missing_part = dir.join("missing.exe.part");
+        fs::write(&dest, b"existing-good-binary").unwrap();
+        let err = replace_from_part(&missing_part, &dest).unwrap_err();
+        assert_eq!(err, UpdateError::Storage);
+        assert_eq!(fs::read(&dest).unwrap(), b"existing-good-binary");
+
+        let next_part = dir.join("next.exe.part");
+        fs::write(&next_part, b"new-verified-binary").unwrap();
+        replace_from_part(&next_part, &dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"new-verified-binary");
+        assert!(!dir.join("serabot-desktop-1.0.0.exe.bak").exists());
+        fs::remove_dir_all(dir).unwrap();
     }
 }

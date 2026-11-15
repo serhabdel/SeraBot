@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 
 use crate::error::Result;
 use crate::store::{DigestItem, Store};
+use crate::util::{redact_url_queries, truncate_chars};
 
 /// Window used when the caller gives no hours.
 pub const DEFAULT_HOURS: u32 = 24;
@@ -19,6 +20,11 @@ pub const MAX_HOURS: u32 = 168;
 pub const MAX_ITEMS: usize = 50;
 /// Items shown in a Telegram reply; the rest are counted, not listed.
 const TELEGRAM_ITEMS: usize = 15;
+const MAX_TITLE_CHARS: usize = 160;
+const MAX_SOURCE_CHARS: usize = 60;
+const MAX_URL_CHARS: usize = 200;
+/// Safe Telegram message budget (well below Telegram's 4096-char limit).
+const MAX_TELEGRAM_CHARS: usize = 3900;
 
 /// Start of a window that reaches `hours` back from `now`, clamped to 1..=MAX_HOURS.
 pub fn window_start(now: DateTime<Utc>, hours: u32) -> DateTime<Utc> {
@@ -102,14 +108,23 @@ pub fn telegram_text(digest: &Digest, hours: u32) -> String {
             digest.items.len()
         ));
         for item in digest.items.iter().take(TELEGRAM_ITEMS) {
+            let title = truncate_chars(&one_line(&item.title), MAX_TITLE_CHARS);
+            let source = truncate_chars(&one_line(&item.source), MAX_SOURCE_CHARS);
             let link = item
                 .url
                 .as_deref()
+                .map(|url| truncate_chars(&redact_url_queries(&one_line(url)), MAX_URL_CHARS))
+                .filter(|url| !url.is_empty())
                 .map(|url| format!(" {url}"))
                 .unwrap_or_default();
-            lines.push(format!("- {} ({}){link}", item.title, item.source));
+            lines.push(format!("- {title} ({source}){link}"));
         }
-        if digest.items.len() > TELEGRAM_ITEMS {
+        if digest.items.len() >= MAX_ITEMS {
+            lines.push(format!(
+                "…and {}+ more (capped at {MAX_ITEMS}).",
+                digest.items.len() - TELEGRAM_ITEMS
+            ));
+        } else if digest.items.len() > TELEGRAM_ITEMS {
             lines.push(format!(
                 "…and {} more.",
                 digest.items.len() - TELEGRAM_ITEMS
@@ -117,12 +132,33 @@ pub fn telegram_text(digest: &Digest, hours: u32) -> String {
         }
     }
     if !digest.failing.is_empty() {
+        let failing: Vec<String> = digest
+            .failing
+            .iter()
+            .map(|source| truncate_chars(&one_line(source), MAX_SOURCE_CHARS))
+            .collect();
         lines.push(format!(
             "Failing sources (last run): {}",
-            digest.failing.join(", ")
+            failing.join(", ")
         ));
     }
-    lines.join("\n")
+    let rendered = lines.join("\n");
+    if rendered.chars().count() <= MAX_TELEGRAM_CHARS {
+        return rendered;
+    }
+    let marker = "\n[digest truncated]";
+    let mut truncated = truncate_chars(&rendered, MAX_TELEGRAM_CHARS - marker.chars().count());
+    if let Some(last_newline) = truncated.rfind('\n')
+        && last_newline > 0
+    {
+        truncated.truncate(last_newline);
+    }
+    truncated.push_str(marker);
+    truncated
+}
+
+fn one_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
@@ -198,5 +234,52 @@ mod tests {
         let text = telegram_text(&many, 24);
         assert!(text.contains("…and 4 more."));
         assert_eq!(text.matches("\n- ").count(), TELEGRAM_ITEMS);
+    }
+
+    #[test]
+    fn telegram_text_sanitizes_redacts_and_bounds_length() {
+        let since = Utc.with_ymd_and_hms(2026, 11, 10, 12, 0, 0).unwrap();
+        let long_title = format!("Line 1\nLine 2\r\n{}", "x".repeat(400));
+        let digest = Digest {
+            since,
+            items: (0..MAX_ITEMS)
+                .map(|n| {
+                    item(
+                        "news\nfeed",
+                        &format!("{n} {long_title}"),
+                        Some(if n == 0 {
+                            "https://feed.example/a?token=secret"
+                        } else {
+                            "   "
+                        }),
+                    )
+                })
+                .collect(),
+            failing: vec!["broken\nsource".into()],
+        };
+        let text = telegram_text(&digest, 24);
+        assert!(
+            text.chars().count() <= MAX_TELEGRAM_CHARS,
+            "len={}",
+            text.chars().count()
+        );
+        assert!(!text.contains("secret"), "{text}");
+        assert!(text.contains("https://feed.example/a?[redacted]"), "{text}");
+        assert!(!text.contains("Line 1\nLine 2"), "{text}");
+        assert!(text.contains("Line 1 Line 2"), "{text}");
+    }
+
+    #[test]
+    fn telegram_text_notes_max_items_cap() {
+        let since = Utc.with_ymd_and_hms(2026, 11, 10, 12, 0, 0).unwrap();
+        let capped = Digest {
+            since,
+            items: (0..MAX_ITEMS)
+                .map(|n| item("news", &format!("Item {n}"), None))
+                .collect(),
+            failing: Vec::new(),
+        };
+        let text = telegram_text(&capped, 24);
+        assert!(text.contains("capped at 50"), "{text}");
     }
 }

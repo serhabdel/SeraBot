@@ -34,7 +34,7 @@ use crate::domain::{new_id, utc_now};
 use crate::error::{Result, SeraError};
 use crate::fetch::{FetchedPage, SafeFetcher};
 use crate::store::Store;
-use crate::util::{sha256_hex, truncate_chars};
+use crate::util::{redact_url_queries, sha256_hex, truncate_chars};
 
 /// Default item bound used by [`watch_all`].
 pub const DEFAULT_MAX_ITEMS: usize = 200;
@@ -202,7 +202,7 @@ pub async fn watch_source(
     let (page, attempts) = match fetch_source_page(fetcher, &source.url).await {
         Ok(fetched) => fetched,
         Err(error) => {
-            let message = format!("fetch failed: {error}");
+            let message = redact_url_queries(&format!("fetch failed: {error}"));
             finish_source_run(store, user_id, &run_id, false, 0, Some(&message))?;
             report.failed = 1;
             report.warn(message);
@@ -236,7 +236,7 @@ pub async fn watch_source(
     let raw_items = match raw_items {
         Ok(items) => items,
         Err(error) => {
-            let message = format!("parse failed: {error}");
+            let message = redact_url_queries(&format!("parse failed: {error}"));
             finish_source_run(store, user_id, &run_id, false, 0, Some(&message))?;
             report.failed = 1;
             report.warn(message);
@@ -248,7 +248,8 @@ pub async fn watch_source(
     let base = match Url::parse(&page.final_url) {
         Ok(url) => url,
         Err(error) => {
-            let message = format!("invalid final URL {}: {error}", page.final_url);
+            let message =
+                redact_url_queries(&format!("invalid final URL {}: {error}", page.final_url));
             finish_source_run(store, user_id, &run_id, false, 0, Some(&message))?;
             report.failed = 1;
             report.warn(message);
@@ -393,7 +394,7 @@ fn ingest_item(
         return Ok(());
     };
 
-    let previous_deadline = active_deadline(&connection, &existing.id)?;
+    let previous_deadline = active_deadline(&connection, user_id, &existing.id)?;
     let deadline_changed = match (&parsed_deadline, &previous_deadline) {
         (Some(new), Some(old)) => {
             new.due_date != old.due_date
@@ -424,7 +425,7 @@ fn ingest_item(
         "UPDATE opportunities
          SET title = ?1, summary = ?2, url = ?3, status = ?4, evidence = ?5,
              revision = revision + 1, last_seen = ?6
-         WHERE id = ?7",
+         WHERE id = ?7 AND user_id = ?8",
         params![
             title,
             summary,
@@ -432,14 +433,15 @@ fn ingest_item(
             status,
             evidence,
             observed_at,
-            existing.id
+            existing.id,
+            user_id
         ],
     )?;
 
     if withdrawn {
-        supersede_deadlines(&connection, &existing.id)?;
+        supersede_deadlines(&connection, user_id, &existing.id)?;
     } else if deadline_changed {
-        supersede_deadlines(&connection, &existing.id)?;
+        supersede_deadlines(&connection, user_id, &existing.id)?;
         if let Some(deadline) = &parsed_deadline {
             insert_deadline(
                 &connection,
@@ -458,15 +460,16 @@ fn ingest_item(
 
 fn active_deadline(
     connection: &rusqlite::Connection,
+    user_id: &str,
     opportunity_id: &str,
 ) -> Result<Option<CurrentDeadline>> {
     Ok(connection
         .query_row(
             "SELECT due_date, due_time, precision
              FROM deadlines
-             WHERE opportunity_id = ?1 AND status <> 'superseded'
+             WHERE opportunity_id = ?1 AND user_id = ?2 AND status <> 'superseded'
              ORDER BY observed_at DESC LIMIT 1",
-            params![opportunity_id],
+            params![opportunity_id, user_id],
             |row| {
                 Ok(CurrentDeadline {
                     due_date: row.get(0)?,
@@ -506,11 +509,15 @@ fn insert_deadline(
     Ok(())
 }
 
-fn supersede_deadlines(connection: &rusqlite::Connection, opportunity_id: &str) -> Result<()> {
+fn supersede_deadlines(
+    connection: &rusqlite::Connection,
+    user_id: &str,
+    opportunity_id: &str,
+) -> Result<()> {
     connection.execute(
         "UPDATE deadlines SET status = 'superseded'
-         WHERE opportunity_id = ?1 AND status <> 'superseded'",
-        params![opportunity_id],
+         WHERE opportunity_id = ?1 AND user_id = ?2 AND status <> 'superseded'",
+        params![opportunity_id, user_id],
     )?;
     Ok(())
 }
@@ -605,6 +612,27 @@ fn parse_rss(body: &str, max_items: usize) -> Result<Vec<RawItem>> {
         .map_err(|error| SeraError::External(format!("invalid RSS: {error}")))?;
     let mut items = Vec::new();
     for item in channel.items().iter().take(max_items) {
+        let description = item
+            .description()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .or_else(|| {
+                item.content()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+            });
+        let date_text = item
+            .pub_date()
+            .map(str::trim)
+            .filter(|date| !date.is_empty())
+            .or_else(|| {
+                item.dublin_core_ext()
+                    .and_then(|dc| dc.dates().first())
+                    .map(String::as_str)
+                    .map(str::trim)
+                    .filter(|date| !date.is_empty())
+            })
+            .map(str::to_owned);
         items.push(RawItem {
             title: truncate_chars(item.title().unwrap_or_default().trim(), 500),
             link: item
@@ -612,12 +640,8 @@ fn parse_rss(body: &str, max_items: usize) -> Result<Vec<RawItem>> {
                 .map(str::trim)
                 .filter(|link| !link.is_empty())
                 .map(str::to_owned),
-            date_text: item
-                .pub_date()
-                .map(str::trim)
-                .filter(|date| !date.is_empty())
-                .map(str::to_owned),
-            summary: item.description().map(strip_html).unwrap_or_default(),
+            date_text,
+            summary: description.map(strip_html).unwrap_or_default(),
         });
     }
     Ok(items)
@@ -633,10 +657,30 @@ fn parse_selector(value: &str, field: &str, source: &SourceConfig) -> Result<Sel
 }
 
 fn element_text(element: &ElementRef<'_>) -> String {
-    truncate_chars(
-        &normalize_ws(&element.text().collect::<Vec<_>>().join(" ")),
-        4000,
-    )
+    let mut raw = String::new();
+    for node in element.descendants() {
+        let scraper::Node::Text(text) = node.value() else {
+            continue;
+        };
+        let hidden_ancestor = node
+            .ancestors()
+            .take_while(|ancestor| ancestor.id() != element.id())
+            .any(|ancestor| {
+                matches!(
+                    ancestor.value(),
+                    scraper::Node::Element(el)
+                        if matches!(
+                            el.name(),
+                            "script" | "style" | "noscript" | "svg" | "template"
+                        )
+                )
+            });
+        if !hidden_ancestor {
+            raw.push_str(text);
+            raw.push(' ');
+        }
+    }
+    truncate_chars(&normalize_ws(&raw), 4000)
 }
 
 fn strip_html(value: &str) -> String {
@@ -644,10 +688,7 @@ fn strip_html(value: &str) -> String {
         return truncate_chars(&normalize_ws(value), 4000);
     }
     let fragment = Html::parse_fragment(value);
-    truncate_chars(
-        &normalize_ws(&fragment.root_element().text().collect::<Vec<_>>().join(" ")),
-        4000,
-    )
+    element_text(&fragment.root_element())
 }
 
 fn resolve_link(base: &Url, href: &str) -> Option<String> {
@@ -670,19 +711,27 @@ fn normalized_key(value: &str) -> String {
 /// Conservative withdrawal detection: only the title is inspected so an
 /// unrelated phrase in a long summary cannot silently hide an opportunity.
 fn looks_withdrawn(title: &str) -> bool {
-    const MARKERS: [&str; 7] = [
+    const MARKERS: [&str; 15] = [
         "withdrawn",
         "cancelled",
         "canceled",
         "annullato",
         "annullata",
         "ritirato",
+        "ritirata",
         "revocato",
+        "revocata",
+        "annule",
+        "annulee",
+        "retire",
+        "retiree",
+        "revoque",
+        "revoquee",
     ];
-    title
+    let folded = fold_accents(&title.to_lowercase());
+    folded
         .split(|character: char| !character.is_alphanumeric())
-        .map(str::to_ascii_lowercase)
-        .any(|word| MARKERS.contains(&word.as_str()))
+        .any(|word| MARKERS.contains(&word))
 }
 
 fn utc_string(value: DateTime<Utc>) -> String {
@@ -732,14 +781,16 @@ fn parse_deadline(text: &str, tz: Tz) -> Option<ParsedDeadline> {
         return Some(from_offset(value, tz, &source_text));
     }
 
-    const DATETIME_FORMATS: [&str; 11] = [
+    const DATETIME_FORMATS: [&str; 13] = [
         "%Y-%m-%dT%H:%M:%S%.f",
         "%Y-%m-%dT%H:%M",
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%d %H:%M",
         "%d/%m/%Y %H:%M:%S",
         "%d/%m/%Y %H:%M",
+        "%d.%m.%Y %H:%M:%S",
         "%d.%m.%Y %H:%M",
+        "%d-%m-%Y %H:%M:%S",
         "%d-%m-%Y %H:%M",
         "%d %B %Y %H:%M",
         "%d %b %Y %H:%M",
@@ -762,7 +813,38 @@ fn parse_deadline(text: &str, tz: Tz) -> Option<ParsedDeadline> {
         }
     }
 
+    if let Some(parsed) = parse_embedded_numeric_date(&source_text, tz) {
+        return Some(parsed);
+    }
+
     parse_textual_date(&source_text, tz)
+}
+
+fn parse_embedded_numeric_date(text: &str, tz: Tz) -> Option<ParsedDeadline> {
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    for (index, raw_token) in tokens.iter().enumerate() {
+        let token = raw_token.trim_matches(|character: char| {
+            matches!(character, ',' | ';' | ':' | '(' | ')' | '[' | ']')
+        });
+        let date = ["%Y-%m-%d", "%d/%m/%Y", "%d.%m.%Y", "%d-%m-%Y"]
+            .iter()
+            .find_map(|format| NaiveDate::parse_from_str(token, format).ok());
+        let Some(date) = date else {
+            continue;
+        };
+        let time = tokens
+            .iter()
+            .skip(index + 1)
+            .take(2)
+            .find_map(|candidate| parse_hhmm(candidate));
+        if let Some(time) = time
+            && let Some(local) = resolve_local(date.and_time(time), tz)
+        {
+            return Some(from_local(local, text));
+        }
+        return Some(from_date(date, text));
+    }
+    None
 }
 
 fn from_offset(value: DateTime<chrono::FixedOffset>, tz: Tz, source_text: &str) -> ParsedDeadline {
@@ -795,34 +877,59 @@ fn parse_textual_date(text: &str, tz: Tz) -> Option<ParsedDeadline> {
         let Some(month) = month_number(token) else {
             continue;
         };
-        let day = index
+        // Day-Month-Year (`28 October 2026`, `1er fevrier 2027`)
+        if let Some(day) = index
             .checked_sub(1)
-            .and_then(|index| leading_u32(tokens[index]))?;
-        let year_token = tokens.get(index + 1)?;
-        let year_text: String = year_token
-            .chars()
-            .filter(|character| character.is_ascii_digit())
-            .collect();
-        if year_text.len() != 4 {
-            return None;
+            .and_then(|prev| leading_u32(tokens[prev]))
+            && let Some(year_token) = tokens.get(index + 1)
+            && let Some(year) = parse_four_digit_year(year_token)
+            && let Some(date) = NaiveDate::from_ymd_opt(year, month, day)
+        {
+            let time = tokens
+                .iter()
+                .skip(index + 2)
+                .take(3)
+                .find_map(|token| parse_hhmm(token));
+            if let Some(time) = time
+                && let Some(local) = resolve_local(date.and_time(time), tz)
+            {
+                return Some(from_local(local, text));
+            }
+            return Some(from_date(date, text));
         }
-        let year: i32 = year_text.parse().ok()?;
-        if !(1900..=2200).contains(&year) {
-            return None;
+        // Month-Day-Year (`October 28, 2026`, `Oct 28th 2026`)
+        if let Some(day_token) = tokens.get(index + 1)
+            && let Some(day) = leading_u32(day_token)
+            && let Some(year_token) = tokens.get(index + 2)
+            && let Some(year) = parse_four_digit_year(year_token)
+            && let Some(date) = NaiveDate::from_ymd_opt(year, month, day)
+        {
+            let time = tokens
+                .iter()
+                .skip(index + 3)
+                .take(3)
+                .find_map(|token| parse_hhmm(token));
+            if let Some(time) = time
+                && let Some(local) = resolve_local(date.and_time(time), tz)
+            {
+                return Some(from_local(local, text));
+            }
+            return Some(from_date(date, text));
         }
-        let date = NaiveDate::from_ymd_opt(year, month, day)?;
-        let time = tokens
-            .iter()
-            .skip(index + 2)
-            .take(3)
-            .find_map(|token| parse_hhmm(token));
-        if let Some(time) = time {
-            let local = resolve_local(date.and_time(time), tz)?;
-            return Some(from_local(local, text));
-        }
-        return Some(from_date(date, text));
     }
     None
+}
+
+fn parse_four_digit_year(token: &str) -> Option<i32> {
+    let year_text: String = token
+        .chars()
+        .filter(|character| character.is_ascii_digit())
+        .collect();
+    if year_text.len() != 4 {
+        return None;
+    }
+    let year: i32 = year_text.parse().ok()?;
+    (1900..=2200).contains(&year).then_some(year)
 }
 
 fn leading_u32(value: &str) -> Option<u32> {
@@ -1414,5 +1521,134 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM source_runs", [], |row| row.get(0))
             .unwrap();
         assert_eq!(runs, 2);
+    }
+
+    #[test]
+    fn parses_dates_after_month_word_us_format_and_labelled_iso() {
+        let tz: Tz = "Europe/Rome".parse().unwrap();
+
+        let with_may = parse_deadline("Submissions may close 15 June 2026", tz).unwrap();
+        assert_eq!(with_may.due_date, "2026-06-15");
+
+        let us_date = parse_deadline("Deadline: October 28, 2026 14:30", tz).unwrap();
+        assert_eq!(us_date.due_date, "2026-10-28");
+        assert_eq!(us_date.due_time.as_deref(), Some("14:30"));
+
+        let nov_short = parse_deadline("Due: 15 Nov 2026", tz).unwrap();
+        assert_eq!(nov_short.due_date, "2026-11-15");
+
+        let labelled_iso = parse_deadline("Deadline: 2026-10-28 17:00", tz).unwrap();
+        assert_eq!(labelled_iso.due_date, "2026-10-28");
+        assert_eq!(labelled_iso.due_time.as_deref(), Some("17:00"));
+
+        assert!(looks_withdrawn("Appel à projets annulé"));
+    }
+
+    #[tokio::test]
+    async fn strips_script_style_noise_uses_content_encoded_and_redacts_errors() {
+        let server = MockServer::start().await;
+        let noisy_html = r#"<!doctype html><html><body>
+            <article>
+                <h2>Grant D</h2>
+                <a href="/grant-d">Read</a>
+                <style>.card { color: red; }</style>
+                <script>console.log("tracking");</script>
+                <p>Clean summary text.</p>
+            </article>
+        </body></html>"#;
+        mount_html(&server, "/noisy", noisy_html).await;
+
+        let rss_content = r#"<?xml version="1.0" encoding="UTF-8"?>
+            <rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/"
+                 xmlns:dc="http://purl.org/dc/elements/1.1/">
+            <channel><title>Feed</title><link>http://localhost/</link>
+                <item>
+                    <title>Grant E</title>
+                    <link>http://localhost/grant-e</link>
+                    <dc:date>2026-11-20</dc:date>
+                    <content:encoded><![CDATA[<p>Body from content encoded.</p>]]></content:encoded>
+                </item>
+            </channel></rss>"#;
+        Mock::given(method("GET"))
+            .and(path("/rss-content"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(rss_content.to_owned(), "application/rss+xml"),
+            )
+            .mount(&server)
+            .await;
+
+        let store = store();
+        let user = admin(&store);
+        let html_source = source("html-noisy", server_url(&server, "/noisy"), "html");
+        let report = watch_source(&store, &user, &fetcher(), &html_source, "Europe/Rome", 10)
+            .await
+            .unwrap();
+        assert!(report.ok);
+
+        let rss_source = source("rss-content", server_url(&server, "/rss-content"), "rss");
+        let report = watch_source(&store, &user, &fetcher(), &rss_source, "Europe/Rome", 10)
+            .await
+            .unwrap();
+        assert!(report.ok);
+        assert_eq!(report.new, 1);
+
+        {
+            let connection = store.connection().unwrap();
+            let html_summary: String = connection
+                .query_row(
+                    "SELECT summary FROM opportunities WHERE title = 'Grant D'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(html_summary, "Clean summary text.");
+            assert!(!html_summary.contains("tracking"));
+            assert!(!html_summary.contains("color: red"));
+
+            let rss_summary: String = connection
+                .query_row(
+                    "SELECT summary FROM opportunities WHERE title = 'Grant E'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(rss_summary, "Body from content encoded.");
+        }
+
+        // Failed fetch redacts URL query parameters in source_runs.error.
+        let closed_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let bad_source = source(
+            "secret-feed",
+            format!("http://localhost:{closed_port}/feed?api_key=TOPSECRET"),
+            "rss",
+        );
+        let _ = watch_source(&store, &user, &fetcher(), &bad_source, "Europe/Rome", 10)
+            .await
+            .unwrap();
+        let connection = store.connection().unwrap();
+        let stored_err: Option<String> = connection
+            .query_row(
+                "SELECT error FROM source_runs WHERE source = 'secret-feed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let err_text = stored_err.expect("failed fetch stores error");
+        assert!(
+            err_text.contains("fetch failed:"),
+            "unexpected error: {err_text}"
+        );
+        assert!(
+            !err_text.contains("TOPSECRET"),
+            "error leaked secret: {err_text}"
+        );
+        assert_eq!(
+            redact_url_queries("bad url https://feed.example/rss?api_key=TOPSECRET"),
+            "bad url https://feed.example/rss?[redacted]"
+        );
     }
 }
