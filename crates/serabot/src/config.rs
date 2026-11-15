@@ -1277,6 +1277,10 @@ pub struct VaultConfig {
     pub op_path: String,
     #[serde(default)]
     pub pass_cli_path: String,
+    /// Optional directory where SeraBot auto-installs missing CLIs (`op`,
+    /// `pass-cli`). Empty uses the platform user data bin directory.
+    #[serde(default)]
+    pub bin_dir: String,
     /// Read Proton Pass references. Enabled by default; set `false` in
     /// `[vault]` to disable it.
     #[serde(default = "default_true")]
@@ -1288,6 +1292,7 @@ impl Default for VaultConfig {
         Self {
             op_path: String::new(),
             pass_cli_path: String::new(),
+            bin_dir: String::new(),
             protonpass_enabled: true,
         }
     }

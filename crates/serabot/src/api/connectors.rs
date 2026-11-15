@@ -1067,20 +1067,40 @@ async fn connector_test_outcome(
         });
     }
     if id == "onedrive" {
-        let connected = state
-            .onedrive
-            .as_ref()
-            .map(|registry| registry.connected(&user.id))
-            .transpose()?
-            .unwrap_or(false);
-        return Ok(if connected {
-            (true, "OneDrive is connected for this account.".into())
-        } else {
-            (
+        let Some(registry) = state.onedrive.as_ref() else {
+            return Ok((false, "OneDrive is not enabled on this server.".into()));
+        };
+        if !registry.connected(&user.id)? {
+            return Ok((
                 false,
                 "OneDrive is not connected. Sign in, then test again.".into(),
-            )
-        });
+            ));
+        }
+        let client = registry.client_for(&user.id)?;
+        let client = client.lock().await;
+        let base_folder = state.config.onedrive.folder.clone();
+        return match client.list_folder(None, 1).await {
+            Ok(base_res) if !base_res.items.is_empty() => Ok((
+                true,
+                format!(
+                    "OneDrive is connected for this account (folder '{}' has {} item(s)).",
+                    base_folder,
+                    base_res.items.len()
+                ),
+            )),
+            Ok(_) => match client.list_folder(Some("/"), 1).await {
+                Ok(root_res) => Ok((
+                    true,
+                    format!(
+                        "OneDrive is connected for this account (root has {} item(s); folder '{}' is currently empty).",
+                        root_res.items.len(),
+                        base_folder
+                    ),
+                )),
+                Err(error) => Ok((false, format!("OneDrive root check failed: {error}"))),
+            },
+            Err(error) => Ok((false, format!("OneDrive connection check failed: {error}"))),
+        };
     }
     if crate::token_connectors::TokenConnectors::ids().contains(&id) {
         let personal = state.token_connectors.view(&user.id, id)?;

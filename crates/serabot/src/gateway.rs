@@ -392,30 +392,28 @@ impl Gateway {
         self.vault.clone()
     }
 
-    /// Redact the acting user's vault values from `text`. Fails closed: if
-    /// the vault cannot be read, the text is not returned.
+    /// Redact the acting user's vault values and credential patterns from `text`.
+    /// Fails closed: if the vault cannot be read, the text is not returned.
     pub fn redact_text(&self, user_id: &str, text: &str) -> Result<String> {
-        match &self.vault {
-            Some(users) => Ok(Redactor::for_user(users, user_id, &self.resolved)?.redact(text)),
-            None => Ok(text.to_owned()),
-        }
+        let redactor = match &self.vault {
+            Some(users) => Redactor::for_user(users, user_id, &self.resolved)?,
+            None => Redactor::empty(),
+        };
+        Ok(redactor.redact(text))
     }
 
-    /// A copy of `messages` with the acting user's vault values redacted:
-    /// the form that may be sent to a model. Content, tool-call arguments and
-    /// names are all covered.
+    /// A copy of `messages` with the acting user's vault values and credential
+    /// patterns redacted: the form that may be sent to a model. Content,
+    /// tool-call arguments and names are all covered.
     pub fn redact_messages(
         &self,
         user_id: &str,
         messages: &[LlmMessage],
     ) -> Result<Vec<LlmMessage>> {
-        let Some(users) = &self.vault else {
-            return Ok(messages.to_vec());
+        let redactor = match &self.vault {
+            Some(users) => Redactor::for_user(users, user_id, &self.resolved)?,
+            None => Redactor::empty(),
         };
-        let redactor = Redactor::for_user(users, user_id, &self.resolved)?;
-        if redactor.is_empty() {
-            return Ok(messages.to_vec());
-        }
         Ok(messages
             .iter()
             .map(|message| {
@@ -440,14 +438,11 @@ impl Gateway {
         context: &ToolContext,
         output: Result<ToolOutput>,
     ) -> Result<ToolOutput> {
-        let Some(users) = &self.vault else {
-            return output;
-        };
         let mut output = output?;
-        let redactor = Redactor::for_user(users, &context.user_id, &self.resolved)?;
-        if redactor.is_empty() {
-            return Ok(output);
-        }
+        let redactor = match &self.vault {
+            Some(users) => Redactor::for_user(users, &context.user_id, &self.resolved)?,
+            None => Redactor::empty(),
+        };
         output.content = redactor.redact(&output.content);
         if let Some(data) = output.data.as_mut() {
             redactor.redact_json(data);
@@ -2715,5 +2710,47 @@ mod tests {
             panic!("expected completion");
         };
         assert_eq!(output.content, "page says: plain");
+    }
+
+    #[tokio::test]
+    async fn gateway_scrubs_pattern_tokens_even_when_vault_is_empty() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let users = Arc::new(UserSecrets::with_master_key(store.clone(), [5u8; 32]).unwrap());
+        let mut registry = ToolRegistry::default();
+        registry.register(EchoTool).unwrap();
+        let gateway =
+            Gateway::new(store, Arc::new(Policy::empty()), registry, 1, false).with_vault(users);
+
+        let messages = vec![LlmMessage {
+            role: crate::domain::Role::User,
+            content: Some(
+                "leaked sk-proj-abcdefghijklmnopqrstuvwxyz1234 and op://Vault/Item/pass".into(),
+            ),
+            name: None,
+            tool_call_id: None,
+            tool_calls: vec![],
+        }];
+        let redacted = gateway.redact_messages(&admin, &messages).unwrap();
+        let msg = redacted[0].content.as_deref().unwrap();
+        assert!(!msg.contains("sk-proj-abcdefghijklmnopqrstuvwxyz1234"));
+        assert!(msg.contains("op://Vault/Item/pass"));
+
+        let ToolOutcome::Completed(output) = gateway
+            .execute(
+                "echo",
+                serde_json::json!({"text": "ghp_1234567890abcdefghijklmnopqrstuv"}),
+                &vault_context(&admin),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected completion");
+        };
+        assert!(
+            !output
+                .content
+                .contains("ghp_1234567890abcdefghijklmnopqrstuv")
+        );
     }
 }

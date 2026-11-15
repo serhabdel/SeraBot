@@ -238,13 +238,14 @@ pub fn escape_stops_run(run_active: bool, awaiting_approval: bool) -> bool {
 pub enum SlashAction {
     NewChat,
     Memory,
+    Vault,
     Attach,
     Stop,
     Expand,
 }
 
 /// `(command, what it does, action)`, in the order the picker lists them.
-pub const SLASH_ACTIONS: [(&str, &str, SlashAction); 5] = [
+pub const SLASH_ACTIONS: [(&str, &str, SlashAction); 6] = [
     (
         "new",
         "Start a new chat with this bot",
@@ -254,6 +255,11 @@ pub const SLASH_ACTIONS: [(&str, &str, SlashAction); 5] = [
         "memory",
         "Open the bots\u{2019} memory",
         SlashAction::Memory,
+    ),
+    (
+        "vault",
+        "Open Vault or use a safe vault:// reference",
+        SlashAction::Vault,
     ),
     ("attach", "Attach files", SlashAction::Attach),
     ("stop", "Stop the reply", SlashAction::Stop),
@@ -349,6 +355,321 @@ pub fn quote_reply_text(existing: &str, body: &str) -> String {
         format!("{quoted}\n\n")
     } else {
         format!("{head}\n\n{quoted}\n\n")
+    }
+}
+
+/// Placeholder inserted in place of raw secrets when the user chooses to redact.
+pub const REDACTED_PLACEHOLDER: &str = "[REDACTED \u{2014} store in Vault]";
+
+/// Kind of sensitive credential detected in a composer draft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SensitiveKind {
+    OnePasswordToken,
+    ApiKey,
+    GitHubToken,
+    SlackToken,
+    GoogleApiKey,
+    AwsAccessKey,
+    PrivateKeyPem,
+    BearerToken,
+}
+
+impl SensitiveKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OnePasswordToken => "1Password service account token",
+            Self::ApiKey => "API key",
+            Self::GitHubToken => "GitHub token",
+            Self::SlackToken => "Slack token",
+            Self::GoogleApiKey => "Google API key",
+            Self::AwsAccessKey => "AWS access key",
+            Self::PrivateKeyPem => "PEM private key",
+            Self::BearerToken => "Bearer token",
+        }
+    }
+}
+
+/// Byte span of a detected secret in the draft.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SensitiveSpan {
+    pub kind: SensitiveKind,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// All non-overlapping sensitive credential spans found in a composer draft.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SensitiveDraftMatch {
+    pub spans: Vec<SensitiveSpan>,
+}
+
+impl SensitiveDraftMatch {
+    /// Short human-readable summary of the detected credential kinds.
+    pub fn summary(&self) -> String {
+        let mut labels: Vec<&'static str> = Vec::new();
+        for span in &self.spans {
+            let label = span.kind.label();
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
+        }
+        labels.join(", ")
+    }
+}
+
+fn is_token_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'+' | b'=' | b'/' | b'~')
+}
+
+fn is_key_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')
+}
+
+fn is_boundary_before(bytes: &[u8], idx: usize) -> bool {
+    if idx == 0 {
+        return true;
+    }
+    let prev = bytes[idx - 1];
+    !prev.is_ascii_alphanumeric() && prev != b'_' && prev != b'/' && prev != b':'
+}
+
+fn scan_while(bytes: &[u8], start: usize, pred: fn(u8) -> bool) -> usize {
+    let mut i = start;
+    while i < bytes.len() && pred(bytes[i]) {
+        i += 1;
+    }
+    i
+}
+
+/// Safe vault/password-manager reference prefixes that must never trigger the guard.
+fn safe_ref_end(text: &str, idx: usize) -> Option<usize> {
+    let rest = &text[idx..];
+    for prefix in ["op://", "pass://", "vault://"] {
+        if rest.starts_with(prefix) {
+            let end = text[idx..]
+                .find(char::is_whitespace)
+                .map_or(text.len(), |rel| idx + rel);
+            return Some(end);
+        }
+    }
+    None
+}
+
+/// Detect pasted raw secrets in a composer draft.
+///
+/// Safe references (`op://...`, `pass://...`, `vault://...`) and normal prose
+/// or URLs do not trigger.
+pub fn detect_sensitive_draft(text: &str) -> Option<SensitiveDraftMatch> {
+    let bytes = text.as_bytes();
+    let mut spans: Vec<SensitiveSpan> = Vec::new();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        // Never trigger inside safe vault/password-manager references.
+        if is_boundary_before(bytes, i)
+            && let Some(end) = safe_ref_end(text, i)
+        {
+            i = end;
+            continue;
+        }
+
+        // PEM private keys: -----BEGIN ... PRIVATE KEY----- ... -----END ... PRIVATE KEY-----
+        if text[i..].starts_with("-----BEGIN ")
+            && let Some(nl_or_dash) = text[i..].find("PRIVATE KEY-----")
+        {
+            let header_end = i + nl_or_dash + "PRIVATE KEY-----".len();
+            let end = if let Some(rel_end) = text[header_end..].find("-----END ")
+                && let Some(rel_close) = text[header_end + rel_end..].find("PRIVATE KEY-----")
+            {
+                header_end + rel_end + rel_close + "PRIVATE KEY-----".len()
+            } else {
+                text.len()
+            };
+            spans.push(SensitiveSpan {
+                kind: SensitiveKind::PrivateKeyPem,
+                start: i,
+                end,
+            });
+            i = end;
+            continue;
+        }
+
+        if is_boundary_before(bytes, i) {
+            let rest = &text[i..];
+
+            // 1Password service account token: ops_eyJ...
+            if rest.starts_with("ops_eyJ") {
+                let end = scan_while(bytes, i + "ops_eyJ".len(), is_token_char);
+                if end - i >= 16 {
+                    spans.push(SensitiveSpan {
+                        kind: SensitiveKind::OnePasswordToken,
+                        start: i,
+                        end,
+                    });
+                    i = end;
+                    continue;
+                }
+            }
+
+            // OpenAI / Anthropic keys: sk-ant-..., sk-proj-..., sk-...
+            if rest.starts_with("sk-ant-")
+                || rest.starts_with("sk-proj-")
+                || rest.starts_with("sk-")
+            {
+                let end = scan_while(bytes, i, is_key_char);
+                if end - i >= 20 {
+                    spans.push(SensitiveSpan {
+                        kind: SensitiveKind::ApiKey,
+                        start: i,
+                        end,
+                    });
+                    i = end;
+                    continue;
+                }
+            }
+
+            // GitHub tokens: ghp_..., github_pat_...
+            if rest.starts_with("ghp_") || rest.starts_with("github_pat_") {
+                let end = scan_while(bytes, i, is_key_char);
+                if end - i >= 20 {
+                    spans.push(SensitiveSpan {
+                        kind: SensitiveKind::GitHubToken,
+                        start: i,
+                        end,
+                    });
+                    i = end;
+                    continue;
+                }
+            }
+
+            // Slack tokens: xoxb-..., xoxp-...
+            if rest.starts_with("xoxb-") || rest.starts_with("xoxp-") {
+                let end = scan_while(bytes, i, is_key_char);
+                if end - i >= 16 {
+                    spans.push(SensitiveSpan {
+                        kind: SensitiveKind::SlackToken,
+                        start: i,
+                        end,
+                    });
+                    i = end;
+                    continue;
+                }
+            }
+
+            // Google API keys: AIza...
+            if rest.starts_with("AIza") {
+                let end = scan_while(bytes, i, is_key_char);
+                if end - i >= 24 {
+                    spans.push(SensitiveSpan {
+                        kind: SensitiveKind::GoogleApiKey,
+                        start: i,
+                        end,
+                    });
+                    i = end;
+                    continue;
+                }
+            }
+
+            // AWS access key IDs: AKIA + 16 uppercase alphanumeric
+            if rest.starts_with("AKIA") && bytes.len() >= i + 20 {
+                let candidate = &bytes[i + 4..i + 20];
+                let all_upper_alnum = candidate
+                    .iter()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+                let next_ok = bytes
+                    .get(i + 20)
+                    .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_');
+                if all_upper_alnum && next_ok {
+                    spans.push(SensitiveSpan {
+                        kind: SensitiveKind::AwsAccessKey,
+                        start: i,
+                        end: i + 20,
+                    });
+                    i += 20;
+                    continue;
+                }
+            }
+
+            // Long Bearer <token>
+            if rest.len() > 7 && rest[..7].eq_ignore_ascii_case("bearer ") {
+                let mut tok_start = i + 7;
+                while tok_start < bytes.len() && bytes[tok_start] == b' ' {
+                    tok_start += 1;
+                }
+                let tok_end = scan_while(bytes, tok_start, is_token_char);
+                if tok_end - tok_start >= 20 {
+                    spans.push(SensitiveSpan {
+                        kind: SensitiveKind::BearerToken,
+                        start: tok_start,
+                        end: tok_end,
+                    });
+                    i = tok_end;
+                    continue;
+                }
+            }
+        }
+
+        // Advance to next UTF-8 character boundary.
+        let ch_len = text[i..].chars().next().map_or(1, char::len_utf8);
+        i += ch_len;
+    }
+
+    if spans.is_empty() {
+        None
+    } else {
+        Some(SensitiveDraftMatch { spans })
+    }
+}
+
+/// Replace detected raw secrets with `[REDACTED — store in Vault]` while
+/// keeping surrounding message text intact.
+pub fn redact_sensitive_draft(text: &str) -> String {
+    let Some(matched) = detect_sensitive_draft(text) else {
+        return text.to_owned();
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for span in matched.spans {
+        if span.start > cursor {
+            out.push_str(&text[cursor..span.start]);
+        }
+        out.push_str(REDACTED_PLACEHOLDER);
+        cursor = span.end;
+    }
+    if cursor < text.len() {
+        out.push_str(&text[cursor..]);
+    }
+    out
+}
+
+/// Derive a concise task title from a chat message's first meaningful line,
+/// stripping leading markdown markers and truncating cleanly to ~100 chars.
+pub fn task_title_from_message(content: &str) -> String {
+    let first_line = content
+        .lines()
+        .map(str::trim)
+        .map(|line| {
+            line.trim_start_matches('#')
+                .trim_start_matches('>')
+                .trim_start_matches("- ")
+                .trim_start_matches("* ")
+                .trim()
+        })
+        .find(|line| !line.is_empty())
+        .unwrap_or("Follow up on chat message");
+
+    const MAX_LEN: usize = 100;
+    if first_line.chars().count() <= MAX_LEN {
+        first_line.to_owned()
+    } else {
+        let mut truncated: String = first_line.chars().take(MAX_LEN - 1).collect();
+        if let Some(space) = truncated.rfind(' ')
+            && space >= MAX_LEN / 2
+        {
+            truncated.truncate(space);
+        }
+        truncated.push('\u{2026}');
+        truncated
     }
 }
 
@@ -591,5 +912,111 @@ mod tests {
         );
         assert_eq!(quote_reply_text("Draft", "quoted"), "Draft\n\n> quoted\n\n");
         assert_eq!(quote_reply_text("Draft", "   "), "Draft");
+    }
+
+    #[test]
+    fn vault_slash_command_is_registered_and_parsed() {
+        assert_eq!(parse_slash_action("/vault"), Some(SlashAction::Vault));
+        assert_eq!(parse_slash_action(" /VAULT "), Some(SlashAction::Vault));
+        assert!(
+            slash_actions("vault")
+                .iter()
+                .any(|(cmd, _, act)| *cmd == "vault" && *act == SlashAction::Vault)
+        );
+    }
+
+    #[test]
+    fn sensitive_draft_guard_detects_raw_tokens() {
+        let cases = [
+            (
+                "Use ops_eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.abc123",
+                SensitiveKind::OnePasswordToken,
+            ),
+            ("key: sk-1234567890abcdef123456", SensitiveKind::ApiKey),
+            (
+                "anthropic sk-ant-api03-abcdef1234567890xyz",
+                SensitiveKind::ApiKey,
+            ),
+            ("openai sk-proj-abcdef1234567890xyz", SensitiveKind::ApiKey),
+            (
+                "token ghp_1234567890abcdef1234567890abcdef",
+                SensitiveKind::GitHubToken,
+            ),
+            (
+                "pat github_pat_11AAAAAA0123456789abcdef",
+                SensitiveKind::GitHubToken,
+            ),
+            (
+                "slack xoxb-123456789012-123456789012-abcdef",
+                SensitiveKind::SlackToken,
+            ),
+            (
+                "slack user xoxp-123456789012-123456789012-abcdef",
+                SensitiveKind::SlackToken,
+            ),
+            (
+                "google AIzaSyDaGmWKa4JsXZ-HjGw7ISLn_3namBGt",
+                SensitiveKind::GoogleApiKey,
+            ),
+            ("aws AKIAIOSFODNN7EXAMPLE", SensitiveKind::AwsAccessKey),
+            (
+                "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----",
+                SensitiveKind::PrivateKeyPem,
+            ),
+            (
+                "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload",
+                SensitiveKind::BearerToken,
+            ),
+        ];
+        for (sample, expected_kind) in cases {
+            let matched = detect_sensitive_draft(sample)
+                .unwrap_or_else(|| panic!("expected match for: {sample}"));
+            assert_eq!(matched.spans[0].kind, expected_kind, "for {sample}");
+        }
+    }
+
+    #[test]
+    fn sensitive_draft_guard_ignores_safe_references_and_prose() {
+        for safe in [
+            "Use op://Private/GitHub/token for this",
+            "Read pass://Personal/API/key please",
+            "Fetch vault://openai_api_key from my vault",
+            "Check https://example.com/docs/api-keys and https://github.com/org/repo",
+            "Normal prose with sk-short or Bearer short or AKIA123",
+            "Let's discuss the API key rotation schedule tomorrow.",
+        ] {
+            assert_eq!(
+                detect_sensitive_draft(safe),
+                None,
+                "false positive on: {safe}"
+            );
+            assert_eq!(redact_sensitive_draft(safe), safe);
+        }
+    }
+
+    #[test]
+    fn redact_sensitive_draft_replaces_tokens_and_preserves_surrounding_text() {
+        let draft = "Please use sk-proj-abcdef1234567890xyz and op://Work/Key/val for testing.";
+        let redacted = redact_sensitive_draft(draft);
+        assert_eq!(
+            redacted,
+            "Please use [REDACTED \u{2014} store in Vault] and op://Work/Key/val for testing."
+        );
+    }
+
+    #[test]
+    fn task_title_from_message_cleans_markdown_and_truncates() {
+        assert_eq!(
+            task_title_from_message("\n## Review Q3 invoice\nDetails follow."),
+            "Review Q3 invoice"
+        );
+        assert_eq!(
+            task_title_from_message("- Send contract to legal"),
+            "Send contract to legal"
+        );
+        let long = "Please review the attached quarterly financial report and prepare an executive summary for Friday's board meeting";
+        let title = task_title_from_message(long);
+        assert!(title.chars().count() <= 100);
+        assert!(title.ends_with('\u{2026}'));
     }
 }

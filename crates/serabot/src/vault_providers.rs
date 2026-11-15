@@ -17,14 +17,15 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
-use std::io::Read;
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use secrecy::ExposeSecret;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::config::VaultConfig;
@@ -124,6 +125,13 @@ impl Provider {
         match self {
             Self::OnePassword => true,
             Self::ProtonPass => config.protonpass_enabled,
+        }
+    }
+
+    fn lock_index(self) -> usize {
+        match self {
+            Self::OnePassword => 0,
+            Self::ProtonPass => 1,
         }
     }
 }
@@ -408,6 +416,68 @@ impl SecretCommand for ProcessCommand {
     }
 }
 
+/// Metadata fetch timeout for CLI auto-install.
+const INSTALL_METADATA_TIMEOUT: Duration = Duration::from_secs(5);
+/// Binary/archive download timeout for CLI auto-install.
+const INSTALL_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum CLI archive or binary payload accepted (100 MiB).
+const MAX_INSTALL_PAYLOAD_BYTES: usize = 100 * 1024 * 1024;
+const PROTON_VERSIONS_URL: &str = "https://proton.me/download/pass-cli/versions.json";
+const ONEPASSWORD_VERSION_URL: &str = "https://app-updates.agilebits.com/check/1/0/CLI2/en/2.0.0/N";
+
+/// Executable filename for `provider` on the current OS.
+pub fn executable_name(provider: Provider) -> String {
+    if cfg!(windows) {
+        format!("{}.exe", provider.cli_name())
+    } else {
+        provider.cli_name().to_owned()
+    }
+}
+
+/// Persistent server-local bin directory for auto-installed password manager CLIs.
+pub fn managed_bin_dir(config: &VaultConfig) -> PathBuf {
+    let configured = config.bin_dir.trim();
+    if !configured.is_empty() {
+        return PathBuf::from(configured);
+    }
+    if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .map(|p| PathBuf::from(p).join("AppData").join("Local"))
+            })
+            .unwrap_or_else(std::env::temp_dir)
+            .join("serabot")
+            .join("bin")
+    } else {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".local").join("share"))
+            })
+            .unwrap_or_else(std::env::temp_dir)
+            .join("serabot")
+            .join("bin")
+    }
+}
+
+/// Full path to the managed CLI binary inside [`managed_bin_dir`].
+pub fn managed_bin_path(provider: Provider, config: &VaultConfig) -> PathBuf {
+    managed_bin_dir(config).join(executable_name(provider))
+}
+
+fn auto_install_disabled() -> bool {
+    std::env::var("SERABOT_DISABLE_CLI_AUTO_INSTALL")
+        .map(|val| {
+            matches!(
+                val.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// The first file named `name` on `PATH` (`name.exe` on Windows).
 pub fn find_on_path(name: &str) -> Option<PathBuf> {
     let extensions: &[&str] = if cfg!(windows) { &[".exe"] } else { &[""] };
@@ -421,15 +491,339 @@ pub fn find_on_path(name: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// The CLI for `provider`: the configured path when one is set, else the
-/// `PATH` lookup. `None` when it is not installed.
+/// The CLI for `provider`: the configured path when one is set, else `PATH`
+/// lookup, else the server-managed bin directory. `None` when not installed.
 pub fn program_for(provider: Provider, config: &VaultConfig) -> Option<PathBuf> {
     let configured = provider.configured_path(config).trim();
-    if configured.is_empty() {
-        return find_on_path(provider.cli_name());
+    if !configured.is_empty() {
+        let path = PathBuf::from(configured);
+        return path.is_file().then_some(path);
     }
-    let path = PathBuf::from(configured);
-    path.is_file().then_some(path)
+    if let Some(found) = find_on_path(provider.cli_name()) {
+        return Some(found);
+    }
+    let managed = managed_bin_path(provider, config);
+    managed.is_file().then_some(managed)
+}
+
+fn validate_download_url(raw: &str, allowed_domains: &[&str]) -> Result<url::Url> {
+    let parsed = url::Url::parse(raw)
+        .map_err(|err| SeraError::External(format!("invalid CLI download URL: {err}")))?;
+    if parsed.scheme() != "https" {
+        return Err(SeraError::External(
+            "CLI download URL must use HTTPS".into(),
+        ));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| SeraError::External("CLI download URL has no host".into()))?
+        .to_ascii_lowercase();
+    let allowed = allowed_domains.iter().any(|domain| {
+        let d = domain.to_ascii_lowercase();
+        host == d || host.ends_with(&format!(".{d}"))
+    });
+    if !allowed {
+        return Err(SeraError::External(format!(
+            "CLI download host '{host}' is not on the allowlist"
+        )));
+    }
+    Ok(parsed)
+}
+
+fn allowed_domains_for(provider: Provider) -> &'static [&'static str] {
+    match provider {
+        Provider::OnePassword => &["agilebits.com"],
+        Provider::ProtonPass => &["proton.me"],
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProtonVersionsManifest {
+    pass_cli_versions: ProtonPassCliVersions,
+}
+
+#[derive(Deserialize)]
+struct ProtonPassCliVersions {
+    version: String,
+    urls: HashMap<String, HashMap<String, ProtonPlatformArtifact>>,
+}
+
+#[derive(Deserialize)]
+struct ProtonPlatformArtifact {
+    url: String,
+    hash: String,
+}
+
+fn proton_platform_keys(os: &str, arch: &str) -> Result<(&'static str, &'static str)> {
+    let os_key = match os {
+        "linux" => "linux",
+        "macos" => "macos",
+        "windows" => "windows",
+        other => {
+            return Err(SeraError::External(format!(
+                "Proton Pass CLI auto-install is unsupported on OS '{other}'"
+            )));
+        }
+    };
+    let arch_key = match arch {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        other => {
+            return Err(SeraError::External(format!(
+                "Proton Pass CLI auto-install is unsupported on arch '{other}'"
+            )));
+        }
+    };
+    Ok((os_key, arch_key))
+}
+
+fn parse_proton_manifest(bytes: &[u8], os: &str, arch: &str) -> Result<(String, String, String)> {
+    let manifest: ProtonVersionsManifest = serde_json::from_slice(bytes).map_err(|err| {
+        SeraError::External(format!("invalid Proton Pass CLI manifest JSON: {err}"))
+    })?;
+    let (os_key, arch_key) = proton_platform_keys(os, arch)?;
+    let artifact = manifest
+        .pass_cli_versions
+        .urls
+        .get(os_key)
+        .and_then(|arches| arches.get(arch_key))
+        .ok_or_else(|| {
+            SeraError::External(format!(
+                "no Proton Pass CLI build listed for {os_key}/{arch_key}"
+            ))
+        })?;
+    Ok((
+        manifest.pass_cli_versions.version,
+        artifact.url.clone(),
+        artifact.hash.clone(),
+    ))
+}
+
+#[derive(Deserialize)]
+struct OnePasswordVersionResponse {
+    version: String,
+}
+
+fn parse_onepassword_version(bytes: &[u8]) -> Result<String> {
+    let resp: OnePasswordVersionResponse = serde_json::from_slice(bytes)
+        .map_err(|err| SeraError::External(format!("invalid 1Password CLI version JSON: {err}")))?;
+    let version = resp.version.trim().to_owned();
+    let valid = !version.is_empty()
+        && version.len() <= 32
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'));
+    if !valid {
+        return Err(SeraError::External(
+            "1Password CLI version string is invalid".into(),
+        ));
+    }
+    Ok(version)
+}
+
+fn onepassword_download_url(version: &str, os: &str, arch: &str) -> Result<String> {
+    let target = match (os, arch) {
+        ("linux", "x86_64") => "linux_amd64",
+        ("linux", "aarch64") => "linux_arm64",
+        ("macos", "x86_64") => "darwin_amd64",
+        ("macos", "aarch64") => "darwin_arm64",
+        ("windows", "x86_64") => "windows_amd64",
+        _ => {
+            return Err(SeraError::External(format!(
+                "1Password CLI auto-install is unsupported on {os}/{arch}"
+            )));
+        }
+    };
+    Ok(format!(
+        "https://cache.agilebits.com/dist/1P/op2/pkg/v{version}/op_{target}_v{version}.zip"
+    ))
+}
+
+fn verify_sha256(bytes: &[u8], expected_hex: &str) -> Result<()> {
+    let expected = expected_hex.trim();
+    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(SeraError::External(
+            "invalid SHA-256 hash in CLI manifest".into(),
+        ));
+    }
+    let actual = hex::encode(Sha256::digest(bytes));
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err(SeraError::External(
+            "downloaded CLI payload failed SHA-256 verification".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn extract_binary_from_zip(zip_bytes: &[u8], target_filename: &str) -> Result<Vec<u8>> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes))
+        .map_err(|err| SeraError::External(format!("invalid CLI zip archive: {err}")))?;
+    for idx in 0..archive.len() {
+        let mut entry = archive
+            .by_index(idx)
+            .map_err(|err| SeraError::External(format!("failed to read zip entry: {err}")))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let Some(safe_path) = entry.enclosed_name() else {
+            return Err(SeraError::External(
+                "CLI zip archive contains unsafe path traversal".into(),
+            ));
+        };
+        let Some(file_name) = safe_path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let matches = if cfg!(windows) {
+            file_name.eq_ignore_ascii_case(target_filename)
+        } else {
+            file_name == target_filename
+        };
+        if !matches {
+            continue;
+        }
+        if entry.size() > MAX_INSTALL_PAYLOAD_BYTES as u64 {
+            return Err(SeraError::External(
+                "CLI binary inside zip archive exceeds size limit".into(),
+            ));
+        }
+        let mut buf = Vec::new();
+        entry
+            .by_ref()
+            .take((MAX_INSTALL_PAYLOAD_BYTES + 1) as u64)
+            .read_to_end(&mut buf)
+            .map_err(|err| SeraError::External(format!("failed to extract CLI binary: {err}")))?;
+        if buf.is_empty() || buf.len() > MAX_INSTALL_PAYLOAD_BYTES {
+            return Err(SeraError::External(
+                "extracted CLI binary is empty or oversized".into(),
+            ));
+        }
+        return Ok(buf);
+    }
+    Err(SeraError::External(format!(
+        "CLI zip archive did not contain '{target_filename}'"
+    )))
+}
+
+fn atomic_install_binary(bin_dir: &Path, target_name: &str, bytes: &[u8]) -> Result<PathBuf> {
+    if bytes.is_empty() {
+        return Err(SeraError::External("downloaded CLI binary is empty".into()));
+    }
+    std::fs::create_dir_all(bin_dir)
+        .map_err(|err| SeraError::External(format!("failed to create CLI bin directory: {err}")))?;
+    let mut temp = tempfile::NamedTempFile::new_in(bin_dir).map_err(|err| {
+        SeraError::External(format!("failed to create temporary CLI file: {err}"))
+    })?;
+    temp.write_all(bytes)
+        .map_err(|err| SeraError::External(format!("failed to write temporary CLI file: {err}")))?;
+    temp.flush()
+        .map_err(|err| SeraError::External(format!("failed to flush temporary CLI file: {err}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755)).map_err(
+            |err| SeraError::External(format!("failed to set CLI executable permissions: {err}")),
+        )?;
+    }
+    let dest = bin_dir.join(target_name);
+    temp.persist(&dest).map_err(|err| {
+        SeraError::External(format!("failed to install CLI binary: {}", err.error))
+    })?;
+    Ok(dest)
+}
+
+async fn fetch_bounded_https(
+    url_str: &str,
+    allowed_domains: &[&str],
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    let url = validate_download_url(url_str, allowed_domains)?;
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .map_err(|err| SeraError::External(format!("HTTP client build failed: {err}")))?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|err| SeraError::External(format!("CLI download request failed: {err}")))?;
+    validate_download_url(resp.url().as_str(), allowed_domains)?;
+    if !resp.status().is_success() {
+        return Err(SeraError::External(format!(
+            "CLI download returned HTTP {}",
+            resp.status()
+        )));
+    }
+    if let Some(len) = resp.content_length()
+        && len > MAX_INSTALL_PAYLOAD_BYTES as u64
+    {
+        return Err(SeraError::External(
+            "CLI download exceeds maximum allowed size".into(),
+        ));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|err| SeraError::External(format!("failed to read CLI download body: {err}")))?;
+    if bytes.is_empty() || bytes.len() > MAX_INSTALL_PAYLOAD_BYTES {
+        return Err(SeraError::External(
+            "CLI download payload is empty or oversized".into(),
+        ));
+    }
+    Ok(bytes.to_vec())
+}
+
+async fn install_provider_cli(provider: Provider, bin_dir: &Path) -> Result<PathBuf> {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    let allowed = allowed_domains_for(provider);
+    let target_name = executable_name(provider);
+
+    let binary_bytes = match provider {
+        Provider::ProtonPass => {
+            let meta =
+                fetch_bounded_https(PROTON_VERSIONS_URL, allowed, INSTALL_METADATA_TIMEOUT).await?;
+            let (version, url, hash) = parse_proton_manifest(&meta, os, arch)?;
+            tracing::info!(
+                provider = provider.id(),
+                version = %version,
+                "downloading Proton Pass CLI"
+            );
+            let payload = fetch_bounded_https(&url, allowed, INSTALL_DOWNLOAD_TIMEOUT).await?;
+            verify_sha256(&payload, &hash)?;
+            if url.ends_with(".zip") || payload.starts_with(b"PK\x03\x04") {
+                extract_binary_from_zip(&payload, &target_name)?
+            } else {
+                if payload.starts_with(b"<") {
+                    return Err(SeraError::External(
+                        "downloaded Proton Pass CLI payload is not a binary".into(),
+                    ));
+                }
+                payload
+            }
+        }
+        Provider::OnePassword => {
+            let meta =
+                fetch_bounded_https(ONEPASSWORD_VERSION_URL, allowed, INSTALL_METADATA_TIMEOUT)
+                    .await?;
+            let version = parse_onepassword_version(&meta)?;
+            let url = onepassword_download_url(&version, os, arch)?;
+            tracing::info!(
+                provider = provider.id(),
+                version = %version,
+                "downloading 1Password CLI"
+            );
+            let payload = fetch_bounded_https(&url, allowed, INSTALL_DOWNLOAD_TIMEOUT).await?;
+            extract_binary_from_zip(&payload, &target_name)?
+        }
+    };
+
+    let dest = bin_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || atomic_install_binary(&dest, &target_name, &binary_bytes))
+        .await
+        .map_err(|_| SeraError::Internal("CLI install task failed".into()))?
 }
 
 /// How long a value read from a password manager stays in the model redactor.
@@ -507,6 +901,7 @@ pub struct Providers {
     config: VaultConfig,
     runner: Arc<dyn SecretCommand>,
     resolved: Arc<ResolvedValues>,
+    install_locks: [tokio::sync::Mutex<()>; 2],
 }
 
 impl Providers {
@@ -519,7 +914,29 @@ impl Providers {
             config: config.clone(),
             runner,
             resolved: Arc::default(),
+            install_locks: [tokio::sync::Mutex::new(()), tokio::sync::Mutex::new(())],
         }
+    }
+
+    /// Ensure the CLI for `provider` is available, auto-installing it into the
+    /// managed bin directory when no custom path is configured.
+    pub async fn ensure_cli(&self, provider: Provider) -> Result<Option<PathBuf>> {
+        if let Some(path) = program_for(provider, &self.config) {
+            return Ok(Some(path));
+        }
+        if !provider.configured_path(&self.config).trim().is_empty() {
+            return Ok(None);
+        }
+        if !self.enabled(provider) || auto_install_disabled() {
+            return Ok(None);
+        }
+        let _guard = self.install_locks[provider.lock_index()].lock().await;
+        if let Some(path) = program_for(provider, &self.config) {
+            return Ok(Some(path));
+        }
+        let bin_dir = managed_bin_dir(&self.config);
+        let installed = install_provider_cli(provider, &bin_dir).await?;
+        Ok(Some(installed))
     }
 
     /// The registry of values read through these providers. Share it with the
@@ -557,12 +974,25 @@ impl Providers {
     ) -> Result<Zeroizing<String>> {
         self.require_enabled(provider)?;
         let args = read_args(provider, reference)?;
-        let program = program_for(provider, &self.config).ok_or_else(|| {
-            SeraError::External(format!(
-                "the {} CLI is not installed on the server",
-                provider.label()
-            ))
-        })?;
+        let program = match program_for(provider, &self.config) {
+            Some(path) => path,
+            None => match self.ensure_cli(provider).await {
+                Ok(Some(path)) => path,
+                Ok(None) => {
+                    return Err(SeraError::External(format!(
+                        "the {} CLI is not installed on the server",
+                        provider.label()
+                    )));
+                }
+                Err(error) => {
+                    tracing::warn!(provider = provider.id(), %error, "password manager CLI auto-install failed");
+                    return Err(SeraError::External(format!(
+                        "the {} CLI is not installed on the server",
+                        provider.label()
+                    )));
+                }
+            },
+        };
         let runner = self.runner.clone();
         let token = Zeroizing::new(token.to_owned());
         let env_name = provider.token_env();
@@ -647,7 +1077,7 @@ pub async fn probe(
     user_id: &str,
     provider: Provider,
 ) -> Result<ProviderProbe> {
-    let cli_found = providers.cli_found(provider);
+    let mut cli_found = providers.cli_found(provider);
     let configured = users
         .vault_provider_token(user_id, provider.id())?
         .is_some();
@@ -666,6 +1096,12 @@ pub async fn probe(
             configured,
             message: "save an access token first".into(),
         });
+    }
+    if !cli_found {
+        if let Err(error) = providers.ensure_cli(provider).await {
+            tracing::warn!(provider = provider.id(), %error, "password manager CLI auto-install failed during probe");
+        }
+        cli_found = providers.cli_found(provider);
     }
     if !cli_found {
         return Ok(ProviderProbe {
@@ -850,6 +1286,7 @@ mod tests {
         VaultConfig {
             op_path: "Z:/synthetic/op-missing.exe".into(),
             pass_cli_path: "Z:/synthetic/pass-cli-missing.exe".into(),
+            bin_dir: String::new(),
             protonpass_enabled: false,
         }
     }
@@ -1402,6 +1839,134 @@ mod tests {
         assert_eq!(
             again.iter().filter(|(name, _)| name == "entry-39").count(),
             1
+        );
+    }
+
+    #[test]
+    fn proton_and_onepassword_manifests_parse_cleanly() {
+        let proton_json = br#"{
+            "formatVersion": 1,
+            "passCliVersions": {
+                "version": "2.7.0",
+                "urls": {
+                    "windows": {
+                        "x86_64": {
+                            "url": "https://proton.me/download/pass-cli/2.7.0/pass-cli-windows-x86_64.zip",
+                            "hash": "c752af109dbda98ad154dfcdb40e8e43f1a38bc37de224b6182647b625290bb7"
+                        }
+                    },
+                    "linux": {
+                        "x86_64": {
+                            "url": "https://proton.me/download/pass-cli/2.7.0/pass-cli-linux-x86_64",
+                            "hash": "fd933e76179a5a33b295853e9c6696e49e584fe2141b1aafc63a3d78c0791cdb"
+                        }
+                    }
+                }
+            }
+        }"#;
+        let (ver, url, hash) = parse_proton_manifest(proton_json, "windows", "x86_64").unwrap();
+        assert_eq!(ver, "2.7.0");
+        assert!(url.ends_with("pass-cli-windows-x86_64.zip"));
+        assert_eq!(hash.len(), 64);
+        assert!(parse_proton_manifest(proton_json, "macos", "aarch64").is_err());
+
+        let op_json = br#"{"available":"1","version":"2.42.0"}"#;
+        let op_ver = parse_onepassword_version(op_json).unwrap();
+        assert_eq!(op_ver, "2.42.0");
+        let op_url = onepassword_download_url(&op_ver, "linux", "x86_64").unwrap();
+        assert_eq!(
+            op_url,
+            "https://cache.agilebits.com/dist/1P/op2/pkg/v2.42.0/op_linux_amd64_v2.42.0.zip"
+        );
+        assert!(parse_onepassword_version(br#"{"version":"../bad"}"#).is_err());
+    }
+
+    #[test]
+    fn sha256_verification_accepts_match_and_rejects_mismatch() {
+        let payload = b"synthetic-pass-cli-binary";
+        let expected = hex::encode(Sha256::digest(payload));
+        assert!(verify_sha256(payload, &expected).is_ok());
+        assert!(verify_sha256(payload, &expected.to_ascii_uppercase()).is_ok());
+        assert!(verify_sha256(b"tampered", &expected).is_err());
+        assert!(verify_sha256(payload, "not-a-hex-hash").is_err());
+    }
+
+    #[test]
+    fn zip_extraction_extracts_target_and_blocks_zip_slip() {
+        use std::io::Write as _;
+        let target = executable_name(Provider::OnePassword);
+
+        // Valid archive
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default();
+            zw.start_file(&target, opts).unwrap();
+            zw.write_all(b"synthetic-op-bytes").unwrap();
+            zw.finish().unwrap();
+        }
+        let extracted = extract_binary_from_zip(&buf, &target).unwrap();
+        assert_eq!(extracted, b"synthetic-op-bytes");
+
+        // Zip-slip archive
+        let mut bad_buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(Cursor::new(&mut bad_buf));
+            let opts = zip::write::SimpleFileOptions::default();
+            zw.start_file("../../evil.exe", opts).unwrap();
+            zw.write_all(b"evil").unwrap();
+            zw.finish().unwrap();
+        }
+        assert!(extract_binary_from_zip(&bad_buf, &target).is_err());
+    }
+
+    #[test]
+    fn download_url_allowlist_enforces_https_and_provider_domains() {
+        assert!(
+            validate_download_url("https://proton.me/download/pass-cli/a", &["proton.me"]).is_ok()
+        );
+        assert!(
+            validate_download_url(
+                "https://cache.agilebits.com/dist/op.zip",
+                &["agilebits.com"]
+            )
+            .is_ok()
+        );
+        assert!(validate_download_url("http://proton.me/download/a", &["proton.me"]).is_err());
+        assert!(validate_download_url("https://evil.example/op.zip", &["agilebits.com"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn custom_path_override_bypasses_auto_install_and_managed_bin_is_resolved() {
+        let custom = VaultConfig {
+            op_path: "Z:/synthetic/op-missing.exe".into(),
+            ..Default::default()
+        };
+        let providers = Providers::new(&custom);
+        assert!(
+            providers
+                .ensure_cli(Provider::OnePassword)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(program_for(Provider::OnePassword, &custom).is_none());
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let managed_cfg = VaultConfig {
+            bin_dir: dir.path().display().to_string(),
+            ..Default::default()
+        };
+        let installed = atomic_install_binary(
+            dir.path(),
+            &executable_name(Provider::ProtonPass),
+            b"synthetic-pass-cli",
+        )
+        .unwrap();
+        assert!(installed.is_file());
+        assert_eq!(
+            program_for(Provider::ProtonPass, &managed_cfg),
+            Some(installed)
         );
     }
 }

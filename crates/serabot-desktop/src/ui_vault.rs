@@ -907,12 +907,18 @@ fn ProviderCard(session: Signal<Session>, manager: PasswordManager) -> Element {
                     span { class: "vault-provider-icon", "aria-hidden": "true",
                         Icon { name: if manager.id == "onepassword" { "lock" } else { "key" }, size: 16 }
                     }
-                    div {
+                    div { class: "vault-provider-title-col",
                         strong { class: "vault-name", "{manager.name}" }
-                        span { class: "vault-provider-sub mono", "{token_hint}" }
+                        span { class: "vault-provider-sub mono", title: "{token_hint}", "{token_hint}" }
                     }
                 }
                 span { class: "{status_class}", "{status_label}" }
+            }
+
+            if manager.enabled && !manager.cli_found {
+                p { class: "tiny muted",
+                    "The server CLI installs automatically when you test connection or use this provider."
+                }
             }
 
             div { class: "vault-provider-token",

@@ -5,7 +5,7 @@
 
 use crate::ui::Icon;
 use dioxus::prelude::*;
-use serabot_desktop::session::Session;
+use serabot_desktop::session::{Section, Session};
 use serabot_desktop::{TaskEntry, TaskEvent, TaskUpdate};
 
 /// The three views of the tab.
@@ -202,6 +202,18 @@ fn date_offset_iso(today_z: i64, offset_days: i64) -> String {
     iso_date(today_z + offset_days)
 }
 
+fn calendar_month_range(today_y: i64, today_m: u32, offset: i64) -> (i64, u32, String, String) {
+    let total = today_y * 12 + (today_m as i64 - 1) + offset;
+    let year = total.div_euclid(12);
+    let month = (total.rem_euclid(12) + 1) as u32;
+    let first = days_from_civil(year, month, 1);
+    let next_total = year * 12 + (month as i64 - 1) + 1;
+    let ny = next_total.div_euclid(12);
+    let nm = (next_total.rem_euclid(12) + 1) as u32;
+    let last = days_from_civil(ny, nm, 1);
+    (year, month, iso_date(first), iso_date(last))
+}
+
 fn format_due_date(due: &str) -> String {
     let trimmed = due.trim();
     let date_prefix: String = trimmed.chars().take(10).collect();
@@ -395,22 +407,14 @@ pub fn TasksView(mut session: Signal<Session>) -> Element {
             "microsoft_todo" | "outlook_calendar"
         ) && !signed_in_microsoft;
 
-    let (year, month) = {
-        let total = today_y * 12 + (today_m as i64 - 1) + *month_offset.read();
-        (total.div_euclid(12), (total.rem_euclid(12) + 1) as u32)
-    };
+    let (year, month, _, _) = calendar_month_range(today_y, today_m, *month_offset.read());
     {
         let mut session = session;
         use_effect(move || {
-            let first = days_from_civil(year, month, 1);
-            let (ny, nm) = {
-                let total = year * 12 + (month as i64 - 1) + 1;
-                (total.div_euclid(12), (total.rem_euclid(12) + 1) as u32)
-            };
-            let last = days_from_civil(ny, nm, 1);
-            session
-                .write()
-                .load_task_calendar(iso_date(first), iso_date(last));
+            let _active_view = *view.read();
+            let offset = *month_offset.read();
+            let (_, _, from, to) = calendar_month_range(today_y, today_m, offset);
+            session.write().load_task_calendar(from, to);
         });
     }
 
@@ -573,7 +577,13 @@ pub fn TasksView(mut session: Signal<Session>) -> Element {
                         class: "btn primary sm",
                         r#type: "button",
                         disabled: current_provider == "none" || needs_sign_in,
-                        onclick: move |_| session.write().run_task_sync(),
+                        onclick: move |_| {
+                            let (_, _, from, to) =
+                                calendar_month_range(today_y, today_m, *month_offset.read());
+                            let mut s = session.write();
+                            s.run_task_sync();
+                            s.load_task_calendar(from, to);
+                        },
                         Icon { name: "refresh", size: 13 }
                         "Sync now"
                     }
@@ -818,8 +828,48 @@ pub fn TasksView(mut session: Signal<Session>) -> Element {
                                 }
                             }
                         },
-                        TaskView::Calendar => rsx! {
-                            div { class: "cal-head",
+                        TaskView::Calendar => {
+                            let cal_status = match (signed_in_google, signed_in_microsoft) {
+                                (true, true) => "Google & Outlook Calendars connected",
+                                (true, false) => "Google Calendar connected",
+                                (false, true) => "Outlook Calendar connected",
+                                (false, false) => "No external calendar connected — showing task due dates",
+                            };
+                            let has_external_cal = signed_in_google || signed_in_microsoft;
+                            let can_sync_cal = current_provider != "none" && !needs_sign_in;
+                            rsx! {
+                                div { class: "tasks-cal-sync-strip",
+                                    span {
+                                        class: if has_external_cal { "tasks-health-badge ok" } else { "tasks-health-badge warn" },
+                                        "{cal_status}"
+                                    }
+                                    div { class: "tasks-cal-sync-actions",
+                                        button {
+                                            class: "btn ghost sm",
+                                            r#type: "button",
+                                            onclick: move |_| {
+                                                let (_, _, from, to) =
+                                                    calendar_month_range(today_y, today_m, *month_offset.read());
+                                                let mut s = session.write();
+                                                if can_sync_cal {
+                                                    s.run_task_sync();
+                                                }
+                                                s.load_task_calendar(from, to);
+                                            },
+                                            Icon { name: "refresh", size: 13 }
+                                            "Sync calendars"
+                                        }
+                                        if !has_external_cal {
+                                            button {
+                                                class: "btn ghost sm",
+                                                r#type: "button",
+                                                onclick: move |_| session.write().open_section(Section::Integrations),
+                                                "Open Integrations"
+                                            }
+                                        }
+                                    }
+                                }
+                                div { class: "cal-head",
                                 button {
                                     class: "btn sm",
                                     r#type: "button",
@@ -949,6 +999,7 @@ pub fn TasksView(mut session: Signal<Session>) -> Element {
                                     }
                                 }
                             }
+                        }
                         },
                     }
                 }

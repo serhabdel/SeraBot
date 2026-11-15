@@ -650,6 +650,15 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
             if signed_in_with_account {
                 p { class: "tiny", role: "status", "Signed in with your {title} account." }
             }
+            if id == "onedrive" {
+                p { class: if connected { "tiny" } else { "tiny muted" }, role: "status",
+                    if connected {
+                        "Signed in with your Microsoft OneDrive account. Cloud scope: /SeraBot (with root fallback access)."
+                    } else {
+                        "Cloud scope: /SeraBot (with root fallback access) once connected."
+                    }
+                }
+            }
             if key_inputs {
                 div { class: "form-grid",
                     for (role, secret) in connector.secrets.iter().filter(|(role, _)| !is_internal_role(role)) {
@@ -796,6 +805,17 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
                                 disabled: od_busy,
                                 onclick: move |_| confirm_action.set(Some("disconnect_od")),
                                 "Disconnect"
+                            }
+                            button {
+                                class: "btn ghost",
+                                r#type: "button",
+                                title: "Check the OneDrive connection",
+                                disabled: od_busy || testing,
+                                onclick: {
+                                    let id = id.clone();
+                                    move |_| session.write().test_connector(id.clone())
+                                },
+                                if testing { "Testing\u{2026}" } else { "Test" }
                             }
                         },
                         Some(ConnectorAction::SignIn) if can_act => {

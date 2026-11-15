@@ -670,6 +670,12 @@ pub fn LocalFoldersCard(session: Signal<Session>) -> Element {
                 "Let your bots browse, search and read big folders on this PC, bring Word, Excel, PowerPoint, PDF and image files in to work on, and with your approval save results back. "
                 "It is off until you add a folder. Only this app can see the folder paths; the bots get a short name."
             }
+            p { class: "tiny muted",
+                strong { "Local PC folders" }
+                " are directories on this machine \u{2014} "
+                strong { "OneDrive cloud storage" }
+                " is managed separately in Integrations and does not require a local PC folder."
+            }
             if folders.len() > 2 {
                 div { class: "search-wrap",
                     input {

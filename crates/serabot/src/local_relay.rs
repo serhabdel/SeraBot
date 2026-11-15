@@ -676,11 +676,11 @@ impl Tool for LocalQueryTool {
             if roots.is_empty() {
                 if self.relay.roots(&context.user_id).is_empty() {
                     return Err(SeraError::External(
-                        "Your PC app is closed, so I can't reach your folders (or no folder is allowed yet): either the SeraBot desktop app is not connected, or the owner has not allowlisted a folder. Ask the owner to open the desktop app and allow a folder under Settings \u{2192} Local folders.".into(),
+                        "0 local PC folders are shared in Settings \u{2192} This PC (or the SeraBot desktop app is not connected). Note: cloud OneDrive is separate from local PC folders and is accessed via `onedrive_list`, not `local_list`.".into(),
                     ));
                 }
                 return Err(SeraError::External(format!(
-                    "No folder is shared with {}. The owner can share one in Settings › Local folders.",
+                    "No folder is shared with {} in Settings \u{2192} This PC (0 local PC folders). Note: cloud OneDrive is accessed via `onedrive_list`, not `local_list`.",
                     context.bot
                 )));
             }
