@@ -12,7 +12,7 @@ use dioxus::prelude::*;
 use serabot_desktop::chat_cards::{
     self, CardBody, CardState, CardView, MAX_ANSWER, QuestionCard, SecretCard,
 };
-use serabot_desktop::session::Session;
+use serabot_desktop::session::{Section, Session};
 use zeroize::Zeroizing;
 
 /// One card at the foot of the feed. A pending card takes its full form; a
@@ -234,19 +234,24 @@ fn SecretPrompt(
                     Icon { name: "lock", size: 14 }
                     " {title}"
                 }
+                span { class: "secret-prompt-badge",
+                    Icon { name: "shield", size: 12 }
+                    " Write-only encrypted \u{2022} Never visible to bots or AI models"
+                }
             }
             p { class: "chat-card-facts",
-                span { "Name: {secret.name}" }
+                span { "Key: {secret.name}" }
                 span { "Kind: {kind}" }
                 if let Some(username) = secret.username.clone() {
-                    span { "Username: {username}" }
+                    span { "Account: {username}" }
                 }
             }
             if secret.replaces {
-                p { class: "chat-card-note", "This replaces your existing \u{201C}{secret.name}\u{201D} entry." }
+                p { class: "chat-card-note", "This replaces your existing \u{201C}{secret.name}\u{201D} entry in Vault." }
             }
             if !secret.domains.is_empty() {
-                div { class: "chat-card-domains", "aria-label": "Sites",
+                div { class: "chat-card-domains", "aria-label": "Provider sites",
+                    span { class: "tiny muted", "Provider / Sites:" }
                     for domain in secret.domains.clone() {
                         span { key: "{domain}", class: "chip", "{domain}" }
                     }
@@ -256,7 +261,7 @@ fn SecretPrompt(
                 p { class: "chat-card-reason", "{secret.reason}" }
             }
             p { class: "chat-card-note",
-                "The value goes straight into your encrypted vault. The bot never sees it."
+                "Stored write-only in your encrypted Vault. Neither {name} nor any AI model can read the raw value."
             }
             div { class: "chat-card-field",
                 input {
@@ -265,6 +270,7 @@ fn SecretPrompt(
                     disabled: submitting(),
                     autocomplete: "off",
                     spellcheck: "false",
+                    placeholder: "Paste or type secret value\u{2026}",
                     "aria-label": "Secret value",
                     value: "{shown}",
                     oninput: move |event| value.set(event.value()),
@@ -323,6 +329,15 @@ fn SecretPrompt(
                         session.write().decline_card(id.clone());
                     },
                     "Decline"
+                }
+                button {
+                    class: "btn ghost sm",
+                    r#type: "button",
+                    disabled: submitting(),
+                    title: "Inspect or manage saved secrets in Vault",
+                    onclick: move |_| session.write().open_section(Section::Vault),
+                    Icon { name: "external", size: 13 }
+                    " Open Vault"
                 }
             }
         }
