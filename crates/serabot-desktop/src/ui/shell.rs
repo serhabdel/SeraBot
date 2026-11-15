@@ -12,6 +12,7 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
     let undo = use_signal(|| Option::<String>::None);
     let onboarding_open = chat && session.read().onboarding_ui.open;
     let settings_open = session.read().bot_settings.open;
+    let preview_open = session.read().state.preview_dock_hash.is_some();
     // One stylesheet defines every avatar image; tiles only reference it.
     let avatar_css = serabot_desktop::avatars::stylesheet(&session.read().state.avatars);
 
@@ -59,13 +60,26 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
                 }
                 }
             }
+            div {
+                class: if (chat && settings_open) || preview_open {
+                    "scrim inspector-scrim open"
+                } else {
+                    "scrim inspector-scrim"
+                },
+                onclick: move |_| {
+                    let mut s = session.write();
+                    if s.bot_settings.open {
+                        s.close_bot_settings();
+                    }
+                    if s.state.preview_dock_hash.is_some() {
+                        s.close_preview_dock();
+                    }
+                },
+            }
             if chat {
-                div {
-                    class: if settings_open { "scrim inspector-scrim open" } else { "scrim inspector-scrim" },
-                    onclick: move |_| session.write().close_bot_settings(),
-                }
                 SettingsPanel { session, overlay }
             }
+            crate::ui_files::PreviewDock { session }
             BrowserDock { session }
             {match overlay() {
                 Overlay::NewConversation => rsx! {
