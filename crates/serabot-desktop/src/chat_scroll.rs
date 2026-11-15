@@ -19,6 +19,32 @@ pub struct TranscriptMark {
     pub tail: Option<(String, usize)>,
     pub steps: usize,
     pub step_tail: Option<(String, usize)>,
+    /// Id of the oldest row. A change with more rows means "Load earlier"
+    /// put rows in front, which must not read as new messages.
+    pub head: Option<String>,
+}
+
+/// Whether older rows were put in front of the transcript since `previous`.
+/// A first mark (no head yet) and a switch of chats never count.
+pub fn rows_prepended(previous: &TranscriptMark, now: &TranscriptMark) -> bool {
+    previous.head.is_some() && previous.head != now.head && now.count > previous.count
+}
+
+/// Remember where the list is before older rows are added in front.
+pub const ANCHOR_CAPTURE_JS: &str = "window.__serabotAnchorCapture?.();";
+
+/// Keep the row the reader was looking at in place after rows were added in
+/// front. Runs after the new rows have been laid out.
+pub const ANCHOR_RESTORE_JS: &str =
+    "requestAnimationFrame(() => requestAnimationFrame(() => window.__serabotAnchorRestore?.()));";
+
+/// Move focus inside a message toolbar: `next`, `prev`, `first` or `last`.
+pub fn toolbar_move_js(direction: &str) -> String {
+    let direction = match direction {
+        "next" | "prev" | "first" | "last" => direction,
+        _ => "next",
+    };
+    format!("window.__serabotToolbarMove?.('{direction}');")
 }
 
 /// Whether the open conversation is a different one from the one the view last
@@ -108,6 +134,8 @@ pub const CHAT_SCROLL_BRIDGE_JS: &str = r#"
   // app runs). `pending` restores one after the transcript has loaded.
   const saved = {};
   let pending = null;
+  // Scroll position taken just before older rows were added in front.
+  let anchor = null;
 
   const box = () => document.getElementById('messages');
   const convOf = (b) => (b && b.dataset && b.dataset.conv) || '';
@@ -156,12 +184,60 @@ pub const CHAT_SCROLL_BRIDGE_JS: &str = r#"
     if (raf) return;
     raf = requestAnimationFrame(() => {
       raf = 0;
+      rove();
       if (pending) {
         tryRestore();
         return;
       }
       if (follow) snap();
     });
+  };
+
+  // One tab stop per message toolbar; arrow keys move inside it.
+  const rove = () => {
+    document.querySelectorAll('.msg-actions').forEach((bar) => {
+      const buttons = bar.querySelectorAll('button.msg-action');
+      buttons.forEach((b) => {
+        if (!b.dataset.r) {
+          b.dataset.r = '1';
+          b.tabIndex = -1;
+        }
+      });
+      if (buttons.length && !bar.querySelector('button.msg-action[tabindex="0"]')) {
+        buttons[0].tabIndex = 0;
+      }
+    });
+  };
+
+  window.__serabotToolbarMove = (direction) => {
+    const current = document.activeElement;
+    const bar = current && current.closest ? current.closest('.msg-actions') : null;
+    if (!bar) return;
+    const buttons = Array.from(bar.querySelectorAll('button.msg-action:not([disabled])'));
+    if (!buttons.length) return;
+    let index = buttons.indexOf(current);
+    if (direction === 'first') index = 0;
+    else if (direction === 'last') index = buttons.length - 1;
+    else if (direction === 'prev') index = index <= 0 ? buttons.length - 1 : index - 1;
+    else index = index < 0 || index >= buttons.length - 1 ? 0 : index + 1;
+    bar.querySelectorAll('button.msg-action').forEach((b) => { b.tabIndex = -1; });
+    buttons[index].tabIndex = 0;
+    buttons[index].focus();
+  };
+
+  window.__serabotAnchorCapture = () => {
+    const b = box();
+    if (!b) return;
+    anchor = { height: b.scrollHeight, top: b.scrollTop };
+  };
+
+  window.__serabotAnchorRestore = () => {
+    const b = box();
+    if (!b || !anchor) return;
+    b.scrollTop = anchor.top + (b.scrollHeight - anchor.height);
+    lastTop = b.scrollTop;
+    lastHeight = b.scrollHeight;
+    anchor = null;
   };
 
   window.__serabotResync = () => {
@@ -392,6 +468,7 @@ mod tests {
             tail: Some(("m4".into(), 120)),
             steps: 1,
             step_tail: Some(("c1".into(), 8)),
+            head: Some("m1".into()),
         };
         assert_eq!(mark, mark.clone());
         let mut grown = mark.clone();
@@ -400,6 +477,55 @@ mod tests {
         let mut stepped = mark.clone();
         stepped.steps = 2;
         assert_ne!(mark, stepped);
+    }
+
+    #[test]
+    fn older_rows_in_front_are_told_apart_from_new_messages() {
+        let before = TranscriptMark {
+            count: 100,
+            head: Some("m100".into()),
+            ..TranscriptMark::default()
+        };
+        let paged = TranscriptMark {
+            count: 150,
+            head: Some("m50".into()),
+            ..TranscriptMark::default()
+        };
+        assert!(rows_prepended(&before, &paged));
+        // A new message at the end keeps the head.
+        let appended = TranscriptMark {
+            count: 101,
+            head: Some("m100".into()),
+            ..TranscriptMark::default()
+        };
+        assert!(!rows_prepended(&before, &appended));
+        // The first load has no head yet.
+        assert!(!rows_prepended(&TranscriptMark::default(), &paged));
+        // A shorter list (a conversation switch) is not paging.
+        let shorter = TranscriptMark {
+            count: 3,
+            head: Some("x1".into()),
+            ..TranscriptMark::default()
+        };
+        assert!(!rows_prepended(&before, &shorter));
+    }
+
+    #[test]
+    fn toolbar_and_anchor_bridges_are_wired() {
+        assert!(CHAT_SCROLL_BRIDGE_JS.contains("window.__serabotToolbarMove"));
+        assert!(CHAT_SCROLL_BRIDGE_JS.contains("window.__serabotAnchorCapture"));
+        assert!(CHAT_SCROLL_BRIDGE_JS.contains("window.__serabotAnchorRestore"));
+        assert!(CHAT_SCROLL_BRIDGE_JS.contains("tabIndex = -1"));
+        assert_eq!(
+            toolbar_move_js("next"),
+            "window.__serabotToolbarMove?.('next');"
+        );
+        // Anything else is not spliced into the script.
+        assert_eq!(
+            toolbar_move_js("');alert(1);//"),
+            "window.__serabotToolbarMove?.('next');"
+        );
+        assert!(ANCHOR_RESTORE_JS.contains("__serabotAnchorRestore"));
     }
 
     #[test]

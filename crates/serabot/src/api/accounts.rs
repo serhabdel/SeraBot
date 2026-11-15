@@ -277,7 +277,17 @@ pub(super) async fn auth_me(
         .store
         .get_user(&user.id)?
         .ok_or_else(|| SeraError::NotFound("user".into()))?;
-    Ok(Json(me_view(&account)))
+    let mut view = me_view(&account);
+    // Sessions renew while in use; the client reads the current expiry here.
+    if user.session_id.is_some()
+        && let Some(expires) = state
+            .store
+            .device_token_by_hash(&user.token_hash)?
+            .and_then(|record| record.expires_at)
+    {
+        view["session_expires_at"] = json!(expires.to_rfc3339_opts(SecondsFormat::Millis, true));
+    }
+    Ok(Json(view))
 }
 
 /// Revoke the caller's own session. The static config token has no session

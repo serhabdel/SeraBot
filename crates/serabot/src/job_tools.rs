@@ -794,4 +794,80 @@ mod tests {
             .unwrap();
         assert!(cal_out.content.contains("Submit ANAPEC dossier"));
     }
+
+    #[tokio::test]
+    async fn job_tasks_and_calendar_never_cross_users() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("test.db"), 384, 5000).unwrap();
+        let alice = store
+            .create_user("sub-job-a", "a@example.com", "Alice")
+            .unwrap()
+            .id;
+        let bob = store
+            .create_user("sub-job-b", "b@example.com", "Bob")
+            .unwrap()
+            .id;
+        let users = Arc::new(UserSecrets::with_master_key(store.clone(), [5u8; 32]).unwrap());
+        let secrets = SharedSecrets::new(SecretStore::from_map(BTreeMap::new()));
+        let config = Arc::new(Config::default());
+        let mut registry = ToolRegistry::default();
+        register_task_calendar_tools(&mut registry, store, users, secrets, config).unwrap();
+
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        registry
+            .get("tasks_create")
+            .unwrap()
+            .execute(
+                json!({"title": "Alice private dossier", "due": format!("{today}T12:00:00Z")}),
+                &test_ctx(&alice),
+            )
+            .await
+            .unwrap();
+
+        for tool in ["tasks_list", "calendar_events"] {
+            let own = registry
+                .get(tool)
+                .unwrap()
+                .execute(json!({}), &test_ctx(&alice))
+                .await
+                .unwrap();
+            assert!(own.content.contains("Alice private dossier"), "{tool}");
+            let foreign = registry
+                .get(tool)
+                .unwrap()
+                .execute(json!({}), &test_ctx(&bob))
+                .await
+                .unwrap();
+            assert!(!foreign.content.contains("Alice private dossier"), "{tool}");
+        }
+    }
+
+    #[test]
+    fn jobfinder_template_grants_no_outbound_effect_tools() {
+        // `require_approval = []` is consistent with the other bots only
+        // while jobfinder holds no upload/send/execute tool; if one is added
+        // it must be listed for approval.
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../bots/jobfinder.toml"
+        ))
+        .unwrap();
+        let bot: toml::Value = toml::from_str(&raw).unwrap();
+        let strings = |key: &str| -> Vec<String> {
+            bot[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_owned())
+                .collect()
+        };
+        let approval = strings("require_approval");
+        for tool in strings("tools") {
+            let outbound = tool.contains("upload")
+                || tool.contains("send")
+                || tool.contains("execute")
+                || tool.contains("whatsapp");
+            assert!(!outbound || approval.contains(&tool), "{tool}");
+        }
+    }
 }

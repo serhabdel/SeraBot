@@ -87,10 +87,27 @@ pub(super) async fn decide_approval(
 
 #[derive(Debug, Deserialize)]
 pub(super) struct EventQuery {
+    /// An event id, or `latest` to start at the newest event.
     #[serde(default)]
-    after: Option<i64>,
+    after: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+}
+
+/// Longest an idle stream waits before it re-checks the table, in case an
+/// event was written by a path that does not wake the stream.
+const EVENT_RECHECK: Duration = Duration::from_secs(1);
+/// Comment frames keep proxies and mobile NATs from dropping an idle stream,
+/// and let clients notice a dead one.
+const EVENT_KEEP_ALIVE: Duration = Duration::from_secs(10);
+
+/// `GET /v1/events/head`: the newest event id, so a fresh client can start
+/// there instead of replaying the retained history.
+pub(super) async fn events_head(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    Ok(Json(json!({"id": state.store.latest_event_id(&user.id)?})))
 }
 
 pub(super) async fn events(
@@ -98,18 +115,39 @@ pub(super) async fn events(
     Extension(user): Extension<ActingUser>,
     headers: HeaderMap,
     Query(query): Query<EventQuery>,
-) -> Sse<impl futures::Stream<Item = std::result::Result<SseEvent, Infallible>>> {
-    let last = resume_cursor(&headers, query.after);
+) -> Result<Sse<impl futures::Stream<Item = std::result::Result<SseEvent, Infallible>>>> {
+    let last = match query.after.as_deref().map(str::trim) {
+        Some("latest") | Some("head") => state.store.latest_event_id(&user.id)?,
+        Some(raw) => {
+            let parsed = raw
+                .parse::<i64>()
+                .map_err(|_| SeraError::Validation("after must be an event id or latest".into()))?;
+            resume_cursor(&headers, Some(parsed))
+        }
+        None => resume_cursor(&headers, None),
+    };
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
     let store = state.store.clone();
+    let notifier = store.event_notifier();
     let user_id = user.id;
     let stream = futures::stream::unfold(
-        (last, store, user_id),
-        move |(last, store, user_id)| async move {
+        (last, store, notifier, user_id),
+        move |(last, store, notifier, user_id)| async move {
             loop {
-                tokio::time::sleep(Duration::from_millis(180)).await;
-                match store.events_after(&user_id, last, limit) {
-                    Ok(events) if !events.is_empty() => {
+                // Register before querying so a write between the query and
+                // the wait still wakes this stream.
+                let waiter = Arc::clone(&notifier);
+                let notified = waiter.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let query_store = store.clone();
+                let query_user = user_id.clone();
+                let found = tokio::task::spawn_blocking(move || {
+                    query_store.events_after(&query_user, last, limit)
+                })
+                .await;
+                match found {
+                    Ok(Ok(events)) if !events.is_empty() => {
                         let next = events.last().map(|event| event.id).unwrap_or(last);
                         let items = events
                             .into_iter()
@@ -120,11 +158,23 @@ pub(super) async fn events(
                                     .data(event.payload.to_string()))
                             })
                             .collect::<Vec<_>>();
-                        return Some((futures::stream::iter(items), (next, store, user_id)));
+                        return Some((
+                            futures::stream::iter(items),
+                            (next, store, notifier, user_id),
+                        ));
                     }
-                    Ok(_) => continue,
-                    Err(error) => {
+                    Ok(Ok(_)) => {
+                        tokio::select! {
+                            _ = &mut notified => {}
+                            _ = tokio::time::sleep(EVENT_RECHECK) => {}
+                        }
+                    }
+                    Ok(Err(error)) => {
                         warn!(%error, "event stream query failed");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                    Err(error) => {
+                        warn!(%error, "event stream query task failed");
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                 }
@@ -132,7 +182,7 @@ pub(super) async fn events(
         },
     )
     .flatten();
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(EVENT_KEEP_ALIVE)))
 }
 
 /// `?after=` wins; otherwise honor the standard SSE reconnect header.

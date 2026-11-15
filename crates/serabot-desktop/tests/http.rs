@@ -164,7 +164,9 @@ fn card_writes_use_their_own_routes_and_bodies() {
 #[test]
 fn safe_errors_never_include_response_bodies() {
     for status in [401, 403, 429, 500] {
-        let (client, handle) = server(vec![(status, "secret-server-body".into())]);
+        // A 401 is asked once more before it counts, so it needs two replies.
+        let replies = if status == 401 { 2 } else { 1 };
+        let (client, handle) = server(vec![(status, "secret-server-body".into()); replies]);
         let error = client.health().unwrap_err();
         assert_eq!(error, ApiError::Http(status));
         assert!(!error.to_string().contains("secret-server-body"));
@@ -524,7 +526,7 @@ fn catalog_without_egress_approval_fails_closed() {
 }
 
 #[test]
-fn history_keeps_a_bot_speaker_and_rejects_an_unsafe_name() {
+fn history_keeps_a_bot_speaker_and_drops_an_unsafe_name_from_its_row() {
     let (client, handle) = server(vec![
         (
             200,
@@ -541,13 +543,41 @@ fn history_keeps_a_bot_speaker_and_rejects_an_unsafe_name() {
     assert_eq!(history.cards[0].kind, "question");
     handle.join().unwrap();
 
+    // An unsafe speaker label is dropped from its row; the transcript loads.
+    // A failing cards read degrades to "no cards" instead of failing it.
+    let (client, handle) = server(vec![
+        (
+            200,
+            r#"{"messages":[{"id":"m","role":"assistant","content":"note","created_at":"now","name":"bot999:secretvalue"}],"has_more":true}"#.into(),
+        ),
+        (500, r#"{"error":"boom"}"#.into()),
+    ]);
+    let history = client.history("room:review").unwrap();
+    assert_eq!(history.messages.len(), 1);
+    assert_eq!(history.messages[0].content, "note");
+    assert_eq!(history.messages[0].name, None);
+    assert!(history.has_more);
+    assert!(history.cards.is_empty());
+    assert!(history.cards_degraded);
+    handle.join().unwrap();
+}
+
+#[test]
+fn an_older_page_is_asked_for_by_cursor_and_reads_no_cards() {
     let (client, handle) = server(vec![(
         200,
-        r#"{"messages":[{"id":"m","role":"assistant","content":"note","created_at":"now","name":"bot999:secretvalue"}]}"#.into(),
+        r#"{"messages":[{"id":"m1","role":"user","content":"older","created_at":"now"}],"has_more":false}"#.into(),
     )]);
+    let page = client.history_before("owner", "m2").unwrap();
+    assert_eq!(page.messages[0].id, "m1");
+    assert!(!page.has_more);
+    assert!(!page.cards_degraded);
+    handle.join().unwrap();
+    // A cursor that is not an id never leaves the process.
+    let (client, handle) = server(vec![]);
     assert!(matches!(
-        client.history("room:review"),
-        Err(ApiError::InvalidResponse)
+        client.history_before("owner", "../x"),
+        Err(ApiError::Validation(_))
     ));
     handle.join().unwrap();
 }
@@ -645,13 +675,28 @@ fn meet_your_team_reads_the_catalog_and_installs_one_bot() {
 }
 
 #[test]
-fn unexpected_roles_and_overlong_history_are_rejected() {
-    for body in [r#"{"messages":[{"id":"m","role":"tool","content":"untrusted internal details","created_at":"now"}]}"#.to_string(),
-        serde_json::json!({"messages": (0..101).map(|_| serde_json::json!({"id":"m","role":"user","content":"fixture","created_at":"now"})).collect::<Vec<_>>()}).to_string()] {
-        let (client, handle) = server(vec![(200, body)]);
-        assert!(matches!(client.history("owner"), Err(ApiError::InvalidResponse)));
-        handle.join().unwrap();
-    }
+fn unexpected_roles_are_dropped_and_overlong_history_keeps_its_newest_rows() {
+    // A row with a role the console does not draw never reaches the screen,
+    // but it does not take the rest of the transcript down either.
+    let (client, handle) = server(vec![
+        (
+            200,
+            r#"{"messages":[{"id":"t","role":"tool","content":"untrusted internal details","created_at":"now"},{"id":"u","role":"user","content":"kept","created_at":"now"}]}"#.into(),
+        ),
+        (200, r#"{"cards":[]}"#.into()),
+    ]);
+    let history = client.history("owner").unwrap();
+    assert_eq!(history.messages.len(), 1);
+    assert_eq!(history.messages[0].id, "u");
+    handle.join().unwrap();
+
+    let body = serde_json::json!({"messages": (0..101).map(|n| serde_json::json!({"id":format!("m{n}"),"role":"user","content":"fixture","created_at":"now"})).collect::<Vec<_>>()}).to_string();
+    let (client, handle) = server(vec![(200, body), (200, r#"{"cards":[]}"#.into())]);
+    let history = client.history("owner").unwrap();
+    assert_eq!(history.messages.len(), 100);
+    assert_eq!(history.messages[0].id, "m1");
+    assert_eq!(history.messages[99].id, "m100");
+    handle.join().unwrap();
 }
 
 #[test]
@@ -1038,6 +1083,8 @@ fn me_and_logout_use_the_session_token() {
         (204, String::new()),
         (401, String::new()),
         (500, String::new()),
+        // A 401 on `me` is asked once more before it is believed.
+        (401, String::new()),
         (401, String::new()),
     ]);
     let user = client.me().unwrap();
@@ -1055,6 +1102,7 @@ fn me_and_logout_use_the_session_token() {
         "POST /v1/auth/logout ",
         "POST /v1/auth/logout ",
         "POST /v1/auth/logout ",
+        "GET /v1/me ",
         "GET /v1/me ",
     ]) {
         assert!(request.starts_with(route), "wrong route: {request}");

@@ -47,6 +47,12 @@ max_users = 10
 # Daily task budget per user (enforced from phase 5).
 tasks_per_user_per_day = 500
 
+[logging]
+# Durable, owner-only log directory (relative to this file). RUST_LOG wins over
+# `level`; rustls/hyper/h2/reqwest stay at warn unless named explicitly.
+dir = "data/logs"
+# level = "serabot=info,tower_http=warn"
+
 [telegram]
 enabled = false
 bot_token_secret = "telegram_bot_token"

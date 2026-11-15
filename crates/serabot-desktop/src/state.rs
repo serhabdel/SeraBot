@@ -7,6 +7,11 @@ use crate::{
     worker::{OperationKind, Reply},
 };
 use std::collections::{BTreeMap, HashSet};
+use std::time::{Duration, Instant};
+
+/// How long the transcript skeleton may stay before it gives way to a
+/// "Could not load" panel with a Retry button.
+pub const HISTORY_STALL: Duration = Duration::from_secs(8);
 
 /// Merge a server transcript with what is already on screen. Rows with the same
 /// id are updated in place; optimistic `opt-*` user rows are paired by content.
@@ -42,6 +47,21 @@ pub fn merge_transcript(current: &[Message], incoming: Vec<Message>) -> Vec<Mess
     }
 
     merged
+}
+
+/// Rows the reader paged in before the first row of a fresh newest page:
+/// everything in `current` ahead of the first row the server page also has.
+/// Optimistic rows never count.
+fn older_rows_kept(current: &[Message], incoming: &[Message]) -> Vec<Message> {
+    let ids: HashSet<&str> = incoming.iter().map(|row| row.id.as_str()).collect();
+    match current.iter().position(|row| ids.contains(row.id.as_str())) {
+        Some(index) => current[..index]
+            .iter()
+            .filter(|row| !row.id.starts_with("opt-"))
+            .cloned()
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 fn transcript_row_equal(a: &Message, b: &Message) -> bool {
@@ -116,6 +136,17 @@ pub struct State {
     /// Chat cards of the open conversation (0.23), oldest first.
     pub cards: Vec<crate::ChatCard>,
     pub history_loaded: bool,
+    /// The first transcript read failed or stalled. Unlike `error` it is not
+    /// cleared by unrelated replies: only a transcript (or a retry) ends it.
+    pub history_failed: bool,
+    /// When this conversation began waiting for its transcript.
+    pub history_started: Option<Instant>,
+    /// Older messages exist beyond the oldest row shown ("Load earlier").
+    pub has_more_history: bool,
+    pub older_loading: bool,
+    pub older_error: Option<String>,
+    /// The last cards read failed; the cards on screen may be stale.
+    pub cards_degraded: bool,
     pub task: Option<Task>,
     /// Live steps of the latest turn, from the event stream.
     pub activity: crate::activity::Activity,
@@ -204,6 +235,9 @@ pub struct State {
     pub transcript_loading: bool,
     /// A failed send, shown in the chat instead of a raw error banner.
     pub chat_failure: Option<crate::chat_failure::ChatFailure>,
+    /// Counts failed sends. A dismissed banner is keyed by (message, attempt),
+    /// so the same sentence on the next attempt is shown again.
+    pub failure_attempt: u64,
     /// Text from a send that did not land, or whose outcome is unknown.
     /// Putting it back fills the composer; it is never sent by itself.
     pub held_draft: Option<String>,
@@ -277,6 +311,12 @@ impl Default for State {
             messages: Vec::new(),
             cards: Vec::new(),
             history_loaded: false,
+            history_failed: false,
+            history_started: None,
+            has_more_history: false,
+            older_loading: false,
+            older_error: None,
+            cards_degraded: false,
             task: None,
             activity: Default::default(),
             working: Default::default(),
@@ -337,6 +377,7 @@ impl Default for State {
             transcript_error: None,
             transcript_loading: false,
             chat_failure: None,
+            failure_attempt: 0,
             held_draft: None,
             created_bot: None,
             created_conversation: None,
@@ -479,6 +520,9 @@ impl State {
             provider_tests,
             ..Self::default()
         };
+        if connected {
+            self.history_started = Some(Instant::now());
+        }
     }
 
     pub fn disconnect(&mut self) {
@@ -518,6 +562,39 @@ impl State {
         self.provider_tests.clear();
     }
 
+    /// Zero the badge of one conversation, e.g. the one just opened.
+    pub fn clear_unread(&mut self, conversation: &str) {
+        if let Some(row) = self
+            .conversations
+            .iter_mut()
+            .find(|row| row.id == conversation)
+        {
+            row.unread_count = 0;
+        }
+    }
+
+    /// Track how long the transcript has been awaited. Past `HISTORY_STALL`
+    /// the load counts as failed, so the chat can offer Retry instead of an
+    /// endless skeleton. Returns whether the state changed.
+    pub fn note_history_wait(&mut self, now: Instant) -> bool {
+        if !self.connected || self.history_loaded {
+            self.history_started = None;
+            return false;
+        }
+        let started = *self.history_started.get_or_insert(now);
+        if !self.history_failed && now.saturating_duration_since(started) >= HISTORY_STALL {
+            self.history_failed = true;
+            return true;
+        }
+        false
+    }
+
+    /// Back to the skeleton for another attempt (the Retry button).
+    pub fn begin_history_retry(&mut self, now: Instant) {
+        self.history_failed = false;
+        self.history_started = Some(now);
+    }
+
     pub fn can_send(&self) -> bool {
         self.connected
             && self.history_loaded
@@ -555,9 +632,24 @@ impl State {
                 self.catalog = Some(catalog);
             }
             Reply::History(history) => {
-                self.messages = merge_transcript(&self.messages, history.messages);
-                self.cards = history.cards;
+                let older = older_rows_kept(&self.messages, &history.messages);
+                let mut merged = merge_transcript(&self.messages, history.messages);
+                if !older.is_empty() {
+                    // Pages the reader loaded stay in front of the newest page.
+                    let mut rows = older;
+                    rows.append(&mut merged);
+                    merged = rows;
+                } else {
+                    self.has_more_history = history.has_more;
+                }
+                self.messages = merged;
+                if !history.cards_degraded {
+                    self.cards = history.cards;
+                }
+                self.cards_degraded = history.cards_degraded;
                 self.history_loaded = true;
+                self.history_failed = false;
+                self.history_started = None;
                 // Fetching the transcript marks the thread read on the server;
                 // the badge clears locally at the same moment.
                 if let Some(conversation) = self
@@ -567,6 +659,20 @@ impl State {
                 {
                     conversation.unread_count = 0;
                 }
+            }
+            Reply::HistoryOlder(page) => {
+                let known: HashSet<&str> =
+                    self.messages.iter().map(|row| row.id.as_str()).collect();
+                let mut rows: Vec<Message> = page
+                    .messages
+                    .into_iter()
+                    .filter(|row| !known.contains(row.id.as_str()))
+                    .collect();
+                rows.append(&mut self.messages);
+                self.messages = rows;
+                self.has_more_history = page.has_more;
+                self.older_loading = false;
+                self.older_error = None;
             }
             Reply::Selection(selection) => {
                 self.draft = selection.clone();
@@ -682,6 +788,12 @@ impl State {
             Reply::Conversations(page) => {
                 self.conversations = page.conversations;
                 self.conversations_loaded = true;
+                // The chat on screen is being read: a count the list brings
+                // for it is already seen.
+                if self.history_loaded {
+                    let open = self.scope.conversation.clone();
+                    self.clear_unread(&open);
+                }
             }
             Reply::ArchivedConversations(page) => {
                 self.archived = page
@@ -1429,13 +1541,7 @@ mod tests {
         );
         state.new_scope("dir:analyst".into(), true);
         let scope = state.scope.clone();
-        state.receive(
-            &scope,
-            Reply::History(History {
-                messages: Vec::new(),
-                cards: Vec::new(),
-            }),
-        );
+        state.receive(&scope, Reply::History(History::default()));
         let opened = state
             .conversations
             .iter()
@@ -1835,6 +1941,7 @@ mod tests {
             description: None,
             role: "specialist".into(),
             installed,
+            enabled: installed,
             avatar_version: None,
         }
     }
@@ -1855,6 +1962,13 @@ mod tests {
         // "builder", "gamma"); the id is the tie-break, so the order never
         // depends on the server's list order.
         assert_eq!(order, ["zeta", "beta", "gamma", "alpha"]);
+    }
+
+    #[test]
+    fn a_catalog_entry_without_enabled_reads_as_off() {
+        let bot: ShippedBot =
+            serde_json::from_str(r#"{"id":"a","role":"specialist","installed":true}"#).unwrap();
+        assert!(bot.installed && !bot.enabled);
     }
 
     #[test]
@@ -1922,5 +2036,151 @@ mod tests {
                 state.error
             );
         }
+    }
+
+    fn row(id: &str, role: Role, text: &str) -> Message {
+        Message {
+            id: id.into(),
+            role,
+            content: text.into(),
+            created_at: "2026-10-29T10:00:00.000Z".into(),
+            name: None,
+            bot: None,
+            attachments: Vec::new(),
+            limit_reached: false,
+        }
+    }
+
+    fn page(ids: &[&str], has_more: bool) -> History {
+        History {
+            messages: ids
+                .iter()
+                .map(|id| row(id, Role::Assistant, "synthetic"))
+                .collect(),
+            has_more,
+            ..History::default()
+        }
+    }
+
+    #[test]
+    fn a_stalled_transcript_turns_into_a_retryable_failure() {
+        let mut state = State {
+            connected: true,
+            ..State::default()
+        };
+        let start = Instant::now();
+        assert!(!state.note_history_wait(start));
+        assert!(!state.note_history_wait(start + Duration::from_secs(3)));
+        assert!(!state.history_failed);
+        assert!(state.note_history_wait(start + HISTORY_STALL));
+        assert!(state.history_failed);
+        // Retry goes back to the skeleton and restarts the clock.
+        state.begin_history_retry(start + Duration::from_secs(9));
+        assert!(!state.history_failed);
+        assert!(!state.note_history_wait(start + Duration::from_secs(12)));
+        assert!(state.note_history_wait(start + Duration::from_secs(9) + HISTORY_STALL));
+        // A transcript ends the wait and the failure.
+        let scope = state.scope.clone();
+        state.receive(&scope, Reply::History(page(&["m1"], false)));
+        assert!(state.history_loaded);
+        assert!(!state.history_failed);
+        assert!(state.history_started.is_none());
+        assert!(!state.note_history_wait(start + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn a_disconnected_session_never_times_a_transcript_out() {
+        let mut state = State::default();
+        let start = Instant::now();
+        assert!(!state.note_history_wait(start));
+        assert!(!state.note_history_wait(start + Duration::from_secs(60)));
+        assert!(!state.history_failed);
+    }
+
+    #[test]
+    fn unrelated_failures_do_not_clear_a_history_failure() {
+        let mut state = State {
+            connected: true,
+            history_failed: true,
+            ..State::default()
+        };
+        let scope = state.scope.clone();
+        state.fail(&scope, OperationKind::History, ApiError::Transport);
+        // Another arm resetting the global banner leaves the flag alone.
+        state.error = None;
+        assert!(state.history_failed);
+    }
+
+    #[test]
+    fn older_pages_go_in_front_and_survive_a_newest_page_refresh() {
+        let mut state = State {
+            connected: true,
+            ..State::default()
+        };
+        let scope = state.scope.clone();
+        state.receive(&scope, Reply::History(page(&["m3", "m4"], true)));
+        assert!(state.has_more_history);
+        state.older_loading = true;
+        state.receive(
+            &scope,
+            Reply::HistoryOlder(page(&["m1", "m2", "m3"], false)),
+        );
+        let ids: Vec<&str> = state.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["m1", "m2", "m3", "m4"]);
+        assert!(!state.has_more_history);
+        assert!(!state.older_loading);
+        // A poll brings the newest page again, with one new row.
+        state.receive(&scope, Reply::History(page(&["m3", "m4", "m5"], true)));
+        let ids: Vec<&str> = state.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["m1", "m2", "m3", "m4", "m5"]);
+        assert!(
+            !state.has_more_history,
+            "the cursor stays with the oldest row"
+        );
+    }
+
+    #[test]
+    fn a_degraded_cards_read_keeps_the_cards_on_screen() {
+        let mut state = State {
+            connected: true,
+            ..State::default()
+        };
+        let scope = state.scope.clone();
+        state.receive(&scope, Reply::History(page(&["m1"], false)));
+        state.cards_degraded = false;
+        let mut degraded = page(&["m1", "m2"], false);
+        degraded.cards_degraded = true;
+        state.receive(&scope, Reply::History(degraded));
+        assert!(state.cards_degraded);
+        assert_eq!(state.messages.len(), 2);
+        state.receive(&scope, Reply::History(page(&["m1", "m2"], false)));
+        assert!(!state.cards_degraded);
+    }
+
+    #[test]
+    fn opening_a_chat_clears_its_badge_only() {
+        let mut state = State::default();
+        let mut open = ConversationSummary {
+            id: "dir:analyst".into(),
+            kind: "direct".into(),
+            parent_id: None,
+            title: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            last_message_at: None,
+            archived_at: None,
+            unread_count: 4,
+            accepts_turns: true,
+            last_message: None,
+            avatar_version: None,
+        };
+        let mut other = open.clone();
+        other.id = "room:review".into();
+        other.unread_count = 6;
+        open.unread_count = 4;
+        state.conversations = vec![open, other];
+        state.clear_unread("dir:analyst");
+        assert_eq!(state.conversations[0].unread_count, 0);
+        assert_eq!(state.conversations[1].unread_count, 6);
     }
 }

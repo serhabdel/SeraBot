@@ -453,6 +453,7 @@ impl Store {
             params![card.created_at, CARD_CREATED_EVENT, event, user_id],
         )?;
         transaction.commit()?;
+        self.notify_events();
         Ok(card)
     }
 
@@ -656,6 +657,7 @@ impl Store {
         let card = read_card(&transaction, user_id, id)?
             .ok_or_else(|| SeraError::NotFound(format!("card {id}")))?;
         transaction.commit()?;
+        self.notify_events();
         Ok(card)
     }
 
@@ -696,6 +698,7 @@ impl Store {
             )?;
         }
         transaction.commit()?;
+        self.notify_events();
         Ok(changed == 1)
     }
 }

@@ -177,20 +177,32 @@ enum TokenCommand {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // 0.28: rolling file logs + a redacting in-memory ring buffer for the
-    // console Logs tab, installed before anything logs. Falls back to stdout
-    // only when the log directory cannot be created.
-    let log_dir = std::env::temp_dir().join("serabot-logs");
-    if let Err(error) = serabot::logging::install_default(&log_dir) {
+    // console Logs tab, installed before anything logs. The directory and
+    // level come from `[logging]` (default `data/logs` beside the config, not
+    // the OS temp dir); a config that cannot load yet falls back to the same
+    // default next to it. Falls back to stdout only when the log directory
+    // cannot be created.
+    let cli = Cli::parse();
+    let (log_dir, log_level) = match Config::load(&cli.config) {
+        Ok(config) => (config.path(&config.logging.dir), config.logging.level),
+        Err(_) => {
+            let parent = std::path::Path::new(&cli.config)
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."));
+            (parent.join("data/logs"), None)
+        }
+    };
+    if let Err(error) = serabot::logging::install(&log_dir, log_level.as_deref()) {
         eprintln!("file logging disabled, stdout only: {error}");
+        let env = std::env::var("RUST_LOG").ok();
         tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| "serabot=info,tower_http=warn".into()),
-            )
+            .with_env_filter(serabot::logging::build_filter(
+                env.as_deref().or(log_level.as_deref()),
+            ))
             .init();
     }
 
-    let cli = Cli::parse();
     match cli.command {
         Command::Check => check(&cli.config)?,
         Command::Secrets { command } => match command {

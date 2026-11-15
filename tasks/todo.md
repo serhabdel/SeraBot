@@ -108,3 +108,14 @@ never merge without the owner's OK.
 - [x] T6.5 Final full gate (Windows + WSL), push, PR for owner review -
       merge only on the owner's OK. Merged as PR #9 (b863143) after the
       Windows, Linux, desktop, and mobile CI checks passed.
+
+## Releases 0.39-0.48 — hardening follow-up
+
+- [x] T7.1 Logging: noisy-crate caps, shared default filter, per-layer ring
+      filter, `[logging]` durable owner-only directory (0.48.0).
+- [x] T7.2 Approval decision refuses an expired approval before the sweep.
+- [x] T7.3 Negative tests: job tools, workflows/routines, preview, vault
+      autofill, approval binding (args/expiry/user/destination).
+- [x] T7.4 Spot-check: workflow/routine rows are `user_id`-scoped; artifact
+      preview is gated by `user_owns_artifact` and a 64-hex hash; jobfinder
+      `require_approval = []` is consistent (no outbound-effect tools).

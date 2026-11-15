@@ -88,6 +88,26 @@ pub fn reconnect_delay(attempt: u32) -> Duration {
     Duration::from_secs(STEPS[(attempt as usize).min(STEPS.len() - 1)])
 }
 
+/// `base` spread by up to 20% either way, so clients that lost the server at
+/// the same moment do not all come back at the same moment.
+pub fn jitter(base: Duration) -> Duration {
+    use std::hash::{BuildHasher, Hasher};
+    // RandomState is seeded per process from the OS, which is all the entropy
+    // a retry delay needs.
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos()),
+    );
+    jitter_with(base, (hasher.finish() % 10_000) as f64 / 10_000.0)
+}
+
+/// `jitter` with the random draw (`unit`, 0.0 to 1.0) supplied, for tests.
+pub fn jitter_with(base: Duration, unit: f64) -> Duration {
+    base.mul_f64(0.8 + 0.4 * unit.clamp(0.0, 1.0))
+}
+
 /// The longest link the console opens. Anything longer is refused.
 pub const MAX_LINK_CHARS: usize = 2048;
 
@@ -134,6 +154,18 @@ mod tests {
         }
         let long = format!("https://example.invalid/{}", "a".repeat(MAX_LINK_CHARS));
         assert!(!external_link_allowed(&long));
+    }
+
+    #[test]
+    fn jitter_stays_within_twenty_percent() {
+        let base = Duration::from_secs(10);
+        assert_eq!(jitter_with(base, 0.0), Duration::from_secs(8));
+        assert_eq!(jitter_with(base, 1.0), Duration::from_secs(12));
+        assert_eq!(jitter_with(base, 0.5), base);
+        for _ in 0..50 {
+            let delay = jitter(base);
+            assert!(delay >= Duration::from_secs(8) && delay <= Duration::from_secs(12));
+        }
     }
 
     #[test]

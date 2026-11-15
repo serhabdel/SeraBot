@@ -507,6 +507,29 @@ fn write(root: &Path, rel: &str, content: &str) -> Result<String, String> {
 // Agent: long-polls the server and answers relayed requests.
 // ---------------------------------------------------------------------------
 
+/// How long one poll is held open. The server allows 25 s; fewer, longer polls
+/// mean fewer requests, token checks and rate-limit hits.
+const LOCAL_POLL_WAIT_SECS: u64 = 25;
+
+/// Pause after a 401 or 403 poll: 30 s, 60 s, 120 s, then every 4 minutes,
+/// each spread by jitter.
+fn denied_delay(denied: u32) -> Duration {
+    let secs = 30u64.saturating_mul(1u64 << denied.min(3)).min(300);
+    crate::net_policy::jitter(Duration::from_secs(secs))
+}
+
+/// Sleep in short steps so a stopped agent does not linger for minutes.
+fn sleep_unless_stopped(stop: &AtomicBool, total: Duration) {
+    let end = std::time::Instant::now() + total;
+    while !stop.load(Ordering::SeqCst) {
+        let left = end.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        std::thread::sleep(left.min(Duration::from_millis(500)));
+    }
+}
+
 /// Stops its thread when dropped. The allowlist is shared with the thread, so
 /// removing a folder takes effect on the next request, not the next poll.
 pub struct LocalAgent {
@@ -534,6 +557,7 @@ impl LocalAgent {
             .name("serabot-local-folders".into())
             .spawn(move || {
                 let mut backoff = Duration::from_secs(2);
+                let mut denied = 0u32;
                 while !flag.load(Ordering::SeqCst) {
                     let current = list.read().map(|guard| guard.clone()).unwrap_or_default();
                     let views: Vec<(String, String, &'static str, BotScope)> = current
@@ -561,9 +585,10 @@ impl LocalAgent {
                             bots,
                         })
                         .collect();
-                    match client.local_poll(&roots_json(&roots), 12) {
+                    match client.local_poll(&roots_json(&roots), LOCAL_POLL_WAIT_SECS) {
                         Ok(Some(request)) => {
                             backoff = Duration::from_secs(2);
+                            denied = 0;
                             // Re-read the allowlist: a folder removed while the
                             // poll was open must not be served.
                             let live = list.read().map(|guard| guard.clone()).unwrap_or_default();
@@ -574,13 +599,18 @@ impl LocalAgent {
                             };
                             let _ = client.local_result(&request.id, outcome);
                         }
-                        Ok(None) => backoff = Duration::from_secs(2),
+                        Ok(None) => {
+                            backoff = Duration::from_secs(2);
+                            denied = 0;
+                        }
                         Err(ApiError::Http(401)) | Err(ApiError::Http(403)) => {
-                            // Signed out: wait for the session to restart us.
-                            std::thread::sleep(Duration::from_secs(30));
+                            // Signed out: back off harder each time and wait
+                            // for the session to restart us.
+                            sleep_unless_stopped(&flag, denied_delay(denied));
+                            denied = denied.saturating_add(1);
                         }
                         Err(_) => {
-                            std::thread::sleep(backoff);
+                            sleep_unless_stopped(&flag, crate::net_policy::jitter(backoff));
                             backoff = (backoff * 2).min(Duration::from_secs(30));
                         }
                     }
@@ -607,6 +637,16 @@ fn roots_json(roots: &[RootView<'_>]) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poll_backoff_after_a_denial_grows_and_caps() {
+        let secs = |n| denied_delay(n).as_secs_f64();
+        assert!((24.0..=36.0).contains(&secs(0)));
+        assert!((48.0..=72.0).contains(&secs(1)));
+        assert!((192.0..=288.0).contains(&secs(3)));
+        assert!((192.0..=288.0).contains(&secs(40)));
+        assert_eq!(LOCAL_POLL_WAIT_SECS, 25);
+    }
 
     fn fixture() -> (PathBuf, Vec<LocalFolder>) {
         let base = std::env::temp_dir().join(format!("serabot-lf-{}", uuid::Uuid::new_v4()));

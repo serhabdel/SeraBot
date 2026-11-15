@@ -388,12 +388,13 @@ pub(super) fn Sidebar(
                 key: key.clone(),
                 title: "Bots".into(),
                 count: bots.len(),
+                total: Some(state.state.shipped_bots.len()).filter(|total| *total > bots.len()),
                 collapsed: is_collapsed,
             });
             if !is_collapsed {
                 for bot in bot_rows {
                     let id = format!("dir:{}", bot.id);
-                    let unread = conversations
+                    let main_unread = conversations
                         .iter()
                         .find(|conversation| conversation.id == id)
                         .map(|conversation| conversation.unread_count)
@@ -404,6 +405,18 @@ pub(super) fn Sidebar(
                         .get(&bot.id)
                         .map(serabot_desktop::bot_chats::live_chats)
                         .unwrap_or_default();
+                    // The bot's badge covers its other chats too.
+                    let other_unread: Vec<i64> = chats
+                        .iter()
+                        .filter(|chat| chat.id != id)
+                        .filter_map(|chat| {
+                            conversations
+                                .iter()
+                                .find(|conversation| conversation.id == chat.id)
+                                .map(|conversation| conversation.unread_count)
+                        })
+                        .collect();
+                    let unread = chat_feed::rolled_up_unread(main_unread, &other_unread);
                     let extra = chats.iter().filter(|chat| !chat.primary).count();
                     let has_active = chats.iter().any(|chat| chat.id == current);
                     items.push(RailItem::Bot {
@@ -477,6 +490,7 @@ pub(super) fn Sidebar(
                     key: section.id.clone(),
                     title: state.conversation_label(section),
                     count: rows.len(),
+                    total: None,
                     collapsed: is_collapsed,
                 });
                 if !is_collapsed {
@@ -527,6 +541,7 @@ pub(super) fn Sidebar(
                     key: key.to_owned(),
                     title: title.to_owned(),
                     count: if is_room { room_total } else { direct_total },
+                    total: None,
                     collapsed: is_collapsed,
                 });
             }
@@ -554,6 +569,7 @@ pub(super) fn Sidebar(
                 key: "group:archived".to_owned(),
                 title: "Archived".into(),
                 count: archived.len(),
+                total: None,
                 collapsed: is_collapsed,
             });
             if !is_collapsed {
@@ -642,7 +658,7 @@ pub(super) fn Sidebar(
                 }
                 for item in items {
                     {match item {
-                        RailItem::Header { key, title, count, collapsed: closed } => {
+                        RailItem::Header { key, title, count, total, collapsed: closed } => {
                             let toggle = key.clone();
                             rsx! {
                                 button {
@@ -663,7 +679,24 @@ pub(super) fn Sidebar(
                                     },
                                     Icon { name: if closed { "chevron-right" } else { "chevron-down" }, size: 14 }
                                     span { class: "thread-title", "{title}" }
-                                    span { class: "thread-meta", "{count}" }
+                                    if let Some(total) = total {
+                                        span { class: "thread-meta", "{count} of {total}" }
+                                    } else {
+                                        span { class: "thread-meta", "{count}" }
+                                    }
+                                }
+                                if total.is_some() {
+                                    button {
+                                        key: "{key}-more",
+                                        class: "btn ghost sm",
+                                        r#type: "button",
+                                        title: "See every built-in bot and add the ones you do not have",
+                                        onclick: move |_| {
+                                            drawer_open.set(false);
+                                            session.write().open_bots_tab();
+                                        },
+                                        "Add more bots"
+                                    }
                                 }
                             }
                         },
@@ -714,8 +747,13 @@ pub(super) fn Sidebar(
                                                 "{extra_chats + 1}"
                                             }
                                         }
-                                        if unread > 0 {
-                                            span { class: "unread-badge", "{unread}" }
+                                        if let Some(badge) = chat_feed::unread_badge(unread) {
+                                            span {
+                                                class: "unread-badge",
+                                                role: "img",
+                                                "aria-label": "{chat_feed::unread_label(unread)}",
+                                                "{badge}"
+                                            }
                                         }
                                     }
                                     // Liveness dots only render for the
@@ -879,8 +917,15 @@ pub(super) fn Sidebar(
                                                 }
                                                 span { class: "thread-meta", "{subtitle}" }
                                             }
-                                            if !archived && unread > 0 {
-                                                span { class: "unread-badge", "{unread}" }
+                                            if !archived {
+                                                if let Some(badge) = chat_feed::unread_badge(unread) {
+                                                    span {
+                                                        class: "unread-badge",
+                                                        role: "img",
+                                                        "aria-label": "{chat_feed::unread_label(unread)}",
+                                                        "{badge}"
+                                                    }
+                                                }
                                             }
                                         }
                                         {
@@ -974,16 +1019,22 @@ pub(super) fn ActivityRow(mut session: Signal<Session>, step: Step) -> Element {
         .map(serabot_desktop::activity::format_duration);
     let approval = step.approval_id.clone();
     let can_retry = session.read().state.can_send();
-    let last_user = session
-        .read()
-        .state
-        .messages
-        .iter()
-        .rev()
-        .find_map(|message| {
-            (message.role == Role::User && !message.content.trim().is_empty())
-                .then(|| message.content.clone())
-        });
+    // Only a retryable failed step ever uses the last message: the other
+    // rows of a long run skip the scan and the clone.
+    let last_user = if step.phase == StepPhase::Failed && step.action == StepAction::Retry {
+        session
+            .read()
+            .state
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| {
+                (message.role == Role::User && !message.content.trim().is_empty())
+                    .then(|| message.content.clone())
+            })
+    } else {
+        None
+    };
     let has_body = step.input_summary.is_some()
         || !step.cards.is_empty()
         || step.detail.is_some()
@@ -1354,6 +1405,8 @@ pub(super) enum RailItem {
         key: String,
         title: String,
         count: usize,
+        /// Set when the catalog has more bots than the user has ("N of M").
+        total: Option<usize>,
         collapsed: bool,
     },
     Bot {
@@ -1544,6 +1597,7 @@ pub(super) fn Topbar(
     };
     let task_status = session.read().state.task.as_ref().map(|task| task.status);
     let auto_approve = session.read().state.auto_approve;
+    let auto_approve_confirming = session.read().auto_approve_confirming;
     let accepts_turns = session.read().conversation_accepts_turns();
     let (subtitle, avatar) = {
         let state = session.read();
@@ -1696,14 +1750,37 @@ pub(super) fn Topbar(
                     Icon { name: "refresh", size: 16 }
                 }
                 if accepts_turns && connected {
-                    button {
-                        class: if auto_approve { "btn sm yolo-btn active" } else { "btn ghost sm yolo-btn" },
-                        title: "Auto-approve: when on, this chat's bots run actions that normally ask you first (sending email, uploading or deleting files) without waiting for your OK. Policy checks and the audit log still apply. Off by default; applies to this chat only.",
-                        "aria-label": "Auto-approve in this chat",
-                        "aria-pressed": if auto_approve { "true" } else { "false" },
-                        onclick: move |_| session.write().set_auto_approve(!auto_approve),
-                        Icon { name: "bolt", size: 15 }
-                        span { class: "btn-label", "Auto-approve" }
+                    div { class: "yolo-wrap",
+                        button {
+                            class: if auto_approve { "btn sm yolo-btn active" } else { "btn ghost sm yolo-btn" },
+                            title: "Auto-approve: when on, this chat's bots run actions that normally ask you first (sending email, uploading or deleting files) without waiting for your OK. Policy checks and the audit log still apply. Off by default; applies to this chat only.",
+                            "aria-label": "Auto-approve in this chat",
+                            "aria-pressed": if auto_approve { "true" } else { "false" },
+                            onclick: move |_| session.write().request_auto_approve(!auto_approve),
+                            Icon { name: "bolt", size: 15 }
+                            span { class: "btn-label", "Auto-approve" }
+                        }
+                        if auto_approve_confirming && !auto_approve {
+                            div { class: "yolo-confirm", role: "alertdialog", "aria-label": "Turn on Auto-approve?",
+                                p { class: "yolo-confirm-text",
+                                    "Auto-approve lets this chat's bots send email, upload and delete files without asking you first. Policy checks and the audit log still apply."
+                                }
+                                div { class: "yolo-confirm-actions",
+                                    button {
+                                        class: "btn ghost sm",
+                                        r#type: "button",
+                                        onclick: move |_| session.write().cancel_auto_approve(),
+                                        "Cancel"
+                                    }
+                                    button {
+                                        class: "btn primary sm",
+                                        r#type: "button",
+                                        onclick: move |_| session.write().confirm_auto_approve(),
+                                        "Turn on"
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 if browser_active {

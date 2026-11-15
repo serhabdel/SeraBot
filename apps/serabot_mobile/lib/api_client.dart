@@ -1,4 +1,6 @@
+import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:http/http.dart' as http;
 
@@ -18,11 +20,14 @@ enum ApiErrorKind {
 }
 
 class ApiException implements Exception {
-  ApiException(this.kind, {this.statusCode, this.detail});
+  ApiException(this.kind, {this.statusCode, this.detail, this.retryAfter});
 
   final ApiErrorKind kind;
   final int? statusCode;
   final String? detail;
+
+  /// The server's `Retry-After` on a 429 or 503, when it sent one.
+  final Duration? retryAfter;
 
   bool get unknownOutcome {
     if (kind == ApiErrorKind.validation) {
@@ -57,6 +62,10 @@ class ApiException implements Exception {
           return 'Forbidden (403). Server policy or data-egress approval blocks this request.';
         }
         if (c == 429) {
+          final wait = retryAfter;
+          if (wait != null) {
+            return 'Rate limited (429). Retry in ${max(1, wait.inSeconds)} seconds.';
+          }
           return 'Rate limited (429). Wait at least one minute, then retry.';
         }
         if (c >= 300 && c < 400) {
@@ -97,14 +106,50 @@ String? serverErrorText(int status, List<int> body) {
   return null;
 }
 
+/// Pauses before the second and third try of a read.
+const defaultGetRetryDelays = [Duration(milliseconds: 400), Duration(milliseconds: 1200)];
+
+/// A `Retry-After` longer than this is shown to the user, not waited out.
+const _maxAutoRetryWait = Duration(seconds: 5);
+
+/// Pause before a 401 is asked once more, ahead of signing the user out.
+const _reverifyDelay = Duration(milliseconds: 300);
+
+/// No bytes (data or keep-alive comment) for this long means the event
+/// stream is half-open. The server sends a comment every 10 seconds.
+const eventIdleTimeout = Duration(seconds: 40);
+
+/// [base] spread by up to 20% either way so clients that lost the server
+/// together do not return together.
+Duration jittered(Duration base, [double? unit]) {
+  final u = (unit ?? Random().nextDouble()).clamp(0.0, 1.0);
+  return Duration(microseconds: (base.inMicroseconds * (0.8 + 0.4 * u)).round());
+}
+
+/// Seconds from a `Retry-After` header, or null when absent or not a number.
+Duration? parseRetryAfter(String? value) {
+  final seconds = int.tryParse((value ?? '').trim());
+  if (seconds == null || seconds < 0 || seconds > 3600) {
+    return null;
+  }
+  return Duration(seconds: seconds);
+}
+
 /// Owner API client. Token is held in memory only; never logged.
 class ApiClient {
-  ApiClient._(this._base, this._token, this._http, this._onUnauthorized);
+  ApiClient._(
+    this._base,
+    this._token,
+    this._http,
+    this._onUnauthorized,
+    this._getRetryDelays,
+  );
 
   final String _base;
   final String _token;
   final http.Client _http;
   final void Function()? _onUnauthorized;
+  final List<Duration> _getRetryDelays;
 
   /// [onUnauthorized] runs on every HTTP 401 so the session can drop the
   /// stored token and return to the sign-in screen. [httpClient] is for tests.
@@ -113,6 +158,7 @@ class ApiClient {
     String token, {
     http.Client? httpClient,
     void Function()? onUnauthorized,
+    List<Duration> getRetryDelays = defaultGetRetryDelays,
   }) {
     final base = validateEndpoint(endpointRaw);
     if (!validToken(token)) {
@@ -122,7 +168,13 @@ class ApiClient {
             'API token must contain 32–512 visible ASCII characters, without spaces.',
       );
     }
-    return ApiClient._(base, token, httpClient ?? http.Client(), onUnauthorized);
+    return ApiClient._(
+      base,
+      token,
+      httpClient ?? http.Client(),
+      onUnauthorized,
+      getRetryDelays,
+    );
   }
 
   void close() {
@@ -140,6 +192,10 @@ class ApiClient {
 
   /// One authenticated request. Redirects are never followed: the bearer
   /// token must not travel to another URL.
+  ///
+  /// A read (GET) is tried again after a dropped connection, a 502/503/504, or
+  /// a 429 whose `Retry-After` is short. Writes are never repeated: they may
+  /// have reached the server.
   Future<http.Response> _send(
     String method,
     Uri uri, {
@@ -148,21 +204,40 @@ class ApiClient {
     String accept = 'application/json',
     Duration timeout = const Duration(seconds: 20),
   }) async {
-    try {
-      final req = http.Request(method, uri)
-        ..followRedirects = false
-        ..headers.addAll({
-          'Authorization': 'Bearer $_token',
-          'Accept': accept,
-          ...?extraHeaders,
-        });
-      if (bodyBytes != null) {
-        req.bodyBytes = bodyBytes;
+    final retries = method == 'GET' ? _getRetryDelays : const <Duration>[];
+    var attempt = 0;
+    while (true) {
+      final http.Response response;
+      try {
+        final req = http.Request(method, uri)
+          ..followRedirects = false
+          ..headers.addAll({
+            'Authorization': 'Bearer $_token',
+            'Accept': accept,
+            ...?extraHeaders,
+          });
+        if (bodyBytes != null) {
+          req.bodyBytes = bodyBytes;
+        }
+        final streamed = await _http.send(req).timeout(timeout);
+        response = await http.Response.fromStream(streamed).timeout(timeout);
+      } catch (_) {
+        if (attempt >= retries.length) {
+          throw ApiException(ApiErrorKind.transport);
+        }
+        await Future<void>.delayed(jittered(retries[attempt++]));
+        continue;
       }
-      final streamed = await _http.send(req).timeout(timeout);
-      return await http.Response.fromStream(streamed).timeout(timeout);
-    } catch (_) {
-      throw ApiException(ApiErrorKind.transport);
+      final code = response.statusCode;
+      if (attempt < retries.length && (code == 429 || code == 502 || code == 503 || code == 504)) {
+        final hinted = parseRetryAfter(response.headers['retry-after']);
+        if (hinted == null || hinted <= _maxAutoRetryWait) {
+          await Future<void>.delayed(jittered(hinted ?? retries[attempt]));
+          attempt++;
+          continue;
+        }
+      }
+      return response;
     }
   }
 
@@ -173,12 +248,19 @@ class ApiClient {
     Map<String, dynamic>? body,
   }) async {
     final uri = _uri(segments, query);
-    final response = await _send(
-      method,
-      uri,
-      bodyBytes: body == null ? null : utf8.encode(jsonEncode(body)),
-      extraHeaders: {if (body != null) 'Content-Type': 'application/json'},
-    );
+    Future<http.Response> send() => _send(
+          method,
+          uri,
+          bodyBytes: body == null ? null : utf8.encode(jsonEncode(body)),
+          extraHeaders: {if (body != null) 'Content-Type': 'application/json'},
+        );
+    var response = await send();
+    if (response.statusCode == 401) {
+      // The server rejects before running a handler, so asking again is safe
+      // for every method. One proxy or auth hiccup must not sign the user out.
+      await Future<void>.delayed(_reverifyDelay);
+      response = await send();
+    }
     if (response.statusCode == 401) {
       _onUnauthorized?.call();
       throw ApiException(ApiErrorKind.http, statusCode: 401);
@@ -191,6 +273,7 @@ class ApiClient {
         ApiErrorKind.http,
         statusCode: response.statusCode,
         detail: serverErrorText(response.statusCode, response.bodyBytes),
+        retryAfter: parseRetryAfter(response.headers['retry-after']),
       );
     }
 
@@ -826,38 +909,68 @@ class ApiClient {
     }
   }
 
-  /// Server events after [after] (`GET /v1/events`, Server-Sent Events). The
-  /// stream ends when the connection drops; the caller reconnects from the
-  /// last id it saw. A 401 signs the session out like any other call.
-  Stream<ServerEvent> events({int after = 0}) async* {
-    final req = http.Request(
-      'GET',
-      _uri(
-        ['v1', 'events'],
-        {if (after > 0) 'after': '$after', 'limit': '100'},
-      ),
-    )
-      ..followRedirects = false
-      ..headers.addAll({
-        'Authorization': 'Bearer $_token',
-        'Accept': 'text/event-stream',
-      });
-    final http.StreamedResponse res;
-    try {
-      res = await _http.send(req).timeout(const Duration(seconds: 20));
-    } catch (_) {
-      throw ApiException(ApiErrorKind.transport);
+  /// Server events after [after] (`GET /v1/events`, Server-Sent Events). With
+  /// no cursor the stream starts at the newest event (`after=latest`): current
+  /// state comes from the normal loads, not from replaying retained history.
+  ///
+  /// [onOpen] runs once the server answers 200, before any event, so callers
+  /// can show the link as up even on a quiet stream. The stream errors with a
+  /// transport failure when nothing, not even a keep-alive, arrives for
+  /// [idleTimeout]; the caller reconnects from the last id it saw. A 401 is
+  /// asked once more, then signs the session out like any other call.
+  Stream<ServerEvent> events({
+    int after = 0,
+    void Function()? onOpen,
+    Duration idleTimeout = eventIdleTimeout,
+  }) async* {
+    Future<http.StreamedResponse> open() async {
+      final req = http.Request(
+        'GET',
+        _uri(
+          ['v1', 'events'],
+          {'after': after > 0 ? '$after' : 'latest', 'limit': '100'},
+        ),
+      )
+        ..followRedirects = false
+        ..headers.addAll({
+          'Authorization': 'Bearer $_token',
+          'Accept': 'text/event-stream',
+        });
+      try {
+        return await _http.send(req).timeout(const Duration(seconds: 20));
+      } catch (_) {
+        throw ApiException(ApiErrorKind.transport);
+      }
+    }
+
+    var res = await open();
+    if (res.statusCode == 401) {
+      await res.stream.drain<void>().catchError((_) {});
+      await Future<void>.delayed(_reverifyDelay);
+      res = await open();
     }
     if (res.statusCode == 401) {
       _onUnauthorized?.call();
       throw ApiException(ApiErrorKind.http, statusCode: 401);
     }
     if (res.statusCode != 200) {
-      throw ApiException(ApiErrorKind.http, statusCode: res.statusCode);
+      throw ApiException(
+        ApiErrorKind.http,
+        statusCode: res.statusCode,
+        retryAfter: parseRetryAfter(res.headers['retry-after']),
+      );
     }
+    onOpen?.call();
     final parser = SseParser();
     try {
-      await for (final chunk in res.stream.transform(utf8.decoder)) {
+      final watched = res.stream.timeout(
+        idleTimeout,
+        onTimeout: (sink) {
+          sink.addError(ApiException(ApiErrorKind.transport));
+          sink.close();
+        },
+      );
+      await for (final chunk in watched.transform(utf8.decoder)) {
         for (final frame in parser.feed(chunk)) {
           final e = ServerEvent.fromFrame(frame);
           if (e != null) {

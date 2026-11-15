@@ -85,6 +85,11 @@ struct BotOffering {
     /// Prompt digest (see `prompt_digest`) of the text last offered.
     #[serde(default)]
     prompt_sha256: String,
+    /// Set when the owner removed this bot. Only this flag keeps a template
+    /// out of the fleet: a record with no row and no flag is a stale record
+    /// and the bot is restored on the next upgrade.
+    #[serde(default)]
+    removed: bool,
 }
 
 impl BotOffering {
@@ -94,6 +99,7 @@ impl BotOffering {
             skills: template.config.skills.iter().cloned().collect(),
             delegates: template.config.delegates.iter().cloned().collect(),
             prompt_sha256: prompt_digest(&template.prompt),
+            removed: false,
         }
     }
 }
@@ -154,6 +160,8 @@ pub struct CatalogEntry {
     pub role: String,
     /// Whether the acting user has a row for this bot.
     pub installed: bool,
+    /// Whether the user's row is enabled (false when not installed).
+    pub enabled: bool,
 }
 
 /// The per-user fleet registry shared by the runtime, the skill tools, and
@@ -186,6 +194,15 @@ impl FleetRegistry {
         Self::validate_fleet(&templates)?;
         catalog.validate_bot_skills(&templates)?;
         let admin_user_id = store.admin_user_id()?;
+        tracing::info!(
+            count = templates.len(),
+            bots = %templates
+                .iter()
+                .map(|template| template.config.name.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            "fleet templates loaded"
+        );
         Ok(Self {
             config,
             store,
@@ -231,8 +248,9 @@ impl FleetRegistry {
     /// user's lock and upgrades, and later calls return at once until
     /// [`Self::invalidate`] clears the mark. Per template, against the user's
     /// offering record:
-    /// - no row and no record: insert it, so a new default bot reaches an
-    ///   existing user. A row the owner deleted after an offering stays gone.
+    /// - no row, not marked removed: insert it, so every shipped bot reaches
+    ///   every user. A bot the owner removed (the record's `removed` flag, set
+    ///   by [`Self::mark_removed`]) stays gone until re-added.
     /// - a row: add the tools, skills, and delegates the template gained since
     ///   the baseline, never re-adding one the owner removed. Replace the
     ///   prompt only while the row still holds a shipped text (the recorded
@@ -294,7 +312,10 @@ impl FleetRegistry {
             let name = template.config.name.as_str();
             let record = offerings.bots.get(name).cloned();
             let Some(row) = rows.iter().find(|row| row.name == name) else {
-                if record.is_none() {
+                // Only an explicit owner removal keeps a template out; a
+                // record without the flag is stale (row never written or lost)
+                // and the template is restored.
+                if !record.is_some_and(|record| record.removed) {
                     self.store.upsert_bot(
                         user_id,
                         name,
@@ -325,6 +346,7 @@ impl FleetRegistry {
                 skills: config.skills.iter().cloned().collect(),
                 delegates: config.delegates.iter().cloned().collect(),
                 prompt_sha256: String::new(),
+                removed: false,
             });
             let row_digest = prompt_digest(&row.prompt);
             let prompt_is_shipped = row.prompt.is_empty()
@@ -483,6 +505,9 @@ impl FleetRegistry {
                 description: template.config.description.clone(),
                 role: template.config.role.as_str().to_owned(),
                 installed: rows.iter().any(|row| row.name == template.config.name),
+                enabled: rows
+                    .iter()
+                    .any(|row| row.name == template.config.name && row.enabled),
             })
             .collect())
     }
@@ -535,6 +560,30 @@ impl FleetRegistry {
             .set_fleet_offerings(user_id, &serde_json::to_string(&offerings)?)?;
         self.evict(user_id);
         Ok(true)
+    }
+
+    /// Record that the owner removed a shipped bot, so upgrades do not bring
+    /// it back; "Add to my team" ([`Self::install_template`]) clears the flag.
+    /// Call after the row is deleted. A name that is not a template is a no-op.
+    pub fn mark_removed(&self, user_id: &str, name: &str) -> Result<()> {
+        let Some(template) = self
+            .templates
+            .iter()
+            .find(|template| template.config.name == name)
+        else {
+            return Ok(());
+        };
+        let user_lock = self.user_lock(user_id);
+        let _guard = user_lock.lock().unwrap_or_else(|error| error.into_inner());
+        let mut offerings = self.offerings(user_id)?;
+        offerings
+            .bots
+            .entry(name.to_owned())
+            .or_insert_with(|| BotOffering::of(template))
+            .removed = true;
+        self.store
+            .set_fleet_offerings(user_id, &serde_json::to_string(&offerings)?)?;
+        Ok(())
     }
 
     /// The acting user's effective skill ids: shipped catalog ∪ own rows.
@@ -780,6 +829,7 @@ mod tests {
                 .unwrap()
         );
         assert!(store.delete_bot(&member, "analyst").unwrap());
+        registry.mark_removed(&member, "analyst").unwrap();
         registry.invalidate(&member);
         let error = registry.load(&member).unwrap_err();
         assert!(error.to_string().contains("delegate analyst"), "{error}");
@@ -1030,10 +1080,10 @@ mod tests {
     fn a_new_template_bot_reaches_existing_users_and_a_deleted_one_stays_deleted() {
         let store = Store::open_in_memory(384).unwrap();
         let admin = store.admin_user_id().unwrap();
-        registry_with(&store, versioned(&[], "v1"))
-            .seed(&admin)
-            .unwrap();
+        let first = registry_with(&store, versioned(&[], "v1"));
+        first.seed(&admin).unwrap();
         store.delete_bot(&admin, "analyst").unwrap();
+        first.mark_removed(&admin, "analyst").unwrap();
 
         let mut templates = versioned(&[], "v1");
         templates.push(bot("watcher", BotRole::Specialist, vec![], true));
@@ -1456,7 +1506,9 @@ mod tests {
         registry.seed(&admin).unwrap();
         registry.seed(&member).unwrap();
         store.delete_bot(&member, "watcher").unwrap();
+        registry.mark_removed(&member, "watcher").unwrap();
         store.delete_bot(&admin, "watcher").unwrap();
+        registry.mark_removed(&admin, "watcher").unwrap();
 
         assert!(registry.install_template(&admin, "watcher").unwrap());
         assert!(store.get_bot(&admin, "watcher").unwrap().is_some());
@@ -1478,11 +1530,10 @@ mod tests {
     fn an_installed_bot_takes_a_later_template_upgrade() {
         let store = Store::open_in_memory(384).unwrap();
         let admin = store.admin_user_id().unwrap();
-        registry_with(&store, with_watcher(&["fetch_url"]))
-            .seed(&admin)
-            .unwrap();
-        store.delete_bot(&admin, "watcher").unwrap();
         let registry = registry_with(&store, with_watcher(&["fetch_url"]));
+        registry.seed(&admin).unwrap();
+        store.delete_bot(&admin, "watcher").unwrap();
+        registry.mark_removed(&admin, "watcher").unwrap();
         assert!(registry.install_template(&admin, "watcher").unwrap());
         assert!(
             store
@@ -1498,6 +1549,77 @@ mod tests {
             config_of(&store, &admin, "watcher").tools,
             vec!["fetch_url".to_owned(), "memory_search".to_owned()]
         );
+    }
+
+    /// A record that names a template but has no row and no `removed` flag is
+    /// stale (a lost or never-written row): the next upgrade restores it.
+    #[test]
+    fn a_stale_record_without_the_removed_flag_restores_the_bot() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let registry = registry_with(&store, with_watcher(&["fetch_url"]));
+        registry.seed(&admin).unwrap();
+        // Lost row, record intact and written by an older build (no flag).
+        store.delete_bot(&admin, "watcher").unwrap();
+        let raw = store.fleet_offerings(&admin).unwrap().unwrap();
+        assert!(!raw.contains("\"removed\":true"));
+        registry.invalidate(&admin);
+        assert_eq!(registry.seed(&admin).unwrap(), 1);
+        assert!(store.get_bot(&admin, "watcher").unwrap().is_some());
+    }
+
+    /// An owner removal survives upgrades and restarts until the bot is added
+    /// back; the flag is per user, and re-adding clears it.
+    #[test]
+    fn a_removed_bot_is_not_reseeded_and_removal_is_per_user() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let member = member(&store);
+        let registry = registry_with(&store, with_watcher(&["fetch_url"]));
+        registry.seed(&admin).unwrap();
+        registry.seed(&member).unwrap();
+
+        store.delete_bot(&admin, "watcher").unwrap();
+        registry.mark_removed(&admin, "watcher").unwrap();
+        // A fresh process (new registry) does not bring it back.
+        let restarted = registry_with(&store, with_watcher(&["fetch_url"]));
+        assert_eq!(restarted.seed(&admin).unwrap(), 0);
+        assert!(store.get_bot(&admin, "watcher").unwrap().is_none());
+        // The other user keeps theirs.
+        assert!(store.get_bot(&member, "watcher").unwrap().is_some());
+        let catalog = restarted.template_catalog(&member).unwrap();
+        assert!(
+            catalog
+                .iter()
+                .any(|entry| entry.name == "watcher" && entry.installed && entry.enabled)
+        );
+
+        // Add to my team clears the flag, so the bot is an ordinary row again.
+        assert!(restarted.install_template(&admin, "watcher").unwrap());
+        let raw = store.fleet_offerings(&admin).unwrap().unwrap();
+        assert!(!raw.contains("\"removed\":true"));
+        let again = registry_with(&store, with_watcher(&["fetch_url"]));
+        assert_eq!(again.seed(&admin).unwrap(), 0);
+        assert!(store.get_bot(&admin, "watcher").unwrap().is_some());
+    }
+
+    /// Records written before the flag existed deserialize with it false.
+    #[test]
+    fn an_old_offering_record_reads_with_removed_false() {
+        let offering: BotOffering = serde_json::from_str(r#"{"tools":["a"]}"#).unwrap();
+        assert!(!offering.removed);
+    }
+
+    /// Marking an unknown name removed writes nothing.
+    #[test]
+    fn marking_a_non_template_removed_is_a_no_op() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let registry = registry_with(&store, versioned(&[], "v1"));
+        registry.seed(&admin).unwrap();
+        let before = store.fleet_offerings(&admin).unwrap();
+        registry.mark_removed(&admin, "my-scaffold").unwrap();
+        assert_eq!(store.fleet_offerings(&admin).unwrap(), before);
     }
 
     #[test]

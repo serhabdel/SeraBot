@@ -40,6 +40,53 @@ pub const RING_CAPACITY: usize = 2000;
 pub const LOG_RETENTION_DAYS: i64 = 7;
 /// Log file name prefix: `serabot-YYYY-MM-DD.log`.
 pub const LOG_FILE_PREFIX: &str = "serabot";
+/// The one default filter for every sink and the stdout fallback in `main`;
+/// matches `Environment=RUST_LOG=` in `deploy/serabot.service`.
+pub const DEFAULT_FILTER: &str = "serabot=info,tower_http=warn";
+/// Chatty transport crates that stay at `warn` unless the filter names them
+/// explicitly, so a bare `RUST_LOG=trace` cannot flood logs with TLS/HTTP
+/// handshake lines.
+pub const NOISY_CRATES: [&str; 6] = [
+    "rustls",
+    "hyper",
+    "hyper_util",
+    "h2",
+    "reqwest",
+    "tokio_util",
+];
+
+/// Build the filter from a directive string (`RUST_LOG` or `[logging] level`),
+/// falling back to [`DEFAULT_FILTER`]. Every crate in [`NOISY_CRATES`] that the
+/// directives do not mention is capped at `warn`.
+pub fn build_filter(directives: Option<&str>) -> EnvFilter {
+    let spec = directives
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_FILTER);
+    let spec = capped_spec(spec);
+    EnvFilter::try_new(&spec).unwrap_or_else(|_| EnvFilter::new(capped_spec(DEFAULT_FILTER)))
+}
+
+fn capped_spec(spec: &str) -> String {
+    let mut out = spec.to_owned();
+    for name in NOISY_CRATES {
+        let named = spec.split(',').any(|directive| {
+            let target = directive
+                .split('=')
+                .next()
+                .unwrap_or_default()
+                .split('[')
+                .next()
+                .unwrap_or_default()
+                .trim();
+            target == name || target.starts_with(&format!("{name}::"))
+        });
+        if !named {
+            out.push_str(&format!(",{name}=warn"));
+        }
+    }
+    out
+}
 
 /// One captured log event, as served by `GET /v1/logs`. The message is
 /// already redacted.
@@ -340,12 +387,16 @@ impl Write for DailyWriter {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let today = Utc::now().date_naive();
         if state.date != Some(today) {
-            std::fs::create_dir_all(self.dir.as_ref())?;
+            create_private_dir(self.dir.as_ref())?;
             let path = Self::log_path(&self.dir, today);
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)?;
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let file = options.open(path)?;
             state.file = Some(file);
             state.date = Some(today);
             let _ = Self::prune(&self.dir, today);
@@ -380,31 +431,57 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for DailyWriter {
 /// writer under `log_dir`, and the redacting ring buffer. Idempotent: a
 /// second call (as in tests) is a no-op.
 pub fn install_default(log_dir: impl Into<PathBuf>) -> Result<()> {
+    install(log_dir, None)
+}
+
+/// [`install_default`] with an optional `[logging] level` directive string.
+/// `RUST_LOG` wins over `level`; both get the noisy-crate caps.
+pub fn install(log_dir: impl Into<PathBuf>, level: Option<&str>) -> Result<()> {
     let dir = log_dir.into();
-    std::fs::create_dir_all(&dir).map_err(SeraError::from)?;
+    create_private_dir(&dir).map_err(SeraError::from)?;
     let _ = DailyWriter::prune(&dir, Utc::now().date_naive());
 
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,serabot=debug"));
+    let env = std::env::var("RUST_LOG").ok();
+    let directives = env.as_deref().or(level);
     let file_writer = DailyWriter::new(dir);
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(file_writer)
         .with_ansi(false)
         .event_format(RedactingFormatter)
-        .with_filter(filter.clone());
+        .with_filter(build_filter(directives));
     let stdout_layer = tracing_subscriber::fmt::layer()
         .with_writer(io::stdout)
         .event_format(RedactingFormatter)
-        .with_filter(filter);
+        .with_filter(build_filter(directives));
+    // The ring buffer is filtered too, so a verbose RUST_LOG cannot push
+    // third-party noise into the console Logs tab.
+    let ring_layer = RingLayer.with_filter(build_filter(directives));
 
     // `try_init` fails only when a dispatcher is already installed (tests);
     // that is the idempotent path, not an error.
     let _ = tracing_subscriber::registry()
         .with(file_layer)
         .with(stdout_layer)
-        .with(RingLayer)
+        .with(ring_layer)
         .try_init();
     Ok(())
+}
+
+/// Create the log directory owner-only (0700 on Unix; on Windows it inherits
+/// the owner's profile/data ACL).
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
 }
 
 /// The log query behind `GET /v1/logs?level=warn&q=...`.
@@ -508,6 +585,53 @@ mod tests {
         assert!(!scrubbed.contains(&key));
         // Short words pass through untouched.
         assert_eq!(builtin_scrub("hello world"), "hello world");
+    }
+
+    fn spec_has(spec: &str, directive: &str) -> bool {
+        spec.split(',').any(|part| part == directive)
+    }
+
+    #[test]
+    fn bare_trace_still_caps_noisy_crates() {
+        let spec = capped_spec("trace");
+        for name in NOISY_CRATES {
+            assert!(spec_has(&spec, &format!("{name}=warn")), "{name} in {spec}");
+        }
+        assert!(spec.starts_with("trace"));
+    }
+
+    #[test]
+    fn explicit_noisy_override_is_kept() {
+        let spec = capped_spec("serabot=info,hyper=debug,rustls::client=trace");
+        assert!(!spec_has(&spec, "hyper=warn"));
+        assert!(!spec_has(&spec, "rustls=warn"));
+        assert!(spec_has(&spec, "h2=warn"));
+        assert!(spec_has(&spec, "reqwest=warn"));
+        // `hyper_util` is a distinct crate from `hyper`.
+        assert!(spec_has(&spec, "hyper_util=warn"));
+    }
+
+    #[test]
+    fn default_filter_is_the_service_filter_and_parses() {
+        assert_eq!(DEFAULT_FILTER, "serabot=info,tower_http=warn");
+        let _ = build_filter(None);
+        let _ = build_filter(Some("  "));
+        // An unparsable level falls back instead of panicking.
+        let _ = build_filter(Some("=[=="));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_dir_and_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("serabot-log-perm-{}", uuid::Uuid::new_v4()));
+        let mut writer = DailyWriter::new(dir.clone());
+        writer.write_all(b"x\n").unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        let file = DailyWriter::log_path(&dir, Utc::now().date_naive());
+        assert_eq!(mode(&file), 0o600);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

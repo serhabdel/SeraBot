@@ -846,6 +846,10 @@ pub struct ShippedBot {
     pub description: Option<String>,
     pub role: String,
     pub installed: bool,
+    /// Whether the owner's copy is switched on. False when not installed, and
+    /// for an older server that omits it.
+    #[serde(default)]
+    pub enabled: bool,
     #[serde(default)]
     pub avatar_version: Option<String>,
 }
@@ -1578,6 +1582,10 @@ pub struct AuthUser {
     pub display_name: String,
     #[serde(default)]
     pub role: String,
+    /// When this session now ends. The server renews sessions while they are
+    /// in use, so this moves forward; absent on older servers.
+    #[serde(default)]
+    pub session_expires_at: Option<String>,
 }
 
 impl AuthUser {
@@ -1941,12 +1949,58 @@ impl Drop for Message {
     }
 }
 
-#[derive(Deserialize)]
+/// Rows asked for per transcript page.
+const HISTORY_PAGE_ROWS: &str = "100";
+const HISTORY_PAGE: usize = 100;
+
+#[derive(Default, Deserialize)]
 pub struct History {
+    #[serde(deserialize_with = "lenient_messages")]
     pub messages: Vec<Message>,
     /// The conversation's chat cards (0.23), oldest first.
     #[serde(default)]
     pub cards: Vec<ChatCard>,
+    /// Older messages exist beyond this page.
+    #[serde(default)]
+    pub has_more: bool,
+    /// The cards read failed: the caller keeps the cards it already has.
+    #[serde(skip)]
+    pub cards_degraded: bool,
+}
+
+/// Read a message list row by row: a row that is not a valid message (an
+/// unknown role, a missing field) is dropped, the rest of the transcript
+/// still loads.
+fn lenient_messages<'de, D>(deserializer: D) -> Result<Vec<Message>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let rows = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| serde_json::from_value::<Message>(row).ok())
+        .collect())
+}
+
+/// Make a server page safe to show without rejecting the whole transcript:
+/// a speaker label that is not a plain bot id is dropped from that row, and a
+/// page longer than asked for keeps its newest rows.
+pub fn sanitize_history_messages(messages: &mut Vec<Message>) {
+    if messages.len() > HISTORY_PAGE {
+        messages.drain(..messages.len() - HISTORY_PAGE);
+    }
+    for message in messages.iter_mut() {
+        if message
+            .name
+            .as_ref()
+            .is_some_and(|name| !valid_speaker(name))
+        {
+            message.name = None;
+        }
+        if message.bot.as_ref().is_some_and(|bot| !valid_speaker(bot)) {
+            message.bot = None;
+        }
+    }
 }
 
 /// One chat card (0.23): a question from a bot, or a request for a secret.
@@ -2303,16 +2357,26 @@ impl ApiClient {
         if !query.is_empty() {
             url.query_pairs_mut().extend_pairs(query.iter().copied());
         }
-        let response = send_with_policy(&method, route, || {
-            let mut request = self
-                .client
-                .request(method.clone(), url.clone())
-                .bearer_auth(self.token.expose_secret());
-            if let Some(body) = body {
-                request = request.json(body);
-            }
-            request
-        })?;
+        let send = || {
+            send_with_policy(&method, route, || {
+                let mut request = self
+                    .client
+                    .request(method.clone(), url.clone())
+                    .bearer_auth(self.token.expose_secret());
+                if let Some(body) = body {
+                    request = request.json(body);
+                }
+                request
+            })
+        };
+        let mut response = send()?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            // The server rejects before running any handler, so asking again is
+            // safe for every method. One transient proxy or auth hiccup must
+            // not end a session; a real expiry answers 401 twice.
+            std::thread::sleep(Duration::from_millis(300));
+            response = send()?;
+        }
         note_rate_limit(&response);
         let status = response.status();
         if !status.is_success() {
@@ -2389,26 +2453,36 @@ impl ApiClient {
         check_id(conversation)?;
         self.get(&["v1", "models"], &[("conversation_id", conversation)])
     }
+    /// The newest page of the transcript with the conversation's cards.
     pub fn history(&self, conversation: &str) -> Result<History, ApiError> {
+        self.history_page(conversation, None)
+    }
+
+    /// One page of rows older than `before` (a message id): "Load earlier".
+    /// No cards are read, the first page already carried them.
+    pub fn history_before(&self, conversation: &str, before: &str) -> Result<History, ApiError> {
+        check_id(before)?;
+        self.history_page(conversation, Some(before))
+    }
+
+    fn history_page(&self, conversation: &str, before: Option<&str>) -> Result<History, ApiError> {
         check_id(conversation)?;
-        let mut history: History = self.get(
-            &["v1", "conversations", conversation, "messages"],
-            &[("limit", "100")],
-        )?;
-        if history.messages.len() > 100 {
-            return Err(ApiError::InvalidResponse);
+        let mut query: Vec<(&str, &str)> = vec![("limit", HISTORY_PAGE_ROWS)];
+        if let Some(before) = before {
+            query.push(("before", before));
         }
-        if history.messages.iter().any(|message| {
-            message
-                .name
-                .as_ref()
-                .is_some_and(|name| !valid_speaker(name))
-                || message.bot.as_ref().is_some_and(|bot| !valid_speaker(bot))
-        }) {
-            return Err(ApiError::InvalidResponse);
+        let mut history: History =
+            self.get(&["v1", "conversations", conversation, "messages"], &query)?;
+        sanitize_history_messages(&mut history.messages);
+        if before.is_some() {
+            return Ok(history);
         }
-        // Cards come with the transcript, so one history load refreshes both.
-        history.cards = self.list_cards(conversation)?;
+        // Cards ride along with the transcript, but they are optional: a
+        // failing /cards read must not take the messages down with it.
+        match self.list_cards(conversation) {
+            Ok(cards) => history.cards = cards,
+            Err(_) => history.cards_degraded = true,
+        }
         Ok(history)
     }
 
@@ -2862,7 +2936,7 @@ impl ApiClient {
             &[],
             Some(&Poll {
                 roots,
-                wait_secs: wait_secs.min(15),
+                wait_secs: wait_secs.min(25),
             }),
         )?;
         if let Some(request) = &reply.request
@@ -6249,6 +6323,7 @@ mod tests {
             email: "a@example.test".into(),
             display_name: " Ada ".into(),
             role: "member".into(),
+            session_expires_at: None,
         };
         assert_eq!(named.label(), "Ada");
         let mut unnamed = named.clone();
@@ -6465,6 +6540,44 @@ mod tests {
     #[test]
     fn task_sync_run_payload_is_an_empty_json_object() {
         assert_eq!(ApiClient::task_sync_run_payload(), serde_json::json!({}));
+    }
+
+    fn history_row(id: &str, name: Option<&str>, bot: Option<&str>) -> Message {
+        Message {
+            id: id.into(),
+            role: Role::Assistant,
+            content: "synthetic".into(),
+            created_at: "2026-10-29T10:00:00.000Z".into(),
+            name: name.map(str::to_owned),
+            bot: bot.map(str::to_owned),
+            attachments: Vec::new(),
+            limit_reached: false,
+        }
+    }
+
+    #[test]
+    fn a_bad_speaker_label_drops_the_label_not_the_transcript() {
+        let mut rows = vec![
+            history_row("m1", Some("analyst"), Some("analyst")),
+            history_row("m2", Some("Bad Name!"), Some("../etc")),
+        ];
+        sanitize_history_messages(&mut rows);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name.as_deref(), Some("analyst"));
+        assert_eq!(rows[1].name, None);
+        assert_eq!(rows[1].bot, None);
+        assert_eq!(rows[1].content, "synthetic");
+    }
+
+    #[test]
+    fn an_overlong_page_keeps_its_newest_rows() {
+        let mut rows: Vec<Message> = (0..105)
+            .map(|n| history_row(&format!("m{n}"), None, None))
+            .collect();
+        sanitize_history_messages(&mut rows);
+        assert_eq!(rows.len(), 100);
+        assert_eq!(rows[0].id, "m5");
+        assert_eq!(rows[99].id, "m104");
     }
 }
 

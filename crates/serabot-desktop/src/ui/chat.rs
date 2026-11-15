@@ -29,78 +29,122 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         .as_ref()
         .is_some_and(|task| task.status == TaskStatus::AwaitingApproval);
     // One prepared row per message: what the transcript draws, the day
-    // heading where a new day starts, and which actions it offers.
-    let messages: Vec<MsgView> = {
+    // heading where a new day starts, and which actions it offers. Rows are
+    // rebuilt only when something they are drawn from changed: the session
+    // signal is written on every poll and streamed token, and most of those
+    // writes leave the transcript as it was.
+    let row_cache = use_hook(|| Rc::new(RefCell::new(None::<(u64, Rc<Vec<Rc<MsgView>>>)>)));
+    let messages: Rc<Vec<Rc<MsgView>>> = {
         let state = session.read();
-        let last_user = state
-            .state
-            .messages
-            .iter()
-            .rposition(|m| m.role == Role::User);
-        let last_bot = state
-            .state
-            .messages
-            .iter()
-            .rposition(|m| m.role != Role::User);
-        let regen_text = last_user.map(|index| state.state.messages[index].content.clone());
-        let mut rows: Vec<MsgView> = Vec::with_capacity(state.state.messages.len());
-        let mut prev_user: Option<bool> = None;
-        let mut prev_day: Option<String> = None;
-        for (index, message) in state.state.messages.iter().enumerate() {
-            let user = message.role == Role::User;
-            let (speaker, avatar, bot) = state.message_speaker(message);
-            let peer = !user
-                && group_like
-                && bot.as_deref().is_some()
-                && bot.as_deref() != orchestrator.as_deref();
-            let day_now = chat_feed::day_key(&message.created_at, &today);
-            let day = match &day_now {
-                Some(now) if prev_day.as_deref() != Some(now.as_str()) => {
-                    Some(chat_feed::day_heading(now, &today))
+        let fingerprint = chat_feed::transcript_fingerprint(
+            &state.state.messages,
+            (
+                state.conversation.as_str(),
+                group_like,
+                orchestrator.as_deref(),
+                idle,
+                today.as_str(),
+                state.state.bot_chat_binding,
+                state
+                    .state
+                    .listed_bots
+                    .iter()
+                    .map(|bot| {
+                        (
+                            bot.id.as_str(),
+                            bot.display_name.as_deref(),
+                            bot.title.as_deref(),
+                            bot.role.as_str(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        );
+        let cached = row_cache
+            .borrow()
+            .as_ref()
+            .filter(|(key, _)| *key == fingerprint)
+            .map(|(_, rows)| Rc::clone(rows));
+        match cached {
+            Some(rows) => rows,
+            None => {
+                let last_user = state
+                    .state
+                    .messages
+                    .iter()
+                    .rposition(|m| m.role == Role::User);
+                let last_bot = state
+                    .state
+                    .messages
+                    .iter()
+                    .rposition(|m| m.role != Role::User);
+                let regen_text = last_user.map(|index| state.state.messages[index].content.clone());
+                let mut rows: Vec<Rc<MsgView>> = Vec::with_capacity(state.state.messages.len());
+                let mut prev_user: Option<bool> = None;
+                let mut prev_day: Option<String> = None;
+                for (index, message) in state.state.messages.iter().enumerate() {
+                    let user = message.role == Role::User;
+                    let (speaker, avatar, bot) = state.message_speaker(message);
+                    let peer = !user
+                        && group_like
+                        && bot.as_deref().is_some()
+                        && bot.as_deref() != orchestrator.as_deref();
+                    let day_now = chat_feed::day_key(&message.created_at, &today);
+                    let day = match &day_now {
+                        Some(now) if prev_day.as_deref() != Some(now.as_str()) => {
+                            Some(chat_feed::day_heading(now, &today))
+                        }
+                        _ => None,
+                    };
+                    if day_now.is_some() {
+                        prev_day = day_now;
+                    }
+                    let speaker_change = prev_user != Some(user);
+                    prev_user = Some(user);
+                    let mut class = String::from(if user {
+                        "msg user"
+                    } else if peer {
+                        "msg bot peer"
+                    } else {
+                        "msg bot"
+                    });
+                    if speaker_change {
+                        class.push_str(" speaker-change");
+                    }
+                    if !user && Some(index) == last_bot {
+                        // The newest reply keeps its actions in view.
+                        class.push_str(" last-reply");
+                    }
+                    rows.push(Rc::new(MsgView {
+                        id: message.id.clone(),
+                        user,
+                        haystack: chat_feed::search_haystack(&message.content, &speaker),
+                        speaker,
+                        avatar,
+                        bot,
+                        stamp: msg_stamp(&message.created_at),
+                        content: message.content.clone(),
+                        peer,
+                        class,
+                        day,
+                        edit: idle && Some(index) == last_user,
+                        regen: if idle && Some(index) == last_bot && !user {
+                            regen_text.clone()
+                        } else {
+                            None
+                        },
+                        continue_offer: idle
+                            && serabot_desktop::media_view::offers_continue(
+                                &state.state.messages,
+                                index,
+                            ),
+                    }));
                 }
-                _ => None,
-            };
-            if day_now.is_some() {
-                prev_day = day_now;
+                let rows = Rc::new(rows);
+                *row_cache.borrow_mut() = Some((fingerprint, Rc::clone(&rows)));
+                rows
             }
-            let speaker_change = prev_user != Some(user);
-            prev_user = Some(user);
-            let mut class = String::from(if user {
-                "msg user"
-            } else if peer {
-                "msg bot peer"
-            } else {
-                "msg bot"
-            });
-            if speaker_change {
-                class.push_str(" speaker-change");
-            }
-            if !user && Some(index) == last_bot {
-                // The newest reply keeps its actions in view.
-                class.push_str(" last-reply");
-            }
-            rows.push(MsgView {
-                id: message.id.clone(),
-                user,
-                speaker,
-                avatar,
-                bot,
-                stamp: msg_stamp(&message.created_at),
-                content: message.content.clone(),
-                peer,
-                class,
-                day,
-                edit: idle && Some(index) == last_user,
-                regen: if idle && Some(index) == last_bot && !user {
-                    regen_text.clone()
-                } else {
-                    None
-                },
-                continue_offer: idle
-                    && serabot_desktop::media_view::offers_continue(&state.state.messages, index),
-            });
         }
-        rows
     };
     // Chat cards (0.23). A pending card sits at the foot of the feed. A resolved
     // card keeps its place in the transcript: before the first message made after it.
@@ -132,7 +176,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         .task
         .as_ref()
         .and_then(|task| (!task.status.terminal()).then_some(task.status));
-    let (steps, steps_summary, sending) = {
+    let (steps, steps_summary, steps_dropped, steps_attention, sending, history_ready) = {
         let state = session.read();
         let sending =
             state.state.messages.last().is_some_and(|message| {
@@ -141,7 +185,10 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         (
             state.state.activity.steps.clone(),
             state.state.activity.summary(),
+            state.state.activity.dropped_note(),
+            state.state.activity.needs_attention(),
             sending,
+            state.state.history_loaded,
         )
     };
     let chat_plan = session.read().state.plan.clone();
@@ -261,13 +308,45 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     // The composer grows to about 40% of the window; Expand lifts that to 70%.
     let mut composer_expanded = use_signal(|| false);
     let mut composer_focused = use_signal(|| false);
-    let mut copied = use_signal(|| Option::<String>::None);
+    let copied = use_signal(|| Option::<String>::None);
     let mut confirm_regen = use_signal(|| Option::<String>::None);
-    let mut task_added_ids = use_signal(HashSet::<String>::new);
+    let task_added_ids = use_signal(HashSet::<String>::new);
     let mut search_open = use_signal(|| false);
     let mut search_query = use_signal(String::new);
-    let mut dismissed_failure = use_signal(|| Option::<String>::None);
+    // Keyed by (message, attempt): the same sentence after another failed
+    // send is a new failure and shows again.
+    let mut dismissed_failure = use_signal(|| Option::<(String, u64)>::None);
     let mut dismissed_held = use_signal(|| false);
+    // One polite announcement per finished reply, never per streamed token.
+    let mut announcement = use_signal(String::new);
+    let mut was_running = use_signal(|| false);
+    use_effect(move || {
+        let (running, done, spoken) = {
+            let state = session.read();
+            let task = state.state.task.as_ref();
+            let running = task.is_some_and(|task| !task.status.terminal());
+            let done = task.is_some_and(|task| task.status == TaskStatus::Done);
+            let spoken = state
+                .state
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role != Role::User)
+                .map(|message| chat_feed::reply_announcement(&state.message_speaker(message).0));
+            (running, done, spoken)
+        };
+        let was = *was_running.peek();
+        if was == running {
+            return;
+        }
+        was_running.set(running);
+        if was
+            && done
+            && let Some(text) = spoken
+        {
+            announcement.set(text);
+        }
+    });
     let mut dismissed_transcript_err = use_signal(|| Option::<String>::None);
     let enter_sends_pref = session.read().prefs.enter_sends;
     let mut composer_room = use_signal(|| session.read().conversation.clone());
@@ -317,10 +396,8 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let transcript_error = session.read().state.transcript_error.clone();
     let chat_failure = session.read().state.chat_failure.clone();
     let held_draft = session.read().state.held_draft.is_some();
-    if chat_failure.as_ref().map(|f| f.message.as_str()) != dismissed_failure().as_deref()
-        && chat_failure.is_none()
-        && dismissed_failure().is_some()
-    {
+    let failure_attempt = session.read().state.failure_attempt;
+    if chat_failure.is_none() && dismissed_failure().is_some() {
         dismissed_failure.set(None);
     }
     if !held_draft && dismissed_held() {
@@ -331,7 +408,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     }
     let show_failure = chat_failure
         .as_ref()
-        .filter(|f| dismissed_failure().as_deref() != Some(f.message.as_str()))
+        .filter(|f| dismissed_failure() != Some((f.message.clone(), failure_attempt)))
         .cloned();
     let show_held = held_draft && !dismissed_held();
     let show_transcript_error = transcript_error
@@ -397,22 +474,32 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             .steps
             .last()
             .map(|step| (step.call_id.clone(), step.label.len()));
+        let head = session
+            .read()
+            .state
+            .messages
+            .iter()
+            .find(|message| !message.id.starts_with("opt-"))
+            .map(|message| message.id.clone());
         let mark = chat_scroll::TranscriptMark {
             count,
             tail,
             steps: activity_steps,
             step_tail: activity_tail,
+            head,
         };
         // Real growth only: this effect also runs for unrelated session writes.
-        let streaming_growth = {
+        let (streaming_growth, prepended) = {
             let mut last = last_mark_effect.borrow_mut();
             let grew = *last != mark;
+            let prepended = chat_scroll::rows_prepended(&last, &mark);
             *last = mark;
-            grew
+            (grew, prepended)
         };
         let previous = *last_count.peek();
         if count != previous {
-            if count > previous && !*at_bottom.peek() && !own_send {
+            // Rows added in front ("Load earlier") are history, not news.
+            if count > previous && !*at_bottom.peek() && !own_send && !prepended {
                 let incoming = session
                     .read()
                     .state
@@ -436,7 +523,10 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                 unseen.set(0);
             }
         }
-        if let Some(force_pin) =
+        if prepended {
+            // Keep the row the reader was on where it was.
+            let _ = dioxus::document::eval(chat_scroll::ANCHOR_RESTORE_JS);
+        } else if let Some(force_pin) =
             chat_scroll::transcript_pin_action(previous, count, own_send, streaming_growth)
         {
             let _ = dioxus::document::eval(&chat_scroll::pin_messages_js(force_pin));
@@ -453,10 +543,28 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let empty = messages.is_empty();
     // Until this chat's transcript has arrived, show placeholders instead of
     // the "start a conversation" empty state (it used to flash on every open).
-    let history_loading = empty && {
+    // A transcript that failed or stalled gets its own panel with Retry; it
+    // must never fall through to the "start a conversation" empty state.
+    let (
+        history_loading,
+        history_failed,
+        has_more_history,
+        older_loading,
+        older_error,
+        cards_degraded,
+    ) = {
         let state = session.read();
-        state.state.connected && !state.state.history_loaded && state.state.error.is_none()
+        let waiting = empty && state.state.connected && !state.state.history_loaded;
+        (
+            waiting && !state.state.history_failed,
+            waiting && state.state.history_failed,
+            state.state.has_more_history && state.state.history_loaded,
+            state.state.older_loading,
+            state.state.older_error.clone(),
+            state.state.cards_degraded,
+        )
     };
+    let link_retrying = session.read().link_retrying;
     let conversation_id = session.read().conversation.clone();
     // On a new chat: where it started from (the bot's memory and a summary).
     let memory_note = {
@@ -542,29 +650,98 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let search_match_count = if search_active {
         messages
             .iter()
-            .filter(|row| {
-                row.content.to_lowercase().contains(&search_needle)
-                    || row.speaker.to_lowercase().contains(&search_needle)
-            })
+            .filter(|row| chat_feed::row_matches(&row.haystack, &search_needle))
             .count()
     } else {
         0
+    };
+    // Each row with the class it is drawn with this time (entrance animation
+    // once per row, search highlight), its bot chips and its media cards.
+    let row_views: Vec<RowView> = {
+        let mut guard = entered_messages.borrow_mut();
+        chat_feed::trim_entered(
+            &mut guard.1,
+            messages.iter().map(|row| row.id.as_str()),
+            messages.len(),
+        );
+        messages
+            .iter()
+            .map(|row| {
+                let enter = !guard.1.contains(&row.id);
+                if enter {
+                    guard.1.insert(row.id.clone());
+                }
+                let mut class = if enter {
+                    format!("{} msg-enter", row.class)
+                } else {
+                    row.class.clone()
+                };
+                if search_active {
+                    class.push_str(if chat_feed::row_matches(&row.haystack, &search_needle) {
+                        " msg-match"
+                    } else {
+                        " msg-dim"
+                    });
+                }
+                RowView {
+                    row: Rc::clone(row),
+                    class,
+                    bot_meta: row.bot.as_ref().and_then(|id| bot_meta.get(id).cloned()),
+                    media: if row.user {
+                        Vec::new()
+                    } else {
+                        assigned_library
+                            .by_message
+                            .get(&row.id)
+                            .cloned()
+                            .unwrap_or_default()
+                    },
+                }
+            })
+            .collect()
     };
     let run_active = live_task.is_some();
     rsx! {
         div { class: "pane-body chat-body",
             onkeydown: move |event: KeyboardEvent| {
-                if !event.is_composing()
-                    && (event.modifiers().contains(Modifiers::CONTROL)
-                        || event.modifiers().contains(Modifiers::META))
+                if event.is_composing() {
+                    return;
+                }
+                let command = event.modifiers().contains(Modifiers::CONTROL)
+                    || event.modifiers().contains(Modifiers::META);
+                // Ctrl+F searches the conversation whenever it has a message;
+                // only an empty chat leaves the key to the browser.
+                if command
                     && matches!(event.key(), Key::Character(ref c) if c.eq_ignore_ascii_case("f"))
-                    && (message_count >= 4 || search_open())
+                    && (message_count >= 1 || search_open())
                 {
                     event.prevent_default();
                     search_open.set(true);
                     let _ = dioxus::document::eval(
                         "requestAnimationFrame(() => { const el = document.getElementById('chat-find-input'); if (el) { el.focus(); el.select(); } })",
                     );
+                } else if command && event.key() == Key::End && !composer_focused() {
+                    // Ctrl+End: jump to the latest message.
+                    event.prevent_default();
+                    let _ = dioxus::document::eval(chat_scroll::SCROLL_TO_BOTTOM_JS);
+                    at_bottom.set(true);
+                    unseen.set(0);
+                } else if command
+                    && matches!(event.key(), Key::Character(ref c) if c == "/")
+                {
+                    // Ctrl+/: back to the composer from anywhere in the chat.
+                    event.prevent_default();
+                    focus_composer();
+                } else if event.key() == Key::Escape
+                    && !command
+                    && run_active
+                    && !search_open()
+                    && !show_mention
+                    && !show_slash
+                {
+                    // Esc stops the reply that is being written.
+                    event.prevent_default();
+                    session.write().stop_turn();
                 }
             },
             ondragover: move |event: DragEvent| {
@@ -685,12 +862,53 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                             }
                         }
                     }
+                    if has_more_history {
+                        div { class: "load-earlier-row",
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                disabled: older_loading,
+                                onclick: move |_| {
+                                    // Remember the scroll position so the row
+                                    // being read stays put when rows are added above it.
+                                    let _ = dioxus::document::eval(chat_scroll::ANCHOR_CAPTURE_JS);
+                                    session.write().load_older_messages();
+                                },
+                                if older_loading {
+                                    "Loading earlier messages…"
+                                } else {
+                                    "Load earlier messages"
+                                }
+                            }
+                            if let Some(message) = older_error.clone() {
+                                span { class: "load-earlier-error", role: "alert", "{message}" }
+                            }
+                        }
+                    }
                     if history_loading {
                         div { class: "transcript-skeleton", role: "status", "aria-label": "Loading messages",
                             div { class: "sk-row user", span { class: "sk-bar w40" } }
                             div { class: "sk-row", span { class: "sk-bar w90" } span { class: "sk-bar w75" } span { class: "sk-bar w55" } }
                             div { class: "sk-row user", span { class: "sk-bar w25" } }
                             div { class: "sk-row", span { class: "sk-bar w80" } span { class: "sk-bar w60" } }
+                        }
+                    } else if history_failed {
+                        div { class: "history-failed", role: "alert",
+                            h2 { class: "history-failed-title", "Could not load this conversation" }
+                            p { class: "history-failed-text",
+                                "The messages did not arrive. Nothing is lost: they are still on the server."
+                            }
+                            button {
+                                class: "btn primary sm",
+                                r#type: "button",
+                                disabled: link_retrying,
+                                onclick: move |_| session.write().retry_history(),
+                                if link_retrying {
+                                    "Retrying…"
+                                } else {
+                                    "Retry"
+                                }
+                            }
                         }
                     } else if empty {
                         div { class: "empty",
@@ -794,215 +1012,27 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                             }
                         }
                     }
-                    for (index, row) in messages.into_iter().enumerate() {
-                        Fragment { key: "{row.id}",
+                    for (index, view) in row_views.into_iter().enumerate() {
+                        Fragment { key: "{view.row.id}",
                             for card in placed[index].clone() {
                                 ChatCardRow { session, key: "{card.id}", card }
                             }
-                            if let Some(heading) = row.day.clone() {
+                            if let Some(heading) = view.row.day.clone() {
                                 div { class: "day-sep", role: "separator",
                                     span { "{heading}" }
                                 }
                             }
-                            div {
-                                class: {
-                                    let mut guard = entered_messages.borrow_mut();
-                                    let enter = if guard.1.contains(&row.id) {
-                                        false
-                                    } else {
-                                        guard.1.insert(row.id.clone());
-                                        true
-                                    };
-                                    let mut cls = if enter {
-                                        format!("{} msg-enter", row.class)
-                                    } else {
-                                        row.class.clone()
-                                    };
-                                    if search_active {
-                                        let is_match = row.content.to_lowercase().contains(&search_needle)
-                                            || row.speaker.to_lowercase().contains(&search_needle);
-                                        cls.push_str(if is_match { " msg-match" } else { " msg-dim" });
-                                    }
-                                    cls
-                                },
-                                span {
-                                    class: if row.user { "msg-avatar avatar user" } else { "msg-avatar avatar bot" },
-                                    style: row.bot.as_deref().map(avatar_style).unwrap_or_default(),
-                                    "{row.avatar}"
-                                }
-                                div { class: "msg-main",
-                                    div { class: "msg-head",
-                                        // The own-message label restates what the
-                                        // right-aligned bubble already says.
-                                        if !row.user {
-                                            span { class: "msg-name", "{row.speaker}" }
-                                        }
-                                        span { class: "msg-time", "{row.stamp}" }
-                                        if let Some(id) = row.bot.as_ref() {
-                                            if let Some((role, live)) = bot_meta.get(id) {
-                                                span { class: "team-chip", "{role}" }
-                                                span {
-                                                    class: if *live { "chip ok" } else { "chip warn" },
-                                                    if *live { "live" } else { "not live" }
-                                                }
-                                            }
-                                        }
-                                        if row.peer {
-                                            span { class: "team-chip", "peer bot" }
-                                        }
-                                    }
-                                    div { class: "msg-body", title: "{row.stamp}",
-                                        MarkdownBody { message_id: row.id.clone(), content: row.content.clone() }
-                                        if row.user {
-                                            MessageFiles { session, id: row.id.clone() }
-                                        }
-                                    }
-                                    if !row.user {
-                                        if let Some(entries) = assigned_library.by_message.get(&row.id).cloned() {
-                                            if !entries.is_empty() {
-                                                TurnMediaCards { session, entries }
-                                            }
-                                        }
-                                    }
-                                    div { class: "msg-actions", role: "toolbar", "aria-label": "Message actions",
-                                        // The time shows with the actions, on hover or focus.
-                                        span { class: "msg-action-time", "{row.stamp}" }
-                                        button {
-                                            class: "msg-action",
-                                            r#type: "button",
-                                            "aria-label": "Copy message",
-                                            title: "Copy",
-                                            onclick: {
-                                                let text = row.content.clone();
-                                                let id = row.id.clone();
-                                                move |_| {
-                                                    let _ = dioxus::document::eval(&copy_script(&text));
-                                                    copied.set(Some(id.clone()));
-                                                    let id = id.clone();
-                                                    spawn(async move {
-                                                        let mut done = dioxus::document::eval(CONFIRM_RESET_JS);
-                                                        let _ = done.recv::<bool>().await;
-                                                        if copied.peek().as_deref() == Some(id.as_str()) {
-                                                            copied.set(None);
-                                                        }
-                                                    });
-                                                }
-                                            },
-                                            Icon {
-                                                name: if copied().as_deref() == Some(row.id.as_str()) { "check" } else { "copy" },
-                                                size: 13
-                                            }
-                                            span { class: "msg-action-label",
-                                                if copied().as_deref() == Some(row.id.as_str()) { "Copied" } else { "Copy" }
-                                            }
-                                        }
-                                        if accepts && !row.content.trim().is_empty() {
-                                            button {
-                                                class: "msg-action",
-                                                r#type: "button",
-                                                "aria-label": "Quote message in composer",
-                                                title: "Quote in composer",
-                                                onclick: {
-                                                    let text = row.content.clone();
-                                                    move |_| {
-                                                        confirm_regen.set(None);
-                                                        let next = chat_compose::quote_reply_text(
-                                                            &composer_draft(),
-                                                            &text,
-                                                        );
-                                                        composer_draft.set(next.clone());
-                                                        session.write().composer = next;
-                                                        focus_composer();
-                                                    }
-                                                },
-                                                Icon { name: "chat", size: 13 }
-                                                span { class: "msg-action-label", "Quote" }
-                                            }
-                                        }
-                                        if !row.content.trim().is_empty() {
-                                            if task_added_ids().contains(&row.id) {
-                                                span { class: "msg-task-added", role: "status",
-                                                    Icon { name: "check", size: 12 }
-                                                    " Task added"
-                                                }
-                                            } else {
-                                                button {
-                                                    class: "msg-action",
-                                                    r#type: "button",
-                                                    "aria-label": "Create task from message",
-                                                    title: "Create task from this message",
-                                                    onclick: {
-                                                        let text = row.content.clone();
-                                                        let id = row.id.clone();
-                                                        move |_| {
-                                                            let title = chat_compose::task_title_from_message(&text);
-                                                            session.write().add_task(title, None);
-                                                            task_added_ids.write().insert(id.clone());
-                                                        }
-                                                    },
-                                                    Icon { name: "plus", size: 13 }
-                                                    span { class: "msg-action-label", "Create task" }
-                                                }
-                                            }
-                                        }
-                                        if row.edit {
-                                            button {
-                                                class: "msg-action",
-                                                r#type: "button",
-                                                "aria-label": "Edit message",
-                                                title: "Put this message back in the composer",
-                                                onclick: {
-                                                    let text = row.content.clone();
-                                                    move |_| {
-                                                        confirm_regen.set(None);
-                                                        composer_draft.set(text.clone());
-                                                        session.write().edit_text(text.clone());
-                                                        focus_composer();
-                                                    }
-                                                },
-                                                Icon { name: "edit", size: 13 }
-                                                span { class: "msg-action-label", "Edit" }
-                                            }
-                                        }
-                                        if let Some(text) = row.regen.clone() {
-                                            {
-                                                let confirming = confirm_regen().as_deref() == Some(row.id.as_str());
-                                                let row_id = row.id.clone();
-                                                rsx! {
-                                                    button {
-                                                        class: if confirming { "msg-action warn" } else { "msg-action" },
-                                                        r#type: "button",
-                                                        "aria-label": if confirming { "Confirm overwrite of draft and regenerate reply" } else { "Regenerate reply" },
-                                                        title: if confirming { "Click again to replace your unsent draft and resend" } else { "Send your last message again" },
-                                                        onclick: move |_| {
-                                                            if composer_draft().trim().is_empty() || confirming {
-                                                                confirm_regen.set(None);
-                                                                session.write().regenerate(text.clone());
-                                                            } else {
-                                                                confirm_regen.set(Some(row_id.clone()));
-                                                            }
-                                                        },
-                                                        Icon { name: "refresh", size: 13 }
-                                                        span { class: "msg-action-label",
-                                                            if confirming { "Replace draft?" } else { "Regenerate" }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        if row.continue_offer {
-                                            button {
-                                                class: "msg-action",
-                                                r#type: "button",
-                                                "aria-label": "Continue from where the bot stopped",
-                                                title: "Ask the bot to carry on from its tool limit",
-                                                onclick: move |_| session.write().continue_from_limit(),
-                                                Icon { name: "refresh", size: 13 }
-                                                span { class: "msg-action-label", "Continue" }
-                                            }
-                                        }
-                                    }
-                                }
+                            MessageRow {
+                                session,
+                                row: view.row,
+                                class: view.class,
+                                bot_meta: view.bot_meta,
+                                media: view.media,
+                                accepts,
+                                copied,
+                                confirm_regen,
+                                task_added_ids,
+                                composer_draft,
                             }
                         }
                     }
@@ -1027,6 +1057,23 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                         div { class: "banner warn", role: "status", "aria-live": "polite",
                             span { class: "step-spin", "aria-hidden": "true" }
                             "Reconnecting to live updates…"
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                disabled: link_retrying,
+                                "aria-label": "Try the live connection again",
+                                onclick: move |_| session.write().retry_link(),
+                                if link_retrying {
+                                    "Retrying…"
+                                } else {
+                                    "Retry"
+                                }
+                            }
+                        }
+                    }
+                    if cards_degraded {
+                        div { class: "banner info", role: "status",
+                            "Some questions or requests from your bots could not be refreshed. Reload to try again."
                         }
                     }
                     if sending && live_task.is_none() {
@@ -1049,12 +1096,19 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     for step in steps.iter().cloned() {
                                         ActivityRow { session, step, key: "{step.call_id}" }
                                     }
+                                    if let Some(note) = steps_dropped.clone() {
+                                        p { class: "activity-more", "{note}" }
+                                    }
                                 }
                             }
                         }
-                    } else if !steps.is_empty() {
+                    } else if !steps.is_empty() && history_ready {
+                        // The summary describes a reply: it waits for the
+                        // transcript, and opens by itself when a step needs
+                        // approval or failed, so it cannot hide either.
                         details {
                             class: "activity done",
+                            open: steps_attention,
                             ontoggle: move |_| {
                                 let _ = dioxus::document::eval(
                                     "requestAnimationFrame(() => { const el = document.querySelector('details.activity.done[open]'); if (el) el.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); })",
@@ -1068,8 +1122,19 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                 for step in steps.iter().cloned() {
                                     ActivityRow { session, step, key: "{step.call_id}" }
                                 }
+                                if let Some(note) = steps_dropped.clone() {
+                                    p { class: "activity-more", "{note}" }
+                                }
                             }
                         }
+                    }
+                    // One polite announcement per finished reply.
+                    div {
+                        class: "visually-hidden",
+                        role: "status",
+                        "aria-live": "polite",
+                        "aria-atomic": "true",
+                        "{announcement()}"
                     }
                     // Bottom sentinel: the page watches it to know the reader
                     // is at the end of the conversation.
@@ -1117,9 +1182,14 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     button {
                                         class: "btn ghost sm",
                                         r#type: "button",
+                                        disabled: link_retrying,
                                         "aria-label": "Try the connection again",
                                         onclick: move |_| session.write().retry_link(),
-                                        "Reconnect"
+                                        if link_retrying {
+                                            "Retrying…"
+                                        } else {
+                                            "Reconnect"
+                                        }
                                     }
                                 },
                                 ChatAction::OpenKeys => rsx! {
@@ -1138,7 +1208,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                 r#type: "button",
                                 title: "Dismiss",
                                 "aria-label": "Dismiss error",
-                                onclick: move |_| dismissed_failure.set(Some(failure.message.clone())),
+                                onclick: move |_| dismissed_failure.set(Some((failure.message.clone(), failure_attempt))),
                                 Icon { name: "x", size: 13 }
                             }
                         }
@@ -1151,6 +1221,13 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                 "aria-label": "Put the message back in the box",
                                 onclick: move |_| session.write().restore_held_draft(),
                                 "Put it back"
+                            }
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                "aria-label": "Check the transcript for the message",
+                                onclick: move |_| session.write().retry_history(),
+                                "Check transcript"
                             }
                             button {
                                 class: "btn ghost sm chat-banner-close",
@@ -1696,6 +1773,226 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One prepared transcript row, with what it is drawn with this time.
+struct RowView {
+    row: Rc<MsgView>,
+    class: String,
+    bot_meta: Option<(String, bool)>,
+    media: Vec<serabot_desktop::LibraryEntry>,
+}
+
+/// One message of the transcript. A component of its own so that a row whose
+/// props did not change is not re-diffed when the session is written for
+/// something else (a poll, a toast, a token of the streaming reply).
+#[component]
+fn MessageRow(
+    mut session: Signal<Session>,
+    row: Rc<MsgView>,
+    class: String,
+    bot_meta: Option<(String, bool)>,
+    media: Vec<serabot_desktop::LibraryEntry>,
+    accepts: bool,
+    mut copied: Signal<Option<String>>,
+    mut confirm_regen: Signal<Option<String>>,
+    mut task_added_ids: Signal<HashSet<String>>,
+    mut composer_draft: Signal<String>,
+) -> Element {
+    rsx! {
+        div { class: "{class}",
+            span {
+                class: if row.user { "msg-avatar avatar user" } else { "msg-avatar avatar bot" },
+                style: row.bot.as_deref().map(avatar_style).unwrap_or_default(),
+                "{row.avatar}"
+            }
+            div { class: "msg-main",
+                div { class: "msg-head",
+                    // The own-message label restates what the
+                    // right-aligned bubble already says.
+                    if !row.user {
+                        span { class: "msg-name", "{row.speaker}" }
+                    }
+                    span { class: "msg-time", "{row.stamp}" }
+                    if row.bot.is_some() {
+                        if let Some((role, live)) = bot_meta.clone() {
+                            span { class: "team-chip", "{role}" }
+                            span {
+                                class: if live { "chip ok" } else { "chip warn" },
+                                if live { "live" } else { "not live" }
+                            }
+                        }
+                    }
+                    if row.peer {
+                        span { class: "team-chip", "peer bot" }
+                    }
+                }
+                div { class: "msg-body", title: "{row.stamp}",
+                    MarkdownBody { message_id: row.id.clone(), content: row.content.clone() }
+                    if row.user {
+                        MessageFiles { session, id: row.id.clone() }
+                    }
+                }
+                if !media.is_empty() {
+                    TurnMediaCards { session, entries: media.clone() }
+                }
+                div {
+                    class: "msg-actions",
+                    role: "toolbar",
+                    "aria-label": "Message actions",
+                    "aria-orientation": "horizontal",
+                    // One tab stop per toolbar; the arrow keys move inside it.
+                    onkeydown: move |event: KeyboardEvent| {
+                        let direction = match event.key() {
+                            Key::ArrowRight | Key::ArrowDown => "next",
+                            Key::ArrowLeft | Key::ArrowUp => "prev",
+                            Key::Home => "first",
+                            Key::End => "last",
+                            _ => return,
+                        };
+                        event.prevent_default();
+                        let _ = dioxus::document::eval(&chat_scroll::toolbar_move_js(direction));
+                    },
+                    // The time shows with the actions, on hover or focus.
+                    span { class: "msg-action-time", "{row.stamp}" }
+                    button {
+                        class: "msg-action",
+                        r#type: "button",
+                        "aria-label": "Copy message",
+                        title: "Copy",
+                        onclick: {
+                            let text = row.content.clone();
+                            let id = row.id.clone();
+                            move |_| {
+                                let _ = dioxus::document::eval(&copy_script(&text));
+                                copied.set(Some(id.clone()));
+                                let id = id.clone();
+                                spawn(async move {
+                                    let mut done = dioxus::document::eval(CONFIRM_RESET_JS);
+                                    let _ = done.recv::<bool>().await;
+                                    if copied.peek().as_deref() == Some(id.as_str()) {
+                                        copied.set(None);
+                                    }
+                                });
+                            }
+                        },
+                        Icon {
+                            name: if copied().as_deref() == Some(row.id.as_str()) { "check" } else { "copy" },
+                            size: 13
+                        }
+                        span { class: "msg-action-label",
+                            if copied().as_deref() == Some(row.id.as_str()) { "Copied" } else { "Copy" }
+                        }
+                    }
+                    if accepts && !row.content.trim().is_empty() {
+                        button {
+                            class: "msg-action",
+                            r#type: "button",
+                            "aria-label": "Quote message in composer",
+                            title: "Quote in composer",
+                            onclick: {
+                                let text = row.content.clone();
+                                move |_| {
+                                    confirm_regen.set(None);
+                                    let next = chat_compose::quote_reply_text(
+                                        &composer_draft(),
+                                        &text,
+                                    );
+                                    composer_draft.set(next.clone());
+                                    session.write().composer = next;
+                                    focus_composer();
+                                }
+                            },
+                            Icon { name: "chat", size: 13 }
+                            span { class: "msg-action-label", "Quote" }
+                        }
+                    }
+                    if !row.content.trim().is_empty() {
+                        if task_added_ids().contains(&row.id) {
+                            span { class: "msg-task-added",
+                                Icon { name: "check", size: 12 }
+                                " Task added"
+                            }
+                        } else {
+                            button {
+                                class: "msg-action",
+                                r#type: "button",
+                                "aria-label": "Create task from message",
+                                title: "Create task from this message",
+                                onclick: {
+                                    let text = row.content.clone();
+                                    let id = row.id.clone();
+                                    move |_| {
+                                        let title = chat_compose::task_title_from_message(&text);
+                                        session.write().add_task(title, None);
+                                        task_added_ids.write().insert(id.clone());
+                                    }
+                                },
+                                Icon { name: "plus", size: 13 }
+                                span { class: "msg-action-label", "Create task" }
+                            }
+                        }
+                    }
+                    if row.edit {
+                        button {
+                            class: "msg-action",
+                            r#type: "button",
+                            "aria-label": "Edit message",
+                            title: "Put this message back in the composer",
+                            onclick: {
+                                let text = row.content.clone();
+                                move |_| {
+                                    confirm_regen.set(None);
+                                    composer_draft.set(text.clone());
+                                    session.write().edit_text(text.clone());
+                                    focus_composer();
+                                }
+                            },
+                            Icon { name: "edit", size: 13 }
+                            span { class: "msg-action-label", "Edit" }
+                        }
+                    }
+                    if let Some(text) = row.regen.clone() {
+                        {
+                            let confirming = confirm_regen().as_deref() == Some(row.id.as_str());
+                            let row_id = row.id.clone();
+                            rsx! {
+                                button {
+                                    class: if confirming { "msg-action warn" } else { "msg-action" },
+                                    r#type: "button",
+                                    "aria-label": if confirming { "Confirm overwrite of draft and regenerate reply" } else { "Regenerate reply" },
+                                    title: if confirming { "Click again to replace your unsent draft and resend" } else { "Send your last message again" },
+                                    onclick: move |_| {
+                                        if composer_draft().trim().is_empty() || confirming {
+                                            confirm_regen.set(None);
+                                            session.write().regenerate(text.clone());
+                                        } else {
+                                            confirm_regen.set(Some(row_id.clone()));
+                                        }
+                                    },
+                                    Icon { name: "refresh", size: 13 }
+                                    span { class: "msg-action-label",
+                                        if confirming { "Replace draft?" } else { "Regenerate" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if row.continue_offer {
+                        button {
+                            class: "msg-action",
+                            r#type: "button",
+                            "aria-label": "Continue from where the bot stopped",
+                            title: "Ask the bot to carry on from its tool limit",
+                            onclick: move |_| session.write().continue_from_limit(),
+                            Icon { name: "refresh", size: 13 }
+                            span { class: "msg-action-label", "Continue" }
                         }
                     }
                 }

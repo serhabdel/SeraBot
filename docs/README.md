@@ -36,6 +36,7 @@ artifacts.
 | [Release 0.45.0](release-0.45.0.md) | Wave 8 OAuth callback & connector test fixes, Proton Pass default & PAT fallback, Vault & Tasks full editing, and Visual Workflow Studio routine/workflow editing. |
 | [Release 0.46.0](release-0.46.0.md) | Wave 9 Vault CLI auto-install, Tasks HTTP 415 + unified Calendar sync + layout fixes, OneDrive folder visibility & local-folder clarity, secret redaction + Composer Credential Guard, and ChatView search / create-task / starter chips. |
 | [Release 0.47.0](release-0.47.0.md) | Wave 10 `jobfinder` specialist bot, smart conversation titles & `conversation.renamed` SSE, inline approvals (desktop/mobile/Telegram), 1-click Browser Vault autofill, Vault provider sync, compiled-in default bot avatars, and mobile Tasks/Chat/Preview upgrades. |
+| [Release 0.48.0](release-0.48.0.md) | Logging hardening (noisy-crate caps, shared default filter, per-layer ring filter, durable owner-only `[logging] dir`), approval expiry check at decision time, and negative tests for jobs, workflows, preview, vault autofill and approvals. |
 | [Events](events.md) | `turn.step` payload for desktop and Android step cards. |
 | [Tool results](tool-results.md) | Audio, file, image, link, and table cards. |
 | [Console pages](console-pages.md) | Tasks, Memory, Connectors, and Providers fields the next desktop pages read. |

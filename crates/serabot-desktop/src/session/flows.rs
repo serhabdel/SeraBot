@@ -285,7 +285,20 @@ impl Session {
             self.schedule(Operation::OnboardingLoad { id }, Duration::ZERO);
             return;
         }
+        // The sidebar's "Bots N of M" needs the catalog even before the Meet
+        // your team sheet is opened, and it is read again after a change.
+        if self.state.connected && (self.catalog_refresh || !self.state.shipped_loaded) {
+            self.catalog_refresh = false;
+            self.schedule(Operation::BotCatalog, Duration::ZERO);
+            return;
+        }
         self.schedule_next_avatar();
+    }
+
+    /// Open the Integrations screen on its Bots tab (the sidebar link).
+    pub fn open_bots_tab(&mut self) {
+        self.integrations_tab_request = Some(crate::integrations::Tab::Bots);
+        self.open_section(Section::Integrations);
     }
 
     /// "Meet your team" opened: read the shipped templates. Scheduled, not

@@ -1223,6 +1223,63 @@ mod tests {
         serde_json::from_slice(&body).unwrap()
     }
 
+    #[tokio::test]
+    async fn preview_refuses_foreign_artifacts_and_path_like_hashes() {
+        let (app, store, artifacts, owner) = preview_test_app();
+        let meta = ArtifactMeta {
+            title: "Private".into(),
+            filename: "private.md".into(),
+            language: crate::domain::Language::En,
+            source_artifact: None,
+            created_at: Utc::now(),
+        };
+        let stored = artifacts.save(b"# private", "private.md", meta).unwrap();
+        store
+            .record_conversation_artifact(
+                &owner,
+                "dir:main",
+                None,
+                "test_tool",
+                &stored.hash,
+                "private.md",
+                None,
+            )
+            .unwrap();
+        let other = store
+            .create_user("subject-preview-b", "pb@example.example", "Preview B")
+            .unwrap();
+        let token = store
+            .mint_session(&other.id, chrono::Duration::hours(1))
+            .unwrap();
+        let get = |uri: String| {
+            let app = app.clone();
+            let token = token.clone();
+            async move {
+                app.oneshot(
+                    axum::http::Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+        // Another user's artifact looks missing; a traversal-shaped hash
+        // never reaches the filesystem.
+        assert_eq!(
+            get(format!("/v1/artifacts/{}/preview", stored.hash)).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_ne!(
+            get("/v1/artifacts/..%2F..%2Fserabot.db/preview".into()).await,
+            StatusCode::OK
+        );
+    }
+
     #[test]
     fn pdf_preview_synthesizes_summary_when_pdf_has_no_text_layer() {
         // Pure vector path (like outline-rendered deck PDFs): no Tj/TJ text.

@@ -412,3 +412,90 @@ async fn active_workflows_return_items_and_support_editing() {
         .unwrap();
     assert_eq!(bad_res.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
+
+#[tokio::test]
+async fn workflows_and_routines_never_cross_users() {
+    let (app, _, store) = app();
+    let alice = store
+        .create_user("subject-wf-a", "wfa@example.example", "Workflow A")
+        .unwrap();
+    let bob = store
+        .create_user("subject-wf-b", "wfb@example.example", "Workflow B")
+        .unwrap();
+    let bob_token = mint_for(&store, &bob.id, "wf-b");
+    store
+        .ensure_conversation_accepts_turns(&alice.id, "dir:wf-private")
+        .unwrap();
+    store
+        .set_plan(
+            &alice.id,
+            "dir:wf-private",
+            "Alice goal",
+            &[crate::plans::PlanItem {
+                text: "Alice step".into(),
+                status: crate::plans::PlanStatus::Pending,
+            }],
+        )
+        .unwrap();
+
+    // Bob's list is empty and a goal-only edit of Alice's plan is a 404.
+    let list = app
+        .clone()
+        .oneshot(request_with_token(
+            "GET",
+            "/v1/workflows/active",
+            &bob_token,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    assert!(
+        read_json(list).await["workflows"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let edit = app
+        .clone()
+        .oneshot(request_with_token(
+            "PUT",
+            "/v1/workflows/active/dir:wf-private",
+            &bob_token,
+            Some(json!({"goal": "Hijacked"})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(edit.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        store
+            .get_plan(&alice.id, "dir:wf-private")
+            .unwrap()
+            .unwrap()
+            .goal,
+        "Alice goal"
+    );
+
+    // Routines: Bob cannot delete Alice's schedule.
+    crate::scheduler::ensure_daily_routine(
+        &store,
+        &alice.id,
+        "morning_brief",
+        "07:00",
+        chrono_tz::UTC,
+    )
+    .unwrap();
+    assert!(store.routine_exists(&alice.id, "morning_brief").unwrap());
+    let delete = app
+        .clone()
+        .oneshot(request_with_token(
+            "DELETE",
+            "/v1/routines/morning_brief",
+            &bob_token,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), StatusCode::NOT_FOUND);
+    assert!(store.routine_exists(&alice.id, "morning_brief").unwrap());
+}
