@@ -146,7 +146,6 @@ pub enum Section {
     Conversations,
     Memory,
     Providers,
-    Approvals,
     Browser,
     Vault,
     Usage,
@@ -162,7 +161,7 @@ pub enum Section {
 }
 
 impl Section {
-    pub const NAV: [Self; 12] = [
+    pub const NAV: [Self; 11] = [
         Self::Chat,
         Self::Conversations,
         Self::Browser,
@@ -170,7 +169,6 @@ impl Section {
         Self::Memory,
         Self::Providers,
         Self::Integrations,
-        Self::Approvals,
         Self::Vault,
         Self::Usage,
         Self::Workflows,
@@ -183,7 +181,6 @@ impl Section {
             Self::Conversations => "Conversations",
             Self::Memory => "Memory",
             Self::Providers => "Providers",
-            Self::Approvals => "Approvals",
             Self::Browser => "Browser",
             Self::Vault => "Vault",
             Self::Usage => "Usage",
@@ -1144,7 +1141,6 @@ impl Session {
             self.avatar_op = None;
             self.creating_named_bot = false;
             self.pending_open_group = None;
-            crate::avatars::publish(&std::collections::BTreeMap::new());
             self.bot_settings = BotSettings::default();
             self.memory.content.zeroize();
             self.memory.edit_content.zeroize();
@@ -2437,17 +2433,54 @@ impl Session {
             .unwrap_or_else(|| "B".into())
     }
 
+    fn first_user_message_in_active(&self) -> Option<&str> {
+        self.state.messages.iter().find_map(|message| {
+            (message.role == Role::User && !message.content.trim().is_empty())
+                .then_some(message.content.as_str())
+        })
+    }
+
+    fn fallback_extra_chat_title(&self, id: &str) -> String {
+        if let Some(chat) = self.bot_chat(id) {
+            let bot_name = self
+                .conversation_bot(id)
+                .map(|bot| self.bot_display_name(&bot));
+            let first_msg = (id == self.conversation)
+                .then(|| self.first_user_message_in_active())
+                .flatten();
+            return crate::bot_chats::chat_title_with_fallback(
+                chat,
+                first_msg,
+                bot_name.as_deref(),
+            );
+        }
+        if id == self.conversation
+            && let Some(derived) = self
+                .first_user_message_in_active()
+                .and_then(crate::bot_chats::derive_title_from_message)
+        {
+            return derived;
+        }
+        if let Some(bot) = self.conversation_bot(id) {
+            return format!("New conversation \u{00b7} {}", self.bot_display_name(&bot));
+        }
+        "New conversation".into()
+    }
+
     pub fn conversation_label(&self, conversation: &crate::ConversationSummary) -> String {
         if let Some(title) = conversation
             .title
             .as_deref()
             .map(str::trim)
-            .filter(|title| !title.is_empty())
+            .filter(|title| !title.is_empty() && !crate::bot_chats::is_raw_chat_id(title))
         {
             return title.to_owned();
         }
         if conversation.id == "windows-owner" {
             return "Owner".into();
+        }
+        if crate::bot_chats::is_extra_chat_id(&conversation.id) {
+            return self.fallback_extra_chat_title(&conversation.id);
         }
         if let Some(bot) = conversation.id.strip_prefix("dir:")
             && self.state.listed_bots.iter().any(|item| item.id == bot)
@@ -2460,12 +2493,11 @@ impl Session {
             .split_once(':')
             .map(|(_, slug)| slug)
             .unwrap_or(&conversation.id);
-        if conversation.id.chars().all(|c| c.is_ascii_digit()) {
-            let tail = conversation
-                .id
-                .get(conversation.id.len().saturating_sub(4)..)
-                .unwrap_or(&conversation.id);
-            return format!("Chat {tail}");
+        if conversation.id.chars().all(|c| c.is_ascii_digit())
+            || crate::bot_chats::is_raw_chat_id(slug)
+            || crate::bot_chats::is_raw_chat_id(&conversation.id)
+        {
+            return self.fallback_extra_chat_title(&conversation.id);
         }
         match kind {
             "section" => format!("Section · {}", humanize_label(slug)),
@@ -3311,8 +3343,6 @@ impl Session {
                     self.schedule(operation, POLL_GAP * slow);
                 }
             }
-        } else if self.section == Section::Approvals {
-            self.schedule(Operation::Approvals, POLL_GAP * 2 * slow);
         } else {
             self.ensure_section_data();
         }
@@ -3379,6 +3409,30 @@ impl Session {
                             &payload,
                         ) {
                             continue;
+                        }
+                        if kind == "conversation.renamed"
+                            && let Some(conv_id) = payload
+                                .get("id")
+                                .or_else(|| payload.get("conversation_id"))
+                                .and_then(|value| value.as_str())
+                            && let Some(title) =
+                                payload.get("title").and_then(|value| value.as_str())
+                        {
+                            let clean = title.trim();
+                            if !clean.is_empty() {
+                                for conversation in &mut self.state.conversations {
+                                    if conversation.id == conv_id {
+                                        conversation.title = Some(clean.to_owned());
+                                    }
+                                }
+                                for list in self.state.bot_chats.values_mut() {
+                                    for chat in &mut list.chats {
+                                        if chat.id == conv_id {
+                                            chat.title = Some(clean.to_owned());
+                                        }
+                                    }
+                                }
+                            }
                         }
                         choose_event_kind(
                             &mut self.last_event_kind,
@@ -3640,11 +3694,17 @@ impl Session {
                 Err(error) if completion.kind == OperationKind::Avatar => {
                     match self.avatar_op.take() {
                         Some(AvatarOp::Fetch(target, version)) => {
+                            let key = target.key();
+                            let existing_url = self
+                                .state
+                                .avatars
+                                .get(&key)
+                                .and_then(|img| img.data_url.clone());
                             self.state.avatars.insert(
-                                target.key(),
+                                key,
                                 crate::avatars::AvatarImage {
                                     version,
-                                    data_url: None,
+                                    data_url: existing_url,
                                 },
                             );
                             self.schedule_next_avatar();
@@ -4516,6 +4576,8 @@ impl Session {
                     })
                 } else if !self.state.bots_loaded {
                     Some(Operation::ListBots)
+                } else if !self.state.approvals_loaded {
+                    Some(Operation::Approvals)
                 } else {
                     // One bot's chat list per tick, until every bot has one.
                     self.state
@@ -4540,15 +4602,6 @@ impl Session {
                 }
             }
             Section::Providers => (!self.state.providers_loaded).then_some(Operation::Providers),
-            Section::Approvals => {
-                if !self.state.approvals_loaded {
-                    Some(Operation::Approvals)
-                } else if !self.state.standing_grants_loaded {
-                    Some(Operation::StandingGrants)
-                } else {
-                    None
-                }
-            }
             Section::Tasks => {
                 if self.state.tasks_loaded {
                     None
@@ -4678,16 +4731,34 @@ impl Session {
         if self.conversation == "windows-owner" {
             return "Owner".into();
         }
-        if crate::bot_chats::is_extra_chat_id(&self.conversation) {
-            return self
-                .bot_chat(&self.conversation)
-                .map(crate::bot_chats::chat_title)
-                .unwrap_or_else(|| "New chat".into());
+        if crate::bot_chats::is_extra_chat_id(&self.conversation)
+            || crate::bot_chats::is_raw_chat_id(&self.conversation)
+        {
+            return self.fallback_extra_chat_title(&self.conversation);
         }
         if let Some(bot) = self.conversation.strip_prefix("dir:") {
             return self.bot_display_name(bot);
         }
         humanize_label(&self.conversation)
+    }
+
+    /// Jump directly to the conversation needing approval (or open the active
+    /// chat's inline approval card) instead of a standalone Approvals tab.
+    pub fn open_approval_conversation(&mut self) {
+        self.open_section(Section::Chat);
+        if let Some(task) = self.state.task.as_ref()
+            && task.status == TaskStatus::AwaitingApproval
+            && !task.bot.trim().is_empty()
+        {
+            let target_bot = task.bot.clone();
+            if self.conversation_bot(&self.conversation).as_deref() != Some(target_bot.as_str()) {
+                self.open_bot_chat(target_bot);
+                return;
+            }
+        }
+        if !self.state.approvals_loaded {
+            self.refresh_approvals();
+        }
     }
 
     pub fn conversation_kind(&self) -> Option<&str> {
@@ -6562,5 +6633,85 @@ mod backlog_tests {
             event_refresh(&session.last_event_kind, &session.conversation),
             EventRefresh::Approvals
         );
+    }
+
+    #[test]
+    fn conversation_titles_never_expose_raw_ids_and_fallback_cleanly() {
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        session.state.listed_bots.push(crate::BotSummary {
+            id: "analyst".into(),
+            role: "analyst".into(),
+            enabled: true,
+            live: true,
+            model: None,
+            display_name: Some("Analyst".into()),
+            title: None,
+            description: None,
+            avatar: Some("A".into()),
+            avatar_version: None,
+            tools: Vec::new(),
+            skills: Vec::new(),
+            require_approval: Vec::new(),
+        });
+        session.state.bot_chats.insert(
+            "analyst".into(),
+            crate::bot_chats::BotChatList {
+                bot: "analyst".into(),
+                refresh_every_turns: 40,
+                chats: vec![crate::bot_chats::BotChat {
+                    id: "dir:chat-01a1dfd96abc".into(),
+                    bot: "analyst".into(),
+                    title: None,
+                    primary: false,
+                    archived: false,
+                    carried_from: None,
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                    last_message_at: None,
+                    turns: 0,
+                    has_summary: false,
+                }],
+            },
+        );
+        session.conversation = "dir:chat-01a1dfd96abc".into();
+        // No messages yet -> "New conversation · Analyst" (never raw hex id).
+        assert_eq!(
+            session.conversation_title(),
+            "New conversation \u{00b7} Analyst"
+        );
+        // Active thread with a user message -> derived short title.
+        session.state.messages.push(crate::Message {
+            id: "m1".into(),
+            role: crate::Role::User,
+            content: "Summarize Q4 cashflow forecast".into(),
+            created_at: String::new(),
+            name: None,
+            bot: None,
+            attachments: Vec::new(),
+            limit_reached: false,
+        });
+        assert_eq!(
+            session.conversation_title(),
+            "Summarize Q4 cashflow forecast"
+        );
+    }
+
+    #[test]
+    fn open_approval_conversation_routes_to_awaiting_bot() {
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        session.state.bot_chat_binding = Some(true);
+        session.section = Section::Settings;
+        session.conversation = "dir:main".into();
+        session.state.task = Some(crate::Task {
+            id: "t1".into(),
+            kind: "turn".into(),
+            bot: "analyst".into(),
+            status: crate::TaskStatus::AwaitingApproval,
+        });
+        session.open_approval_conversation();
+        assert!(session.section == Section::Chat);
+        assert_eq!(session.conversation, "dir:analyst");
     }
 }

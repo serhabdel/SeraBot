@@ -498,6 +498,40 @@ pub(super) fn TeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> E
                     }
                 }
                 if is_room {
+                    {
+                        let title = session.read().conversation_title();
+                        let letter = title
+                            .chars()
+                            .find(|c| c.is_alphanumeric())
+                            .map(|c| c.to_uppercase().to_string())
+                            .unwrap_or_else(|| "G".into());
+                        let key = serabot_desktop::avatars::css_key("grp", &conversation);
+                        let label = if serabot_desktop::avatars::has_image(&key) {
+                            "Change image\u{2026}".to_owned()
+                        } else {
+                            "Set channel image\u{2026}".to_owned()
+                        };
+                        let conv_id = conversation.clone();
+                        rsx! {
+                            div { class: "field",
+                                label { class: "field-label", "Channel image" }
+                                crate::ui_bots::AvatarPicker {
+                                    preview: None,
+                                    letter,
+                                    style: group_avatar_style(&conversation),
+                                    has_image: false,
+                                    label,
+                                    on_pick: move |bytes: Vec<u8>| {
+                                        session.write().pick_image(
+                                            serabot_desktop::session::ImageSlot::Group(conv_id.clone()),
+                                            bytes,
+                                        );
+                                    },
+                                    on_clear: move |_| {},
+                                }
+                            }
+                        }
+                    }
                     div { class: "field",
                         label { class: "field-label", r#for: "team-mode-select", "Mode" }
                         select {

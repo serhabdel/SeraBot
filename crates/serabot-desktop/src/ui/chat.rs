@@ -126,12 +126,6 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         let index = chat_cards::insert_index(&message_times, &card.created_at);
         placed[index].push(card);
     }
-    let task = session
-        .read()
-        .state
-        .task
-        .as_ref()
-        .map(|task| (task.status, task.status.label().to_owned()));
     let live_task: Option<TaskStatus> = session
         .read()
         .state
@@ -665,18 +659,6 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                         }
                     }
                 }
-                if let Some((status, label)) = task {
-                    if status == TaskStatus::AwaitingApproval {
-                        div { class: "banner warn",
-                            span { "{label}" }
-                            button {
-                                class: "btn ghost sm",
-                                onclick: move |_| session.write().open_section(Section::Approvals),
-                                "Review approvals"
-                            }
-                        }
-                    }
-                }
                 if let Some(plan) = chat_plan.clone() {
                     PlanPanel { plan }
                 }
@@ -1117,6 +1099,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                             }
                         }
                     }
+                    crate::ui_cards::InlineApprovals { session }
                     if let Some(failure) = show_failure.clone() {
                         div { class: "banner err", role: "alert",
                             span { "{failure.message}" }
