@@ -36,6 +36,8 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _atBottom = true;
   int _unseen = 0;
   int _lastCount = 0;
+  final Set<String> _busyApprovals = <String>{};
+  bool _showOtherApprovals = false;
 
   @override
   void initState() {
@@ -190,6 +192,63 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  Future<void> _decideApproval(ApprovalItem item, ApprovalDecision d) async {
+    setState(() => _busyApprovals.add(item.id));
+    try {
+      await chat.decide(item.id, d);
+    } on ApiException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text(e.messageForUser())));
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _busyApprovals.remove(item.id));
+      }
+    }
+  }
+
+  Widget _approvalsSection(BuildContext context) {
+    final all = widget.app.approvals;
+    if (all.isEmpty) {
+      return const SizedBox.shrink();
+    }
+    final stepIds = chat.activity.steps
+        .map((s) => s.approvalId)
+        .whereType<String>()
+        .toSet();
+    final inThread = all
+        .where((a) =>
+            a.conversationId == widget.conversation.id ||
+            stepIds.contains(a.id))
+        .toList();
+    final other = all.where((a) => !inThread.contains(a)).toList();
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          for (final a in inThread)
+            _InlineApprovalCard(
+              item: a,
+              busy: _busyApprovals.contains(a.id),
+              onDecide: (d) => _decideApproval(a, d),
+            ),
+          if (other.isNotEmpty)
+            _OtherApprovalsBanner(
+              approvals: other,
+              expanded: _showOtherApprovals,
+              busyIds: _busyApprovals,
+              onToggle: () =>
+                  setState(() => _showOtherApprovals = !_showOtherApprovals),
+              onDecide: _decideApproval,
+            ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final c = widget.conversation;
@@ -294,6 +353,7 @@ class _ChatScreenState extends State<ChatScreen> {
                         : () => _onErrorAction(context),
                   ),
                 ),
+              _approvalsSection(context),
               Composer(chat: chat, device: widget.device),
             ],
           ),
@@ -1256,6 +1316,192 @@ class _ReconnectBanner extends StatelessWidget {
           ]),
         ),
       ),
+    );
+  }
+}
+
+class _InlineApprovalCard extends StatelessWidget {
+  const _InlineApprovalCard({
+    required this.item,
+    required this.busy,
+    required this.onDecide,
+  });
+
+  final ApprovalItem item;
+  final bool busy;
+  final ValueChanged<ApprovalDecision> onDecide;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final exp = shortTime(item.expiresAt);
+    return Card(
+      key: Key('inline-approval-${item.id}'),
+      margin: const EdgeInsets.only(bottom: 6),
+      color: scheme.tertiaryContainer.withValues(alpha: 0.45),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(14),
+        side: BorderSide(color: scheme.tertiary.withValues(alpha: 0.4)),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: scheme.tertiary,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.gavel_rounded,
+                          size: 13, color: scheme.onTertiary),
+                      const SizedBox(width: 4),
+                      Text(
+                        item.tool,
+                        style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                              color: scheme.onTertiary,
+                              fontWeight: FontWeight.w700,
+                            ),
+                      ),
+                    ],
+                  ),
+                ),
+                const Spacer(),
+                if (exp.isNotEmpty)
+                  Text(
+                    'Expires $exp',
+                    style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                          color: scheme.onSurfaceVariant,
+                        ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(item.summary, style: Theme.of(context).textTheme.bodyMedium),
+            if (item.destination != null) ...[
+              const SizedBox(height: 4),
+              Row(
+                children: [
+                  Icon(Icons.arrow_outward_rounded,
+                      size: 14, color: scheme.onSurfaceVariant),
+                  const SizedBox(width: 4),
+                  Expanded(
+                    child: Text(
+                      item.destination!,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                            color: scheme.onSurfaceVariant,
+                          ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+            const SizedBox(height: 10),
+            Wrap(
+              spacing: 8,
+              runSpacing: 6,
+              children: [
+                FilledButton.tonalIcon(
+                  onPressed:
+                      busy ? null : () => onDecide(ApprovalDecision.once),
+                  icon: const Icon(Icons.check_rounded, size: 16),
+                  label: const Text('Approve'),
+                ),
+                OutlinedButton(
+                  onPressed:
+                      busy ? null : () => onDecide(ApprovalDecision.always),
+                  child: const Text('Always'),
+                ),
+                TextButton(
+                  onPressed:
+                      busy ? null : () => onDecide(ApprovalDecision.deny),
+                  child: const Text('Deny'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _OtherApprovalsBanner extends StatelessWidget {
+  const _OtherApprovalsBanner({
+    required this.approvals,
+    required this.expanded,
+    required this.busyIds,
+    required this.onToggle,
+    required this.onDecide,
+  });
+
+  final List<ApprovalItem> approvals;
+  final bool expanded;
+  final Set<String> busyIds;
+  final VoidCallback onToggle;
+  final void Function(ApprovalItem, ApprovalDecision) onDecide;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final count = approvals.length;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        InkWell(
+          key: const Key('other-approvals-banner'),
+          borderRadius: BorderRadius.circular(12),
+          onTap: onToggle,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: BoxDecoration(
+              color: scheme.secondaryContainer.withValues(alpha: 0.7),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Row(
+              children: [
+                Icon(Icons.gavel_rounded,
+                    size: 16, color: scheme.onSecondaryContainer),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    count == 1
+                        ? '1 pending approval waiting'
+                        : '$count pending approvals waiting',
+                    style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                          color: scheme.onSecondaryContainer,
+                          fontWeight: FontWeight.w600,
+                        ),
+                  ),
+                ),
+                Icon(
+                  expanded ? Icons.expand_less : Icons.expand_more,
+                  size: 18,
+                  color: scheme.onSecondaryContainer,
+                ),
+              ],
+            ),
+          ),
+        ),
+        if (expanded) ...[
+          const SizedBox(height: 6),
+          for (final a in approvals)
+            _InlineApprovalCard(
+              item: a,
+              busy: busyIds.contains(a.id),
+              onDecide: (d) => onDecide(a, d),
+            ),
+        ],
+      ],
     );
   }
 }

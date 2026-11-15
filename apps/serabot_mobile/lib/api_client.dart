@@ -697,6 +697,25 @@ class ApiClient {
     _checkStatus(response);
   }
 
+  /// Upload or replace a channel/conversation avatar (`PUT /v1/conversations/{id}/avatar`).
+  Future<void> setConversationAvatar(String id, List<int> bytes) async {
+    _checkId(id);
+    if (bytes.isEmpty || bytes.length > 2 * 1024 * 1024) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Pictures must be at most 2 MB.',
+      );
+    }
+    final response = await _send(
+      'PUT',
+      _uri(['v1', 'conversations', id, 'avatar']),
+      bodyBytes: bytes,
+      extraHeaders: {'Content-Type': 'application/octet-stream'},
+      timeout: const Duration(seconds: 60),
+    );
+    _checkStatus(response);
+  }
+
   /// Speech to text for the composer mic button. The transcript is model
   /// output: the user reviews it before sending.
   Future<String> transcribe(String filename, List<int> audio) async {
@@ -926,6 +945,92 @@ class ApiClient {
       ['v1', 'approvals', id, 'decide'],
       body: {'decision': decision.apiValue},
     );
+  }
+
+  /// Personal tasks (`GET /v1/tasks`). Returns `supported: false` on 404.
+  Future<TasksResponse> tasks({String? status}) async {
+    final query = <String, String>{};
+    if (status != null && status.isNotEmpty) {
+      query['status'] = status;
+    }
+    final response = await _send(
+      'GET',
+      _uri(['v1', 'tasks'], query.isEmpty ? null : query),
+    );
+    if (response.statusCode == 404) {
+      return const TasksResponse(supported: false);
+    }
+    return TasksResponse.fromJson(_decode(response));
+  }
+
+  Future<PersonalTask> createTask({
+    required String title,
+    String? notes,
+    String? status,
+    String? due,
+  }) async {
+    final body = <String, dynamic>{'title': title};
+    if (notes != null && notes.isNotEmpty) {
+      body['notes'] = notes;
+    }
+    if (status != null && status.isNotEmpty) {
+      body['status'] = status;
+    }
+    if (due != null && due.isNotEmpty) {
+      body['due'] = due;
+    }
+    final json = await _request('POST', ['v1', 'tasks'], body: body);
+    return PersonalTask.fromJson(json['task'] as Map<String, dynamic>);
+  }
+
+  Future<PersonalTask> updateTask(
+    String id, {
+    String? title,
+    String? notes,
+    String? status,
+    String? due,
+    bool clearDue = false,
+  }) async {
+    _checkId(id);
+    final body = <String, dynamic>{};
+    if (title != null) body['title'] = title;
+    if (notes != null) body['notes'] = notes;
+    if (status != null) body['status'] = status;
+    if (clearDue) {
+      body['due'] = null;
+    } else if (due != null) {
+      body['due'] = due;
+    }
+    final json = await _request('PATCH', ['v1', 'tasks', id], body: body);
+    return PersonalTask.fromJson(json['task'] as Map<String, dynamic>);
+  }
+
+  Future<void> deleteTask(String id) async {
+    _checkId(id);
+    await _request('DELETE', ['v1', 'tasks', id]);
+  }
+
+  Future<void> syncTasksRun() async {
+    await _request('POST', ['v1', 'tasks', 'sync', 'run']);
+  }
+
+  Future<List<CalendarEventItem>> calendarEvents({String? from, String? to}) async {
+    final query = <String, String>{};
+    if (from != null && from.isNotEmpty) query['from'] = from;
+    if (to != null && to.isNotEmpty) query['to'] = to;
+    final response = await _send(
+      'GET',
+      _uri(['v1', 'tasks', 'calendar'], query.isEmpty ? null : query),
+    );
+    if (response.statusCode == 404) {
+      return const [];
+    }
+    final json = _decode(response);
+    final list = json['events'] as List<dynamic>? ?? const [];
+    return list
+        .whereType<Map<String, dynamic>>()
+        .map(CalendarEventItem.fromJson)
+        .toList();
   }
 
   /// Scaffolds a disabled specialist. An empty [tools] list is sent as-is;
