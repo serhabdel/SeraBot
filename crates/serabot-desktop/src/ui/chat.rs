@@ -18,6 +18,10 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         .task
         .as_ref()
         .is_none_or(|task| task.status.terminal());
+    let assigned_library = {
+        let state = session.read();
+        chat_feed::assign_library_to_messages(&state.state.messages, &state.state.library)
+    };
     let awaiting_approval = session
         .read()
         .state
@@ -753,6 +757,13 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                             MessageFiles { session, id: row.id.clone() }
                                         }
                                     }
+                                    if !row.user {
+                                        if let Some(entries) = assigned_library.by_message.get(&row.id).cloned() {
+                                            if !entries.is_empty() {
+                                                TurnMediaCards { session, entries }
+                                            }
+                                        }
+                                    }
                                     div { class: "msg-actions", role: "toolbar", "aria-label": "Message actions",
                                         // The time shows with the actions, on hover or focus.
                                         span { class: "msg-action-time", "{row.stamp}" }
@@ -873,8 +884,13 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     for card in placed.last().cloned().unwrap_or_default() {
                         ChatCardRow { session, key: "{card.id}", card }
                     }
-                    // Files the bots produced in this chat (Open / Save as).
-                    MediaCards { session }
+                    // Files produced in an active turn that has no reply yet.
+                    if !assigned_library.trailing.is_empty() {
+                        TrailingMediaCards {
+                            session,
+                            entries: assigned_library.trailing,
+                        }
+                    }
                     // Cards waiting for the owner: questions and secret requests.
                     for card in pending_cards.clone() {
                         ChatCardRow { session, key: "{card.id}", card }
