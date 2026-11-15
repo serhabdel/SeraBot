@@ -164,7 +164,14 @@ fn parse_plan_step(row: &Value) -> Option<WorkflowPlanStep> {
     let title = clean(row, "title", MAX_GOAL)
         .or_else(|| clean(row, "text", MAX_GOAL))
         .or_else(|| clean(row, "label", MAX_GOAL))?;
-    let done = row.get("done").and_then(|v| v.as_bool()).unwrap_or(false);
+    let done = row
+        .get("done")
+        .and_then(|v| v.as_bool())
+        .unwrap_or_else(|| {
+            row.get("status")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("done"))
+        });
     Some(WorkflowPlanStep { title, done })
 }
 

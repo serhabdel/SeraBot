@@ -2537,8 +2537,8 @@ impl ApiClient {
         }
         #[derive(Serialize)]
         struct Item<'a> {
-            title: &'a str,
-            done: bool,
+            text: &'a str,
+            status: &'a str,
         }
         #[derive(Serialize)]
         struct Body<'a> {
@@ -2550,8 +2550,8 @@ impl ApiClient {
         let encoded_items = items.map(|list| {
             list.iter()
                 .map(|(title, done)| Item {
-                    title: title.as_str(),
-                    done: *done,
+                    text: title.as_str(),
+                    status: if *done { "done" } else { "pending" },
                 })
                 .collect()
         });

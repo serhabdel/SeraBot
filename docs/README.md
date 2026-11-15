@@ -33,6 +33,7 @@ artifacts.
 | [Release 0.42.0](release-0.42.0.md) | Desktop core resilience & server feature polish: fixed pending-gate refresh drops, `Cmd/Ctrl+K` active-screen search focus, standing-grant search/skeleton/confirm, SSE buffer cap & updater backup/restore; server brief/digest/analyst/watcher/spreadsheets/workbooks/documents hardening. |
 | [Release 0.43.0](release-0.43.0.md) | Long conversation scroll & details auto-scroll, ElevenLabs OAuth 2.1-only & media handling fixes, Integrations overhaul & Marketplace base enabled (`RUNTIME_CALLS_PLUGINS = true`, builtin 10-plugin catalog, SVG brand marks), and artifact preview fixes. |
 | [Release 0.44.0](release-0.44.0.md) | Rich visual preview dock across Image, PDF, PPTX, XLSX, and DOCX; expanded activity box & stop button; chat media card layout & pending job visibility; and step-more toggle polish. |
+| [Release 0.45.0](release-0.45.0.md) | Wave 8 OAuth callback & connector test fixes, Proton Pass default & PAT fallback, Vault & Tasks full editing, and Visual Workflow Studio routine/workflow editing. |
 | [Events](events.md) | `turn.step` payload for desktop and Android step cards. |
 | [Tool results](tool-results.md) | Audio, file, image, link, and table cards. |
 | [Console pages](console-pages.md) | Tasks, Memory, Connectors, and Providers fields the next desktop pages read. |
