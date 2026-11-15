@@ -269,6 +269,9 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let mut composer_focused = use_signal(|| false);
     let mut copied = use_signal(|| Option::<String>::None);
     let mut confirm_regen = use_signal(|| Option::<String>::None);
+    let mut task_added_ids = use_signal(HashSet::<String>::new);
+    let mut search_open = use_signal(|| false);
+    let mut search_query = use_signal(String::new);
     let mut dismissed_failure = use_signal(|| Option::<String>::None);
     let mut dismissed_held = use_signal(|| false);
     let mut dismissed_transcript_err = use_signal(|| Option::<String>::None);
@@ -538,9 +541,38 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let composer_file_count = session.read().composer_files.len();
     let busy = session.read().uploading || session.read().upload_pending() > 0;
     let send_ready = chat_compose::can_submit(&composer_text, composer_file_count, busy);
+    let sensitive_draft = chat_compose::detect_sensitive_draft(&composer_text);
+    let message_count = messages.len();
+    let search_needle = search_query().trim().to_lowercase();
+    let search_active = search_open() && !search_needle.is_empty();
+    let search_match_count = if search_active {
+        messages
+            .iter()
+            .filter(|row| {
+                row.content.to_lowercase().contains(&search_needle)
+                    || row.speaker.to_lowercase().contains(&search_needle)
+            })
+            .count()
+    } else {
+        0
+    };
     let run_active = live_task.is_some();
     rsx! {
         div { class: "pane-body chat-body",
+            onkeydown: move |event: KeyboardEvent| {
+                if !event.is_composing()
+                    && (event.modifiers().contains(Modifiers::CONTROL)
+                        || event.modifiers().contains(Modifiers::META))
+                    && matches!(event.key(), Key::Character(ref c) if c.eq_ignore_ascii_case("f"))
+                    && (message_count >= 4 || search_open())
+                {
+                    event.prevent_default();
+                    search_open.set(true);
+                    let _ = dioxus::document::eval(
+                        "requestAnimationFrame(() => { const el = document.getElementById('chat-find-input'); if (el) { el.focus(); el.select(); } })",
+                    );
+                }
+            },
             ondragover: move |event: DragEvent| {
                 event.prevent_default();
                 dragging.set(true);
@@ -574,6 +606,65 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                 }
             }
             div { class: "chat-column",
+                if message_count >= 4 || search_open() {
+                    if search_open() {
+                        div { class: "chat-find-bar", role: "search", "aria-label": "Search in conversation",
+                            Icon { name: "search", size: 14 }
+                            input {
+                                id: "chat-find-input",
+                                class: "chat-find-input",
+                                r#type: "text",
+                                placeholder: "Search in conversation\u{2026}",
+                                value: "{search_query()}",
+                                oninput: move |event| search_query.set(event.value()),
+                                onkeydown: move |event: KeyboardEvent| {
+                                    if event.key() == Key::Escape {
+                                        event.prevent_default();
+                                        search_query.set(String::new());
+                                        search_open.set(false);
+                                    }
+                                },
+                            }
+                            if search_active {
+                                span { class: "chat-find-count",
+                                    if search_match_count == 1 {
+                                        "1 match"
+                                    } else {
+                                        "{search_match_count} matches"
+                                    }
+                                }
+                            }
+                            button {
+                                class: "btn ghost sm chat-find-close",
+                                r#type: "button",
+                                title: "Clear search",
+                                "aria-label": "Clear search",
+                                onclick: move |_| {
+                                    search_query.set(String::new());
+                                    search_open.set(false);
+                                },
+                                Icon { name: "x", size: 13 }
+                            }
+                        }
+                    } else {
+                        div { class: "chat-find-toggle-row",
+                            button {
+                                class: "btn ghost sm chat-find-toggle",
+                                r#type: "button",
+                                title: "Search in conversation (Ctrl+F)",
+                                "aria-label": "Search in conversation",
+                                onclick: move |_| {
+                                    search_open.set(true);
+                                    let _ = dioxus::document::eval(
+                                        "requestAnimationFrame(() => { const el = document.getElementById('chat-find-input'); if (el) el.focus(); })",
+                                    );
+                                },
+                                Icon { name: "search", size: 13 }
+                                " Search"
+                            }
+                        }
+                    }
+                }
                 if let Some((status, label)) = task {
                     if status == TaskStatus::AwaitingApproval {
                         div { class: "banner warn",
@@ -645,6 +736,27 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                 }
                             }
                             if accepts {
+                                div { class: "starter-quick-chips", role: "group", "aria-label": "Quick actions",
+                                    for text in [
+                                        "Check today's tasks & calendar",
+                                        "List my OneDrive files",
+                                        "Ask Vault for a secret safely",
+                                    ] {
+                                        button {
+                                            key: "{text}",
+                                            class: "starter-quick-chip",
+                                            r#type: "button",
+                                            onclick: move |_| {
+                                                let text = text.to_owned();
+                                                session.write().composer = text.clone();
+                                                composer_draft.set(text);
+                                                focus_composer();
+                                            },
+                                            Icon { name: "sparkles", size: 12 }
+                                            " {text}"
+                                        }
+                                    }
+                                }
                                 div { class: "suggestions", role: "group", "aria-label": "Starter prompts",
                                     for text in chat_feed::suggestions(active_bot.as_deref()).iter().copied() {
                                         button {
@@ -719,11 +831,17 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                         guard.1.insert(row.id.clone());
                                         true
                                     };
-                                    if enter {
+                                    let mut cls = if enter {
                                         format!("{} msg-enter", row.class)
                                     } else {
                                         row.class.clone()
+                                    };
+                                    if search_active {
+                                        let is_match = row.content.to_lowercase().contains(&search_needle)
+                                            || row.speaker.to_lowercase().contains(&search_needle);
+                                        cls.push_str(if is_match { " msg-match" } else { " msg-dim" });
                                     }
+                                    cls
                                 },
                                 span {
                                     class: if row.user { "msg-avatar avatar user" } else { "msg-avatar avatar bot" },
@@ -817,6 +935,32 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                                 },
                                                 Icon { name: "chat", size: 13 }
                                                 span { class: "msg-action-label", "Quote" }
+                                            }
+                                        }
+                                        if !row.content.trim().is_empty() {
+                                            if task_added_ids().contains(&row.id) {
+                                                span { class: "msg-task-added", role: "status",
+                                                    Icon { name: "check", size: 12 }
+                                                    " Task added"
+                                                }
+                                            } else {
+                                                button {
+                                                    class: "msg-action",
+                                                    r#type: "button",
+                                                    "aria-label": "Create task from message",
+                                                    title: "Create task from this message",
+                                                    onclick: {
+                                                        let text = row.content.clone();
+                                                        let id = row.id.clone();
+                                                        move |_| {
+                                                            let title = chat_compose::task_title_from_message(&text);
+                                                            session.write().add_task(title, None);
+                                                            task_added_ids.write().insert(id.clone());
+                                                        }
+                                                    },
+                                                    Icon { name: "plus", size: 13 }
+                                                    span { class: "msg-action-label", "Create task" }
+                                                }
                                             }
                                         }
                                         if row.edit {
@@ -1048,6 +1192,36 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                             }
                         }
                     }
+                    if let Some(matched) = sensitive_draft.clone() {
+                        div { class: "chat-secret-guard", role: "alert",
+                            div { class: "chat-secret-guard-copy",
+                                Icon { name: "shield", size: 15 }
+                                span {
+                                    "Sensitive credential detected ({matched.summary()}) \u{2014} never send raw secrets in chat."
+                                }
+                            }
+                            div { class: "chat-secret-guard-actions",
+                                button {
+                                    class: "btn sm",
+                                    r#type: "button",
+                                    onclick: move |_| {
+                                        let redacted = chat_compose::redact_sensitive_draft(&composer_draft());
+                                        composer_draft.set(redacted.clone());
+                                        session.write().composer = redacted;
+                                        focus_composer();
+                                    },
+                                    "Redact before sending"
+                                }
+                                button {
+                                    class: "btn primary sm",
+                                    r#type: "button",
+                                    onclick: move |_| session.write().open_section(Section::Vault),
+                                    Icon { name: "lock", size: 12 }
+                                    " Save in Vault"
+                                }
+                            }
+                        }
+                    }
                     div { class: if composer_expanded() { "composer expanded" } else { "composer" },
                         ComposerFiles { session }
                         textarea {
@@ -1093,6 +1267,9 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                             }
                                             chat_compose::SlashAction::Memory => {
                                                 session.write().open_section(Section::Memory);
+                                            }
+                                            chat_compose::SlashAction::Vault => {
+                                                session.write().open_section(Section::Vault);
                                             }
                                             chat_compose::SlashAction::Attach => session.write().pick_attachments(),
                                             chat_compose::SlashAction::Stop => session.write().stop_turn(),
