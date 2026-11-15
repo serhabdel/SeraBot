@@ -26,13 +26,7 @@ use std::collections::BTreeSet;
 
 /// Connectors whose saved credentials live in the server-wide store and can
 /// be removed from the card (0.26.0). Per-account sign-ins use Disconnect.
-const REMOVABLE_SECRET_CONNECTORS: &[&str] = &[
-    "elevenlabs_api_key",
-    "tavily",
-    "firecrawl",
-    "agentmail",
-    "notion",
-];
+const REMOVABLE_SECRET_CONNECTORS: &[&str] = &["tavily", "firecrawl", "agentmail", "notion"];
 
 /// The provider authorization pages the console can open.
 ///
@@ -611,11 +605,14 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
         (flow.busy, flow.waiting, flow.error.clone())
     };
     let action = connector_action(&connector, connected);
+    let can_sign_in_elevenlabs = id == "elevenlabs" && action == Some(ConnectorAction::SignIn);
+    let can_act = is_admin || can_sign_in_elevenlabs;
+    let can_trigger_sign_in = can_save || can_sign_in_elevenlabs;
     let key_inputs = matches!(
         action,
         Some(ConnectorAction::AddKey | ConnectorAction::ReplaceKey)
     ) && is_admin;
-    let needs_admin = !is_admin
+    let needs_admin = !can_act
         && matches!(
             action,
             Some(
@@ -801,7 +798,7 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
                                 "Disconnect"
                             }
                         },
-                        Some(ConnectorAction::SignIn) if is_admin => {
+                        Some(ConnectorAction::SignIn) if can_act => {
                             let callback_uri = connector
                                 .oauth
                                 .as_ref()
@@ -813,7 +810,7 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
                                     class: if connected { "btn ghost" } else { "btn primary" },
                                     r#type: "button",
                                     title: "Sign in with your account in your browser",
-                                    disabled: signing_in || !can_save,
+                                    disabled: signing_in || !can_trigger_sign_in,
                                     onclick: {
                                         let id = id.clone();
                                         move |_| session.write().sign_in_connector(id.clone(), callback_uri.clone())
@@ -825,7 +822,7 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
                                         class: "btn ghost",
                                         r#type: "button",
                                         title: "Stop using this account sign-in",
-                                        disabled: !can_save,
+                                        disabled: !can_trigger_sign_in,
                                         onclick: move |_| confirm_action.set(Some("sign_out")),
                                         "Sign out"
                                     }

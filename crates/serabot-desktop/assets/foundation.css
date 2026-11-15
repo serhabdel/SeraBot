@@ -609,6 +609,87 @@
   margin-top: auto;
 }
 
+.integration-card-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.integration-card-identity {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.integration-card-name {
+  min-width: 0;
+  font-size: var(--fs-title);
+  font-weight: 600;
+  color: var(--label-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.integration-card-suite {
+  font-size: var(--fs-tiny);
+  color: var(--label-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.integration-status {
+  flex-shrink: 0;
+  margin-left: auto;
+}
+
+.integration-card-blurb {
+  color: var(--label-2);
+  font-size: var(--fs-body-2);
+  line-height: 1.45;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.integration-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: auto;
+  padding-top: 8px;
+  border-top: 1px solid var(--hairline);
+}
+
+.integration-card-account {
+  font-size: var(--fs-tiny);
+  color: var(--label-3);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.integration-card-cta {
+  font-size: var(--fs-tiny);
+  font-weight: 600;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.mp-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
 .mp-sheet-scrim {
   position: fixed;
   inset: 0;
@@ -835,12 +916,23 @@
       jump button. Now the transcript simply ends where the composer begins.
    2. Replies read as text, not as boxed cards; the speaker's avatar shows once
       per run; the newest reply keeps its actions in view. */
+.pane-body.chat-body,
+.chat-column {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0%;
+  min-height: 0;
+  overflow: hidden;
+  position: relative;
+}
+
 .chat-column > .composer-wrap {
   position: relative;
   left: auto;
   right: auto;
   bottom: auto;
   flex: 0 0 auto;
+  z-index: 2;
   width: 100%;
   max-width: 796px;
   margin: 0 auto;
@@ -850,10 +942,27 @@
 
 .chat-column > .composer-wrap::before {
   display: none;
+  content: none;
 }
 
 .chat-column > .messages {
-  padding-bottom: 12px;
+  flex: 1 1 0%;
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: 40px;
+  scroll-padding-bottom: 40px;
+}
+
+.activity,
+details.activity.done {
+  width: min(var(--chat-w), calc(100% - 24px));
+  margin: 10px auto 14px;
+  padding: 10px 14px;
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  position: relative;
+  z-index: 1;
 }
 
 /* The jump button hangs just above the composer, centred. */
@@ -863,6 +972,12 @@
   bottom: 100%;
   margin-bottom: 10px;
   transform: translateX(-50%);
+  z-index: 4;
+}
+
+.jump-bottom {
+  bottom: 124px;
+  z-index: 4;
 }
 
 .messages {

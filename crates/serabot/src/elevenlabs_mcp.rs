@@ -140,12 +140,83 @@ const MEDIA_TYPES: &[&str] = &[
     "image/jpeg",
     "image/webp",
     "image/gif",
+    "image/avif",
+    "image/svg+xml",
     "video/mp4",
     "video/webm",
+    "video/quicktime",
 ];
 /// Hosts a signed media link may point at (https only; loopback http is
 /// accepted for local tests).
-const MEDIA_HOSTS: &[&str] = &["elevenlabs.io", "storage.googleapis.com"];
+const MEDIA_HOSTS: &[&str] = &[
+    "elevenlabs.io",
+    "elevenlabs.com",
+    "googleapis.com",
+    "storage.googleapis.com",
+    "googleusercontent.com",
+    "cloudfront.net",
+    "amazonaws.com",
+    "r2.cloudflarestorage.com",
+    "r2.dev",
+    "fal.media",
+    "v3.fal.media",
+    "fal.run",
+    "replicate.delivery",
+    "pbxt.replicate.delivery",
+    "bfl.ai",
+    "delivery.bfl.ai",
+    "recraft.ai",
+    "img.recraft.ai",
+];
+/// JSON keys that hold web/navigation/metadata links rather than media files.
+const NON_MEDIA_URL_KEYS: &[&str] = &[
+    "flow_url",
+    "studio_url",
+    "project_url",
+    "web_url",
+    "page_url",
+    "share_url",
+    "dashboard_url",
+    "docs_url",
+    "documentation_url",
+    "help_url",
+    "terms_url",
+    "privacy_url",
+    "pricing_url",
+    "webhook_url",
+    "callback_url",
+    "redirect_url",
+    "redirect_uri",
+    "avatar_url",
+    "profile_url",
+    "homepage_url",
+    "status_url",
+    "cancel_url",
+];
+/// Path prefixes on `elevenlabs.io` that serve web pages rather than media
+/// unless the path carries a recognised media extension.
+const ELEVENLABS_NON_MEDIA_PREFIXES: &[&str] = &[
+    "/app/",
+    "/docs/",
+    "/pricing",
+    "/studio",
+    "/flows",
+    "/subscription",
+    "/sign-in",
+    "/oauth",
+];
+const MEDIA_EXTENSIONS: &[&str] = &[
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".svg", ".mp3", ".wav", ".ogg", ".flac",
+    ".m4a", ".aac", ".mp4", ".webm", ".mov",
+];
+/// JSON keys that may carry raw base64-encoded media bytes.
+const INLINE_BASE64_KEYS: &[&str] = &[
+    "image_base64",
+    "b64_json",
+    "audio_base64",
+    "video_base64",
+    "base64",
+];
 const SIGN_IN_AGAIN: &str =
     "ElevenLabs rejected the sign-in. Sign in with ElevenLabs again in the console.";
 const NOT_SIGNED_IN: &str =
@@ -548,7 +619,12 @@ impl ElevenLabsMcp {
 
     async fn save_media(&self, result: &Value) -> Result<Vec<SavedMedia>> {
         let mut saved: Vec<SavedMedia> = Vec::new();
+        let mut explicit_links: Vec<String> = Vec::new();
         let mut links: Vec<String> = Vec::new();
+        let mut inline_json: Vec<(Option<String>, String)> = Vec::new();
+        let mut has_explanatory_content = false;
+        let mut explicit_resource_unrecognised = false;
+
         let items = result
             .get("content")
             .and_then(Value::as_array)
@@ -570,41 +646,115 @@ impl ElevenLabsMcp {
                 }
                 "resource" => {
                     let resource = item.get("resource").unwrap_or(&Value::Null);
-                    if let Some(media) = self.save_inline(
-                        resource.get("blob").and_then(Value::as_str),
-                        resource.get("mimeType").and_then(Value::as_str),
-                    )? {
+                    let blob = resource.get("blob").and_then(Value::as_str);
+                    let mime = resource.get("mimeType").and_then(Value::as_str);
+                    if let Some(media) = self.save_inline(blob, mime)? {
                         saved.push(media);
+                    } else if blob.is_some() {
+                        explicit_resource_unrecognised = true;
                     }
                 }
                 "resource_link" => {
-                    if let Some(uri) = item.get("uri").and_then(Value::as_str) {
-                        links.push(uri.to_owned());
+                    if let Some(uri) = item.get("uri").and_then(Value::as_str)
+                        && !explicit_links.iter().any(|existing| existing == uri)
+                    {
+                        explicit_links.push(uri.to_owned());
                     }
                 }
                 "text" => {
-                    if let Some(text) = item.get("text").and_then(Value::as_str)
-                        && let Ok(value) = serde_json::from_str::<Value>(text)
-                    {
-                        collect_links(&value, &mut links);
+                    if let Some(text) = item.get("text").and_then(Value::as_str) {
+                        if !text.trim().is_empty() {
+                            has_explanatory_content = true;
+                        }
+                        if let Ok(value) = serde_json::from_str::<Value>(text) {
+                            collect_json_media(&value, &mut links, Some(&mut inline_json));
+                        }
                     }
                 }
                 _ => {}
             }
         }
-        if let Some(structured) = result.get("structuredContent") {
-            collect_links(structured, &mut links);
+        if let Some(structured) = result.get("structuredContent")
+            && !structured.is_null()
+        {
+            has_explanatory_content = true;
+            collect_json_media(structured, &mut links, Some(&mut inline_json));
         }
-        links.dedup();
+
+        for (declared_mime, b64) in inline_json {
+            if saved.len() >= MAX_MEDIA_PER_CALL {
+                break;
+            }
+            if let Some(media) = self.save_json_inline(declared_mime.as_deref(), &b64)? {
+                saved.push(media);
+            }
+        }
+
+        for link in &explicit_links {
+            if saved.len() >= MAX_MEDIA_PER_CALL {
+                break;
+            }
+            if let Some(media) = self.save_link(link).await? {
+                saved.push(media);
+            } else {
+                explicit_resource_unrecognised = true;
+            }
+        }
+
         for link in links {
             if saved.len() >= MAX_MEDIA_PER_CALL {
                 break;
+            }
+            if explicit_links.iter().any(|existing| existing == &link) {
+                continue;
             }
             if let Some(media) = self.save_link(&link).await? {
                 saved.push(media);
             }
         }
+
+        if saved.is_empty() && !has_explanatory_content && explicit_resource_unrecognised {
+            return Err(SeraError::Rejected {
+                code: "media_unrecognised",
+                message: MEDIA_UNRECOGNISED.into(),
+            });
+        }
         Ok(saved)
+    }
+
+    fn save_json_inline(
+        &self,
+        declared_mime: Option<&str>,
+        data: &str,
+    ) -> Result<Option<SavedMedia>> {
+        let trimmed = data.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        if trimmed.len() / 4 * 3 > MAX_INLINE_MEDIA_BYTES + 3 {
+            return Err(SeraError::Validation(
+                "generated media exceeds size limit".into(),
+            ));
+        }
+        let bytes = match base64::engine::general_purpose::STANDARD.decode(trimmed) {
+            Ok(bytes) => bytes,
+            Err(_) if declared_mime.is_some() => {
+                return Err(SeraError::External(
+                    "ElevenLabs returned invalid media data".into(),
+                ));
+            }
+            Err(_) => return Ok(None),
+        };
+        if bytes.is_empty() || bytes.len() > MAX_INLINE_MEDIA_BYTES {
+            return Ok(None);
+        }
+        let mime = sniff_media(&bytes)
+            .map(str::to_owned)
+            .or_else(|| declared_mime.and_then(media_type));
+        let Some(mime) = mime else {
+            return Ok(None);
+        };
+        self.store(&bytes, &mime).map(Some)
     }
 
     fn save_inline(&self, data: Option<&str>, mime: Option<&str>) -> Result<Option<SavedMedia>> {
@@ -646,7 +796,16 @@ impl ElevenLabsMcp {
         // application/octet-stream, text/plain or a wrong type, so magic bytes
         // win over the declared type. The declared type and the URL's extension
         // only decide when the bytes are unrecognised.
-        let mime = sniff_media(&body)
+        let sniffed = sniff_media(&body);
+        if sniffed.is_none() && is_non_media_response(&declared, &body) {
+            tracing::debug!(
+                url = %final_url,
+                content_type = %declared,
+                "ignoring non-media link returned in ElevenLabs MCP result"
+            );
+            return Ok(None);
+        }
+        let mime = sniffed
             .map(str::to_owned)
             .or_else(|| media_type(&declared))
             .or_else(|| {
@@ -854,6 +1013,8 @@ fn extension_media_type(ext: &str) -> Option<String> {
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
+        "avif" => "image/avif",
+        "svg" => "image/svg+xml",
         "mp3" => "audio/mpeg",
         "wav" => "audio/wav",
         "ogg" => "audio/ogg",
@@ -863,9 +1024,46 @@ fn extension_media_type(ext: &str) -> Option<String> {
         "weba" => "audio/webm",
         "mp4" => "video/mp4",
         "webm" => "video/webm",
+        "mov" => "video/quicktime",
         _ => return None,
     };
     media_type(mime)
+}
+
+fn looks_like_svg(bytes: &[u8]) -> bool {
+    let slice = &bytes[..bytes.len().min(2048)];
+    let text = match std::str::from_utf8(slice) {
+        Ok(s) => s,
+        Err(e) if bytes.len() > 2048 && e.valid_up_to() > 0 => {
+            std::str::from_utf8(&slice[..e.valid_up_to()]).unwrap_or("")
+        }
+        Err(_) => return false,
+    };
+    let trimmed = text
+        .trim_start()
+        .trim_start_matches('\u{feff}')
+        .trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("<!doctype html") || lower.starts_with("<html") {
+        return false;
+    }
+    let after_xml = if lower.starts_with("<?xml") {
+        let Some(end) = trimmed.find("?>") else {
+            return false;
+        };
+        trimmed[end + 2..].trim_start()
+    } else {
+        trimmed
+    };
+    let after_xml_lower = after_xml.to_ascii_lowercase();
+    if after_xml_lower.starts_with("<!doctype html") || after_xml_lower.starts_with("<html") {
+        return false;
+    }
+    after_xml_lower.starts_with("<svg")
+        && after_xml_lower
+            .as_bytes()
+            .get(4)
+            .is_some_and(|b| b.is_ascii_whitespace() || *b == b'>' || *b == b'/')
 }
 
 /// Sniff the media type from magic bytes (0.28): CDN downloads of generated
@@ -885,6 +1083,13 @@ fn sniff_media(bytes: &[u8]) -> Option<&'static str> {
         return Some("image/webp");
     }
     if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        let brand = &bytes[8..12];
+        if brand == b"avif" || brand == b"avis" || brand == b"mif1" {
+            return Some("image/avif");
+        }
+        if brand == b"M4A " || brand == b"M4B " {
+            return Some("audio/mp4");
+        }
         return Some("video/mp4");
     }
     if bytes.starts_with(b"RIFF") && bytes.len() >= 12 && &bytes[8..12] == b"WAVE" {
@@ -904,7 +1109,33 @@ fn sniff_media(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
         return Some("video/webm");
     }
+    if looks_like_svg(bytes) {
+        return Some("image/svg+xml");
+    }
     None
+}
+
+fn is_non_media_response(declared: &str, body: &[u8]) -> bool {
+    let base = declared
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if matches!(
+        base.as_str(),
+        "text/html" | "text/plain" | "application/json"
+    ) {
+        return true;
+    }
+    let slice = &body[..body.len().min(256)];
+    let preview = String::from_utf8_lossy(slice);
+    let trimmed = preview.trim_start_matches('\u{feff}').trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("<!doctype html")
+        || lower.starts_with("<html")
+        || trimmed.starts_with('{')
+        || trimmed.starts_with('[')
 }
 
 fn media_link_allowed(url: &url::Url) -> bool {
@@ -925,26 +1156,128 @@ fn media_link_allowed(url: &url::Url) -> bool {
             .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}")))
 }
 
+fn normalize_snake_key(key: &str) -> String {
+    let mut out = String::with_capacity(key.len() + 4);
+    for ch in key.chars() {
+        if ch.is_ascii_uppercase() && !out.is_empty() && !out.ends_with('_') {
+            out.push('_');
+        }
+        out.push(ch.to_ascii_lowercase());
+    }
+    out
+}
+
+fn is_non_media_elevenlabs_url(raw: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host_lower = host.to_ascii_lowercase();
+    if host_lower != "elevenlabs.io" && !host_lower.ends_with(".elevenlabs.io") {
+        return false;
+    }
+    let path = url.path().to_ascii_lowercase();
+    if MEDIA_EXTENSIONS.iter().any(|ext| path.ends_with(ext)) {
+        return false;
+    }
+    ELEVENLABS_NON_MEDIA_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+}
+
+fn parse_data_uri_media(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim();
+    let (meta, b64) = trimmed.split_once(',')?;
+    let meta_lower = meta.to_ascii_lowercase();
+    if !(meta_lower.starts_with("data:image/")
+        || meta_lower.starts_with("data:audio/")
+        || meta_lower.starts_with("data:video/"))
+    {
+        return None;
+    }
+    if !meta_lower.ends_with(";base64") {
+        return None;
+    }
+    let mime = meta_lower["data:".len()..]
+        .split(';')
+        .next()?
+        .trim()
+        .to_owned();
+    Some((mime, b64.to_owned()))
+}
+
 /// Media-looking links in a JSON value: string values under keys that end in
-/// `url` or `link` (for example `audio_url`, `download_link`).
+/// `url`, `uri`, `href`, or `link`, excluding navigation/metadata keys and
+/// non-media `elevenlabs.io` pages.
 fn collect_links(value: &Value, links: &mut Vec<String>) {
+    collect_json_media(value, links, None);
+}
+
+fn collect_json_media(
+    value: &Value,
+    links: &mut Vec<String>,
+    mut inline: Option<&mut Vec<(Option<String>, String)>>,
+) {
     match value {
         Value::Object(map) => {
             for (key, item) in map {
-                let key = key.to_ascii_lowercase();
+                let key_lower = key.to_ascii_lowercase();
+                let key_snake = normalize_snake_key(key);
                 match item {
-                    Value::String(text)
-                        if (key.ends_with("url") || key.ends_with("link"))
+                    Value::String(text) => {
+                        if let Some((mime, b64)) = parse_data_uri_media(text) {
+                            if let Some(items) = inline.as_deref_mut()
+                                && items.len() < 16
+                            {
+                                items.push((Some(mime), b64));
+                            }
+                            continue;
+                        }
+                        if (INLINE_BASE64_KEYS.contains(&key_lower.as_str())
+                            || INLINE_BASE64_KEYS.contains(&key_snake.as_str()))
+                            && !text.trim().is_empty()
+                        {
+                            if let Some(items) = inline.as_deref_mut()
+                                && items.len() < 16
+                            {
+                                items.push((None, text.clone()));
+                            }
+                            continue;
+                        }
+                        let is_link_key = key_lower.ends_with("url")
+                            || key_lower.ends_with("uri")
+                            || key_lower.ends_with("href")
+                            || key_lower.ends_with("link");
+                        if is_link_key
+                            && !NON_MEDIA_URL_KEYS.contains(&key_lower.as_str())
+                            && !NON_MEDIA_URL_KEYS.contains(&key_snake.as_str())
                             && text.starts_with("http")
-                            && links.len() < 16 =>
-                    {
-                        links.push(text.clone());
+                            && !is_non_media_elevenlabs_url(text)
+                            && links.len() < 16
+                            && !links.iter().any(|existing| existing == text)
+                        {
+                            links.push(text.clone());
+                        }
                     }
-                    other => collect_links(other, links),
+                    other => collect_json_media(other, links, inline.as_deref_mut()),
                 }
             }
         }
-        Value::Array(items) => items.iter().for_each(|item| collect_links(item, links)),
+        Value::Array(items) => {
+            for item in items {
+                collect_json_media(item, links, inline.as_deref_mut());
+            }
+        }
+        Value::String(text) => {
+            if let Some((mime, b64)) = parse_data_uri_media(text)
+                && let Some(items) = inline
+                && items.len() < 16
+            {
+                items.push((Some(mime), b64));
+            }
+        }
         _ => {}
     }
 }
@@ -3421,5 +3754,227 @@ mod tests {
         assert_eq!(moved.api_key, "server-access");
         assert!(moved.refresh_token.is_empty());
         assert!(secrets.get("elevenlabs_access_token").is_none());
+    }
+
+    #[test]
+    fn collect_links_skips_navigation_keys_and_elevenlabs_web_pages() {
+        let payload = json!({
+            "flow_url": "https://elevenlabs.io/app/flows/abc",
+            "studio_url": "https://elevenlabs.io/studio/project-1",
+            "project_url": "https://elevenlabs.io/projects/1",
+            "web_url": "https://elevenlabs.io/some-page",
+            "page_url": "https://elevenlabs.io/page",
+            "share_url": "https://elevenlabs.io/share/123",
+            "dashboard_url": "https://elevenlabs.io/dashboard",
+            "docs_url": "https://elevenlabs.io/docs/api",
+            "documentation_url": "https://elevenlabs.io/docs/mcp",
+            "help_url": "https://elevenlabs.io/help",
+            "terms_url": "https://elevenlabs.io/terms",
+            "privacy_url": "https://elevenlabs.io/privacy",
+            "pricing_url": "https://elevenlabs.io/pricing",
+            "webhook_url": "https://elevenlabs.io/webhook",
+            "callback_url": "https://elevenlabs.io/callback",
+            "redirect_url": "https://elevenlabs.io/redirect",
+            "redirect_uri": "https://elevenlabs.io/oauth/cb",
+            "avatar_url": "https://elevenlabs.io/avatar",
+            "profile_url": "https://elevenlabs.io/profile",
+            "homepage_url": "https://elevenlabs.io/",
+            "status_url": "https://elevenlabs.io/status",
+            "cancel_url": "https://elevenlabs.io/cancel",
+            "flowUrl": "https://elevenlabs.io/app/flows/camel",
+            "nested": {
+                "app_page": "https://elevenlabs.io/app/creative",
+                "app_link": "https://elevenlabs.io/app/creative",
+                "docs_href": "https://elevenlabs.io/docs/creative",
+                "pricing_href": "https://elevenlabs.io/pricing/pro",
+                "studio_uri": "https://elevenlabs.io/studio/xyz",
+                "flows_uri": "https://elevenlabs.io/flows/1",
+                "sub_link": "https://elevenlabs.io/subscription",
+                "signin_link": "https://elevenlabs.io/sign-in",
+                "oauth_link": "https://elevenlabs.io/oauth/authorize",
+                "media_in_app_url": "https://elevenlabs.io/app/assets/render.png",
+                "image_url": "https://v3.fal.media/files/render.webp",
+                "audio_uri": "https://storage.googleapis.com/bucket/clip.mp3"
+            }
+        });
+        let mut links = Vec::new();
+        collect_links(&payload, &mut links);
+        assert_eq!(
+            links,
+            vec![
+                "https://storage.googleapis.com/bucket/clip.mp3",
+                "https://v3.fal.media/files/render.webp",
+                "https://elevenlabs.io/app/assets/render.png",
+            ]
+        );
+    }
+
+    #[test]
+    fn sniff_media_handles_avif_m4a_mp4_and_svg() {
+        assert_eq!(
+            sniff_media(b"\x00\x00\x00\x1cftypavif\x00\x00\x00\x00"),
+            Some("image/avif")
+        );
+        assert_eq!(
+            sniff_media(b"\x00\x00\x00\x1cftypavis\x00\x00\x00\x00"),
+            Some("image/avif")
+        );
+        assert_eq!(
+            sniff_media(b"\x00\x00\x00\x1cftypmif1\x00\x00\x00\x00"),
+            Some("image/avif")
+        );
+        assert_eq!(
+            sniff_media(b"\x00\x00\x00\x20ftypM4A \x00\x00\x00\x00"),
+            Some("audio/mp4")
+        );
+        assert_eq!(
+            sniff_media(b"\x00\x00\x00\x20ftypM4B \x00\x00\x00\x00"),
+            Some("audio/mp4")
+        );
+        assert_eq!(
+            sniff_media(b"\x00\x00\x00\x20ftypmp42\x00\x00\x00\x00"),
+            Some("video/mp4")
+        );
+        assert_eq!(
+            sniff_media(b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>"),
+            Some("image/svg+xml")
+        );
+        assert_eq!(
+            sniff_media(b"  \xef\xbb\xbf<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<svg viewBox=\"0 0 10 10\"/>"),
+            Some("image/svg+xml")
+        );
+        assert_eq!(
+            sniff_media(b"<!DOCTYPE html><html><svg></svg></html>"),
+            None
+        );
+        assert_eq!(
+            sniff_media(b"<?xml version=\"1.0\"?><html><svg/></html>"),
+            None
+        );
+    }
+
+    #[test]
+    fn media_hosts_allow_elevenlabs_creative_cdns() {
+        let ok = |u: &str| media_link_allowed(&url::Url::parse(u).unwrap());
+        for host in [
+            "elevenlabs.io",
+            "elevenlabs.com",
+            "cdn.elevenlabs.com",
+            "googleapis.com",
+            "storage.googleapis.com",
+            "lh3.googleusercontent.com",
+            "d123.cloudfront.net",
+            "s3.amazonaws.com",
+            "pub.r2.cloudflarestorage.com",
+            "pub-123.r2.dev",
+            "fal.media",
+            "v3.fal.media",
+            "fal.run",
+            "replicate.delivery",
+            "pbxt.replicate.delivery",
+            "bfl.ai",
+            "delivery.bfl.ai",
+            "recraft.ai",
+            "img.recraft.ai",
+        ] {
+            assert!(ok(&format!("https://{host}/out.png")), "{host}");
+        }
+    }
+
+    #[tokio::test]
+    async fn html_and_json_page_links_in_tool_json_are_skipped_without_failing() {
+        let h = harness(fake(fixture(9, false), json!({}))).await;
+        Mock::given(method("GET"))
+            .and(path("/app/flows/123"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=utf-8")
+                    .set_body_bytes(b"<!DOCTYPE html><html><body>Flow</body></html>".to_vec()),
+            )
+            .mount(&h.mcp)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/estimate"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_bytes(br#"{"credits":42}"#.to_vec()),
+            )
+            .mount(&h.mcp)
+            .await;
+
+        let flow_page = format!("{}/app/flows/123", h.mcp.uri());
+        let estimate_page = format!("{}/estimate", h.mcp.uri());
+
+        // Direct save_link returns Ok(None) for HTML and JSON non-media links.
+        assert!(h.service.save_link(&flow_page).await.unwrap().is_none());
+        assert!(h.service.save_link(&estimate_page).await.unwrap().is_none());
+
+        // Typical creative_list_flows / estimate_only / creative_generate_image metadata
+        // returns Ok(vec![]) instead of MEDIA_UNRECOGNISED.
+        let saved = h
+            .service
+            .save_media(&json!({
+                "content": [{
+                    "type": "text",
+                    "text": json!({
+                        "flow_url": flow_page,
+                        "studio_url": flow_page,
+                        "info_url": flow_page,
+                        "estimate_link": estimate_page,
+                        "estimated_credits": 42
+                    }).to_string()
+                }],
+                "structuredContent": {
+                    "flow_url": flow_page,
+                    "details_url": estimate_page
+                }
+            }))
+            .await
+            .unwrap();
+        assert!(saved.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inline_data_uris_and_base64_keys_in_json_are_saved() {
+        let h = harness(fake(fixture(9, false), json!({}))).await;
+        let mut png_bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        png_bytes.extend_from_slice(b"synthetic-png");
+        let png_b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+        let svg_bytes = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"/>";
+        let svg_b64 = base64::engine::general_purpose::STANDARD.encode(svg_bytes);
+        let mut avif_bytes = b"\x00\x00\x00\x1cftypavif\x00\x00\x00\x00".to_vec();
+        avif_bytes.extend_from_slice(b"avif-data");
+        let avif_b64 = base64::engine::general_purpose::STANDARD.encode(&avif_bytes);
+        let m4a_bytes = b"\x00\x00\x00\x20ftypM4A \x00\x00\x00\x00audio";
+        let m4a_b64 = base64::engine::general_purpose::STANDARD.encode(m4a_bytes);
+
+        let saved = h
+            .service
+            .save_media(&json!({
+                "content": [{
+                    "type": "text",
+                    "text": json!({
+                        "flow_url": "https://elevenlabs.io/app/flows/f1",
+                        "preview_data_uri": format!("data:image/png;base64,{png_b64}"),
+                        "vector_uri": format!("data:image/svg+xml;charset=utf-8;base64,{svg_b64}")
+                    }).to_string()
+                }],
+                "structuredContent": {
+                    "image_base64": avif_b64,
+                    "audio_base64": m4a_b64
+                }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(saved.len(), 4);
+        assert_eq!(saved[0].mime, "image/png");
+        assert!(saved[0].filename.ends_with(".png"));
+        assert_eq!(saved[1].mime, "image/svg+xml");
+        assert!(saved[1].filename.ends_with(".svg"));
+        assert_eq!(saved[2].mime, "audio/mp4");
+        assert!(saved[2].filename.ends_with(".m4a"));
+        assert_eq!(saved[3].mime, "image/avif");
+        assert!(saved[3].filename.ends_with(".avif"));
     }
 }

@@ -971,7 +971,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     .with_plugin_tools(serabot::plugin_runtime::PluginTools::new(
         store.clone(),
         users.clone(),
-        serabot::marketplace::load_catalog(&config.path("plugins")).0,
+        serabot::marketplace::load_catalog_with_builtin(&config.path("plugins")).0,
     ));
 
     let runtime = Runtime::with_fleet(

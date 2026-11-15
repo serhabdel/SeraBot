@@ -40,6 +40,30 @@ const GENERIC_PLUG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="
 
 const GENERIC_CODE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="2.5" y="2.5" width="19" height="19" rx="5" fill="#0891B2"/><path d="m8.5 8-3.5 4 3.5 4M15.5 8l3.5 4-3.5 4M13.2 6.5l-2.4 11" fill="none" stroke="#fff" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
 
+const SVG_GITHUB: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="5" fill="#181717"/><path d="M12 5.4a6.7 6.7 0 0 0-2.12 13.06c.34.06.46-.14.46-.32v-1.24c-1.86.4-2.25-.79-2.25-.79-.3-.77-.74-.98-.74-.98-.61-.42.05-.41.05-.41.67.05 1.03.69 1.03.69.6 1.03 1.57.73 1.95.56.06-.43.24-.73.43-.9-1.49-.17-3.05-.74-3.05-3.31 0-.73.26-1.33.69-1.8-.07-.17-.3-.85.07-1.78 0 0 .56-.18 1.84.69a6.4 6.4 0 0 1 3.36 0c1.28-.87 1.84-.69 1.84-.69.37.93.14 1.61.07 1.78.43.47.69 1.07.69 1.8 0 2.58-1.57 3.14-3.06 3.3.24.21.46.62.46 1.25v1.85c0 .18.12.39.46.32A6.7 6.7 0 0 0 12 5.4Z" fill="#fff"/></svg>"##;
+
+const SVG_TODOIST: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="5" fill="#E44332"/><path d="M6.5 9.2 10.6 11.6 17.5 7.6M6.5 13 10.6 15.4 17.5 11.4M6.5 16.8 10.6 19.2 17.5 15.2" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
+
+const SVG_SLACK: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="5" fill="#4A154B"/><path d="M9.5 14a1.2 1.2 0 1 1-1.2-1.2h1.2V14Zm.6 0a1.2 1.2 0 1 1 2.4 0v3a1.2 1.2 0 1 1-2.4 0v-3Z" fill="#E01E5A"/><path d="M10 9.5a1.2 1.2 0 1 1 1.2-1.2v1.2H10Zm0 .6a1.2 1.2 0 1 1 0 2.4H7a1.2 1.2 0 1 1 0-2.4h3Z" fill="#36C5F0"/><path d="M14.5 10a1.2 1.2 0 1 1 1.2 1.2h-1.2V10Zm-.6 0a1.2 1.2 0 1 1-2.4 0V7a1.2 1.2 0 1 1 2.4 0v3Z" fill="#2EB67D"/><path d="M14 14.5a1.2 1.2 0 1 1-1.2 1.2v-1.2H14Zm0-.6a1.2 1.2 0 1 1 0-2.4h3a1.2 1.2 0 1 1 0 2.4h-3Z" fill="#ECB22E"/></svg>"##;
+
+const SVG_EXA: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="5" fill="#1F40ED"/><path d="M7.5 7.5h9M7.5 12h6.5M7.5 16.5h9" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round"/><circle cx="16.5" cy="12" r="1.4" fill="#fff"/></svg>"##;
+
+const SVG_BRAVE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="5" fill="#FB542B"/><path d="M12 5.8 16.8 8l-1.2 6.8L12 18.2l-3.6-3.4L7.2 8 12 5.8Z" fill="none" stroke="#fff" stroke-width="1.8" stroke-linejoin="round"/><path d="M10 11.2h4l-.6 2.6-1.4 1-1.4-1-.6-2.6Z" fill="#fff"/></svg>"##;
+
+const SVG_LINEAR: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="5" fill="#5E6AD2"/><path d="M6.4 13.8a6 6 0 0 0 3.8 3.8L6.4 13.8Zm-.3-2.5 6.6 6.6a6 6 0 0 0 1.8-.7L6.8 9.5a6 6 0 0 0-.7 1.8Zm2-3.4 8 8a6 6 0 1 0-8-8Z" fill="#fff"/></svg>"##;
+
+const SVG_RESEND: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="5" fill="#111827"/><path d="M7.5 16.5V7.5h4.8a2.8 2.8 0 0 1 0 5.6H9.8l5.2 3.4" fill="none" stroke="#fff" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
+
+const SVG_WORKSPACE_FILES: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="5" fill="#0F766E"/><path d="M6.5 8.5a1.5 1.5 0 0 1 1.5-1.5h2.6l1.4 1.5h4a1.5 1.5 0 0 1 1.5 1.5v5.5a1.5 1.5 0 0 1-1.5 1.5H8a1.5 1.5 0 0 1-1.5-1.5v-7Z" fill="none" stroke="#fff" stroke-width="1.7" stroke-linejoin="round"/></svg>"##;
+
+const SVG_CLOUDFLARE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="5" fill="#F38020"/><path d="M16.2 15.8H8.1a2.6 2.6 0 0 1-.4-5.1 4 4 0 0 1 7.7-.8 2.9 2.9 0 0 1 .8 5.9Z" fill="#fff"/></svg>"##;
+
+const SVG_POSTGRES: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="5" fill="#336791"/><path d="M12 6.5c-2.6 0-4.5 1.7-4.5 4.2 0 2 1 3.7 2.2 4.5v2.3l2.3-1 2.3 1v-2.3c1.2-.8 2.2-2.5 2.2-4.5 0-2.5-1.9-4.2-4.5-4.2Z" fill="none" stroke="#fff" stroke-width="1.7" stroke-linejoin="round"/></svg>"##;
+
+const SVG_SENTRY: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="5" fill="#362D59"/><path d="M12.9 7.2a1 1 0 0 0-1.8 0l-4.6 8a1 1 0 0 0 .9 1.5h2.2v-1.6H8.5l3.5-6.1 3.5 6.1h-2.1v1.6h3.2a1 1 0 0 0 .9-1.5l-4.6-8Z" fill="#fff"/></svg>"##;
+
+const SVG_STRIPE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="5" fill="#635BFF"/><path d="M14.7 10.3c0-.9-.7-1.3-1.9-1.3-1.4 0-2.6.5-3.4 1.1v-2.2c.9-.5 2.1-.9 3.4-.9 2.5 0 4.1 1.2 4.1 3.3 0 3.3-4.6 2.8-4.6 4.4 0 .6.6 1 1.6 1 1.3 0 2.6-.5 3.5-1.1v2.2c-1 .6-2.2.9-3.5.9-2.5 0-4-1.2-4-3.2 0-3.5 4.8-3 4.8-4.2Z" fill="#fff"/></svg>"##;
+
 /// Every known brand. To add one: drop `<key>.png` in `assets/brands/`, list
 /// it in `SOURCES.md`, and add a line here.
 static BRANDS: &[Brand] = &[
@@ -80,7 +104,7 @@ static BRANDS: &[Brand] = &[
         mark: png!("onedrive"),
     },
     Brand {
-        keys: &["notion"],
+        keys: &["notion", "notion-mcp"],
         label: "Notion",
         mark: png!("notion"),
     },
@@ -90,7 +114,7 @@ static BRANDS: &[Brand] = &[
         mark: png!("agentmail"),
     },
     Brand {
-        keys: &["elevenlabs", "elevenlabs-api-key"],
+        keys: &["elevenlabs"],
         label: "ElevenLabs",
         mark: png!("elevenlabs"),
     },
@@ -108,6 +132,67 @@ static BRANDS: &[Brand] = &[
         keys: &["composio"],
         label: "Composio",
         mark: png!("composio"),
+    },
+    Brand {
+        keys: &["github", "github-mcp"],
+        label: "GitHub",
+        mark: Mark::Svg(SVG_GITHUB),
+    },
+    Brand {
+        keys: &["todoist"],
+        label: "Todoist",
+        mark: Mark::Svg(SVG_TODOIST),
+    },
+    Brand {
+        keys: &["slack", "slack-mcp"],
+        label: "Slack",
+        mark: Mark::Svg(SVG_SLACK),
+    },
+    Brand {
+        keys: &["exa"],
+        label: "Exa Search",
+        mark: Mark::Svg(SVG_EXA),
+    },
+    // Marketplace plugins
+    Brand {
+        keys: &["brave-search"],
+        label: "Brave Search",
+        mark: Mark::Svg(SVG_BRAVE),
+    },
+    Brand {
+        keys: &["linear"],
+        label: "Linear",
+        mark: Mark::Svg(SVG_LINEAR),
+    },
+    Brand {
+        keys: &["resend"],
+        label: "Resend",
+        mark: Mark::Svg(SVG_RESEND),
+    },
+    Brand {
+        keys: &["workspace-files"],
+        label: "Workspace Files",
+        mark: Mark::Svg(SVG_WORKSPACE_FILES),
+    },
+    Brand {
+        keys: &["cloudflare"],
+        label: "Cloudflare",
+        mark: Mark::Svg(SVG_CLOUDFLARE),
+    },
+    Brand {
+        keys: &["postgres-read"],
+        label: "PostgreSQL",
+        mark: Mark::Svg(SVG_POSTGRES),
+    },
+    Brand {
+        keys: &["sentry"],
+        label: "Sentry",
+        mark: Mark::Svg(SVG_SENTRY),
+    },
+    Brand {
+        keys: &["stripe-read"],
+        label: "Stripe",
+        mark: Mark::Svg(SVG_STRIPE),
     },
     // Providers
     Brand {
@@ -245,6 +330,11 @@ pub fn brand_image_src(key: &str) -> Option<String> {
     })
 }
 
+/// Returns whether a brand key has a dedicated PNG or SVG mark.
+pub fn has_mark(key: &str) -> bool {
+    find(key).is_some()
+}
+
 /// Returns a human-readable label for a known brand key (same normalization
 /// as [`brand_image_src`]), for use in alt/title text. Unknown keys return
 /// `None`.
@@ -268,11 +358,26 @@ mod tests {
         "outlook-calendar",
         "onedrive",
         "notion",
+        "notion-mcp",
         "agentmail",
         "elevenlabs",
         "tavily",
         "firecrawl",
         "composio",
+        "github",
+        "github-mcp",
+        "todoist",
+        "slack",
+        "slack-mcp",
+        "exa",
+        "brave-search",
+        "linear",
+        "resend",
+        "workspace-files",
+        "cloudflare",
+        "postgres-read",
+        "sentry",
+        "stripe-read",
         "mistral",
         "openai",
         "xai",

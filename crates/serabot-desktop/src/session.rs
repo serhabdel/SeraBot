@@ -5933,22 +5933,47 @@ mod tests {
 
     #[test]
     fn marketplace_install_enable_and_secrets_are_refused_until_plugins_can_run() {
-        use crate::marketplace::PluginAction;
+        use crate::marketplace::{ActivationBlock, PluginAction, PluginDetail};
         use zeroize::Zeroizing;
 
         let mut session = Session::new();
         session.state.connected = true;
         session.plugin_action("firecrawl".into(), PluginAction::Install);
         let install = session.state.marketplace_error.clone().unwrap();
-        assert!(
-            install.contains("Coming soon"),
-            "install must say why it is refused: {install}"
+        assert_eq!(
+            install,
+            ActivationBlock::Unchecked.message(),
+            "unloaded plugin install must require opening the plugin page first: {install}"
         );
         assert!(!session.marketplace_busy);
         assert!(!install.to_lowercase().contains("secret"));
 
         session.plugin_action("firecrawl".into(), PluginAction::Enable);
-        assert!(session.state.marketplace_error.is_some());
+        assert_eq!(
+            session.state.marketplace_error.as_deref(),
+            Some(ActivationBlock::Unchecked.message())
+        );
+        assert!(!session.marketplace_busy);
+
+        // Loaded placeholder-host plugin is refused with PlaceholderHost ("Coming soon")
+        // and never echoes typed secret values.
+        let placeholder_detail: PluginDetail = serde_json::from_value(serde_json::json!({
+            "plugin": {
+                "slug": "firecrawl",
+                "name": "Firecrawl",
+                "installed": false,
+                "enabled": false,
+                "apps": [{"id": "a", "name": "A", "transport": "http", "auth": []}],
+                "permissions": {"egress": ["mcp.firecrawl.example.invalid"]}
+            }
+        }))
+        .unwrap();
+        session.state.marketplace_detail = Some(placeholder_detail);
+        session.plugin_action("firecrawl".into(), PluginAction::Install);
+        assert_eq!(
+            session.state.marketplace_error.as_deref(),
+            Some(ActivationBlock::PlaceholderHost.message())
+        );
         assert!(!session.marketplace_busy);
 
         session.save_plugin_config(
@@ -5963,6 +5988,26 @@ mod tests {
         assert!(
             !saved.contains("synthetic-plugin-key"),
             "a refused save must not echo the typed value"
+        );
+        assert!(!session.marketplace_busy);
+
+        // Loaded stdio (local-program) plugin is refused with LocalProgram.
+        let stdio_detail: PluginDetail = serde_json::from_value(serde_json::json!({
+            "plugin": {
+                "slug": "local-tool",
+                "name": "Local Tool",
+                "installed": false,
+                "enabled": false,
+                "apps": [{"id": "a", "name": "A", "transport": "stdio", "auth": []}],
+                "permissions": {"egress": []}
+            }
+        }))
+        .unwrap();
+        session.state.marketplace_detail = Some(stdio_detail);
+        session.plugin_action("local-tool".into(), PluginAction::Install);
+        assert_eq!(
+            session.state.marketplace_error.as_deref(),
+            Some(ActivationBlock::LocalProgram.message())
         );
         assert!(!session.marketplace_busy);
 

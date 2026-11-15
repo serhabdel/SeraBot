@@ -57,6 +57,9 @@ pub fn pin_messages_js(force: bool) -> String {
     )
 }
 
+/// Softly pin the message list when an inline preview or card expands.
+pub const PIN_ON_GROW_JS: &str = "window.__serabotPinMessages?.(false);";
+
 /// Jump to the newest message and resume following. Instant on purpose: a
 /// smooth scroll toward a moving target (a reply still streaming) stops short
 /// and fights the follow logic, which was the "unstable" jump button.
@@ -212,11 +215,29 @@ pub const CHAT_SCROLL_BRIDGE_JS: &str = r#"
       b.addEventListener('scroll', () => {
         const top = b.scrollTop;
         const height = b.scrollHeight;
-        if (top < lastTop - 1 && height >= lastHeight) setFollow(false);
+        const dist = height - top - b.clientHeight;
+        if (top < lastTop - 1 && height >= lastHeight) {
+          setFollow(false);
+        } else if (dist <= BOTTOM) {
+          setFollow(true);
+        } else if (!follow && dist > BOTTOM) {
+          setFollow(false);
+        }
         lastTop = top;
         lastHeight = height;
         if (!pending) saved[convOf(b)] = { top: top, stick: follow };
       }, { passive: true });
+      b.addEventListener('toggle', (e) => {
+        const t = e.target;
+        if (!t || !t.open) return;
+        requestAnimationFrame(() => {
+          const br = b.getBoundingClientRect();
+          const tr = t.getBoundingClientRect();
+          if (tr.bottom > br.bottom - 16) {
+            t.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+          }
+        });
+      }, true);
       const io = new IntersectionObserver((entries) => {
         for (const entry of entries) {
           if (entry.isIntersecting) setFollow(true);
@@ -402,5 +423,13 @@ mod tests {
             .expect("jump handler closes");
         let jump_block = &CHAT_SCROLL_BRIDGE_JS[jump_start..jump_start + jump_end];
         assert!(jump_block.contains("pending = null;"));
+    }
+
+    #[test]
+    fn bridge_reveals_expanded_details_and_resumes_follow_at_bottom() {
+        assert_eq!(PIN_ON_GROW_JS, "window.__serabotPinMessages?.(false);");
+        assert!(CHAT_SCROLL_BRIDGE_JS.contains("dist <= BOTTOM"));
+        assert!(CHAT_SCROLL_BRIDGE_JS.contains("addEventListener('toggle'"));
+        assert!(CHAT_SCROLL_BRIDGE_JS.contains("scrollIntoView"));
     }
 }

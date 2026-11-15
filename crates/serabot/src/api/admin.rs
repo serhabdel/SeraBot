@@ -375,8 +375,8 @@ pub(super) async fn admin_provider_oauth_complete(
     })))
 }
 
-/// Begin an ElevenLabs OAuth sign-in for the connector. PKCE only: the
-/// browser leg and loopback listener run on the owner's machine (the desktop
+/// Begin an ElevenLabs OAuth sign-in for the acting user. PKCE only: the
+/// browser leg and loopback listener run on the user's machine (the desktop
 /// console); the server only builds the pinned consent URL. No pending state
 /// is stored server-side — the desktop holds verifier and state.
 pub(super) async fn admin_connector_oauth_start(
@@ -385,7 +385,6 @@ pub(super) async fn admin_connector_oauth_start(
     Path(id): Path<String>,
     Json(request): Json<OAuthStartRequest>,
 ) -> AdminResult<Json<Value>> {
-    require_admin(&user).map_err(admin_error)?;
     if id != "elevenlabs" {
         return Err(admin_error(SeraError::NotFound(format!(
             "connector {id} does not support OAuth sign-in"
@@ -417,7 +416,6 @@ pub(super) async fn admin_connector_oauth_complete(
     Path(id): Path<String>,
     Json(request): Json<OAuthCompleteRequest>,
 ) -> AdminResult<Json<Value>> {
-    require_admin(&user).map_err(admin_error)?;
     if id != "elevenlabs" {
         return Err(admin_error(SeraError::NotFound(format!(
             "connector {id} does not support OAuth sign-in"
@@ -481,7 +479,6 @@ pub(super) async fn admin_connector_oauth_disconnect(
     Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
 ) -> AdminResult<Json<Value>> {
-    require_admin(&user).map_err(admin_error)?;
     if id != "elevenlabs" {
         return Err(admin_error(SeraError::NotFound(format!(
             "connector {id} does not support sign-in"

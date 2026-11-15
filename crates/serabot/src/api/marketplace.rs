@@ -343,7 +343,128 @@ pub(super) async fn put_plugin_config(
 }
 
 /// The catalog as loaded at boot, and the problems found in any plugin file.
-/// The catalog sits in `plugins/` beside the config file.
+/// Loads from `plugins/` beside the config file when present and merges any
+/// built-in shipped manifests not already loaded from disk.
 pub fn load(config: &Config) -> (Vec<PluginManifest>, Vec<String>) {
-    marketplace::load_catalog(&config.path("plugins"))
+    marketplace::load_catalog_with_builtin(&config.path("plugins"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gateway::{Gateway, ToolRegistry};
+    use crate::llm::LlmClient;
+    use crate::policy::Policy;
+    use crate::runtime::NullNotifier;
+    use tower::ServiceExt;
+
+    #[test]
+    fn load_falls_back_to_builtin_catalog_when_plugins_dir_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            base_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let (plugins, problems) = load(&config);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(plugins.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn marketplace_list_route_returns_builtin_catalog_without_plugins_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.api.enabled = true;
+        config.api.token_hash = sha256_hex("test-token-that-is-long-enough-123");
+        config.llm.model = "test".into();
+        config.llm.base_url = "https://example.com/v1".into();
+        config.base_dir = dir.path().to_path_buf();
+        let db_path = dir.path().join("serabot.db");
+        config.database.path = db_path.to_string_lossy().into_owned();
+        let config = Arc::new(config);
+        let store = Store::open(&db_path, 384, 5000).unwrap();
+        let gateway = Gateway::new(
+            store.clone(),
+            Arc::new(Policy::empty()),
+            ToolRegistry::default(),
+            1,
+            false,
+        );
+        let llm = LlmClient::new("https://example.com/v1", "test", 5, 50)
+            .unwrap()
+            .with_model("test");
+        let runtime = Runtime::new(
+            config.clone(),
+            store.clone(),
+            gateway,
+            crate::model_router::ModelRouter::new(
+                &config.llm,
+                BTreeMap::from([("default".into(), llm)]),
+            )
+            .unwrap(),
+            vec![crate::config::LoadedBot {
+                config: BotConfig {
+                    title: None,
+                    description: None,
+                    name: "main".into(),
+                    trigger: "command".into(),
+                    model: None,
+                    system_prompt: "prompts/main.txt".into(),
+                    skills: vec![],
+                    tools: vec![],
+                    require_approval: vec![],
+                    enabled: true,
+                    temperature: None,
+                    thinking: None,
+                    role: BotRole::Orchestrator,
+                    delegates: vec![],
+                },
+                prompt: "test prompt".into(),
+            }],
+            Arc::new(NullNotifier),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+        let artifacts =
+            Arc::new(crate::maker::ArtifactStore::new(dir.path().join("artifacts")).unwrap());
+        let secrets =
+            SharedSecrets::new(crate::secrets::SecretStore::from_map(BTreeMap::from([(
+                config.llm.api_key_secret.clone(),
+                "synthetic-llm".into(),
+            )])));
+        let users = Arc::new(UserSecrets::with_master_key(store.clone(), [8u8; 32]).unwrap());
+        let state = ApiState::new(
+            runtime,
+            store.clone(),
+            config,
+            artifacts,
+            secrets,
+            users,
+            None,
+        )
+        .unwrap();
+        let app = crate::api::router(state);
+        let admin_id = store.admin_user_id().unwrap();
+        let token = store
+            .mint_session(&admin_id, chrono::Duration::hours(1))
+            .unwrap();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/v1/marketplace/plugins")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let plugins = body["plugins"].as_array().unwrap();
+        assert_eq!(plugins.len(), 10);
+    }
 }

@@ -10,7 +10,7 @@
 //! Secrets: the cards and sheets only show what the server reports. A typed
 //! key is handled by the card that collects it, and is never displayed again.
 
-use crate::ui::Icon;
+use crate::ui::{BrandLogo, Icon};
 use crate::ui_composio::ComposioCard;
 use crate::ui_connectors::{ConnectorCard, GoogleSetupCard};
 use crate::ui_marketplace::{MarketplaceTab, PluginSheet};
@@ -126,6 +126,13 @@ pub fn IntegrationCard(session: Signal<Session>, entry: Entry) -> Element {
     let mut session = session;
     let label = format!("{}, {}", entry.name, entry.pill);
     let source = entry.source.clone();
+    let cta = if entry.set_up {
+        "Manage \u{2192}"
+    } else if matches!(source, Source::Connector(_)) {
+        "Connect \u{2192}"
+    } else {
+        "Details \u{2192}"
+    };
     rsx! {
         button {
             class: "mp-card integration-card",
@@ -135,15 +142,24 @@ pub fn IntegrationCard(session: Signal<Session>, entry: Entry) -> Element {
                 Source::Connector(id) => session.write().open_connector_sheet(id.clone()),
                 Source::Plugin(slug) => session.write().open_plugin(slug.clone()),
             },
-            div { class: "mp-card-head",
-                span { class: "mp-card-name", title: "{entry.name}", "{entry.name}" }
-                StatusChip { tone: entry.tone, text: entry.pill.clone() }
+            div { class: "integration-card-head",
+                BrandLogo { brand: entry.brand_key.clone(), size: 38 }
+                div { class: "integration-card-identity",
+                    span { class: "integration-card-name", title: "{entry.name}", "{entry.name}" }
+                    if !entry.suite_label.is_empty() {
+                        span { class: "integration-card-suite", "{entry.suite_label}" }
+                    }
+                }
+                div { class: "integration-status",
+                    StatusChip { tone: entry.tone, text: entry.pill.clone() }
+                }
             }
             if !entry.blurb.is_empty() {
-                span { class: "mp-card-tagline", "{entry.blurb}" }
+                span { class: "integration-card-blurb", "{entry.blurb}" }
             }
-            div { class: "mp-card-meta",
-                span { class: "tiny", "{entry.meta}" }
+            div { class: "integration-card-foot",
+                span { class: "integration-card-account", "{entry.meta}" }
+                span { class: "integration-card-cta", "{cta}" }
             }
         }
     }

@@ -1137,7 +1137,7 @@ async fn connector_test_outcome(
 
 pub(super) fn connector_group(id: &str) -> &'static str {
     match id {
-        "elevenlabs" | "elevenlabs_api_key" => "Voice & Media",
+        "elevenlabs" => "Voice & Media",
         "tavily" | "firecrawl" => "Web Research",
         "agentmail" => "Email",
         "composio" => "Apps & tools",
@@ -1269,6 +1269,11 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_app_with_connectors() -> (Router, Store) {
+        let (app, store, _) = test_app_with_connectors_and_users();
+        (app, store)
+    }
+
+    fn test_app_with_connectors_and_users() -> (Router, Store, Arc<UserSecrets>) {
         let dir = std::env::temp_dir().join(format!("serabot-conn-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -1341,11 +1346,11 @@ mod tests {
             config,
             artifacts,
             secrets,
-            users,
+            users.clone(),
             None,
         )
         .unwrap();
-        (crate::api::router(state), store)
+        (crate::api::router(state), store, users)
     }
 
     async fn get_json(app: &Router, token: &str, uri: &str) -> Value {
@@ -1458,5 +1463,159 @@ mod tests {
         assert!(member_default["secrets"]["api_key"]["name"].is_null());
         assert_eq!(member_default["secrets"]["api_key"]["configured"], true);
         assert!(!member_prov.to_string().contains("llm_api_key"));
+    }
+
+    #[tokio::test]
+    async fn elevenlabs_connector_is_oauth_only_and_per_user_for_admin_and_member() {
+        let (app, store, users) = test_app_with_connectors_and_users();
+        let admin_id = store.admin_user_id().unwrap();
+        let member = store
+            .create_user("sub-eleven-member", "member@example.example", "Member")
+            .unwrap();
+        let admin_token = store
+            .mint_session(&admin_id, chrono::Duration::hours(1))
+            .unwrap();
+        let member_token = store
+            .mint_session(&member.id, chrono::Duration::hours(1))
+            .unwrap();
+
+        // Sign in ONLY the non-admin member; admin remains disconnected.
+        crate::elevenlabs_mcp::store_sign_in(
+            &users,
+            &member.id,
+            "synthetic-member-access",
+            "synthetic-member-refresh",
+            Some(3600),
+        )
+        .unwrap();
+
+        let admin_conn = get_json(&app, &admin_token, "/v1/connectors").await;
+        let admin_list = admin_conn["connectors"].as_array().unwrap();
+        assert!(!admin_list.iter().any(|c| c["id"] == "elevenlabs_api_key"));
+        let admin_el = find_by_id(admin_list, "elevenlabs");
+        assert_eq!(admin_el["kind"], "oauth");
+        assert_eq!(admin_el["auth_modes"], json!(["oauth"]));
+        assert_eq!(admin_el["connected"], false);
+        assert!(admin_el["oauth"]["authorize_url"].is_string());
+
+        let member_conn = get_json(&app, &member_token, "/v1/connectors").await;
+        let member_list = member_conn["connectors"].as_array().unwrap();
+        assert!(!member_list.iter().any(|c| c["id"] == "elevenlabs_api_key"));
+        let member_el = find_by_id(member_list, "elevenlabs");
+        assert_eq!(member_el["kind"], "oauth");
+        assert_eq!(member_el["auth_modes"], json!(["oauth"]));
+        assert_eq!(member_el["connected"], true);
+        assert!(member_el["oauth"]["authorize_url"].is_string());
+        assert!(!member_conn.to_string().contains("synthetic-member-access"));
+
+        // Non-admin member can test their own ElevenLabs connection via /v1/connectors/elevenlabs/test.
+        let test_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/connectors/elevenlabs/test")
+                    .header("authorization", format!("Bearer {member_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(test_resp.status(), StatusCode::OK);
+        let test_bytes = axum::body::to_bytes(test_resp.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        let test_json: Value = serde_json::from_slice(&test_bytes).unwrap();
+        assert_eq!(test_json["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn non_admin_member_can_start_and_disconnect_own_elevenlabs_oauth_only() {
+        let (app, store, users) = test_app_with_connectors_and_users();
+        let admin_id = store.admin_user_id().unwrap();
+        let member = store
+            .create_user(
+                "sub-eleven-oauth",
+                "oauth-member@example.example",
+                "OAuth Member",
+            )
+            .unwrap();
+        let member_token = store
+            .mint_session(&member.id, chrono::Duration::hours(1))
+            .unwrap();
+
+        // Both admin and member start signed in with ElevenLabs.
+        crate::elevenlabs_mcp::store_sign_in(
+            &users,
+            &admin_id,
+            "synthetic-admin-access",
+            "synthetic-admin-refresh",
+            Some(3600),
+        )
+        .unwrap();
+        crate::elevenlabs_mcp::store_sign_in(
+            &users,
+            &member.id,
+            "synthetic-member-access",
+            "synthetic-member-refresh",
+            Some(3600),
+        )
+        .unwrap();
+
+        // Non-admin member can start ElevenLabs OAuth PKCE for their own account.
+        let start_body = json!({
+            "challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            "state": "synthetic-state-1234",
+            "redirect_uri": crate::elevenlabs_oauth::oauth_callback_uri(),
+        });
+        let start_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/admin/connectors/elevenlabs/oauth/start")
+                    .header("authorization", format!("Bearer {member_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(start_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start_resp.status(), StatusCode::OK);
+        let start_bytes = axum::body::to_bytes(start_resp.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        let start_json: Value = serde_json::from_slice(&start_bytes).unwrap();
+        assert_eq!(start_json["flow"], "pkce");
+        assert!(
+            start_json["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("https://elevenlabs.io/app/oauth/authorize?")
+        );
+
+        // Non-admin member can disconnect their own ElevenLabs OAuth without touching admin's.
+        let del_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/admin/connectors/elevenlabs/oauth")
+                    .header("authorization", format!("Bearer {member_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(del_resp.status(), StatusCode::OK);
+        let del_bytes = axum::body::to_bytes(del_resp.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        let del_json: Value = serde_json::from_slice(&del_bytes).unwrap();
+        assert_eq!(del_json["signed_in"], false);
+        assert_eq!(del_json["removed"], true);
+
+        assert!(!crate::elevenlabs_mcp::is_signed_in(&users, &member.id).unwrap());
+        assert!(crate::elevenlabs_mcp::is_signed_in(&users, &admin_id).unwrap());
     }
 }

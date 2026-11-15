@@ -497,8 +497,11 @@ pub(crate) fn extension_for_mime(mime: &str) -> &'static str {
         "image/png" => "png",
         "image/jpeg" => "jpg",
         "image/webp" => "webp",
+        "image/avif" => "avif",
+        "image/svg+xml" => "svg",
         "video/mp4" => "mp4",
         "video/webm" => "webm",
+        "video/quicktime" => "mov",
         _ => "bin",
     }
 }

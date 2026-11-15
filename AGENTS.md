@@ -20,10 +20,10 @@ in passing:
   plugin runner without a new security design.
 - The shipped manifests under `plugins/` use placeholder hosts
   (`*.example.invalid`). They are not real services.
-- The desktop keeps Install and Enable off while `RUNTIME_CALLS_PLUGINS` in
-  `crates/serabot-desktop/src/marketplace.rs` is `false`. Placeholder hosts and
-  local-program plugins stay off after that. Do not offer those actions, and do
-  not ask the user to paste a secret for a plugin that cannot run.
+- `RUNTIME_CALLS_PLUGINS` in `crates/serabot-desktop/src/marketplace.rs` is
+  `true` for live `http` MCP plugins. Placeholder hosts (`*.example.invalid`)
+  and local-program (`stdio`) plugins stay off. Do not offer those actions, and
+  do not ask the user to paste a secret for a plugin that cannot run.
 - Secrets are write-only in the per-user store. The admin cannot read them.
 
 Everything user-owned is UID-scoped — bots, skills, memory, documents,
