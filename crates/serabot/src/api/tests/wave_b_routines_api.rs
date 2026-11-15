@@ -253,3 +253,162 @@ async fn get_models_enforces_conversation_ownership_and_isolates_settings() {
     let bob_body = read_json(bob_own).await;
     assert_ne!(bob_body["selection"]["model"], "test-alternative");
 }
+
+#[tokio::test]
+async fn put_routine_edits_label_and_prompt_and_preserves_them_across_schedule_updates() {
+    let (app, _, store) = app();
+    let member = store
+        .create_user("subject-rout-meta", "rmeta@example.example", "Routine Meta")
+        .unwrap();
+    let token = mint_for(&store, &member.id, "rmeta");
+
+    // Set label and prompt without changing time/timezone.
+    let res = app
+        .clone()
+        .oneshot(request_with_token(
+            "PUT",
+            "/v1/routines/morning_brief",
+            &token,
+            Some(json!({
+                "label": "Executive Brief",
+                "prompt": "Summarize top priorities and deadlines."
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = read_json(res).await;
+    assert_eq!(body["routine"]["config"]["label"], "Executive Brief");
+    assert_eq!(
+        body["routine"]["config"]["prompt"],
+        "Summarize top priorities and deadlines."
+    );
+
+    // Updating time via ensure_daily_routine preserves label and prompt.
+    crate::scheduler::ensure_daily_routine(&store, &member.id, "morning_brief", "09:15", Rome)
+        .unwrap();
+    let listed = store.list_routines(&member.id).unwrap();
+    let row = listed.iter().find(|r| r.name == "morning_brief").unwrap();
+    assert_eq!(row.config["time"], "09:15");
+    assert_eq!(row.config["label"], "Executive Brief");
+    assert_eq!(
+        row.config["prompt"],
+        "Summarize top priorities and deadlines."
+    );
+
+    // Empty string clears label.
+    let clear = app
+        .clone()
+        .oneshot(request_with_token(
+            "PUT",
+            "/v1/routines/morning_brief",
+            &token,
+            Some(json!({ "label": "" })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(clear.status(), StatusCode::OK);
+    let cleared = read_json(clear).await;
+    assert!(cleared["routine"]["config"].get("label").is_none());
+    assert_eq!(
+        cleared["routine"]["config"]["prompt"],
+        "Summarize top priorities and deadlines."
+    );
+
+    // Control characters are rejected.
+    let bad = app
+        .clone()
+        .oneshot(request_with_token(
+            "PUT",
+            "/v1/routines/morning_brief",
+            &token,
+            Some(json!({ "label": "bad\nlabel" })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn active_workflows_return_items_and_support_editing() {
+    let (app, _, store) = app();
+    let member = store
+        .create_user("subject-wf-edit", "wfe@example.example", "Workflow Edit")
+        .unwrap();
+    let token = mint_for(&store, &member.id, "wfe");
+    store
+        .ensure_conversation_accepts_turns(&member.id, "dir:wf1")
+        .unwrap();
+    store
+        .set_plan(
+            &member.id,
+            "dir:wf1",
+            "Initial goal",
+            &[
+                crate::plans::PlanItem {
+                    text: "Step one".into(),
+                    status: crate::plans::PlanStatus::Pending,
+                },
+                crate::plans::PlanItem {
+                    text: "Step two".into(),
+                    status: crate::plans::PlanStatus::Done,
+                },
+            ],
+        )
+        .unwrap();
+
+    // GET /v1/workflows/active includes items.
+    let list_res = app
+        .clone()
+        .oneshot(request_with_token(
+            "GET",
+            "/v1/workflows/active",
+            &token,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(list_res.status(), StatusCode::OK);
+    let list_body = read_json(list_res).await;
+    assert_eq!(
+        list_body["workflows"][0]["items"].as_array().unwrap().len(),
+        2
+    );
+
+    // PUT /v1/workflows/active/{conversation_id} updates goal and items.
+    let put_res = app
+        .clone()
+        .oneshot(request_with_token(
+            "PUT",
+            "/v1/workflows/active/dir:wf1",
+            &token,
+            Some(json!({
+                "goal": "Updated goal",
+                "items": [
+                    {"text": "Revised step", "status": "doing"},
+                    {"text": "Second step", "status": "done"}
+                ]
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_res.status(), StatusCode::OK);
+    let put_body = read_json(put_res).await;
+    assert_eq!(put_body["workflow"]["goal"], "Updated goal");
+    assert_eq!(put_body["workflow"]["done"], 1);
+    assert_eq!(put_body["workflow"]["total"], 2);
+    assert_eq!(put_body["workflow"]["items"][0]["text"], "Revised step");
+
+    // Empty goal is rejected.
+    let bad_res = app
+        .clone()
+        .oneshot(request_with_token(
+            "PUT",
+            "/v1/workflows/active/dir:wf1",
+            &token,
+            Some(json!({ "goal": "   " })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(bad_res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}

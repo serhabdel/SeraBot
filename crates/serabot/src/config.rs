@@ -1271,17 +1271,26 @@ impl Default for FirecrawlConfig {
 
 /// `[vault]`: where the password manager CLIs live. Empty means look the
 /// binary up on `PATH` (`op` for 1Password, `pass-cli` for Proton Pass).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultConfig {
     #[serde(default)]
     pub op_path: String,
     #[serde(default)]
     pub pass_cli_path: String,
-    /// Read Proton Pass references. Off by default: experimental until the
-    /// `pass-cli` token variable and item flags are checked against the
-    /// installed release (see docs/vault.md).
-    #[serde(default)]
+    /// Read Proton Pass references. Enabled by default; set `false` in
+    /// `[vault]` to disable it.
+    #[serde(default = "default_true")]
     pub protonpass_enabled: bool,
+}
+
+impl Default for VaultConfig {
+    fn default() -> Self {
+        Self {
+            op_path: String::new(),
+            pass_cli_path: String::new(),
+            protonpass_enabled: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

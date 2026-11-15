@@ -3037,6 +3037,55 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Update optional `label` and `prompt` metadata inside a routine's `config_json`.
+    /// Empty strings clear the corresponding field.
+    pub fn update_routine_metadata(
+        &self,
+        user_id: &str,
+        name: &str,
+        label: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<()> {
+        let connection = self.connection()?;
+        let existing: Option<String> = connection
+            .query_row(
+                "SELECT config_json FROM routines WHERE name = ?1 AND user_id = ?2",
+                params![name, user_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(raw) = existing else {
+            return Err(SeraError::NotFound(format!("routine {name}")));
+        };
+        let mut map = serde_json::from_str::<Value>(&raw)
+            .ok()
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        if let Some(value) = label {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                map.remove("label");
+            } else {
+                map.insert("label".to_owned(), Value::String(trimmed.to_owned()));
+            }
+        }
+        if let Some(value) = prompt {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                map.remove("prompt");
+            } else {
+                map.insert("prompt".to_owned(), Value::String(trimmed.to_owned()));
+            }
+        }
+        let updated = Value::Object(map).to_string();
+        let now_string = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        connection.execute(
+            "UPDATE routines SET config_json = ?1, updated_at = ?2 WHERE name = ?3 AND user_id = ?4",
+            params![updated, now_string, name, user_id],
+        )?;
+        Ok(())
+    }
+
     /// The latest `source_runs` row per source for the acting user.
     /// Items this user first saw after `since`, newest first. `since` must be
     /// RFC 3339 with milliseconds (the stored format), so text order is time

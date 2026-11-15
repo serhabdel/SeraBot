@@ -11,6 +11,19 @@ pub(super) struct PutRoutineRequest {
     time: Option<String>,
     #[serde(default)]
     timezone: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+}
+
+fn validate_routine_text(field: &str, value: &str) -> Result<()> {
+    if value.chars().count() > 240 || value.chars().any(char::is_control) {
+        return Err(SeraError::Validation(format!(
+            "{field} must be at most 240 characters with no control characters"
+        )));
+    }
+    Ok(())
 }
 
 /// `GET /v1/routines`: name, enabled, next run, last run date and config.
@@ -33,8 +46,19 @@ pub(super) async fn put_routine(
         return Err(SeraError::Validation("invalid routine name".into()));
     }
     let kind = crate::config::classify_member_routine(&name)?;
-    if body.enabled.is_none() && body.time.is_none() && body.timezone.is_none() {
+    if body.enabled.is_none()
+        && body.time.is_none()
+        && body.timezone.is_none()
+        && body.label.is_none()
+        && body.prompt.is_none()
+    {
         return Err(SeraError::Validation("no routine fields to update".into()));
+    }
+    if let Some(label) = body.label.as_deref() {
+        validate_routine_text("label", label)?;
+    }
+    if let Some(prompt) = body.prompt.as_deref() {
+        validate_routine_text("prompt", prompt)?;
     }
 
     let exists = state.store.routine_exists(&user.id, &name)?;
@@ -54,14 +78,23 @@ pub(super) async fn put_routine(
         .map_err(|_| SeraError::Validation(format!("invalid timezone: {tz_name:?}")))?;
 
     let schedule_change = body.time.is_some() || body.timezone.is_some();
-    if schedule_change || (body.enabled == Some(true) && !exists) {
+    let metadata_change = body.label.is_some() || body.prompt.is_some();
+    if schedule_change || ((body.enabled == Some(true) || metadata_change) && !exists) {
         crate::scheduler::ensure_daily_routine(&state.store, &user.id, &name, time, tz)?;
     }
+    if metadata_change {
+        state.store.update_routine_metadata(
+            &user.id,
+            &name,
+            body.label.as_deref(),
+            body.prompt.as_deref(),
+        )?;
+    }
     if let Some(enabled) = body.enabled {
-        if !enabled && !exists && !schedule_change {
+        if !enabled && !exists && !schedule_change && !metadata_change {
             return Err(SeraError::NotFound(format!("routine {name}")));
         }
-        if enabled || exists || schedule_change {
+        if enabled || exists || schedule_change || metadata_change {
             crate::scheduler::set_routine_enabled(&state.store, &user.id, &name, enabled)?;
         }
     }

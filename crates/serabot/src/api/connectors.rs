@@ -652,11 +652,11 @@ pub(super) async fn start_onedrive_consent(
 
 #[derive(Debug, Deserialize)]
 pub(super) struct ConsentCallbackParams {
-    state: String,
+    pub(super) state: String,
     #[serde(default)]
-    code: Option<String>,
+    pub(super) code: Option<String>,
     #[serde(default)]
-    error: Option<String>,
+    pub(super) error: Option<String>,
 }
 
 /// The OneDrive consent redirect target. Public (the browser arrives from
@@ -852,7 +852,10 @@ pub(super) async fn personal_callback(
     personal_callback_inner(&state, params).await
 }
 
-async fn personal_callback_inner(state: &ApiState, params: ConsentCallbackParams) -> Response {
+pub(super) async fn personal_callback_inner(
+    state: &ApiState,
+    params: ConsentCallbackParams,
+) -> Response {
     if params.error.is_some() {
         // Drop the pending state so a declined consent cannot be replayed.
         let _ = state.personal.take_state(&params.state).await;
@@ -1090,14 +1093,22 @@ async fn connector_test_outcome(
             )
         });
     }
-    if let Some(kind) = crate::connectors::ConnectorKind::from_section(id) {
-        let personal = state.personal.view(&user.id, kind)?;
-        return Ok(match personal.map(|view| view.state) {
-            Some("connected") => (true, "Signed in.".into()),
-            _ => (
+    if let Some(kind) = crate::connectors::ConnectorKind::from_section(id)
+        && let Some(view) = state.personal.view(&user.id, kind)?
+    {
+        return Ok(if view.state == "connected" {
+            let message = match view.account {
+                Some(account) => format!("Signed in as {account}."),
+                None => "Signed in.".into(),
+            };
+            (true, message)
+        } else {
+            (
                 false,
-                "Not signed in. Connect the account, then test again.".into(),
-            ),
+                view.hint.unwrap_or_else(|| {
+                    "Not signed in. Connect the account, then test again.".into()
+                }),
+            )
         });
     }
     if !user.is_admin() {
@@ -1168,34 +1179,54 @@ pub(super) async fn admin_test_connector(
     Path(id): Path<String>,
 ) -> AdminResult<Json<Value>> {
     require_admin(&user).map_err(admin_error)?;
-    let roles = connector_secret_roles(&state.config, &id).map_err(admin_error)?;
     let checked_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-    let missing = roles.iter().find(|(_, name)| !state.secrets.has(name));
-    let (ok, message) = match (missing, api_key_probe(&state.config, &id)) {
-        (Some((_, name)), _) => (false, format!("Missing secret: {name}")),
-        (None, Some(probe)) => {
-            let key = roles
-                .iter()
-                .find(|(role, _)| *role == "api_key" || *role == "access_token")
-                .and_then(|(_, name)| state.secrets.get(name))
-                .unwrap_or_default();
-            match probe_api_key(probe, &key).await {
-                Ok(()) => (true, "Key accepted".to_owned()),
-                Err(message) => (false, message),
-            }
+    let (ok, message) = if id == "composio"
+        || id == "onedrive"
+        || id == "elevenlabs"
+        || crate::token_connectors::TokenConnectors::ids().contains(&id.as_str())
+    {
+        connector_test_outcome(&state, &user, &id)
+            .await
+            .map_err(admin_error)?
+    } else if let Some(view) = crate::connectors::ConnectorKind::from_section(&id)
+        .and_then(|kind| state.personal.view(&user.id, kind).transpose())
+        .transpose()
+        .map_err(admin_error)?
+    {
+        if view.state == "connected" {
+            let message = match view.account {
+                Some(account) => format!("Signed in as {account}."),
+                None => "Signed in for this account.".to_owned(),
+            };
+            (true, message)
+        } else {
+            (
+                false,
+                view.hint
+                    .unwrap_or_else(|| "Not signed in. Connect this account first.".to_owned()),
+            )
         }
-        // The sign-in is per account: the check is whether this account has one.
-        (None, None) if id == "elevenlabs" => {
-            if crate::elevenlabs_mcp::is_signed_in(&state.users, &user.id).map_err(admin_error)? {
-                (true, "Signed in with ElevenLabs for this account.".to_owned())
-            } else {
-                (false, "Not signed in with ElevenLabs for this account.".to_owned())
+    } else {
+        let roles = connector_secret_roles(&state.config, &id).map_err(admin_error)?;
+        let missing = roles.iter().find(|(_, name)| !state.secrets.has(name));
+        match (missing, api_key_probe(&state.config, &id)) {
+            (Some((_, name)), _) => (false, format!("Missing secret: {name}")),
+            (None, Some(probe)) => {
+                let key = roles
+                    .iter()
+                    .find(|(role, _)| *role == "api_key" || *role == "access_token")
+                    .and_then(|(_, name)| state.secrets.get(name))
+                    .unwrap_or_default();
+                match probe_api_key(probe, &key).await {
+                    Ok(()) => (true, "Key accepted".to_owned()),
+                    Err(message) => (false, message),
+                }
             }
+            (None, None) => (
+                true,
+                "Client ID, client secret and refresh token are stored. The OAuth token exchange was not run.".to_owned(),
+            ),
         }
-        (None, None) => (
-            true,
-            "Client ID, client secret and refresh token are stored. The OAuth token exchange was not run.".to_owned(),
-        ),
     };
     audit_config(
         &state,
@@ -1617,5 +1648,71 @@ mod tests {
 
         assert!(!crate::elevenlabs_mcp::is_signed_in(&users, &member.id).unwrap());
         assert!(crate::elevenlabs_mcp::is_signed_in(&users, &admin_id).unwrap());
+    }
+
+    #[tokio::test]
+    async fn personal_google_connectors_test_cleanly_on_user_and_admin_endpoints() {
+        let (app, store, users) = test_app_with_connectors_and_users();
+        let admin_id = store.admin_user_id().unwrap();
+        let admin_token = store
+            .mint_session(&admin_id, chrono::Duration::hours(1))
+            .unwrap();
+        let member = store
+            .create_user("sub-google-test", "gtest@example.example", "Google Test")
+            .unwrap();
+        let member_token = store
+            .mint_session(&member.id, chrono::Duration::hours(1))
+            .unwrap();
+
+        let cred = serde_json::json!({
+            "refresh_token": "synthetic-refresh-token-1234",
+            "account": "alice@example.com",
+            "connectors": ["google_drive", "gmail"]
+        })
+        .to_string();
+        users.set(&admin_id, "conn.google", &cred).unwrap();
+        users.set(&member.id, "conn.google", &cred).unwrap();
+
+        for id in ["google_drive", "gmail"] {
+            let user_resp = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/v1/connectors/{id}/test"))
+                        .header("authorization", format!("Bearer {member_token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(user_resp.status(), StatusCode::OK, "{id}");
+            let user_bytes = axum::body::to_bytes(user_resp.into_body(), 128 * 1024)
+                .await
+                .unwrap();
+            let user_json: Value = serde_json::from_slice(&user_bytes).unwrap();
+            assert_eq!(user_json["ok"], true);
+            assert_eq!(user_json["message"], "Signed in as alice@example.com.");
+
+            let admin_resp = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/v1/admin/connectors/{id}/test"))
+                        .header("authorization", format!("Bearer {admin_token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(admin_resp.status(), StatusCode::OK, "{id}");
+            let admin_bytes = axum::body::to_bytes(admin_resp.into_body(), 128 * 1024)
+                .await
+                .unwrap();
+            let admin_json: Value = serde_json::from_slice(&admin_bytes).unwrap();
+            assert_eq!(admin_json["ok"], true);
+            assert_eq!(admin_json["message"], "Signed in as alice@example.com.");
+        }
     }
 }

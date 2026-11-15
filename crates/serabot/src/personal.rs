@@ -44,14 +44,13 @@ use crate::connectors::{
 };
 use crate::error::{Result, SeraError};
 use crate::gateway::{ApprovalDetails, Tool, ToolContext, ToolOutput, ToolRegistry, ToolSpec};
-use crate::onedrive::CONSENT_CALLBACK_PATH;
 use crate::secrets::SharedSecrets;
 use crate::user_secrets::UserSecrets;
 use crate::util::truncate_chars;
 
-/// Microsoft consent lands on the redirect already registered for OneDrive, so
-/// the owner adds no new redirect URI to the Entra app.
-pub const MICROSOFT_CALLBACK_PATH: &str = CONSENT_CALLBACK_PATH;
+/// Microsoft consent lands on the OIDC callback already registered on the
+/// Entra app, so the owner adds no new redirect URI.
+pub const MICROSOFT_CALLBACK_PATH: &str = "/v1/auth/callback";
 pub const GOOGLE_CALLBACK_PATH: &str = "/v1/connectors/google/callback";
 pub const NOTION_CALLBACK_PATH: &str = "/v1/connectors/notion/callback";
 /// Age-store names the admin Google setup writes (shared by the four Google
@@ -471,6 +470,46 @@ impl PersonalConnectors {
         Ok(self.read_credential(user_id, kind)?.is_some())
     }
 
+    /// Whether the user has a personal Microsoft OAuth connection (Outlook Mail or Calendar).
+    pub fn has_microsoft_connection(&self, user_id: &str) -> Result<bool> {
+        Ok(self.users.get(user_id, "conn.outlook_calendar")?.is_some()
+            || self.users.get(user_id, "conn.outlook")?.is_some())
+    }
+
+    /// Whether the user has a personal Google OAuth connection.
+    pub fn has_google_connection(&self, user_id: &str) -> Result<bool> {
+        Ok(self.users.get(user_id, "conn.google")?.is_some())
+    }
+
+    /// Access token for task/calendar sync from the user's personal Microsoft connection.
+    pub async fn microsoft_sync_token(&self, user_id: &str) -> Result<String> {
+        for kind in [ConnectorKind::OutlookCalendar, ConnectorKind::OutlookMail] {
+            if self.read_credential(user_id, kind)?.is_some() {
+                return self.access_token(user_id, kind).await;
+            }
+        }
+        Err(SeraError::Forbidden(
+            "Outlook is not connected for this account; connect it from the console first".into(),
+        ))
+    }
+
+    /// Access token for task/calendar sync from the user's personal Google connection.
+    pub async fn google_sync_token(&self, user_id: &str) -> Result<String> {
+        for kind in [
+            ConnectorKind::GoogleCalendar,
+            ConnectorKind::GoogleDrive,
+            ConnectorKind::Gmail,
+            ConnectorKind::GoogleSheets,
+        ] {
+            if self.read_credential(user_id, kind)?.is_some() {
+                return self.access_token(user_id, kind).await;
+            }
+        }
+        Err(SeraError::Forbidden(
+            "Google is not connected for this account; connect it from the console first".into(),
+        ))
+    }
+
     /// The card state for one connector, or `None` when the old global
     /// Outlook client is configured and keeps the legacy admin card.
     pub fn view(&self, user_id: &str, kind: ConnectorKind) -> Result<Option<PersonalView>> {
@@ -560,17 +599,24 @@ impl PersonalConnectors {
         match kind.provider() {
             OAuthProvider::Microsoft => {
                 let data = match kind {
-                    ConnectorKind::OutlookMail => "Mail.ReadWrite Mail.Send",
-                    _ => "Calendars.ReadWrite",
+                    ConnectorKind::OutlookMail => "Mail.ReadWrite Mail.Send Tasks.ReadWrite",
+                    _ => "Calendars.ReadWrite Tasks.ReadWrite",
                 };
                 format!("{MICROSOFT_IDENTITY_SCOPE} {data}")
             }
             OAuthProvider::Google => {
                 let mut scopes = vec![GOOGLE_IDENTITY_SCOPE.to_owned()];
+                let mut has_calendar = kind == ConnectorKind::GoogleCalendar;
                 for id in grant {
                     if let Some(granted) = ConnectorKind::from_section(id) {
+                        if granted == ConnectorKind::GoogleCalendar {
+                            has_calendar = true;
+                        }
                         scopes.push(granted.scope().to_owned());
                     }
+                }
+                if has_calendar {
+                    scopes.push("https://www.googleapis.com/auth/tasks".to_owned());
                 }
                 scopes.join(" ")
             }
@@ -1300,12 +1346,12 @@ mod tests {
         assert_eq!(query_value(&mail, "client_id").unwrap(), "entra-client");
         assert_eq!(
             query_value(&mail, "scope").unwrap(),
-            "offline_access openid email Mail.ReadWrite Mail.Send"
+            "offline_access openid email Mail.ReadWrite Mail.Send Tasks.ReadWrite"
         );
         assert_eq!(query_value(&mail, "code_challenge_method").unwrap(), "S256");
         assert_eq!(
             query_value(&mail, "redirect_uri").unwrap(),
-            "https://bot.example.example/v1/connectors/onedrive/callback"
+            "https://bot.example.example/v1/auth/callback"
         );
         assert!(!mail.contains("client_secret"));
         let calendar = service
@@ -1313,7 +1359,11 @@ mod tests {
             .await
             .unwrap();
         let scope = query_value(&calendar, "scope").unwrap();
-        assert!(scope.contains("Calendars.ReadWrite") && !scope.contains("Mail."));
+        assert!(
+            scope.contains("Calendars.ReadWrite")
+                && scope.contains("Tasks.ReadWrite")
+                && !scope.contains("Mail.")
+        );
     }
 
     #[tokio::test]

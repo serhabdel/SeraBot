@@ -1245,7 +1245,7 @@ async fn connector_test_is_owner_only_and_reports_missing_secrets_without_networ
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-    for id in ["tavily", "firecrawl", "agentmail", "gmail"] {
+    for id in ["tavily", "firecrawl", "agentmail"] {
         let response = app
             .clone()
             .oneshot(request(
@@ -1270,6 +1270,23 @@ async fn connector_test_is_owner_only_and_reports_missing_secrets_without_networ
         );
         assert!(body["checked_at"].as_str().is_some());
     }
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            &app,
+            "POST",
+            "/v1/admin/connectors/gmail/test",
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    assert_eq!(body["id"], "gmail");
+    assert_eq!(body["ok"], false);
+    assert!(body["checked_at"].as_str().is_some());
 }
 
 #[tokio::test]

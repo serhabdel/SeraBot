@@ -584,6 +584,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/digest", get(get_digest))
         .route("/v1/monitoring/run", post(run_all_sources))
         .route("/v1/workflows/active", get(list_active_workflows))
+        .route(
+            "/v1/workflows/active/{conversation_id}",
+            put(put_active_workflow),
+        )
         .route("/v1/traces", get(list_traces))
         .route("/v1/logs", get(list_logs))
         .route("/v1/me", get(auth_me))

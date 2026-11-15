@@ -166,12 +166,12 @@ pub(super) async fn sync_status(
         &state.users,
         &user.id,
         crate::task_sync::GOOGLE_PROVIDER,
-    )?;
+    )? || state.personal.has_google_connection(&user.id)?;
     let microsoft = crate::task_sync::sign_in_status(
         &state.users,
         &user.id,
         crate::task_sync::MICROSOFT_PROVIDER,
-    )?;
+    )? || state.personal.has_microsoft_connection(&user.id)?;
     Ok(Json(json!({
         "prefs": prefs,
         "signed_in": {"tasks_google": google, "tasks_microsoft": microsoft},
@@ -293,24 +293,104 @@ pub(super) async fn sync_oauth_disconnect(
 /// credentials the per-user personal connectors are configured with.
 fn sync_client_credentials(state: &ApiState, provider: &str) -> Result<(String, String)> {
     crate::task_sync::validate_oauth_provider(provider)?;
-    let (id_name, secret_name) = match provider {
-        crate::task_sync::GOOGLE_PROVIDER => (
-            &state.config.connectors.google_drive.client_id_secret,
-            &state.config.connectors.google_drive.client_secret_secret,
-        ),
-        _ => (
+    if provider == crate::task_sync::GOOGLE_PROVIDER {
+        let client_id = state
+            .secrets
+            .get(&state.config.connectors.google_drive.client_id_secret)
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                SeraError::Config("task sync OAuth client id is not configured".into())
+            })?;
+        let client_secret = state
+            .secrets
+            .get(&state.config.connectors.google_drive.client_secret_secret)
+            .unwrap_or_default();
+        return Ok((client_id, client_secret));
+    }
+
+    let candidates: [(&str, Option<&str>); 4] = [
+        (&state.config.auth.client_id_secret, None),
+        (&state.config.onedrive.client_id_secret, None),
+        (
             &state.config.connectors.outlook.client_id_secret,
-            &state.config.connectors.outlook.client_secret_secret,
+            Some(
+                state
+                    .config
+                    .connectors
+                    .outlook
+                    .client_secret_secret
+                    .as_str(),
+            ),
         ),
-    };
-    let client_id = state
-        .secrets
-        .get(id_name)
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| SeraError::Config("task sync OAuth client id is not configured".into()))?;
-    let client_secret = state.secrets.get(secret_name).unwrap_or_default();
-    Ok((client_id, client_secret))
+        (
+            &state.config.connectors.outlook_calendar.client_id_secret,
+            Some(
+                state
+                    .config
+                    .connectors
+                    .outlook_calendar
+                    .client_secret_secret
+                    .as_str(),
+            ),
+        ),
+    ];
+    for (id_name, secret_name) in candidates {
+        if let Some(client_id) = state
+            .secrets
+            .get(id_name)
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+        {
+            let client_secret = secret_name
+                .and_then(|name| state.secrets.get(name))
+                .unwrap_or_default();
+            return Ok((client_id, client_secret));
+        }
+    }
+    Err(SeraError::Config(
+        "task sync OAuth client id is not configured".into(),
+    ))
+}
+
+async fn resolve_sync_token(
+    state: &ApiState,
+    user_id: &str,
+    family: &str,
+    client_id: &str,
+    client_secret: &str,
+    http: &reqwest::Client,
+) -> Result<secrecy::SecretString> {
+    match crate::task_sync::access_token(
+        &state.users,
+        user_id,
+        family,
+        client_id,
+        client_secret,
+        http,
+    )
+    .await
+    {
+        Ok(token) => Ok(token),
+        Err(error)
+            if error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("not signed in") =>
+        {
+            let personal = match family {
+                crate::task_sync::GOOGLE_PROVIDER => {
+                    state.personal.google_sync_token(user_id).await?
+                }
+                crate::task_sync::MICROSOFT_PROVIDER => {
+                    state.personal.microsoft_sync_token(user_id).await?
+                }
+                _ => return Err(error),
+            };
+            Ok(secrecy::SecretString::from(personal))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn sync_failure_text(error: &SeraError) -> String {
@@ -362,15 +442,8 @@ pub(super) async fn run_sync(
     let (client_id, client_secret) = sync_client_credentials(&state, family)?;
     let http = sync_http()?;
     let synced = async {
-        let token = crate::task_sync::access_token(
-            &state.users,
-            &user.id,
-            family,
-            &client_id,
-            &client_secret,
-            &http,
-        )
-        .await?;
+        let token =
+            resolve_sync_token(&state, &user.id, family, &client_id, &client_secret, &http).await?;
         let mut report = crate::task_sync::SyncReport::default();
         if matches!(
             provider.as_str(),
@@ -446,15 +519,8 @@ pub(super) async fn calendar_events(
         .ok_or_else(|| SeraError::Validation("choose a calendar provider first".into()))?;
     let (client_id, client_secret) = sync_client_credentials(&state, family)?;
     let http = sync_http()?;
-    let token = crate::task_sync::access_token(
-        &state.users,
-        &user.id,
-        family,
-        &client_id,
-        &client_secret,
-        &http,
-    )
-    .await?;
+    let token =
+        resolve_sync_token(&state, &user.id, family, &client_id, &client_secret, &http).await?;
     let events = crate::task_sync::calendar_events(
         &user.id,
         &provider,

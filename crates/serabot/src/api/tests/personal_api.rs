@@ -78,7 +78,7 @@ async fn microsoft_consent_starts_with_the_auth_client_id_and_no_secret() {
     assert_eq!(outlook["personal"]["state"], "ready");
     assert_eq!(
         outlook["personal"]["redirect_uri"],
-        "https://bot.example.example/v1/connectors/onedrive/callback"
+        "https://bot.example.example/v1/auth/callback"
     );
 
     let response = call(&app, &token, "POST", "/v1/connectors/outlook/start", None).await;
@@ -184,4 +184,64 @@ async fn the_connectors_routes_require_a_session() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
     }
+}
+
+#[tokio::test]
+async fn auth_callback_completes_or_cancels_personal_microsoft_consent_and_sync_recognizes_it() {
+    let (app, _, store, _idp) = auth_app().await;
+    let member = store
+        .create_user("subject-ms-cb", "mscb@example.example", "Synthetic MSCB")
+        .unwrap();
+    let token = mint_for(&store, &member.id, "mscb-test");
+
+    let response = call(&app, &token, "POST", "/v1/connectors/outlook/start", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let url = read_json(response).await["url"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let parsed = url::Url::parse(&url).unwrap();
+    let pairs: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(
+        pairs["redirect_uri"],
+        "https://bot.example.example/v1/auth/callback"
+    );
+    let state_param = pairs["state"].clone();
+
+    // Declining at Microsoft via /v1/auth/callback delegates to personal_callback_inner.
+    let cb = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/v1/auth/callback?state={state_param}&error=access_denied"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cb.status(), StatusCode::BAD_REQUEST);
+
+    // Sync OAuth start falls back to auth_client_id for Microsoft.
+    let sync_start = call(
+        &app,
+        &token,
+        "POST",
+        "/v1/tasks/sync/oauth/start",
+        Some(json!({
+            "provider": "tasks_microsoft",
+            "redirect_uri": "http://127.0.0.1:43210/cb",
+            "challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            "state": "sync-state-1"
+        })),
+    )
+    .await;
+    assert_eq!(sync_start.status(), StatusCode::OK);
+    let sync_url = read_json(sync_start).await["url"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(sync_url.contains(crate::auth::test_idp::TEST_CLIENT_ID));
 }
