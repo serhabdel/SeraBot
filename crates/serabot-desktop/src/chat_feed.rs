@@ -198,6 +198,92 @@ pub fn suggestions(bot_id: Option<&str>) -> &'static [&'static str] {
     }
 }
 
+/// Library artifacts grouped by the assistant message of the turn that
+/// produced them, plus any artifacts from an in-progress turn (or a
+/// conversation with no assistant reply yet).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AssignedLibrary {
+    pub by_message: std::collections::BTreeMap<String, Vec<crate::LibraryEntry>>,
+    pub trailing: Vec<crate::LibraryEntry>,
+}
+
+/// Assign each library artifact to the assistant message of the user turn
+/// whose time window `[turn_user_ts, next_user_ts)` produced it.
+///
+/// Artifacts are sorted oldest-first by `(created_at, hash)` so each turn's
+/// attachments render in chronological creation order. Artifacts from an
+/// active turn that has no assistant reply yet go into `trailing`.
+pub fn assign_library_to_messages(
+    messages: &[crate::Message],
+    library: &[crate::LibraryEntry],
+) -> AssignedLibrary {
+    let mut assigned = AssignedLibrary::default();
+    if library.is_empty() {
+        return assigned;
+    }
+
+    let mut sorted = library.to_vec();
+    sorted.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.hash.cmp(&b.hash))
+    });
+
+    struct Turn<'a> {
+        start_ts: Option<&'a str>,
+        last_assistant_id: Option<&'a str>,
+    }
+
+    let mut leading_assistant_id: Option<&str> = None;
+    let mut turns: Vec<Turn<'_>> = Vec::new();
+
+    for msg in messages {
+        match msg.role {
+            crate::Role::User => {
+                let start_ts = (msg.created_at != "Just now").then_some(msg.created_at.as_str());
+                turns.push(Turn {
+                    start_ts,
+                    last_assistant_id: None,
+                });
+            }
+            crate::Role::Assistant => {
+                if let Some(turn) = turns.last_mut() {
+                    turn.last_assistant_id = Some(msg.id.as_str());
+                } else {
+                    leading_assistant_id = Some(msg.id.as_str());
+                }
+            }
+        }
+    }
+
+    for entry in sorted {
+        let ts = entry.created_at.as_str();
+        let target_id = if turns.is_empty() {
+            leading_assistant_id
+        } else {
+            let matching_turn = turns
+                .iter()
+                .rfind(|turn| turn.start_ts.is_some_and(|start| start <= ts));
+            match matching_turn {
+                Some(turn) => turn.last_assistant_id,
+                None => leading_assistant_id.or_else(|| turns[0].last_assistant_id),
+            }
+        };
+
+        if let Some(id) = target_id {
+            assigned
+                .by_message
+                .entry(id.to_owned())
+                .or_default()
+                .push(entry);
+        } else {
+            assigned.trailing.push(entry);
+        }
+    }
+
+    assigned
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,5 +407,142 @@ mod tests {
             checked += 1;
         }
         assert!(checked >= 12, "expected the twelve shipped bot files");
+    }
+
+    fn test_msg(id: &str, role: crate::Role, created_at: &str) -> crate::Message {
+        crate::Message {
+            id: id.into(),
+            role,
+            content: String::new(),
+            created_at: created_at.into(),
+            name: None,
+            bot: None,
+            attachments: Vec::new(),
+            limit_reached: false,
+        }
+    }
+
+    fn test_entry(hash: &str, created_at: &str) -> crate::LibraryEntry {
+        crate::LibraryEntry {
+            action_id: format!("act-{hash}"),
+            tool: "maker".into(),
+            hash: hash.into(),
+            filename: Some(format!("{hash}.png")),
+            title: None,
+            mime: Some("image/png".into()),
+            created_at: created_at.into(),
+        }
+    }
+
+    #[test]
+    fn assign_library_groups_by_turn_in_chronological_order() {
+        let messages = vec![
+            test_msg("u1", crate::Role::User, "2026-11-15T10:00:00Z"),
+            test_msg("a1", crate::Role::Assistant, "2026-11-15T10:01:05Z"),
+            test_msg("u2", crate::Role::User, "2026-11-15T11:40:00Z"),
+            test_msg("a2", crate::Role::Assistant, "2026-11-15T11:45:00Z"),
+        ];
+        // Provided newest-first (as the API returns them).
+        let library = vec![
+            test_entry("img4", "2026-11-15T11:44:00Z"),
+            test_entry("img2", "2026-11-15T11:43:10Z"),
+            test_entry("img3", "2026-11-15T11:43:30Z"),
+            test_entry("img1", "2026-11-15T11:43:00Z"),
+            test_entry("deck", "2026-11-15T10:01:00Z"),
+        ];
+
+        let assigned = assign_library_to_messages(&messages, &library);
+        assert!(assigned.trailing.is_empty());
+        assert_eq!(
+            assigned
+                .by_message
+                .get("a1")
+                .unwrap()
+                .iter()
+                .map(|e| e.hash.as_str())
+                .collect::<Vec<_>>(),
+            vec!["deck"]
+        );
+        assert_eq!(
+            assigned
+                .by_message
+                .get("a2")
+                .unwrap()
+                .iter()
+                .map(|e| e.hash.as_str())
+                .collect::<Vec<_>>(),
+            vec!["img1", "img2", "img3", "img4"]
+        );
+    }
+
+    #[test]
+    fn assign_library_puts_active_turn_without_reply_in_trailing() {
+        let messages = vec![
+            test_msg("u1", crate::Role::User, "2026-11-15T10:00:00Z"),
+            test_msg("a1", crate::Role::Assistant, "2026-11-15T10:01:05Z"),
+            test_msg("u2", crate::Role::User, "2026-11-15T11:40:00Z"),
+        ];
+        let library = vec![
+            test_entry("deck", "2026-11-15T10:01:00Z"),
+            test_entry("wip1", "2026-11-15T11:41:00Z"),
+            test_entry("wip2", "2026-11-15T11:42:00Z"),
+        ];
+
+        let assigned = assign_library_to_messages(&messages, &library);
+        assert_eq!(assigned.by_message.get("a1").unwrap().len(), 1);
+        assert_eq!(
+            assigned
+                .trailing
+                .iter()
+                .map(|e| e.hash.as_str())
+                .collect::<Vec<_>>(),
+            vec!["wip1", "wip2"]
+        );
+    }
+
+    #[test]
+    fn assign_library_attaches_post_reply_artifact_before_next_user_turn() {
+        let messages = vec![
+            test_msg("u1", crate::Role::User, "2026-11-15T10:00:00Z"),
+            test_msg("a1", crate::Role::Assistant, "2026-11-15T10:01:05Z"),
+            test_msg("u2", crate::Role::User, "2026-11-15T11:40:00Z"),
+            test_msg("a2", crate::Role::Assistant, "2026-11-15T11:45:00Z"),
+        ];
+        let library = vec![test_entry("late", "2026-11-15T10:01:08Z")];
+
+        let assigned = assign_library_to_messages(&messages, &library);
+        assert!(assigned.trailing.is_empty());
+        assert_eq!(
+            assigned
+                .by_message
+                .get("a1")
+                .unwrap()
+                .iter()
+                .map(|e| e.hash.as_str())
+                .collect::<Vec<_>>(),
+            vec!["late"]
+        );
+        assert!(!assigned.by_message.contains_key("a2"));
+    }
+
+    #[test]
+    fn assign_library_handles_empty_inputs_and_optimistic_user_message() {
+        let empty = assign_library_to_messages(&[], &[]);
+        assert!(empty.by_message.is_empty());
+        assert!(empty.trailing.is_empty());
+
+        let only_lib = assign_library_to_messages(&[], &[test_entry("a", "2026-11-15T10:00:00Z")]);
+        assert!(only_lib.by_message.is_empty());
+        assert_eq!(only_lib.trailing.len(), 1);
+
+        let messages = vec![
+            test_msg("u1", crate::Role::User, "2026-11-15T10:00:00Z"),
+            test_msg("a1", crate::Role::Assistant, "2026-11-15T10:01:05Z"),
+            test_msg("opt-1", crate::Role::User, "Just now"),
+        ];
+        let library = vec![test_entry("deck", "2026-11-15T10:01:00Z")];
+        let assigned = assign_library_to_messages(&messages, &library);
+        assert!(assigned.trailing.is_empty());
+        assert_eq!(assigned.by_message.get("a1").unwrap().len(), 1);
     }
 }

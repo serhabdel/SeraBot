@@ -1285,3 +1285,123 @@ button.md-image-chip:hover {
     padding-inline: 8px;
   }
 }
+
+/* ===== Wave 7: Activity box, steps, and composer stop button ===== */
+
+.messages > * {
+  flex-shrink: 0;
+}
+
+.activity,
+details.activity.done {
+  flex: 0 0 auto;
+  height: auto;
+  max-height: none;
+  min-height: 0;
+  contain: none;
+  overflow: hidden;
+  box-sizing: border-box;
+  width: min(var(--chat-w), calc(100% - 24px));
+  margin: 10px auto 14px;
+  padding: 10px 14px;
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+}
+
+.activity-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--hairline);
+  max-height: min(360px, 46vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 4px;
+}
+
+.step {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  flex: 0 0 auto;
+  height: auto;
+  min-height: 26px;
+  padding: 5px 8px;
+  border-radius: var(--r-xs);
+}
+
+.step-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+  min-height: 22px;
+}
+
+details.step-more {
+  display: block;
+  margin-left: 24px;
+  margin-top: 2px;
+  width: calc(100% - 24px);
+}
+
+details.step-more > summary.step-more-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  border: 1px solid var(--hairline);
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+  line-height: 1.4;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+details.step-more > summary.step-more-summary:hover {
+  color: var(--label-1);
+  border-color: var(--hairline-strong);
+}
+
+details.step-more > summary.step-more-summary::before {
+  content: "\25B8";
+  font-size: 10px;
+  line-height: 1;
+  transition: transform var(--dur-1) var(--ease);
+}
+
+details.step-more[open] > summary.step-more-summary::before {
+  transform: rotate(90deg);
+}
+
+.stop-btn,
+.composer-stop {
+  width: 34px;
+  height: 34px;
+  min-height: 34px;
+  padding: 0;
+  border-radius: 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--danger-soft);
+  color: var(--danger);
+  border: 1px solid var(--danger-soft);
+  cursor: pointer;
+  opacity: 1;
+}
+
+.stop-btn:hover,
+.composer-stop:hover {
+  background: var(--danger);
+  color: #fff;
+  border-color: var(--danger);
+  opacity: 1;
+}

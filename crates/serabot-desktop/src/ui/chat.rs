@@ -903,18 +903,30 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     span {}
                                 }
                             }
-                            for step in steps.iter().cloned() {
-                                ActivityRow { session, step, key: "{step.call_id}" }
+                            if !steps.is_empty() {
+                                div { class: "activity-steps",
+                                    for step in steps.iter().cloned() {
+                                        ActivityRow { session, step, key: "{step.call_id}" }
+                                    }
+                                }
                             }
                         }
                     } else if !steps.is_empty() {
-                        details { class: "activity done",
+                        details {
+                            class: "activity done",
+                            ontoggle: move |_| {
+                                let _ = dioxus::document::eval(
+                                    "requestAnimationFrame(() => { const el = document.querySelector('details.activity.done[open]'); if (el) el.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); })",
+                                );
+                            },
                             summary { class: "activity-summary",
                                 Icon { name: "chevron-right", size: 12 }
                                 "{steps_summary}"
                             }
-                            for step in steps.iter().cloned() {
-                                ActivityRow { session, step, key: "{step.call_id}" }
+                            div { class: "activity-steps",
+                                for step in steps.iter().cloned() {
+                                    ActivityRow { session, step, key: "{step.call_id}" }
+                                }
                             }
                         }
                     }
@@ -1329,9 +1341,9 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     }
                                 } else if live_task.is_some() {
                                     button {
-                                        class: "btn stop-btn",
-                                        title: "Stop the reply",
-                                        "aria-label": "Stop the reply",
+                                        class: "btn stop-btn composer-stop",
+                                        title: "Stop generating",
+                                        "aria-label": "Stop generating",
                                         onclick: move |_| session.write().stop_turn(),
                                         Icon { name: "stop", size: 14 }
                                     }
