@@ -884,12 +884,11 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     for card in placed.last().cloned().unwrap_or_default() {
                         ChatCardRow { session, key: "{card.id}", card }
                     }
-                    // Files produced in an active turn that has no reply yet.
-                    if !assigned_library.trailing.is_empty() {
-                        TrailingMediaCards {
-                            session,
-                            entries: assigned_library.trailing,
-                        }
+                    // Files produced in an active turn that has no reply yet,
+                    // plus any in-flight media jobs.
+                    TrailingMediaCards {
+                        session,
+                        entries: assigned_library.trailing,
                     }
                     // Cards waiting for the owner: questions and secret requests.
                     for card in pending_cards.clone() {
