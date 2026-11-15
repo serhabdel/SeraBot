@@ -174,7 +174,7 @@ async fn a8_smoke_steps_one_to_seven_hold_for_admin_and_member() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        ["cli_found", "configured", "message", "ok"],
+        ["cli_found", "configured", "message", "ok", "synced_items"],
         "{probe}"
     );
     assert!(!probe.to_string().contains(SECRET_PROBE));

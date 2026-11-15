@@ -143,6 +143,264 @@ fn next_scheme(text: &str) -> Option<usize> {
     }
 }
 
+const MAX_SMART_TITLE_CHARS: usize = 56;
+const MAX_SMART_TITLE_WORDS: usize = 7;
+
+/// Whether a conversation title is absent or a generic placeholder (`"New chat"`,
+/// `"Chat"`, `"Chat <hex>"`, or `"dir:chat-..."`).
+pub fn is_placeholder_chat_title(title: Option<&str>) -> bool {
+    let Some(raw) = title.map(str::trim).filter(|s| !s.is_empty()) else {
+        return true;
+    };
+    let lower = raw.to_ascii_lowercase();
+    if matches!(lower.as_str(), "new chat" | "chat") || lower.starts_with("dir:chat-") {
+        return true;
+    }
+    if let Some(rest) = lower.strip_prefix("chat ") {
+        let rest = rest.trim();
+        if !rest.is_empty()
+            && rest.len() >= 6
+            && rest.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn strip_code_blocks(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("```") {
+        out.push_str(&rest[..start]);
+        out.push(' ');
+        let after_start = &rest[start + 3..];
+        if let Some(end) = after_start.find("```") {
+            rest = &after_start[end + 3..];
+        } else {
+            rest = "";
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn strip_urls(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = next_scheme(rest) {
+        out.push_str(&rest[..start]);
+        out.push(' ');
+        let tail = &rest[start..];
+        let end = tail
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '(' | ')' | ']')
+            })
+            .unwrap_or(tail.len());
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn strip_markdown_links(input: &str) -> String {
+    // Convert `[label](url)` into `label` and drop the URL.
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(open) = rest.find('[') {
+        out.push_str(&rest[..open]);
+        let after_open = &rest[open + 1..];
+        if let Some(mid) = after_open.find("](") {
+            let label = &after_open[..mid];
+            let after_mid = &after_open[mid + 2..];
+            if let Some(close) = after_mid.find(')') {
+                out.push_str(label);
+                rest = &after_mid[close + 1..];
+                continue;
+            }
+        }
+        out.push('[');
+        rest = after_open;
+    }
+    out.push_str(rest);
+    out
+}
+
+fn clean_title_source(raw: &str, bot_name: &str) -> String {
+    let no_blocks = strip_code_blocks(raw);
+    let no_links = strip_markdown_links(&no_blocks);
+    let no_urls = strip_urls(&no_links);
+    let cleaned: String = no_urls
+        .chars()
+        .map(|c| {
+            if matches!(c, '*' | '`' | '#' | '~' | '>' | '|') || c.is_control() {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+
+    let mut collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let bot_lower = bot_name.trim().to_ascii_lowercase();
+    let filler_prefixes: &[&str] = &[
+        "hey there",
+        "hello there",
+        "hi there",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "hey",
+        "hello",
+        "hi",
+        "bonjour",
+        "salut",
+        "salam",
+        "please",
+        "could you please",
+        "can you please",
+        "would you please",
+        "could you",
+        "can you",
+        "would you",
+        "help me",
+        "i need you to",
+        "i want you to",
+        "i need",
+        "i want",
+        "tell me",
+        "let's",
+        "lets",
+        "serabot",
+    ];
+
+    loop {
+        let trimmed = collapsed
+            .trim_start_matches([',', ':', ';', '-', '!', '?', '.'])
+            .trim_start();
+        if trimmed.len() != collapsed.len() {
+            collapsed = trimmed.to_owned();
+            continue;
+        }
+        let lower = collapsed.to_ascii_lowercase();
+        let mut matched = false;
+        if !bot_lower.is_empty()
+            && lower.starts_with(&bot_lower)
+            && lower[bot_lower.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric())
+        {
+            collapsed = collapsed[bot_lower.len()..].trim_start().to_owned();
+            matched = true;
+        }
+        if !matched {
+            for prefix in filler_prefixes {
+                if lower.starts_with(prefix)
+                    && lower[prefix.len()..]
+                        .chars()
+                        .next()
+                        .is_none_or(|c| !c.is_alphanumeric())
+                {
+                    collapsed = collapsed[prefix.len()..].trim_start().to_owned();
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if !matched {
+            break;
+        }
+    }
+
+    collapsed
+        .trim_matches(|c: char| matches!(c, ',' | ':' | ';' | '-' | '!' | '?' | '.' | '"' | '\''))
+        .trim()
+        .to_owned()
+}
+
+fn format_concise_topic(cleaned: &str) -> Option<String> {
+    let words: Vec<&str> = cleaned.split_whitespace().collect();
+    if words.is_empty() {
+        return None;
+    }
+
+    let mut chosen: Vec<String> = Vec::new();
+    let mut current_len = 0usize;
+    for word in words.into_iter().take(MAX_SMART_TITLE_WORDS) {
+        let word_len = word.chars().count();
+        let added_len = if chosen.is_empty() {
+            word_len
+        } else {
+            1 + word_len
+        };
+        if current_len + added_len > MAX_SMART_TITLE_CHARS {
+            break;
+        }
+        chosen.push(word.to_owned());
+        current_len += added_len;
+    }
+
+    if chosen.is_empty() {
+        let truncated: String = cleaned.chars().take(MAX_SMART_TITLE_CHARS).collect();
+        let trimmed = truncated.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        chosen.push(trimmed.to_owned());
+    }
+
+    while chosen.len() >= 4
+        && matches!(
+            chosen.last().map(|w| w.to_ascii_lowercase()).as_deref(),
+            Some("a" | "an" | "the" | "to" | "for" | "of" | "in" | "on" | "with" | "and" | "or")
+        )
+    {
+        chosen.pop();
+    }
+
+    let mut topic = chosen.join(" ");
+    topic = topic
+        .trim_end_matches([',', ':', ';', '-', '.', '!', '?'])
+        .trim()
+        .to_owned();
+
+    if topic.chars().count() < 3 {
+        return None;
+    }
+
+    let mut chars = topic.chars();
+    let first = chars.next()?;
+    let capitalized = first.to_uppercase().collect::<String>() + chars.as_str();
+
+    if is_placeholder_chat_title(Some(&capitalized)) {
+        return None;
+    }
+    Some(capitalized)
+}
+
+/// Derive a concise, context-aware 3–7 word conversation title (max 56 chars)
+/// from the user's prompt and optional assistant reply. Never returns `"New chat"`,
+/// `"Chat"`, or hex conversation IDs.
+pub fn derive_smart_chat_title(
+    user_text: &str,
+    assistant_text: Option<&str>,
+    bot_name: &str,
+) -> Option<String> {
+    let cleaned_user = clean_title_source(user_text, bot_name);
+    if let Some(title) = format_concise_topic(&cleaned_user) {
+        return Some(title);
+    }
+    if let Some(reply) = assistant_text {
+        let cleaned_reply = clean_title_source(reply, bot_name);
+        if let Some(title) = format_concise_topic(&cleaned_reply) {
+            return Some(title);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +443,52 @@ mod tests {
         assert_eq!(
             mime_for_filename("no-extension"),
             "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn placeholder_chat_title_detects_generic_and_hex_names() {
+        assert!(is_placeholder_chat_title(None));
+        assert!(is_placeholder_chat_title(Some("")));
+        assert!(is_placeholder_chat_title(Some("   ")));
+        assert!(is_placeholder_chat_title(Some("New chat")));
+        assert!(is_placeholder_chat_title(Some("new chat")));
+        assert!(is_placeholder_chat_title(Some("Chat")));
+        assert!(is_placeholder_chat_title(Some("Chat 01a1dfd96ab2")));
+        assert!(is_placeholder_chat_title(Some("dir:chat-01a1dfd96ab2")));
+        assert!(!is_placeholder_chat_title(Some("Q3 Revenue Forecast")));
+        assert!(!is_placeholder_chat_title(Some("Chat about Morocco jobs")));
+    }
+
+    #[test]
+    fn derive_smart_chat_title_strips_markdown_urls_and_fillers() {
+        let title = derive_smart_chat_title(
+            "Hey, please can you help me review [this contract](https://example.com/doc) for **Acme Corp**? ```rust\nfn main(){}\n```",
+            None,
+            "legal",
+        )
+        .unwrap();
+        assert!(!title.contains('*'));
+        assert!(!title.contains("https://"));
+        assert!(!title.contains("Hey"));
+        assert!(title.len() <= 56);
+        assert!(title.starts_with("Review this contract for Acme Corp"));
+
+        // Falls back to assistant reply when user prompt is only greeting/filler.
+        let fallback = derive_smart_chat_title(
+            "Hi!",
+            Some("## Moroccan Public Sector Job Checklist\nHere are the required documents."),
+            "jobfinder",
+        )
+        .unwrap();
+        assert!(fallback.starts_with("Moroccan Public Sector Job Checklist"));
+        assert!(fallback.len() <= 56);
+
+        // Never returns placeholder titles.
+        assert_eq!(derive_smart_chat_title("New chat", None, "main"), None);
+        assert_eq!(
+            derive_smart_chat_title("Chat 01a1dfd96ab2", None, "main"),
+            None
         );
     }
 }

@@ -56,6 +56,7 @@ pub fn register_browser_tools(
         Kind::Snapshot,
         Kind::Click,
         Kind::Type,
+        Kind::FillCredentials,
         Kind::Press,
         Kind::Screenshot,
         Kind::Close,
@@ -76,6 +77,7 @@ enum Kind {
     Snapshot,
     Click,
     Type,
+    FillCredentials,
     Press,
     Screenshot,
     Close,
@@ -120,7 +122,7 @@ fn signin_note(url: &str) -> String {
 /// https page counts; plain http is allowed for a loopback address (a local
 /// test server). Anything else fails closed, so a secret never travels in the
 /// clear.
-fn secret_page_host(url: &str) -> Result<String> {
+pub(crate) fn secret_page_host(url: &str) -> Result<String> {
     let host = host_of(url)
         .ok_or_else(|| SeraError::Validation("open a page before typing a secret".into()))?;
     let scheme = url::Url::parse(url)
@@ -144,10 +146,68 @@ fn text_output(lease: &Lease, body: String, data: Value) -> ToolOutput {
     }
 }
 
+/// Locate `(username_ref, password_ref)` on a page outline for credential autofill.
+pub(crate) fn find_credential_refs(
+    outline: &super::outline::Outline,
+) -> (Option<String>, Option<String>) {
+    let mut username_ref: Option<String> = None;
+    let mut password_ref: Option<String> = None;
+    let mut textbox_indices: Vec<usize> = Vec::new();
+    let mut password_idx: Option<usize> = None;
+
+    for (idx, target) in outline.refs.iter().enumerate() {
+        let role = target.role.to_ascii_lowercase();
+        let name = target.name.to_ascii_lowercase();
+        let is_input = matches!(
+            role.as_str(),
+            "textbox" | "searchbox" | "combobox" | "input"
+        );
+        if !is_input {
+            continue;
+        }
+        textbox_indices.push(idx);
+        let ref_id = format!("e{}", idx + 1);
+        if password_ref.is_none()
+            && (name.contains("password")
+                || name.contains("mot de passe")
+                || name.contains("passcode")
+                || name == "pin")
+        {
+            password_ref = Some(ref_id);
+            password_idx = Some(idx);
+            continue;
+        }
+        if username_ref.is_none()
+            && (name.contains("email")
+                || name.contains("e-mail")
+                || name.contains("username")
+                || name.contains("user")
+                || name.contains("login")
+                || name.contains("identifiant")
+                || name.contains("account")
+                || name.contains("phone"))
+        {
+            username_ref = Some(ref_id);
+        }
+    }
+
+    // Fallback: if we found a password field but no explicitly named username
+    // field, use the textbox immediately preceding the password field.
+    if username_ref.is_none()
+        && let Some(p_idx) = password_idx
+        && let Some(prev_idx) = textbox_indices.iter().rev().find(|&&i| i < p_idx)
+    {
+        username_ref = Some(format!("e{}", prev_idx + 1));
+    }
+
+    (username_ref, password_ref)
+}
+
 impl BrowserTool {
     /// Whether this call types a vault secret.
     fn types_secret(&self, args: &Value) -> bool {
-        self.kind == Kind::Type && opt_str(args, "secret").is_some()
+        (self.kind == Kind::Type && opt_str(args, "secret").is_some())
+            || self.kind == Kind::FillCredentials
     }
 
     /// The host of the page the bot is on, for a secret: https only. Reads
@@ -171,6 +231,28 @@ impl BrowserTool {
     /// entry name and the host: `vault:<name> → <host>`. The gateway
     /// re-checks the destination before dispatch.
     async fn secret_details(&self, args: &Value, context: &ToolContext) -> Result<ApprovalDetails> {
+        let host = self.page_host(context).await?;
+        if self.kind == Kind::FillCredentials {
+            let secret = match opt_str(args, "secret") {
+                Some(s) => s.to_owned(),
+                None => self
+                    .deps
+                    .resolver
+                    .find_for_host(&context.user_id, &host)?
+                    .ok_or_else(|| {
+                        SeraError::NotFound(format!("no matching vault credential for {host}"))
+                    })?,
+            };
+            self.deps
+                .resolver
+                .authorize(&context.user_id, &secret, "password", &host)?;
+            let name = truncate_chars(&secret, 48);
+            return Ok(ApprovalDetails {
+                summary: format!("Autofill vault credentials '{name}' on {host}"),
+                destination: Some(format!("vault:{name} → {host}")),
+                artifact_hash: None,
+            });
+        }
         let reference = truncate_chars(str_arg(args, "ref")?, 16);
         let secret = str_arg(args, "secret")?;
         let field = opt_str(args, "field").unwrap_or("password");
@@ -179,7 +261,6 @@ impl BrowserTool {
                 "field must be password, username or value".into(),
             ));
         }
-        let host = self.page_host(context).await?;
         self.deps
             .resolver
             .authorize(&context.user_id, secret, field, &host)?;
@@ -197,6 +278,7 @@ impl BrowserTool {
             Kind::Snapshot => "browser_snapshot",
             Kind::Click => "browser_click",
             Kind::Type => "browser_type",
+            Kind::FillCredentials => "browser_fill_credentials",
             Kind::Press => "browser_press",
             Kind::Screenshot => "browser_screenshot",
             Kind::Close => "browser_close",
@@ -234,6 +316,14 @@ impl Tool for BrowserTool {
                     "field":{"type":"string","enum":SECRET_FIELDS},
                     "submit":{"type":"boolean"}
                 },"required":["ref"],"additionalProperties":false}),
+                true,
+            ),
+            Kind::FillCredentials => (
+                "Autofill username and password on the current HTTPS login page using a matching Vault entry (or an explicit secret name). Secret values are never shown to you. Requires the owner's approval.",
+                json!({"type":"object","properties":{
+                    "secret":{"type":"string"},
+                    "submit":{"type":"boolean"}
+                },"additionalProperties":false}),
                 true,
             ),
             Kind::Press => (
@@ -498,6 +588,75 @@ impl Tool for BrowserTool {
                         "give exactly one of text or secret".into(),
                     )),
                 }
+            }
+            Kind::FillCredentials => {
+                let submit = args.get("submit").and_then(Value::as_bool).unwrap_or(false);
+                let lease = manager.bot_lease(user, profile, false, driver).await?;
+                let (info, outline) = lease.backend().snapshot().await?;
+                let host = secret_page_host(&info.url)?;
+                let secret = match opt_str(&args, "secret") {
+                    Some(s) => s.to_owned(),
+                    None => self
+                        .deps
+                        .resolver
+                        .find_for_host(user, &host)?
+                        .ok_or_else(|| {
+                            SeraError::NotFound(format!("no matching vault credential for {host}"))
+                        })?,
+                };
+                let password = self
+                    .deps
+                    .resolver
+                    .resolve(user, &secret, "password", &host)
+                    .await?;
+                let username = self
+                    .deps
+                    .resolver
+                    .resolve(user, &secret, "username", &host)
+                    .await
+                    .ok();
+                let after = lease.backend().info().await?;
+                if secret_page_host(&after.url).ok().as_deref() != Some(host.as_str()) {
+                    return Err(SeraError::Validation(
+                        "the page moved; not filling credentials".into(),
+                    ));
+                }
+                lease.remember_secret(&secret, &password);
+                let (username_ref, password_ref) = find_credential_refs(&outline);
+                if username_ref.is_none() && password_ref.is_none() {
+                    return Err(SeraError::Validation(
+                        "no login form fields found on the current page".into(),
+                    ));
+                }
+                let mut username_filled = false;
+                if let (Some(uref), Some(uname)) = (&username_ref, &username) {
+                    lease
+                        .backend()
+                        .type_ref(uref, uname.as_str(), false)
+                        .await
+                        .map_err(|error| SeraError::External(lease.redact(&error.to_string())))?;
+                    username_filled = true;
+                }
+                let mut password_filled = false;
+                if let Some(pref) = &password_ref {
+                    lease
+                        .backend()
+                        .type_ref(pref, password.as_str(), submit)
+                        .await
+                        .map_err(|error| SeraError::External(lease.redact(&error.to_string())))?;
+                    password_filled = true;
+                }
+                Ok(text_output(
+                    &lease,
+                    format!("autofilled vault credentials '{secret}' on {host}"),
+                    json!({
+                        "filled": true,
+                        "secret": secret,
+                        "host": host,
+                        "username_filled": username_filled,
+                        "password_filled": password_filled,
+                    }),
+                ))
             }
             Kind::Press => {
                 let key = str_arg(&args, "key")?;
@@ -1304,5 +1463,32 @@ mod tests {
             h.store.bot_browser_profile(&user, "buyer").unwrap(),
             "default"
         );
+    }
+
+    #[test]
+    fn find_credential_refs_locates_username_and_password_inputs() {
+        let outline = crate::browser::outline::Outline {
+            text: String::new(),
+            refs: vec![
+                crate::browser::outline::RefTarget {
+                    backend_node_id: 1,
+                    role: "textbox".into(),
+                    name: "Email or username".into(),
+                },
+                crate::browser::outline::RefTarget {
+                    backend_node_id: 2,
+                    role: "textbox".into(),
+                    name: "Password".into(),
+                },
+                crate::browser::outline::RefTarget {
+                    backend_node_id: 3,
+                    role: "button".into(),
+                    name: "Sign in".into(),
+                },
+            ],
+        };
+        let (u, p) = find_credential_refs(&outline);
+        assert_eq!(u.as_deref(), Some("e1"));
+        assert_eq!(p.as_deref(), Some("e2"));
     }
 }

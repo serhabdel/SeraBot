@@ -202,3 +202,58 @@ async fn unknown_bots_and_unknown_fields_are_refused() {
     .await;
     assert_eq!(extra.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
+
+#[tokio::test]
+async fn retroactive_smart_title_renames_untitled_extra_chat_on_list() {
+    let (app, _, store) = app_with_root(true, Policy::empty(), temp_base());
+    let (uid, token) = member_with_analyst(&app, &store, "v047-smart-title").await;
+
+    // Create an extra chat without a title.
+    let created = read_json(
+        call(
+            &app,
+            &token,
+            "POST",
+            "/v1/bots/analyst/chats",
+            Some(json!({})),
+        )
+        .await,
+    )
+    .await;
+    let chat_id = created["chat"]["id"].as_str().unwrap().to_owned();
+    assert!(chat_id.starts_with("dir:chat-"));
+
+    // Seed a user message and assistant reply into that untitled chat.
+    store
+        .append_message(
+            &uid,
+            &chat_id,
+            None,
+            crate::domain::Role::User,
+            "Hey, please analyze Q4 Morocco export margins",
+        )
+        .unwrap();
+    store
+        .append_message(
+            &uid,
+            &chat_id,
+            Some("analyst"),
+            crate::domain::Role::Assistant,
+            "Here is the Q4 margin breakdown.",
+        )
+        .unwrap();
+
+    // Listing bot chats lazily derives and persists the smart title.
+    let listed = read_json(call(&app, &token, "GET", "/v1/bots/analyst/chats", None).await).await;
+    let chats = listed["chats"].as_array().unwrap();
+    let entry = chats.iter().find(|c| c["id"] == chat_id).unwrap();
+    let title = entry["title"].as_str().unwrap();
+    assert!(
+        title.contains("Analyze Q4 Morocco export margins"),
+        "unexpected title: {title}"
+    );
+
+    // Persisted in SQLite as well.
+    let stored = store.get_conversation(&uid, &chat_id).unwrap().unwrap();
+    assert_eq!(stored.title.as_deref(), Some(title));
+}

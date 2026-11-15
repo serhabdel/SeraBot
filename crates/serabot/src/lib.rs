@@ -36,6 +36,7 @@ pub mod firecrawl;
 pub mod fleet;
 pub mod gateway;
 pub mod image_ops;
+pub mod job_tools;
 pub mod llm;
 pub mod local_bulk;
 pub mod local_relay;

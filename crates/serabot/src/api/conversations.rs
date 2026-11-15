@@ -437,6 +437,25 @@ pub(super) async fn list_conversations(
         .iter()
         .map(|record| {
             let mut view = conversation_view(record)?;
+            if record.id.starts_with("dir:")
+                && crate::util::is_placeholder_chat_title(record.title.as_deref())
+                && previews.contains_key(&record.id)
+            {
+                let bot_hint = record
+                    .id
+                    .strip_prefix("dir:")
+                    .filter(|rest| !rest.starts_with("chat-"))
+                    .unwrap_or("");
+                if let Some(title) = lazy_smart_title_for_conversation(
+                    &state,
+                    &user.id,
+                    &record.id,
+                    record.title.as_deref(),
+                    bot_hint,
+                )? {
+                    view["title"] = json!(title);
+                }
+            }
             if let Some(version) = avatar_versions.get(&record.id) {
                 view["avatar_version"] = json!(version);
             }
@@ -470,6 +489,38 @@ pub(super) fn preview_text(content: &str) -> String {
         .collect();
     let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     collapsed.chars().take(120).collect()
+}
+
+pub(super) fn lazy_smart_title_for_conversation(
+    state: &ApiState,
+    user_id: &str,
+    id: &str,
+    current_title: Option<&str>,
+    bot_name: &str,
+) -> Result<Option<String>> {
+    if !crate::util::is_placeholder_chat_title(current_title) {
+        return Ok(current_title.map(str::to_owned));
+    }
+    let messages = state.store.list_visible_messages(user_id, id, 10)?;
+    if messages.is_empty() {
+        return Ok(current_title.map(str::to_owned));
+    }
+    let user_text = messages
+        .iter()
+        .find(|m| m.role == crate::domain::Role::User)
+        .map(|m| m.content.as_str())
+        .unwrap_or("");
+    let assistant_text = messages
+        .iter()
+        .find(|m| m.role == crate::domain::Role::Assistant)
+        .map(|m| m.content.as_str());
+    if let Some(title) = crate::util::derive_smart_chat_title(user_text, assistant_text, bot_name)
+        && state.runtime.scan_owner_output(user_id, &title).is_ok()
+    {
+        let _ = state.store.rename_conversation(user_id, id, &title)?;
+        return Ok(Some(title));
+    }
+    Ok(current_title.map(str::to_owned))
 }
 
 pub(super) fn conversation_view(record: &StoredConversation) -> Result<Value> {

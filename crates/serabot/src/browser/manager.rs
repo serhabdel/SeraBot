@@ -119,6 +119,12 @@ pub trait SecretResolver: Send + Sync {
     /// its value. Used to refuse before an approval is asked for.
     fn authorize(&self, user_id: &str, name: &str, field: &str, host: &str) -> Result<()>;
 
+    /// Find a matching password entry name for `host` when no explicit
+    /// `secret` name was given.
+    fn find_for_host(&self, _user_id: &str, _host: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// The value to type. Fails closed on an unknown name or a host outside
     /// the entry's sites.
     async fn resolve(

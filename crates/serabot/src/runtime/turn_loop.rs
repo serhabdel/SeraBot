@@ -470,6 +470,40 @@ impl Runtime {
         Ok(())
     }
 
+    fn maybe_auto_name_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        bot_name: &str,
+        user_text: &str,
+        assistant_text: Option<&str>,
+    ) {
+        let Ok(Some(conv)) = self.store.get_conversation(user_id, conversation_id) else {
+            return;
+        };
+        if !crate::util::is_placeholder_chat_title(conv.title.as_deref()) {
+            return;
+        }
+        let Some(title) = crate::util::derive_smart_chat_title(user_text, assistant_text, bot_name)
+        else {
+            return;
+        };
+        if self.scan_owner_output(user_id, &title).is_err() {
+            return;
+        }
+        if self
+            .store
+            .rename_conversation(user_id, conversation_id, &title)
+            .unwrap_or(false)
+        {
+            let _ = self.store.append_event(
+                user_id,
+                "conversation.renamed",
+                &json!({"conversation_id": conversation_id, "title": title}),
+            );
+        }
+    }
+
     /// End a turn the owner stopped. The reply is one short line; no further
     /// model or tool step runs. Tool calls that already finished keep their
     /// results, and nothing that had an external effect is retried.
@@ -684,6 +718,16 @@ impl Runtime {
                     "turn.completed",
                     &json!({"turn_id": turn.id, "task_id": task.id}),
                 )?;
+                if state.handoff.is_none() && state.team.is_none() {
+                    let owner_prompt = extract::owner_text(&state.messages).unwrap_or("");
+                    self.maybe_auto_name_conversation(
+                        &user,
+                        conversation_id,
+                        &turn.bot,
+                        owner_prompt,
+                        Some(&text),
+                    );
+                }
                 // Owner turns only: extraction and summaries run after the reply
                 // is stored, in the background, and never fail the turn.
                 if state.handoff.is_none()
