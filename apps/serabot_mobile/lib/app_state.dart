@@ -156,6 +156,7 @@ class AppState extends ChangeNotifier {
     final k = e.kind;
     if (k == 'message' ||
         k == 'conversation.created' ||
+        k == 'conversation.renamed' ||
         k == 'turn.completed' ||
         k == 'task.failed' ||
         k == 'handoff.queued' ||

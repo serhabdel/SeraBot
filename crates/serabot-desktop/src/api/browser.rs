@@ -154,7 +154,7 @@ pub enum BrowserHistory {
 pub struct BrowserAutofillResult {
     #[serde(default)]
     pub filled: bool,
-    #[serde(default)]
+    #[serde(default, alias = "secret")]
     pub entry_name: Option<String>,
     #[serde(default)]
     pub message: Option<String>,
@@ -596,12 +596,12 @@ impl ApiClient {
         #[derive(Serialize)]
         struct Body<'a> {
             #[serde(skip_serializing_if = "Option::is_none")]
-            session_id: Option<&'a str>,
+            profile: Option<&'a str>,
         }
         self.panel_json(
             Method::POST,
             &["v1", "browser", "autofill"],
-            Some(&Body { session_id: id }),
+            Some(&Body { profile: id }),
         )
     }
 
@@ -918,5 +918,14 @@ lines"
         assert_eq!(profile_for_bot(&profiles, "main"), "default");
         assert_eq!(profile_for_bot(&profiles, "unknown"), "default");
         assert_eq!(profile_for_bot(&[], "main"), "default");
+    }
+
+    #[test]
+    fn autofill_result_parses_server_secret_field() {
+        let json = r#"{"filled":true,"secret":"acme-login","host":"acme.com","username_filled":true,"password_filled":true}"#;
+        let res: BrowserAutofillResult = serde_json::from_str(json).unwrap();
+        assert!(res.filled);
+        assert_eq!(res.entry_name.as_deref(), Some("acme-login"));
+        assert_eq!(res.message, None);
     }
 }
