@@ -1142,6 +1142,11 @@ impl OneDriveConsent {
         Ok(())
     }
 
+    /// Whether a callback `state` belongs to a pending OneDrive consent.
+    pub async fn owns_state(&self, state: &str) -> bool {
+        self.pending.lock().await.contains_key(state.trim())
+    }
+
     /// Override the pending-consent TTL. Intended for tests; bounded to at
     /// most a day.
     pub fn set_ttl(&mut self, ttl: Duration) -> Result<()> {

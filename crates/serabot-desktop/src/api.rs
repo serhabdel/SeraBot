@@ -1237,6 +1237,15 @@ pub struct TaskEntry {
     pub updated_at: String,
 }
 
+/// Partial update for `PATCH /v1/tasks/{id}`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskUpdate {
+    pub title: Option<String>,
+    pub notes: Option<String>,
+    pub status: Option<String>,
+    pub due: Option<Option<String>>,
+}
+
 /// The account's chosen task/calendar sync provider.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct TaskPrefs {
@@ -2466,6 +2475,20 @@ impl ApiClient {
         time: Option<&str>,
         timezone: Option<&str>,
     ) -> Result<(), ApiError> {
+        let _ = self.put_routine_details(name, enabled, time, timezone, None, None)?;
+        Ok(())
+    }
+
+    /// `PUT /v1/routines/{name}` with optional custom label and prompt (0.45.0).
+    pub fn put_routine_details(
+        &self,
+        name: &str,
+        enabled: Option<bool>,
+        time: Option<&str>,
+        timezone: Option<&str>,
+        label: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<serde_json::Value, ApiError> {
         if name.is_empty() || name.len() > 128 {
             return Err(ApiError::Validation("Invalid routine name."));
         }
@@ -2482,8 +2505,12 @@ impl ApiClient {
             time: Option<&'a str>,
             #[serde(skip_serializing_if = "Option::is_none")]
             timezone: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            label: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            prompt: Option<&'a str>,
         }
-        let _: serde_json::Value = self.request(
+        self.request(
             Method::PUT,
             &["v1", "routines", name],
             &[],
@@ -2491,9 +2518,52 @@ impl ApiClient {
                 enabled,
                 time,
                 timezone,
+                label,
+                prompt,
             }),
-        )?;
-        Ok(())
+        )
+    }
+
+    /// `PUT /v1/workflows/active/{conversation_id}`: update an active multi-step plan (0.45.0).
+    pub fn put_active_workflow(
+        &self,
+        conversation_id: &str,
+        goal: Option<&str>,
+        items: Option<&[(String, bool)]>,
+    ) -> Result<serde_json::Value, ApiError> {
+        let conversation_id = conversation_id.trim();
+        if conversation_id.is_empty() || conversation_id.len() > 128 {
+            return Err(ApiError::Validation("Invalid conversation id."));
+        }
+        #[derive(Serialize)]
+        struct Item<'a> {
+            text: &'a str,
+            status: &'a str,
+        }
+        #[derive(Serialize)]
+        struct Body<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            goal: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            items: Option<Vec<Item<'a>>>,
+        }
+        let encoded_items = items.map(|list| {
+            list.iter()
+                .map(|(title, done)| Item {
+                    text: title.as_str(),
+                    status: if *done { "done" } else { "pending" },
+                })
+                .collect()
+        });
+        self.request(
+            Method::PUT,
+            &["v1", "workflows", "active", conversation_id],
+            &[],
+            Some(&Body {
+                goal,
+                items: encoded_items,
+            }),
+        )
     }
 
     /// `DELETE /v1/routines/{name}`: remove one routine's schedule (0.34.0).
@@ -3920,15 +3990,50 @@ impl ApiClient {
     }
 
     pub fn patch_task_status(&self, id: &str, status: &str) -> Result<TaskEntry, ApiError> {
+        self.update_task(
+            id,
+            &TaskUpdate {
+                status: Some(status.to_owned()),
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn update_task(&self, id: &str, update: &TaskUpdate) -> Result<TaskEntry, ApiError> {
         if !valid_task_id(id) {
             return Err(ApiError::Validation("Invalid task id."));
         }
-        if !matches!(status, "todo" | "doing" | "done") {
+        let title = match update.title.as_deref() {
+            Some(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    return Err(ApiError::Validation("Title cannot be empty."));
+                }
+                Some(trimmed)
+            }
+            None => None,
+        };
+        if let Some(status) = update.status.as_deref()
+            && !matches!(status, "todo" | "doing" | "done")
+        {
             return Err(ApiError::Validation("Status must be todo, doing or done."));
         }
+        let due = update.due.as_ref().map(|inner| {
+            inner
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        });
         #[derive(Serialize)]
         struct Body<'a> {
-            status: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            title: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            notes: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            status: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            due: Option<Option<&'a str>>,
         }
         #[derive(Deserialize)]
         struct Envelope {
@@ -3938,7 +4043,12 @@ impl ApiClient {
             Method::PATCH,
             &["v1", "tasks", id],
             &[],
-            Some(&Body { status }),
+            Some(&Body {
+                title,
+                notes: update.notes.as_deref(),
+                status: update.status.as_deref(),
+                due,
+            }),
         )?;
         if response.task.id != id {
             return Err(ApiError::InvalidResponse);
@@ -4859,6 +4969,23 @@ impl ApiClient {
             &serde_json::json!({}),
         )?;
         Ok(())
+    }
+
+    /// `POST /v1/connectors/{id}/test` for per-user and global connectors.
+    pub fn test_connector(&self, id: &str) -> Result<ConnectorTestResult, ApiError> {
+        if !valid_id(id) {
+            return Err(ApiError::Validation("Connector id is not valid."));
+        }
+        let mut result: ConnectorTestResult = self.request(
+            Method::POST,
+            &["v1", "connectors", id, "test"],
+            &[],
+            Some(&serde_json::json!({})),
+        )?;
+        result.id = id.to_owned();
+        result.message.truncate(256);
+        result.message.retain(|c| !c.is_control());
+        Ok(result)
     }
 
     pub fn admin_test_connector(&self, id: &str) -> Result<ConnectorTestResult, ApiError> {
@@ -6231,6 +6358,99 @@ mod tests {
             .unwrap();
         assert_eq!(filename, "clip.mp4");
         assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn test_connector_and_update_task_and_workflow_plumbing_validate_and_parse() {
+        let test_resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 43\r\nConnection: close\r\n\r\n{\"id\":\"google\",\"ok\":true,\"message\":\"Ready\"}".to_vec();
+        let res = client_for(serve_once(test_resp))
+            .test_connector("google")
+            .unwrap();
+        assert!(res.ok);
+        assert_eq!(res.id, "google");
+        assert_eq!(res.message, "Ready");
+        assert!(matches!(
+            client_for(serve_once(vec![])).test_connector("../bad"),
+            Err(ApiError::Validation(_))
+        ));
+
+        let task_json = r#"{"task":{"id":"t1","title":"Updated","notes":"Some notes","status":"doing","due":"2026-11-20","position":0,"remote_provider":null,"remote_id":null,"created_at":"2026-11-15T00:00:00Z","updated_at":"2026-11-15T00:00:00Z"}}"#;
+        let task_resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            task_json.len(),
+            task_json
+        )
+        .into_bytes();
+        let updated = client_for(serve_once(task_resp))
+            .update_task(
+                "t1",
+                &TaskUpdate {
+                    title: Some("  Updated  ".into()),
+                    notes: Some("Some notes".into()),
+                    status: Some("doing".into()),
+                    due: Some(Some("2026-11-20".into())),
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.id, "t1");
+        assert_eq!(updated.title, "Updated");
+        assert_eq!(updated.status, "doing");
+
+        assert!(matches!(
+            client_for(serve_once(vec![])).update_task(
+                "t1",
+                &TaskUpdate {
+                    title: Some("   ".into()),
+                    ..Default::default()
+                }
+            ),
+            Err(ApiError::Validation(_))
+        ));
+        assert!(matches!(
+            client_for(serve_once(vec![])).update_task(
+                "t1",
+                &TaskUpdate {
+                    status: Some("invalid".into()),
+                    ..Default::default()
+                }
+            ),
+            Err(ApiError::Validation(_))
+        ));
+
+        let routine_resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}".to_vec();
+        let routine_val = client_for(serve_once(routine_resp))
+            .put_routine_details(
+                "morning_brief",
+                Some(true),
+                Some("08:30"),
+                Some("UTC"),
+                Some("Morning Brief"),
+                Some("Summarize inbox"),
+            )
+            .unwrap();
+        assert_eq!(routine_val["ok"], true);
+        assert!(matches!(
+            client_for(serve_once(vec![])).put_routine_details(
+                "morning_brief",
+                None,
+                Some("99:99"),
+                None,
+                None,
+                None
+            ),
+            Err(ApiError::Validation(_))
+        ));
+
+        let wf_resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}".to_vec();
+        let items = vec![("Step 1".to_owned(), true), ("Step 2".to_owned(), false)];
+        let wf_val = client_for(serve_once(wf_resp))
+            .put_active_workflow("conv-1", Some("Ship v0.45"), Some(&items))
+            .unwrap();
+        assert_eq!(wf_val["ok"], true);
+        assert!(matches!(
+            client_for(serve_once(vec![])).put_active_workflow("   ", Some("Goal"), None),
+            Err(ApiError::Validation(_))
+        ));
     }
 }
 

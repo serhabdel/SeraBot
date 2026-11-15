@@ -289,6 +289,98 @@ impl Default for ProcessCommand {
     }
 }
 
+fn run_in_home(
+    home: &Path,
+    program: &Path,
+    args: &[String],
+    env: &[(&str, &str)],
+    timeout: Duration,
+) -> Result<CommandOutput> {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .env_clear()
+        .envs(child_environment(home, env))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().map_err(|_| {
+        SeraError::External("the password manager command could not be started".into())
+    })?;
+    // Read stdout on its own thread so a full pipe cannot block the wait.
+    // The buffer is sized up front and never grows, so no stale copy of
+    // the value is left behind by a reallocation.
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let stdout = child.stdout.take();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::with_capacity(MAX_OUTPUT_BYTES + 1);
+        if let Some(mut stdout) = stdout {
+            let mut chunk = [0u8; 4096];
+            while bytes.len() <= MAX_OUTPUT_BYTES {
+                let room = (MAX_OUTPUT_BYTES + 1 - bytes.len()).min(chunk.len());
+                match stdout.read(&mut chunk[..room]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => bytes.extend_from_slice(&chunk[..read]),
+                }
+            }
+            chunk.zeroize();
+        }
+        // The receiver is gone when the caller timed out: wipe what was read.
+        if let Err(error) = sender.send(bytes) {
+            let mut bytes = error.0;
+            bytes.zeroize();
+        }
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SeraError::External(
+                    "the password manager did not answer in time".into(),
+                ));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SeraError::External(
+                    "the password manager command failed".into(),
+                ));
+            }
+        }
+    };
+    // The pipe closes with the child; the bound keeps a stray grandchild
+    // that holds it open from stalling the call.
+    let mut bytes = receiver
+        .recv_timeout(Duration::from_secs(2))
+        .map_err(|_| SeraError::External("the password manager output was lost".into()))?;
+    if bytes.len() > MAX_OUTPUT_BYTES {
+        bytes.zeroize();
+        return Err(SeraError::External(
+            "the password manager returned too much data".into(),
+        ));
+    }
+    let stdout = match String::from_utf8(bytes) {
+        Ok(text) => Zeroizing::new(text),
+        Err(error) => {
+            let mut bytes = error.into_bytes();
+            bytes.zeroize();
+            return Err(SeraError::External(
+                "the password manager returned data that is not text".into(),
+            ));
+        }
+    };
+    Ok(CommandOutput {
+        status: status.code(),
+        stdout,
+    })
+}
+
 impl SecretCommand for ProcessCommand {
     fn run(&self, program: &Path, args: &[String], env: &[(&str, &str)]) -> Result<CommandOutput> {
         // Private to this call and removed when it returns. The child has
@@ -296,89 +388,23 @@ impl SecretCommand for ProcessCommand {
         let home = tempfile::TempDir::new().map_err(|_| {
             SeraError::External("the password manager command could not be started".into())
         })?;
-        let mut command = Command::new(program);
-        command
-            .args(args)
-            .env_clear()
-            .envs(child_environment(home.path(), env))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        let mut child = command.spawn().map_err(|_| {
-            SeraError::External("the password manager command could not be started".into())
-        })?;
-        // Read stdout on its own thread so a full pipe cannot block the wait.
-        // The buffer is sized up front and never grows, so no stale copy of
-        // the value is left behind by a reallocation.
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let stdout = child.stdout.take();
-        std::thread::spawn(move || {
-            let mut bytes = Vec::with_capacity(MAX_OUTPUT_BYTES + 1);
-            if let Some(mut stdout) = stdout {
-                let mut chunk = [0u8; 4096];
-                while bytes.len() <= MAX_OUTPUT_BYTES {
-                    let room = (MAX_OUTPUT_BYTES + 1 - bytes.len()).min(chunk.len());
-                    match stdout.read(&mut chunk[..room]) {
-                        Ok(0) | Err(_) => break,
-                        Ok(read) => bytes.extend_from_slice(&chunk[..read]),
-                    }
-                }
-                chunk.zeroize();
-            }
-            // The receiver is gone when the caller timed out: wipe what was read.
-            if let Err(error) = sender.send(bytes) {
-                let mut bytes = error.0;
-                bytes.zeroize();
-            }
-        });
-        let deadline = Instant::now() + self.timeout;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(SeraError::External(
-                        "the password manager did not answer in time".into(),
-                    ));
-                }
-                Err(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(SeraError::External(
-                        "the password manager command failed".into(),
-                    ));
-                }
-            }
-        };
-        // The pipe closes with the child; the bound keeps a stray grandchild
-        // that holds it open from stalling the call.
-        let mut bytes = receiver
-            .recv_timeout(Duration::from_secs(2))
-            .map_err(|_| SeraError::External("the password manager output was lost".into()))?;
-        if bytes.len() > MAX_OUTPUT_BYTES {
-            bytes.zeroize();
-            return Err(SeraError::External(
-                "the password manager returned too much data".into(),
-            ));
+        let output = run_in_home(home.path(), program, args, env, self.timeout)?;
+        if output.status != Some(0)
+            && env
+                .iter()
+                .any(|(k, _)| *k == "PROTON_PASS_PERSONAL_ACCESS_TOKEN")
+            && args.first().map(String::as_str) != Some("login")
+        {
+            let _ = run_in_home(
+                home.path(),
+                program,
+                &["login".to_owned()],
+                env,
+                self.timeout,
+            );
+            return run_in_home(home.path(), program, args, env, self.timeout);
         }
-        let stdout = match String::from_utf8(bytes) {
-            Ok(text) => Zeroizing::new(text),
-            Err(error) => {
-                let mut bytes = error.into_bytes();
-                bytes.zeroize();
-                return Err(SeraError::External(
-                    "the password manager returned data that is not text".into(),
-                ));
-            }
-        };
-        Ok(CommandOutput {
-            status: status.code(),
-            stdout,
-        })
+        Ok(output)
     }
 }
 
@@ -516,7 +542,7 @@ impl Providers {
             return Ok(());
         }
         Err(SeraError::Validation(format!(
-            "{} is disabled on this server (experimental): set [vault] protonpass_enabled = true to use it",
+            "{} is disabled on this server: set [vault] protonpass_enabled = true to use it",
             provider.label()
         )))
     }
@@ -1250,7 +1276,10 @@ mod tests {
             .set_vault_provider_token(&user, "protonpass", "synthetic-token")
             .unwrap();
         let runner = fake(Some(0), "synthetic-pass-value");
-        let disabled = Providers::with_runner(&config(), runner.clone());
+        assert!(VaultConfig::default().protonpass_enabled);
+        let mut disabled_config = config();
+        disabled_config.protonpass_enabled = false;
+        let disabled = Providers::with_runner(&disabled_config, runner.clone());
         let error = resolve_for_browser(
             &users,
             &disabled,

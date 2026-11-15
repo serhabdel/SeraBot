@@ -1459,6 +1459,40 @@ impl Session {
         });
     }
 
+    /// Update one scheduled routine with optional label and prompt (0.45.0).
+    pub fn update_routine(
+        &mut self,
+        name: String,
+        enabled: Option<bool>,
+        time: Option<String>,
+        timezone: Option<String>,
+        label: Option<String>,
+        prompt: Option<String>,
+    ) {
+        self.queue_workflow_write(Operation::PutRoutineDetails {
+            name,
+            enabled,
+            time,
+            timezone,
+            label,
+            prompt,
+        });
+    }
+
+    /// Update an active multi-step workflow plan (0.45.0).
+    pub fn update_active_workflow(
+        &mut self,
+        conversation_id: String,
+        goal: Option<String>,
+        items: Option<Vec<(String, bool)>>,
+    ) {
+        self.queue_workflow_write(Operation::PutActiveWorkflow {
+            conversation_id,
+            goal,
+            items,
+        });
+    }
+
     /// Enqueue a manual watch run (0.30.0 Wave B2).
     pub fn run_all_watch_sources(&mut self) {
         self.queue_workflow_write(Operation::RunAllWatchSources);
@@ -5164,6 +5198,11 @@ impl Session {
             id,
             status: next.into(),
         });
+    }
+
+    pub fn update_task(&mut self, id: String, update: crate::api::TaskUpdate) {
+        self.start_request(Operation::UpdateTask { id, update });
+        self.start_request(Operation::ListTasks);
     }
 
     pub fn delete_task(&mut self, id: String) {

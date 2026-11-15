@@ -144,6 +144,30 @@ pub(super) async fn auth_callback(
     State(state): State<Arc<ApiState>>,
     Query(params): Query<CallbackParams>,
 ) -> Response {
+    if state.personal.owns_state(&params.state).await {
+        return super::connectors::personal_callback_inner(
+            &state,
+            super::connectors::ConsentCallbackParams {
+                state: params.state,
+                code: params.code,
+                error: params.error,
+            },
+        )
+        .await;
+    }
+    if let Some(consent) = &state.onedrive_consent
+        && consent.owns_state(&params.state).await
+    {
+        return super::connectors::onedrive_callback(
+            State(state.clone()),
+            Query(super::connectors::ConsentCallbackParams {
+                state: params.state,
+                code: params.code,
+                error: params.error,
+            }),
+        )
+        .await;
+    }
     let Some(service) = state.auth.as_ref() else {
         return auth_error_page(
             StatusCode::SERVICE_UNAVAILABLE,

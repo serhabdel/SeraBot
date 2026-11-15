@@ -257,6 +257,10 @@ pub enum Operation {
         id: String,
         status: String,
     },
+    UpdateTask {
+        id: String,
+        update: crate::api::TaskUpdate,
+    },
     DeleteTask {
         id: String,
     },
@@ -314,6 +318,21 @@ pub enum Operation {
         enabled: Option<bool>,
         time: Option<String>,
         timezone: Option<String>,
+    },
+    /// `PUT /v1/routines/{name}` with optional label/prompt then refresh workflows (0.45.0).
+    PutRoutineDetails {
+        name: String,
+        enabled: Option<bool>,
+        time: Option<String>,
+        timezone: Option<String>,
+        label: Option<String>,
+        prompt: Option<String>,
+    },
+    /// `PUT /v1/workflows/active/{conversation_id}` then refresh workflows (0.45.0).
+    PutActiveWorkflow {
+        conversation_id: String,
+        goal: Option<String>,
+        items: Option<Vec<(String, bool)>>,
     },
     /// `POST /v1/monitoring/run` then refresh workflows (0.30.0 B2).
     RunAllWatchSources,
@@ -541,7 +560,7 @@ impl Operation {
             Self::MemoryStats => OperationKind::MemoryStats,
             Self::ListTasks => OperationKind::ListTasks,
             Self::AddTask { .. } => OperationKind::AddTask,
-            Self::SetTaskStatus { .. } => OperationKind::SetTaskStatus,
+            Self::SetTaskStatus { .. } | Self::UpdateTask { .. } => OperationKind::SetTaskStatus,
             Self::DeleteTask { .. } => OperationKind::DeleteTask,
             Self::TaskPrefs | Self::TaskSyncStatus | Self::TaskCalendar { .. } => {
                 OperationKind::TaskPrefs
@@ -562,6 +581,8 @@ impl Operation {
             Self::Logs { .. } => OperationKind::Logs,
             Self::Workflows => OperationKind::Workflows,
             Self::SaveRoutine { .. }
+            | Self::PutRoutineDetails { .. }
+            | Self::PutActiveWorkflow { .. }
             | Self::RunAllWatchSources
             | Self::DeleteRoutine { .. }
             | Self::RunRoutine { .. }
@@ -1084,6 +1105,9 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         Operation::SetTaskStatus { id, status } => {
             client.patch_task_status(id, status).map(Reply::UpdatedTask)
         }
+        Operation::UpdateTask { id, update } => {
+            client.update_task(id, update).map(Reply::UpdatedTask)
+        }
         Operation::DeleteTask { id } => client
             .delete_task(id)
             .map(|_| Reply::DeletedTask(id.clone())),
@@ -1173,6 +1197,32 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
             client.put_routine(name, *enabled, time.as_deref(), timezone.as_deref())?;
             client.workflows_snapshot().map(Reply::Workflows)
         }
+        Operation::PutRoutineDetails {
+            name,
+            enabled,
+            time,
+            timezone,
+            label,
+            prompt,
+        } => {
+            client.put_routine_details(
+                name,
+                *enabled,
+                time.as_deref(),
+                timezone.as_deref(),
+                label.as_deref(),
+                prompt.as_deref(),
+            )?;
+            client.workflows_snapshot().map(Reply::Workflows)
+        }
+        Operation::PutActiveWorkflow {
+            conversation_id,
+            goal,
+            items,
+        } => {
+            client.put_active_workflow(conversation_id, goal.as_deref(), items.as_deref())?;
+            client.workflows_snapshot().map(Reply::Workflows)
+        }
         Operation::RunAllWatchSources => {
             client.run_all_watch_sources()?;
             client.workflows_snapshot().map(Reply::Workflows)
@@ -1247,7 +1297,11 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
             .admin_connector_oauth_disconnect(id)
             .map(|_| Reply::AdminSaved),
         Operation::TestConnector { id } => {
-            client.admin_test_connector(id).map(Reply::ConnectorTested)
+            let result = match client.test_connector(id) {
+                Err(ApiError::Http(404 | 405)) => client.admin_test_connector(id),
+                other => other,
+            };
+            result.map(Reply::ConnectorTested)
         }
         Operation::AdminSetAudio(update) => {
             client.admin_set_audio(update).map(|_| Reply::AdminSaved)

@@ -125,11 +125,19 @@ pub fn ensure_daily_routine(
             } else {
                 utc_string(next)
             };
+            let mut merged = old
+                .as_ref()
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            merged.insert("time".to_owned(), json!(time.format("%H:%M").to_string()));
+            merged.insert("timezone".to_owned(), json!(tz.name()));
+            let merged_config = Value::Object(merged).to_string();
             connection.execute(
                 "UPDATE routines
                  SET kind = 'daily', config_json = ?1, next_run_at = ?2, updated_at = ?3
                  WHERE name = ?4 AND user_id = ?5",
-                params![config, next_run_at, now_string, name, user_id],
+                params![merged_config, next_run_at, now_string, name, user_id],
             )?;
         }
     }
