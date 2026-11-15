@@ -753,13 +753,45 @@ impl Tool for OneDriveListTool {
             .unwrap_or(5);
         let client = self.registry.client_for(&context.user_id)?;
         let client = client.lock().await;
-        let result = client.list_folder(subfolder, max_pages).await?;
+        let mut listed_scope = match subfolder {
+            Some(sub) => format!("{}/{}", self.folder, sub),
+            None => self.folder.clone(),
+        };
+        let mut result = client.list_folder(subfolder, max_pages).await?;
+        if subfolder.is_none() && result.items.is_empty() {
+            let root_result = client.list_folder(Some("/"), max_pages).await?;
+            if !root_result.items.is_empty() {
+                result = root_result;
+                listed_scope = "/ (OneDrive root)".to_owned();
+            }
+        }
+        let header = format!(
+            "OneDrive listing ({listed_scope}): {} item(s){}",
+            result.items.len(),
+            if result.truncated { " (truncated)" } else { "" }
+        );
+        let content = if result.items.is_empty() {
+            header
+        } else {
+            let lines = result
+                .items
+                .iter()
+                .map(|item| {
+                    if item.folder {
+                        format!("- [folder] {} ({})", item.name, item.path)
+                    } else {
+                        format!(
+                            "- [file] {} ({} bytes, {})",
+                            item.name, item.size, item.path
+                        )
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{header}\n{lines}")
+        };
         Ok(ToolOutput {
-            content: format!(
-                "OneDrive listing: {} item(s){}",
-                result.items.len(),
-                if result.truncated { " (truncated)" } else { "" }
-            ),
+            content,
             data: Some(json!({
                 "items": result.items.iter().map(|item| json!({
                     "id": item.id,

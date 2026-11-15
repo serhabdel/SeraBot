@@ -747,10 +747,105 @@ impl std::fmt::Debug for Redactor {
     }
 }
 
+const MIN_ENCODED_REDACT_CHARS: usize = 6;
+
+fn push_secret_variants(secrets: &mut Vec<(String, Zeroizing<String>)>, name: &str, raw: &str) {
+    if raw.chars().count() < MIN_REDACT_CHARS {
+        return;
+    }
+    let mut push_unique = |candidate: String| {
+        if !candidate.is_empty()
+            && !secrets.iter().any(|(existing_name, existing_val)| {
+                existing_name == name && existing_val.as_str() == candidate
+            })
+        {
+            secrets.push((name.to_owned(), Zeroizing::new(candidate)));
+        }
+    };
+    push_unique(raw.to_owned());
+
+    if raw.chars().count() >= MIN_ENCODED_REDACT_CHARS {
+        use base64::Engine as _;
+        let url_form: String = url::form_urlencoded::byte_serialize(raw.as_bytes()).collect();
+        push_unique(url_form);
+        // Also percent-encode spaces as `%20` in case a URL path/query uses `%20` rather than `+`.
+        let mut pct_encoded = String::with_capacity(raw.len());
+        for byte in raw.as_bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                pct_encoded.push(*byte as char);
+            } else {
+                pct_encoded.push_str(&format!("%{byte:02X}"));
+            }
+        }
+        push_unique(pct_encoded);
+
+        push_unique(base64::engine::general_purpose::STANDARD.encode(raw.as_bytes()));
+        push_unique(base64::engine::general_purpose::STANDARD_NO_PAD.encode(raw.as_bytes()));
+        push_unique(base64::engine::general_purpose::URL_SAFE.encode(raw.as_bytes()));
+        push_unique(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw.as_bytes()));
+    }
+}
+
+fn secret_patterns() -> &'static [(regex::Regex, &'static str)] {
+    static PATTERNS: std::sync::OnceLock<Vec<(regex::Regex, &'static str)>> =
+        std::sync::OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        [
+            (
+                r"\bops_eyJ[A-Za-z0-9_-]{10,}\b",
+                "[redacted:1password_token]",
+            ),
+            (
+                r"\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}\b",
+                "[redacted:api_key]",
+            ),
+            (
+                r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b",
+                "[redacted:github_token]",
+            ),
+            (
+                r"\bgithub_pat_[A-Za-z0-9_]{20,}\b",
+                "[redacted:github_token]",
+            ),
+            (
+                r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b",
+                "[redacted:slack_token]",
+            ),
+            (r"\bAIza[0-9A-Za-z_-]{30,}\b", "[redacted:google_api_key]"),
+            (r"\bAKIA[0-9A-Z]{16}\b", "[redacted:aws_access_key]"),
+            (
+                r"\bBearer\s+[A-Za-z0-9._~+/=-]{20,}",
+                "Bearer [redacted:token]",
+            ),
+        ]
+        .into_iter()
+        .map(|(pat, repl)| (regex::Regex::new(pat).expect("valid redaction regex"), repl))
+        .collect()
+    })
+}
+
+fn redact_patterns(text: &str) -> String {
+    let mut current = std::borrow::Cow::Borrowed(text);
+    for (re, replacement) in secret_patterns() {
+        if let std::borrow::Cow::Owned(replaced) = re.replace_all(&current, *replacement) {
+            current = std::borrow::Cow::Owned(replaced);
+        }
+    }
+    current.into_owned()
+}
+
 impl Redactor {
-    /// Load the acting user's values: their sealed local values, and the
-    /// values recently read from a password manager (`resolved`). A decrypt
-    /// failure is an error: the caller must not forward unredacted text.
+    /// An empty redactor that still scrubs well-known credential patterns.
+    pub fn empty() -> Self {
+        Self {
+            secrets: Vec::new(),
+        }
+    }
+
+    /// Load the acting user's values: their sealed local values, their saved
+    /// password-manager tokens, and the values recently read from a password
+    /// manager (`resolved`). A decrypt failure is an error: the caller must not
+    /// forward unredacted text.
     pub fn for_user(
         users: &UserSecrets,
         user_id: &str,
@@ -761,15 +856,15 @@ impl Redactor {
             let Some(value) = users.get_vault(user_id, &entry.name)? else {
                 continue;
             };
-            let value = value.expose_secret();
-            if value.chars().count() >= MIN_REDACT_CHARS {
-                secrets.push((entry.name, Zeroizing::new(value.clone())));
+            push_secret_variants(&mut secrets, &entry.name, value.expose_secret());
+        }
+        for provider in vault_providers::Provider::ALL {
+            if let Some(token) = users.vault_provider_token(user_id, provider.id())? {
+                push_secret_variants(&mut secrets, provider.token_env(), token.expose_secret());
             }
         }
         for (name, value) in resolved.live(user_id) {
-            if value.chars().count() >= MIN_REDACT_CHARS {
-                secrets.push((name, value));
-            }
+            push_secret_variants(&mut secrets, &name, value.as_str());
         }
         secrets.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
         Ok(Self { secrets })
@@ -780,10 +875,10 @@ impl Redactor {
     }
 
     /// Replace every occurrence in one left-to-right pass, so a placeholder
-    /// is never re-scanned.
+    /// is never re-scanned, then scrub unstored credential patterns.
     pub fn redact(&self, text: &str) -> String {
         if self.secrets.is_empty() {
-            return text.to_owned();
+            return redact_patterns(text);
         }
         let mut out = String::with_capacity(text.len());
         let mut index = 0;
@@ -804,7 +899,7 @@ impl Redactor {
                 index += c.len_utf8().max(1);
             }
         }
-        out
+        redact_patterns(&out)
     }
 
     /// Redact every string inside a JSON value, in place.
@@ -1774,5 +1869,74 @@ mod tests {
     #[test]
     fn the_request_tool_is_not_a_destructive_tool() {
         assert!(!crate::gateway::is_destructive_tool(REQUEST_SECRET_TOOL));
+    }
+
+    #[test]
+    fn redactor_scrubs_encoded_secrets_provider_tokens_and_patterns_while_keeping_refs() {
+        use base64::Engine as _;
+        let (_store, users, user_a, _) = setup();
+        let secret = "s3cr3t+val/ue=99";
+        put(
+            &users,
+            &user_a,
+            "api-secret",
+            &VaultInput {
+                kind: VaultKind::ApiKey,
+                username: None,
+                value: Zeroizing::new(secret.to_owned()),
+                domains: vec!["api.example".into()],
+                note: None,
+                source: VaultSource::Local,
+                reference: None,
+            },
+        )
+        .unwrap();
+        users
+            .set_vault_provider_token(
+                &user_a,
+                "1password",
+                "ops_eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9_tok",
+            )
+            .unwrap();
+
+        let resolved = vault_providers::ResolvedValues::default();
+        let redactor = Redactor::for_user(&users, &user_a, &resolved).unwrap();
+
+        let url_encoded: String = url::form_urlencoded::byte_serialize(secret.as_bytes()).collect();
+        let b64_std = base64::engine::general_purpose::STANDARD.encode(secret.as_bytes());
+        let b64_url = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret.as_bytes());
+
+        let input = format!(
+            "raw={secret} url={url_encoded} b64={b64_std} b64u={b64_url} \
+             pm=ops_eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9_tok \
+             openai=sk-proj-abcdefghijklmnopqrstuvwxyz1234 \
+             anth=sk-ant-abcdefghijklmnopqrstuvwxyz1234 \
+             gh=ghp_1234567890abcdefghijklmnopqrstuv \
+             ghp=github_pat_1234567890abcdefghijklmnopqrstuv \
+             slack=xoxb-1234567890-abcdefg \
+             gkey=AIzaSyDummyKey123456789012345678901234 \
+             aws=AKIAIOSFODNN7EXAMPLE \
+             auth=\"Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.abc\" \
+             refs: op://Private/Bank/password pass://Work/Email/key vault://api-secret"
+        );
+        let out = redactor.redact(&input);
+
+        assert!(!out.contains(secret));
+        assert!(!out.contains(&url_encoded));
+        assert!(!out.contains(&b64_std));
+        assert!(!out.contains(&b64_url));
+        assert!(!out.contains("ops_eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9_tok"));
+        assert!(!out.contains("sk-proj-abcdefghijklmnopqrstuvwxyz1234"));
+        assert!(!out.contains("sk-ant-abcdefghijklmnopqrstuvwxyz1234"));
+        assert!(!out.contains("ghp_1234567890abcdefghijklmnopqrstuv"));
+        assert!(!out.contains("github_pat_1234567890abcdefghijklmnopqrstuv"));
+        assert!(!out.contains("xoxb-1234567890-abcdefg"));
+        assert!(!out.contains("AIzaSyDummyKey123456789012345678901234"));
+        assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!out.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"));
+
+        assert!(out.contains("op://Private/Bank/password"));
+        assert!(out.contains("pass://Work/Email/key"));
+        assert!(out.contains("vault://api-secret"));
     }
 }

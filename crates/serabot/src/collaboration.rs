@@ -23,6 +23,9 @@ pub const SHARED_TOOLS: &[&str] = &[
     "memory_search",
     "memory_update",
     "memory_delete",
+    "onedrive_list",
+    "vault_list",
+    "vault_request_secret",
 ];
 
 /// A specialist (or a handoff that has not already been handed on) asks main

@@ -417,7 +417,7 @@ fn sync_http() -> Result<reqwest::Client> {
         .map_err(|error| SeraError::External(error.to_string()))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct SyncRunRequest {
     /// Defaults to the stored `sync_provider`.
@@ -430,8 +430,14 @@ pub(super) struct SyncRunRequest {
 pub(super) async fn run_sync(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
-    Json(request): Json<SyncRunRequest>,
+    body: axum::body::Bytes,
 ) -> Result<Json<Value>> {
+    let request = if body.trim_ascii().is_empty() {
+        SyncRunRequest::default()
+    } else {
+        serde_json::from_slice::<SyncRunRequest>(&body)
+            .map_err(|error| SeraError::Validation(format!("invalid sync run request: {error}")))?
+    };
     let prefs = crate::personal_tasks::get_prefs(&state.store, &user.id)?;
     let provider = request
         .provider
@@ -496,8 +502,48 @@ pub(super) struct CalendarQuery {
     to: String,
 }
 
-/// Calendar events in `[from, to]` from the user's chosen calendar provider
-/// (read-only), merged with the local tasks' due dates by the client.
+fn calendar_providers_for_user(
+    state: &ApiState,
+    user_id: &str,
+    sync_provider: &str,
+) -> Vec<&'static str> {
+    let has_google = sync_provider == crate::personal_tasks::PROVIDER_GOOGLE_CALENDAR
+        || state
+            .personal
+            .has_google_connection(user_id)
+            .unwrap_or(false)
+        || crate::task_sync::sign_in_status(
+            &state.users,
+            user_id,
+            crate::task_sync::GOOGLE_PROVIDER,
+        )
+        .unwrap_or(false);
+    let has_outlook = sync_provider == crate::personal_tasks::PROVIDER_OUTLOOK_CALENDAR
+        || sync_provider == crate::personal_tasks::PROVIDER_MICROSOFT_TODO
+        || state
+            .personal
+            .has_microsoft_connection(user_id)
+            .unwrap_or(false)
+        || crate::task_sync::sign_in_status(
+            &state.users,
+            user_id,
+            crate::task_sync::MICROSOFT_PROVIDER,
+        )
+        .unwrap_or(false);
+
+    let mut providers = Vec::new();
+    if has_google {
+        providers.push(crate::personal_tasks::PROVIDER_GOOGLE_CALENDAR);
+    }
+    if has_outlook {
+        providers.push(crate::personal_tasks::PROVIDER_OUTLOOK_CALENDAR);
+    }
+    providers
+}
+
+/// Calendar events in `[from, to]` from all connected calendar providers for
+/// the acting user (read-only), merged with the local tasks' due dates by the
+/// client.
 pub(super) async fn calendar_events(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
@@ -505,34 +551,200 @@ pub(super) async fn calendar_events(
 ) -> Result<Json<Value>> {
     let prefs = crate::personal_tasks::get_prefs(&state.store, &user.id)?;
     let provider = prefs.sync_provider;
-    // Only the calendar providers have events. Any other choice, including
-    // "none" (the default), is an empty calendar, not a rejected request: the
-    // Tasks window asks for the calendar every time it opens.
-    if !matches!(
-        provider.as_str(),
-        crate::personal_tasks::PROVIDER_GOOGLE_CALENDAR
-            | crate::personal_tasks::PROVIDER_OUTLOOK_CALENDAR
-    ) {
+    let providers = calendar_providers_for_user(&state, &user.id, &provider);
+    if providers.is_empty() {
         return Ok(Json(json!({"provider": provider, "events": []})));
     }
-    let family = crate::task_sync::provider_family(&provider)
-        .ok_or_else(|| SeraError::Validation("choose a calendar provider first".into()))?;
-    let (client_id, client_secret) = sync_client_credentials(&state, family)?;
     let http = sync_http()?;
-    let token =
-        resolve_sync_token(&state, &user.id, family, &client_id, &client_secret, &http).await?;
-    let events = crate::task_sync::calendar_events(
-        &user.id,
-        &provider,
-        &query.from,
-        &query.to,
-        &token,
-        &http,
-    )
-    .await?;
+    let mut events = Vec::new();
+    for cal_provider in providers {
+        let Some(family) = crate::task_sync::provider_family(cal_provider) else {
+            continue;
+        };
+        let (client_id, client_secret) = match sync_client_credentials(&state, family) {
+            Ok(creds) => creds,
+            Err(error) => {
+                tracing::warn!(
+                    user_id = %user.id,
+                    provider = cal_provider,
+                    %error,
+                    "skipping calendar provider without OAuth credentials"
+                );
+                continue;
+            }
+        };
+        let token =
+            match resolve_sync_token(&state, &user.id, family, &client_id, &client_secret, &http)
+                .await
+            {
+                Ok(token) => token,
+                Err(error) => {
+                    tracing::warn!(
+                        user_id = %user.id,
+                        provider = cal_provider,
+                        %error,
+                        "skipping calendar provider token resolution failure"
+                    );
+                    continue;
+                }
+            };
+        match crate::task_sync::calendar_events(
+            &user.id,
+            cal_provider,
+            &query.from,
+            &query.to,
+            &token,
+            &http,
+        )
+        .await
+        {
+            Ok(mut fetched) => events.append(&mut fetched),
+            Err(error) => {
+                tracing::warn!(
+                    user_id = %user.id,
+                    provider = cal_provider,
+                    %error,
+                    "calendar provider fetch failed"
+                );
+            }
+        }
+    }
+    events.sort_by(|a, b| {
+        let sa = a.get("start").and_then(Value::as_str).unwrap_or("");
+        let sb = b.get("start").and_then(Value::as_str).unwrap_or("");
+        sa.cmp(sb)
+    });
     let body = json!({"provider": provider, "events": events});
     state
         .runtime
         .scan_owner_output(&user.id, &body.to_string())?;
     Ok(Json(body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gateway::{Gateway, ToolRegistry};
+    use crate::llm::LlmClient;
+    use crate::policy::Policy;
+    use crate::runtime::NullNotifier;
+    use tower::ServiceExt;
+
+    fn test_state_and_router() -> (ApiState, Router, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.api.enabled = true;
+        config.api.token_hash = sha256_hex("test-token-that-is-long-enough-123");
+        config.llm.model = "test".into();
+        config.llm.base_url = "https://example.com/v1".into();
+        config.base_dir = dir.path().to_path_buf();
+        let db_path = dir.path().join("serabot.db");
+        config.database.path = db_path.to_string_lossy().into_owned();
+        let config = Arc::new(config);
+        let store = Store::open(&db_path, 384, 5000).unwrap();
+        let gateway = Gateway::new(
+            store.clone(),
+            Arc::new(Policy::empty()),
+            ToolRegistry::default(),
+            1,
+            false,
+        );
+        let llm = LlmClient::new("https://example.com/v1", "test", 5, 50)
+            .unwrap()
+            .with_model("test");
+        let runtime = Runtime::new(
+            config.clone(),
+            store.clone(),
+            gateway,
+            crate::model_router::ModelRouter::new(
+                &config.llm,
+                BTreeMap::from([("default".into(), llm)]),
+            )
+            .unwrap(),
+            vec![crate::config::LoadedBot {
+                config: BotConfig {
+                    title: None,
+                    description: None,
+                    name: "main".into(),
+                    trigger: "command".into(),
+                    model: None,
+                    system_prompt: "prompts/main.txt".into(),
+                    skills: vec![],
+                    tools: vec![],
+                    require_approval: vec![],
+                    enabled: true,
+                    temperature: None,
+                    thinking: None,
+                    role: crate::orchestration::BotRole::Orchestrator,
+                    delegates: vec![],
+                },
+                prompt: "test".into(),
+            }],
+            Arc::new(NullNotifier),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+        let artifacts = Arc::new(ArtifactStore::new(dir.path().join("artifacts")).unwrap());
+        let secrets = SharedSecrets::new(crate::secrets::SecretStore::from_map(BTreeMap::new()));
+        let users = Arc::new(
+            crate::user_secrets::UserSecrets::with_master_key(store.clone(), [7u8; 32]).unwrap(),
+        );
+        let state = ApiState::new(runtime, store, config, artifacts, secrets, users, None).unwrap();
+        let app = router(state.clone());
+        (state, app, dir)
+    }
+
+    #[tokio::test]
+    async fn run_sync_accepts_bodyless_post_without_http_415() {
+        let (_state, app, _dir) = test_state_and_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/tasks/sync/run")
+            .header("Authorization", "Bearer test-token-that-is-long-enough-123")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        assert_eq!(resp.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn calendar_providers_include_connected_accounts_even_when_sync_provider_is_none_or_todo()
+    {
+        let (state, _app, _dir) = test_state_and_router();
+        let uid = state
+            .store
+            .create_user("sub-cal-test", "cal@example.example", "Cal Test")
+            .unwrap()
+            .id;
+        assert!(calendar_providers_for_user(&state, &uid, "none").is_empty());
+        assert_eq!(
+            calendar_providers_for_user(&state, &uid, "microsoft_todo"),
+            vec![crate::personal_tasks::PROVIDER_OUTLOOK_CALENDAR]
+        );
+
+        state
+            .users
+            .set(&uid, "conn.google", "{\"refresh_token\":\"rt\"}")
+            .unwrap();
+        assert_eq!(
+            calendar_providers_for_user(&state, &uid, "none"),
+            vec![crate::personal_tasks::PROVIDER_GOOGLE_CALENDAR]
+        );
+
+        state
+            .users
+            .set(&uid, "conn.outlook_calendar", "{\"refresh_token\":\"rt2\"}")
+            .unwrap();
+        assert_eq!(
+            calendar_providers_for_user(&state, &uid, "none"),
+            vec![
+                crate::personal_tasks::PROVIDER_GOOGLE_CALENDAR,
+                crate::personal_tasks::PROVIDER_OUTLOOK_CALENDAR,
+            ]
+        );
+    }
 }

@@ -131,6 +131,16 @@ pub(super) async fn put_vault_provider(
     let provider = password_manager(&id)?;
     let token = Zeroizing::new(request.token.trim().to_owned());
     vault_providers::set_token(&state.users, &user.id, provider, &token)?;
+    if state.vault_providers.enabled(provider)
+        && !state.vault_providers.cli_found(provider)
+        && let Err(error) = state.vault_providers.ensure_cli(provider).await
+    {
+        tracing::warn!(
+            provider = provider.id(),
+            %error,
+            "password manager CLI auto-install failed on token save"
+        );
+    }
     Ok(Json(json!(vault_providers::status(
         &state.users,
         &state.vault_providers,

@@ -322,14 +322,30 @@ impl OneDriveClient {
         subfolder: Option<&str>,
         max_pages: usize,
     ) -> Result<ListFolderResult> {
-        let folders = self.destination_folders(subfolder)?;
         let max_pages = max_pages.clamp(1, LIST_MAX_PAGES_CAP);
-        let encoded = encode_path(&folders);
-        let mut url = format!(
-            "{}/me/drive/root:/{}:/children?$top={LIST_PAGE_SIZE}",
-            self.graph_base, encoded
+        let list_root = matches!(
+            subfolder.map(str::trim),
+            Some("/") | Some(".") | Some("root")
         );
-        let parent_path = display_folder_path(&folders);
+        let (mut url, parent_path) = if list_root {
+            (
+                format!(
+                    "{}/me/drive/root/children?$top={LIST_PAGE_SIZE}",
+                    self.graph_base
+                ),
+                "/".to_owned(),
+            )
+        } else {
+            let folders = self.destination_folders(subfolder)?;
+            let encoded = encode_path(&folders);
+            (
+                format!(
+                    "{}/me/drive/root:/{}:/children?$top={LIST_PAGE_SIZE}",
+                    self.graph_base, encoded
+                ),
+                display_folder_path(&folders),
+            )
+        };
 
         let mut items = Vec::new();
         let mut pages = 0usize;
@@ -341,6 +357,9 @@ impl OneDriveClient {
             let response = self
                 .graph_get_with_retries(&url, &token, "folder listing")
                 .await?;
+            if response.status() == StatusCode::NOT_FOUND {
+                break;
+            }
             let body = read_limited(response, MAX_RESPONSE_BYTES).await?;
             let page: ListPageResponse = serde_json::from_slice(&body).map_err(|error| {
                 SeraError::External(format!("invalid OneDrive list response: {error}"))
@@ -2006,6 +2025,48 @@ mod tests {
         assert_eq!(result.items[0].path, "/SeraBot/Deliverables/report.pdf");
         assert!(!result.items[0].folder);
         assert!(result.items[1].folder);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn list_folder_handles_root_and_404_cleanly() {
+        let server = MockServer::start().await;
+        mount_token(&server, "access-1", None, 3600).await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/drive/root/children"))
+            .and(query_param("$top", "200"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "value": [
+                    {
+                        "id": "root-folder-1",
+                        "name": "Documents",
+                        "folder": {},
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/drive/root:/SeraBot/Missing:/children"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": { "code": "itemNotFound", "message": "The resource could not be found." }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server);
+        let root_res = client.list_folder(Some("/"), 5).await.unwrap();
+        assert_eq!(root_res.items.len(), 1);
+        assert_eq!(root_res.items[0].name, "Documents");
+        assert_eq!(root_res.items[0].path, "/Documents");
+
+        let missing_res = client.list_folder(Some("Missing"), 5).await.unwrap();
+        assert!(missing_res.items.is_empty());
+        assert!(!missing_res.truncated);
         server.verify().await;
     }
 
