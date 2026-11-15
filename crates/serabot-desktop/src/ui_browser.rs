@@ -18,12 +18,12 @@ use crate::ui::{ChatView, Icon, Overlay, avatar_style};
 use dioxus::prelude::*;
 use serabot_desktop::SigninHelperStatus;
 use serabot_desktop::panel::{
-    address_to_url, host_label, idle_label, idle_timeout_label, profile_users, tab_count_label,
+    host_label, idle_label, idle_timeout_label, profile_users, tab_count_label,
 };
 use serabot_desktop::session::{Section, Session};
 use serabot_desktop::{
-    BrowserController, BrowserHistory, BrowserInput, BrowserPointer, BrowserSessionInfo,
-    BrowserTab, MAX_BROWSER_TABS, SigninBlocked,
+    BrowserController, BrowserHistory, BrowserPointer, BrowserSessionInfo, BrowserTab,
+    MAX_BROWSER_TABS, SigninBlocked,
 };
 
 /// A grid card: the session, its latest picture, and the bot driving it.
@@ -48,7 +48,6 @@ pub fn PointerOverlay(pointer: Option<BrowserPointer>) -> Element {
     };
     rsx! {
         div {
-            id: "dock-pointer",
             class: "dock-pointer",
             "aria-hidden": "true",
             "data-x": "{p.x}",
@@ -82,6 +81,7 @@ fn tab_label(tab: &BrowserTab) -> String {
 fn TabStrip(
     session: Signal<Session>,
     tabs: Vec<BrowserTab>,
+    active: bool,
     in_control: bool,
     opening: Signal<bool>,
 ) -> Element {
@@ -102,9 +102,9 @@ fn TabStrip(
                                 class: "tab-main",
                                 role: "tab",
                                 "aria-selected": if tab.active { "true" } else { "false" },
-                                title: if in_control { "{tab.url}" } else { "Take control to switch tabs" },
-                                disabled: !in_control,
-                                onclick: move |_| session.write().panel.switch_tab(&switch_id),
+                                title: if active { "{tab.url}" } else { "Browser is closed" },
+                                disabled: !active,
+                                onclick: move |_| session.write().panel.switch_tab_or_takeover(&switch_id),
                                 "{label}"
                             }
                             if in_control && !only {
@@ -120,13 +120,16 @@ fn TabStrip(
                     }
                 }
             }
-            if in_control {
+            if active {
                 button {
                     class: "tab-add",
                     title: if full { "At most 8 tabs; close one first" } else { "New tab: type an address" },
                     "aria-label": "New tab",
                     disabled: full,
                     onclick: move |_| {
+                        if !in_control {
+                            session.write().panel.take_over();
+                        }
                         // The address bar takes the next address as a new tab.
                         opening.set(true);
                         let _ = dioxus::document::eval(FOCUS_ADDRESS_JS);
@@ -663,7 +666,18 @@ fn FocusView(session: Signal<Session>, overlay: Signal<Overlay>, id: String) -> 
     let mut opening = use_signal(|| false);
     let mut draft = use_signal(String::new);
     let mut confirm_end = use_signal(|| false);
-    let (info, shot, busy, error, bot, in_control, idle_ttl, helpers) = {
+    let (
+        info,
+        shot,
+        busy,
+        autofill_busy,
+        autofill_feedback,
+        error,
+        bot,
+        in_control,
+        idle_ttl,
+        helpers,
+    ) = {
         let s = session.read();
         let info = s.panel.session(&id).cloned();
         let bot = info.as_ref().and_then(|i| i.bot.clone());
@@ -671,6 +685,8 @@ fn FocusView(session: Signal<Session>, overlay: Signal<Overlay>, id: String) -> 
             info,
             s.panel.shots.get(&id).cloned(),
             s.panel.control_busy,
+            s.panel.autofill_busy,
+            s.panel.autofill_feedback.clone(),
             s.panel.browser_error.clone(),
             bot,
             s.panel.user_in_control(),
@@ -691,11 +707,7 @@ fn FocusView(session: Signal<Session>, overlay: Signal<Overlay>, id: String) -> 
         .as_ref()
         .and_then(|i| i.url.clone())
         .unwrap_or_default();
-    let url_text = if url.is_empty() {
-        "No page open".to_owned()
-    } else {
-        url.clone()
-    };
+    let is_https = url.starts_with("https://");
     let (pill, label) = controller_pill(
         info.as_ref()
             .map_or(BrowserController::Bot, |i| i.controller),
@@ -750,136 +762,154 @@ fn FocusView(session: Signal<Session>, overlay: Signal<Overlay>, id: String) -> 
                 if let Some(block) = signin.clone() {
                     SigninBanner { session, block }
                 }
-                if in_control {
-                    div { class: "browser-toolbar", role: "toolbar", "aria-label": "Page controls",
-                        button {
-                            class: "icon-btn",
-                            title: "Back",
-                            "aria-label": "Back",
-                            disabled: !active,
-                            onclick: move |_| session.write().panel.history(BrowserHistory::Back),
-                            Icon { name: "chevron-left", size: 16 }
+                if !tabs.is_empty() {
+                    TabStrip { session, tabs: tabs.clone(), active, in_control, opening }
+                }
+                div { class: "browser-toolbar", role: "toolbar", "aria-label": "Page controls",
+                    button {
+                        class: "icon-btn",
+                        r#type: "button",
+                        title: "Back",
+                        "aria-label": "Back",
+                        disabled: !active,
+                        onclick: move |_| session.write().panel.history_or_takeover(BrowserHistory::Back),
+                        Icon { name: "chevron-left", size: 16 }
+                    }
+                    button {
+                        class: "icon-btn",
+                        r#type: "button",
+                        title: "Forward",
+                        "aria-label": "Forward",
+                        disabled: !active,
+                        onclick: move |_| session.write().panel.history_or_takeover(BrowserHistory::Forward),
+                        Icon { name: "chevron-right", size: 16 }
+                    }
+                    button {
+                        class: "icon-btn",
+                        r#type: "button",
+                        title: "Reload",
+                        "aria-label": "Reload",
+                        disabled: !active,
+                        onclick: move |_| session.write().panel.history_or_takeover(BrowserHistory::Reload),
+                        Icon { name: "refresh", size: 16 }
+                    }
+                    button {
+                        class: "icon-btn",
+                        r#type: "button",
+                        title: "Home",
+                        "aria-label": "Home",
+                        disabled: !active,
+                        onclick: move |_| {
+                            session.write().panel.navigate_omnibox("https://www.google.com");
+                        },
+                        svg {
+                            width: "16",
+                            height: "16",
+                            "viewBox": "0 0 24 24",
+                            fill: "none",
+                            stroke: "currentColor",
+                            "stroke-width": "1.75",
+                            "stroke-linecap": "round",
+                            "stroke-linejoin": "round",
+                            path { d: "M3 10.5L12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1v-9.5z" }
                         }
-                        button {
-                            class: "icon-btn",
-                            title: "Forward",
-                            "aria-label": "Forward",
-                            disabled: !active,
-                            onclick: move |_| session.write().panel.history(BrowserHistory::Forward),
-                            Icon { name: "chevron-right", size: 16 }
+                    }
+                    div { class: "dock-url editable",
+                        span {
+                            class: if is_https { "omnibox-lock secure" } else { "omnibox-lock" },
+                            title: if is_https { "Secure HTTPS connection" } else { "Not HTTPS" },
+                            Icon { name: if is_https { "lock" } else { "globe" }, size: 14 }
                         }
-                        button {
-                            class: "icon-btn",
-                            title: "Reload",
-                            "aria-label": "Reload",
+                        input {
+                            id: "browser-address",
+                            class: "dock-address",
+                            "aria-label": "Address or search",
+                            placeholder: if opening() { "New tab: enter URL or search\u{2026}" } else { "Enter URL or search\u{2026}" },
                             disabled: !active,
-                            onclick: move |_| session.write().panel.history(BrowserHistory::Reload),
-                            Icon { name: "refresh", size: 16 }
-                        }
-                        div { class: "dock-url editable",
-                            Icon { name: "globe", size: 14 }
-                            input {
-                                id: "browser-address",
-                                class: "dock-address",
-                                "aria-label": "Address",
-                                placeholder: if opening() { "New tab: type an address and press Enter" } else { "Type an address and press Enter" },
-                                value: "{url_shown}",
-                                onfocus: {
-                                    let url = url.clone();
-                                    move |_| {
-                                        // A new tab starts from an empty field.
-                                        if opening() {
-                                            draft.set(String::new());
-                                        } else {
-                                            draft.set(url.clone());
-                                        }
-                                        editing.set(true);
+                            value: "{url_shown}",
+                            onfocus: {
+                                let url = url.clone();
+                                move |_| {
+                                    // A new tab starts from an empty field.
+                                    if opening() {
+                                        draft.set(String::new());
+                                    } else {
+                                        draft.set(url.clone());
                                     }
-                                },
-                                onblur: move |_| {
-                                    editing.set(false);
-                                    opening.set(false);
-                                },
-                                oninput: move |event| draft.set(event.value()),
-                                onkeydown: {
-                                    let url_reset = url.clone();
-                                    move |event: KeyboardEvent| {
-                                        event.stop_propagation();
-                                        if event.key() == Key::Escape {
+                                    editing.set(true);
+                                }
+                            },
+                            onblur: move |_| {
+                                editing.set(false);
+                                opening.set(false);
+                            },
+                            oninput: move |event| draft.set(event.value()),
+                            onkeydown: {
+                                let url_reset = url.clone();
+                                move |event: KeyboardEvent| {
+                                    event.stop_propagation();
+                                    if event.key() == Key::Escape {
+                                        opening.set(false);
+                                        editing.set(false);
+                                        draft.set(url_reset.clone());
+                                        session.write().panel.browser_error = None;
+                                    } else if event.key() == Key::Enter && opening() {
+                                        if session.write().panel.open_tab(&draft()) {
                                             opening.set(false);
                                             editing.set(false);
-                                            draft.set(url_reset.clone());
-                                            session.write().panel.browser_error = None;
-                                        } else if event.key() == Key::Enter && opening() {
-                                            if session.write().panel.open_tab(&draft()) {
-                                                opening.set(false);
-                                                editing.set(false);
-                                            } else {
-                                                session.write().panel.browser_error = Some("Enter a web address.".into());
-                                            }
-                                        } else if event.key() == Key::Enter {
-                                            match address_to_url(&draft()) {
-                                                Some(url) => {
-                                                    session.write().panel.send_input(BrowserInput::Navigate { url });
-                                                    editing.set(false);
-                                                }
-                                                None => {
-                                                    session.write().panel.browser_error = Some("Enter a web address.".into());
-                                                }
-                                            }
+                                        } else {
+                                            session.write().panel.browser_error = Some("Enter a web address.".into());
                                         }
+                                    } else if event.key() == Key::Enter
+                                        && session.write().panel.navigate_omnibox(&draft())
+                                    {
+                                        editing.set(false);
+                                    }
+                                }
+                            },
+                        }
+                        if editing() {
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                onmousedown: move |event| event.prevent_default(),
+                                onclick: move |_| {
+                                    if opening() {
+                                        if session.write().panel.open_tab(&draft()) {
+                                            opening.set(false);
+                                            editing.set(false);
+                                        } else {
+                                            session.write().panel.browser_error = Some("Enter a web address.".into());
+                                        }
+                                    } else if session.write().panel.navigate_omnibox(&draft()) {
+                                        editing.set(false);
                                     }
                                 },
-                            }
-                            if editing() {
-                                button {
-                                    class: "btn ghost sm",
-                                    r#type: "button",
-                                    onmousedown: move |event| event.prevent_default(),
-                                    onclick: move |_| {
-                                        if opening() {
-                                            if session.write().panel.open_tab(&draft()) {
-                                                opening.set(false);
-                                                editing.set(false);
-                                            } else {
-                                                session.write().panel.browser_error = Some("Enter a web address.".into());
-                                            }
-                                        } else {
-                                            match address_to_url(&draft()) {
-                                                Some(url) => {
-                                                    session.write().panel.send_input(BrowserInput::Navigate { url });
-                                                    editing.set(false);
-                                                }
-                                                None => {
-                                                    session.write().panel.browser_error = Some("Enter a web address.".into());
-                                                }
-                                            }
-                                        }
-                                    },
-                                    "Go"
-                                }
+                                "Go"
                             }
                         }
                     }
-                } else {
-                    div { class: "dock-url", title: "{url_text}",
-                        Icon { name: "globe", size: 14 }
-                        span { class: "dock-url-text", "{url_text}" }
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        title: "Autofill matching credentials from Vault",
+                        "aria-label": "Autofill from Vault",
+                        disabled: !active || autofill_busy,
+                        onclick: move |_| session.write().panel.autofill_browser(),
+                        Icon { name: "key", size: 14 }
+                        if autofill_busy { "Filling\u{2026}" } else { "Autofill" }
                     }
-                }
-                if !tabs.is_empty() {
-                    TabStrip { session, tabs: tabs.clone(), in_control, opening }
                 }
                 div { class: if active && shot.is_some() { "focus-view has-shot" } else { "focus-view" },
                     if active && shot.is_some() {
                         div {
-                            id: "dock-stage",
-                            class: if in_control { "dock-stage control" } else { "dock-stage" },
+                            id: "focus-stage",
+                            class: if in_control { "dock-stage taking-control control" } else { "dock-stage" },
                             tabindex: if in_control { 0 } else { -1 },
                             "data-control": if in_control { "user" } else { "bot" },
                             "aria-label": if in_control { "Live page. You are in control: click, scroll and type here." } else { "Live page" },
                             img {
-                                id: "dock-shot",
+                                id: "focus-shot",
                                 class: "dock-shot",
                                 alt: "Live view of the page",
                                 draggable: false,
@@ -897,6 +927,12 @@ fn FocusView(session: Signal<Session>, overlay: Signal<Overlay>, id: String) -> 
                             h2 { class: "empty-title", "This browser is closed" }
                             p { class: "empty-text", "Go back to see the ones that are still open." }
                         }
+                    }
+                }
+                if let Some(feedback) = autofill_feedback {
+                    div { class: "vault-notice dock-autofill-notice", role: "status",
+                        Icon { name: "key", size: 14 }
+                        span { "{feedback}" }
                     }
                 }
                 if let Some(message) = error {
@@ -983,5 +1019,24 @@ mod tests {
     fn the_pill_names_who_is_driving() {
         assert_eq!(controller_pill(BrowserController::Bot).1, "Bot is driving");
         assert_eq!(controller_pill(BrowserController::User).1, "You're driving");
+    }
+
+    #[test]
+    fn tab_label_prefers_title_then_host() {
+        let titled = BrowserTab {
+            id: "t1".into(),
+            url: "https://example.com/docs".into(),
+            title: "Example Docs".into(),
+            active: true,
+        };
+        assert_eq!(tab_label(&titled), "Example Docs");
+
+        let untitled = BrowserTab {
+            id: "t2".into(),
+            url: "https://www.github.com/login".into(),
+            title: "   ".into(),
+            active: false,
+        };
+        assert_eq!(tab_label(&untitled), "github.com");
     }
 }
