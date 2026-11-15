@@ -17,6 +17,8 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
+use tower_http::compression::CompressionLayer;
+use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 use tracing::warn;
@@ -575,6 +577,7 @@ pub fn router(state: ApiState) -> Router {
             delete(revoke_standing_grant_endpoint),
         )
         .route("/v1/events", get(events))
+        .route("/v1/events/head", get(events_head))
         .route("/v1/audit", get(audit))
         .route("/v1/artifacts/{hash}", get(artifact))
         .route("/v1/artifacts/{hash}/preview", get(artifact_preview))
@@ -655,6 +658,11 @@ pub fn router(state: ApiState) -> Router {
         .merge(public_auth)
         .merge(protected)
         .layer(TraceLayer::new_for_http())
+        // gzip for JSON lists and history. A compressor buffers, so the live
+        // event stream must stay out of it.
+        .layer(CompressionLayer::new().gzip(true).compress_when(
+            DefaultPredicate::new().and(NotForContentType::const_new("text/event-stream")),
+        ))
         .with_state(shared)
 }
 
@@ -796,6 +804,7 @@ async fn authorize(
             if let Err(error) = state.store.touch_device_token(&record.id, now) {
                 warn!(%error, "device token last-used update failed");
             }
+            slide_session(&state, &record, now);
             request.extensions_mut().insert(ActingUser {
                 id: user.id,
                 role: user.role,
@@ -809,6 +818,26 @@ async fn authorize(
             warn!(%error, "device token lookup failed");
             unauthorized()
         }
+    }
+}
+
+/// Sliding renewal: a sign-in session that is past half of its lifetime is
+/// extended to a full lifetime from now, so an active device never has to sign
+/// in again. Only `session` tokens slide; operator tokens keep the expiry they
+/// were minted with.
+fn slide_session(state: &ApiState, record: &crate::store::DeviceToken, now: DateTime<Utc>) {
+    if record.label != Store::SESSION_LABEL {
+        return;
+    }
+    let Some(expires) = record.expires_at else {
+        return;
+    };
+    let ttl = chrono::Duration::hours(state.config.auth.session_ttl_hours as i64);
+    if expires - now >= ttl / 2 {
+        return;
+    }
+    if let Err(error) = state.store.extend_device_token(&record.id, now + ttl) {
+        warn!(%error, "session renewal failed");
     }
 }
 
@@ -892,6 +921,10 @@ async fn rate_limit(State(state): State<Arc<ApiState>>, request: Request, next: 
 /// Cheap idempotent polling reads the desktop repeats every few seconds.
 /// They get their own bucket so polling can never starve real actions.
 fn is_poll_request(method: &axum::http::Method, path: &str) -> bool {
+    // The desktop's folder agent re-issues this long poll continuously.
+    if method == axum::http::Method::POST && path == "/v1/local/poll" {
+        return true;
+    }
     if method != axum::http::Method::GET {
         return false;
     }
@@ -903,6 +936,7 @@ fn is_poll_request(method: &axum::http::Method, path: &str) -> bool {
             | "/v1/browser/sessions"
             | "/v1/browser/profiles"
             | "/v1/events"
+            | "/v1/events/head"
             | "/v1/approvals"
     ) || (path.starts_with("/v1/browser/sessions/") && path.ends_with("/screenshot"))
         || path

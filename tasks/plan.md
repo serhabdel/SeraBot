@@ -149,3 +149,13 @@ Checkpoint: isolation suite green; full workspace test green.
 - Envelope: `chacha20poly1305` AEAD; master key file 0600; per-user DEK.
 - No unscoped store path for user-owned rows — enforced by method
   signatures, not runtime checks.
+
+## Status after 0.47.0 (hardening follow-up, 0.48.0)
+
+Phases 1-6 shipped; releases 0.39-0.47 added desktop/mobile UX, marketplace
+base (`RUNTIME_CALLS_PLUGINS = true` for live `http` MCP plugins), OAuth
+wave 8, vault providers, workflow studio, and the `jobfinder` bot. 0.48.0
+hardens logging (`[logging]`, noisy-crate caps), rejects expired approvals at
+decision time, and adds negative isolation/approval tests. Future releases
+should split server/security changes from UI churn and add wrong-user,
+missing-approval and stale-approval tests alongside each new surface.

@@ -4,6 +4,8 @@ use super::*;
 #[serde(deny_unknown_fields)]
 pub(super) struct HistoryQuery {
     limit: Option<usize>,
+    /// A message id: return only the page of rows older than it.
+    before: Option<String>,
 }
 
 pub(super) async fn conversation_messages(
@@ -13,11 +15,21 @@ pub(super) async fn conversation_messages(
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&id)?;
-    let visible = state.store.list_visible_messages(
+    let page = query.limit.unwrap_or(100).clamp(1, 200);
+    if let Some(before) = query.before.as_deref() {
+        validate_message_cursor(before)?;
+    }
+    // One extra row says whether older messages exist.
+    let mut visible = state.store.list_visible_messages_before(
         &user.id,
         &id,
-        query.limit.unwrap_or(100).clamp(1, 200),
+        query.before.as_deref(),
+        page + 1,
     )?;
+    let has_more = visible.len() > page;
+    if has_more {
+        visible.drain(..visible.len() - page);
+    }
     // Attachment chips for the user messages of these turns (own rows only).
     let turn_ids = visible
         .iter()
@@ -81,9 +93,23 @@ pub(super) async fn conversation_messages(
             body
         })
         .collect::<Vec<_>>();
-    // Opening the thread is the acting user reading it.
-    state.store.mark_conversation_read(&user.id, &id)?;
-    Ok(Json(json!({"messages": messages})))
+    // Opening the thread is the acting user reading it; paging back is not.
+    if query.before.is_none() {
+        state.store.mark_conversation_read(&user.id, &id)?;
+    }
+    Ok(Json(json!({"messages": messages, "has_more": has_more})))
+}
+
+fn validate_message_cursor(before: &str) -> Result<()> {
+    if before.is_empty()
+        || before.len() > 64
+        || !before
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(SeraError::Validation("invalid message cursor".into()));
+    }
+    Ok(())
 }
 
 /// Team rejections must be HTTP 400 with the offending value named, so they do

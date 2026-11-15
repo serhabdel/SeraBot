@@ -7156,3 +7156,100 @@ html[data-reduce-transparency="true"] .chat-header {
   letter-spacing: 0.02em;
 }
 
+/* ------------------------------------------------------------------------
+   Chat view: long transcripts, load failures, paging, announcements.
+   ------------------------------------------------------------------------ */
+
+/* Rows far from the viewport skip layout and paint. The newest reply and a
+   row that is still animating in are left out so streaming and the pin to
+   the bottom measure real heights. */
+.messages > .msg:not(.last-reply):not(.msg-enter) {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 96px;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* The transcript could not be loaded: one calm panel with Retry. */
+.history-failed {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 40px 16px;
+  text-align: center;
+  color: var(--label-2);
+}
+
+.history-failed-title {
+  margin: 0;
+  font-size: var(--fs-body-1, 15px);
+  font-weight: 600;
+  color: var(--label-1);
+}
+
+.history-failed-text {
+  margin: 0;
+  max-width: 44ch;
+  font-size: var(--fs-body-2);
+}
+
+.load-earlier-row {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 0;
+}
+
+.load-earlier-error {
+  font-size: var(--fs-caption);
+  color: var(--danger);
+}
+
+.activity-more {
+  margin: 4px 0 0;
+  font-size: var(--fs-caption);
+  color: var(--label-3);
+}
+
+/* First-time Auto-approve confirmation, anchored under its button. */
+.yolo-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+.yolo-confirm {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 30;
+  width: min(320px, 80vw);
+  padding: 12px;
+  border-radius: var(--r-md);
+  background: var(--surface-1, var(--surface-2));
+  border: 1px solid var(--warn);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+}
+
+.yolo-confirm-text {
+  margin: 0 0 10px;
+  font-size: var(--fs-body-2);
+  color: var(--label-1);
+}
+
+.yolo-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}

@@ -22,17 +22,25 @@ pub enum Tab {
     Installed,
     /// The plugin catalogue.
     Marketplace,
+    /// Every shipped bot, with add, switch and remove for the owner's team.
+    Bots,
     /// Composio's apps, with its key first when there is none.
     Composio,
 }
 
 impl Tab {
-    pub const ALL: [Self; 3] = [Self::Installed, Self::Marketplace, Self::Composio];
+    pub const ALL: [Self; 4] = [
+        Self::Installed,
+        Self::Marketplace,
+        Self::Bots,
+        Self::Composio,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Installed => "Installed",
             Self::Marketplace => "Marketplace",
+            Self::Bots => "Bots",
             Self::Composio => "Composio",
         }
     }
@@ -369,7 +377,7 @@ mod tests {
     fn each_tab_has_a_label_and_the_installed_tab_comes_first() {
         assert_eq!(Tab::default(), Tab::Installed);
         let labels: Vec<_> = Tab::ALL.iter().map(|tab| tab.label()).collect();
-        assert_eq!(labels, ["Installed", "Marketplace", "Composio"]);
+        assert_eq!(labels, ["Installed", "Marketplace", "Bots", "Composio"]);
     }
 
     #[test]

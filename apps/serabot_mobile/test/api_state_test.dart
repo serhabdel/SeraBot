@@ -19,9 +19,12 @@ http.Response json(Object body, [int status = 200]) =>
 ApiClient clientFor(
   Future<http.Response> Function(http.Request) handler, {
   void Function()? onUnauthorized,
+  List<Duration> retries = const [],
 }) =>
     ApiClient.connect('https://example.com', token,
-        httpClient: MockClient(handler), onUnauthorized: onUnauthorized);
+        httpClient: MockClient(handler),
+        onUnauthorized: onUnauthorized,
+        getRetryDelays: retries);
 
 Map<String, dynamic> conv(String id, {String kind = 'direct', int unread = 0}) => {
       'id': id,
@@ -308,6 +311,172 @@ void main() {
   test('conversationTraces returns null on 404', () async {
     final c = clientFor((r) async => json({}, 404));
     expect(await c.conversationTraces('dir:main'), isNull);
+  });
+
+  group('link resilience', () {
+    test('a fresh event stream starts at the newest event and reports 200', () async {
+      var opened = 0;
+      final c = ApiClient.connect('https://example.com', token,
+          httpClient: MockClient.streaming((req, body) async {
+        expect(req.url.queryParameters['after'], 'latest');
+        return http.StreamedResponse(const Stream.empty(), 200);
+      }));
+      await c.events(onOpen: () => opened++).toList();
+      expect(opened, 1);
+    });
+
+    test('a silent event stream is dropped by the idle watchdog', () async {
+      final never = StreamController<List<int>>();
+      final c = ApiClient.connect('https://example.com', token,
+          httpClient: MockClient.streaming(
+              (req, body) async => http.StreamedResponse(never.stream, 200)));
+      await expectLater(
+        c.events(after: 3, idleTimeout: const Duration(milliseconds: 80)).toList(),
+        throwsA(isA<ApiException>()
+            .having((e) => e.kind, 'kind', ApiErrorKind.transport)),
+      );
+      await never.close();
+    });
+
+    test('a single 401 is asked again before the session is dropped', () async {
+      var calls = 0;
+      var out = 0;
+      final c = clientFor((r) async {
+        calls++;
+        return calls == 1 ? json({}, 401) : json({'ok': true});
+      }, onUnauthorized: () => out++);
+      await c.health();
+      expect(calls, 2);
+      expect(out, 0);
+    });
+
+    test('reads are retried after a drop or 503, writes are not', () async {
+      var calls = 0;
+      final c = clientFor((r) async {
+        calls++;
+        if (calls == 1) {
+          throw http.ClientException('reset');
+        }
+        if (calls == 2) {
+          return http.Response('', 503, headers: {'retry-after': '0'});
+        }
+        return json({'ok': true});
+      }, retries: const [Duration.zero, Duration.zero]);
+      await c.health();
+      expect(calls, 3);
+
+      var posts = 0;
+      final w = clientFor((r) async {
+        posts++;
+        return http.Response('', 503);
+      }, retries: const [Duration.zero, Duration.zero]);
+      await expectLater(w.logout(), throwsA(isA<ApiException>()));
+      expect(posts, 1);
+    });
+
+    test('a long Retry-After is reported, not waited out', () async {
+      var calls = 0;
+      final c = clientFor((r) async {
+        calls++;
+        return http.Response('', 429, headers: {'retry-after': '42'});
+      }, retries: const [Duration.zero]);
+      await expectLater(
+        c.health(),
+        throwsA(isA<ApiException>()
+            .having((e) => e.retryAfter, 'retryAfter', const Duration(seconds: 42))
+            .having((e) => e.messageForUser(), 'message', contains('42 seconds'))),
+      );
+      expect(calls, 1);
+    });
+
+    test('jitter stays within twenty percent and Retry-After parses', () {
+      const base = Duration(seconds: 10);
+      expect(jittered(base, 0), const Duration(seconds: 8));
+      expect(jittered(base, 1), const Duration(seconds: 12));
+      expect(jittered(base, 0.5), base);
+      expect(parseRetryAfter('7'), const Duration(seconds: 7));
+      expect(parseRetryAfter('soon'), isNull);
+      expect(parseRetryAfter('-1'), isNull);
+      expect(parseRetryAfter(null), isNull);
+    });
+
+    test('pause closes the live flag and resume catches up once', () async {
+      var lists = 0;
+      final c = clientFor((r) async {
+        if (r.url.path == '/v1/conversations') {
+          lists++;
+          return json({'conversations': [conv('dir:a')]});
+        }
+        if (r.url.path == '/v1/approvals') {
+          return json({'approvals': []});
+        }
+        return json({}, 404);
+      });
+      final app = AppState(c);
+      app.live = true;
+      final seen = <String>[];
+      final sub = app.events.listen((e) => seen.add(e.kind));
+      app.pause();
+      expect(app.foreground, isFalse);
+      expect(app.live, isFalse);
+      app.resume();
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(app.foreground, isTrue);
+      expect(lists, 1);
+      expect(seen, ['resume']);
+      app.resume();
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(lists, 1, reason: 'resume without a pause does nothing');
+      await sub.cancel();
+      app.dispose();
+    });
+
+    test('a running turn is polled slowly while events are live', () async {
+      var polls = 0;
+      final c = clientFor((r) async {
+        if (r.url.path.startsWith('/v1/tasks/')) {
+          polls++;
+          return json({
+            'task': {
+              'id': 't1',
+              'kind': 'turn',
+              'bot': 'main',
+              'status': 'running',
+              'attempts': 1,
+              'created_at': 'a',
+              'run_after': 'a',
+            }
+          });
+        }
+        return json({}, 404);
+      });
+      final app = AppState(c);
+      app.live = true;
+      final chat = ChatController('dir:main', c, app,
+          pollInterval: const Duration(milliseconds: 10),
+          livePollInterval: const Duration(seconds: 30));
+      chat.runningTaskId = 't1';
+      chat.startPollForTest();
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+      expect(polls, 0, reason: 'live stream: no 2 s polling');
+      app.live = false;
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+      expect(polls, greaterThan(0), reason: 'stream down: poll resumes');
+      chat.dispose();
+      app.dispose();
+    });
+
+    test('a reload that finds the same rows keeps the list', () {
+      final a = ChatMessage(
+          id: 'm1', role: MessageRole.user, content: 'hi', createdAt: 'x');
+      final b = ChatMessage(
+          id: 'm1', role: MessageRole.user, content: 'hi', createdAt: 'x');
+      final changed = ChatMessage(
+          id: 'm1', role: MessageRole.user, content: 'hi!', createdAt: 'x');
+      expect(sameMessages([a], [b]), isTrue);
+      expect(sameMessages([a], [changed]), isFalse);
+      expect(sameMessages([a], [a, b]), isFalse);
+    });
   });
 }
 

@@ -13,7 +13,7 @@ ui-check = ["dep:dioxus"]
 [dependencies]
 base64 = "0.22"
 dioxus = { version = "0.7", optional = true, default-features = false, features = ["macro", "html", "hooks", "signals", "document"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json", "gzip"] }
 secrecy = "0.8"
 # This PC card: the app's own memory/CPU and free disk space. System and disk
 # readers only (no network, component or user lists).

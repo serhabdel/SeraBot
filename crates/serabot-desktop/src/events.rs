@@ -15,7 +15,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use url::Url;
 
@@ -24,6 +24,10 @@ const READ_CHUNK: usize = 8 * 1024;
 const MAX_SSE_BUFFER: usize = 256 * 1024;
 const CONNECT_TIMEOUT: Duration = crate::net_policy::CONNECT_TIMEOUT;
 const STOP_POLL: Duration = Duration::from_millis(200);
+/// The server sends a keep-alive comment every 10 s. Four missed ones mean the
+/// socket is half-open (sleep/resume, Wi-Fi switch, NAT drop) and must be
+/// replaced; a blocked read would otherwise never report it.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(40);
 const BACKOFF: [Duration; 5] = [
     Duration::from_secs(1),
     Duration::from_secs(2),
@@ -42,7 +46,8 @@ impl EventStream {
     /// Spawns one detached thread that streams events from `credentials.endpoint`.
     ///
     /// `wake` runs after every queued update so the UI can request a repaint.
-    /// `after` is the resume cursor; only positive cursors are sent.
+    /// `after` is the resume cursor; without one the stream starts at the
+    /// server's newest event (`after=latest`).
     pub fn start(credentials: Arc<Credentials>, after: i64, wake: Box<dyn Fn() + Send>) -> Self {
         let (sender, receiver) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
@@ -220,6 +225,7 @@ fn run(
     };
     let mut cursor = after;
     let mut backoff = 0;
+    let mut rejected_once = false;
     while !stop.load(Ordering::SeqCst) {
         match stream_once(
             &client,
@@ -229,7 +235,16 @@ fn run(
             &*wake,
             &stop,
             &mut backoff,
+            IDLE_TIMEOUT,
         ) {
+            StreamEnd::Unauthorized if !rejected_once => {
+                // A proxy or auth hiccup can answer 401 once. Look again
+                // before ending the session for good.
+                rejected_once = true;
+                if !sleep_backoff(&stop, crate::net_policy::jitter(Duration::from_secs(2))) {
+                    return;
+                }
+            }
             StreamEnd::Unauthorized => {
                 emit(&sender, &*wake, EventUpdate::Unauthorized);
                 stop.store(true, Ordering::SeqCst);
@@ -240,7 +255,8 @@ fn run(
                 if !emit(&sender, &*wake, EventUpdate::Disconnected) {
                     return;
                 }
-                if !sleep_backoff(&stop, BACKOFF[backoff.min(BACKOFF.len() - 1)]) {
+                let pause = crate::net_policy::jitter(BACKOFF[backoff.min(BACKOFF.len() - 1)]);
+                if !sleep_backoff(&stop, pause) {
                     return;
                 }
                 backoff = (backoff + 1).min(BACKOFF.len() - 1);
@@ -249,6 +265,7 @@ fn run(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stream_once(
     client: &Client,
     credentials: &Credentials,
@@ -257,6 +274,7 @@ fn stream_once(
     wake: &(dyn Fn() + Send),
     stop: &AtomicBool,
     backoff: &mut usize,
+    idle: Duration,
 ) -> StreamEnd {
     let Some(url) = events_url(&credentials.endpoint, *cursor) else {
         return StreamEnd::Disconnected;
@@ -280,24 +298,59 @@ fn stream_once(
         return StreamEnd::ReceiverGone;
     }
 
-    let mut reader = BufReader::with_capacity(READ_CHUNK, response);
+    // A blocking read cannot time out, so a helper thread does the reading and
+    // this loop watches the clock. A stalled helper ends when its socket dies
+    // (TCP keep-alive is on) or when this receiver is dropped.
+    let (chunks, incoming) = mpsc::sync_channel::<ReadMsg>(16);
+    let reader_stop = Arc::new(AtomicBool::new(false));
+    let helper_stop = Arc::clone(&reader_stop);
+    let spawned = std::thread::Builder::new()
+        .name("serabot-events-read".into())
+        .spawn(move || {
+            let mut reader = BufReader::with_capacity(READ_CHUNK, response);
+            let mut chunk = [0u8; READ_CHUNK];
+            while !helper_stop.load(Ordering::SeqCst) {
+                let message = match reader.read(&mut chunk) {
+                    Ok(0) => ReadMsg::Eof,
+                    Ok(read) => ReadMsg::Data(chunk[..read].to_vec()),
+                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => ReadMsg::Eof,
+                };
+                let last = !matches!(message, ReadMsg::Data(_));
+                if chunks.send(message).is_err() || last {
+                    return;
+                }
+            }
+        });
+    if spawned.is_err() {
+        return StreamEnd::Disconnected;
+    }
     let mut decoder = Utf8Decoder::new();
     let mut parser = SseParser::new();
-    let mut chunk = [0u8; READ_CHUNK];
-    loop {
+    let mut last_bytes = Instant::now();
+    let end = loop {
         if stop.load(Ordering::SeqCst) {
-            return StreamEnd::Stopped;
+            break StreamEnd::Stopped;
         }
-        match reader.read(&mut chunk) {
-            Ok(0) => return StreamEnd::Disconnected,
-            Ok(read) => {
+        let remaining = idle.saturating_sub(last_bytes.elapsed());
+        if remaining.is_zero() {
+            break StreamEnd::Disconnected;
+        }
+        match incoming.recv_timeout(remaining.min(STOP_POLL)) {
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) | Ok(ReadMsg::Eof) => {
+                break StreamEnd::Disconnected;
+            }
+            Ok(ReadMsg::Data(bytes)) => {
+                last_bytes = Instant::now();
                 // Only reset reconnect backoff once the peer delivers bytes, so an
                 // immediate HTTP 200 + EOF loop keeps backing off.
                 *backoff = 0;
-                let text = decoder.push(&chunk[..read]);
+                let text = decoder.push(&bytes);
                 if text.is_empty() {
                     continue;
                 }
+                let mut gone = false;
                 for frame in parser.feed(&text) {
                     let Some(id) = frame.id else {
                         continue;
@@ -313,14 +366,24 @@ fn stream_once(
                             payload,
                         },
                     ) {
-                        return StreamEnd::ReceiverGone;
+                        gone = true;
+                        break;
                     }
                 }
+                if gone {
+                    break StreamEnd::ReceiverGone;
+                }
             }
-            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-            Err(_) => return StreamEnd::Disconnected,
         }
-    }
+    };
+    reader_stop.store(true, Ordering::SeqCst);
+    end
+}
+
+/// What the reader thread hands to the watchdog loop.
+enum ReadMsg {
+    Data(Vec<u8>),
+    Eof,
 }
 
 fn events_url(endpoint: &Url, after: i64) -> Option<Url> {
@@ -332,6 +395,10 @@ fn events_url(endpoint: &Url, after: i64) -> Option<Url> {
     let mut query = url.query_pairs_mut();
     if after > 0 {
         query.append_pair("after", &after.to_string());
+    } else {
+        // A fresh start begins at the newest event; current state comes from
+        // the normal REST loads, not from replaying retained history.
+        query.append_pair("after", "latest");
     }
     query.append_pair("limit", LIMIT);
     drop(query);
@@ -344,6 +411,8 @@ fn build_client(endpoint: &Url) -> Option<Client> {
         .no_proxy()
         .retry(reqwest::retry::never())
         .connect_timeout(CONNECT_TIMEOUT)
+        // Lets the OS notice a dead peer so a stalled reader thread ends.
+        .tcp_keepalive(Duration::from_secs(30))
         // reqwest defaults to a 30 s total timeout; an SSE stream is long-lived.
         .timeout(None::<Duration>);
     if endpoint.host_str() == Some("localhost") {
@@ -594,8 +663,8 @@ mod tests {
                     "{request}"
                 );
                 if index == 0 {
-                    assert!(request.contains("GET /v1/events?limit=100 "), "{request}");
-                    assert!(!request.contains("after="), "{request}");
+                    assert!(request.contains("after=latest"), "{request}");
+                    assert!(request.contains("limit=100"), "{request}");
                 } else {
                     assert!(request.contains("after=2"), "{request}");
                     assert!(request.contains("limit=100"), "{request}");
@@ -677,21 +746,24 @@ mod tests {
             crate::validate_endpoint(&format!("http://{}", listener.local_addr().unwrap()))
                 .unwrap();
         let token = "synthetic-unauthorized-token-0123456789";
+        // The first 401 is re-checked once; the second ends the session.
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let request = read_request(&mut stream);
-            assert!(
-                request
-                    .to_ascii_lowercase()
-                    .contains("authorization: bearer synthetic-unauthorized-token-0123456789\r\n"),
-                "{request}"
-            );
-            stream
-                .write_all(
-                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .unwrap();
-            stream.flush().unwrap();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                assert!(
+                    request.to_ascii_lowercase().contains(
+                        "authorization: bearer synthetic-unauthorized-token-0123456789\r\n"
+                    ),
+                    "{request}"
+                );
+                stream
+                    .write_all(
+                        b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                stream.flush().unwrap();
+            }
         });
 
         let credentials = Arc::new(Credentials {
@@ -699,7 +771,7 @@ mod tests {
             token: secrecy::SecretString::new(token.into()),
         });
         let stream = EventStream::start(credentials, 0, Box::new(|| {}));
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(8);
         let mut updates = Vec::new();
         while Instant::now() < deadline {
             while let Some(update) = stream.try_recv() {
@@ -770,10 +842,63 @@ mod tests {
             &|| {},
             &stop,
             &mut backoff,
+            IDLE_TIMEOUT,
         );
         server.join().unwrap();
         assert!(matches!(end, StreamEnd::Disconnected));
         assert_eq!(backoff, 3);
+    }
+
+    #[test]
+    fn a_silent_stream_is_dropped_by_the_idle_watchdog() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint =
+            crate::validate_endpoint(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
+        let (release, held) = mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK
+Content-Type: text/event-stream
+
+: hello
+
+",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+            // Hold the socket open without sending anything, like a dead NAT.
+            let _ = held.recv_timeout(Duration::from_secs(10));
+        });
+        let credentials = Credentials {
+            endpoint,
+            token: secrecy::SecretString::new("synthetic-idle-token-0123456789abcdef".into()),
+        };
+        let client = build_client(&credentials.endpoint).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let stop = AtomicBool::new(false);
+        let mut cursor = 0;
+        let mut backoff = 0;
+        let started = Instant::now();
+        let end = stream_once(
+            &client,
+            &credentials,
+            &mut cursor,
+            &tx,
+            &|| {},
+            &stop,
+            &mut backoff,
+            Duration::from_millis(600),
+        );
+        let waited = started.elapsed();
+        let _ = release.send(());
+        server.join().unwrap();
+        assert!(matches!(end, StreamEnd::Disconnected));
+        assert!(waited < Duration::from_secs(5), "{waited:?}");
+        assert_eq!(rx.try_recv().ok(), Some(EventUpdate::Connected));
     }
 
     fn read_request(stream: &mut TcpStream) -> String {

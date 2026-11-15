@@ -27,6 +27,8 @@ pub enum OperationKind {
     Me,
     Catalog,
     History,
+    /// "Load earlier": one page of rows older than the first one shown.
+    HistoryOlder,
     Apply,
     Submit,
     Task,
@@ -146,6 +148,8 @@ pub enum Operation {
     Me,
     Catalog,
     History,
+    /// The page of messages older than this message id.
+    HistoryBefore(String),
     Apply(Selection),
     Submit(Zeroizing<String>),
     /// A message with uploaded attachment ids (text may be empty).
@@ -525,6 +529,7 @@ impl Operation {
             Self::Me => OperationKind::Me,
             Self::Catalog => OperationKind::Catalog,
             Self::History => OperationKind::History,
+            Self::HistoryBefore(_) => OperationKind::HistoryOlder,
             Self::Apply(_) => OperationKind::Apply,
             Self::Submit(_) | Self::SubmitWith { .. } => OperationKind::Submit,
             Self::UploadAttachment { .. } => OperationKind::Attach,
@@ -639,6 +644,8 @@ pub enum Reply {
     Me(AuthUser),
     Catalog(Catalog),
     History(History),
+    /// A page of older messages, to be put in front of the transcript.
+    HistoryOlder(History),
     Selection(Selection),
     Task(Task),
     Approvals(Vec<Approval>),
@@ -987,6 +994,9 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         Operation::Me => client.me().map(Reply::Me),
         Operation::Catalog => client.models(conversation).map(Reply::Catalog),
         Operation::History => client.history(conversation).map(Reply::History),
+        Operation::HistoryBefore(before) => client
+            .history_before(conversation, before)
+            .map(Reply::HistoryOlder),
         Operation::Apply(selection) => client.select(conversation, selection).map(Reply::Selection),
         Operation::Submit(text) => client.submit(conversation, text).map(Reply::Task),
         Operation::SubmitWith { text, attachments } => client

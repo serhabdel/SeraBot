@@ -1,19 +1,37 @@
 ﻿import 'dart:async';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
 
 import 'api_client.dart';
 import 'chat_models.dart';
 import 'models.dart';
 
+const _defaultIdle = eventIdleTimeout;
+
 /// Per-user data shared by every screen: the conversation list (same
 /// `GET /v1/conversations` as the desktop, same order), bots, the pending
 /// approval count and the `GET /v1/events` stream that keeps them current.
-class AppState extends ChangeNotifier {
-  AppState(this.client, {this.eventDebounce = const Duration(milliseconds: 400)});
+/// The stream follows the app lifecycle: it closes when the app goes to the
+/// background and reconnects, with a catch-up load, when it returns. A change
+/// of network ([networkChanges]) reconnects at once instead of waiting out the
+/// backoff.
+class AppState extends ChangeNotifier with WidgetsBindingObserver {
+  AppState(
+    this.client, {
+    this.eventDebounce = const Duration(milliseconds: 400),
+    this.networkChanges,
+    this.eventIdleTimeout = _defaultIdle,
+  });
 
   final ApiClient client;
   final Duration eventDebounce;
+
+  /// Fires when the device's network changes (Wi-Fi to cellular, back online).
+  final Stream<void>? networkChanges;
+
+  /// Silence on the event stream that counts as a dead connection.
+  final Duration eventIdleTimeout;
 
   List<ConversationSummary> conversations = const [];
   List<BotSummary> bots = const [];
@@ -30,6 +48,11 @@ class AppState extends ChangeNotifier {
   int get cursor => _cursor;
   bool _disposed = false;
   bool _running = false;
+  bool _paused = false;
+  bool _observing = false;
+  StreamSubscription<void>? _networkSub;
+  StreamSubscription<ServerEvent>? _eventSub;
+  Completer<void>? _wake;
   Timer? _debounce;
   Timer? _approvalDebounce;
 
@@ -45,7 +68,82 @@ class AppState extends ChangeNotifier {
     refreshBots();
     refreshApprovals();
     if (events) {
+      WidgetsBinding.instance.addObserver(this);
+      _observing = true;
+      _networkSub = networkChanges?.listen((_) => reconnectNow());
       _loop();
+    }
+  }
+
+  /// True while the app is in the foreground.
+  bool get foreground => !_paused;
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    switch (state) {
+      case AppLifecycleState.resumed:
+        resume();
+      case AppLifecycleState.paused:
+      case AppLifecycleState.hidden:
+      case AppLifecycleState.detached:
+        pause();
+      case AppLifecycleState.inactive:
+        break;
+    }
+  }
+
+  /// Background: close the stream so a sleeping phone holds no socket and no
+  /// timers. The cursor is kept for the catch-up on [resume].
+  void pause() {
+    if (_paused) {
+      return;
+    }
+    _paused = true;
+    _debounce?.cancel();
+    _approvalDebounce?.cancel();
+    _eventSub?.cancel();
+    _eventSub = null;
+    _poke();
+    if (live) {
+      live = false;
+      _notify();
+    }
+  }
+
+  /// Foreground again: reconnect now with a fresh backoff, then reload what
+  /// may have changed while the stream was closed.
+  void resume() {
+    if (!_paused) {
+      return;
+    }
+    _paused = false;
+    _resetBackoff = true;
+    _poke();
+    refreshConversations();
+    refreshApprovals();
+    // Open chats reload their transcript and task state on this synthetic event.
+    if (!_events.isClosed) {
+      _events.add(const ServerEvent(0, 'resume', {}));
+    }
+  }
+
+  /// The network changed: drop the current connection and dial again now.
+  void reconnectNow() {
+    if (_paused || _disposed) {
+      return;
+    }
+    _eventSub?.cancel();
+    _eventSub = null;
+    _resetBackoff = true;
+    _poke();
+  }
+
+  bool _resetBackoff = false;
+
+  void _poke() {
+    final wake = _wake;
+    if (wake != null && !wake.isCompleted) {
+      wake.complete();
     }
   }
 
@@ -172,38 +270,85 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  /// Waits up to [d], or until [_poke] (pause, resume, network change, stop).
+  Future<void> _sleep(Duration d) async {
+    final wake = Completer<void>();
+    _wake = wake;
+    final timer = Timer(d, () {
+      if (!wake.isCompleted) {
+        wake.complete();
+      }
+    });
+    await wake.future;
+    timer.cancel();
+  }
+
   Future<void> _loop() async {
     var attempt = 0;
     const backoff = [1, 2, 5, 10, 30];
     while (!_disposed) {
-      try {
-        await for (final e in client.events(after: _cursor)) {
-          if (_disposed) {
-            return;
-          }
-          if (!live) {
-            live = true;
-            _notify();
-          }
-          attempt = 0;
-          handleEvent(e);
-        }
-      } on ApiException catch (e) {
-        if (e.kind == ApiErrorKind.http && e.statusCode == 401) {
-          return;
-        }
-      } catch (_) {
-        // fall through to reconnect
+      if (_paused) {
+        await _sleep(const Duration(hours: 1));
+        continue;
       }
-      if (_disposed) {
+      if (_resetBackoff) {
+        _resetBackoff = false;
+        attempt = 0;
+      }
+      final wake = Completer<void>();
+      _wake = wake;
+      var unauthorized = false;
+      _eventSub = client
+          .events(
+            after: _cursor,
+            idleTimeout: eventIdleTimeout,
+            onOpen: () {
+              // HTTP 200: the link is up even if the stream is quiet.
+              attempt = 0;
+              if (!live) {
+                live = true;
+                _notify();
+              }
+            },
+          )
+          .listen(
+            (e) {
+              if (!_disposed) {
+                handleEvent(e);
+              }
+            },
+            onError: (Object e) {
+              if (e is ApiException &&
+                  e.kind == ApiErrorKind.http &&
+                  e.statusCode == 401) {
+                unauthorized = true;
+              }
+              if (!wake.isCompleted) {
+                wake.complete();
+              }
+            },
+            onDone: () {
+              if (!wake.isCompleted) {
+                wake.complete();
+              }
+            },
+            cancelOnError: true,
+          );
+      await wake.future;
+      await _eventSub?.cancel();
+      _eventSub = null;
+      if (_disposed || unauthorized) {
         return;
       }
       if (live) {
         live = false;
         _notify();
       }
-      await Future<void>.delayed(
-        Duration(seconds: backoff[attempt.clamp(0, backoff.length - 1)]),
+      if (_paused || _resetBackoff) {
+        continue;
+      }
+      await _sleep(
+        jittered(Duration(seconds: backoff[attempt.clamp(0, backoff.length - 1)])),
       );
       attempt++;
     }
@@ -218,6 +363,12 @@ class AppState extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    if (_observing) {
+      WidgetsBinding.instance.removeObserver(this);
+    }
+    _networkSub?.cancel();
+    _eventSub?.cancel();
+    _poke();
     _debounce?.cancel();
     _approvalDebounce?.cancel();
     _events.close();

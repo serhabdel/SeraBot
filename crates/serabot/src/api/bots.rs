@@ -235,11 +235,16 @@ pub(super) async fn bot_catalog(
                 "description": entry.description,
                 "role": entry.role,
                 "installed": entry.installed,
+                "enabled": entry.enabled,
                 "avatar_version": default_avatar_version(&entry.name),
             })
         })
         .collect::<Vec<_>>();
-    let body = json!({ "bots": bots });
+    let body = json!({
+        "bots": bots,
+        "templates_total": bots.len(),
+        "installed_total": bots.iter().filter(|bot| bot["installed"] == true).count(),
+    });
     state
         .runtime
         .scan_owner_output(&user.id, &body.to_string())?;
@@ -786,6 +791,9 @@ pub(super) async fn delete_bot(
     let mut candidate = state.runtime.fleet().candidates(&user.id)?;
     candidate.retain(|bot| bot.config.name != id);
     crate::fleet::FleetRegistry::validate_fleet(&candidate)?;
+    // A shipped bot stays removed (not re-seeded) until the owner re-adds it.
+    // Mark first so a failure here leaves the row intact instead of restoring it.
+    state.runtime.fleet().mark_removed(&user.id, &id)?;
     if !state.store.delete_bot(&user.id, &id)? {
         return Err(SeraError::NotFound(format!("bot {id}")));
     }

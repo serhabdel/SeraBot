@@ -20,6 +20,7 @@ class ChatController extends ChangeNotifier {
     this.client,
     this.app, {
     this.pollInterval = const Duration(seconds: 2),
+    this.livePollInterval = const Duration(seconds: 20),
   }) {
     _sub = app.events.listen(_onEvent);
   }
@@ -27,7 +28,13 @@ class ChatController extends ChangeNotifier {
   final String conversationId;
   final ApiClient client;
   final AppState app;
+
+  /// Task poll gap while the event stream is down.
   final Duration pollInterval;
+
+  /// Safety poll gap while the event stream is up: events finish the turn, the
+  /// poll only covers a lost event.
+  final Duration livePollInterval;
 
   List<ChatMessage> messages = const [];
   final Activity activity = Activity();
@@ -48,6 +55,7 @@ class ChatController extends ChangeNotifier {
   ChatPlan? plan;
   String? runningTaskId;
   Timer? _poll;
+  DateTime _lastPoll = DateTime.fromMillisecondsSinceEpoch(0);
   StreamSubscription<ServerEvent>? _sub;
   bool _disposed = false;
 
@@ -264,6 +272,13 @@ class ChatController extends ChangeNotifier {
         if (e.conversationId == conversationId && !running) {
           unawaited(_reload());
         }
+      case 'resume':
+        // Back from the background: events may have been missed.
+        if (running) {
+          unawaited(_pollTask(force: true));
+        } else {
+          unawaited(_reload());
+        }
     }
   }
 
@@ -272,22 +287,41 @@ class ChatController extends ChangeNotifier {
     return v is String && v.isNotEmpty && v.length <= 300 ? v : null;
   }
 
+  /// Starts the task poll without a send. For tests.
+  @visibleForTesting
+  void startPollForTest() => _startPoll();
+
   void _startPoll() {
     _poll?.cancel();
-    _poll = Timer.periodic(pollInterval, (_) async {
-      final id = runningTaskId;
-      if (id == null || _disposed) {
+    _lastPoll = DateTime.now();
+    _poll = Timer.periodic(pollInterval, (_) => _pollTask());
+  }
+
+  /// One task check. Skipped in the background, and while the event stream is
+  /// live it only runs as a slow safety net. [force] is for a resume.
+  Future<void> _pollTask({bool force = false}) async {
+    final id = runningTaskId;
+    if (id == null || _disposed) {
+      return;
+    }
+    if (!force) {
+      if (!app.foreground) {
         return;
       }
-      try {
-        final t = await client.task(id);
-        if (t.status.terminal) {
-          _finish(failed: t.status == TaskStatus.failed);
-        }
-      } on ApiException {
-        // transient; try again next tick
+      final gap = app.live ? livePollInterval : pollInterval;
+      if (DateTime.now().difference(_lastPoll) < gap) {
+        return;
       }
-    });
+    }
+    _lastPoll = DateTime.now();
+    try {
+      final t = await client.task(id);
+      if (t.status.terminal && runningTaskId == id) {
+        _finish(failed: t.status == TaskStatus.failed);
+      }
+    } on ApiException {
+      // transient; try again next tick
+    }
   }
 
   Future<void> _finish({bool failed = false, String? detail}) async {
@@ -309,8 +343,13 @@ class ChatController extends ChangeNotifier {
 
   Future<void> _reload() async {
     try {
-      messages = await client.history(conversationId);
-      _notify();
+      final next = await client.history(conversationId);
+      // Keep the list the screen already shows when nothing changed, so a
+      // reload that finds the same rows does not rebuild the transcript.
+      if (!sameMessages(messages, next)) {
+        messages = next;
+        _notify();
+      }
     } on ApiException catch (e) {
       _fail(e);
       _notify();
@@ -330,4 +369,19 @@ class ChatController extends ChangeNotifier {
     _sub?.cancel();
     super.dispose();
   }
+}
+
+/// True when [a] and [b] show the same rows in the same order.
+bool sameMessages(List<ChatMessage> a, List<ChatMessage> b) {
+  if (a.length != b.length) {
+    return false;
+  }
+  for (var i = 0; i < a.length; i++) {
+    if (a[i].id != b[i].id ||
+        a[i].content != b[i].content ||
+        a[i].attachments.length != b[i].attachments.length) {
+      return false;
+    }
+  }
+  return true;
 }

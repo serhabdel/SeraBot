@@ -488,53 +488,13 @@ pub fn NewGroupSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Elem
     }
 }
 
-/// The chat that opens right after a bot is created.
-/// "Meet your team": every shipped bot, with "Add to my team" for the ones the
-/// owner does not have yet. Installed ones show a badge instead.
+/// "Meet your team": every shipped bot, with add, switch and remove for the
+/// owner's team. The same list is the Bots tab of the Integrations screen.
 #[component]
 pub fn MeetTeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
     let mut overlay = overlay;
     let mut query = use_signal(String::new);
-    let needle = query().trim().to_ascii_lowercase();
-    let (rows, total_count, loaded, installing, error) = {
-        let state = session.read();
-        let all_rows = meet_order(&state.state.shipped_bots)
-            .into_iter()
-            .map(|bot| {
-                let name = shipped_label(bot);
-                let letter = name
-                    .chars()
-                    .next()
-                    .map(|c| c.to_uppercase().to_string())
-                    .unwrap_or_else(|| "B".into());
-                (
-                    bot.id.clone(),
-                    name,
-                    letter,
-                    bot.role.clone(),
-                    bot.description.clone().unwrap_or_default(),
-                    bot.installed,
-                )
-            })
-            .collect::<Vec<_>>();
-        let total = all_rows.len();
-        let filtered = all_rows
-            .into_iter()
-            .filter(|(_, name, _, role, desc, _)| {
-                needle.is_empty()
-                    || name.to_ascii_lowercase().contains(&needle)
-                    || role.to_ascii_lowercase().contains(&needle)
-                    || desc.to_ascii_lowercase().contains(&needle)
-            })
-            .collect::<Vec<_>>();
-        (
-            filtered,
-            total,
-            state.state.shipped_loaded,
-            state.state.shipped_installing.clone(),
-            state.state.shipped_error.clone(),
-        )
-    };
+    let total_count = session.read().state.shipped_bots.len();
     rsx! {
         div { class: "scrim open", onclick: move |_| overlay.set(Overlay::None) }
         div {
@@ -568,68 +528,177 @@ pub fn MeetTeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Elem
                         oninput: move |e| query.set(e.value()),
                     }
                 }
-                if let Some(message) = error {
-                    div { class: "banner err", span { "{message}" } }
-                }
-                if !loaded {
-                    div { class: "row",
-                        span { class: "spinner", title: "Loading the team" }
-                        span { class: "hint", "Loading the team\u{2026}" }
+                ShippedList { session, query: query(), overlay: Some(overlay) }
+            }
+            div { class: "sheet-foot",
+                button { class: "btn ghost", r#type: "button", onclick: move |_| overlay.set(Overlay::None), "Done" }
+            }
+        }
+    }
+}
+
+/// Every shipped bot with the owner's state for it: "Add to my team" when not
+/// installed, otherwise switch on/off and remove (the orchestrator is
+/// required and has neither). Used by the sheet and the Bots tab.
+#[component]
+pub fn ShippedList(
+    session: Signal<Session>,
+    query: String,
+    overlay: Option<Signal<Overlay>>,
+) -> Element {
+    let mut confirming = use_signal(|| Option::<String>::None);
+    let needle = query.trim().to_ascii_lowercase();
+    let (rows, total_count, loaded, installing, error, busy) = {
+        let state = session.read();
+        let all_rows = meet_order(&state.state.shipped_bots)
+            .into_iter()
+            .map(|bot| {
+                let name = shipped_label(bot);
+                let letter = name
+                    .chars()
+                    .next()
+                    .map(|c| c.to_uppercase().to_string())
+                    .unwrap_or_else(|| "B".into());
+                (
+                    bot.id.clone(),
+                    name,
+                    letter,
+                    bot.role.clone(),
+                    bot.description.clone().unwrap_or_default(),
+                    bot.installed,
+                    bot.enabled,
+                )
+            })
+            .collect::<Vec<_>>();
+        let total = all_rows.len();
+        let filtered = all_rows
+            .into_iter()
+            .filter(|(_, name, _, role, desc, _, _)| {
+                needle.is_empty()
+                    || name.to_ascii_lowercase().contains(&needle)
+                    || role.to_ascii_lowercase().contains(&needle)
+                    || desc.to_ascii_lowercase().contains(&needle)
+            })
+            .collect::<Vec<_>>();
+        (
+            filtered,
+            total,
+            state.state.shipped_loaded,
+            state.state.shipped_installing.clone(),
+            state.state.shipped_error.clone(),
+            state.bot_settings.lifecycle_busy,
+        )
+    };
+    rsx! {
+        if let Some(message) = error {
+            div { class: "banner err", span { "{message}" } }
+        }
+        if !loaded {
+            div { class: "row",
+                span { class: "spinner", title: "Loading the team" }
+                span { class: "hint", "Loading the team\u{2026}" }
+            }
+        } else if total_count == 0 {
+            p { class: "hint", "No shipped bots are available on this server." }
+        } else if rows.is_empty() {
+            p { class: "hint", "No shipped bots match \"{query}\"." }
+        }
+        div { class: "roster",
+            for (id, name, letter, role, description, installed, enabled) in rows {
+                div { key: "{id}", class: "roster-row",
+                    span { class: "avatar lg bot", style: avatar_style(&id), "{letter}" }
+                    span { class: "meet-copy",
+                        span { class: "thread-title", "{name}" }
+                        span { class: "thread-meta", "{role}" }
+                        if !description.is_empty() {
+                            span { class: "hint meet-desc", "{description}" }
+                        }
                     }
-                } else if total_count == 0 {
-                    p { class: "hint", "No shipped bots are available on this server." }
-                } else if rows.is_empty() {
-                    p { class: "hint", "No shipped bots match \"{query}\"." }
-                }
-                div { class: "roster",
-                    for (id, name, letter, role, description, installed) in rows {
-                        div { key: "{id}", class: "roster-row",
-                            span { class: "avatar lg bot", style: avatar_style(&id), "{letter}" }
-                            span { class: "meet-copy",
-                                span { class: "thread-title", "{name}" }
-                                span { class: "thread-meta", "{role}" }
-                                if !description.is_empty() {
-                                    span { class: "hint meet-desc", "{description}" }
-                                }
+                    if installed {
+                        div { class: "row-actions",
+                            if !serabot_desktop::can_remove_bot(&id, &role) {
+                                span { class: "chip ok", "Required" }
+                            } else if enabled {
+                                span { class: "chip ok", "Enabled" }
+                            } else {
+                                span { class: "chip", "Disabled" }
                             }
-                            if installed {
-                                div { class: "row-actions",
-                                    span { class: "chip ok", "In your team" }
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                onclick: {
+                                    let id = id.clone();
+                                    move |_| {
+                                        if let Some(mut overlay) = overlay {
+                                            overlay.set(Overlay::None);
+                                        }
+                                        session.write().open_bot_chat(id.clone());
+                                    }
+                                },
+                                "Chat"
+                            }
+                            if serabot_desktop::can_remove_bot(&id, &role) {
+                                button {
+                                    class: "btn ghost sm",
+                                    r#type: "button",
+                                    disabled: busy,
+                                    onclick: {
+                                        let id = id.clone();
+                                        move |_| session.write().set_bot_enabled(id.clone(), !enabled)
+                                    },
+                                    if enabled { "Disable" } else { "Enable" }
+                                }
+                                if confirming().as_deref() == Some(id.as_str()) {
                                     button {
-                                        class: "btn ghost sm",
+                                        class: "btn danger sm",
                                         r#type: "button",
+                                        disabled: busy,
                                         onclick: {
                                             let id = id.clone();
                                             move |_| {
-                                                overlay.set(Overlay::None);
-                                                session.write().open_bot_chat(id.clone());
+                                                confirming.set(None);
+                                                session.write().remove_shipped_bot(id.clone());
                                             }
                                         },
-                                        "Chat"
+                                        "Confirm remove"
                                     }
-                                }
-                            } else {
-                                button {
-                                    class: "btn primary sm",
-                                    r#type: "button",
-                                    disabled: installing.is_some(),
-                                    onclick: {
-                                        let id = id.clone();
-                                        move |_| session.write().install_shipped_bot(id.clone())
-                                    },
-                                    if installing.as_deref() == Some(id.as_str()) {
-                                        "Adding\u{2026}"
-                                    } else {
-                                        "Add to my team"
+                                    button {
+                                        class: "btn ghost sm",
+                                        r#type: "button",
+                                        onclick: move |_| confirming.set(None),
+                                        "Cancel"
+                                    }
+                                } else {
+                                    button {
+                                        class: "btn ghost sm",
+                                        r#type: "button",
+                                        disabled: busy,
+                                        onclick: {
+                                            let id = id.clone();
+                                            move |_| confirming.set(Some(id.clone()))
+                                        },
+                                        "Remove"
                                     }
                                 }
                             }
                         }
+                    } else {
+                        button {
+                            class: "btn primary sm",
+                            r#type: "button",
+                            disabled: installing.is_some(),
+                            onclick: {
+                                let id = id.clone();
+                                move |_| session.write().install_shipped_bot(id.clone())
+                            },
+                            if installing.as_deref() == Some(id.as_str()) {
+                                "Adding\u{2026}"
+                            } else {
+                                "Add to my team"
+                            }
+                        }
                     }
                 }
-            }
-            div { class: "sheet-foot",
-                button { class: "btn ghost", r#type: "button", onclick: move |_| overlay.set(Overlay::None), "Done" }
             }
         }
     }

@@ -1082,6 +1082,14 @@ impl Gateway {
                 approval.state
             )));
         }
+        // The expiry sweep runs on a timer; a decision that arrives between
+        // the deadline and the next sweep must not revive the approval.
+        if approval.expires_at <= chrono::Utc::now() {
+            self.store.expire_approvals()?;
+            return Err(SeraError::InvalidState(
+                "approval expired; ask again".into(),
+            ));
+        }
         if action.policy_version != self.policy.version() {
             self.store.transition_approval(
                 acting_user_id,
@@ -1536,6 +1544,136 @@ mod tests {
             .get_action(&context.user_id, &action_id)
             .unwrap();
         assert_eq!(action.status, "invalidated");
+    }
+
+    #[tokio::test]
+    async fn an_expired_approval_cannot_be_decided() {
+        let (gateway, calls, _page, context) = live_setup(false, "login.bank.example");
+        let ToolOutcome::PendingApproval {
+            approval_id,
+            action_id,
+            ..
+        } = gateway
+            .execute(
+                "live_dest_tool",
+                serde_json::json!({"field": "password"}),
+                &context,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected approval");
+        };
+        // The deadline passes before the expiry sweep runs.
+        let past = crate::store::to_string(chrono::Utc::now() - Duration::minutes(5));
+        gateway
+            .store()
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE approvals SET expires_at = ?1 WHERE id = ?2",
+                rusqlite::params![past, approval_id],
+            )
+            .unwrap();
+        assert!(matches!(
+            gateway.decide(&context.user_id, &approval_id, Decision::Once),
+            Err(SeraError::InvalidState(_))
+        ));
+        assert!(
+            gateway
+                .execute_approved(&action_id, &context)
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let approval = gateway
+            .store()
+            .get_approval(&context.user_id, &approval_id)
+            .unwrap();
+        assert_eq!(approval.state, "expired");
+    }
+
+    #[tokio::test]
+    async fn approved_arguments_that_changed_are_not_dispatched() {
+        let (gateway, calls, _page, context) = live_setup(false, "login.bank.example");
+        let ToolOutcome::PendingApproval {
+            approval_id,
+            action_id,
+            ..
+        } = gateway
+            .execute(
+                "live_dest_tool",
+                serde_json::json!({"field": "password"}),
+                &context,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected approval");
+        };
+        gateway
+            .decide(&context.user_id, &approval_id, Decision::Once)
+            .unwrap();
+        // The stored arguments are swapped after approval; the hash no
+        // longer matches, so the action is invalidated, not dispatched.
+        gateway
+            .store()
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE actions SET canonical_args = ?1 WHERE id = ?2",
+                rusqlite::params![r#"{"field":"username"}"#, action_id],
+            )
+            .unwrap();
+        assert!(matches!(
+            gateway.execute_approved(&action_id, &context).await,
+            Err(SeraError::InvalidState(_))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let action = gateway
+            .store()
+            .get_action(&context.user_id, &action_id)
+            .unwrap();
+        assert_eq!(action.status, "invalidated");
+    }
+
+    #[tokio::test]
+    async fn another_users_approval_cannot_be_decided_or_dispatched() {
+        let (gateway, calls, _page, context) = live_setup(false, "login.bank.example");
+        let ToolOutcome::PendingApproval {
+            approval_id,
+            action_id,
+            ..
+        } = gateway
+            .execute(
+                "live_dest_tool",
+                serde_json::json!({"field": "password"}),
+                &context,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected approval");
+        };
+        let other = gateway
+            .store()
+            .create_user("microsoft:binding-other", "o@example.example", "O")
+            .unwrap();
+        assert!(
+            gateway
+                .decide(&other.id, &approval_id, Decision::Once)
+                .is_err()
+        );
+        let mut foreign = context.clone();
+        foreign.user_id = other.id.clone();
+        foreign.actor = other.id;
+        assert!(
+            gateway
+                .execute_approved(&action_id, &foreign)
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

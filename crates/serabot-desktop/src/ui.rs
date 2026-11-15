@@ -103,6 +103,8 @@ struct MsgView {
     bot: Option<String>,
     stamp: String,
     content: String,
+    /// Lower-cased message and speaker, built once for transcript search.
+    haystack: String,
     peer: bool,
     class: String,
     day: Option<String>,

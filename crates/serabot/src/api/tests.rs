@@ -3555,6 +3555,154 @@ fn event_resume_prefers_query_and_accepts_last_event_id() {
     assert_eq!(resume_cursor(&headers, None), 0);
 }
 
+#[test]
+fn local_folder_long_poll_uses_the_poll_bucket() {
+    assert!(is_poll_request(&axum::http::Method::POST, "/v1/local/poll"));
+    assert!(!is_poll_request(
+        &axum::http::Method::POST,
+        "/v1/local/result/abc"
+    ));
+    assert!(is_poll_request(&axum::http::Method::GET, "/v1/events/head"));
+}
+
+#[tokio::test]
+async fn events_head_and_after_latest_start_at_the_newest_event() {
+    let (app, _, store) = app();
+    let admin_id = admin(&store);
+    let first = store
+        .append_event(&admin_id, "message", &json!({"n": 1}))
+        .unwrap();
+    let second = store
+        .append_event(&admin_id, "message", &json!({"n": 2}))
+        .unwrap();
+    assert!(second > first);
+    let response = app
+        .clone()
+        .oneshot(request(&app, "GET", "/v1/events/head", true, None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(read_json(response).await["id"], second);
+
+    // `after=latest` skips the retained history and delivers only new events.
+    let response = app
+        .clone()
+        .oneshot(request(&app, "GET", "/v1/events?after=latest", true, None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let writer = store.clone();
+    let writer_user = admin_id.clone();
+    let started = Instant::now();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        writer
+            .append_event(&writer_user, "message", &json!({"n": 3}))
+            .unwrap();
+    });
+    let mut body = response.into_body().into_data_stream();
+    let mut text = String::new();
+    while !text.contains("\"n\":3") {
+        let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
+            .await
+            .expect("event stream stalled")
+            .expect("stream ended")
+            .unwrap();
+        text.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    assert!(
+        !text.contains("\"n\":1") && !text.contains("\"n\":2"),
+        "{text}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(900),
+        "events are pushed, not polled: {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn events_reject_a_malformed_cursor() {
+    let (app, _, _) = app();
+    let response = app
+        .clone()
+        .oneshot(request(&app, "GET", "/v1/events?after=banana", true, None))
+        .await
+        .unwrap();
+    assert!(response.status().is_client_error());
+}
+
+#[tokio::test]
+async fn sessions_slide_but_operator_tokens_keep_their_expiry() {
+    let (app, config, store) = app();
+    let admin_id = admin(&store);
+    let ttl = chrono::Duration::hours(config.auth.session_ttl_hours as i64);
+    let session = store
+        .mint_session(&admin_id, chrono::Duration::hours(2))
+        .unwrap();
+    let response = app
+        .clone()
+        .oneshot(request_with_token("GET", "/v1/me", &session, None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let record = store
+        .device_token_by_hash(&sha256_hex(&session))
+        .unwrap()
+        .unwrap();
+    let remaining = record.expires_at.unwrap() - Utc::now();
+    assert!(
+        remaining > ttl - chrono::Duration::minutes(5),
+        "{remaining}"
+    );
+    let me = app
+        .clone()
+        .oneshot(request_with_token("GET", "/v1/me", &session, None))
+        .await
+        .unwrap();
+    assert!(read_json(me).await["session_expires_at"].is_string());
+
+    let operator = crate::token_cli::mint(&store, "operator", Some(1)).unwrap();
+    let before = store
+        .device_token_by_hash(&sha256_hex(&operator))
+        .unwrap()
+        .unwrap()
+        .expires_at;
+    let response = app
+        .clone()
+        .oneshot(request_with_token("GET", "/v1/health", &operator, None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let after = store
+        .device_token_by_hash(&sha256_hex(&operator))
+        .unwrap()
+        .unwrap()
+        .expires_at;
+    assert_eq!(before, after);
+}
+
+#[tokio::test]
+async fn a_revoked_session_is_rejected_despite_the_token_cache() {
+    let (app, _, store) = app();
+    let session = store
+        .mint_session(&admin(&store), chrono::Duration::hours(2))
+        .unwrap();
+    let response = app
+        .clone()
+        .oneshot(request_with_token("GET", "/v1/health", &session, None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(store.revoke_session(&sha256_hex(&session)).unwrap());
+    let response = app
+        .clone()
+        .oneshot(request_with_token("GET", "/v1/health", &session, None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
 /// A running fleet that matches the on-disk fleet directory used by
 /// `list_configured_bots` (analyst, maker, watcher enabled; legal disabled).
 fn app_with_team() -> (Router, Arc<Config>, Store) {
@@ -4557,7 +4705,14 @@ async fn native_handoff_flow_issues_a_session_exactly_once() {
         .await
         .unwrap();
     assert_eq!(me.status(), StatusCode::OK);
-    assert_eq!(read_json(me).await, body["user"]);
+    let mut me_body = read_json(me).await;
+    // `/v1/me` also reports the (renewable) session end.
+    assert!(me_body["session_expires_at"].is_string());
+    me_body
+        .as_object_mut()
+        .unwrap()
+        .remove("session_expires_at");
+    assert_eq!(me_body, body["user"]);
     let anonymous = app
         .clone()
         .oneshot(request(&app, "GET", "/v1/me", false, None))

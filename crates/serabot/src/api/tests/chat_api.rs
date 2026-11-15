@@ -150,3 +150,103 @@ async fn cancel_is_owner_scoped_and_reports_nothing_running_when_idle() {
     let foreign = call(&app, &other_token, "POST", uri, None).await;
     assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn history_pages_back_with_a_cursor_and_reports_more() {
+    let (app, _, store) = app();
+    let user = store
+        .create_user("subject-page-a", "pa@example.example", "Synthetic Page A")
+        .unwrap();
+    let other = store
+        .create_user("subject-page-b", "pb@example.example", "Synthetic Page B")
+        .unwrap();
+    let token = mint_for(&store, &user.id, "page-a");
+    let other_token = mint_for(&store, &other.id, "page-b");
+    store
+        .ensure_conversation_accepts_turns(&user.id, "dir:paged")
+        .unwrap();
+    let mut ids = Vec::new();
+    for n in 0..5 {
+        let role = if n % 2 == 0 {
+            crate::domain::Role::User
+        } else {
+            crate::domain::Role::Assistant
+        };
+        ids.push(
+            store
+                .append_message(&user.id, "dir:paged", None, role, &format!("synthetic {n}"))
+                .unwrap()
+                .id,
+        );
+    }
+    store
+        .connection()
+        .unwrap()
+        .execute(
+            "UPDATE messages SET created_at = '2026-01-01T00:00:00.000Z'",
+            [],
+        )
+        .unwrap();
+
+    let newest = read_json(
+        call(
+            &app,
+            &token,
+            "GET",
+            "/v1/conversations/dir:paged/messages?limit=2",
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(newest["has_more"], true);
+    assert_eq!(newest["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(newest["messages"][0]["id"], ids[3].as_str());
+
+    let older = read_json(
+        call(
+            &app,
+            &token,
+            "GET",
+            &format!(
+                "/v1/conversations/dir:paged/messages?limit=10&before={}",
+                ids[3]
+            ),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(older["has_more"], false);
+    let got: Vec<&str> = older["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(got, vec![ids[0].as_str(), ids[1].as_str(), ids[2].as_str()]);
+
+    // Another account's cursor over the same ids finds nothing.
+    let foreign = read_json(
+        call(
+            &app,
+            &other_token,
+            "GET",
+            &format!("/v1/conversations/dir:paged/messages?before={}", ids[3]),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert!(foreign["messages"].as_array().unwrap().is_empty());
+
+    let bad = call(
+        &app,
+        &token,
+        "GET",
+        "/v1/conversations/dir:paged/messages?before=..%2Fsecret",
+        None,
+    )
+    .await;
+    assert!(bad.status().is_client_error());
+}

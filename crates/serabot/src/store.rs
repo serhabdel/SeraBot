@@ -26,8 +26,8 @@
 //! routines use it too because they are server work, not user requests.
 
 use std::path::{Path, PathBuf};
-use std::sync::Once;
-use std::time::Duration;
+use std::sync::{Arc, Once};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use r2d2::{Pool, PooledConnection};
@@ -449,6 +449,11 @@ pub struct Store {
     pool: Pool<SqliteConnectionManager>,
     path: PathBuf,
     dimension: usize,
+    /// Woken after an event row is written so SSE streams push instead of poll.
+    event_notify: Arc<tokio::sync::Notify>,
+    /// Short-lived copy of recent device-token lookups; every API request
+    /// resolves its bearer token. Cleared on any write that changes a token.
+    token_cache: Arc<std::sync::Mutex<std::collections::HashMap<String, (Instant, DeviceToken)>>>,
 }
 
 impl std::fmt::Debug for Store {
@@ -484,6 +489,8 @@ impl Store {
             pool,
             path,
             dimension,
+            event_notify: Arc::default(),
+            token_cache: Arc::default(),
         };
         store.migrate()?;
         Ok(store)
@@ -504,6 +511,8 @@ impl Store {
             pool,
             path: PathBuf::from(":memory:"),
             dimension,
+            event_notify: Arc::default(),
+            token_cache: Arc::default(),
         };
         store.migrate()?;
         Ok(store)
@@ -1008,16 +1017,43 @@ impl Store {
         Ok(())
     }
 
+    /// How long a device-token lookup may be served from memory.
+    const TOKEN_CACHE_TTL: Duration = Duration::from_secs(5);
+    const TOKEN_CACHE_MAX: usize = 256;
+
     pub fn device_token_by_hash(&self, token_hash: &str) -> Result<Option<DeviceToken>> {
+        if let Ok(cache) = self.token_cache.lock()
+            && let Some((at, record)) = cache.get(token_hash)
+            && at.elapsed() < Self::TOKEN_CACHE_TTL
+        {
+            return Ok(Some(record.clone()));
+        }
         let connection = self.connection()?;
-        Ok(connection
+        let record = connection
             .query_row(
                 "SELECT id, label, user_id, created_at, last_used_at, expires_at, revoked_at
                  FROM device_tokens WHERE token_hash = ?1",
                 params![token_hash],
                 device_token_from_row,
             )
-            .optional()?)
+            .optional()?;
+        if let Some(record) = &record
+            && let Ok(mut cache) = self.token_cache.lock()
+        {
+            if cache.len() >= Self::TOKEN_CACHE_MAX {
+                cache.retain(|_, (at, _)| at.elapsed() < Self::TOKEN_CACHE_TTL);
+            }
+            if cache.len() < Self::TOKEN_CACHE_MAX {
+                cache.insert(token_hash.to_owned(), (Instant::now(), record.clone()));
+            }
+        }
+        Ok(record)
+    }
+
+    fn forget_cached_tokens(&self) {
+        if let Ok(mut cache) = self.token_cache.lock() {
+            cache.clear();
+        }
     }
 
     pub fn list_device_tokens(&self) -> Result<Vec<DeviceToken>> {
@@ -1041,6 +1077,7 @@ impl Store {
             "UPDATE device_tokens SET revoked_at = COALESCE(revoked_at, ?2) WHERE id = ?1",
             params![id, now_string()],
         )?;
+        self.forget_cached_tokens();
         Ok(changed > 0)
     }
 
@@ -1057,6 +1094,20 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Push a live session's expiry out to `expires_at`. Never shortens it and
+    /// never touches a revoked token. Returns whether the row changed.
+    pub fn extend_device_token(&self, id: &str, expires_at: DateTime<Utc>) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE device_tokens SET expires_at = ?2
+             WHERE id = ?1 AND revoked_at IS NULL
+               AND expires_at IS NOT NULL AND expires_at < ?2",
+            params![id, to_string(expires_at)],
+        )?;
+        self.forget_cached_tokens();
+        Ok(changed == 1)
     }
 
     // ---- Users, invites, and sessions (multi-user phase 1) ----
@@ -1539,6 +1590,7 @@ impl Store {
             "UPDATE device_tokens SET revoked_at = COALESCE(revoked_at, ?2) WHERE token_hash = ?1",
             params![token_hash, now_string()],
         )?;
+        self.forget_cached_tokens();
         Ok(changed > 0)
     }
 
@@ -2664,16 +2716,57 @@ impl Store {
         conversation_id: &str,
         limit: usize,
     ) -> Result<Vec<StoredMessage>> {
+        self.list_visible_messages_before(user_id, conversation_id, None, limit)
+    }
+
+    /// Like `list_visible_messages`, but only rows older than `before` (a
+    /// message id of the same user and conversation). An unknown cursor yields
+    /// no rows, so a stale "Load earlier" never repeats the newest page.
+    pub fn list_visible_messages_before(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        before: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>> {
         let connection = self.connection()?;
+        let cursor: Option<(String, i64)> = match before {
+            Some(id) => {
+                let found = connection
+                    .query_row(
+                        "SELECT created_at, rowid FROM messages
+                         WHERE id = ?1 AND conversation_id = ?2 AND user_id = ?3",
+                        params![id, conversation_id, user_id],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .optional()?;
+                match found {
+                    Some(found) => Some(found),
+                    None => return Ok(Vec::new()),
+                }
+            }
+            None => None,
+        };
         let mut statement = connection.prepare(
             "SELECT m.id, m.conversation_id, m.turn_id, m.role, m.content, m.name,
                     m.created_at, t.bot, t.status
              FROM messages m LEFT JOIN turns t ON t.id = m.turn_id
              WHERE m.conversation_id = ?1 AND m.user_id = ?2 AND m.role IN ('user', 'assistant')
+               AND (?4 IS NULL OR (m.created_at, m.rowid) < (?4, ?5))
              ORDER BY m.created_at DESC, m.rowid DESC LIMIT ?3",
         )?;
+        let (cursor_at, cursor_rowid) = match &cursor {
+            Some((at, rowid)) => (Some(at.clone()), *rowid),
+            None => (None, 0),
+        };
         let rows = statement.query_map(
-            params![conversation_id, user_id, limit.clamp(1, 200) as i64],
+            params![
+                conversation_id,
+                user_id,
+                limit.clamp(1, 201) as i64,
+                cursor_at,
+                cursor_rowid
+            ],
             |row| {
                 Ok(StoredMessage {
                     id: row.get(0)?,
@@ -3421,7 +3514,33 @@ impl Store {
             "INSERT INTO events(at, kind, payload_json, user_id) VALUES (?1, ?2, ?3, ?4)",
             params![now_string(), kind, serde_json::to_string(payload)?, user_id],
         )?;
-        Ok(connection.last_insert_rowid())
+        let id = connection.last_insert_rowid();
+        drop(connection);
+        self.notify_events();
+        Ok(id)
+    }
+
+    /// Wake every SSE stream waiting for new events. Call after a commit that
+    /// inserted into `events`; streams also re-check on a timer, so a missed
+    /// call only delays delivery.
+    pub(crate) fn notify_events(&self) {
+        self.event_notify.notify_waiters();
+    }
+
+    /// Handle that completes when `notify_events` runs.
+    pub(crate) fn event_notifier(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.event_notify)
+    }
+
+    /// Newest event id of the acting user, or 0 when there is none. Fresh
+    /// clients resume from here instead of replaying retained history.
+    pub fn latest_event_id(&self, user_id: &str) -> Result<i64> {
+        let connection = self.connection()?;
+        Ok(connection.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM events WHERE user_id = ?1",
+            params![user_id],
+            |row| row.get(0),
+        )?)
     }
 
     /// Events of the acting user after `after_id`, oldest first. SSE streams
@@ -5226,6 +5345,63 @@ mod tests {
         assert!(
             store
                 .list_visible_messages(&admin, "absent", 100)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn visible_history_pages_back_from_a_cursor_within_one_user() {
+        let store = store();
+        let admin = admin(&store);
+        let member = member(&store);
+        let mut ids = Vec::new();
+        for n in 0..5 {
+            let role = if n % 2 == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            };
+            ids.push(
+                store
+                    .append_message(&admin, "owner", None, role, &format!("m{n}"))
+                    .unwrap()
+                    .id,
+            );
+        }
+        let foreign = store
+            .append_message(&member.id, "owner", None, Role::User, "theirs")
+            .unwrap();
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE messages SET created_at = '2026-01-01T00:00:00.000Z'",
+                [],
+            )
+            .unwrap();
+        let page = store
+            .list_visible_messages_before(&admin, "owner", Some(&ids[3]), 2)
+            .unwrap();
+        assert_eq!(
+            page.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec![ids[1].as_str(), ids[2].as_str()]
+        );
+        let rest = store
+            .list_visible_messages_before(&admin, "owner", Some(&ids[1]), 10)
+            .unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].id, ids[0]);
+        // Another user's id, or an unknown id, is not a cursor.
+        assert!(
+            store
+                .list_visible_messages_before(&admin, "owner", Some(&foreign.id), 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_visible_messages_before(&admin, "owner", Some("absent"), 10)
                 .unwrap()
                 .is_empty()
         );

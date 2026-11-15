@@ -53,6 +53,9 @@ pub const REQUEST_GAP: Duration = Duration::from_millis(60);
 pub const POLL_GAP: Duration = Duration::from_millis(750);
 pub const POLL_SAFETY: Duration = Duration::from_secs(4);
 
+/// Wait after a locally expired session before the server is asked again.
+const SESSION_RECHECK_SECS: u64 = 600;
+
 /// Shown on the sign-in screen after any 401.
 pub const SESSION_ENDED: &str = "Your session ended. Sign in again.";
 const SETTINGS_NOT_SAVED: &str =
@@ -122,6 +125,26 @@ fn event_refresh(kind: &str, conversation: &str) -> EventRefresh {
         EventRefresh::Conversations
     } else {
         EventRefresh::History
+    }
+}
+
+/// Activity in another conversation must not reload the open transcript.
+///
+/// An event that would re-read the open conversation but names a different
+/// one only changes that conversation's row (order, preview), so it asks for
+/// the list instead of the transcript.
+fn scope_event_kind(kind: String, payload: &serde_json::Value, conversation: &str) -> String {
+    if !matches!(event_refresh(&kind, conversation), EventRefresh::History) {
+        return kind;
+    }
+    let other = payload
+        .get("conversation_id")
+        .and_then(|value| value.as_str())
+        .is_some_and(|id| id != conversation);
+    if other {
+        "conversation.activity".to_owned()
+    } else {
+        kind
     }
 }
 
@@ -657,6 +680,13 @@ pub struct Session {
     link_retry_at: Option<Instant>,
     pub rename: Option<RenameDraft>,
     pub archive_confirm: Option<String>,
+    /// Auto-approve is waiting for the owner's first-time OK in this chat.
+    pub auto_approve_confirming: bool,
+    /// A reconnect or transcript retry was asked for and nothing has answered
+    /// yet: the Retry buttons show "Retrying…" and stay disabled.
+    pub link_retrying: bool,
+    /// Chats where the owner already confirmed turning Auto-approve on.
+    auto_approve_confirmed: std::collections::BTreeSet<String>,
     /// Editable copy of the open room's group instructions; synced from the
     /// server team and written back with the next team save.
     pub team_rules_draft: String,
@@ -735,6 +765,12 @@ pub struct Session {
     pub marketplace_open: Option<String>,
     /// The connector whose card is open in the Integrations detail sheet (v0.38).
     pub integration_open: Option<String>,
+    /// A tab the Integrations screen should switch to the next time it
+    /// renders (the sidebar's "Bots N of M" link asks for the Bots tab).
+    pub integrations_tab_request: Option<crate::integrations::Tab>,
+    /// The shipped-bot catalog must be read again (a bot was added, switched
+    /// or removed), so the sidebar count and the Bots tab stay true.
+    catalog_refresh: bool,
     /// A change is in flight (so its buttons wait).
     pub marketplace_busy: bool,
     /// The bot config write in flight: (bot id, update), kept so the cached
@@ -848,6 +884,9 @@ impl Session {
             restarting: false,
             rename: None,
             archive_confirm: None,
+            auto_approve_confirming: false,
+            link_retrying: false,
+            auto_approve_confirmed: std::collections::BTreeSet::new(),
             team_rules_draft: String::new(),
             update: UpdateUi::default(),
             status: StatusUi::default(),
@@ -895,6 +934,8 @@ impl Session {
             bot_chats_pending: None,
             marketplace_open: None,
             integration_open: None,
+            integrations_tab_request: None,
+            catalog_refresh: false,
             marketplace_busy: false,
             bot_config_pending: None,
             pending_team: None,
@@ -1029,10 +1070,52 @@ impl Session {
         self.poll_paused = false;
         self.refreshing = false;
         self.next_request = Instant::now();
+        self.link_retrying = true;
         if !self.state.unknown_outcome {
             self.state.error = None;
         }
+        if !self.state.history_loaded {
+            // The transcript never arrived: restart the chain that loads it
+            // (and the catalog behind it) instead of a lone probe.
+            self.state.begin_history_retry(Instant::now());
+            self.refreshing = true;
+        }
         self.schedule(Operation::History, Duration::ZERO);
+    }
+
+    /// The "Retry" button of the "Could not load this conversation" panel.
+    pub fn retry_history(&mut self) {
+        if !self.state.connected {
+            return;
+        }
+        self.state.begin_history_retry(Instant::now());
+        self.state.error = None;
+        self.link_retrying = true;
+        self.poll_paused = false;
+        self.refreshing = true;
+        self.schedule(Operation::History, Duration::ZERO);
+    }
+
+    /// "Load earlier messages": one page of rows older than the oldest shown.
+    pub fn load_older_messages(&mut self) {
+        let state = &mut self.state;
+        if !state.connected || !state.history_loaded || state.older_loading {
+            return;
+        }
+        if !state.has_more_history {
+            return;
+        }
+        let Some(first) = state
+            .messages
+            .iter()
+            .find(|row| !row.id.starts_with("opt-"))
+            .map(|row| row.id.clone())
+        else {
+            return;
+        };
+        state.older_loading = true;
+        state.older_error = None;
+        self.start_request(Operation::HistoryBefore(first));
     }
 
     pub fn connect_now(&mut self) {
@@ -1074,11 +1157,38 @@ impl Session {
         self.connect_error = self.clear_session().err();
         self.sign_in.notice = Some(SESSION_ENDED.into());
     }
+    /// The server renews a session while it is in use and reports the new end
+    /// on `/v1/me`. Keep the stored expiry in step so the local check below
+    /// does not sign out a session the server has extended.
+    fn adopt_session_expiry(&mut self) {
+        let Some(expires) = self
+            .state
+            .user
+            .as_ref()
+            .and_then(|user| user.session_expires_at.as_deref())
+            .and_then(parse_rfc3339_unix)
+        else {
+            return;
+        };
+        if self.session_expires == Some(expires) {
+            return;
+        }
+        self.session_expires = Some(expires);
+        self.persist_credentials();
+    }
+
     /// Sign the user out cleanly once the session expiry the server reported
     /// has passed, instead of waiting for a request to answer 401.
     fn check_session_expiry(&mut self) {
         if self.session_expires.is_some_and(|at| unix_now() >= at) {
-            self.reject_token();
+            if self.credentials.is_some() && self.state.connected {
+                // The server renews sessions in use, so the stored end may be
+                // stale. Ask once; a real expiry answers 401 and signs out.
+                self.session_expires = Some(unix_now() + SESSION_RECHECK_SECS);
+                self.queue_backlog(Operation::Me);
+            } else {
+                self.reject_token();
+            }
         }
     }
 
@@ -2202,7 +2312,12 @@ impl Session {
                 .is_some_and(|c| !c.providers.is_empty());
         self.reset_scope(true);
         self.composer = self.drafts.restore(&self.conversation);
+        self.auto_approve_confirming = false;
         self.state.error = None;
+        // Opening a chat is reading it: its badge goes now, not when the
+        // transcript has arrived.
+        let opened = self.conversation.clone();
+        self.state.clear_unread(&opened);
         self.refreshing = true;
         self.poll_paused = false;
         if has_models {
@@ -3043,6 +3158,7 @@ impl Session {
         }
         if let Some(failure) = failure {
             self.state.chat_failure = Some(failure);
+            self.state.failure_attempt = self.state.failure_attempt.wrapping_add(1);
             self.state.error = None;
         }
     }
@@ -3262,6 +3378,7 @@ impl Session {
     /// Called from the UI timer. Drains completions and advances scheduled work.
     pub fn tick(&mut self) {
         self.check_session_expiry();
+        self.state.note_history_wait(Instant::now());
         self.poll_events();
         self.receive();
         self.drain_backlog();
@@ -3434,6 +3551,7 @@ impl Session {
                                 }
                             }
                         }
+                        let kind = scope_event_kind(kind, &payload, &self.conversation);
                         choose_event_kind(
                             &mut self.last_event_kind,
                             &mut self.events_dirty,
@@ -3665,6 +3783,7 @@ impl Session {
                 continue;
             }
             self.pending = None;
+            self.link_retrying = false;
             self.bot_detail_pending = None;
             // The in-flight config write (if any) resolves with this completion.
             let bot_config = if completion.kind == OperationKind::BotConfigWrite {
@@ -3781,11 +3900,24 @@ impl Session {
                     self.provider_testing = None;
                     self.scheduled = None;
                 }
+                // "Load earlier" is optional: a failure is said next to the
+                // button and never pauses the poll loop or raises the banner.
+                Err(error) if completion.kind == OperationKind::HistoryOlder => {
+                    self.state.older_loading = false;
+                    self.state.older_error =
+                        Some(format!("Could not load earlier messages: {error}"));
+                }
                 Err(ApiError::Http(429)) if completion.kind.is_background_poll() => {
                     // A rate-limited background poll backs off quietly (no
                     // banner) and the poll loop carries on afterwards.
                     self.rate_attempts = self.rate_attempts.saturating_add(1);
-                    self.refreshing = false;
+                    // The first transcript read must not be lost to a 429:
+                    // ask for it again once the back-off is over.
+                    let first_read =
+                        completion.kind == OperationKind::History && !self.state.history_loaded;
+                    if !first_read {
+                        self.refreshing = false;
+                    }
                     self.scheduled = None;
                     self.next_request = Instant::now()
                         + crate::api::poll_backoff(
@@ -3793,6 +3925,9 @@ impl Session {
                             self.rate_attempts,
                             crate::api::jitter_seed(),
                         );
+                    if first_read {
+                        self.schedule(Operation::History, Duration::ZERO);
+                    }
                 }
                 Err(error) => {
                     self.usage_loading = false;
@@ -3978,6 +4113,17 @@ impl Session {
                             }
                         }
                         OperationKind::Submit => self.note_submit_failure(submit_failure),
+                        // The transcript has its own failure state: the chat
+                        // shows a Retry panel that no other reply can clear.
+                        OperationKind::History if !self.state.history_loaded => {
+                            self.state.history_failed = true;
+                        }
+                        // The chain that loads the transcript starts with the
+                        // catalog on a cold open; without the catalog it would
+                        // never reach the transcript.
+                        OperationKind::Catalog if !self.state.history_loaded => {
+                            self.schedule(Operation::History, Duration::ZERO);
+                        }
                         _ => {}
                     }
                     if !self.state.connected {
@@ -4114,6 +4260,7 @@ impl Session {
                             self.schedule(Operation::Me, Duration::ZERO);
                         }
                         OperationKind::Me => {
+                            self.adopt_session_expiry();
                             self.schedule(Operation::Catalog, Duration::ZERO);
                         }
                         OperationKind::Health => {
@@ -4206,6 +4353,7 @@ impl Session {
                             } else {
                                 Operation::ListBots
                             };
+                            self.catalog_refresh = false;
                             self.schedule(next, Duration::ZERO);
                         }
                         OperationKind::Avatar => {
@@ -5533,6 +5681,37 @@ impl Session {
         self.start_request(Operation::ArchiveConversation { id });
     }
 
+    /// The Auto-approve button. Turning it on in a chat for the first time asks
+    /// first: it lets the bots send email or delete files without the usual
+    /// approval prompt. Turning it off never asks.
+    pub fn request_auto_approve(&mut self, enabled: bool) {
+        if needs_auto_approve_confirmation(
+            &self.auto_approve_confirmed,
+            &self.conversation,
+            enabled,
+        ) {
+            self.auto_approve_confirming = true;
+            return;
+        }
+        self.auto_approve_confirming = false;
+        self.set_auto_approve(enabled);
+    }
+
+    /// "Turn on" in the first-time confirmation.
+    pub fn confirm_auto_approve(&mut self) {
+        if !self.auto_approve_confirming {
+            return;
+        }
+        self.auto_approve_confirming = false;
+        self.auto_approve_confirmed
+            .insert(self.conversation.clone());
+        self.set_auto_approve(true);
+    }
+
+    pub fn cancel_auto_approve(&mut self) {
+        self.auto_approve_confirming = false;
+    }
+
     /// Flip the open conversation's auto-approve switch. Turning it off is
     /// applied locally at once and then confirmed by the server; turning it on
     /// waits for the server's answer so the switch never shows a state the
@@ -5996,6 +6175,16 @@ fn model_csv(raw: &str) -> Vec<String> {
 /// Requests that record state before they are sent (a per-file preview guard,
 /// an in-flight avatar or bot write). Such a request is never replayed from the
 /// backlog, because replaying would find its own state already set.
+/// Whether turning Auto-approve on must be confirmed first: only when
+/// enabling, and only in a chat where the owner has not confirmed it yet.
+fn needs_auto_approve_confirmation(
+    confirmed: &std::collections::BTreeSet<String>,
+    conversation: &str,
+    enabling: bool,
+) -> bool {
+    enabling && !confirmed.contains(conversation)
+}
+
 fn has_dispatch_guard(operation: &Operation) -> bool {
     matches!(
         operation,
@@ -6067,9 +6256,10 @@ mod tests {
     use super::SettingsSection;
     use super::{
         AtomicBool, Duration, EventRefresh, Instant, Ordering, Session, SignInPhase, SignInUi,
-        Theme, event_refresh, telegram_error,
+        Theme, event_refresh, scope_event_kind, telegram_error,
     };
     use crate::ApiError;
+    use crate::worker::{Credentials, Operation};
     use std::sync::Arc;
 
     #[test]
@@ -6176,6 +6366,7 @@ mod tests {
             email: "ada@example.test".into(),
             display_name: "Ada".into(),
             role: role.into(),
+            session_expires_at: None,
         };
         let mut member = Session::new();
         member.state.user = Some(user("member"));
@@ -6226,6 +6417,58 @@ mod tests {
         assert_eq!(
             event_refresh("message", "room:review"),
             EventRefresh::History
+        );
+    }
+
+    #[test]
+    fn activity_in_another_conversation_does_not_reload_the_open_transcript() {
+        let other = serde_json::json!({"conversation_id": "conv-b"});
+        let same = serde_json::json!({"conversation_id": "conv-a"});
+        let none = serde_json::json!({});
+        let scoped = scope_event_kind("message".into(), &other, "conv-a");
+        assert_eq!(
+            event_refresh(&scoped, "conv-a"),
+            EventRefresh::Conversations
+        );
+        assert_eq!(
+            scope_event_kind("message".into(), &same, "conv-a"),
+            "message"
+        );
+        assert_eq!(
+            scope_event_kind("message".into(), &none, "conv-a"),
+            "message"
+        );
+        // Approvals and conversation events keep their own refresh.
+        assert_eq!(
+            scope_event_kind("approval.requested".into(), &other, "conv-a"),
+            "approval.requested"
+        );
+    }
+
+    #[test]
+    fn a_stale_local_expiry_asks_the_server_before_signing_out() {
+        let _guard = crate::creds::test_lock();
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        session.token = "synthetic-session-token-0123456789abcdef".into();
+        session.credentials = Some(Arc::new(Credentials {
+            endpoint: crate::validate_endpoint("http://127.0.0.1:9").unwrap(),
+            token: secrecy::SecretString::new(session.token.clone()),
+        }));
+        session.state.connected = true;
+        session.session_expires = Some(super::unix_now().saturating_sub(1));
+        session.check_session_expiry();
+        assert!(session.sign_in.notice.is_none(), "still signed in");
+        assert!(
+            session
+                .session_expires
+                .is_some_and(|at| at > super::unix_now())
+        );
+        assert!(
+            session
+                .backlog
+                .iter()
+                .any(|operation| matches!(operation, Operation::Me))
         );
     }
 
@@ -6293,6 +6536,7 @@ mod tests {
             email: "ada@example.test".into(),
             display_name: "Ada".into(),
             role: "member".into(),
+            session_expires_at: None,
         });
         session.server = "http://127.0.0.1:9".into();
         session.reject_token();
@@ -6713,5 +6957,120 @@ mod backlog_tests {
         session.open_approval_conversation();
         assert!(session.section == Section::Chat);
         assert_eq!(session.conversation, "dir:analyst");
+    }
+
+    #[test]
+    fn retry_history_restarts_the_transcript_chain_and_clears_the_failure() {
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        session.state.connected = true;
+        session.state.history_failed = true;
+        session.retry_history();
+        assert!(!session.state.history_failed);
+        assert!(session.state.history_started.is_some());
+        assert!(
+            session.refreshing,
+            "the catalog and lists follow the transcript"
+        );
+        assert!(matches!(
+            session.scheduled.as_ref().map(|(_, op)| op.kind()),
+            Some(OperationKind::History)
+        ));
+    }
+
+    #[test]
+    fn the_reconnect_retry_reloads_a_transcript_that_never_arrived() {
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        session.state.connected = true;
+        session.state.history_failed = true;
+        session.retry_link();
+        assert!(session.link_retrying);
+        assert!(!session.state.history_failed);
+        assert!(session.refreshing);
+        assert!(session.scheduled.is_some());
+        // With a transcript on screen the link probe leaves the chain alone.
+        let mut loaded =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        loaded.state.connected = true;
+        loaded.state.history_loaded = true;
+        loaded.retry_link();
+        assert!(!loaded.refreshing);
+    }
+
+    #[test]
+    fn load_earlier_needs_a_loaded_transcript_with_older_rows_and_runs_once() {
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        session.state.connected = true;
+        session.load_older_messages();
+        assert!(!session.state.older_loading, "nothing loaded yet");
+        session.state.history_loaded = true;
+        session.load_older_messages();
+        assert!(!session.state.older_loading, "no older rows are advertised");
+        session.state.has_more_history = true;
+        session.load_older_messages();
+        assert!(!session.state.older_loading, "no row to page back from");
+    }
+
+    #[test]
+    fn opening_a_conversation_clears_its_unread_badge_at_once() {
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        session.state.connected = true;
+        session
+            .state
+            .conversations
+            .push(crate::ConversationSummary {
+                id: "dir:analyst".into(),
+                kind: "direct".into(),
+                parent_id: None,
+                title: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+                last_message_at: None,
+                archived_at: None,
+                unread_count: 5,
+                accepts_turns: true,
+                last_message: None,
+                avatar_version: None,
+            });
+        session.open_conversation("dir:analyst".into());
+        assert_eq!(session.state.conversations[0].unread_count, 0);
+    }
+
+    #[test]
+    fn auto_approve_asks_once_per_chat_when_turned_on_and_never_when_turned_off() {
+        let mut confirmed = std::collections::BTreeSet::new();
+        assert!(needs_auto_approve_confirmation(&confirmed, "dir:a", true));
+        assert!(!needs_auto_approve_confirmation(&confirmed, "dir:a", false));
+        confirmed.insert("dir:a".to_owned());
+        assert!(!needs_auto_approve_confirmation(&confirmed, "dir:a", true));
+        assert!(needs_auto_approve_confirmation(&confirmed, "dir:b", true));
+    }
+
+    #[test]
+    fn the_first_auto_approve_press_only_opens_the_confirmation() {
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        session.state.connected = true;
+        session.conversation = "dir:analyst".into();
+        session.request_auto_approve(true);
+        assert!(session.auto_approve_confirming);
+        assert!(!session.state.auto_approve, "nothing is switched on yet");
+        session.cancel_auto_approve();
+        assert!(!session.auto_approve_confirming);
+        session.request_auto_approve(true);
+        session.confirm_auto_approve();
+        assert!(!session.auto_approve_confirming);
+        // Confirmed once: the next press goes straight through.
+        session.request_auto_approve(true);
+        assert!(!session.auto_approve_confirming);
+        // Leaving the chat drops an open question.
+        let mut other =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        other.request_auto_approve(true);
+        other.open_conversation("dir:main".into());
+        assert!(!other.auto_approve_confirming);
     }
 }

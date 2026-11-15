@@ -28,6 +28,12 @@ pub fn IntegrationsView(session: Signal<Session>) -> Element {
     let mut session = session;
     let mut tab = use_signal(Tab::default);
     let mut query = use_signal(String::new);
+    // The sidebar's Bots link asks for its tab; take the request once.
+    let requested = session.read().integrations_tab_request;
+    if let Some(requested) = requested {
+        session.write().integrations_tab_request = None;
+        tab.set(requested);
+    }
     let (open_connector, has_plugin_sheet) = {
         let state = session.read();
         (
@@ -51,6 +57,7 @@ pub fn IntegrationsView(session: Signal<Session>) -> Element {
                     onclick: move |_| match tab() {
                         Tab::Installed => session.write().refresh_connectors(),
                         Tab::Marketplace => session.write().refresh_marketplace(),
+                        Tab::Bots => session.write().open_meet_team(),
                         Tab::Composio => {
                             let mut s = session.write();
                             s.refresh_connectors();
@@ -81,7 +88,7 @@ pub fn IntegrationsView(session: Signal<Session>) -> Element {
                             input {
                                 class: "input mp-search",
                                 r#type: "search",
-                                placeholder: if tab() == Tab::Marketplace { "Search plugins" } else { "Search integrations" },
+                                placeholder: if tab() == Tab::Bots { "Search bots" } else if tab() == Tab::Marketplace { "Search plugins" } else { "Search integrations" },
                                 "aria-label": if tab() == Tab::Marketplace { "Search plugins" } else { "Search integrations" },
                                 value: "{query}",
                                 oninput: move |event| query.set(event.value()),
@@ -106,6 +113,7 @@ pub fn IntegrationsView(session: Signal<Session>) -> Element {
                 {match tab() {
                     Tab::Installed => rsx! { InstalledTab { session, query, tab } },
                     Tab::Marketplace => rsx! { MarketplaceTab { session, query } },
+                    Tab::Bots => rsx! { BotsTab { session, query } },
                     Tab::Composio => rsx! { ComposioTab { session } },
                 }}
             }
@@ -292,6 +300,30 @@ fn entry_key(entry: &Entry) -> String {
     match &entry.source {
         Source::Connector(id) => format!("connector:{id}"),
         Source::Plugin(slug) => format!("plugin:{slug}"),
+    }
+}
+
+/// The Bots tab: every shipped bot with add, switch and remove. Reads the
+/// catalog when it opens, so it is current.
+#[component]
+fn BotsTab(session: Signal<Session>, query: Signal<String>) -> Element {
+    let mut session = session;
+    use_hook(move || session.write().open_meet_team());
+    let (installed, total) = {
+        let state = session.read();
+        (
+            state
+                .state
+                .shipped_bots
+                .iter()
+                .filter(|bot| bot.installed)
+                .count(),
+            state.state.shipped_bots.len(),
+        )
+    };
+    rsx! {
+        p { class: "hint", "{installed} of {total} built-in bots are on your team. Remove one and add it back here any time." }
+        crate::ui_bots::ShippedList { session, query: query(), overlay: None }
     }
 }
 

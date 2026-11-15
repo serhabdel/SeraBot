@@ -9,6 +9,8 @@ use serde_json::Value;
 
 /// Most steps kept for one turn.
 const MAX_STEPS: usize = 64;
+/// Dropped call ids remembered so repeat events of one step count once.
+const MAX_TRACKED_DROPS: usize = 1_024;
 const MAX_TEXT: usize = 120;
 const MAX_INPUT: usize = 160;
 const MAX_ERROR: usize = 200;
@@ -186,6 +188,11 @@ pub struct Step {
 pub struct Activity {
     pub task_id: String,
     pub steps: Vec<Step>,
+    /// Steps past `MAX_STEPS` that were counted but not kept.
+    pub dropped: usize,
+    /// Call ids already counted in `dropped` (a step's later events must not
+    /// count again). Bounded by the number of calls of one turn.
+    dropped_calls: std::collections::BTreeSet<String>,
 }
 
 fn clean(value: &Value, key: &str) -> Option<String> {
@@ -238,6 +245,8 @@ impl Activity {
         };
         if self.task_id != task_id {
             self.steps.clear();
+            self.dropped = 0;
+            self.dropped_calls.clear();
             self.task_id = task_id;
         }
         let icon = clean(payload, "icon").unwrap_or_else(|| "bolt".into());
@@ -286,7 +295,12 @@ impl Activity {
                 step.error = None;
                 step.action = StepAction::None;
             }
-        } else if self.steps.len() < MAX_STEPS {
+        } else if self.steps.len() >= MAX_STEPS {
+            // Not kept, but counted: the summary says how many are missing.
+            if self.dropped_calls.len() >= MAX_TRACKED_DROPS || self.dropped_calls.insert(call_id) {
+                self.dropped = self.dropped.saturating_add(1);
+            }
+        } else {
             self.steps.push(Step {
                 call_id,
                 icon,
@@ -322,9 +336,30 @@ impl Activity {
 
     /// "1 step" / "5 steps, 12s" for the collapsed summary. The time is the
     /// sum of reported durations, and it is left off when any finished step
-    /// has none (an older server, or a lost event).
+    /// has none (an older server, or a lost event). Steps past the cap are
+    /// counted in, so a long run is not under-reported.
     pub fn summary(&self) -> String {
-        format_steps_summary(self.steps.len(), self.total_duration_ms())
+        format_steps_summary(
+            self.steps.len().saturating_add(self.dropped),
+            self.total_duration_ms(),
+        )
+    }
+
+    /// "+3 more steps not shown" once the cap was hit.
+    pub fn dropped_note(&self) -> Option<String> {
+        match self.dropped {
+            0 => None,
+            1 => Some("+1 more step not shown".into()),
+            n => Some(format!("+{n} more steps not shown")),
+        }
+    }
+
+    /// A step needs the owner (approval) or went wrong: the collapsed
+    /// summary must not hide it.
+    pub fn needs_attention(&self) -> bool {
+        self.steps
+            .iter()
+            .any(|step| matches!(step.phase, StepPhase::WaitingApproval | StepPhase::Failed))
     }
 
     fn total_duration_ms(&self) -> Option<u64> {
@@ -585,6 +620,36 @@ mod tests {
         assert!(a.apply("turn.step", &ev("t2", "c9", "running")));
         assert_eq!(a.steps.len(), 1);
         assert_eq!(a.summary(), "1 step");
+    }
+
+    #[test]
+    fn steps_past_the_cap_are_counted_and_announced() {
+        let mut a = Activity::default();
+        for n in 0..(MAX_STEPS + 3) {
+            a.apply("turn.step", &ev("t1", &format!("c{n}"), "running"));
+        }
+        // A later event of a dropped step does not count twice.
+        a.apply("turn.step", &ev("t1", &format!("c{}", MAX_STEPS), "done"));
+        assert_eq!(a.steps.len(), MAX_STEPS);
+        assert_eq!(a.dropped, 3);
+        assert_eq!(a.summary(), "67 steps");
+        assert_eq!(a.dropped_note().as_deref(), Some("+3 more steps not shown"));
+        a.apply("turn.step", &ev("t2", "c1", "running"));
+        assert_eq!(a.dropped, 0);
+        assert!(a.dropped_note().is_none());
+    }
+
+    #[test]
+    fn waiting_or_failed_steps_need_attention() {
+        let mut a = Activity::default();
+        a.apply("turn.step", &ev("t1", "c1", "done"));
+        assert!(!a.needs_attention());
+        a.apply("turn.step", &ev("t1", "c2", "waiting_approval"));
+        assert!(a.needs_attention());
+        a.apply("turn.step", &ev("t1", "c2", "done"));
+        assert!(!a.needs_attention());
+        a.apply("turn.step", &ev("t1", "c3", "failed"));
+        assert!(a.needs_attention());
     }
 
     #[test]

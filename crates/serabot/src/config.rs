@@ -38,6 +38,9 @@ pub struct Config {
     /// Per-user quotas and limits.
     #[serde(default)]
     pub users: UsersConfig,
+    /// Durable server log directory and level (see `logging.rs`).
+    #[serde(default)]
+    pub logging: LoggingConfig,
     #[serde(default)]
     pub policy: PolicyConfig,
     #[serde(default)]
@@ -109,6 +112,7 @@ impl Default for Config {
             api: ApiConfig::default(),
             auth: AuthConfig::default(),
             users: UsersConfig::default(),
+            logging: LoggingConfig::default(),
             policy: PolicyConfig::default(),
             watcher: WatcherConfig::default(),
             onedrive: OneDriveConfig::default(),
@@ -197,6 +201,7 @@ impl Config {
         }
         self.auth.validate()?;
         self.users.validate()?;
+        self.logging.validate()?;
         self.memory.validate()?;
         if !self.server.bind.starts_with("127.")
             && !self.server.bind.starts_with("localhost")
@@ -935,6 +940,55 @@ impl AuthConfig {
         }
         Ok(())
     }
+}
+
+/// Server logging. Logs hold operational detail, so the default directory sits
+/// under the config directory's `data/` (not the world-readable OS temp dir)
+/// and is created owner-only on Unix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoggingConfig {
+    /// Log directory; relative paths resolve against the config directory.
+    #[serde(default = "default_log_dir")]
+    pub dir: String,
+    /// Optional filter directives (`serabot=debug,tower_http=warn`). The
+    /// `RUST_LOG` environment variable wins. Noisy transport crates stay at
+    /// `warn` unless named here.
+    #[serde(default)]
+    pub level: Option<String>,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            dir: default_log_dir(),
+            level: None,
+        }
+    }
+}
+
+impl LoggingConfig {
+    fn validate(&self) -> Result<()> {
+        let path = Path::new(&self.dir);
+        if self.dir.trim().is_empty()
+            || path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(SeraError::Config(
+                "logging.dir must be a non-empty path without `..`".into(),
+            ));
+        }
+        if let Some(level) = &self.level
+            && level.len() > 256
+        {
+            return Err(SeraError::Config("logging.level is too long".into()));
+        }
+        Ok(())
+    }
+}
+
+fn default_log_dir() -> String {
+    "data/logs".into()
 }
 
 /// Per-user quota settings. Enforced from phase 5; validated now so a bad
@@ -3348,6 +3402,18 @@ enabled = false
         let mut config = Config::default();
         config.api.enabled = false;
         config
+    }
+
+    #[test]
+    fn logging_defaults_are_durable_and_dir_is_validated() {
+        let mut config = valid_config();
+        assert_eq!(config.logging.dir, "data/logs");
+        assert!(config.logging.level.is_none());
+        config.validate().unwrap();
+        config.logging.dir = "../escape".into();
+        assert!(config.validate().is_err());
+        config.logging.dir = " ".into();
+        assert!(config.validate().is_err());
     }
 
     #[test]

@@ -1,3 +1,4 @@
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:material_ui/material_ui.dart';
 
 import '../app_state.dart';
@@ -41,9 +42,22 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
-    _app = AppState(widget.session.client);
+    _app = AppState(
+      widget.session.client,
+      // Plugins are not available in widget tests, which also run without
+      // the live stream.
+      networkChanges: widget.startEvents ? _networkChanges() : null,
+    );
     _device = widget.device ?? PlatformDeviceActions();
     _app.start(events: widget.startEvents);
+  }
+
+  /// Fires when the device comes back online or switches network.
+  Stream<void> _networkChanges() {
+    return Connectivity()
+        .onConnectivityChanged
+        .where((results) => !results.contains(ConnectivityResult.none))
+        .map((_) {});
   }
 
   @override

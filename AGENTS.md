@@ -84,4 +84,8 @@ OVH is read-only unless the owner explicitly authorizes an additive installation
 - `crates/serabot-desktop/src/marketplace.rs`, `ui_marketplace.rs`, `ui_integrations.rs` — Integrations & Marketplace screen (v0.37–v0.38). Desktop Install/Enable stay off while `RUNTIME_CALLS_PLUGINS` is `false`.
 - `plugins/` — synthetic catalog manifests. Hosts are placeholders (`*.example.invalid`).
 - `bots/` + `prompts/` — default fleet templates, seeded per user.
-- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status.
+- `crates/serabot/src/logging.rs` — daily files (`[logging] dir`, default `data/logs`, owner-only), redacting ring buffer, shared `DEFAULT_FILTER`; noisy transport crates stay at `warn`.
+- `crates/serabot/src/vault.rs`, `vault_providers.rs`, `api/vault.rs`, `api/browser.rs` — per-user vault, password-manager CLIs (cleared child env, `Zeroizing`), and browser autofill (host-bound).
+- `crates/serabot/src/job_tools.rs`, `bots/jobfinder.toml` — `jobfinder` tools; task/calendar tools use the acting user's id.
+- `crates/serabot/src/api/preview.rs`, `api/workflows.rs`, `api/routines.rs` — artifact preview (owner-only, hash-addressed), per-user workflow plans and routines.
+- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.48.0.

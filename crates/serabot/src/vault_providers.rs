@@ -1983,6 +1983,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn autofill_resolution_never_crosses_users_or_look_alike_hosts() {
+        let (store, users, user) = setup();
+        let other = store
+            .create_user("subject-vp-2", "vp2@example.example", "Synthetic VP2")
+            .unwrap()
+            .id;
+        let runner = fake(Some(0), "synthetic-op-value");
+        let providers = Providers::with_runner(&config_with_op(), runner.clone());
+        vault::put(
+            &users,
+            &user,
+            "bank",
+            &reference_entry(
+                VaultSource::OnePassword,
+                "op://Vault/Bank/password",
+                &["bank.example"],
+            ),
+        )
+        .unwrap();
+        users
+            .set_vault_provider_token(&user, "onepassword", "synthetic-token")
+            .unwrap();
+        // Another user cannot resolve (or even see) this user's entry, with
+        // either field, and no CLI runs on their behalf.
+        for field in [VaultField::Value, VaultField::Username] {
+            assert!(matches!(
+                resolve_for_browser(&users, &providers, &other, "bank", "bank.example", field)
+                    .await,
+                Err(SeraError::NotFound(_))
+            ));
+        }
+        // Look-alike hosts are refused for both fields.
+        for host in ["bank.example.evil.example", "evilbank.example", "example"] {
+            for field in [VaultField::Value, VaultField::Username] {
+                assert!(
+                    matches!(
+                        resolve_for_browser(&users, &providers, &user, "bank", host, field).await,
+                        Err(SeraError::Forbidden(_))
+                    ),
+                    "{host}"
+                );
+            }
+        }
+        assert!(runner.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_cli_child_gets_a_cleared_environment_in_a_real_process() {
+        // `CARGO_MANIFEST_DIR` is set for every cargo test run; a cleared
+        // child must not see it, but must see its own token variable.
+        assert!(std::env::var_os("CARGO_MANIFEST_DIR").is_some());
+        let home = tempfile::TempDir::new().unwrap();
+        let (program, args): (&str, Vec<String>) = if cfg!(windows) {
+            ("cmd", vec!["/C".into(), "set".into()])
+        } else {
+            ("env", Vec::new())
+        };
+        let output = run_in_home(
+            home.path(),
+            Path::new(program),
+            &args,
+            &[("OP_SERVICE_ACCOUNT_TOKEN", "synthetic-token")],
+            Duration::from_secs(20),
+        )
+        .unwrap();
+        let text = output.stdout.to_string();
+        assert!(!text.contains("CARGO_MANIFEST_DIR"), "{text}");
+        assert!(text.contains("OP_SERVICE_ACCOUNT_TOKEN=synthetic-token"));
+    }
+
+    #[test]
+    fn provider_secrets_are_zeroizing_buffers() {
+        // The value types that carry tokens and fetched secrets wipe on
+        // drop; this fails to compile if one is changed to a plain String.
+        fn assert_zeroizing<T: zeroize::Zeroize>(_: &T) {}
+        let output = CommandOutput {
+            status: Some(0),
+            stdout: Zeroizing::new("synthetic".into()),
+        };
+        assert_zeroizing(&output.stdout);
+        let mut value = Zeroizing::new("synthetic-value".to_owned());
+        value.zeroize();
+        assert!(value.is_empty());
+    }
+
+    #[tokio::test]
     async fn username_fill_needs_no_cli_and_no_token() {
         let (_, users, user) = setup();
         let runner = fake(Some(0), "unused");

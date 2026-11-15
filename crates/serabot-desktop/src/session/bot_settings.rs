@@ -453,7 +453,7 @@ impl Session {
         }
     }
 
-    fn can_remove(&self, id: &str) -> bool {
+    pub(super) fn can_remove(&self, id: &str) -> bool {
         self.state
             .listed_bots
             .iter()
@@ -483,6 +483,22 @@ impl Session {
 
     pub fn cancel_delete_bot(&mut self) {
         self.bot_settings.confirm_delete = None;
+    }
+
+    /// Remove one of the owner's bots from the catalog row. The server marks a
+    /// shipped bot as owner-removed (so it is not seeded again) and
+    /// "Add to my team" brings it back. Never the orchestrator.
+    pub fn remove_shipped_bot(&mut self, id: String) {
+        if !self.can_remove(&id) || self.bot_settings.lifecycle_busy || !self.can_admin() {
+            return;
+        }
+        self.bot_settings.lifecycle_busy = true;
+        self.bot_settings.deleted = Some(id.clone());
+        self.start_request(Operation::DeleteBot { id });
+        if self.pending.is_none() && self.backlog.is_empty() {
+            self.bot_settings.lifecycle_busy = false;
+            self.bot_settings.deleted = None;
+        }
     }
 
     /// Delete the bot whose confirm step is showing.
@@ -516,6 +532,7 @@ impl Session {
             }
             self.toast = Some("Bot deleted.".into());
         }
+        self.catalog_refresh = true;
         self.schedule(Operation::ListBots, Duration::ZERO);
         self.panel.ask_profiles();
     }

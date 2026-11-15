@@ -839,6 +839,12 @@ async fn bot_catalog_lists_templates_and_install_is_per_user() {
     let unknown = call(&app, &owner, "GET", "/v1/bots/nobody/avatar", None).await;
     assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
     assert_eq!(entry(&catalog, "main")["installed"], true);
+    // Owner removal is not re-seeded by the upgrade that every read re-runs,
+    // and the totals let the console show "Bots N of M".
+    assert_eq!(catalog["templates_total"], 2);
+    assert_eq!(catalog["installed_total"], 1);
+    assert_eq!(entry(&catalog, "main")["enabled"], true);
+    assert_eq!(entry(&catalog, "watcher")["enabled"], false);
 
     let installed = call(
         &app,

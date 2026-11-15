@@ -111,6 +111,95 @@ pub fn unseen_badge(count: usize) -> Option<String> {
     }
 }
 
+/// Lower-cased text a transcript search looks in, built once per row: the
+/// message and who said it.
+pub fn search_haystack(content: &str, speaker: &str) -> String {
+    let mut text = content.to_lowercase();
+    text.push('\n');
+    text.push_str(&speaker.to_lowercase());
+    text
+}
+
+/// Whether a row matches a trimmed, lower-cased search needle.
+pub fn row_matches(haystack: &str, needle: &str) -> bool {
+    !needle.is_empty() && haystack.contains(needle)
+}
+
+/// Forget the rows that already had their entrance animation once the set has
+/// outgrown the transcript, so a long-lived chat does not keep every id it
+/// ever saw. Rows still on screen are kept (no animation replays).
+pub fn trim_entered<'a>(
+    entered: &mut std::collections::HashSet<String>,
+    live: impl IntoIterator<Item = &'a str>,
+    rows: usize,
+) {
+    if entered.len() <= rows.saturating_add(ENTERED_SLACK) {
+        return;
+    }
+    let live: std::collections::HashSet<&str> = live.into_iter().collect();
+    entered.retain(|id| live.contains(id.as_str()));
+}
+
+/// How far the entrance-animation set may run ahead of the rows on screen.
+const ENTERED_SLACK: usize = 64;
+
+/// A fingerprint of everything a transcript row is drawn from, so the view
+/// rebuilds its rows only when one of them changed. `context` carries what
+/// the rows depend on besides the messages (speaker names, group mode, ...).
+pub fn transcript_fingerprint(messages: &[crate::Message], context: impl std::hash::Hash) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    context.hash(&mut hasher);
+    messages.len().hash(&mut hasher);
+    for message in messages {
+        message.id.hash(&mut hasher);
+        (message.role == crate::Role::User).hash(&mut hasher);
+        message.content.hash(&mut hasher);
+        message.created_at.hash(&mut hasher);
+        message.name.hash(&mut hasher);
+        message.bot.hash(&mut hasher);
+        message.limit_reached.hash(&mut hasher);
+        message.attachments.len().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// What the live region says when a reply lands.
+pub fn reply_announcement(speaker: &str) -> String {
+    let speaker = speaker.trim();
+    if speaker.is_empty() {
+        "A reply arrived".into()
+    } else {
+        format!("{speaker} replied")
+    }
+}
+
+/// The unread badge in the rail: nothing at zero, `99+` past 99.
+pub fn unread_badge(count: i64) -> Option<String> {
+    match count {
+        i64::MIN..=0 => None,
+        1..=99 => Some(count.to_string()),
+        _ => Some("99+".into()),
+    }
+}
+
+/// What a screen reader says for an unread badge.
+pub fn unread_label(count: i64) -> String {
+    match count {
+        i64::MIN..=0 => "No unread messages".into(),
+        1 => "1 unread message".into(),
+        2..=99 => format!("{count} unread messages"),
+        _ => "More than 99 unread messages".into(),
+    }
+}
+
+/// A bot's badge: its main chat plus every other chat of that bot.
+pub fn rolled_up_unread<'a>(primary: i64, others: impl IntoIterator<Item = &'a i64>) -> i64 {
+    others.into_iter().fold(primary.max(0), |total, count| {
+        total.saturating_add((*count).max(0))
+    })
+}
+
 const MAIN_SUGGESTIONS: &[&str] = &[
     "Plan my week from my deadlines",
     "Summarize the files in my inbox",
@@ -292,6 +381,83 @@ pub fn assign_library_to_messages(
 
 #[cfg(test)]
 mod tests {
+    fn synthetic(id: &str, text: &str) -> crate::Message {
+        crate::Message {
+            id: id.into(),
+            role: crate::Role::Assistant,
+            content: text.into(),
+            created_at: "2026-10-29T10:00:00.000Z".into(),
+            name: None,
+            bot: None,
+            attachments: Vec::new(),
+            limit_reached: false,
+        }
+    }
+
+    #[test]
+    fn the_fingerprint_changes_with_content_rows_and_context_only() {
+        let rows = vec![synthetic("m1", "hello"), synthetic("m2", "world")];
+        let base = transcript_fingerprint(&rows, ("dir:main", true));
+        assert_eq!(
+            base,
+            transcript_fingerprint(&rows.clone(), ("dir:main", true))
+        );
+        let mut grown = rows.clone();
+        grown[1].content.push_str(" and more");
+        assert_ne!(base, transcript_fingerprint(&grown, ("dir:main", true)));
+        let mut longer = rows.clone();
+        longer.push(synthetic("m3", "x"));
+        assert_ne!(base, transcript_fingerprint(&longer, ("dir:main", true)));
+        assert_ne!(base, transcript_fingerprint(&rows, ("dir:main", false)));
+        let mut limited = rows.clone();
+        limited[0].limit_reached = true;
+        assert_ne!(base, transcript_fingerprint(&limited, ("dir:main", true)));
+    }
+
+    #[test]
+    fn search_uses_one_lowercase_haystack_per_row() {
+        let hay = search_haystack("Quarterly REPORT is ready", "Analyst");
+        assert!(row_matches(&hay, "report"));
+        assert!(row_matches(&hay, "analyst"));
+        assert!(!row_matches(&hay, "invoice"));
+        assert!(!row_matches(&hay, ""), "an empty needle matches nothing");
+    }
+
+    #[test]
+    fn the_entered_set_is_trimmed_to_the_rows_on_screen_once_it_outgrows_them() {
+        let mut entered: std::collections::HashSet<String> =
+            (0..200).map(|n| format!("old-{n}")).collect();
+        entered.insert("live-1".into());
+        trim_entered(&mut entered, ["live-1", "live-2"], 2);
+        assert_eq!(entered.len(), 1);
+        assert!(entered.contains("live-1"));
+        // Within the slack nothing is dropped.
+        let mut small: std::collections::HashSet<String> =
+            ["a".to_owned(), "b".to_owned()].into_iter().collect();
+        trim_entered(&mut small, ["a"], 1);
+        assert_eq!(small.len(), 2);
+    }
+
+    #[test]
+    fn a_finished_reply_is_announced_by_speaker() {
+        assert_eq!(reply_announcement("Analyst"), "Analyst replied");
+        assert_eq!(reply_announcement("  "), "A reply arrived");
+    }
+
+    #[test]
+    fn unread_badges_cap_at_99_and_roll_up_child_chats() {
+        assert_eq!(unread_badge(0), None);
+        assert_eq!(unread_badge(-3), None);
+        assert_eq!(unread_badge(7).as_deref(), Some("7"));
+        assert_eq!(unread_badge(99).as_deref(), Some("99"));
+        assert_eq!(unread_badge(100).as_deref(), Some("99+"));
+        assert_eq!(unread_label(1), "1 unread message");
+        assert_eq!(unread_label(4), "4 unread messages");
+        assert_eq!(unread_label(250), "More than 99 unread messages");
+        assert_eq!(rolled_up_unread(4, [&2, &0, &-1]), 6);
+        assert_eq!(rolled_up_unread(0, std::iter::empty::<&i64>()), 0);
+    }
+
     use super::*;
 
     #[test]
