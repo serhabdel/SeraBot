@@ -179,6 +179,12 @@ pub struct State {
     /// "no preview; use download/open". A hash has at most one read in flight,
     /// tracked by the session.
     pub doc_previews: BTreeMap<String, Option<crate::preview::ArtifactPreview>>,
+    /// Right sidebar visual preview dock state (0.44.0).
+    pub preview_dock_hash: Option<String>,
+    pub preview_dock_wide: bool,
+    pub preview_dock_page: usize,
+    pub preview_dock_zoom: u16,
+    pub preview_dock_text_mode: bool,
     /// Media files already read back for inline players (capped, 0.24).
     pub media_previews: crate::media_view::PreviewCache,
     /// The owner's per-turn work limits (0.24), once read or saved.
@@ -315,6 +321,11 @@ impl Default for State {
             workflows_loaded: false,
             workflows_error: None,
             doc_previews: BTreeMap::new(),
+            preview_dock_hash: None,
+            preview_dock_wide: false,
+            preview_dock_page: 0,
+            preview_dock_zoom: 100,
+            preview_dock_text_mode: false,
             media_previews: crate::media_view::PreviewCache::default(),
             turn_limits: None,
             turn_limits_error: None,

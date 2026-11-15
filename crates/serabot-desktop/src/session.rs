@@ -1519,6 +1519,50 @@ impl Session {
         }
     }
 
+    /// Open the right sidebar visual preview dock for an artifact hash.
+    pub fn open_preview_dock(&mut self, hash: &str) {
+        self.state.preview_dock_hash = Some(hash.to_owned());
+        self.state.preview_dock_page = 0;
+        self.state.preview_dock_zoom = 100;
+        self.state.preview_dock_text_mode = false;
+        self.bot_settings.open = false;
+        self.request_doc_preview(hash.to_owned());
+    }
+
+    /// Close the right sidebar visual preview dock.
+    pub fn close_preview_dock(&mut self) {
+        self.state.preview_dock_hash = None;
+    }
+
+    /// Toggle the preview dock between standard and wide widths.
+    pub fn toggle_preview_dock_wide(&mut self) {
+        self.state.preview_dock_wide = !self.state.preview_dock_wide;
+    }
+
+    /// Switch the active page/slide/sheet index in the preview dock.
+    pub fn set_preview_dock_page(&mut self, page: usize) {
+        self.state.preview_dock_page = page;
+    }
+
+    /// Set the zoom percentage (clamped to 25..=300) in the preview dock.
+    pub fn set_preview_dock_zoom(&mut self, zoom: u16) {
+        self.state.preview_dock_zoom = zoom.clamp(25, 300);
+    }
+
+    /// Toggle between the rich visual renderer and raw text mode in the preview dock.
+    pub fn toggle_preview_dock_text_mode(&mut self) {
+        self.state.preview_dock_text_mode = !self.state.preview_dock_text_mode;
+    }
+
+    /// Toggle the right sidebar preview dock for an artifact hash.
+    pub fn toggle_doc_preview(&mut self, hash: &str) {
+        if self.state.preview_dock_hash.as_deref() == Some(hash) {
+            self.close_preview_dock();
+        } else {
+            self.open_preview_dock(hash);
+        }
+    }
+
     /// Read the live sandbox posture from `GET /v1/status`.
     ///
     /// The read runs on its own thread so the console never blocks on it. A
