@@ -1,21 +1,42 @@
-//! Server-rendered artifact previews (0.28.0, phase C3):
+//! Server-rendered artifact previews (0.28.0, phase C3; upgraded v0.44.0):
 //! `GET /v1/artifacts/{hash}/preview` returns a JSON envelope with metadata
-//! and a preview payload for the formats the server can render — pdf (page
-//! text), pptx (slide text), xlsx (first rows as a JSON grid), docx (first
-//! blocks), md (text). The artifact store is read only; ownership is gated
-//! exactly like the download endpoint, so a foreign hash is a 404.
+//! and a rich visual preview payload for the formats the server can render —
+//! image (base64 + dimensions), pdf (page text + SVG-ready geometry), pptx
+//! (slide text + positioned visual shapes), xlsx (sheet grids + multi-sheet
+//! array), docx (blocks + structured rich_blocks), md (text). The artifact
+//! store is read only; ownership is gated exactly like the download endpoint,
+//! so a foreign hash is a 404.
 
+#[path = "preview_pdf.rs"]
+mod preview_pdf;
+
+use std::io::Cursor;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 
 use super::*;
 
 /// Characters of text a preview payload carries at most.
 pub(super) const MAX_PREVIEW_CHARS: usize = 8_000;
+/// Maximum source artifact size for image/visual previews (20 MiB).
+const PREVIEW_SOURCE_CAP_BYTES: usize = 20 * 1024 * 1024;
 /// Rows/columns of a spreadsheet grid preview.
 const GRID_MAX_ROWS: usize = 50;
 const GRID_MAX_COLS: usize = 26;
+/// Multi-sheet spreadsheet preview bounds.
+const XLSX_MAX_SHEETS: usize = 12;
+const XLSX_MAX_ROWS: usize = 120;
 /// Blocks of a docx preview.
 const DOCX_MAX_BLOCKS: usize = 50;
+const DOCX_MAX_RICH_BLOCKS: usize = 150;
+/// Visual PPTX preview bounds.
+const PPTX_MAX_PREVIEW_SLIDES: usize = 50;
+const PPTX_MAX_SHAPES_PER_SLIDE: usize = 60;
+/// Embedded image bounds for PPTX/DOCX rich previews.
+const MAX_EMBEDDED_IMAGE_BYTES: usize = 1_536 * 1024;
+const MAX_TOTAL_EMBEDDED_IMAGE_BYTES: usize = 6 * 1024 * 1024;
 
 #[derive(Debug, Serialize)]
 struct PreviewPayload {
@@ -54,6 +75,9 @@ pub(super) async fn artifact_preview(
         "xlsx" | "xlsm" => ("xlsx", xlsx_preview(&artifact.bytes)?),
         "docx" => ("docx", docx_preview(&artifact.bytes)?),
         "md" | "markdown" => ("md", md_preview(&artifact.bytes)),
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "svg" => {
+            ("image", image_preview(&artifact.bytes, &extension)?)
+        }
         _ => {
             return Err(SeraError::Validation(
                 "no server preview for this artifact type".into(),
@@ -111,6 +135,17 @@ fn human_readable_text(kind: &str, payload: &PreviewPayload) -> String {
     let raw = match &payload.preview {
         Value::String(text) => text.clone(),
         Value::Object(obj) => match kind {
+            "image" => {
+                let w = obj.get("width").and_then(Value::as_u64);
+                let h = obj.get("height").and_then(Value::as_u64);
+                match (w, h) {
+                    (Some(w), Some(h)) => format!("Image ({w}×{h} px)"),
+                    _ => {
+                        let size = obj.get("size_bytes").and_then(Value::as_u64).unwrap_or(0);
+                        format!("Image ({size} bytes)")
+                    }
+                }
+            }
             "pdf" => obj
                 .get("text")
                 .and_then(Value::as_str)
@@ -170,6 +205,112 @@ fn human_readable_text(kind: &str, payload: &PreviewPayload) -> String {
         _ => String::new(),
     };
     clip(&raw, MAX_PREVIEW_CHARS).0
+}
+
+/// Image: base64-encoded image bytes with detected dimensions.
+fn image_preview(bytes: &[u8], extension: &str) -> Result<PreviewPayload> {
+    if bytes.len() > PREVIEW_SOURCE_CAP_BYTES {
+        return Err(SeraError::Validation(format!(
+            "image exceeds {} MiB preview limit",
+            PREVIEW_SOURCE_CAP_BYTES / (1024 * 1024)
+        )));
+    }
+    let content_type = match extension {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        _ => "application/octet-stream",
+    };
+    let (width, height) = detect_image_dimensions(bytes, extension);
+    let image_b64 = BASE64_STANDARD.encode(bytes);
+    Ok(json_payload(
+        json!({
+            "content_type": content_type,
+            "width": width,
+            "height": height,
+            "size_bytes": bytes.len(),
+            "image_b64": image_b64,
+        }),
+        false,
+    ))
+}
+
+fn detect_image_dimensions(bytes: &[u8], extension: &str) -> (Option<u32>, Option<u32>) {
+    if extension == "svg" {
+        return parse_svg_dimensions(bytes);
+    }
+    if let Ok(reader) = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format()
+        && let Ok((w, h)) = reader.into_dimensions()
+    {
+        return (Some(w), Some(h));
+    }
+    if extension == "gif"
+        && bytes.len() >= 10
+        && (&bytes[..6] == b"GIF87a" || &bytes[..6] == b"GIF89a")
+    {
+        let w = u16::from_le_bytes([bytes[6], bytes[7]]) as u32;
+        let h = u16::from_le_bytes([bytes[8], bytes[9]]) as u32;
+        return (Some(w), Some(h));
+    }
+    if extension == "bmp" && bytes.len() >= 26 && &bytes[..2] == b"BM" {
+        let w = i32::from_le_bytes([bytes[18], bytes[19], bytes[20], bytes[21]]).unsigned_abs();
+        let h = i32::from_le_bytes([bytes[22], bytes[23], bytes[24], bytes[25]]).unsigned_abs();
+        return (Some(w), Some(h));
+    }
+    (None, None)
+}
+
+fn parse_svg_dimensions(bytes: &[u8]) -> (Option<u32>, Option<u32>) {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return (None, None);
+    };
+    let head: String = text.chars().take(4096).collect();
+    let lower = head.to_ascii_lowercase();
+    if let Some(vb) = extract_xml_attr(&lower, "viewbox") {
+        let nums: Vec<f64> = vb
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse::<f64>().ok())
+            .collect();
+        if nums.len() >= 4 && nums[2] > 0.0 && nums[3] > 0.0 {
+            return (Some(nums[2].round() as u32), Some(nums[3].round() as u32));
+        }
+    }
+    let w = extract_xml_attr(&lower, "width").and_then(|v| parse_svg_len(&v));
+    let h = extract_xml_attr(&lower, "height").and_then(|v| parse_svg_len(&v));
+    (w, h)
+}
+
+fn extract_xml_attr(xml: &str, name: &str) -> Option<String> {
+    for quote in ['"', '\''] {
+        let pat = format!("{name}={quote}");
+        if let Some(pos) = xml.find(&pat) {
+            let rest = &xml[pos + pat.len()..];
+            if let Some(end) = rest.find(quote) {
+                return Some(rest[..end].trim().to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn parse_svg_len(val: &str) -> Option<u32> {
+    let trimmed = val
+        .trim()
+        .trim_end_matches("px")
+        .trim_end_matches("pt")
+        .trim();
+    if trimmed.ends_with('%') {
+        return None;
+    }
+    trimmed
+        .parse::<f64>()
+        .ok()
+        .filter(|v| *v > 0.0)
+        .map(|v| v.round() as u32)
 }
 
 /// Best-effort fallback when `extract_pdf_text` yields no text: walk page
@@ -247,9 +388,7 @@ fn extract_pdf_literal_strings(bytes: &[u8]) -> Option<String> {
     (!joined.trim().is_empty()).then_some(joined)
 }
 
-/// PDF: page count from the structural inspect, page-1-first text bounded to
-/// [`MAX_PREVIEW_CHARS`]. (No rasterizer is linked, so the text form is the
-/// preview the server can produce.)
+/// PDF: page count, bounded text, and SVG-ready page geometry (`pages`).
 fn pdf_preview(bytes: &[u8], title: &str, filename: &str) -> Result<PreviewPayload> {
     let info = crate::pdf_ops::inspect(bytes)?;
     let mut text = crate::documents::extract_pdf_text(bytes.to_vec()).unwrap_or_default();
@@ -270,18 +409,325 @@ fn pdf_preview(bytes: &[u8], title: &str, filename: &str) -> Result<PreviewPaylo
         );
     }
     let (text, truncated) = clip(&text, MAX_PREVIEW_CHARS);
+    let pages = preview_pdf::extract_pdf_pages(bytes);
     Ok(json_payload(
-        json!({"page_count": info.page_count, "text": text}),
+        json!({"page_count": info.page_count, "text": text, "pages": pages}),
         truncated,
     ))
 }
 
-/// PPTX: slide text starting at slide 1, bounded.
+/// PPTX: slide text plus structured visual slide geometry & shapes.
 #[cfg(feature = "pptx")]
 fn pptx_preview(bytes: &[u8]) -> Result<PreviewPayload> {
-    let text = crate::pptx_ops::slide_plain_text(bytes, MAX_PREVIEW_CHARS)?;
-    let (text, truncated) = clip(&text, MAX_PREVIEW_CHARS);
-    Ok(text_payload(text, truncated))
+    use deckcraft_model::{Background, Presentation, Shape, ShapeKind, resolve};
+
+    let full_text = crate::pptx_ops::slide_plain_text(bytes, MAX_PREVIEW_CHARS)?;
+    let (text, truncated) = clip(&full_text, MAX_PREVIEW_CHARS);
+
+    let presentation: Presentation =
+        catch_unwind(AssertUnwindSafe(|| deckcraft_pptx::import(bytes)))
+            .map_err(|_| SeraError::Validation("malformed PPTX: importer aborted".into()))?
+            .map_err(|err| SeraError::Validation(format!("cannot read PPTX: {err}")))?;
+
+    let slide_count = presentation.slides.len();
+    let slide_w =
+        if presentation.slide_size.width.is_finite() && presentation.slide_size.width > 0.0 {
+            presentation.slide_size.width
+        } else {
+            720.0
+        };
+    let slide_h =
+        if presentation.slide_size.height.is_finite() && presentation.slide_size.height > 0.0 {
+            presentation.slide_size.height
+        } else {
+            405.0
+        };
+
+    let mut total_image_bytes = 0usize;
+    let mut slides = Vec::with_capacity(slide_count.min(PPTX_MAX_PREVIEW_SLIDES));
+
+    for (idx, slide) in presentation
+        .slides
+        .iter()
+        .take(PPTX_MAX_PREVIEW_SLIDES)
+        .enumerate()
+    {
+        let ctx = resolve::Ctx::for_slide(&presentation, slide);
+        let title = pptx_slide_title(slide);
+        let slide_text = pptx_slide_text(slide);
+
+        let background_hex = ctx.as_ref().and_then(|c| {
+            let bg = slide
+                .background
+                .as_ref()
+                .or_else(|| c.layout.and_then(|l| l.background.as_ref()))
+                .or(c.master.background.as_ref())?;
+            match bg {
+                Background::Fill { fill } => pptx_fill_hex(c, fill, None),
+                Background::Ref { color, .. } => Some(rgba_to_hex(c.color(color, None))),
+            }
+        });
+
+        let mut flat_shapes: Vec<&Shape> = Vec::new();
+        deckcraft_model::walk(&slide.shapes, &mut |shape, _| {
+            if !shape.hidden {
+                flat_shapes.push(shape);
+            }
+        });
+
+        let mut shapes_json = Vec::new();
+        for shape in flat_shapes {
+            if shapes_json.len() >= PPTX_MAX_SHAPES_PER_SLIDE {
+                break;
+            }
+            if matches!(shape.kind, ShapeKind::Group { .. }) {
+                continue;
+            }
+            let xfrm = if let Some(c) = &ctx {
+                resolve::xfrm(c, shape)
+            } else {
+                shape.xfrm.unwrap_or_default()
+            };
+            let fill_hex = ctx.as_ref().and_then(|c| {
+                let (fill, ph) = resolve::fill(c, shape);
+                fill.as_ref().and_then(|f| pptx_fill_hex(c, f, ph))
+            });
+            let stroke_hex = ctx.as_ref().and_then(|c| {
+                let (line, ph) = resolve::line(c, shape);
+                let width = line.width.unwrap_or(1.0);
+                if width <= 0.0 {
+                    return None;
+                }
+                line.fill.as_ref().and_then(|f| pptx_fill_hex(c, f, ph))
+            });
+
+            match &shape.kind {
+                ShapeKind::Picture { fill } => {
+                    let mut image_b64: Option<String> = None;
+                    let mut image_mime: Option<String> = None;
+                    if let Some(media) = presentation.media.iter().find(|m| m.id == fill.media)
+                        && !media.data.is_empty()
+                        && media.data.len() <= MAX_EMBEDDED_IMAGE_BYTES
+                        && total_image_bytes + media.data.len() <= MAX_TOTAL_EMBEDDED_IMAGE_BYTES
+                    {
+                        total_image_bytes += media.data.len();
+                        image_b64 = Some(BASE64_STANDARD.encode(media.data.as_slice()));
+                        let mime = if !media.content_type.is_empty() {
+                            media.content_type.clone()
+                        } else {
+                            crate::util::mime_for_filename(&media.name).to_owned()
+                        };
+                        image_mime = Some(mime);
+                    }
+                    shapes_json.push(json!({
+                        "kind": "image",
+                        "x_pt": round2_f64(xfrm.x),
+                        "y_pt": round2_f64(xfrm.y),
+                        "w_pt": round2_f64(xfrm.w),
+                        "h_pt": round2_f64(xfrm.h),
+                        "fill_hex": fill_hex,
+                        "stroke_hex": stroke_hex,
+                        "image_b64": image_b64,
+                        "image_mime": image_mime,
+                    }));
+                }
+                ShapeKind::Table(table) => {
+                    let rows: Vec<Vec<String>> = table
+                        .rows
+                        .iter()
+                        .take(40)
+                        .map(|row| {
+                            row.cells
+                                .iter()
+                                .take(20)
+                                .map(|cell| cell.text.text().trim().to_owned())
+                                .collect()
+                        })
+                        .collect();
+                    shapes_json.push(json!({
+                        "kind": "table",
+                        "x_pt": round2_f64(xfrm.x),
+                        "y_pt": round2_f64(xfrm.y),
+                        "w_pt": round2_f64(xfrm.w),
+                        "h_pt": round2_f64(xfrm.h),
+                        "fill_hex": fill_hex,
+                        "stroke_hex": stroke_hex,
+                        "rows": rows,
+                    }));
+                }
+                _ => {
+                    let body_text = shape
+                        .text
+                        .as_ref()
+                        .map(|t| t.text().trim().to_owned())
+                        .unwrap_or_default();
+                    if !body_text.is_empty() {
+                        let (font_size, color_hex, bold, align) =
+                            pptx_text_style(ctx.as_ref(), shape);
+                        shapes_json.push(json!({
+                            "kind": "text",
+                            "x_pt": round2_f64(xfrm.x),
+                            "y_pt": round2_f64(xfrm.y),
+                            "w_pt": round2_f64(xfrm.w),
+                            "h_pt": round2_f64(xfrm.h),
+                            "fill_hex": fill_hex,
+                            "stroke_hex": stroke_hex,
+                            "text": body_text,
+                            "font_size": font_size,
+                            "color_hex": color_hex,
+                            "bold": bold,
+                            "align": align,
+                        }));
+                    } else if fill_hex.is_some() || stroke_hex.is_some() {
+                        shapes_json.push(json!({
+                            "kind": "rect",
+                            "x_pt": round2_f64(xfrm.x),
+                            "y_pt": round2_f64(xfrm.y),
+                            "w_pt": round2_f64(xfrm.w),
+                            "h_pt": round2_f64(xfrm.h),
+                            "fill_hex": fill_hex,
+                            "stroke_hex": stroke_hex,
+                        }));
+                    }
+                }
+            }
+        }
+
+        slides.push(json!({
+            "slide": idx + 1,
+            "title": title,
+            "text": slide_text,
+            "width_pt": round2_f64(slide_w),
+            "height_pt": round2_f64(slide_h),
+            "background_hex": background_hex,
+            "shapes": shapes_json,
+        }));
+    }
+
+    Ok(json_payload(
+        json!({
+            "slide_count": slide_count,
+            "text": text,
+            "slides": slides,
+        }),
+        truncated,
+    ))
+}
+
+#[cfg(feature = "pptx")]
+fn pptx_slide_title(slide: &deckcraft_model::Slide) -> String {
+    let title = slide.title();
+    let trimmed = title.trim();
+    if !trimmed.is_empty() {
+        return trimmed.to_owned();
+    }
+    let mut first_line = String::new();
+    deckcraft_model::walk(&slide.shapes, &mut |shape, _| {
+        if !first_line.is_empty() {
+            return;
+        }
+        if let Some(body) = &shape.text {
+            let text = body.text();
+            if let Some(line) = text.lines().find(|l| !l.trim().is_empty()) {
+                first_line = line.trim().to_owned();
+            }
+        }
+    });
+    first_line
+}
+
+#[cfg(feature = "pptx")]
+fn pptx_slide_text(slide: &deckcraft_model::Slide) -> String {
+    let mut parts = Vec::new();
+    deckcraft_model::walk(&slide.shapes, &mut |shape, _| {
+        if let Some(body) = &shape.text {
+            let t = body.text();
+            let trimmed = t.trim();
+            if !trimmed.is_empty() {
+                parts.push(trimmed.to_owned());
+            }
+        }
+    });
+    let notes = slide.notes.text();
+    if !notes.trim().is_empty() {
+        parts.push(format!("speaker notes:\n{}", notes.trim()));
+    }
+    parts.join("\n")
+}
+
+#[cfg(feature = "pptx")]
+fn pptx_fill_hex(
+    ctx: &deckcraft_model::resolve::Ctx<'_>,
+    fill: &deckcraft_model::Fill,
+    ph: Option<deckcraft_model::Rgba>,
+) -> Option<String> {
+    match fill {
+        deckcraft_model::Fill::Solid { color } => Some(rgba_to_hex(ctx.color(color, ph))),
+        deckcraft_model::Fill::Gradient(g) => g
+            .stops
+            .first()
+            .map(|stop| rgba_to_hex(ctx.color(&stop.color, ph))),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "pptx")]
+fn pptx_text_style(
+    ctx: Option<&deckcraft_model::resolve::Ctx<'_>>,
+    shape: &deckcraft_model::Shape,
+) -> (f64, String, bool, &'static str) {
+    use deckcraft_model::text::Align;
+    let Some(body) = &shape.text else {
+        return (14.0, "#111111".to_owned(), false, "left");
+    };
+    let first_para = body.paragraphs.iter().find(|p| !p.text().trim().is_empty());
+    let align = match first_para.and_then(|p| p.props.align) {
+        Some(Align::Center) => "center",
+        Some(Align::Right) => "right",
+        Some(Align::Justify | Align::JustLow | Align::Distributed) => "justify",
+        _ => "left",
+    };
+    let first_run = first_para.and_then(|p| p.runs.iter().find(|r| !r.text.trim().is_empty()));
+    let mut font_size = first_run.and_then(|r| r.props.size).unwrap_or(14.0);
+    let mut bold = first_run.and_then(|r| r.props.bold).unwrap_or(false);
+    let mut color_hex = first_run
+        .and_then(|r| r.props.fill.as_ref())
+        .and_then(|f| ctx.and_then(|c| pptx_fill_hex(c, f, None)))
+        .unwrap_or_else(|| "#111111".to_owned());
+
+    if let Some(c) = ctx
+        && first_run.is_some_and(|r| r.props.size.is_none() || r.props.fill.is_none())
+    {
+        let level = first_para.map(|p| p.level).unwrap_or(0);
+        let style = deckcraft_model::resolve::level_style(c, shape, level);
+        if first_run.and_then(|r| r.props.size).is_none()
+            && let Some(sz) = style.run.size
+        {
+            font_size = sz;
+        }
+        if first_run.and_then(|r| r.props.bold).is_none()
+            && let Some(b) = style.run.bold
+        {
+            bold = b;
+        }
+        if first_run.and_then(|r| r.props.fill.as_ref()).is_none()
+            && let Some(f) = style.run.fill.as_ref()
+            && let Some(hex) = pptx_fill_hex(c, f, None)
+        {
+            color_hex = hex;
+        }
+    }
+
+    (round2_f64(font_size), color_hex, bold, align)
+}
+
+#[cfg(feature = "pptx")]
+fn rgba_to_hex(c: deckcraft_model::Rgba) -> String {
+    format!("#{:02X}{:02X}{:02X}", c.r, c.g, c.b)
+}
+
+fn round2_f64(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
 }
 
 #[cfg(not(feature = "pptx"))]
@@ -291,16 +737,17 @@ fn pptx_preview(_bytes: &[u8]) -> Result<PreviewPayload> {
     ))
 }
 
-/// XLSX: the first sheet's leading rows as a JSON grid.
+/// XLSX: the first sheet's leading rows as a JSON grid plus multi-sheet `sheets`.
 fn xlsx_preview(bytes: &[u8]) -> Result<PreviewPayload> {
     let workbook = crate::workbooks::import(bytes)?;
-    let Some(sheet) = workbook.sheet_names().first().copied() else {
+    let sheet_names = workbook.sheet_names();
+    let Some(&first_sheet) = sheet_names.first() else {
         return Ok(json_payload(
-            json!({"sheet": Value::Null, "rows": [], "truncated": false}),
+            json!({"sheet": Value::Null, "rows": [], "sheets": [], "truncated": false}),
             false,
         ));
     };
-    let read = match crate::workbooks::read_range(bytes, sheet) {
+    let read = match crate::workbooks::read_range(bytes, first_sheet) {
         Ok(read) => read,
         // A used range over the read cap still previews as bounded text.
         Err(_) => {
@@ -309,13 +756,69 @@ fn xlsx_preview(bytes: &[u8]) -> Result<PreviewPayload> {
             return Ok(text_payload(text, truncated));
         }
     };
+    let (first_rows, first_truncated) = grid_from_range_read(&read, GRID_MAX_ROWS, GRID_MAX_COLS);
+
+    let mut sheets = Vec::with_capacity(sheet_names.len().min(XLSX_MAX_SHEETS));
+    for (idx, &sheet_name) in sheet_names.iter().take(XLSX_MAX_SHEETS).enumerate() {
+        if idx == 0 {
+            let (rows, trunc) = grid_from_range_read(&read, XLSX_MAX_ROWS, GRID_MAX_COLS);
+            sheets.push(json!({
+                "name": read.sheet,
+                "range": read.range,
+                "rows": rows,
+                "truncated": trunc,
+            }));
+            continue;
+        }
+        let sheet_read = crate::workbooks::read_range(bytes, sheet_name).or_else(|_| {
+            let escaped = sheet_name.replace('\'', "''");
+            crate::workbooks::read_range(bytes, &format!("'{escaped}'!A1:Z75"))
+        });
+        match sheet_read {
+            Ok(sr) => {
+                let (rows, trunc) = grid_from_range_read(&sr, XLSX_MAX_ROWS, GRID_MAX_COLS);
+                sheets.push(json!({
+                    "name": sr.sheet,
+                    "range": sr.range,
+                    "rows": rows,
+                    "truncated": trunc,
+                }));
+            }
+            Err(_) => {
+                sheets.push(json!({
+                    "name": sheet_name,
+                    "range": "",
+                    "rows": [],
+                    "truncated": true,
+                }));
+            }
+        }
+    }
+
+    Ok(json_payload(
+        json!({
+            "sheet": read.sheet,
+            "range": read.range,
+            "rows": first_rows,
+            "truncated": first_truncated,
+            "sheets": sheets,
+        }),
+        first_truncated,
+    ))
+}
+
+fn grid_from_range_read(
+    read: &crate::workbooks::RangeRead,
+    max_rows: usize,
+    max_cols: usize,
+) -> (Vec<Vec<Value>>, bool) {
     let mut rows: Vec<Vec<Value>> = Vec::new();
     let mut truncated = read.truncated_values > 0;
     for cell in &read.cells {
         let Some((col, row)) = a1_to_col_row(&cell.address) else {
             continue;
         };
-        if row > GRID_MAX_ROWS || col > GRID_MAX_COLS {
+        if row > max_rows || col > max_cols {
             truncated = true;
             continue;
         }
@@ -332,10 +835,7 @@ fn xlsx_preview(bytes: &[u8]) -> Result<PreviewPayload> {
             .or_else(|| cell.cached.clone())
             .unwrap_or(Value::Null);
     }
-    Ok(json_payload(
-        json!({"sheet": read.sheet, "range": read.range, "rows": rows, "truncated": truncated}),
-        truncated,
-    ))
+    (rows, truncated)
 }
 
 /// `A1` → 1-based (column, row).
@@ -356,19 +856,166 @@ fn a1_to_col_row(address: &str) -> Option<(usize, usize)> {
     (seen_col && row > 0).then_some((col, row))
 }
 
-/// DOCX: the first blocks, structured.
+/// DOCX: the first blocks, plus structured `rich_blocks`.
 #[cfg(feature = "docx")]
 fn docx_preview(bytes: &[u8]) -> Result<PreviewPayload> {
     let info = crate::docx_ops::inspect(bytes)?;
     if info.block_count == 0 {
-        return Ok(json_payload(json!({"block_count": 0, "blocks": []}), false));
+        return Ok(json_payload(
+            json!({"block_count": 0, "blocks": [], "rich_blocks": []}),
+            false,
+        ));
     }
     let last = (info.block_count - 1).min(DOCX_MAX_BLOCKS - 1);
     let text = crate::docx_ops::read_blocks(bytes, 0, last)?;
+    let rich_blocks = extract_docx_rich_blocks(bytes);
     Ok(json_payload(
-        json!({"block_count": text.block_count, "blocks": text.blocks}),
+        json!({
+            "block_count": text.block_count,
+            "blocks": text.blocks,
+            "rich_blocks": rich_blocks,
+        }),
         info.block_count > DOCX_MAX_BLOCKS,
     ))
+}
+
+#[cfg(feature = "docx")]
+fn extract_docx_rich_blocks(bytes: &[u8]) -> Vec<Value> {
+    use wordcraft_doc::section::NumFormat;
+    use wordcraft_doc::{Block, InlineObject};
+
+    let Ok(Ok(document)) = catch_unwind(AssertUnwindSafe(|| wordcraft_docx::read(bytes))) else {
+        return Vec::new();
+    };
+
+    let mut rich_blocks = Vec::new();
+    let mut total_image_bytes = 0usize;
+
+    for block in &document.body {
+        if rich_blocks.len() >= DOCX_MAX_RICH_BLOCKS {
+            break;
+        }
+        match block.as_ref() {
+            Block::Para(paragraph) => {
+                for obj in &paragraph.objects {
+                    if rich_blocks.len() >= DOCX_MAX_RICH_BLOCKS {
+                        break;
+                    }
+                    if let InlineObject::Image { media, alt, .. } = obj
+                        && let Some(img_bytes) = document.media.get(media)
+                        && !img_bytes.is_empty()
+                        && img_bytes.len() <= MAX_EMBEDDED_IMAGE_BYTES
+                        && total_image_bytes + img_bytes.len() <= MAX_TOTAL_EMBEDDED_IMAGE_BYTES
+                    {
+                        total_image_bytes += img_bytes.len();
+                        rich_blocks.push(json!({
+                            "kind": "image",
+                            "content_type": crate::util::mime_for_filename(media),
+                            "image_b64": BASE64_STANDARD.encode(img_bytes.as_slice()),
+                            "alt": alt,
+                        }));
+                    }
+                }
+                if rich_blocks.len() >= DOCX_MAX_RICH_BLOCKS {
+                    break;
+                }
+                let clean: String = paragraph
+                    .plain_text()
+                    .chars()
+                    .filter(|&c| c != wordcraft_doc::para::OBJ)
+                    .collect();
+                let trimmed = clean.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Some(level) = docx_heading_level(paragraph.props.style.as_deref()) {
+                    rich_blocks.push(json!({
+                        "kind": "heading",
+                        "level": level,
+                        "text": trimmed,
+                    }));
+                } else if let Some(num_ref) = &paragraph.props.numbering {
+                    let ordered = document
+                        .numbering
+                        .nums
+                        .iter()
+                        .find(|n| n.id == num_ref.num)
+                        .and_then(|n| {
+                            n.level_overrides
+                                .iter()
+                                .find(|(lvl, _)| *lvl == num_ref.level)
+                                .map(|(_, l)| l)
+                                .or_else(|| {
+                                    document
+                                        .numbering
+                                        .abstracts
+                                        .iter()
+                                        .find(|a| a.id == n.abstract_id)
+                                        .and_then(|a| a.levels.get(num_ref.level as usize))
+                                })
+                        })
+                        .is_some_and(|lvl| !matches!(lvl.format, NumFormat::Bullet));
+                    rich_blocks.push(json!({
+                        "kind": "list_item",
+                        "ordered": ordered,
+                        "text": trimmed,
+                    }));
+                } else {
+                    let bold = !paragraph.runs.is_empty()
+                        && paragraph.runs.iter().all(|r| r.props.bold == Some(true));
+                    let italic = !paragraph.runs.is_empty()
+                        && paragraph.runs.iter().all(|r| r.props.italic == Some(true));
+                    rich_blocks.push(json!({
+                        "kind": "paragraph",
+                        "text": trimmed,
+                        "bold": bold,
+                        "italic": italic,
+                    }));
+                }
+            }
+            Block::Table(table) => {
+                let rows: Vec<Vec<String>> = table
+                    .rows
+                    .iter()
+                    .take(100)
+                    .map(|row| {
+                        row.cells
+                            .iter()
+                            .take(32)
+                            .map(|cell| {
+                                cell.blocks
+                                    .iter()
+                                    .filter_map(|b| b.as_para().map(|p| p.plain_text()))
+                                    .map(|s| s.trim().to_owned())
+                                    .filter(|s| !s.is_empty())
+                                    .collect::<Vec<_>>()
+                                    .join(" / ")
+                            })
+                            .collect()
+                    })
+                    .collect();
+                rich_blocks.push(json!({
+                    "kind": "table",
+                    "rows": rows,
+                }));
+            }
+        }
+    }
+
+    rich_blocks
+}
+
+#[cfg(feature = "docx")]
+fn docx_heading_level(style: Option<&str>) -> Option<u8> {
+    let s = style?.trim().to_ascii_lowercase();
+    if s == "title" {
+        return Some(1);
+    }
+    if s == "subtitle" {
+        return Some(2);
+    }
+    let rest = s.strip_prefix("heading")?.trim();
+    rest.parse::<u8>().ok().filter(|&n| (1..=6).contains(&n))
 }
 
 #[cfg(not(feature = "docx"))]
@@ -694,11 +1341,13 @@ mod tests {
                 .contains("--- slide 1 ---")
         );
         assert!(
-            pptx_json["payload"]["preview"]
+            pptx_json["payload"]["preview"]["text"]
                 .as_str()
                 .unwrap()
                 .contains("--- slide 1 ---")
         );
+        assert_eq!(pptx_json["payload"]["preview"]["slide_count"], 3);
+        assert!(pptx_json["payload"]["preview"]["slides"].is_array());
 
         // 4. XLSX
         let xlsx_bytes = {
@@ -781,5 +1430,269 @@ mod tests {
         assert_eq!(md_json["content_type"], "text/plain; charset=utf-8");
         assert_eq!(md_json["text"], "# Markdown Heading\nBody");
         assert_eq!(md_json["payload"]["preview"], "# Markdown Heading\nBody");
+    }
+
+    #[tokio::test]
+    async fn rich_visual_preview_for_image_pdf_pptx_xlsx_and_docx() {
+        let (app, store, artifacts, user_id) = preview_test_app();
+
+        // 1. Image (PNG + SVG)
+        let mut png_bytes = Vec::new();
+        {
+            let img = image::RgbaImage::from_pixel(32, 16, image::Rgba([47, 111, 106, 255]));
+            img.write_to(&mut Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+                .unwrap();
+        }
+        let png_json = fetch_preview(
+            &app,
+            &store,
+            &artifacts,
+            &user_id,
+            png_bytes.clone(),
+            "chart.png",
+            "Chart",
+        )
+        .await;
+        assert_eq!(png_json["kind"], "image");
+        assert_eq!(png_json["text"], "Image (32×16 px)");
+        let png_prev = &png_json["payload"]["preview"];
+        assert_eq!(png_prev["content_type"], "image/png");
+        assert_eq!(png_prev["width"], 32);
+        assert_eq!(png_prev["height"], 16);
+        assert_eq!(png_prev["size_bytes"], png_bytes.len());
+        assert_eq!(png_prev["image_b64"], BASE64_STANDARD.encode(&png_bytes));
+
+        let svg_bytes = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 120"><rect width="240" height="120" fill="#2F6F6A"/></svg>"##.to_vec();
+        let svg_json = fetch_preview(
+            &app,
+            &store,
+            &artifacts,
+            &user_id,
+            svg_bytes,
+            "diagram.svg",
+            "Diagram",
+        )
+        .await;
+        assert_eq!(svg_json["kind"], "image");
+        assert_eq!(svg_json["text"], "Image (240×120 px)");
+        assert_eq!(
+            svg_json["payload"]["preview"]["content_type"],
+            "image/svg+xml"
+        );
+
+        // 2. PDF visual geometry (MediaBox 200x300, background rect, colored rect, text block)
+        let pdf_bytes = build_pdf(
+            b"0.95 0.95 0.95 rg 0 0 200 300 re f 0.18 0.44 0.42 rg 10 200 100 40 re f BT /F1 14 Tf 1 0 0 1 20 260 Tm 0.07 0.07 0.07 rg (Visual Title) Tj ET",
+            1,
+        );
+        let pdf_json = fetch_preview(
+            &app,
+            &store,
+            &artifacts,
+            &user_id,
+            pdf_bytes,
+            "visual.pdf",
+            "Visual PDF",
+        )
+        .await;
+        let pages = pdf_json["payload"]["preview"]["pages"].as_array().unwrap();
+        assert_eq!(pages.len(), 1);
+        let page0 = &pages[0];
+        assert_eq!(page0["page"], 1);
+        assert_eq!(page0["width_pt"], 200.0);
+        assert_eq!(page0["height_pt"], 300.0);
+        assert_eq!(page0["background_hex"], "#F2F2F2");
+        let rects = page0["rects"].as_array().unwrap();
+        assert!(rects.len() >= 2);
+        // Second rect: pdf (10, 200, 100, 40) -> top-left y = 300 - 200 - 40 = 60.0
+        assert_eq!(rects[1]["x_pt"], 10.0);
+        assert_eq!(rects[1]["y_pt"], 60.0);
+        assert_eq!(rects[1]["w_pt"], 100.0);
+        assert_eq!(rects[1]["h_pt"], 40.0);
+        assert_eq!(rects[1]["fill_hex"], "#2E706B");
+        let text_blocks = page0["text_blocks"].as_array().unwrap();
+        assert_eq!(text_blocks.len(), 1);
+        assert_eq!(text_blocks[0]["text"], "Visual Title");
+        assert_eq!(text_blocks[0]["x_pt"], 20.0);
+        assert_eq!(text_blocks[0]["y_pt"], 40.0); // 300 - 260
+        assert_eq!(text_blocks[0]["font_size"], 14.0);
+
+        // 3. PPTX visual slides + shapes
+        let pptx_bytes = {
+            use crate::deck::{Brand, BrandPalette, DeckSection, DeckSpec};
+            let brand = Brand {
+                name: "Test".into(),
+                palette: BrandPalette {
+                    background: "#FFFFFF".into(),
+                    foreground: "#111111".into(),
+                    accent: "#2F6F6A".into(),
+                    muted: "#6B7280".into(),
+                },
+                monogram_text: "T".into(),
+                footer: None,
+                font_family: Some("helvetica".into()),
+            };
+            let spec = DeckSpec {
+                title: "Visual Deck".into(),
+                subtitle: Some("Q4 Review".into()),
+                language: crate::domain::Language::En,
+                date_label: None,
+                author: None,
+                sections: vec![DeckSection {
+                    part_title: None,
+                    title: "Key Metrics".into(),
+                    cards: vec![],
+                    bullets: vec!["Revenue up 20%".into()],
+                }],
+                footer: None,
+            };
+            crate::deck_pptx::render_deck_pptx(&spec, &brand, 10)
+                .unwrap()
+                .bytes
+        };
+        let pptx_json = fetch_preview(
+            &app,
+            &store,
+            &artifacts,
+            &user_id,
+            pptx_bytes,
+            "visual.pptx",
+            "Visual Deck",
+        )
+        .await;
+        let pptx_prev = &pptx_json["payload"]["preview"];
+        assert_eq!(pptx_prev["slide_count"], 3);
+        let slides = pptx_prev["slides"].as_array().unwrap();
+        assert_eq!(slides.len(), 3);
+        assert_eq!(slides[0]["slide"], 1);
+        assert_eq!(slides[0]["width_pt"], 960.0);
+        assert_eq!(slides[0]["height_pt"], 540.0);
+        assert_eq!(slides[0]["background_hex"], "#FFFFFF");
+        let shapes0 = slides[0]["shapes"].as_array().unwrap();
+        assert!(!shapes0.is_empty());
+        assert!(shapes0.iter().any(|s| {
+            s["kind"] == "text"
+                && s["text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("Visual Deck"))
+        }));
+
+        // 4. XLSX multi-sheet
+        let xlsx_bytes = {
+            use crate::workbooks::{CellValue, SheetSpec, WorkbookSpec};
+            crate::workbooks::build(&WorkbookSpec {
+                title: "Multi".into(),
+                language: None,
+                sheets: vec![
+                    SheetSpec {
+                        name: "Summary".into(),
+                        header: vec!["Metric".into(), "Value".into()],
+                        rows: vec![vec![
+                            CellValue::Text("ARR".into()),
+                            CellValue::Number(100.0),
+                        ]],
+                    },
+                    SheetSpec {
+                        name: "Details".into(),
+                        header: vec!["Region".into()],
+                        rows: vec![vec![CellValue::Text("EMEA".into())]],
+                    },
+                ],
+            })
+            .unwrap()
+        };
+        let xlsx_json = fetch_preview(
+            &app,
+            &store,
+            &artifacts,
+            &user_id,
+            xlsx_bytes,
+            "multi.xlsx",
+            "Multi",
+        )
+        .await;
+        let sheets = xlsx_json["payload"]["preview"]["sheets"]
+            .as_array()
+            .unwrap();
+        assert_eq!(sheets.len(), 2);
+        assert_eq!(sheets[0]["name"], "Summary");
+        assert_eq!(sheets[1]["name"], "Details");
+        assert_eq!(sheets[1]["rows"][1][0], "EMEA");
+
+        // 5. DOCX rich_blocks (heading, paragraph, list_item, table)
+        let docx_bytes = {
+            use crate::docx_ops::{DocxBlockSpec, DocxSpec};
+            crate::docx_ops::build(&DocxSpec {
+                title: "Rich Doc".into(),
+                subtitle: None,
+                language: None,
+                blocks: vec![
+                    DocxBlockSpec {
+                        kind: "heading".into(),
+                        level: Some(1),
+                        text: Some("Overview".into()),
+                        items: vec![],
+                        header: vec![],
+                        rows: vec![],
+                    },
+                    DocxBlockSpec {
+                        kind: "paragraph".into(),
+                        level: None,
+                        text: Some("Body paragraph.".into()),
+                        items: vec![],
+                        header: vec![],
+                        rows: vec![],
+                    },
+                    DocxBlockSpec {
+                        kind: "bullets".into(),
+                        level: None,
+                        text: None,
+                        items: vec!["First item".into()],
+                        header: vec![],
+                        rows: vec![],
+                    },
+                    DocxBlockSpec {
+                        kind: "table".into(),
+                        level: None,
+                        text: None,
+                        items: vec![],
+                        header: vec!["Col A".into(), "Col B".into()],
+                        rows: vec![vec!["1".into(), "2".into()]],
+                    },
+                ],
+            })
+            .unwrap()
+        };
+        let docx_json = fetch_preview(
+            &app,
+            &store,
+            &artifacts,
+            &user_id,
+            docx_bytes,
+            "rich.docx",
+            "Rich Doc",
+        )
+        .await;
+        let rich_blocks = docx_json["payload"]["preview"]["rich_blocks"]
+            .as_array()
+            .unwrap();
+        assert!(
+            rich_blocks
+                .iter()
+                .any(|b| b["kind"] == "heading" && b["text"] == "Overview")
+        );
+        assert!(
+            rich_blocks
+                .iter()
+                .any(|b| b["kind"] == "paragraph" && b["text"] == "Body paragraph.")
+        );
+        assert!(rich_blocks.iter().any(|b| b["kind"] == "list_item"
+            && b["ordered"] == false
+            && b["text"] == "First item"));
+        assert!(
+            rich_blocks
+                .iter()
+                .any(|b| b["kind"] == "table" && b["rows"][0][0] == "Col A")
+        );
     }
 }

@@ -35,8 +35,9 @@ use crate::ui_cards::ChatCardRow;
 
 use crate::ui_dock::BrowserDock;
 use crate::ui_files::{
-    COMPOSER_CARET_BRIDGE_JS, COMPOSER_CARET_SETUP_JS, CONFIRM_RESET_JS, ComposerFiles, MediaCards,
-    MessageFiles, PASTE_BRIDGE_JS, PastedFile, copy_script, decode_pasted,
+    COMPOSER_CARET_BRIDGE_JS, COMPOSER_CARET_SETUP_JS, CONFIRM_RESET_JS, ComposerFiles,
+    MessageFiles, PASTE_BRIDGE_JS, PastedFile, TrailingMediaCards, TurnMediaCards, copy_script,
+    decode_pasted,
 };
 use crate::ui_settings::SettingsPanel;
 use crate::ui_settings_page::{

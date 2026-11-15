@@ -252,7 +252,7 @@ async fn preview_renders_every_supported_type_for_the_owner() {
 
     let (_, body) = get_preview(&app, &alice_token, &fixtures[1].hash).await;
     assert!(
-        body["payload"]["preview"]
+        body["payload"]["preview"]["text"]
             .as_str()
             .unwrap()
             .contains("--- slide 1 ---")
@@ -309,12 +309,12 @@ async fn preview_never_leaks_across_users_and_rejects_unsupported_types() {
         b"# Alice only".to_vec(),
         "alice.md",
     );
-    let png = save_fixture(
+    let unsupported = save_fixture(
         &artifacts,
         &store,
         &alice.id,
-        vec![0x89, b'P', b'N', b'G', 1, 2, 3],
-        "synthetic.png",
+        vec![0x7f, b'E', b'L', b'F', 1, 2, 3],
+        "synthetic.bin",
     );
 
     // Another user gets the same 404 as a missing hash.
@@ -326,7 +326,7 @@ async fn preview_never_leaks_across_users_and_rejects_unsupported_types() {
     let (status, _) = get_preview(&app, &alice_token, &md.hash).await;
     assert_eq!(status, StatusCode::OK);
     // A type the server cannot render is a 422, not a crash.
-    let (status, _) = get_preview(&app, &alice_token, &png.hash).await;
+    let (status, _) = get_preview(&app, &alice_token, &unsupported.hash).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     // Unauthenticated is a 401.
     let response = app
