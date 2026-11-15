@@ -147,14 +147,10 @@ pub fn file_icon_src(filename: &str) -> Option<String> {
 
 /// Determine the preview kind from filename or MIME type.
 fn entry_preview_kind(entry: &serabot_desktop::LibraryEntry) -> Option<PreviewKind> {
-    let fname = entry.filename.as_deref().unwrap_or_default();
-    serabot_desktop::preview::preview_kind_for_name(fname).or_else(|| {
-        entry
-            .mime
-            .as_deref()
-            .filter(|m| m.trim().to_ascii_lowercase().starts_with("image/"))
-            .map(|_| PreviewKind::Image)
-    })
+    serabot_desktop::preview::preview_kind_for_entry(
+        entry.filename.as_deref(),
+        entry.mime.as_deref(),
+    )
 }
 
 /// Convert a 0-based column index into an Excel column label (`0 -> A`, `25 -> Z`, `26 -> AA`).

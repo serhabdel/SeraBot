@@ -65,6 +65,24 @@ pub fn preview_kind_for_name(name: &str) -> Option<PreviewKind> {
     }
 }
 
+/// Whether an artifact entry (by filename or MIME type) can be previewed.
+pub fn preview_kind_for_entry(filename: Option<&str>, mime: Option<&str>) -> Option<PreviewKind> {
+    filename.and_then(preview_kind_for_name).or_else(|| {
+        mime.map(str::trim).filter(|m| !m.is_empty()).and_then(|m| {
+            let lower = m.to_ascii_lowercase();
+            if lower.starts_with("image/") {
+                Some(PreviewKind::Image)
+            } else if lower == "application/pdf" {
+                Some(PreviewKind::Pdf)
+            } else if lower == "text/markdown" {
+                Some(PreviewKind::Markdown)
+            } else {
+                None
+            }
+        })
+    })
+}
+
 /// Rich visual model for the Right Sidebar Preview Dock.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PreviewVisual {
@@ -837,7 +855,10 @@ fn parse_docx_visual(
                 }
                 "image" => {
                     if let Ok(Some(b64)) = parse_image_b64(b.get("image_b64")) {
-                        let mime = b.get("image_mime").and_then(Value::as_str);
+                        let mime = b
+                            .get("content_type")
+                            .or_else(|| b.get("image_mime"))
+                            .and_then(Value::as_str);
                         if let Some(data_url) = build_image_data_url(&b64, mime, true) {
                             let alt = b
                                 .get("alt")
@@ -1114,6 +1135,14 @@ mod tests {
             Some(PreviewKind::Markdown)
         );
         assert_eq!(preview_kind_for_name("photo.png"), Some(PreviewKind::Image));
+        assert_eq!(
+            preview_kind_for_entry(None, Some("image/png")),
+            Some(PreviewKind::Image)
+        );
+        assert_eq!(
+            preview_kind_for_entry(Some("ElevenLabs media"), Some("image/webp")),
+            Some(PreviewKind::Image)
+        );
         assert_eq!(preview_kind_for_name("photo.JPG"), Some(PreviewKind::Image));
         assert_eq!(preview_kind_for_name("hero.webp"), Some(PreviewKind::Image));
         assert_eq!(preview_kind_for_name("anim.gif"), Some(PreviewKind::Image));
@@ -1511,7 +1540,7 @@ mod tests {
                     { "kind": "paragraph", "text": "Body" },
                     { "kind": "list_item", "text": "Point A", "ordered": true },
                     { "kind": "table", "rows": [["Col 1", "Col 2"], ["A", "B"]] },
-                    { "kind": "image", "image_b64": "aGk=", "image_mime": "image/png", "alt": "Figure 1" }
+                    { "kind": "image", "image_b64": "aGk=", "content_type": "image/png", "alt": "Figure 1" }
                 ]
             }
         }))
