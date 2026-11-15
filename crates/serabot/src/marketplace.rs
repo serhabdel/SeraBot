@@ -178,6 +178,79 @@ pub fn validate(manifest: &PluginManifest, expected_slug: &str) -> Result<()> {
     Ok(())
 }
 
+const BUILTIN_MANIFESTS: &[(&str, &str)] = &[
+    (
+        "brave-search",
+        include_str!("../../../plugins/brave-search/plugin.json"),
+    ),
+    (
+        "elevenlabs",
+        include_str!("../../../plugins/elevenlabs/plugin.json"),
+    ),
+    ("exa", include_str!("../../../plugins/exa/plugin.json")),
+    (
+        "firecrawl",
+        include_str!("../../../plugins/firecrawl/plugin.json"),
+    ),
+    (
+        "github",
+        include_str!("../../../plugins/github/plugin.json"),
+    ),
+    (
+        "linear",
+        include_str!("../../../plugins/linear/plugin.json"),
+    ),
+    (
+        "notion",
+        include_str!("../../../plugins/notion/plugin.json"),
+    ),
+    (
+        "resend",
+        include_str!("../../../plugins/resend/plugin.json"),
+    ),
+    (
+        "tavily",
+        include_str!("../../../plugins/tavily/plugin.json"),
+    ),
+    (
+        "workspace-files",
+        include_str!("../../../plugins/workspace-files/plugin.json"),
+    ),
+];
+
+/// The shipped plugin manifests compiled into the binary as a fallback when no
+/// external `plugins/` folder is deployed next to the server, sorted by
+/// `(name, slug)`.
+pub fn builtin_catalog() -> Vec<PluginManifest> {
+    let mut plugins = Vec::with_capacity(BUILTIN_MANIFESTS.len());
+    for (slug, raw) in BUILTIN_MANIFESTS {
+        let manifest: PluginManifest = serde_json::from_str(raw).unwrap_or_else(|error| {
+            panic!("built-in plugin manifest {slug} is invalid JSON: {error}")
+        });
+        validate(&manifest, slug).unwrap_or_else(|error| {
+            panic!("built-in plugin manifest {slug} failed validation: {error}")
+        });
+        plugins.push(manifest);
+    }
+    plugins.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.slug.cmp(&b.slug)));
+    plugins
+}
+
+/// Load `plugins/<slug>/plugin.json` from `root` (when `root` exists) and merge
+/// any built-in manifests whose `slug` is not already present on disk, sorted
+/// by `(name, slug)`.
+pub fn load_catalog_with_builtin(root: &Path) -> (Vec<PluginManifest>, Vec<String>) {
+    let (mut plugins, problems) = load_catalog(root);
+    let present: HashSet<String> = plugins.iter().map(|plugin| plugin.slug.clone()).collect();
+    for builtin in builtin_catalog() {
+        if !present.contains(&builtin.slug) {
+            plugins.push(builtin);
+        }
+    }
+    plugins.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.slug.cmp(&b.slug)));
+    (plugins, problems)
+}
+
 /// Load every `plugins/<slug>/plugin.json` under `root`, sorted by slug. A file
 /// that fails to read or validate is reported and skipped; it never stops the
 /// others from loading.
@@ -445,5 +518,64 @@ mod tests {
         assert_eq!(plugins.len(), 1);
         assert_eq!(problems.len(), 1);
         assert!(problems[0].starts_with("broken:"));
+    }
+
+    #[test]
+    fn builtin_catalog_parses_all_ten_shipped_manifests() {
+        let builtin = builtin_catalog();
+        assert_eq!(builtin.len(), 10);
+        let slugs: Vec<&str> = builtin.iter().map(|p| p.slug.as_str()).collect();
+        for expected in [
+            "brave-search",
+            "elevenlabs",
+            "exa",
+            "firecrawl",
+            "github",
+            "linear",
+            "notion",
+            "resend",
+            "tavily",
+            "workspace-files",
+        ] {
+            assert!(slugs.contains(&expected), "missing built-in {expected}");
+        }
+        // Sorted by (name, slug).
+        let mut sorted = builtin.clone();
+        sorted.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.slug.cmp(&b.slug)));
+        assert_eq!(builtin, sorted);
+    }
+
+    #[test]
+    fn load_catalog_with_builtin_returns_all_ten_when_dir_is_missing_or_empty() {
+        let missing = std::path::Path::new("/nonexistent/serabot-plugins-dir-xyz");
+        let (plugins, problems) = load_catalog_with_builtin(missing);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(plugins.len(), 10);
+
+        let empty = tempfile::tempdir().unwrap();
+        let (plugins, problems) = load_catalog_with_builtin(empty.path());
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(plugins.len(), 10);
+    }
+
+    #[test]
+    fn load_catalog_with_builtin_merges_and_prefers_disk_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let override_dir = dir.path().join("tavily");
+        std::fs::create_dir_all(&override_dir).unwrap();
+        let mut custom = sample();
+        custom.slug = "tavily".into();
+        custom.name = "Custom Tavily Override".into();
+        std::fs::write(
+            override_dir.join("plugin.json"),
+            serde_json::to_string(&custom).unwrap(),
+        )
+        .unwrap();
+
+        let (plugins, problems) = load_catalog_with_builtin(dir.path());
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(plugins.len(), 10);
+        let tavily = plugins.iter().find(|p| p.slug == "tavily").unwrap();
+        assert_eq!(tavily.name, "Custom Tavily Override");
     }
 }

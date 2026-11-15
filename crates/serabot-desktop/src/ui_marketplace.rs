@@ -8,7 +8,7 @@
 //! form's input is masked, lives in this component only, is moved into the
 //! request when sent and wiped, and is never shown again.
 
-use crate::ui::Icon;
+use crate::ui::{BrandLogo, Icon};
 use crate::ui_integrations::IntegrationCard;
 use crate::ui_widgets::{SecretField, StatusChip};
 use dioxus::prelude::*;
@@ -189,10 +189,13 @@ fn PluginPage(session: Signal<Session>, detail: PluginDetail) -> Element {
                 }
             },
             div { class: "mp-sheet-head",
-                div {
-                    h2 { class: "mp-sheet-title", "{detail.plugin.name}" }
-                    if !detail.plugin.tagline.is_empty() {
-                        p { class: "muted", "{detail.plugin.tagline}" }
+                div { class: "mp-head",
+                    BrandLogo { brand: detail.plugin.slug.clone(), size: 40 }
+                    div {
+                        h2 { class: "mp-sheet-title", "{detail.plugin.name}" }
+                        if !detail.plugin.tagline.is_empty() {
+                            p { class: "muted", "{detail.plugin.tagline}" }
+                        }
                     }
                 }
                 button {

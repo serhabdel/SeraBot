@@ -50,7 +50,9 @@ pub enum Source {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub source: Source,
+    pub brand_key: String,
     pub name: String,
+    pub suite_label: String,
     pub blurb: String,
     pub pill: String,
     pub tone: Tone,
@@ -72,7 +74,7 @@ pub const SUITES: [(&str, &[&str]); 7] = [
     ("Code and tasks", &["github", "todoist"]),
     ("Messages", &["slack"]),
     ("Web search", &["tavily", "firecrawl", "exa"]),
-    ("Voice", &["elevenlabs", "elevenlabs_api_key"]),
+    ("Voice", &["elevenlabs"]),
 ];
 
 pub const MORE_SUITE: &str = "More";
@@ -103,7 +105,6 @@ pub fn connector_title(id: &str) -> String {
         "tavily" => "Tavily Search",
         "firecrawl" => "Firecrawl",
         "elevenlabs" => "ElevenLabs",
-        "elevenlabs_api_key" => "ElevenLabs API key",
         "composio" => "Composio",
         other => return humanize(other),
     }
@@ -141,7 +142,6 @@ pub fn connector_blurb(id: &str) -> &'static str {
         "elevenlabs" => {
             "Sign in with your ElevenLabs account: voices, music, sound, images, video and agents your plan includes."
         }
-        "elevenlabs_api_key" => "Voice, sound and images with the owner's ElevenLabs API key.",
         "composio" => "Connect apps through Composio with your own key.",
         _ => "",
     }
@@ -155,10 +155,27 @@ fn tone_of_card(state: &CardState) -> Tone {
     }
 }
 
+/// Human-friendly suite subtitle shown under the integration name on a card.
+pub fn suite_label_for_connector(id: &str) -> &'static str {
+    match id {
+        "onedrive" | "outlook" | "outlook_calendar" => "Microsoft 365",
+        "google_drive" | "google_sheets" | "google_calendar" | "gmail" => "Google Workspace",
+        "agentmail" => "Mail",
+        "notion" | "todoist" => "Productivity",
+        "elevenlabs" => "Voice & Media",
+        "tavily" | "firecrawl" | "exa" => "Web & Research",
+        "github" => "Developer",
+        "slack" => "Team Chat",
+        "composio" => "Apps & Tools",
+        _ => "Connector",
+    }
+}
+
 /// The card for one connector. `error` is the last failure for it, if any.
 pub fn connector_entry(connector: &ConnectorStatus, error: Option<&str>) -> Entry {
     let name = connector_title(&connector.id);
     let blurb = connector_blurb(&connector.id).to_owned();
+    let suite_label = suite_label_for_connector(&connector.id).to_owned();
     let (pill, tone, set_up, meta) = if connector.id == COMPOSIO_ID {
         let connected = connector.connected.unwrap_or(false);
         let (pill, tone) = if connected {
@@ -170,6 +187,13 @@ pub fn connector_entry(connector: &ConnectorStatus, error: Option<&str>) -> Entr
     } else if let Some(state) = connector_card_state(connector, error) {
         let set_up = state.is_connected();
         (state.pill(), tone_of_card(&state), set_up, "Your account")
+    } else if connector.id == "elevenlabs" {
+        let connected = legacy_connected(connector);
+        if connected {
+            ("Connected", Tone::Ok, true, "Your account")
+        } else {
+            ("Not connected", Tone::Muted, false, "Your account")
+        }
     } else if legacy_connected(connector) {
         ("Connected", Tone::Ok, true, "Shared with the server")
     } else {
@@ -182,7 +206,9 @@ pub fn connector_entry(connector: &ConnectorStatus, error: Option<&str>) -> Entr
     };
     Entry {
         source: Source::Connector(connector.id.clone()),
+        brand_key: connector.id.clone(),
         name,
+        suite_label,
         blurb,
         pill: pill.to_owned(),
         tone,
@@ -211,9 +237,16 @@ pub fn plugin_entry(plugin: &PluginSummary) -> Entry {
     if !plugin.version.is_empty() {
         meta.push(format!("v{}", plugin.version));
     }
+    let suite_label = if plugin.category.trim().is_empty() {
+        "Plugin".to_owned()
+    } else {
+        plugin.category.clone()
+    };
     Entry {
         source: Source::Plugin(plugin.slug.clone()),
+        brand_key: plugin.slug.clone(),
         name: plugin.name.clone(),
+        suite_label,
         blurb: plugin.tagline.clone(),
         pill: state.label().to_owned(),
         tone: plugin_tone(state),

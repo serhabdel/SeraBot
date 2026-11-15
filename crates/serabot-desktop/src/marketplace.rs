@@ -20,10 +20,10 @@ pub const MAX_PLUGINS: usize = 500;
 pub const MAX_TEXT: usize = 4_000;
 pub const MAX_ITEMS: usize = 64;
 
-/// The tool runtime that would call a plugin is not built. While this is
-/// false, nothing in the catalog can run, so Install and Enable stay off
-/// even for a host that is not a placeholder.
-pub const RUNTIME_CALLS_PLUGINS: bool = false;
+/// Whether the tool runtime can call installed `http` MCP plugins.
+/// Placeholder hosts (`*.example.invalid`) and `stdio` local-program plugins
+/// still stay blocked even when this is `true`.
+pub const RUNTIME_CALLS_PLUGINS: bool = true;
 
 /// The line at the top of the screen while [`RUNTIME_CALLS_PLUGINS`] is false.
 pub const COMING_SOON: &str = "Coming soon. You can browse plugins and see what they connect to. Install and Enable stay off until plugin calling is turned on and each plugin points at a live service.";
@@ -654,7 +654,7 @@ mod tests {
         assert_eq!(list.plugins[0].state(), PluginStatus::NeedsSetup);
         assert_eq!(
             summary("a", "Search", "research", false, false, "available").state(),
-            PluginStatus::ComingSoon
+            PluginStatus::Available
         );
 
         // The server nests installed/enabled/status inside `plugin`. Flags
@@ -664,7 +664,7 @@ mod tests {
         )
         .unwrap();
         assert!(!beside.installed());
-        assert_eq!(beside.state(), PluginStatus::ComingSoon);
+        assert_eq!(beside.state(), PluginStatus::Available);
 
         let detail: PluginDetail = serde_json::from_str(
             r#"{"plugin":{"slug":"search","name":"Search","tagline":"t","description":"d","category":"research",
@@ -687,7 +687,7 @@ mod tests {
             serde_json::from_str(r#"{"plugin":{"slug":"x","name":"X"}}"#).unwrap();
         assert!(!sparse.installed());
         assert!(!sparse.needs_config());
-        assert_eq!(sparse.state(), PluginStatus::ComingSoon);
+        assert_eq!(sparse.state(), PluginStatus::Available);
     }
 
     #[test]
@@ -712,29 +712,29 @@ mod tests {
     }
 
     #[test]
-    fn buttons_match_the_state_and_stay_off_until_a_plugin_can_run() {
-        // The runtime is off, so Install and Enable are not offered.
-        assert!(actions_for(&detail(false, false, false, "http")).is_empty());
+    fn buttons_match_the_state_and_stay_off_when_blocked() {
+        // When blocked (e.g. placeholder/runtime off), Install and Enable are not offered.
+        assert!(actions_when(&detail(false, false, false, "http"), true).is_empty());
         assert_eq!(
-            actions_for(&detail(true, false, true, "http")),
+            actions_when(&detail(true, false, true, "http"), true),
             vec![PluginAction::Uninstall]
         );
         assert_eq!(
-            actions_for(&detail(true, true, true, "http")),
+            actions_when(&detail(true, true, true, "http"), true),
             vec![PluginAction::Disable, PluginAction::Uninstall]
         );
-        // Once a real host can be called, the buttons follow the flags.
+        // With runtime enabled and a real host, the buttons follow the flags.
         let ready = detail(true, false, true, "http");
         assert_eq!(
-            actions_when(&ready, false),
+            actions_for(&ready),
             vec![PluginAction::Enable, PluginAction::Uninstall]
         );
         assert_eq!(
-            actions_when(&detail(false, false, false, "http"), false),
+            actions_for(&detail(false, false, false, "http")),
             vec![PluginAction::Install]
         );
         assert_eq!(
-            actions_when(&detail(true, false, false, "http"), false),
+            actions_for(&detail(true, false, false, "http")),
             vec![PluginAction::Uninstall]
         );
     }
@@ -766,8 +766,11 @@ mod tests {
         );
 
         let real = detail(false, false, false, "http");
-        assert_eq!(real.activation_block_when(true), None);
-        assert_eq!(real.activation_block(), Some(ActivationBlock::Runtime));
+        assert_eq!(real.activation_block(), None);
+        assert_eq!(
+            real.activation_block_when(false),
+            Some(ActivationBlock::Runtime)
+        );
     }
 
     #[test]
@@ -906,7 +909,7 @@ mod tests {
     #[test]
     fn status_filters_and_category_counts_are_accurate() {
         const {
-            assert!(!RUNTIME_CALLS_PLUGINS);
+            assert!(RUNTIME_CALLS_PLUGINS);
         }
         assert!(!COMING_SOON.contains("example.invalid"));
         assert!(
@@ -929,7 +932,7 @@ mod tests {
         );
         assert_eq!(
             filter_plugins_with_status(&all, "", "", StatusFilter::ComingSoon).len(),
-            1
+            0
         );
     }
 }

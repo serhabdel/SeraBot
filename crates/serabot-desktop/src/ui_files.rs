@@ -410,6 +410,7 @@ pub fn MediaCards(session: Signal<Session>) -> Element {
                                                 drop(open);
                                                 if opening {
                                                     session.write().request_doc_preview(hash.clone());
+                                                    let _ = dioxus::document::eval(serabot_desktop::chat_scroll::PIN_ON_GROW_JS);
                                                 }
                                             }
                                         },
