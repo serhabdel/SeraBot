@@ -6,13 +6,14 @@
 //! of the signal into a zeroizing buffer on submit, so the signal is empty
 //! before the request starts, and it never enters chat state or messages.
 
-use crate::ui::{Icon, avatar_style};
+use crate::ui::{Icon, avatar_style, stamp};
 use crate::ui_files::CONFIRM_RESET_JS;
 use dioxus::prelude::*;
 use serabot_desktop::chat_cards::{
     self, CardBody, CardState, CardView, MAX_ANSWER, QuestionCard, SecretCard,
 };
 use serabot_desktop::session::{Section, Session};
+use serabot_desktop::{Approval, ApprovalDecision, TaskStatus};
 use zeroize::Zeroizing;
 
 /// One card at the foot of the feed. A pending card takes its full form; a
@@ -341,5 +342,222 @@ fn SecretPrompt(
                 }
             }
         }
+    }
+}
+
+/// Partition pending approvals into `(for_current_conversation, global_other)`
+/// so the active conversation shows full inline cards and Main also surfaces
+/// any other pending approvals as compact cards.
+pub(crate) fn partition_inline_approvals<'a>(
+    approvals: &'a [Approval],
+    step_approval_ids: &[&str],
+    is_main: bool,
+    active_task_awaiting: bool,
+) -> (Vec<&'a Approval>, Vec<&'a Approval>) {
+    let mut local = Vec::new();
+    let mut global = Vec::new();
+    for approval in approvals {
+        if step_approval_ids.contains(&approval.id.as_str())
+            || (active_task_awaiting && step_approval_ids.is_empty())
+        {
+            local.push(approval);
+        } else if is_main {
+            global.push(approval);
+        }
+    }
+    (local, global)
+}
+
+/// Extract an optional destination hint from an approval summary (e.g. URL or
+/// recipient after " to " / " -> "), if present.
+fn approval_destination(summary: &str) -> Option<&str> {
+    summary
+        .split_once(" -> ")
+        .or_else(|| summary.split_once(" to "))
+        .map(|(_, dest)| dest.trim())
+        .filter(|dest| !dest.is_empty())
+}
+
+/// Rich inline approval cards rendered directly above the composer in ChatView.
+#[component]
+pub(crate) fn InlineApprovals(mut session: Signal<Session>) -> Element {
+    let busy_id = use_signal(|| Option::<String>::None);
+    let (local_approvals, global_approvals) = {
+        let state = session.read();
+        if state.state.approvals.is_empty() {
+            return rsx! {};
+        }
+        let conv = state.conversation.as_str();
+        let is_main = conv == "dir:main";
+        let steps = &state.state.activity.steps;
+        let step_ids: Vec<&str> = steps
+            .iter()
+            .filter_map(|step| step.approval_id.as_deref())
+            .collect();
+        let active_task_awaiting = state.state.task.as_ref().is_some_and(|task| {
+            task.status == TaskStatus::AwaitingApproval
+                && state.conversation_bot(conv).as_deref() == Some(task.bot.as_str())
+        });
+        let (local, global) = partition_inline_approvals(
+            &state.state.approvals,
+            &step_ids,
+            is_main,
+            active_task_awaiting,
+        );
+        (
+            local.into_iter().cloned().collect::<Vec<_>>(),
+            global.into_iter().cloned().collect::<Vec<_>>(),
+        )
+    };
+    if local_approvals.is_empty() && global_approvals.is_empty() {
+        return rsx! {};
+    }
+    let active_busy = busy_id();
+    rsx! {
+        div { class: "inline-approvals", role: "region", "aria-label": "Pending approvals",
+            for approval in local_approvals {
+                {
+                    let id = approval.id.clone();
+                    let row_busy = active_busy.as_deref() == Some(id.as_str());
+                    let exp_label = stamp(&approval.expires_at);
+                    let dest = approval_destination(&approval.summary).map(str::to_owned);
+                    rsx! {
+                        section { class: "chat-card approval-card", key: "{id}",
+                            div { class: "approval-card-head",
+                                span { class: "chip accent ap-tool", "{approval.tool}" }
+                                span { class: "tiny muted", title: "{approval.expires_at}",
+                                    if exp_label.is_empty() { "Pending approval" } else { "Expires {exp_label}" }
+                                }
+                            }
+                            p { class: "approval-card-summary", "{approval.summary}" }
+                            if let Some(dest) = dest {
+                                div { class: "approval-card-dest",
+                                    span { class: "tiny muted", "Destination:" }
+                                    span { class: "tiny mono", "{dest}" }
+                                }
+                            }
+                            div { class: "approval-card-actions",
+                                button {
+                                    class: "btn primary sm",
+                                    r#type: "button",
+                                    disabled: row_busy,
+                                    onclick: {
+                                        let id = id.clone();
+                                        let mut busy_id = busy_id;
+                                        move |_| {
+                                            busy_id.set(Some(id.clone()));
+                                            session.write().decide(id.clone(), ApprovalDecision::Once);
+                                        }
+                                    },
+                                    "Approve"
+                                }
+                                button {
+                                    class: "btn danger sm",
+                                    r#type: "button",
+                                    disabled: row_busy,
+                                    onclick: {
+                                        let id = id.clone();
+                                        let mut busy_id = busy_id;
+                                        move |_| {
+                                            busy_id.set(Some(id.clone()));
+                                            session.write().decide(id.clone(), ApprovalDecision::Deny);
+                                        }
+                                    },
+                                    "Deny"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for approval in global_approvals {
+                {
+                    let id = approval.id.clone();
+                    let row_busy = active_busy.as_deref() == Some(id.as_str());
+                    let exp_label = stamp(&approval.expires_at);
+                    rsx! {
+                        section { class: "chat-card approval-card compact", key: "global-{id}",
+                            div { class: "approval-card-compact-row",
+                                span { class: "chip accent ap-tool", "{approval.tool}" }
+                                span { class: "approval-card-summary", title: "{approval.summary}", "{approval.summary}" }
+                                if !exp_label.is_empty() {
+                                    span { class: "tiny muted", title: "{approval.expires_at}", "Expires {exp_label}" }
+                                }
+                                div { class: "approval-card-actions",
+                                    button {
+                                        class: "btn primary sm",
+                                        r#type: "button",
+                                        disabled: row_busy,
+                                        onclick: {
+                                            let id = id.clone();
+                                            let mut busy_id = busy_id;
+                                            move |_| {
+                                                busy_id.set(Some(id.clone()));
+                                                session.write().decide(id.clone(), ApprovalDecision::Once);
+                                            }
+                                        },
+                                        "Approve"
+                                    }
+                                    button {
+                                        class: "btn danger sm",
+                                        r#type: "button",
+                                        disabled: row_busy,
+                                        onclick: {
+                                            let id = id.clone();
+                                            let mut busy_id = busy_id;
+                                            move |_| {
+                                                busy_id.set(Some(id.clone()));
+                                                session.write().decide(id.clone(), ApprovalDecision::Deny);
+                                            }
+                                        },
+                                        "Deny"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approval(id: &str) -> Approval {
+        Approval {
+            id: id.into(),
+            action_id: format!("act-{id}"),
+            tool: "http.post".into(),
+            summary: "Send report to https://example.com".into(),
+            expires_at: "2026-11-15T19:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn inline_approvals_partition_local_and_global_for_main() {
+        let items = vec![approval("a1"), approval("a2")];
+        let (local, global) = partition_inline_approvals(&items, &["a1"], true, false);
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].id, "a1");
+        assert_eq!(global.len(), 1);
+        assert_eq!(global[0].id, "a2");
+
+        // Non-main conversations do not show unrelated global approvals.
+        let (local_other, global_other) = partition_inline_approvals(&items, &["a1"], false, false);
+        assert_eq!(local_other.len(), 1);
+        assert!(global_other.is_empty());
+    }
+
+    #[test]
+    fn approval_destination_extracts_target() {
+        assert_eq!(
+            approval_destination("Send email to ops@example.com"),
+            Some("ops@example.com")
+        );
+        assert_eq!(approval_destination("Post -> #general"), Some("#general"));
+        assert_eq!(approval_destination("Run local check"), None);
     }
 }

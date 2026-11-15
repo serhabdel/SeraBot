@@ -53,6 +53,8 @@ pub enum ImageSlot {
     NewGroup,
     /// Upload straight away to an existing bot.
     Bot(String),
+    /// Upload straight away to an existing group/channel.
+    Group(String),
 }
 
 /// What the avatar request in flight is, so a failure can be handled quietly.
@@ -100,6 +102,17 @@ impl Session {
                     bytes,
                 });
             }
+            ImageSlot::Group(id) => {
+                if !self.ready() {
+                    self.toast = Some("Wait for the current request, then retry.".into());
+                    return;
+                }
+                self.avatar_upload = None;
+                self.start_request(Operation::AvatarUpload {
+                    target: AvatarTarget::Group(id),
+                    bytes,
+                });
+            }
         }
     }
 
@@ -107,7 +120,7 @@ impl Session {
         match slot {
             ImageSlot::NewBot => self.new_bot.error = Some(message),
             ImageSlot::NewGroup => self.new_group.error = Some(message),
-            ImageSlot::Bot(_) => self.toast = Some(message),
+            ImageSlot::Bot(_) | ImageSlot::Group(_) => self.toast = Some(message),
         }
     }
 
@@ -124,6 +137,32 @@ impl Session {
                     self.toast = Some("Wait for the current request, then retry.".into());
                 }
             }
+            ImageSlot::Group(_) => {}
+        }
+    }
+
+    /// Open a native file picker to upload/replace a channel or group image.
+    pub fn pick_group_image(&mut self, id: String) {
+        #[cfg(windows)]
+        let picked = rfd::FileDialog::new()
+            .set_title("Choose channel image")
+            .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
+            .pick_file()
+            .and_then(|path| {
+                let meta = std::fs::metadata(&path).ok()?;
+                if meta.len() > crate::MAX_AVATAR_UPLOAD_BYTES as u64 {
+                    self.toast = Some("Image must be 1 MB or smaller.".into());
+                    return None;
+                }
+                std::fs::read(&path).ok()
+            });
+        #[cfg(not(windows))]
+        let picked: Option<Vec<u8>> = {
+            let _ = &id;
+            None
+        };
+        if let Some(bytes) = picked {
+            self.pick_image(ImageSlot::Group(id), bytes);
         }
     }
 
@@ -133,37 +172,6 @@ impl Session {
     pub(super) fn schedule_next_avatar(&mut self) {
         if self.scheduled.is_some() || !self.state.connected {
             return;
-        }
-        // Forget images the server no longer has.
-        let live: Vec<String> = self
-            .state
-            .listed_bots
-            .iter()
-            .filter(|bot| bot.avatar_version.is_some())
-            .map(|bot| AvatarTarget::Bot(bot.id.clone()).key())
-            .chain(
-                // Shipped bots not added yet still wear their bundled picture
-                // in the "Meet your team" sheet.
-                self.state
-                    .shipped_bots
-                    .iter()
-                    .filter(|bot| !bot.installed && bot.avatar_version.is_some())
-                    .map(|bot| AvatarTarget::Bot(bot.id.clone()).key()),
-            )
-            .chain(
-                self.state
-                    .conversations
-                    .iter()
-                    .filter(|conversation| conversation.avatar_version.is_some())
-                    .map(|conversation| AvatarTarget::Group(conversation.id.clone()).key()),
-            )
-            .collect();
-        let before = self.state.avatars.len();
-        if self.state.bots_loaded && self.state.conversations_loaded {
-            self.state.avatars.retain(|key, _| live.contains(key));
-        }
-        if self.state.avatars.len() != before {
-            avatars::publish(&self.state.avatars);
         }
         let wanted = self
             .state

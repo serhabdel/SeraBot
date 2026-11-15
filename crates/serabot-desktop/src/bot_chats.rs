@@ -107,13 +107,82 @@ pub fn parse_refresh_turns(text: &str) -> Option<u32> {
     valid_refresh_turns(turns).then_some(turns)
 }
 
+/// Maximum character length for a derived short chat title.
+const DERIVED_TITLE_MAX_CHARS: usize = 44;
+
+/// Whether `text` looks like a raw generated chat id (`chat-01a1dfd...`,
+/// `Chat 01a1dfd96...`, or a bare 8+ hex string) that must never appear in UI.
+pub fn is_raw_chat_id(text: &str) -> bool {
+    let trimmed = text.trim();
+    if let Some(rest) = trimmed
+        .strip_prefix("dir:chat-")
+        .or_else(|| trimmed.strip_prefix("chat-"))
+        .or_else(|| trimmed.strip_prefix("Chat "))
+    {
+        let core = rest.trim_end_matches(['.', '\u{2026}']);
+        return !core.is_empty() && core.len() >= 6 && core.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    trimmed.len() >= 8 && trimmed.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Derive a clean short title from the first user message of a thread.
+pub fn derive_title_from_message(message: &str) -> Option<String> {
+    let first_line = message
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    let collapsed: String = first_line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    if collapsed.chars().count() <= DERIVED_TITLE_MAX_CHARS {
+        return Some(collapsed);
+    }
+    let mut clipped = String::new();
+    let mut last_space = None;
+    for (idx, ch) in collapsed.chars().enumerate() {
+        if idx >= DERIVED_TITLE_MAX_CHARS {
+            break;
+        }
+        if ch == ' ' {
+            last_space = Some(clipped.len());
+        }
+        clipped.push(ch);
+    }
+    if let Some(pos) = last_space
+        && pos > 12
+    {
+        clipped.truncate(pos);
+    }
+    let trimmed = clipped.trim_end();
+    Some(format!("{trimmed}\u{2026}"))
+}
+
+/// What a chat row shows as its title, with optional fallback from the first
+/// user message or bot display name so raw IDs never appear.
+pub fn chat_title_with_fallback(
+    chat: &BotChat,
+    first_user_message: Option<&str>,
+    bot_name: Option<&str>,
+) -> String {
+    match chat.title.as_deref().map(str::trim) {
+        Some(title) if !title.is_empty() && !is_raw_chat_id(title) => title.to_owned(),
+        _ if chat.primary => "Main chat".to_owned(),
+        _ => {
+            if let Some(derived) = first_user_message.and_then(derive_title_from_message) {
+                return derived;
+            }
+            match bot_name.map(str::trim).filter(|name| !name.is_empty()) {
+                Some(name) => format!("New conversation \u{00b7} {name}"),
+                None => "New conversation".to_owned(),
+            }
+        }
+    }
+}
+
 /// What a chat row shows as its title.
 pub fn chat_title(chat: &BotChat) -> String {
-    match chat.title.as_deref().map(str::trim) {
-        Some(title) if !title.is_empty() => title.to_owned(),
-        _ if chat.primary => "Main chat".to_owned(),
-        _ => "New chat".to_owned(),
-    }
+    chat_title_with_fallback(chat, None, None)
 }
 
 /// The chats of a list that are not archived, newest activity first. The
@@ -228,6 +297,8 @@ pub struct SwitcherEntry {
     pub title: String,
     pub primary: bool,
     pub active: bool,
+    pub turns: u64,
+    pub last_activity: Option<String>,
 }
 
 /// The chats to offer in the header switcher: the main chat first, then the
@@ -240,11 +311,27 @@ pub fn switcher_entries(list: Option<&BotChatList>, bot: &str, active: &str) -> 
         .map(|list| {
             live_chats(list)
                 .into_iter()
-                .map(|chat| SwitcherEntry {
-                    id: chat.id.clone(),
-                    title: chat_title(chat),
-                    primary: chat.primary,
-                    active: chat.id == active,
+                .map(|chat| {
+                    let last_activity = chat
+                        .last_message_at
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| {
+                            (!chat.updated_at.trim().is_empty()).then_some(chat.updated_at.trim())
+                        })
+                        .or_else(|| {
+                            (!chat.created_at.trim().is_empty()).then_some(chat.created_at.trim())
+                        })
+                        .map(str::to_owned);
+                    SwitcherEntry {
+                        id: chat.id.clone(),
+                        title: chat_title(chat),
+                        primary: chat.primary,
+                        active: chat.id == active,
+                        turns: chat.turns,
+                        last_activity,
+                    }
                 })
                 .collect()
         })
@@ -257,6 +344,8 @@ pub fn switcher_entries(list: Option<&BotChatList>, bot: &str, active: &str) -> 
                 title: "Main chat".to_owned(),
                 primary: true,
                 active: main_id == active,
+                turns: 0,
+                last_activity: None,
             },
         );
     }
@@ -437,12 +526,34 @@ mod tests {
 
     #[test]
     fn titles_fall_back_to_plain_words() {
-        let mut c = chat("dir:chat-aa", false, "x");
-        assert_eq!(chat_title(&c), "New chat");
+        let mut c = chat("dir:chat-01a1dfd96", false, "x");
+        assert_eq!(chat_title(&c), "New conversation");
+        c.title = Some("Chat 01a1dfd96...".into());
+        assert_eq!(chat_title(&c), "New conversation");
         c.title = Some("  Budget review ".into());
         assert_eq!(chat_title(&c), "Budget review");
         let primary = chat("dir:analyst", true, "x");
         assert_eq!(chat_title(&primary), "Main chat");
+    }
+
+    #[test]
+    fn smart_title_derives_from_first_user_message_or_bot_name() {
+        let c = chat("dir:chat-01a1dfd96", false, "x");
+        assert_eq!(
+            chat_title_with_fallback(&c, None, Some("Analyst")),
+            "New conversation \u{00b7} Analyst"
+        );
+        assert_eq!(
+            chat_title_with_fallback(
+                &c,
+                Some("  Please compare   our Q3 revenue against last year\nwith details"),
+                Some("Analyst")
+            ),
+            "Please compare our Q3 revenue against last\u{2026}"
+        );
+        assert!(is_raw_chat_id("Chat 01a1dfd96..."));
+        assert!(is_raw_chat_id("chat-01a1dfd96"));
+        assert!(!is_raw_chat_id("Budget review"));
     }
 
     #[test]

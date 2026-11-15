@@ -69,6 +69,7 @@ fn run_row_action(
         RowAction::SwitchOff => session.write().set_bot_enabled(pin_id.to_owned(), false),
         RowAction::DeleteBot => session.write().ask_delete_bot(pin_id.to_owned()),
         RowAction::Rename => renaming.set(Some((id.to_owned(), label.to_owned()))),
+        RowAction::SetImage => session.write().pick_group_image(id.to_owned()),
         RowAction::Archive => {
             // Leaving an archived chat open would strand the reader in it.
             let home = {
@@ -258,7 +259,8 @@ pub(crate) fn RenameField(
 pub(crate) fn ChatSwitcher(session: Signal<Session>, bot: String, title: String) -> Element {
     let mut session = session;
     let mut open = use_signal(|| false);
-    let (entries, enabled) = {
+    let mut renaming = use_signal(|| Option::<(String, String)>::None);
+    let (entries, enabled, active_conv, active_title) = {
         let state = session.read();
         let entries = serabot_desktop::bot_chats::switcher_entries(
             state.state.bot_chats.get(&bot),
@@ -271,7 +273,12 @@ pub(crate) fn ChatSwitcher(session: Signal<Session>, bot: String, title: String)
             .iter()
             .find(|item| item.id == bot)
             .is_none_or(|item| item.enabled);
-        (entries, enabled)
+        (
+            entries,
+            enabled,
+            state.conversation.clone(),
+            state.conversation_title(),
+        )
     };
     let count = entries.len();
     rsx! {
@@ -282,7 +289,10 @@ pub(crate) fn ChatSwitcher(session: Signal<Session>, bot: String, title: String)
                 title: "Switch chat or start a new one",
                 "aria-haspopup": "menu",
                 "aria-expanded": if open() { "true" } else { "false" },
-                onclick: move |_| open.set(!open()),
+                onclick: move |_| {
+                    renaming.set(None);
+                    open.set(!open());
+                },
                 strong { "{title}" }
                 if count > 1 {
                     span { class: "chat-switcher-count", "{count}" }
@@ -292,7 +302,10 @@ pub(crate) fn ChatSwitcher(session: Signal<Session>, bot: String, title: String)
             if open() {
                 div {
                     class: "row-menu-scrim",
-                    onclick: move |_| open.set(false),
+                    onclick: move |_| {
+                        renaming.set(None);
+                        open.set(false);
+                    },
                 }
                 div {
                     class: "row-menu chat-switcher-menu",
@@ -303,6 +316,9 @@ pub(crate) fn ChatSwitcher(session: Signal<Session>, bot: String, title: String)
                         document::eval(FLIP_OVERFLOW_MENU_JS);
                     },
                     onkeydown: move |event: KeyboardEvent| {
+                        if renaming().is_some() {
+                            return;
+                        }
                         let key = event.key();
                         if key == Key::Escape {
                             event.stop_propagation();
@@ -313,22 +329,151 @@ pub(crate) fn ChatSwitcher(session: Signal<Session>, bot: String, title: String)
                         }
                     },
                     for (idx, entry) in entries.into_iter().enumerate() {
-                        button {
-                            key: "{entry.id}",
-                            class: if entry.active { "row-menu-item active" } else { "row-menu-item" },
-                            r#type: "button",
-                            role: "menuitemradio",
-                            autofocus: idx == 0,
-                            "aria-checked": if entry.active { "true" } else { "false" },
-                            onclick: {
-                                let id = entry.id.clone();
-                                move |_| {
-                                    open.set(false);
-                                    session.write().open_conversation(id.clone());
+                        {
+                            let entry_id = entry.id.clone();
+                            let display_title = if entry.id == active_conv
+                                && !active_title.is_empty()
+                                && entry.title.starts_with("New conversation")
+                            {
+                                active_title.clone()
+                            } else {
+                                entry.title.clone()
+                            };
+                            let editing = renaming()
+                                .as_ref()
+                                .is_some_and(|(edit_id, _)| edit_id == &entry_id);
+                            let mut meta_parts = Vec::new();
+                            if entry.turns == 1 {
+                                meta_parts.push("1 turn".to_owned());
+                            } else if entry.turns > 1 {
+                                meta_parts.push(format!("{} turns", entry.turns));
+                            }
+                            if let Some(ts) = entry.last_activity.as_deref() {
+                                let formatted = stamp(ts);
+                                if !formatted.is_empty() {
+                                    meta_parts.push(formatted);
                                 }
-                            },
-                            Icon { name: if entry.active { "check" } else { "chat" }, size: 15 }
-                            span { class: "chat-switcher-title", "{entry.title}" }
+                            }
+                            let meta = meta_parts.join(" \u{00b7} ");
+                            rsx! {
+                                div {
+                                    key: "{entry_id}",
+                                    class: if entry.active { "chat-switcher-row active" } else { "chat-switcher-row" },
+                                    if editing {
+                                        div { class: "chat-switcher-rename",
+                                            input {
+                                                class: "input",
+                                                autofocus: true,
+                                                "aria-label": "Chat name",
+                                                maxlength: 120,
+                                                value: "{renaming().as_ref().map(|(_, t)| t.clone()).unwrap_or_default()}",
+                                                oninput: move |event| {
+                                                    if let Some((_, text)) = renaming.write().as_mut() {
+                                                        *text = event.value();
+                                                    }
+                                                },
+                                                onkeydown: {
+                                                    let id = entry_id.clone();
+                                                    move |event: KeyboardEvent| {
+                                                        if event.key() == Key::Enter {
+                                                            event.prevent_default();
+                                                            event.stop_propagation();
+                                                            if let Some((_, text)) = renaming()
+                                                                && !text.trim().is_empty()
+                                                            {
+                                                                session.write().rename_conversation(id.clone(), text);
+                                                            }
+                                                            renaming.set(None);
+                                                        } else if event.key() == Key::Escape {
+                                                            event.stop_propagation();
+                                                            renaming.set(None);
+                                                        }
+                                                    }
+                                                },
+                                            }
+                                            button {
+                                                class: "icon-btn",
+                                                r#type: "button",
+                                                title: "Save name",
+                                                "aria-label": "Save name",
+                                                onclick: {
+                                                    let id = entry_id.clone();
+                                                    move |event| {
+                                                        event.stop_propagation();
+                                                        if let Some((_, text)) = renaming()
+                                                            && !text.trim().is_empty()
+                                                        {
+                                                            session.write().rename_conversation(id.clone(), text);
+                                                        }
+                                                        renaming.set(None);
+                                                    }
+                                                },
+                                                Icon { name: "check", size: 14 }
+                                            }
+                                        }
+                                    } else {
+                                        button {
+                                            class: if entry.active { "row-menu-item active chat-switcher-item" } else { "row-menu-item chat-switcher-item" },
+                                            r#type: "button",
+                                            role: "menuitemradio",
+                                            autofocus: idx == 0,
+                                            "aria-checked": if entry.active { "true" } else { "false" },
+                                            onclick: {
+                                                let id = entry_id.clone();
+                                                move |_| {
+                                                    open.set(false);
+                                                    session.write().open_conversation(id.clone());
+                                                }
+                                            },
+                                            Icon { name: if entry.active { "check" } else { "chat" }, size: 15 }
+                                            div { class: "chat-switcher-copy",
+                                                span { class: "chat-switcher-title", "{display_title}" }
+                                                if !meta.is_empty() {
+                                                    span { class: "chat-switcher-meta", "{meta}" }
+                                                }
+                                            }
+                                        }
+                                        if !entry.primary {
+                                            div { class: "chat-switcher-actions",
+                                                button {
+                                                    class: "icon-btn sm",
+                                                    r#type: "button",
+                                                    title: "Rename chat",
+                                                    "aria-label": "Rename {display_title}",
+                                                    onclick: {
+                                                        let id = entry_id.clone();
+                                                        let current_title = display_title.clone();
+                                                        move |event| {
+                                                            event.stop_propagation();
+                                                            renaming.set(Some((id.clone(), current_title.clone())));
+                                                        }
+                                                    },
+                                                    Icon { name: "edit", size: 13 }
+                                                }
+                                                button {
+                                                    class: "icon-btn sm danger",
+                                                    r#type: "button",
+                                                    title: "Archive chat",
+                                                    "aria-label": "Archive {display_title}",
+                                                    onclick: {
+                                                        let id = entry_id.clone();
+                                                        let bot = bot.clone();
+                                                        let is_active = entry.active;
+                                                        move |event| {
+                                                            event.stop_propagation();
+                                                            session.write().archive_conversation(id.clone());
+                                                            if is_active {
+                                                                session.write().open_bot_chat(bot.clone());
+                                                            }
+                                                        }
+                                                    },
+                                                    Icon { name: "trash", size: 13 }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     button {

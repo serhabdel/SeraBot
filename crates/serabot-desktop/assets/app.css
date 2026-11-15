@@ -6995,3 +6995,164 @@ html[data-reduce-transparency="true"] .chat-header {
   animation: none;
   transition: none;
 }
+
+/* v0.47.0: compact bot chat count pill, enhanced chat switcher, inline approval cards, and group avatar gradient */
+.bot-chat-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  background: var(--surface-2, rgba(127, 127, 127, 0.12));
+  flex-shrink: 0;
+}
+
+.chat-switcher-menu {
+  min-width: 280px;
+  max-width: 360px;
+}
+
+.chat-switcher-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 8px;
+}
+
+.chat-switcher-row.active {
+  background: var(--surface-2, rgba(127, 127, 127, 0.1));
+}
+
+.chat-switcher-item {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.chat-switcher-copy {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  text-align: left;
+  gap: 1px;
+}
+
+.chat-switcher-meta {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chat-switcher-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding-right: 4px;
+  opacity: 0.7;
+}
+
+.chat-switcher-row:hover .chat-switcher-actions,
+.chat-switcher-row:focus-within .chat-switcher-actions {
+  opacity: 1;
+}
+
+.chat-switcher-rename {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 4px 6px;
+}
+
+.chat-switcher-rename .input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 28px;
+  font-size: 13px;
+}
+
+.inline-approvals {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.approval-card {
+  padding: 10px 12px;
+  border-left: 3px solid var(--accent);
+}
+
+.approval-card.compact {
+  padding: 8px 10px;
+}
+
+.approval-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.approval-card-summary {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.approval-card-dest {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.approval-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.approval-card-compact-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.approval-card-compact-row .approval-card-summary {
+  flex: 1 1 180px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.approval-card-compact-row .approval-card-actions {
+  margin-top: 0;
+}
+
+.avatar.group {
+  border-radius: 10px;
+  background-image: var(
+    --avatar-img,
+    linear-gradient(
+      135deg,
+      hsl(var(--avatar-hue, 210) 68% 52%),
+      hsl(calc(var(--avatar-hue, 210) + 36) 72% 40%)
+    )
+  );
+  background-size: cover;
+  background-position: center;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
