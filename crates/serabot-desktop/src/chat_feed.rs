@@ -171,6 +171,11 @@ const WHATSAPP_SUGGESTIONS: &[&str] = &[
     "Write a short follow-up for a supplier who has not replied",
     "Draft a message to confirm my appointment changes",
 ];
+const JOBFINDER_SUGGESTIONS: &[&str] = &[
+    "Find remote Rust or backend roles open this week",
+    "Tailor my CV for this job description",
+    "Draft a concise cover letter and application checklist",
+];
 const GENERAL_SUGGESTIONS: &[&str] = &[
     "Summarize the attached file",
     "Help me plan the next step",
@@ -194,6 +199,7 @@ pub fn suggestions(bot_id: Option<&str>) -> &'static [&'static str] {
         Some("courier") => COURIER_SUGGESTIONS,
         Some("inbox") => INBOX_SUGGESTIONS,
         Some("whatsapp") => WHATSAPP_SUGGESTIONS,
+        Some("jobfinder") => JOBFINDER_SUGGESTIONS,
         _ => GENERAL_SUGGESTIONS,
     }
 }
@@ -375,6 +381,7 @@ mod tests {
             suggestions(Some("courier")),
             suggestions(Some("inbox")),
             suggestions(Some("whatsapp")),
+            suggestions(Some("jobfinder")),
             suggestions(None),
         ] {
             assert!((2..=4).contains(&set.len()));

@@ -14,12 +14,12 @@
 use crate::ui::Icon;
 use crate::ui_files::{CONFIRM_RESET_JS, copy_script};
 use dioxus::prelude::*;
-use serabot_desktop::panel::address_to_url;
 use serabot_desktop::session::{Section, Session};
-use serabot_desktop::{BrowserController, BrowserInput};
+use serabot_desktop::{BrowserController, BrowserHistory, BrowserInput};
 
-/// Reports focus changes and, while `#dock-stage[data-control=user]`, the
-/// user's clicks (scaled to screenshot pixels), wheel, keys and pastes.
+/// Reports focus changes and, while any visible `.dock-stage.taking-control`
+/// (`FocusView` or open `BrowserDock`) is active, the user's clicks (scaled to
+/// screenshot pixels), wheel, keys and pastes.
 const DOCK_JS: &str = r#"
 (function () {
   window.__serabotDockOut = (m) => dioxus.send(m);
@@ -30,15 +30,34 @@ const DOCK_JS: &str = r#"
     return;
   }
   window.__serabotDockInit = true;
-  const stage = () => document.getElementById('dock-stage');
   const slotOpen = () => {
     const slot = document.querySelector('.dock-slot');
-    return slot && slot.classList.contains('open');
+    return !!(slot && slot.classList.contains('open'));
+  };
+  const isVisible = (el) => {
+    if (!el || !el.isConnected) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const visibleStages = () => {
+    const list = [];
+    const focus = document.getElementById('focus-stage');
+    if (isVisible(focus)) list.push(focus);
+    if (slotOpen()) {
+      const dock = document.getElementById('dock-stage');
+      if (isVisible(dock)) list.push(dock);
+    }
+    return list;
   };
   const mine = () => {
-    if (!slotOpen()) return null;
-    const s = stage();
-    return s && s.dataset.control === 'user' ? s : null;
+    for (const s of visibleStages()) {
+      if (s.classList.contains('taking-control') || s.dataset.control === 'user') {
+        return s;
+      }
+    }
+    return null;
   };
   window.addEventListener('focus', reportFocus);
   window.addEventListener('blur', reportFocus);
@@ -58,25 +77,34 @@ const DOCK_JS: &str = r#"
     if (wheel) { out({ t: 'scroll', dy: Math.max(-5000, Math.min(5000, wheel)) }); wheel = 0; }
   };
 
+  const spawnClickRipple = (s, clientX, clientY) => {
+    const sr = s.getBoundingClientRect();
+    const ring = document.createElement('span');
+    ring.className = 'dock-click-ripple';
+    ring.style.left = (clientX - sr.left + s.scrollLeft) + 'px';
+    ring.style.top = (clientY - sr.top + s.scrollTop) + 'px';
+    s.appendChild(ring);
+    setTimeout(() => ring.remove(), 460);
+  };
+
   // Draw the bot's pointer over the picture: map viewport pixels onto the
   // image, and replay the click ripple when `data-seq` changes.
-  let lastSeq = '';
   const placePointer = () => {
-    if (!slotOpen()) return;
-    const p = document.getElementById('dock-pointer');
-    const img = document.getElementById('dock-shot');
-    const s = stage();
-    if (!p || !img || !s || !img.naturalWidth) return;
-    const vw = Number(p.dataset.vw) || img.naturalWidth;
-    const vh = Number(p.dataset.vh) || img.naturalHeight;
-    const x = img.offsetLeft + (Number(p.dataset.x) / vw) * img.clientWidth;
-    const y = img.offsetTop + (Number(p.dataset.y) / vh) * img.clientHeight;
-    p.style.transform = 'translate(' + x.toFixed(1) + 'px,' + y.toFixed(1) + 'px)';
-    if (p.dataset.seq !== lastSeq) {
-      lastSeq = p.dataset.seq;
-      p.classList.remove('pulse');
-      void p.offsetWidth;
-      if (p.dataset.action === 'click') p.classList.add('pulse');
+    for (const s of visibleStages()) {
+      const p = s.querySelector('.dock-pointer');
+      const img = s.querySelector('.dock-shot');
+      if (!p || !img || !img.naturalWidth) continue;
+      const vw = Number(p.dataset.vw) || img.naturalWidth;
+      const vh = Number(p.dataset.vh) || img.naturalHeight;
+      const x = img.offsetLeft + (Number(p.dataset.x) / vw) * img.clientWidth;
+      const y = img.offsetTop + (Number(p.dataset.y) / vh) * img.clientHeight;
+      p.style.transform = 'translate(' + x.toFixed(1) + 'px,' + y.toFixed(1) + 'px)';
+      if (p.dataset.seq !== p.dataset.lastSeq) {
+        p.dataset.lastSeq = p.dataset.seq || '';
+        p.classList.remove('pulse');
+        void p.offsetWidth;
+        if (p.dataset.action === 'click') p.classList.add('pulse');
+      }
     }
   };
   setInterval(placePointer, 120);
@@ -86,12 +114,13 @@ const DOCK_JS: &str = r#"
     const s = mine();
     if (!s || !s.contains(e.target)) return;
     s.focus({ preventScroll: true });
-    const img = document.getElementById('dock-shot');
+    const img = s.querySelector('.dock-shot');
     if (!img || e.target !== img || !img.naturalWidth) return;
     const r = img.getBoundingClientRect();
     if (!r.width || !r.height) return;
     const x = (e.clientX - r.left) * img.naturalWidth / r.width;
     const y = (e.clientY - r.top) * img.naturalHeight / r.height;
+    spawnClickRipple(s, e.clientX, e.clientY);
     flushText();
     out({ t: 'click', x: Math.round(x * 10) / 10, y: Math.round(y * 10) / 10 });
   });
@@ -100,11 +129,11 @@ const DOCK_JS: &str = r#"
     if (!s || !s.contains(e.target)) return;
     e.preventDefault();
     wheel += e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
-    if (!wheelTimer) wheelTimer = setTimeout(flushWheel, 80);
+    if (!wheelTimer) wheelTimer = setTimeout(flushWheel, 50);
   }, { passive: false });
   document.addEventListener('keydown', (e) => {
     const s = mine();
-    if (!s || document.activeElement !== s || e.isComposing) return;
+    if (!s || (document.activeElement !== s && !s.contains(document.activeElement)) || e.isComposing) return;
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     e.stopPropagation();
     if (e.key.length === 1) {
@@ -124,7 +153,7 @@ const DOCK_JS: &str = r#"
   }, true);
   document.addEventListener('paste', (e) => {
     const s = mine();
-    if (!s || document.activeElement !== s) return;
+    if (!s || (document.activeElement !== s && !s.contains(document.activeElement))) return;
     const pasted = (e.clipboardData && e.clipboardData.getData('text')) || '';
     if (pasted) { e.preventDefault(); flushText(); out({ t: 'text', text: pasted.slice(0, 2000) }); }
   });
@@ -195,7 +224,18 @@ pub fn BrowserDock(session: Signal<Session>) -> Element {
     let mut more_open = use_signal(|| false);
     let mut copied_url = use_signal(|| false);
 
-    let (open, in_control, busy, info, shot, error, bot_name, dock_pointer) = {
+    let (
+        open,
+        in_control,
+        busy,
+        autofill_busy,
+        autofill_feedback,
+        info,
+        shot,
+        error,
+        bot_name,
+        dock_pointer,
+    ) = {
         let s = session.read();
         let driving = s
             .panel
@@ -215,6 +255,8 @@ pub fn BrowserDock(session: Signal<Session>) -> Element {
             s.panel.open(),
             s.panel.user_in_control(),
             s.panel.control_busy,
+            s.panel.autofill_busy,
+            s.panel.autofill_feedback.clone(),
             s.panel.info.clone(),
             s.panel.dock_shot(),
             s.panel.browser_error.clone(),
@@ -229,6 +271,7 @@ pub fn BrowserDock(session: Signal<Session>) -> Element {
         .as_ref()
         .and_then(|i| i.url.clone())
         .unwrap_or_default();
+    let is_https = url.starts_with("https://");
     let title = info
         .as_ref()
         .and_then(|i| i.title.clone())
@@ -248,11 +291,6 @@ pub fn BrowserDock(session: Signal<Session>) -> Element {
     };
     let has_shot = active && shot.is_some();
     let url_shown = if editing() { draft() } else { url.clone() };
-    let url_text = if url.is_empty() {
-        "No page open".to_owned()
-    } else {
-        url.clone()
-    };
 
     rsx! {
         aside {
@@ -321,13 +359,45 @@ pub fn BrowserDock(session: Signal<Session>) -> Element {
                     }
                 }
                 p { class: "dock-status caption", "aria-live": "polite", "{control_text}" }
-                if in_control {
+                div { class: "browser-toolbar dock-toolbar", role: "toolbar", "aria-label": "Dock navigation",
+                    button {
+                        class: "icon-btn sm",
+                        r#type: "button",
+                        title: "Back",
+                        "aria-label": "Back",
+                        disabled: !active,
+                        onclick: move |_| session.write().panel.history_or_takeover(BrowserHistory::Back),
+                        Icon { name: "chevron-left", size: 14 }
+                    }
+                    button {
+                        class: "icon-btn sm",
+                        r#type: "button",
+                        title: "Forward",
+                        "aria-label": "Forward",
+                        disabled: !active,
+                        onclick: move |_| session.write().panel.history_or_takeover(BrowserHistory::Forward),
+                        Icon { name: "chevron-right", size: 14 }
+                    }
+                    button {
+                        class: "icon-btn sm",
+                        r#type: "button",
+                        title: "Reload",
+                        "aria-label": "Reload",
+                        disabled: !active,
+                        onclick: move |_| session.write().panel.history_or_takeover(BrowserHistory::Reload),
+                        Icon { name: "refresh", size: 14 }
+                    }
                     div { class: "dock-url editable",
-                        Icon { name: "globe", size: 14 }
+                        span {
+                            class: if is_https { "omnibox-lock secure" } else { "omnibox-lock" },
+                            title: if is_https { "Secure HTTPS connection" } else { "Not HTTPS" },
+                            Icon { name: if is_https { "lock" } else { "globe" }, size: 13 }
+                        }
                         input {
                             class: "dock-address",
-                            "aria-label": "Address",
-                            placeholder: "Type an address and press Enter",
+                            "aria-label": "Address or search",
+                            placeholder: "Enter URL or search\u{2026}",
+                            disabled: !active,
                             value: "{url_shown}",
                             onfocus: move |_| {
                                 draft.set(session.read().panel.info.as_ref().and_then(|i| i.url.clone()).unwrap_or_default());
@@ -347,25 +417,22 @@ pub fn BrowserDock(session: Signal<Session>) -> Element {
                                         .unwrap_or_default();
                                     draft.set(original);
                                     editing.set(false);
-                                } else if event.key() == Key::Enter {
-                                    match address_to_url(&draft()) {
-                                        Some(url) => {
-                                            session.write().panel.send_input(BrowserInput::Navigate { url });
-                                            editing.set(false);
-                                        }
-                                        None => {
-                                            session.write().panel.browser_error =
-                                                Some("Enter a web address.".into());
-                                        }
-                                    }
+                                } else if event.key() == Key::Enter
+                                    && session.write().panel.navigate_omnibox(&draft())
+                                {
+                                    editing.set(false);
                                 }
                             },
                         }
                     }
-                } else {
-                    div { class: "dock-url", title: "{url_text}",
-                        Icon { name: "globe", size: 14 }
-                        span { class: "dock-url-text", "{url_text}" }
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        title: "Autofill matching credentials from Vault",
+                        "aria-label": "Autofill from Vault",
+                        disabled: !active || autofill_busy,
+                        onclick: move |_| session.write().panel.autofill_browser(),
+                        Icon { name: "key", size: 13 }
                     }
                 }
                 if let Some(title) = title.clone() {
@@ -375,7 +442,7 @@ pub fn BrowserDock(session: Signal<Session>) -> Element {
                     if active && shot.is_some() {
                         div {
                             id: "dock-stage",
-                            class: if in_control { "dock-stage control" } else { "dock-stage" },
+                            class: if in_control { "dock-stage taking-control control" } else { "dock-stage" },
                             tabindex: if in_control { 0 } else { -1 },
                             "data-control": if in_control { "user" } else { "bot" },
                             "aria-label": if in_control { "Live page. You are in control: click, scroll and type here." } else { "Live page" },
@@ -402,6 +469,12 @@ pub fn BrowserDock(session: Signal<Session>) -> Element {
                                 "When a bot opens a page in the server browser, it shows up here live."
                             }
                         }
+                    }
+                }
+                if let Some(feedback) = autofill_feedback {
+                    div { class: "vault-notice dock-autofill-notice", role: "status",
+                        Icon { name: "key", size: 13 }
+                        span { "{feedback}" }
                     }
                 }
                 if let Some(message) = error {
@@ -468,9 +541,14 @@ mod tests {
     use super::DOCK_JS;
 
     #[test]
-    fn dock_script_guards_listeners_and_skips_when_closed() {
+    fn dock_script_targets_visible_focus_or_open_dock_stage() {
         assert!(DOCK_JS.contains("window.__serabotDockInit"));
-        assert!(DOCK_JS.contains("slot.classList.contains('open')"));
         assert!(DOCK_JS.contains("window.__serabotDockOut"));
+        assert!(DOCK_JS.contains("focus-stage"));
+        assert!(DOCK_JS.contains("dock-stage"));
+        assert!(DOCK_JS.contains("taking-control"));
+        assert!(DOCK_JS.contains("getBoundingClientRect"));
+        assert!(DOCK_JS.contains("dock-click-ripple"));
+        assert!(!DOCK_JS.contains("if (!slotOpen()) return null;"));
     }
 }

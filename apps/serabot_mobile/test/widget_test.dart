@@ -88,7 +88,29 @@ class FakeServer {
       case 'GET /v1/bots':
         return _json({'bots': [{'id': 'main', 'role': 'orchestrator', 'enabled': true, 'live': true, 'display_name': 'Sera', 'tools': [], 'skills': []}]});
       case 'GET /v1/approvals':
-        return _json({'approvals': [{'id': 'ap1', 'action_id': 'act1', 'tool': 'send_email', 'summary': 'Send the report', 'expires_at': '2099-01-01T00:00:00Z'}]});
+        return _json({
+          'approvals': [
+            {
+              'id': 'ap1',
+              'action_id': 'act1',
+              'tool': 'send_email',
+              'summary': 'Send the report',
+              'expires_at': '2099-01-01T00:00:00Z',
+              'conversation_id': 'dir:main',
+              'destination': 'team@example.com',
+            }
+          ]
+        });
+      case 'GET /v1/tasks':
+        return _json({
+          'tasks': [
+            {'id': 'tsk1', 'title': 'Review Q4 budget', 'status': 'todo', 'due': '2026-12-01'}
+          ],
+          'counts': {'todo': 1, 'in_progress': 0, 'done': 0},
+          'sync': {'provider': 'none', 'health': 'off'},
+        });
+      case 'GET /v1/tasks/calendar':
+        return _json({'events': []});
       case 'GET /v1/events':
         return http.Response('', 200);
       case 'GET /v1/conversations/dir:main/messages':
@@ -275,20 +297,32 @@ void main() {
     expect(find.text('prov needs data-egress approval'), findsOneWidget);
   });
 
-  testWidgets('approvals tab has a badge and decides through the API', (tester) async {
+  testWidgets('inline approval card inside chat decides through the API', (tester) async {
     final (_, srv, _) = await _signedIn(tester);
-    expect(find.text('1'), findsWidgets); // badge
-    await tester.tap(find.text('Approvals'));
+    expect(find.text('Approvals'), findsNothing);
+    await tester.tap(find.text('Daily plan'));
     await tester.pumpAndSettle();
+    expect(find.byKey(const Key('inline-approval-ap1')), findsOneWidget);
     expect(find.text('Send the report'), findsOneWidget);
+    expect(find.text('team@example.com'), findsOneWidget);
     await tester.tap(find.text('Deny'));
     await tester.pumpAndSettle();
     expect(srv.bodies['POST /v1/approvals/ap1/decide'], {'decision': 'deny'});
   });
 
+  testWidgets('tasks tab lists personal tasks', (tester) async {
+    await _signedIn(tester);
+    await tester.tap(find.text('Tasks'));
+    await tester.pumpAndSettle();
+    expect(find.text('Review Q4 budget'), findsOneWidget);
+  });
+
   testWidgets('bots tab lists the bots', (tester) async {
     await _signedIn(tester);
-    await tester.tap(find.text('Bots'));
+    await tester.tap(find.descendant(
+      of: find.byType(NavigationBar),
+      matching: find.text('Bots'),
+    ));
     await tester.pumpAndSettle();
     expect(find.text('Sera'), findsWidgets);
   });

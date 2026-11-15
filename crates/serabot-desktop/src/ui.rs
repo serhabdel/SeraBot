@@ -47,7 +47,6 @@ use crate::ui_settings_page::{
 use crate::ui_usage::UsagePage;
 use crate::ui_vault::VaultPage;
 
-mod approvals;
 mod chat;
 mod connect;
 mod conversations;
@@ -58,7 +57,6 @@ mod row_menu;
 mod settings_view;
 mod sheets;
 mod shell;
-pub(crate) use approvals::*;
 pub(crate) use chat::*;
 pub(crate) use connect::*;
 pub(crate) use conversations::*;

@@ -14,12 +14,13 @@ use crate::composio_flow::ComposioFlow;
 use crate::vault_import::{self, ImportItem};
 use crate::worker::Credentials;
 use crate::{
-    ApiClient, ApiError, BrowserController, BrowserHistory, BrowserInfo, BrowserInput,
-    BrowserProfile, BrowserSessionInfo, BrowserSessionsList, ConnectorUpdate, DEFAULT_PROFILE,
-    MAX_VAULT_DOMAINS, MAX_VAULT_ENTRIES, MAX_VAULT_NOTE_CHARS, MAX_VAULT_USERNAME_CHARS,
-    PasswordManager, PasswordManagerProbe, SigninHelperStatus, VaultAccounts, VaultEntry,
-    VaultKind, VaultPendingSecret, VaultPut, VaultSource, normalize_vault_domain, valid_vault_name,
-    valid_vault_reference, validate_vault_put,
+    ApiClient, ApiError, BrowserAutofillResult, BrowserController, BrowserHistory, BrowserInfo,
+    BrowserInput, BrowserProfile, BrowserSessionInfo, BrowserSessionsList, ConnectorUpdate,
+    DEFAULT_PROFILE, MAX_VAULT_DOMAINS, MAX_VAULT_ENTRIES, MAX_VAULT_NOTE_CHARS,
+    MAX_VAULT_USERNAME_CHARS, PasswordManager, PasswordManagerProbe, SigninHelperStatus,
+    VaultAccounts, VaultEntry, VaultKind, VaultPendingSecret, VaultProviderSyncResponse, VaultPut,
+    VaultSource, normalize_vault_domain, valid_vault_name, valid_vault_reference,
+    validate_vault_put,
 };
 use crate::{ComposioAccount, ComposioApp};
 use std::{
@@ -37,8 +38,12 @@ use zeroize::{Zeroize, Zeroizing};
 pub const STATUS_EVERY: Duration = Duration::from_secs(2);
 /// Status poll interval while the window is unfocused (screenshots stop).
 pub const UNFOCUSED_STATUS_EVERY: Duration = Duration::from_secs(30);
-/// One live view (the dock or a focused browser): at most twice a second.
+/// One live view (the dock or a focused browser): at most twice a second while bot drives.
 pub const SHOT_EVERY: Duration = Duration::from_millis(500);
+/// Faster screenshot cadence while the human holds control.
+pub const HUMAN_SHOT_EVERY: Duration = Duration::from_millis(220);
+/// Immediate screenshot refresh delay after an input/navigation/autofill/tab action.
+pub const IMMEDIATE_SHOT_DELAY: Duration = Duration::from_millis(50);
 /// The Browser page grid shares this budget: each card is refreshed about
 /// once a second, and the request rate never goes past 3 per second.
 pub const GRID_SHOT_EVERY: Duration = Duration::from_millis(1000);
@@ -81,6 +86,7 @@ pub enum PanelOp {
     },
     PasswordManagerClear(String),
     PasswordManagerTest(String),
+    SyncProvider(PasswordManager),
     /// List the owner's logins from a password manager on this PC (metadata).
     ImportList(VaultSource),
     /// Create the reference entries for the picked logins, as (name, write).
@@ -99,6 +105,8 @@ pub enum PanelOp {
     TabOpen(String, String),
     /// Back, forward or reload on the active tab (user in control).
     History(String, BrowserHistory),
+    /// Autofill credentials from Vault into the active browser page.
+    AutofillBrowser(Option<String>),
     ProfilesList,
     ProfileCreate(String),
     ProfileRename {
@@ -141,6 +149,7 @@ pub enum PanelKind {
     PasswordManagerSave,
     PasswordManagerClear,
     PasswordManagerTest,
+    SyncProvider,
     ImportList,
     VaultImport,
     Status,
@@ -149,6 +158,7 @@ pub enum PanelKind {
     Handback,
     Close,
     Input,
+    AutofillBrowser,
     ProfilesList,
     ProfileChange,
     OneDriveStart,
@@ -175,6 +185,7 @@ impl PanelOp {
             Self::PasswordManagerSave { .. } => PanelKind::PasswordManagerSave,
             Self::PasswordManagerClear(_) => PanelKind::PasswordManagerClear,
             Self::PasswordManagerTest(_) => PanelKind::PasswordManagerTest,
+            Self::SyncProvider(_) => PanelKind::SyncProvider,
             Self::ImportList(_) => PanelKind::ImportList,
             Self::VaultImport(_) => PanelKind::VaultImport,
             Self::Status => PanelKind::Status,
@@ -186,6 +197,7 @@ impl PanelOp {
                 PanelKind::Input
             }
             Self::Open(_) => PanelKind::Input,
+            Self::AutofillBrowser(_) => PanelKind::AutofillBrowser,
             Self::ProfilesList => PanelKind::ProfilesList,
             Self::ProfileCreate(_) | Self::ProfileRename { .. } | Self::ProfileDelete(_) => {
                 PanelKind::ProfileChange
@@ -217,6 +229,11 @@ pub enum PanelReply {
         id: String,
         probe: PasswordManagerProbe,
     },
+    ProviderSynced {
+        id: String,
+        name: String,
+        result: VaultProviderSyncResponse,
+    },
     ImportList(Vec<ImportItem>),
     VaultImported(usize),
     Sessions(BrowserSessionsList),
@@ -224,6 +241,7 @@ pub enum PanelReply {
     Control(BrowserSessionInfo),
     Closed,
     Input(BrowserSessionInfo),
+    BrowserAutofilled(BrowserAutofillResult),
     Profiles(Vec<BrowserProfile>),
     ProfileChanged(String),
     OneDriveUrl(String),
@@ -366,6 +384,15 @@ fn execute(job: &PanelJob, cache: &mut Option<ApiClient>) -> Result<PanelReply, 
                     probe,
                 })
         }
+        PanelOp::SyncProvider(manager) => {
+            client
+                .sync_vault_provider(&manager.id)
+                .map(|result| PanelReply::ProviderSynced {
+                    id: manager.id.clone(),
+                    name: manager.name.clone(),
+                    result,
+                })
+        }
         // Runs the owner's CLI on this PC: metadata only, nothing is stored.
         PanelOp::ImportList(source) => {
             vault_import::list_items(*source).map(PanelReply::ImportList)
@@ -398,6 +425,9 @@ fn execute(job: &PanelJob, cache: &mut Option<ApiClient>) -> Result<PanelReply, 
         PanelOp::History(id, action) => client
             .browser_session_history(id, *action)
             .map(PanelReply::Input),
+        PanelOp::AutofillBrowser(id) => client
+            .browser_autofill(id.as_deref())
+            .map(PanelReply::BrowserAutofilled),
         PanelOp::ProfilesList => client.browser_profiles().map(PanelReply::Profiles),
         PanelOp::ProfileCreate(name) => client.browser_profile_create(name).map(|profile| {
             PanelReply::ProfileChanged(format!("Added \u{201c}{}\u{201d}.", profile.name))
@@ -664,6 +694,10 @@ pub struct VaultView {
     pub provider_busy: Option<String>,
     /// The password manager whose server probe is in flight.
     pub provider_testing: Option<String>,
+    /// The password manager whose server sync is in flight.
+    pub provider_syncing: Option<String>,
+    /// Providers already auto-synced once this session when `manager_linked == 0`.
+    pub auto_synced_providers: std::collections::BTreeSet<String>,
     pub provider_tests: std::collections::BTreeMap<String, PasswordManagerProbe>,
     pub provider_error: Option<String>,
     /// The import listing in flight, and the source it is for.
@@ -742,9 +776,18 @@ impl ConnectorFlow {
 
 /// The next picture is due after this long. One live view gets the full
 /// rate; the grid spreads about one refresh a second over its cards.
+#[cfg(test)]
 fn shot_interval(targets: usize, grid: bool) -> Duration {
+    shot_interval_for_control(targets, grid, false)
+}
+
+fn shot_interval_for_control(targets: usize, grid: bool, human_control: bool) -> Duration {
     if !grid {
-        return SHOT_EVERY;
+        return if human_control {
+            HUMAN_SHOT_EVERY
+        } else {
+            SHOT_EVERY
+        };
     }
     let n = u32::try_from(targets.max(1)).unwrap_or(u32::MAX);
     (GRID_SHOT_EVERY / n).max(GRID_SHOT_FLOOR)
@@ -851,6 +894,8 @@ pub struct PanelState {
     queue: VecDeque<PanelOp>,
     inputs_inflight: usize,
     pub control_busy: bool,
+    pub autofill_busy: bool,
+    pub autofill_feedback: Option<String>,
     pub vault: VaultView,
     pub onedrive: OneDriveFlow,
     pub connectors: ConnectorFlow,
@@ -893,6 +938,8 @@ impl PanelState {
             queue: VecDeque::new(),
             inputs_inflight: 0,
             control_busy: false,
+            autofill_busy: false,
+            autofill_feedback: None,
             vault: VaultView::default(),
             onedrive: OneDriveFlow::default(),
             connectors: ConnectorFlow::default(),
@@ -1171,6 +1218,94 @@ impl PanelState {
         if self.queue.len() < MAX_QUEUED_INPUTS {
             self.queue.push_back(PanelOp::History(id, action));
         }
+    }
+
+    /// Navigate from the omnibox (normalizing domains and search queries).
+    /// Automatically acquires control first if the session is active and the
+    /// bot currently holds control.
+    pub fn navigate_omnibox(&mut self, raw: &str) -> bool {
+        let Some(url) = omnibox_to_url(raw) else {
+            self.browser_error = Some("Enter a web address or search query.".into());
+            return false;
+        };
+        self.browser_error = None;
+        if self.user_in_control() {
+            self.send_input(BrowserInput::Navigate { url });
+            return true;
+        }
+        let Some(id) = self.control_target() else {
+            return false;
+        };
+        if !self.session(&id).is_some_and(|s| s.active) {
+            return false;
+        }
+        if !self.control_busy {
+            self.control_busy = true;
+            self.queue.push_back(PanelOp::Takeover(id.clone()));
+        }
+        if self.queue.len() < MAX_QUEUED_INPUTS {
+            self.queue
+                .push_back(PanelOp::Input(id, BrowserInput::Navigate { url }));
+        }
+        true
+    }
+
+    /// Switch tabs, acquiring control first if needed.
+    pub fn switch_tab_or_takeover(&mut self, tab: &str) {
+        if !crate::valid_tab_id(tab) {
+            return;
+        }
+        if self.user_in_control() {
+            self.switch_tab(tab);
+            return;
+        }
+        let Some(id) = self.control_target() else {
+            return;
+        };
+        if !self.session(&id).is_some_and(|s| s.active) {
+            return;
+        }
+        if !self.control_busy {
+            self.control_busy = true;
+            self.queue.push_back(PanelOp::Takeover(id.clone()));
+        }
+        if self.queue.len() < MAX_QUEUED_INPUTS {
+            self.queue
+                .push_back(PanelOp::Tab(id, TabAction::Switch(tab.to_owned())));
+        }
+    }
+
+    /// Back, forward or reload, acquiring control first if needed.
+    pub fn history_or_takeover(&mut self, action: BrowserHistory) {
+        if self.user_in_control() {
+            self.history(action);
+            return;
+        }
+        let Some(id) = self.control_target() else {
+            return;
+        };
+        if !self.session(&id).is_some_and(|s| s.active) {
+            return;
+        }
+        if !self.control_busy {
+            self.control_busy = true;
+            self.queue.push_back(PanelOp::Takeover(id.clone()));
+        }
+        if self.queue.len() < MAX_QUEUED_INPUTS {
+            self.queue.push_back(PanelOp::History(id, action));
+        }
+    }
+
+    /// Trigger Vault autofill on the active browser page.
+    pub fn autofill_browser(&mut self) {
+        if self.autofill_busy {
+            return;
+        }
+        let target = self.control_target();
+        self.autofill_busy = true;
+        self.autofill_feedback = None;
+        self.browser_error = None;
+        self.queue.push_back(PanelOp::AutofillBrowser(target));
     }
 
     fn queue_tab(&mut self, action: TabAction) {
@@ -1475,12 +1610,88 @@ impl PanelState {
 
     /// Probe the saved token against the password manager CLI on the server.
     pub fn test_password_manager(&mut self, id: String) {
-        if self.vault.provider_busy.is_some() || self.vault.provider_testing.is_some() {
+        if self.vault.provider_busy.is_some()
+            || self.vault.provider_testing.is_some()
+            || self.vault.provider_syncing.is_some()
+        {
             return;
         }
         self.vault.provider_testing = Some(id.clone());
         self.vault.provider_error = None;
         self.queue.push_back(PanelOp::PasswordManagerTest(id));
+    }
+
+    /// Sync credentials from a configured password manager on the server.
+    pub fn sync_provider(&mut self, manager: PasswordManager) {
+        if self.vault.provider_busy.is_some()
+            || self.vault.provider_testing.is_some()
+            || self.vault.provider_syncing.is_some()
+        {
+            return;
+        }
+        self.vault.provider_syncing = Some(manager.id.clone());
+        self.vault.provider_error = None;
+        self.queue.push_back(PanelOp::SyncProvider(manager));
+    }
+
+    /// Returns true if an auto-sync candidate is ready to run.
+    pub fn has_auto_sync_candidate(&self) -> bool {
+        if !self.vault.loaded
+            || !self.vault.providers_loaded
+            || self.vault.loading
+            || self.vault.provider_busy.is_some()
+            || self.vault.provider_testing.is_some()
+            || self.vault.provider_syncing.is_some()
+        {
+            return false;
+        }
+        if self.vault.entries.iter().any(|e| e.source.is_reference()) {
+            return false;
+        }
+        self.vault.providers.iter().any(|p| {
+            p.enabled
+                && p.configured
+                && p.cli_found
+                && !self.vault.auto_synced_providers.contains(&p.id)
+        })
+    }
+
+    /// Auto-sync a connected provider once per session load if no manager-linked
+    /// entries are present yet.
+    pub fn maybe_auto_sync_providers(&mut self) {
+        if !self.vault.loaded
+            || !self.vault.providers_loaded
+            || self.vault.loading
+            || self.vault.provider_busy.is_some()
+            || self.vault.provider_testing.is_some()
+            || self.vault.provider_syncing.is_some()
+        {
+            return;
+        }
+        let manager_linked = self
+            .vault
+            .entries
+            .iter()
+            .filter(|e| e.source.is_reference())
+            .count();
+        if manager_linked > 0 {
+            return;
+        }
+        let candidate = self
+            .vault
+            .providers
+            .iter()
+            .find(|p| {
+                p.enabled
+                    && p.configured
+                    && p.cli_found
+                    && !self.vault.auto_synced_providers.contains(&p.id)
+            })
+            .cloned();
+        if let Some(manager) = candidate {
+            self.vault.auto_synced_providers.insert(manager.id.clone());
+            self.sync_provider(manager);
+        }
     }
 
     /// List the logins of a password manager on this PC, for the picker.
@@ -1602,8 +1813,12 @@ impl PanelState {
                 self.shot_cursor = self.shot_cursor.wrapping_add(1);
                 self.shot_inflight = true;
                 self.shot_inflight_id = Some(id.clone());
-                self.next_shot =
-                    now + shot_interval(targets.len(), self.page_open && self.focus.is_none());
+                self.next_shot = now
+                    + shot_interval_for_control(
+                        targets.len(),
+                        self.page_open && self.focus.is_none(),
+                        self.user_in_control(),
+                    );
                 return Some(PanelOp::Shot(id));
             }
         }
@@ -1625,6 +1840,7 @@ impl PanelState {
             PanelKind::Input => {
                 self.inputs_inflight = self.inputs_inflight.saturating_sub(1);
             }
+            PanelKind::AutofillBrowser => self.autofill_busy = false,
             PanelKind::Takeover | PanelKind::Handback => self.control_busy = false,
             PanelKind::ProfileChange => self.profiles_busy = false,
             PanelKind::OneDriveStart | PanelKind::OneDriveDisconnect => self.onedrive.busy = false,
@@ -1682,13 +1898,39 @@ impl PanelState {
                 self.signin_helpers = list.signin_helpers;
                 self.set_sessions(list.sessions);
             }
-            PanelReply::Control(session) | PanelReply::Input(session) => {
+            PanelReply::Control(session) => {
+                self.browser_error = None;
+                let user_control = session.controller == BrowserController::User;
+                match self.sessions.iter_mut().find(|s| s.id == session.id) {
+                    Some(existing) => *existing = session,
+                    None => self.sessions.push(session),
+                }
+                self.refresh_dock_info();
+                if user_control {
+                    self.next_shot = self.next_shot.min(now + IMMEDIATE_SHOT_DELAY);
+                }
+            }
+            PanelReply::Input(session) => {
                 self.browser_error = None;
                 match self.sessions.iter_mut().find(|s| s.id == session.id) {
                     Some(existing) => *existing = session,
                     None => self.sessions.push(session),
                 }
                 self.refresh_dock_info();
+                self.next_shot = self.next_shot.min(now + IMMEDIATE_SHOT_DELAY);
+            }
+            PanelReply::BrowserAutofilled(res) => {
+                self.browser_error = None;
+                self.next_shot = self.next_shot.min(now + IMMEDIATE_SHOT_DELAY);
+                self.autofill_feedback = Some(if res.filled {
+                    match res.entry_name.as_deref().filter(|n| !n.is_empty()) {
+                        Some(name) => format!("Autofilled from \u{201c}{name}\u{201d}."),
+                        None => "Credentials autofilled from Vault.".into(),
+                    }
+                } else {
+                    res.message
+                        .unwrap_or_else(|| "No matching Vault credentials for this page.".into())
+                });
             }
             PanelReply::Closed => {
                 self.next_status = now;
@@ -1793,6 +2035,9 @@ impl PanelState {
                     Some(existing) => *existing = manager,
                     None => self.vault.providers.push(manager),
                 }
+                // Reload vault entries so any auto-synced items appear immediately.
+                self.vault.want_list = true;
+                self.vault.loading = true;
             }
             PanelReply::PasswordManagerCleared(id) => {
                 self.vault.provider_busy = None;
@@ -1804,11 +2049,32 @@ impl PanelState {
             }
             PanelReply::PasswordManagerTested { id, probe } => {
                 self.vault.provider_testing = None;
+                let ok = probe.ok;
                 if let Some(manager) = self.vault.providers.iter_mut().find(|p| p.id == id) {
                     manager.configured = probe.configured;
                     manager.cli_found = probe.cli_found;
                 }
                 self.vault.provider_tests.insert(id, probe);
+                if ok {
+                    self.vault.want_list = true;
+                    self.vault.loading = true;
+                }
+            }
+            PanelReply::ProviderSynced {
+                id: _,
+                name,
+                result,
+            } => {
+                self.vault.provider_syncing = None;
+                let count = result.synced_count();
+                self.vault.notice = Some(result.message.unwrap_or_else(|| {
+                    format!(
+                        "Synced {count} item{} from {name}.",
+                        if count == 1 { "" } else { "s" }
+                    )
+                }));
+                self.vault.want_list = true;
+                self.vault.loading = true;
             }
             PanelReply::ImportList(items) => {
                 let source = self.vault.import_loading.take().unwrap_or_default();
@@ -1876,6 +2142,9 @@ impl PanelState {
                 self.browser_error = Some(message);
                 self.next_status = now;
             }
+            PanelKind::AutofillBrowser => {
+                self.browser_error = Some(message);
+            }
             PanelKind::OneDriveStart | PanelKind::OneDriveDisconnect => {
                 self.onedrive.error = Some(message);
             }
@@ -1924,6 +2193,10 @@ impl PanelState {
             }
             PanelKind::PasswordManagerTest => {
                 self.vault.provider_testing = None;
+                self.vault.provider_error = Some(message);
+            }
+            PanelKind::SyncProvider => {
+                self.vault.provider_syncing = None;
                 self.vault.provider_error = Some(message);
             }
             PanelKind::ImportList => {
@@ -1994,6 +2267,40 @@ pub fn address_to_url(raw: &str) -> Option<String> {
         format!("https://{text}")
     };
     (url.chars().count() <= 2048).then_some(url)
+}
+
+/// Omnibox text to a navigable URL:
+/// - `http://` or `https://` URLs pass through
+/// - domains (`example.com`, `localhost:3000`) normalize to `https://`
+/// - non-URL queries (`weather paris`, `serabot`) normalize to a search URL
+pub fn omnibox_to_url(raw: &str) -> Option<String> {
+    let text = raw.trim();
+    if text.is_empty() || text.chars().any(char::is_control) {
+        return None;
+    }
+    let lower = text.to_ascii_lowercase();
+    let has_space = text.chars().any(char::is_whitespace);
+    if !has_space {
+        if lower.starts_with("http://") || lower.starts_with("https://") {
+            return (text.chars().count() <= 2048).then(|| text.to_owned());
+        }
+        if lower.contains("://") {
+            return None;
+        }
+        let host_part = text.split('/').next().unwrap_or("");
+        let looks_like_domain =
+            (host_part.contains('.') && !host_part.starts_with('.') && !host_part.ends_with('.'))
+                || lower == "localhost"
+                || lower.starts_with("localhost:")
+                || lower.starts_with("localhost/");
+        if looks_like_domain {
+            let url = format!("https://{text}");
+            return (url.chars().count() <= 2048).then_some(url);
+        }
+    }
+    let encoded: String = url::form_urlencoded::byte_serialize(text.as_bytes()).collect();
+    let search_url = format!("https://www.google.com/search?q={encoded}");
+    (search_url.chars().count() <= 2048).then_some(search_url)
 }
 
 /// The site a card shows: the host of the address, or a plain fallback.
@@ -3352,5 +3659,151 @@ mod tests {
             !state.vault.provider_tests.contains_key("onepassword"),
             "saving a new token clears the last probe"
         );
+    }
+
+    #[test]
+    fn omnibox_normalizes_domains_and_search_queries() {
+        assert_eq!(
+            omnibox_to_url("example.com/login").as_deref(),
+            Some("https://example.com/login")
+        );
+        assert_eq!(
+            omnibox_to_url("https://docs.rs/tokio").as_deref(),
+            Some("https://docs.rs/tokio")
+        );
+        assert_eq!(
+            omnibox_to_url("localhost:8080/health").as_deref(),
+            Some("https://localhost:8080/health")
+        );
+        assert_eq!(
+            omnibox_to_url("weather in paris").as_deref(),
+            Some("https://www.google.com/search?q=weather+in+paris")
+        );
+        assert_eq!(
+            omnibox_to_url("serabot").as_deref(),
+            Some("https://www.google.com/search?q=serabot")
+        );
+        assert_eq!(omnibox_to_url("ftp://example.com"), None);
+        assert_eq!(omnibox_to_url("   "), None);
+    }
+
+    #[test]
+    fn human_control_lowers_shot_interval_and_input_schedules_immediate_shot() {
+        assert_eq!(
+            shot_interval_for_control(1, false, true),
+            Duration::from_millis(220)
+        );
+        assert_eq!(
+            shot_interval_for_control(1, false, false),
+            Duration::from_millis(500)
+        );
+
+        let t0 = Instant::now();
+        let mut state = PanelState::new();
+        state.next_shot = t0 + Duration::from_secs(10);
+        let mut s = session("default", true, BrowserController::User);
+        s.url = Some("https://example.com".into());
+        state.apply(done(&state, PanelKind::Input, Ok(PanelReply::Input(s))), t0);
+        assert!(state.next_shot <= t0 + IMMEDIATE_SHOT_DELAY);
+    }
+
+    #[test]
+    fn omnibox_navigate_acquires_control_when_bot_is_driving() {
+        let t0 = Instant::now();
+        let mut state = PanelState::new();
+        let bot_session = session("default", true, BrowserController::Bot);
+        state.apply(
+            done(
+                &state,
+                PanelKind::Status,
+                Ok(PanelReply::Sessions(BrowserSessionsList {
+                    sessions: vec![bot_session],
+                    idle_timeout_secs: None,
+                    signin_helpers: Vec::new(),
+                })),
+            ),
+            t0,
+        );
+        assert!(state.navigate_omnibox("example.com"));
+        let first = state.next_op(t0);
+        assert!(matches!(first, Some(PanelOp::Takeover(ref id)) if id == "default"));
+        let second = state.next_op(t0);
+        assert!(matches!(
+            second,
+            Some(PanelOp::Input(ref id, BrowserInput::Navigate { ref url }))
+                if id == "default" && url == "https://example.com"
+        ));
+    }
+
+    #[test]
+    fn autofill_browser_queues_op_and_records_feedback() {
+        let t0 = Instant::now();
+        let mut state = PanelState::new();
+        state.autofill_browser();
+        assert!(state.autofill_busy);
+        assert!(matches!(
+            state.next_op(t0),
+            Some(PanelOp::AutofillBrowser(_))
+        ));
+        state.apply(
+            done(
+                &state,
+                PanelKind::AutofillBrowser,
+                Ok(PanelReply::BrowserAutofilled(BrowserAutofillResult {
+                    filled: true,
+                    entry_name: Some("acme-login".into()),
+                    message: None,
+                })),
+            ),
+            t0,
+        );
+        assert!(!state.autofill_busy);
+        assert!(
+            state
+                .autofill_feedback
+                .as_deref()
+                .is_some_and(|m| m.contains("acme-login"))
+        );
+    }
+
+    #[test]
+    fn vault_sync_and_provider_save_trigger_vault_list_reload_and_auto_sync_runs_once() {
+        let t0 = Instant::now();
+        let mut state = PanelState::new();
+        state.vault.loaded = true;
+        state.vault.providers_loaded = true;
+        let mut mgr = password_manager("onepassword", true, true);
+        mgr.enabled = true;
+        state.vault.providers = vec![mgr.clone()];
+
+        assert!(state.has_auto_sync_candidate());
+        state.maybe_auto_sync_providers();
+        assert!(!state.has_auto_sync_candidate());
+        assert!(matches!(
+            state.next_op(t0),
+            Some(PanelOp::SyncProvider(ref p)) if p.id == "onepassword"
+        ));
+
+        state.apply(
+            done(
+                &state,
+                PanelKind::SyncProvider,
+                Ok(PanelReply::ProviderSynced {
+                    id: "onepassword".into(),
+                    name: "1Password".into(),
+                    result: VaultProviderSyncResponse {
+                        synced_items: Some(3),
+                        entries: None,
+                        message: None,
+                    },
+                }),
+            ),
+            t0,
+        );
+        assert!(state.vault.provider_syncing.is_none());
+        assert!(matches!(
+            state.next_op(t0),
+            Some(PanelOp::VaultList { domain: None })
+        ));
     }
 }

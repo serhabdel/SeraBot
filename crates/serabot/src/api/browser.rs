@@ -150,6 +150,134 @@ pub(super) async fn browser_input(
     input_for(&state, &user, DEFAULT_PROFILE, input).await
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AutofillRequest {
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    secret: Option<String>,
+    #[serde(default)]
+    submit: Option<bool>,
+}
+
+/// `POST /v1/browser/autofill`: 1-click credential autofill for the human user
+/// in control of the browser. Resolves matching Vault credentials for the
+/// current HTTPS page, fills username/password fields, and audits without
+/// logging or returning any secret value.
+pub(super) async fn browser_autofill(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    body: Option<Json<AutofillRequest>>,
+) -> Result<Json<Value>> {
+    let req = body.map(|Json(v)| v).unwrap_or_default();
+    let profile = req
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_PROFILE);
+    if profile != DEFAULT_PROFILE {
+        let _ = existing_profile(&state, &user, profile)?;
+    }
+    let browser = manager(&state)?;
+    let lease = browser.user_lease(&user.id, profile).await?;
+    let (info, outline) = lease.backend().snapshot().await?;
+    let host = crate::browser::tools::secret_page_host(&info.url)?;
+    let secret_name = match req
+        .secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(name) => name.to_owned(),
+        None => {
+            crate::vault::find_matching_password_entry(&state.users, &user.id, &host)?
+                .ok_or_else(|| {
+                    SeraError::NotFound(format!("no matching vault credential for {host}"))
+                })?
+                .name
+        }
+    };
+    let password = crate::vault_providers::resolve_for_browser(
+        &state.users,
+        &state.vault_providers,
+        &user.id,
+        &secret_name,
+        &host,
+        crate::vault::VaultField::Value,
+    )
+    .await?;
+    let username = crate::vault_providers::resolve_for_browser(
+        &state.users,
+        &state.vault_providers,
+        &user.id,
+        &secret_name,
+        &host,
+        crate::vault::VaultField::Username,
+    )
+    .await
+    .ok();
+    let after = lease.backend().info().await?;
+    if crate::browser::tools::secret_page_host(&after.url)
+        .ok()
+        .as_deref()
+        != Some(host.as_str())
+    {
+        return Err(SeraError::Validation(
+            "the page moved; not filling credentials".into(),
+        ));
+    }
+    lease.remember_secret(&secret_name, &password);
+    let (username_ref, password_ref) = crate::browser::tools::find_credential_refs(&outline);
+    if username_ref.is_none() && password_ref.is_none() {
+        return Err(SeraError::Validation(
+            "no login form fields found on the current page".into(),
+        ));
+    }
+    let mut username_filled = false;
+    if let (Some(uref), Some(uname)) = (&username_ref, &username) {
+        lease
+            .backend()
+            .type_ref(uref, uname.as_str(), false)
+            .await
+            .map_err(|error| SeraError::External(lease.redact(&error.to_string())))?;
+        username_filled = true;
+    }
+    let mut password_filled = false;
+    if let Some(pref) = &password_ref {
+        lease
+            .backend()
+            .type_ref(pref, password.as_str(), req.submit.unwrap_or(false))
+            .await
+            .map_err(|error| SeraError::External(lease.redact(&error.to_string())))?;
+        password_filled = true;
+    }
+    state.store.record_audit(
+        &user.id,
+        "browser.autofill",
+        None,
+        None,
+        None,
+        None,
+        Some(state.runtime.policy_version()),
+        Some(&json!({
+            "profile": profile,
+            "secret": secret_name,
+            "host": host,
+            "username_filled": username_filled,
+            "password_filled": password_filled,
+        })),
+    )?;
+    Ok(Json(json!({
+        "filled": true,
+        "secret": secret_name,
+        "host": host,
+        "username_filled": username_filled,
+        "password_filled": password_filled,
+    })))
+}
+
 // ---- 0.16 per-profile session routes ----
 
 fn sessions_envelope(state: &ApiState, sessions: Vec<Value>) -> Value {

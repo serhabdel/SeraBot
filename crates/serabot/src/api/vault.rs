@@ -141,12 +141,37 @@ pub(super) async fn put_vault_provider(
             "password manager CLI auto-install failed on token save"
         );
     }
-    Ok(Json(json!(vault_providers::status(
+    let mut synced_items = 0usize;
+    if state.vault_providers.enabled(provider)
+        && state.vault_providers.cli_found(provider)
+        && let Ok(probe_report) =
+            vault_providers::probe(&state.users, &state.vault_providers, &user.id, provider).await
+        && probe_report.ok
+    {
+        match vault_providers::sync_provider_to_vault(
+            &state.users,
+            &state.vault_providers,
+            &user.id,
+            provider,
+        )
+        .await
+        {
+            Ok(count) => synced_items = count,
+            Err(error) => tracing::warn!(
+                provider = provider.id(),
+                %error,
+                "vault provider auto-sync failed on token save"
+            ),
+        }
+    }
+    let mut body = json!(vault_providers::status(
         &state.users,
         &state.vault_providers,
         &user.id,
         provider
-    )?)))
+    )?);
+    body["synced_items"] = json!(synced_items);
+    Ok(Json(body))
 }
 
 /// `DELETE /v1/vault/providers/{id}`: forget the owner's token for a password
@@ -167,7 +192,8 @@ pub(super) async fn delete_vault_provider(
 }
 
 /// `POST /v1/vault/providers/{id}/test`: exit-code style probe; never a token
-/// or CLI stdout.
+/// or CLI stdout. Auto-syncs reference-backed items into the user's vault when
+/// the probe succeeds.
 pub(super) async fn test_vault_provider(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
@@ -176,5 +202,73 @@ pub(super) async fn test_vault_provider(
     let provider = password_manager(&id)?;
     let report =
         vault_providers::probe(&state.users, &state.vault_providers, &user.id, provider).await?;
-    Ok(Json(json!(report)))
+    let mut synced_items = 0usize;
+    if report.ok {
+        match vault_providers::sync_provider_to_vault(
+            &state.users,
+            &state.vault_providers,
+            &user.id,
+            provider,
+        )
+        .await
+        {
+            Ok(count) => synced_items = count,
+            Err(error) => tracing::warn!(
+                provider = provider.id(),
+                %error,
+                "vault provider auto-sync failed during test"
+            ),
+        }
+    }
+    let mut body = json!(report);
+    body["synced_items"] = json!(synced_items);
+    Ok(Json(body))
+}
+
+/// `POST /v1/vault/providers/{id}/sync`: sync reference-backed items from a
+/// connected password manager into the acting user's vault.
+pub(super) async fn sync_vault_provider(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    let provider = password_manager(&id)?;
+    let synced_items = vault_providers::sync_provider_to_vault(
+        &state.users,
+        &state.vault_providers,
+        &user.id,
+        provider,
+    )
+    .await?;
+    Ok(Json(json!({
+        "ok": true,
+        "provider": provider.id(),
+        "synced_items": synced_items,
+    })))
+}
+
+/// `GET /v1/vault/providers/{id}/items`: list reference-backed items from a
+/// connected password manager without returning any plaintext secret.
+pub(super) async fn list_vault_provider_items(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    let provider = password_manager(&id)?;
+    let token = state
+        .users
+        .vault_provider_token(&user.id, provider.id())?
+        .ok_or_else(|| {
+            SeraError::Validation(format!("save a {} access token first", provider.label()))
+        })?;
+    let items = vault_providers::list_provider_items(
+        &state.vault_providers,
+        provider,
+        secrecy::ExposeSecret::expose_secret(&token),
+    )
+    .await?;
+    Ok(Json(json!({
+        "provider": provider.id(),
+        "items": items,
+    })))
 }

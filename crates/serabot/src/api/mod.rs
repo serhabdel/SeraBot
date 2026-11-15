@@ -327,6 +327,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/browser/takeover", post(browser_takeover))
         .route("/v1/browser/handback", post(browser_handback))
         .route("/v1/browser/input", post(browser_input))
+        .route("/v1/browser/autofill", post(browser_autofill))
         .route("/v1/browser/close", post(browser_close))
         .route("/v1/browser/sessions", get(sessions_list))
         .route(
@@ -435,6 +436,11 @@ pub fn router(state: ApiState) -> Router {
             put(put_vault_provider).delete(delete_vault_provider),
         )
         .route("/v1/vault/providers/{id}/test", post(test_vault_provider))
+        .route("/v1/vault/providers/{id}/sync", post(sync_vault_provider))
+        .route(
+            "/v1/vault/providers/{id}/items",
+            get(list_vault_provider_items),
+        )
         .route("/v1/vault/{name}", put(put_vault).delete(delete_vault))
         .route("/v1/providers", get(list_providers))
         .route("/v1/providers/{id}/key", put(set_provider_key))

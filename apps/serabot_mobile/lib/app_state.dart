@@ -1,9 +1,10 @@
-import 'dart:async';
+﻿import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 
 import 'api_client.dart';
 import 'chat_models.dart';
+import 'models.dart';
 
 /// Per-user data shared by every screen: the conversation list (same
 /// `GET /v1/conversations` as the desktop, same order), bots, the pending
@@ -16,6 +17,7 @@ class AppState extends ChangeNotifier {
 
   List<ConversationSummary> conversations = const [];
   List<BotSummary> bots = const [];
+  List<ApprovalItem> approvals = const [];
   int pendingApprovals = 0;
   bool loadingConversations = false;
   String? conversationsError;
@@ -72,7 +74,8 @@ class AppState extends ChangeNotifier {
 
   Future<void> refreshApprovals() async {
     try {
-      pendingApprovals = (await client.approvals()).length;
+      approvals = await client.approvals();
+      pendingApprovals = approvals.length;
       _notify();
     } on ApiException {
       // Keep the last known count.
@@ -91,18 +94,42 @@ class AppState extends ChangeNotifier {
   }
 
   final _avatars = <String, Future<Uint8List?>>{};
+  final _avatarBytes = <String, Uint8List?>{};
 
-  /// Bot (ots) or group (conversations) picture, cached per version.
-  /// Null when none is set or the fetch failed.
+  String? _avatarKey(String kind, String id, String? version) {
+    final v = version?.trim() ?? '';
+    if (v.isEmpty) {
+      return kind == 'bots' ? '$kind/$id/default' : null;
+    }
+    return '$kind/$id/$v';
+  }
+
+  /// Synchronous in-memory avatar bytes so `SeraAvatar` renders on frame 0
+  /// without a `FutureBuilder` flash.
+  Uint8List? cachedAvatar(String kind, String id, String? version) {
+    final key = _avatarKey(kind, id, version);
+    if (key == null) {
+      return null;
+    }
+    return _avatarBytes[key];
+  }
+
+  /// Bot (`bots`) or group (`conversations`) picture, cached per version.
+  /// Fetches `/v1/bots/{id}/avatar` even when [version] is null/empty since
+  /// the server serves default avatars for shipped bots.
   Future<Uint8List?> avatar(String kind, String id, String? version) {
-    if (version == null || version.isEmpty) {
+    final key = _avatarKey(kind, id, version);
+    if (key == null) {
       return Future.value(null);
     }
-    return _avatars.putIfAbsent('$kind/$id/$version', () async {
+    return _avatars.putIfAbsent(key, () async {
       try {
         final b = await client.avatarBytes(kind, id);
-        return b == null ? null : Uint8List.fromList(b);
+        final bytes = b == null ? null : Uint8List.fromList(b);
+        _avatarBytes[key] = bytes;
+        return bytes;
       } on ApiException {
+        _avatarBytes[key] = null;
         return null;
       }
     });
@@ -129,6 +156,7 @@ class AppState extends ChangeNotifier {
     final k = e.kind;
     if (k == 'message' ||
         k == 'conversation.created' ||
+        k == 'conversation.renamed' ||
         k == 'turn.completed' ||
         k == 'task.failed' ||
         k == 'handoff.queued' ||

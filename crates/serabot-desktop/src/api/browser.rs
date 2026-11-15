@@ -149,6 +149,17 @@ pub enum BrowserHistory {
     Reload,
 }
 
+/// Result of `POST /v1/browser/autofill`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct BrowserAutofillResult {
+    #[serde(default)]
+    pub filled: bool,
+    #[serde(default, alias = "secret")]
+    pub entry_name: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
 impl BrowserSessionInfo {
     /// The dock's single-session view of this session.
     pub fn as_info(&self) -> BrowserInfo {
@@ -576,6 +587,24 @@ impl ApiClient {
         Ok(ack.closed)
     }
 
+    /// `POST /v1/browser/autofill`: fill matching Vault credentials into the
+    /// active browser page.
+    pub fn browser_autofill(&self, id: Option<&str>) -> Result<BrowserAutofillResult, ApiError> {
+        if let Some(id) = id {
+            session_id(id)?;
+        }
+        #[derive(Serialize)]
+        struct Body<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            profile: Option<&'a str>,
+        }
+        self.panel_json(
+            Method::POST,
+            &["v1", "browser", "autofill"],
+            Some(&Body { profile: id }),
+        )
+    }
+
     /// `PUT /v1/bots/{id}`: name, description, instructions, model and
     /// browser profile in one write. A write: an unknown outcome is never
     /// replayed by the caller.
@@ -889,5 +918,14 @@ lines"
         assert_eq!(profile_for_bot(&profiles, "main"), "default");
         assert_eq!(profile_for_bot(&profiles, "unknown"), "default");
         assert_eq!(profile_for_bot(&[], "main"), "default");
+    }
+
+    #[test]
+    fn autofill_result_parses_server_secret_field() {
+        let json = r#"{"filled":true,"secret":"acme-login","host":"acme.com","username_filled":true,"password_filled":true}"#;
+        let res: BrowserAutofillResult = serde_json::from_str(json).unwrap();
+        assert!(res.filled);
+        assert_eq!(res.entry_name.as_deref(), Some("acme-login"));
+        assert_eq!(res.message, None);
     }
 }

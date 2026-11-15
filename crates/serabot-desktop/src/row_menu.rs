@@ -16,8 +16,10 @@ pub enum RowKind {
         /// Whether setup is unfinished.
         needs_setup: bool,
     },
-    /// A conversation (group, room or extra chat).
+    /// A conversation (room or extra chat).
     Thread { archived: bool },
+    /// A group/channel (`room:` conversation) that supports a custom image.
+    Group { archived: bool },
 }
 
 /// One menu entry.
@@ -31,6 +33,7 @@ pub enum RowAction {
     SwitchOff,
     DeleteBot,
     Rename,
+    SetImage,
     Archive,
     Unarchive,
 }
@@ -46,6 +49,7 @@ impl RowAction {
             RowAction::SwitchOff => "Switch off",
             RowAction::DeleteBot => "Delete bot\u{2026}",
             RowAction::Rename => "Rename",
+            RowAction::SetImage => "Set channel image\u{2026}",
             RowAction::Archive => "Archive",
             RowAction::Unarchive => "Restore",
         }
@@ -60,6 +64,7 @@ impl RowAction {
             RowAction::SwitchOn | RowAction::SwitchOff => "bolt",
             RowAction::DeleteBot | RowAction::Archive => "trash",
             RowAction::Rename => "edit",
+            RowAction::SetImage => "image",
             RowAction::Unarchive => "undo",
         }
     }
@@ -105,8 +110,18 @@ pub fn actions(kind: &RowKind, pinned: bool) -> Vec<RowAction> {
             }
             items
         }
-        RowKind::Thread { archived: true } => vec![RowAction::Unarchive, pin],
+        RowKind::Thread { archived: true } | RowKind::Group { archived: true } => {
+            vec![RowAction::Unarchive, pin]
+        }
         RowKind::Thread { archived: false } => vec![RowAction::Rename, pin, RowAction::Archive],
+        RowKind::Group { archived: false } => {
+            vec![
+                RowAction::Rename,
+                RowAction::SetImage,
+                pin,
+                RowAction::Archive,
+            ]
+        }
     }
 }
 

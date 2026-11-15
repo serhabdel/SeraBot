@@ -1174,6 +1174,435 @@ pub fn status(
     })
 }
 
+/// A password-manager item normalized into a reference-backed vault candidate.
+/// Never carries a plaintext password.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderVaultItem {
+    pub id: String,
+    pub title: String,
+    pub vault_id: String,
+    pub vault_name: Option<String>,
+    pub username: Option<String>,
+    pub domains: Vec<String>,
+    pub reference: String,
+}
+
+fn extract_domains_from_urls(raw_urls: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in raw_urls {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let host = if let Ok(url) = reqwest::Url::parse(trimmed) {
+            url.host_str().map(str::to_owned)
+        } else {
+            Some(trimmed.to_owned())
+        };
+        if let Some(host) = host
+            && let Ok(normalized) = vault::normalize_domains(&[host])
+        {
+            for d in normalized {
+                if !out.contains(&d) {
+                    out.push(d);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Parse `op item list --format json` output into reference-backed items.
+pub fn parse_onepassword_items(raw: &str) -> Result<Vec<ProviderVaultItem>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let items: Vec<serde_json::Value> = serde_json::from_str(trimmed)
+        .map_err(|_| SeraError::External("1Password returned invalid JSON".into()))?;
+    let mut out = Vec::new();
+    for item in items {
+        let Some(id) = item
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.starts_with('-'))
+        else {
+            continue;
+        };
+        let title = item
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(id)
+            .to_owned();
+        let vault_obj = item.get("vault");
+        let vault_id = vault_obj
+            .and_then(|v| v.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.starts_with('-'))
+            .or_else(|| {
+                vault_obj
+                    .and_then(|v| v.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| {
+                        !s.is_empty() && !s.contains(char::is_whitespace) && !s.starts_with('-')
+                    })
+            })
+            .unwrap_or("Private");
+        let vault_name = vault_obj
+            .and_then(|v| v.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+
+        let reference = format!("op://{vault_id}/{id}/password");
+        if validate_reference(VaultSource::OnePassword, &reference).is_err() {
+            continue;
+        }
+
+        let username = item
+            .get("additional_information")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| item.get("username").and_then(serde_json::Value::as_str))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+
+        let mut raw_urls = Vec::new();
+        if let Some(urls) = item.get("urls").and_then(serde_json::Value::as_array) {
+            for entry in urls {
+                if let Some(href) = entry
+                    .get("href")
+                    .or_else(|| entry.get("url"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    raw_urls.push(href.to_owned());
+                } else if let Some(s) = entry.as_str() {
+                    raw_urls.push(s.to_owned());
+                }
+            }
+        }
+        let domains = extract_domains_from_urls(&raw_urls);
+
+        out.push(ProviderVaultItem {
+            id: id.to_owned(),
+            title,
+            vault_id: vault_id.to_owned(),
+            vault_name,
+            username,
+            domains,
+            reference,
+        });
+    }
+    Ok(out)
+}
+
+/// Parse `pass-cli vault list --output json` output into `(share_id, name)` pairs.
+pub fn parse_protonpass_vaults(raw: &str) -> Result<Vec<(String, Option<String>)>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parsed: serde_json::Value = serde_json::from_str(trimmed)
+        .map_err(|_| SeraError::External("Proton Pass returned invalid vault JSON".into()))?;
+    let array = parsed
+        .as_array()
+        .or_else(|| parsed.get("vaults").and_then(serde_json::Value::as_array))
+        .ok_or_else(|| SeraError::External("Proton Pass vault list is not an array".into()))?;
+    let mut vaults = Vec::new();
+    for entry in array {
+        let share_id = entry
+            .get("share_id")
+            .or_else(|| entry.get("shareId"))
+            .or_else(|| entry.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.starts_with('-'));
+        if let Some(share_id) = share_id {
+            let name = entry
+                .get("name")
+                .or_else(|| entry.get("title"))
+                .and_then(serde_json::Value::as_str)
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty());
+            vaults.push((share_id.to_owned(), name));
+        }
+    }
+    Ok(vaults)
+}
+
+/// Parse `pass-cli item list --share-id <share_id> --output json` output into
+/// reference-backed items.
+pub fn parse_protonpass_items(
+    raw: &str,
+    share_id: &str,
+    vault_name: Option<&str>,
+) -> Result<Vec<ProviderVaultItem>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parsed: serde_json::Value = serde_json::from_str(trimmed)
+        .map_err(|_| SeraError::External("Proton Pass returned invalid item JSON".into()))?;
+    let array = parsed
+        .as_array()
+        .or_else(|| parsed.get("items").and_then(serde_json::Value::as_array))
+        .ok_or_else(|| SeraError::External("Proton Pass item list is not an array".into()))?;
+    let mut out = Vec::new();
+    for item in array {
+        let Some(id) = item
+            .get("item_id")
+            .or_else(|| item.get("itemId"))
+            .or_else(|| item.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.starts_with('-'))
+        else {
+            continue;
+        };
+        let content = item.get("content");
+        let login = content
+            .and_then(|c| c.get("content"))
+            .and_then(|c| c.get("Login").or_else(|| c.get("login")))
+            .or_else(|| content.and_then(|c| c.get("login")))
+            .or_else(|| item.get("login"));
+        let title = content
+            .and_then(|c| c.get("title"))
+            .or_else(|| item.get("title"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(id)
+            .to_owned();
+
+        let reference = format!("pass://{share_id}/{id}/password");
+        if validate_reference(VaultSource::ProtonPass, &reference).is_err() {
+            continue;
+        }
+
+        let username = login
+            .and_then(|l| {
+                l.get("item_username")
+                    .or_else(|| l.get("username"))
+                    .or_else(|| l.get("email"))
+            })
+            .or_else(|| item.get("username"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+
+        let mut raw_urls = Vec::new();
+        if let Some(urls) = login
+            .and_then(|l| l.get("urls"))
+            .or_else(|| item.get("urls"))
+            .and_then(serde_json::Value::as_array)
+        {
+            for entry in urls {
+                if let Some(s) = entry.as_str() {
+                    raw_urls.push(s.to_owned());
+                } else if let Some(href) = entry
+                    .get("url")
+                    .or_else(|| entry.get("href"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    raw_urls.push(href.to_owned());
+                }
+            }
+        }
+        let domains = extract_domains_from_urls(&raw_urls);
+
+        out.push(ProviderVaultItem {
+            id: id.to_owned(),
+            title,
+            vault_id: share_id.to_owned(),
+            vault_name: vault_name.map(str::to_owned),
+            username,
+            domains,
+            reference,
+        });
+    }
+    Ok(out)
+}
+
+async fn run_provider_cli(
+    providers: &Providers,
+    provider: Provider,
+    args: Vec<String>,
+    token: &str,
+) -> Result<Zeroizing<String>> {
+    let program = program_for(provider, &providers.config).ok_or_else(|| {
+        SeraError::External(format!(
+            "the {} CLI is not installed on the server",
+            provider.label()
+        ))
+    })?;
+    let runner = providers.runner.clone();
+    let env_name = provider.token_env();
+    let token = Zeroizing::new(token.to_owned());
+    let output = tokio::task::spawn_blocking(move || {
+        runner.run(&program, &args, &[(env_name, token.as_str())])
+    })
+    .await
+    .map_err(|_| SeraError::Internal("the password manager command failed".into()))??;
+    if output.status != Some(0) {
+        return Err(SeraError::External(format!(
+            "{} CLI exited with status {:?}",
+            provider.label(),
+            output.status
+        )));
+    }
+    Ok(output.stdout)
+}
+
+/// List items from the user's connected 1Password or Proton Pass account using
+/// strict environment isolation. Never logs or returns secrets.
+pub async fn list_provider_items(
+    providers: &Providers,
+    provider: Provider,
+    token: &str,
+) -> Result<Vec<ProviderVaultItem>> {
+    if !providers.enabled(provider) {
+        return Err(SeraError::Validation(format!(
+            "{} is disabled on this server",
+            provider.label()
+        )));
+    }
+    match provider {
+        Provider::OnePassword => {
+            let stdout = run_provider_cli(
+                providers,
+                provider,
+                vec![
+                    "item".into(),
+                    "list".into(),
+                    "--format".into(),
+                    "json".into(),
+                ],
+                token,
+            )
+            .await?;
+            parse_onepassword_items(&stdout)
+        }
+        Provider::ProtonPass => {
+            let vaults_stdout = run_provider_cli(
+                providers,
+                provider,
+                vec![
+                    "vault".into(),
+                    "list".into(),
+                    "--output".into(),
+                    "json".into(),
+                ],
+                token,
+            )
+            .await?;
+            let vaults = parse_protonpass_vaults(&vaults_stdout)?;
+            let mut all = Vec::new();
+            for (share_id, vault_name) in vaults {
+                let items_stdout = run_provider_cli(
+                    providers,
+                    provider,
+                    vec![
+                        "item".into(),
+                        "list".into(),
+                        "--share-id".into(),
+                        share_id.clone(),
+                        "--output".into(),
+                        "json".into(),
+                    ],
+                    token,
+                )
+                .await?;
+                all.extend(parse_protonpass_items(
+                    &items_stdout,
+                    &share_id,
+                    vault_name.as_deref(),
+                )?);
+            }
+            Ok(all)
+        }
+    }
+}
+
+fn synced_entry_name(provider: Provider, title: &str, item_id: &str) -> String {
+    let prefix = match provider {
+        Provider::OnePassword => "op-",
+        Provider::ProtonPass => "pass-",
+    };
+    let mut slug = String::new();
+    let mut last_dash = false;
+    for ch in title.chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_lowercase() || lower.is_ascii_digit() {
+            slug.push(lower);
+            last_dash = false;
+        } else if !last_dash && !slug.is_empty() {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    let id_suffix: String = item_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(6)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    let mut candidate = if slug.is_empty() {
+        format!("{prefix}{id_suffix}")
+    } else if id_suffix.is_empty() {
+        format!("{prefix}{slug}")
+    } else {
+        format!("{prefix}{slug}-{id_suffix}")
+    };
+    if candidate.len() > 48 {
+        candidate.truncate(48);
+        candidate = candidate.trim_end_matches('-').to_owned();
+    }
+    if candidate.is_empty() {
+        format!("{prefix}item")
+    } else {
+        candidate
+    }
+}
+
+/// Sync all items from a connected password manager into the acting user's
+/// UID-scoped vault as reference-backed entries (`op://` / `pass://`).
+pub async fn sync_provider_to_vault(
+    users: &UserSecrets,
+    providers: &Providers,
+    user_id: &str,
+    provider: Provider,
+) -> Result<usize> {
+    let token = users
+        .vault_provider_token(user_id, provider.id())?
+        .ok_or_else(|| {
+            SeraError::Validation(format!("save a {} access token first", provider.label()))
+        })?;
+    let items = list_provider_items(providers, provider, token.expose_secret()).await?;
+    let mut synced = 0usize;
+    for item in items {
+        let name = synced_entry_name(provider, &item.title, &item.id);
+        let input = vault::VaultInput {
+            kind: vault::VaultKind::Password,
+            username: item.username,
+            value: Zeroizing::new(String::new()),
+            domains: item.domains,
+            note: Some(format!("Synced from {} ({})", provider.label(), item.title)),
+            source: provider.source(),
+            reference: Some(item.reference),
+        };
+        vault::put(users, user_id, &name, &input)?;
+        synced += 1;
+    }
+    Ok(synced)
+}
+
 /// The browser fill's approval-time check: the entry must allow `host` (and
 /// hold `field`), and a password manager value needs its provider enabled.
 /// Nothing is read or decrypted.
@@ -1968,5 +2397,53 @@ mod tests {
             program_for(Provider::ProtonPass, &managed_cfg),
             Some(installed)
         );
+    }
+
+    #[test]
+    fn parses_onepassword_and_protonpass_item_json_to_reference_entries() {
+        let op_json = r#"[
+            {
+                "id": "item123",
+                "title": "GitHub Work",
+                "category": "LOGIN",
+                "vault": { "id": "vault42", "name": "Engineering" },
+                "urls": [{ "href": "https://github.com/login", "primary": true }],
+                "additional_information": "alice@example.com"
+            }
+        ]"#;
+        let op_items = parse_onepassword_items(op_json).unwrap();
+        assert_eq!(op_items.len(), 1);
+        assert_eq!(op_items[0].reference, "op://vault42/item123/password");
+        assert_eq!(op_items[0].username.as_deref(), Some("alice@example.com"));
+        assert_eq!(op_items[0].domains, vec!["github.com".to_owned()]);
+
+        let pp_vaults_json = r#"[{"share_id": "share99", "name": "Personal"}]"#;
+        let vaults = parse_protonpass_vaults(pp_vaults_json).unwrap();
+        assert_eq!(
+            vaults,
+            vec![("share99".to_owned(), Some("Personal".to_owned()))]
+        );
+
+        let pp_items_json = r#"{
+            "items": [
+                {
+                    "item_id": "ppitem1",
+                    "content": {
+                        "title": "Proton Mail",
+                        "content": {
+                            "Login": {
+                                "username": "bob@proton.me",
+                                "urls": ["https://account.proton.me/login"]
+                            }
+                        }
+                    }
+                }
+            ]
+        }"#;
+        let pp_items = parse_protonpass_items(pp_items_json, "share99", Some("Personal")).unwrap();
+        assert_eq!(pp_items.len(), 1);
+        assert_eq!(pp_items[0].reference, "pass://share99/ppitem1/password");
+        assert_eq!(pp_items[0].username.as_deref(), Some("bob@proton.me"));
+        assert_eq!(pp_items[0].domains, vec!["account.proton.me".to_owned()]);
     }
 }

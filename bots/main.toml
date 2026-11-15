@@ -13,6 +13,7 @@ delegates = [
   "courier",
   "whatsapp",
   "inbox",
+  "jobfinder",
 ]
 trigger = "command"
 system_prompt = "prompts/main.txt"

@@ -26,6 +26,7 @@ const MARKETS: &[u8] = include_bytes!("../assets/bots/markets.png");
 const COURIER: &[u8] = include_bytes!("../assets/bots/courier.png");
 const WHATSAPP: &[u8] = include_bytes!("../assets/bots/whatsapp.png");
 const INBOX: &[u8] = include_bytes!("../assets/bots/inbox.png");
+const JOBFINDER: &[u8] = include_bytes!("../assets/bots/jobfinder.png");
 
 /// The bundled default for a bot, keyed by its name (the bot id). `None` for
 /// a bot without one, so the caller keeps answering 404.
@@ -43,6 +44,7 @@ pub fn default_avatar(bot: &str) -> Option<&'static [u8]> {
         "courier" => COURIER,
         "whatsapp" => WHATSAPP,
         "inbox" => INBOX,
+        "jobfinder" => JOBFINDER,
         _ => return None,
     })
 }
@@ -83,6 +85,7 @@ mod tests {
             "courier",
             "whatsapp",
             "inbox",
+            "jobfinder",
         ] {
             let bytes = default_avatar(name).unwrap();
             assert_eq!(png_dimensions(bytes), (256, 256), "{name}");

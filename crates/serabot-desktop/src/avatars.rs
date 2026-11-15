@@ -8,8 +8,10 @@
 //! style, so a long chat does not repeat an 80 KB string per message. A tile
 //! with no image keeps the gradient letter tile.
 
-use std::collections::BTreeMap;
-use std::sync::RwLock;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{LazyLock, RwLock};
+
+include!(concat!(env!("OUT_DIR"), "/default_bot_avatars.rs"));
 
 /// What an avatar belongs to. The id is the bot id, or the room conversation
 /// id for a group.
@@ -55,18 +57,36 @@ pub struct AvatarImage {
     pub data_url: Option<String>,
 }
 
-static PUBLISHED: RwLock<Vec<String>> = RwLock::new(Vec::new());
+static DEFAULT_IMAGES: LazyLock<BTreeMap<String, AvatarImage>> = LazyLock::new(|| {
+    let mut map = BTreeMap::new();
+    for &(slug, bytes) in DEFAULT_BOT_AVATARS {
+        map.insert(
+            css_key("bot", slug),
+            AvatarImage {
+                version: None,
+                data_url: Some(png_data_url(bytes)),
+            },
+        );
+    }
+    map
+});
+
+static PUBLISHED: LazyLock<RwLock<BTreeSet<String>>> =
+    LazyLock::new(|| RwLock::new(DEFAULT_IMAGES.keys().cloned().collect()));
 
 /// Publish which keys currently have an image, so tiles know whether to
-/// reference one. Called by the session whenever the cache changes.
+/// reference one. Never wipes already-loaded avatars on session refresh;
+/// only adds/updates keys that have image bytes.
 pub fn publish(images: &BTreeMap<String, AvatarImage>) {
-    let keys: Vec<String> = images
-        .iter()
-        .filter(|(_, image)| image.data_url.is_some())
-        .map(|(key, _)| key.clone())
-        .collect();
     if let Ok(mut published) = PUBLISHED.write() {
-        *published = keys;
+        for key in DEFAULT_IMAGES.keys() {
+            published.insert(key.clone());
+        }
+        for (key, image) in images {
+            if image.data_url.is_some() {
+                published.insert(key.clone());
+            }
+        }
     }
 }
 
@@ -74,7 +94,7 @@ pub fn publish(images: &BTreeMap<String, AvatarImage>) {
 pub fn has_image(key: &str) -> bool {
     PUBLISHED
         .read()
-        .map(|published| published.iter().any(|candidate| candidate == key))
+        .map(|published| published.contains(key))
         .unwrap_or(false)
 }
 
@@ -89,12 +109,23 @@ pub fn tile_style(key: &str, hue: u16) -> String {
 }
 
 /// The single stylesheet that defines every `--av-*` property.
+/// Always includes the compiled-in default bot avatars, overridden by any
+/// newer fetched/uploaded image bytes.
 pub fn stylesheet(images: &BTreeMap<String, AvatarImage>) -> String {
-    let mut css = String::from(":root {");
-    for (key, image) in images {
-        if let Some(url) = &image.data_url {
-            css.push_str(&format!(" --av-{key}: url(\"{url}\");"));
+    let mut merged: BTreeMap<&str, &str> = BTreeMap::new();
+    for (key, image) in DEFAULT_IMAGES.iter() {
+        if let Some(url) = image.data_url.as_deref() {
+            merged.insert(key.as_str(), url);
         }
+    }
+    for (key, image) in images {
+        if let Some(url) = image.data_url.as_deref() {
+            merged.insert(key.as_str(), url);
+        }
+    }
+    let mut css = String::from(":root {");
+    for (key, url) in merged {
+        css.push_str(&format!(" --av-{key}: url(\"{url}\");"));
     }
     css.push_str(" }");
     css
@@ -158,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn tiles_reference_an_image_only_after_it_is_published() {
+    fn tiles_reference_an_image_after_it_is_published_and_never_wipe() {
         let key = "bot-test-tile-unique";
         assert_eq!(tile_style(key, 12), "--avatar-hue: 12;");
         let mut images = BTreeMap::new();
@@ -171,7 +202,31 @@ mod tests {
         );
         publish(&images);
         assert!(tile_style(key, 12).contains("--avatar-img: var(--av-bot-test-tile-unique)"));
+        // Publishing an empty map on refresh/reconnect must never wipe already-loaded avatars.
         publish(&BTreeMap::new());
-        assert_eq!(tile_style(key, 12), "--avatar-hue: 12;");
+        assert!(tile_style(key, 12).contains("--avatar-img: var(--av-bot-test-tile-unique)"));
+    }
+
+    #[test]
+    fn default_bot_avatars_are_pre_seeded_and_in_stylesheet() {
+        assert!(!DEFAULT_BOT_AVATARS.is_empty());
+        assert!(has_image("bot-analyst"));
+        assert!(tile_style("bot-analyst", 12).contains("--avatar-img: var(--av-bot-analyst)"));
+        let css = stylesheet(&BTreeMap::new());
+        assert!(css.contains("--av-bot-analyst: url(\"data:image/png;base64,"));
+    }
+
+    #[test]
+    fn stylesheet_prefers_newer_images_over_defaults() {
+        let mut images = BTreeMap::new();
+        images.insert(
+            "bot-analyst".to_owned(),
+            AvatarImage {
+                version: Some("v2".into()),
+                data_url: Some(png_data_url(&[9, 8, 7])),
+            },
+        );
+        let css = stylesheet(&images);
+        assert!(css.contains("--av-bot-analyst: url(\"data:image/png;base64,CQgH\")"));
     }
 }

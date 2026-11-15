@@ -26,6 +26,9 @@ pub const SHARED_TOOLS: &[&str] = &[
     "onedrive_list",
     "vault_list",
     "vault_request_secret",
+    "calendar_events",
+    "tasks_list",
+    "tasks_create",
 ];
 
 /// A specialist (or a handoff that has not already been handed on) asks main

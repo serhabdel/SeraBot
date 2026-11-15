@@ -3,7 +3,7 @@
 //! with the bot's latest rolling summary, not the transcript of an old chat.
 //! Rename and archive use the existing `/v1/conversations/{id}` routes.
 
-use super::conversations::normalize_conversation_title;
+use super::conversations::{lazy_smart_title_for_conversation, normalize_conversation_title};
 use super::*;
 use crate::memory;
 use crate::store::BotChatRow;
@@ -70,10 +70,17 @@ fn chat_view(
         })));
     };
     let turns = state.store.count_user_turns(&user.id, id)?;
+    let title = if (!primary || id.starts_with("dir:chat-"))
+        && crate::util::is_placeholder_chat_title(conversation.title.as_deref())
+    {
+        lazy_smart_title_for_conversation(state, &user.id, id, conversation.title.as_deref(), bot)?
+    } else {
+        conversation.title.clone()
+    };
     Ok(Some(json!({
         "id": id,
         "bot": bot,
-        "title": conversation.title,
+        "title": title,
         "primary": primary,
         "archived": conversation.archived_at.is_some(),
         "carried_from": carried_from,

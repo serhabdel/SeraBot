@@ -317,7 +317,7 @@ fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-fn normalize_domains(domains: &[String]) -> Result<Vec<String>> {
+pub fn normalize_domains(domains: &[String]) -> Result<Vec<String>> {
     if domains.len() > MAX_DOMAINS {
         return Err(SeraError::Validation(format!(
             "at most {MAX_DOMAINS} domains per entry"
@@ -684,6 +684,39 @@ pub fn authorize_fill(
         VaultField::Value => {}
     }
     Ok(entry)
+}
+
+/// Find the best matching password entry in `user_id`'s vault for `host`,
+/// preferring exact domain matches over wildcard/parent matches.
+pub fn find_matching_password_entry(
+    users: &UserSecrets,
+    user_id: &str,
+    host: &str,
+) -> Result<Option<VaultEntry>> {
+    let host_lower = host.trim().to_ascii_lowercase();
+    let entries = list(users, user_id)?;
+    let mut best: Option<(usize, VaultEntry)> = None;
+    for entry in entries {
+        if entry.kind != VaultKind::Password || !fill_host_allowed(&entry.domains, &host_lower) {
+            continue;
+        }
+        let exact = entry
+            .domains
+            .iter()
+            .any(|d| d.eq_ignore_ascii_case(&host_lower));
+        let score = if exact {
+            usize::MAX
+        } else {
+            entry.domains.iter().map(|d| d.len()).max().unwrap_or(0)
+        };
+        if best
+            .as_ref()
+            .is_none_or(|(best_score, _)| score > *best_score)
+        {
+            best = Some((score, entry));
+        }
+    }
+    Ok(best.map(|(_, entry)| entry))
 }
 
 /// The stored username of an entry, or NotFound when it has none.

@@ -338,6 +338,39 @@ impl TelegramClient {
         Ok(())
     }
 
+    pub async fn edit_approval_resolved(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        approval: &crate::domain::Approval,
+        label: &str,
+    ) -> Result<()> {
+        let text = format!(
+            "Approval {label}\n\n{}\n\nTool: {}\nStatus: {}",
+            approval.summary, approval.tool, approval.state
+        );
+        let response: TelegramResponse<Value> = self
+            .http
+            .post(self.url("editMessageText"))
+            .json(&json!({
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text,
+                "reply_markup": {"inline_keyboard": []},
+                "disable_web_page_preview": true,
+            }))
+            .send()
+            .await
+            .map_err(|error| telegram_http_error("edit approval message failed", error))?
+            .json()
+            .await
+            .map_err(|error| telegram_http_error("edit approval response", error))?;
+        if !response.ok {
+            return Err(telegram_rejected("editMessageText", response.description));
+        }
+        Ok(())
+    }
+
     pub async fn download_attachment(&self, file_id: &str, max_bytes: u64) -> Result<Vec<u8>> {
         if file_id.is_empty() || file_id.len() > 256 {
             return Err(SeraError::Validation("invalid Telegram file id".into()));
@@ -869,6 +902,17 @@ impl TelegramClient {
                         _ => "Approved",
                     };
                     let _ = self.answer_callback(&callback.id, label).await;
+                    if let Err(error) = self
+                        .edit_approval_resolved(
+                            chat_id,
+                            message.message_id,
+                            &result.approval,
+                            label,
+                        )
+                        .await
+                    {
+                        warn!(%error, "approval message update failed");
+                    }
                 }
                 Err(error) => {
                     warn!(%error, "approval callback failed");
@@ -2999,6 +3043,25 @@ mod tests {
                 .unwrap();
         }
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn edit_approval_resolved_updates_message_and_clears_inline_keyboard() {
+        let (server, client, _store, _admin) = telegram_fixture().await;
+        let mut n = notice();
+        n.approval.state = "approved_once".into();
+        client
+            .edit_approval_resolved(20, 777, &n.approval, "Approved")
+            .await
+            .unwrap();
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].url.path().ends_with("/editMessageText"));
+        let body: Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(body["chat_id"], 20);
+        assert_eq!(body["message_id"], 777);
+        assert_eq!(body["reply_markup"]["inline_keyboard"], json!([]));
+        assert!(body["text"].as_str().unwrap().contains("Approval Approved"));
     }
 
     #[tokio::test]

@@ -252,15 +252,21 @@ class ApprovalItem {
     required this.tool,
     required this.summary,
     required this.expiresAt,
+    this.conversationId,
+    this.destination,
   });
 
   factory ApprovalItem.fromJson(Map<String, dynamic> json) {
+    final conv = json['conversation_id'];
+    final dest = json['destination'];
     return ApprovalItem(
       id: json['id'] as String,
       actionId: json['action_id'] as String,
       tool: json['tool'] as String,
       summary: json['summary'] as String,
       expiresAt: json['expires_at'] as String,
+      conversationId: conv is String && conv.trim().isNotEmpty ? conv : null,
+      destination: dest is String && dest.trim().isNotEmpty ? dest : null,
     );
   }
 
@@ -269,6 +275,8 @@ class ApprovalItem {
   final String tool;
   final String summary;
   final String expiresAt;
+  final String? conversationId;
+  final String? destination;
 }
 
 class HealthInfo {
@@ -614,4 +622,153 @@ class UserInfo {
 
   /// Name to show in the UI: display name, else email.
   String get label => displayName.isNotEmpty ? displayName : email;
+}
+
+/// Personal task row from `GET /v1/tasks`.
+class PersonalTask {
+  const PersonalTask({
+    required this.id,
+    required this.title,
+    this.notes = '',
+    this.status = 'todo',
+    this.due,
+    this.position = 0,
+    this.remoteProvider,
+    this.createdAt = '',
+    this.updatedAt = '',
+  });
+
+  factory PersonalTask.fromJson(Map<String, dynamic> json) {
+    return PersonalTask(
+      id: json['id']?.toString() ?? '',
+      title: json['title'] as String? ?? '',
+      notes: json['notes'] as String? ?? '',
+      status: json['status'] as String? ?? 'todo',
+      due: json['due'] as String?,
+      position: (json['position'] as num?)?.toInt() ?? 0,
+      remoteProvider: json['remote_provider'] as String?,
+      createdAt: json['created_at'] as String? ?? '',
+      updatedAt: json['updated_at'] as String? ?? '',
+    );
+  }
+
+  final String id;
+  final String title;
+  final String notes;
+  final String status;
+  final String? due;
+  final int position;
+  final String? remoteProvider;
+  final String createdAt;
+  final String updatedAt;
+
+  bool get isDone => status == 'done';
+}
+
+class TaskSyncStatus {
+  const TaskSyncStatus({
+    this.provider = 'none',
+    this.health = 'off',
+    this.lastRun,
+    this.lastOk,
+    this.lastError,
+  });
+
+  factory TaskSyncStatus.fromJson(Map<String, dynamic>? json) {
+    if (json == null) {
+      return const TaskSyncStatus();
+    }
+    return TaskSyncStatus(
+      provider: json['provider'] as String? ?? 'none',
+      health: json['health'] as String? ?? 'off',
+      lastRun: json['last_run'] as String?,
+      lastOk: json['last_ok'] as bool?,
+      lastError: json['last_error'] as String?,
+    );
+  }
+
+  final String provider;
+  final String health;
+  final String? lastRun;
+  final bool? lastOk;
+  final String? lastError;
+
+  bool get enabled => provider.isNotEmpty && provider != 'none';
+}
+
+class TaskCounts {
+  const TaskCounts({this.todo = 0, this.inProgress = 0, this.done = 0});
+
+  factory TaskCounts.fromJson(Map<String, dynamic>? json) {
+    if (json == null) {
+      return const TaskCounts();
+    }
+    return TaskCounts(
+      todo: (json['todo'] as num?)?.toInt() ?? 0,
+      inProgress: (json['in_progress'] as num?)?.toInt() ?? 0,
+      done: (json['done'] as num?)?.toInt() ?? 0,
+    );
+  }
+
+  final int todo;
+  final int inProgress;
+  final int done;
+
+  int get open => todo + inProgress;
+}
+
+class TasksResponse {
+  const TasksResponse({
+    this.tasks = const [],
+    this.counts = const TaskCounts(),
+    this.sync = const TaskSyncStatus(),
+    this.supported = true,
+  });
+
+  factory TasksResponse.fromJson(Map<String, dynamic> json) {
+    final list = json['tasks'] as List<dynamic>? ?? const [];
+    return TasksResponse(
+      tasks: list
+          .whereType<Map<String, dynamic>>()
+          .map(PersonalTask.fromJson)
+          .toList(),
+      counts: TaskCounts.fromJson(json['counts'] as Map<String, dynamic>?),
+      sync: TaskSyncStatus.fromJson(json['sync'] as Map<String, dynamic>?),
+      supported: true,
+    );
+  }
+
+  final List<PersonalTask> tasks;
+  final TaskCounts counts;
+  final TaskSyncStatus sync;
+  final bool supported;
+}
+
+class CalendarEventItem {
+  const CalendarEventItem({
+    required this.id,
+    required this.title,
+    this.start = '',
+    this.end,
+    this.allDay = false,
+    this.provider,
+  });
+
+  factory CalendarEventItem.fromJson(Map<String, dynamic> json) {
+    return CalendarEventItem(
+      id: json['id']?.toString() ?? '',
+      title: json['title'] as String? ?? '(Untitled)',
+      start: json['start'] as String? ?? json['due'] as String? ?? '',
+      end: json['end'] as String?,
+      allDay: json['all_day'] as bool? ?? false,
+      provider: json['provider'] as String?,
+    );
+  }
+
+  final String id;
+  final String title;
+  final String start;
+  final String? end;
+  final bool allDay;
+  final String? provider;
 }

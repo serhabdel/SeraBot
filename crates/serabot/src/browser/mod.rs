@@ -81,6 +81,11 @@ impl SecretResolver for VaultResolver {
         .map(|_| ())
     }
 
+    fn find_for_host(&self, user_id: &str, host: &str) -> Result<Option<String>> {
+        crate::vault::find_matching_password_entry(&self.users, user_id, host)
+            .map(|entry| entry.map(|e| e.name))
+    }
+
     async fn resolve(
         &self,
         user_id: &str,
