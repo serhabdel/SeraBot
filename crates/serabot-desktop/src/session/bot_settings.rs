@@ -164,6 +164,21 @@ impl BotSettings {
     pub fn dirty(&self) -> bool {
         self.hydrated && self.draft.dirty(&self.original)
     }
+
+    pub(super) fn reset_saving(&mut self) {
+        self.saving = false;
+        self.close_after_save = false;
+    }
+
+    pub(super) fn reset_lifecycle(&mut self) {
+        self.lifecycle_busy = false;
+        self.deleted = None;
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_deleted(&self) -> bool {
+        self.deleted.is_some()
+    }
 }
 
 impl Session {
@@ -180,6 +195,10 @@ impl Session {
         self.bot_settings.notice = None;
         self.bot_settings.confirm_close = false;
         self.bot_settings.close_after_save = false;
+        if first {
+            self.bot_settings.confirm_delete = None;
+            self.bot_settings.deleted = None;
+        }
         if first || !self.bot_settings.hydrated {
             let draft = BotDraft {
                 display_name: self.bot_display_name(&id),
@@ -230,6 +249,7 @@ impl Session {
         self.bot_settings.error = None;
         self.bot_settings.confirm_close = false;
         self.bot_settings.close_after_save = false;
+        self.bot_settings.confirm_delete = None;
     }
 
     /// The X button: close at once, or ask "Save changes?" when there are
@@ -409,6 +429,11 @@ impl Session {
         self.bot_settings.notice = None;
         self.bot_settings.saving = true;
         self.start_request(Operation::UpdateBot { id, update });
+        if self.pending.is_none() && self.backlog.is_empty() {
+            self.bot_settings.saving = false;
+            self.bot_settings.close_after_save = false;
+            self.bot_settings.error = Some("Network worker unavailable. Reconnect.".into());
+        }
     }
 
     /// The write came back: the draft is the new baseline, and the lists are
@@ -443,6 +468,9 @@ impl Session {
         }
         self.bot_settings.lifecycle_busy = true;
         self.start_request(Operation::SetBotEnabled { id, enabled });
+        if self.pending.is_none() && self.backlog.is_empty() {
+            self.bot_settings.lifecycle_busy = false;
+        }
     }
 
     /// Ask for the confirm step of a delete (from the row or the panel).
@@ -468,6 +496,10 @@ impl Session {
         self.bot_settings.lifecycle_busy = true;
         self.bot_settings.deleted = Some(id.clone());
         self.start_request(Operation::DeleteBot { id });
+        if self.pending.is_none() && self.backlog.is_empty() {
+            self.bot_settings.lifecycle_busy = false;
+            self.bot_settings.deleted = None;
+        }
     }
 
     /// A switch or a delete came back: reread the lists, and leave a deleted
@@ -607,5 +639,16 @@ mod tests {
         assert!(draft.instructions_error().unwrap().contains("96,000"));
         assert!(model_pick("").is_none());
         assert!(model_pick("noseparator").is_none());
+    }
+
+    #[test]
+    fn switching_bot_settings_clears_delete_confirm() {
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        session.bot_settings.bot = Some("alpha".into());
+        session.bot_settings.confirm_delete = Some("alpha".into());
+        session.open_bot_settings("beta".into());
+        assert_eq!(session.bot_settings.bot.as_deref(), Some("beta"));
+        assert!(session.bot_settings.confirm_delete.is_none());
     }
 }

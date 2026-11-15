@@ -79,6 +79,7 @@ pub enum OperationKind {
     TurnLimitsWrite,
     /// Mem0 console settings (read or write the per-user key).
     MemorySettingsWrite,
+    VoiceSettings,
     Transcribe,
     AdminWrite,
     /// Save the account's own key for a provider.
@@ -580,7 +581,7 @@ impl Operation {
             Self::SaveProviderKey { .. } => OperationKind::ProviderKey,
             Self::TestProvider { .. } => OperationKind::ProviderTest,
             Self::SetDefaultRoute { .. } => OperationKind::DefaultRoute,
-            Self::VoiceSettings => OperationKind::Health,
+            Self::VoiceSettings => OperationKind::VoiceSettings,
             Self::AdminSetVoice(_) => OperationKind::AdminWrite,
             Self::TestConnector { .. } => OperationKind::ConnectorTest,
             Self::OAuthSignIn { .. } => OperationKind::OAuthSignIn,
@@ -1095,10 +1096,15 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         Operation::TaskCalendar { from, to } => {
             client.task_calendar_events(from, to).map(Reply::TaskEvents)
         }
-        Operation::Providers => client.providers().map(|mut providers| {
+        Operation::Providers => {
+            let mut providers = client.providers()?;
             // The account's own default route marks one card with a star;
             // without one, the server default is the starred provider.
-            let chosen = client.default_route().ok().flatten();
+            let chosen = match client.default_route() {
+                Ok(route) => route,
+                Err(ApiError::Http(404 | 405)) => None,
+                Err(error) => return Err(error),
+            };
             for provider in &mut providers {
                 provider.is_default = match &chosen {
                     Some(route) => provider.id == route.provider,
@@ -1108,8 +1114,8 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
                     provider.default_model = Some(route.model.clone());
                 }
             }
-            Reply::Providers(providers)
-        }),
+            Ok(Reply::Providers(providers))
+        }
         Operation::Connectors => client.connectors().map(Reply::Connectors),
         Operation::GetTeam => client.get_team(conversation).map(Reply::Team),
         Operation::SetTeam {

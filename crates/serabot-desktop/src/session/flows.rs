@@ -227,7 +227,12 @@ impl Session {
         let group = (!self.new_bot.group.is_empty()).then(|| self.new_bot.group.clone());
         self.creating_named_bot = true;
         self.start_request(Operation::CreateNamedBot { name, model, group });
-        self.pending.is_some()
+        if self.pending.is_none() && self.backlog.is_empty() {
+            self.creating_named_bot = false;
+            self.new_bot.error = Some("Network worker unavailable. Reconnect.".into());
+            return false;
+        }
+        true
     }
 
     /// The server created the bot: queue its image, then open its interview.
@@ -379,6 +384,10 @@ impl Session {
         };
         self.state.onboarding = None;
         self.start_request(Operation::OnboardingStart { id });
+        if self.pending.is_none() && self.backlog.is_empty() {
+            self.onboarding_ui.waiting = false;
+            self.onboarding_ui.error = Some("Network worker unavailable. Reconnect.".into());
+        }
     }
 
     pub fn close_onboarding(&mut self) {
@@ -406,6 +415,10 @@ impl Session {
             id,
             text: zeroize::Zeroizing::new(text),
         });
+        if self.pending.is_none() && self.backlog.is_empty() {
+            self.onboarding_ui.waiting = false;
+            self.onboarding_ui.error = Some("Network worker unavailable. Reconnect.".into());
+        }
     }
 
     pub fn confirm_onboarding(&mut self) {
@@ -416,6 +429,10 @@ impl Session {
         self.onboarding_ui.waiting = true;
         self.onboarding_ui.error = None;
         self.start_request(Operation::OnboardingConfirm { id });
+        if self.pending.is_none() && self.backlog.is_empty() {
+            self.onboarding_ui.waiting = false;
+            self.onboarding_ui.error = Some("Network worker unavailable. Reconnect.".into());
+        }
     }
 
     /// An interview step failed. The error stays in the chat; a write is

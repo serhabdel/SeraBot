@@ -889,6 +889,7 @@ impl State {
             OperationKind::Submit
                 | OperationKind::Apply
                 | OperationKind::Decide
+                | OperationKind::RevokeStandingGrant
                 | OperationKind::CreateBot
                 | OperationKind::CreateConversation
                 | OperationKind::CreateSkill
@@ -898,7 +899,17 @@ impl State {
                 | OperationKind::ArchiveConversation
                 | OperationKind::UnarchiveConversation
                 | OperationKind::AddMemory
+                | OperationKind::UpdateMemory
+                | OperationKind::SetMemoryStatus
+                | OperationKind::DeleteMemory
+                | OperationKind::WorkflowsWrite
+                | OperationKind::MarketplaceWrite
+                | OperationKind::AddTask
+                | OperationKind::SetTaskStatus
+                | OperationKind::DeleteTask
                 | OperationKind::TeamWrite
+                | OperationKind::BotSettingsWrite
+                | OperationKind::BotLifecycle
                 | OperationKind::BotConfigWrite
                 | OperationKind::CreateGroup
                 | OperationKind::OnboardingWrite
@@ -910,6 +921,7 @@ impl State {
             let operation = match kind {
                 OperationKind::Submit => "submission",
                 OperationKind::Decide => "approval decision",
+                OperationKind::RevokeStandingGrant => "standing grant revoke",
                 OperationKind::CreateBot => "bot scaffold",
                 OperationKind::CreateConversation => "conversation create",
                 OperationKind::CreateSkill => "skill create",
@@ -919,7 +931,16 @@ impl State {
                 OperationKind::ArchiveConversation => "archive",
                 OperationKind::UnarchiveConversation => "unarchive",
                 OperationKind::AddMemory => "memory write",
+                OperationKind::UpdateMemory
+                | OperationKind::SetMemoryStatus
+                | OperationKind::DeleteMemory => "memory change",
+                OperationKind::WorkflowsWrite => "workflow change",
+                OperationKind::MarketplaceWrite => "plugin change",
+                OperationKind::AddTask
+                | OperationKind::SetTaskStatus
+                | OperationKind::DeleteTask => "task change",
                 OperationKind::TeamWrite => "team update",
+                OperationKind::BotSettingsWrite | OperationKind::BotLifecycle => "bot change",
                 OperationKind::BotConfigWrite => "bot config update",
                 OperationKind::CreateGroup => "group create",
                 OperationKind::OnboardingWrite => "interview step",
@@ -1857,5 +1878,38 @@ mod tests {
         assert!(state.shipped_error.as_ref().unwrap().contains("409"));
         assert!(state.error.is_none(), "the global banner stays clear");
         assert!(!state.unknown_outcome);
+    }
+
+    #[test]
+    fn transport_failure_on_standing_grant_task_or_memory_mutation_sets_unknown_outcome() {
+        for kind in [
+            OperationKind::RevokeStandingGrant,
+            OperationKind::UpdateMemory,
+            OperationKind::SetMemoryStatus,
+            OperationKind::DeleteMemory,
+            OperationKind::WorkflowsWrite,
+            OperationKind::MarketplaceWrite,
+            OperationKind::AddTask,
+            OperationKind::SetTaskStatus,
+            OperationKind::DeleteTask,
+            OperationKind::BotSettingsWrite,
+            OperationKind::BotLifecycle,
+        ] {
+            let mut state = State {
+                connected: true,
+                ..State::default()
+            };
+            let scope = state.scope.clone();
+            state.fail(&scope, kind, ApiError::Transport);
+            assert!(state.unknown_outcome, "{kind:?} must flag unknown_outcome");
+            assert!(
+                state
+                    .error
+                    .as_deref()
+                    .is_some_and(|text| text.contains("Unknown ")),
+                "{kind:?}: {:?}",
+                state.error
+            );
+        }
     }
 }

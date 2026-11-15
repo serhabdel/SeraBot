@@ -99,6 +99,8 @@ impl DocumentKind {
 
 /// Characters of extracted text one document may contribute to the index.
 const MAX_INDEX_TEXT_CHARS: usize = 2_000_000;
+/// Maximum pages accepted for full PDF extraction/ingestion.
+const MAX_PDF_PAGES: usize = 2_000;
 
 #[derive(Debug)]
 struct PageText {
@@ -162,13 +164,23 @@ pub async fn ingest_file(
     })?;
 
     let bytes = read_bounded(path, config.max_bytes).await?;
+    if bytes.is_empty() {
+        return Err(SeraError::Validation(
+            "document is empty; refusing to ingest a 0-byte file".into(),
+        ));
+    }
     let sha256 = sha256_hex(&bytes);
 
     let existing = find_by_sha(store, user_id, &sha256)?;
-    if let Some(document) = &existing
-        && document.status != "failed"
-    {
-        return duplicate_result(store, user_id, &document.id, sha256);
+    if let Some(document) = &existing {
+        if document.status == "ready" {
+            return duplicate_result(store, user_id, &document.id, sha256);
+        }
+        if document.status == "indexing" {
+            return Err(SeraError::Validation(
+                "document is currently being indexed; retry shortly".into(),
+            ));
+        }
     }
 
     // OCR is only worth a network call for formats that can lack a text layer,
@@ -192,13 +204,7 @@ pub async fn ingest_file(
     {
         match crate::ocr::recognize_bytes(full, bytes, kind.mime()).await {
             Ok(recognized) => {
-                let text = crate::ocr::pages_to_text(&recognized);
-                if text.trim().is_empty() {
-                    return Err(SeraError::Validation(
-                        "OCR ran but found no text in the document".into(),
-                    ));
-                }
-                pages = vec![PageText { page: 1, text }];
+                pages = ocr_pages_to_page_texts(recognized)?;
             }
             Err(error) => {
                 // The built-in extractor produced little or nothing and OCR
@@ -217,6 +223,7 @@ pub async fn ingest_file(
             "document contains no pages; refusing to create an empty document".into(),
         ));
     }
+    cap_pages_text(&mut pages, MAX_INDEX_TEXT_CHARS);
 
     let planned = plan_chunks(pages, config.chunk_chars, config.chunk_overlap);
     if planned.is_empty() {
@@ -519,9 +526,14 @@ fn extract_pdf_pages_bounded(
     }
 
     let total = page_numbers.len();
+    if max_pages > MAX_PDF_PAGES && total > MAX_PDF_PAGES {
+        return Err(SeraError::Validation(format!(
+            "PDF has {total} pages, exceeding the {MAX_PDF_PAGES}-page limit"
+        )));
+    }
     let mut pages = Vec::with_capacity(total.min(max_pages));
     for page_number in page_numbers.into_iter().take(max_pages) {
-        let text = catch_unwind(AssertUnwindSafe(|| document.extract_text(&[page_number])))
+        let raw_text = catch_unwind(AssertUnwindSafe(|| document.extract_text(&[page_number])))
             .map_err(|_| {
                 SeraError::Validation(format!(
                     "malformed PDF: extracting page {page_number} aborted"
@@ -530,6 +542,7 @@ fn extract_pdf_pages_bounded(
             .map_err(|error| {
                 SeraError::Validation(format!("PDF page {page_number} could not be read: {error}"))
             })?;
+        let text = clean_extracted_text(&raw_text);
         let stop = enough(&text);
         pages.push(PageText {
             page: page_number as usize,
@@ -548,6 +561,49 @@ fn extract_pdf_pages_bounded(
         ));
     }
     Ok((pages, more))
+}
+
+fn clean_extracted_text(text: &str) -> String {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    normalized
+        .chars()
+        .filter(|&character| character == '\n' || character == '\t' || !character.is_control())
+        .collect()
+}
+
+fn ocr_pages_to_page_texts(recognized: Vec<crate::ocr::OcrPage>) -> Result<Vec<PageText>> {
+    let ocr_pages: Vec<PageText> = recognized
+        .into_iter()
+        .map(|page| PageText {
+            page: page.index + 1,
+            text: clean_extracted_text(&page.markdown),
+        })
+        .collect();
+    if ocr_pages.iter().all(|page| page.text.trim().is_empty()) {
+        return Err(SeraError::Validation(
+            "OCR ran but found no text in the document".into(),
+        ));
+    }
+    Ok(ocr_pages)
+}
+
+fn cap_pages_text(pages: &mut Vec<PageText>, max_chars: usize) {
+    let mut remaining = max_chars;
+    let mut keep = 0usize;
+    for page in pages.iter_mut() {
+        if remaining == 0 {
+            break;
+        }
+        let chars = page.text.chars().count();
+        if chars <= remaining {
+            remaining -= chars;
+        } else {
+            page.text = crate::util::truncate_chars(&page.text, remaining);
+            remaining = 0;
+        }
+        keep += 1;
+    }
+    pages.truncate(keep);
 }
 
 fn plan_chunks(pages: Vec<PageText>, chunk_chars: usize, overlap: usize) -> Vec<PlannedChunk> {
@@ -582,15 +638,33 @@ fn chunk_ranges(text: &str, chunk_chars: usize, overlap: usize) -> Vec<(usize, u
     let overlap = overlap.min(chunk_chars.saturating_sub(1));
     let mut start = 0usize;
     while start < text.len() {
-        let mut end = start;
+        let mut raw_end = start;
         for (count, (offset, character)) in text[start..].char_indices().enumerate() {
             if count == chunk_chars {
                 break;
             }
-            end = start + offset + character.len_utf8();
+            raw_end = start + offset + character.len_utf8();
         }
-        if end == start {
+        if raw_end == start {
             break;
+        }
+        let mut end = raw_end;
+        // Prefer ending on a whitespace boundary inside the second half of the
+        // window when the hard cut would otherwise split a word.
+        if raw_end < text.len()
+            && text[raw_end..]
+                .chars()
+                .next()
+                .is_some_and(|character| !character.is_whitespace())
+            && let Some((ws_rel, _)) = text[start..raw_end]
+                .char_indices()
+                .rev()
+                .find(|(_, character)| character.is_whitespace())
+        {
+            let ws_abs = start + ws_rel;
+            if text[start..ws_abs].chars().count() >= chunk_chars / 2 {
+                end = ws_abs;
+            }
         }
         ranges.push((start, end));
         if end >= text.len() {
@@ -603,6 +677,30 @@ fn chunk_ranges(text: &str, chunk_chars: usize, overlap: usize) -> Vec<(usize, u
                 break;
             }
             next = start + offset;
+        }
+        // If backing off lands inside a word, snap forward to the next word
+        // start inside the window so the overlap chunk does not start mid-word.
+        if next > start
+            && next < end
+            && text[..next]
+                .chars()
+                .next_back()
+                .is_some_and(|character| !character.is_whitespace())
+            && text[next..end]
+                .chars()
+                .next()
+                .is_some_and(|character| !character.is_whitespace())
+            && let Some((ws_rel, ws_char)) = text[next..end]
+                .char_indices()
+                .find(|(_, character)| character.is_whitespace())
+        {
+            let after_ws = next + ws_rel + ws_char.len_utf8();
+            if let Some((word_rel, _)) = text[after_ws..end]
+                .char_indices()
+                .find(|(_, character)| !character.is_whitespace())
+            {
+                next = after_ws + word_rel;
+            }
         }
         if next <= start {
             // Guarantee forward progress when the overlap covers the window.
@@ -785,7 +883,10 @@ fn purge_document(store: &Store, user_id: &str, document_id: &str) -> Result<()>
         "DELETE FROM chunks WHERE document_id = ?1",
         params![document_id],
     )?;
-    transaction.execute("DELETE FROM documents WHERE id = ?1", params![document_id])?;
+    transaction.execute(
+        "DELETE FROM documents WHERE id = ?1 AND user_id = ?2",
+        params![document_id, user_id],
+    )?;
     transaction.commit()?;
     Ok(())
 }
@@ -1238,5 +1339,102 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))
             .expect("document count");
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn ocr_preserves_multipage_provenance() {
+        let ocr_pages = vec![
+            crate::ocr::OcrPage {
+                index: 0,
+                markdown: "Page one grant guidelines.".into(),
+            },
+            crate::ocr::OcrPage {
+                index: 1,
+                markdown: "   ".into(),
+            },
+            crate::ocr::OcrPage {
+                index: 2,
+                markdown: "Page three budget deadline.".into(),
+            },
+        ];
+        let pages = ocr_pages_to_page_texts(ocr_pages).expect("valid OCR pages");
+        assert_eq!(pages.len(), 3);
+        let chunks = plan_chunks(pages, 100, 10);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].page, 1);
+        assert_eq!(chunks[1].page, 3);
+    }
+
+    #[tokio::test]
+    async fn indexing_status_is_not_treated_as_ready_duplicate_and_rejects_empty() {
+        let directory = tempdir().expect("tempdir");
+        let empty_path = directory.path().join("empty.txt");
+        std::fs::write(&empty_path, b"").expect("write empty");
+
+        let store = Store::open_in_memory(384).expect("store");
+        let admin = store.admin_user_id().unwrap();
+        let embedder = DeterministicTestEmbedder::new(384);
+
+        let err = ingest_file(&store, &admin, &embedder, &empty_path, &test_config(), None)
+            .await
+            .expect_err("0-byte file must be rejected");
+        assert!(err.to_string().contains("empty"), "{err}");
+
+        let path = directory.path().join("in_flight.txt");
+        let body = b"Concurrent indexing check content.";
+        std::fs::write(&path, body).expect("write");
+        let sha = crate::util::sha256_hex(body);
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO documents(id, source_path, sha256, title, mime, pages, status, error, created_at, updated_at, user_id)
+                 VALUES ('doc-inflight', 'in_flight.txt', ?1, 'in_flight', 'text/plain', 1, 'indexing', NULL, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', ?2)",
+                params![sha, admin],
+            )
+            .unwrap();
+
+        let err = ingest_file(&store, &admin, &embedder, &path, &test_config(), None)
+            .await
+            .expect_err("indexing document must not return ready duplicate");
+        assert!(err.to_string().contains("currently being indexed"), "{err}");
+    }
+
+    #[test]
+    fn chunk_ranges_prefers_word_boundaries_and_respects_utf8() {
+        let text = "alpha bravo charlie delta echo foxtrot";
+        let ranges = chunk_ranges(text, 16, 4);
+        assert!(ranges.len() >= 2);
+        let first = &text[ranges[0].0..ranges[0].1];
+        assert_eq!(first, "alpha bravo");
+        assert!(
+            ranges
+                .iter()
+                .all(|(s, e)| text[*s..*e].chars().count() <= 16)
+        );
+        assert_eq!(ranges.last().map(|(_, e)| *e), Some(text.len()));
+    }
+
+    #[test]
+    fn cleans_crlf_control_chars_and_caps_total_index_chars() {
+        assert_eq!(
+            clean_extracted_text("a\r\nb\rc\x00\x07\td\n"),
+            "a\nb\nc\td\n"
+        );
+
+        let mut pages = vec![
+            PageText {
+                page: 1,
+                text: "abcdef".into(),
+            },
+            PageText {
+                page: 2,
+                text: "ghijkl".into(),
+            },
+        ];
+        cap_pages_text(&mut pages, 9);
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].text, "abcdef");
+        assert_eq!(pages[1].text, "ghi");
     }
 }

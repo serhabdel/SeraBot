@@ -30,6 +30,7 @@ artifacts.
 | [Release 0.39.0](release-0.39.0.md) | Per-user isolation & reliability fixes: scheduled/direct `dir:main` isolation, resilient scheduler loop, UID-scoped `kv` & `/v1/models` ownership, per-user monitoring sources, multi-user RAG vector recall, least-privilege `/v1/connectors`, Windows ACLs, and batched media jobs. |
 | [Release 0.40.0](release-0.40.0.md) | Desktop UI/UX overhaul: chat & composer shortcuts, richer markdown & bounded cache, approvals & conversations polish, shell/search/banner fixes, Tasks/Workflows/Logs/Files/Jobs/Bots/Dock upgrades, and CSS/responsive refinements. |
 | [Release 0.41.0](release-0.41.0.md) | Desktop integrations, providers, settings, usage, vault, browser, and memory UX overhaul: clear plugin/connector/OAuth/Composio states, provider draft validation & presets, Mem0/TurnLimits/WebSearch/LocalFolders/Vault/Browser/Memory/Sheets/RowMenu/Preview polish, and settings/usage CSS scaling. |
+| [Release 0.42.0](release-0.42.0.md) | Desktop core resilience & server feature polish: fixed pending-gate refresh drops, `Cmd/Ctrl+K` active-screen search focus, standing-grant search/skeleton/confirm, SSE buffer cap & updater backup/restore; server brief/digest/analyst/watcher/spreadsheets/workbooks/documents hardening. |
 | [Events](events.md) | `turn.step` payload for desktop and Android step cards. |
 | [Tool results](tool-results.md) | Audio, file, image, link, and table cards. |
 | [Console pages](console-pages.md) | Tasks, Memory, Connectors, and Providers fields the next desktop pages read. |

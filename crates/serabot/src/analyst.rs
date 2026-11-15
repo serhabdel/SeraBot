@@ -81,7 +81,8 @@ pub fn analyze_transcript(text: &str) -> TranscriptAnalysis {
 
     for (index, raw_line) in bounded.lines().enumerate() {
         let line_number = index + 1;
-        let line = clean_line(raw_line);
+        let is_markdown_heading = raw_line.trim_start().starts_with('#');
+        let (line, is_open_checkbox) = clean_line_with_checkbox(raw_line);
         if line.is_empty() {
             continue;
         }
@@ -97,6 +98,13 @@ pub fn analyze_transcript(text: &str) -> TranscriptAnalysis {
         }
         if let Some(heading) = section_heading(&line) {
             section = Some(heading);
+            last_action = None;
+            continue;
+        }
+        if is_markdown_heading {
+            // An unrecognized Markdown heading (e.g. `## Notes`) ends the prior section.
+            section = None;
+            last_action = None;
             continue;
         }
 
@@ -109,8 +117,21 @@ pub fn analyze_transcript(text: &str) -> TranscriptAnalysis {
                     content = rest.trim().to_string();
                 }
                 // A short labelled field we do not understand (e.g. "Risk:") is
-                // not silently promoted to a decision or action.
-                None => continue,
+                // not silently promoted to a decision or action, unless it is an
+                // explicit checkbox or carries an inline Owner/Due tag (e.g.
+                // "Prepare slides — Owner: Marco"). An empty heading label
+                // (e.g. "Notes:") also closes the previous section.
+                None => {
+                    if rest.trim().is_empty() {
+                        section = None;
+                        last_action = None;
+                        continue;
+                    }
+                    let tagged = extract_tags(&line);
+                    if !is_open_checkbox && tagged.owner.is_none() && tagged.due.is_none() {
+                        continue;
+                    }
+                }
             }
         }
 
@@ -120,6 +141,8 @@ pub fn analyze_transcript(text: &str) -> TranscriptAnalysis {
             } else if let Some(todo) = todo_action_text(&content) {
                 kind = Some(Kind::Action);
                 content = todo;
+            } else if is_open_checkbox {
+                kind = Some(Kind::Action);
             } else if content.eq_ignore_ascii_case("todo") || content.eq_ignore_ascii_case("to-do")
             {
                 push_question(
@@ -135,6 +158,7 @@ pub fn analyze_transcript(text: &str) -> TranscriptAnalysis {
 
         match kind {
             Some(Kind::Decision) => {
+                last_action = None;
                 let decision = content.trim();
                 if decision.is_empty() {
                     push_question(
@@ -199,6 +223,7 @@ pub fn analyze_transcript(text: &str) -> TranscriptAnalysis {
                 }
             }
             Some(Kind::Question) => {
+                last_action = None;
                 let question = content.trim();
                 if question.is_empty() {
                     push_question(
@@ -352,18 +377,37 @@ const UNCERTAIN_MARKERS: &[&str] = &[
 
 const MONTH_NAMES: &[&str] = &[
     "jan",
+    "janv",
     "feb",
+    "fevr",
+    "févr",
     "mar",
     "apr",
+    "avr",
     "may",
+    "mai",
     "jun",
+    "juin",
     "jul",
+    "juil",
     "aug",
+    "aout",
+    "août",
     "sep",
     "sept",
     "oct",
     "nov",
     "dec",
+    "déc",
+    "gen",
+    "mag",
+    "giu",
+    "lug",
+    "ago",
+    "set",
+    "sett",
+    "ott",
+    "dic",
     "january",
     "february",
     "march",
@@ -380,11 +424,7 @@ const MONTH_NAMES: &[&str] = &[
     "fevrier",
     "mars",
     "avril",
-    "mai",
-    "juin",
     "juillet",
-    "août",
-    "aout",
     "septembre",
     "octobre",
     "novembre",
@@ -414,7 +454,7 @@ fn bound_transcript(text: &str, max_chars: usize) -> (String, bool) {
     (bounded, true)
 }
 
-fn clean_line(raw: &str) -> String {
+fn clean_line_with_checkbox(raw: &str) -> (String, bool) {
     let mut line = raw.trim();
     line = line.trim_start_matches(['#', '>', '*', '+', '|']);
     line = line.trim_start();
@@ -426,7 +466,19 @@ fn clean_line(raw: &str) -> String {
     {
         line = rest.trim_start();
     }
-    strip_numbering(line).trim().to_string()
+    line = strip_numbering(line).trim();
+    if let Some(rest) = line.strip_prefix("[ ]") {
+        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+            return (rest.trim().to_string(), true);
+        }
+    } else if let Some(rest) = line
+        .strip_prefix("[x]")
+        .or_else(|| line.strip_prefix("[X]"))
+        && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+    {
+        return (rest.trim().to_string(), false);
+    }
+    (line.to_string(), false)
 }
 
 fn strip_numbering(line: &str) -> &str {
@@ -523,10 +575,16 @@ fn ends_with_question(line: &str) -> bool {
 }
 
 fn todo_action_text(line: &str) -> Option<String> {
-    let lower = line.to_lowercase();
     for prefix in ["todo", "to-do", "to do"] {
-        if lower.starts_with(prefix) {
+        if let Some(head) = line.get(..prefix.len())
+            && head.eq_ignore_ascii_case(prefix)
+        {
             let rest = &line[prefix.len()..];
+            if !rest.is_empty()
+                && !rest.starts_with(|value: char| value == ':' || value.is_whitespace())
+            {
+                continue;
+            }
             let rest = rest.trim_start_matches(|value: char| value == ':' || value.is_whitespace());
             if !rest.trim().is_empty() {
                 return Some(rest.trim().to_string());
@@ -554,10 +612,32 @@ fn looks_like_date(value: &str) -> bool {
     {
         // YYYY-MM-DD, YYYY/MM/DD, DD/MM/YYYY, DD.MM.YYYY, DD-MM-YYYY.
         let iso = bytes[4] == bytes[7] && matches!(bytes[4], b'-' | b'/');
-        let day_first = bytes[2] == bytes[5] && matches!(bytes[2], b'-' | b'/' | b'.');
-        if iso || day_first {
+        if iso
+            && let (Ok(year), Ok(month), Ok(day)) = (
+                trimmed[0..4].parse::<u32>(),
+                trimmed[5..7].parse::<u32>(),
+                trimmed[8..10].parse::<u32>(),
+            )
+            && (1900..=2200).contains(&year)
+            && (1..=12).contains(&month)
+            && (1..=31).contains(&day)
+        {
             return true;
         }
+        let day_first = bytes[2] == bytes[5] && matches!(bytes[2], b'-' | b'/' | b'.');
+        if day_first
+            && let (Ok(day), Ok(month), Ok(year)) = (
+                trimmed[0..2].parse::<u32>(),
+                trimmed[3..5].parse::<u32>(),
+                trimmed[6..10].parse::<u32>(),
+            )
+            && (1900..=2200).contains(&year)
+            && (1..=12).contains(&month)
+            && (1..=31).contains(&day)
+        {
+            return true;
+        }
+        return false;
     }
     let lower = trimmed.to_lowercase();
     let tokens: Vec<&str> = lower
@@ -671,8 +751,8 @@ fn match_tag(chars: &[char], start: usize) -> Option<(TagKind, usize)> {
     None
 }
 
-fn clean_tag_piece(value: &str) -> String {
-    let mut cleaned = value
+fn strip_tag_punct(value: &str) -> String {
+    value
         .trim()
         .trim_matches(|character: char| {
             matches!(
@@ -694,14 +774,32 @@ fn clean_tag_piece(value: &str) -> String {
             )
         })
         .trim()
-        .to_string();
-    for conjunction in [" and", " et", " e", " und"] {
-        if cleaned.to_lowercase().ends_with(conjunction) {
-            let length = cleaned.len() - conjunction.len();
-            cleaned.truncate(length);
+        .to_string()
+}
+
+fn clean_tag_piece(value: &str) -> String {
+    let mut cleaned = strip_tag_punct(value);
+    loop {
+        let mut stripped = false;
+        for conjunction in [" and", " et", " e", " und"] {
+            let tail_len = conjunction.len();
+            if cleaned.len() >= tail_len {
+                let split_at = cleaned.len() - tail_len;
+                if cleaned.is_char_boundary(split_at)
+                    && cleaned[split_at..].eq_ignore_ascii_case(conjunction)
+                {
+                    cleaned.truncate(split_at);
+                    cleaned = strip_tag_punct(&cleaned);
+                    stripped = true;
+                    break;
+                }
+            }
+        }
+        if !stripped {
+            break;
         }
     }
-    cleaned.trim().to_string()
+    cleaned
 }
 
 fn shorten(value: &str, max_chars: usize) -> String {
@@ -905,63 +1003,79 @@ pub fn synthesis_outline(pages: &[PageText], max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
     }
-    let mut output = String::new();
+    let note = "[outline truncated]";
+    let note_chars = note.chars().count();
+    let mut lines: Vec<String> = Vec::new();
     let mut used = 0usize;
     let mut seen: HashSet<String> = HashSet::new();
     let mut truncated = false;
 
     'pages: for page in pages {
-        let candidates = outline_candidates(&page.text);
-        if candidates.is_empty() {
+        let unique: Vec<String> = outline_candidates(&page.text)
+            .into_iter()
+            .filter(|candidate| {
+                let key = dedup_key(candidate);
+                !key.is_empty() && seen.insert(key)
+            })
+            .collect();
+        if unique.is_empty() {
             continue;
         }
         let marker = format!("[page {}]", page.page);
-        if !append_outline_line(&mut output, &mut used, max_chars, &marker) {
+        let mut iter = unique.into_iter();
+        let Some(first) = iter.next() else {
+            continue;
+        };
+        let sep_before_marker = usize::from(!lines.is_empty());
+        let combined_needed =
+            sep_before_marker + marker.chars().count() + 1 + first.chars().count();
+        if used.saturating_add(combined_needed) > max_chars {
             truncated = true;
             break;
         }
-        for candidate in candidates {
-            let key = dedup_key(&candidate);
-            if key.is_empty() || !seen.insert(key) {
-                continue;
-            }
-            if !append_outline_line(&mut output, &mut used, max_chars, &candidate) {
+        lines.push(marker);
+        lines.push(first);
+        used += combined_needed;
+
+        for candidate in iter {
+            let needed = 1 + candidate.chars().count();
+            if used.saturating_add(needed) > max_chars {
                 truncated = true;
                 break 'pages;
             }
+            lines.push(candidate);
+            used += needed;
         }
     }
 
-    if output.is_empty() {
-        return output;
+    if lines.is_empty() {
+        return String::new();
     }
     if truncated {
-        let note = "[outline truncated]";
-        if used + note.chars().count() < max_chars {
-            output.push('\n');
-            output.push_str(note);
+        while !lines.is_empty() {
+            let sep = usize::from(!lines.is_empty());
+            if used + sep + note_chars <= max_chars {
+                break;
+            }
+            if let Some(removed) = lines.pop() {
+                used =
+                    used.saturating_sub(removed.chars().count() + usize::from(!lines.is_empty()));
+            }
+        }
+        // Avoid leaving a dangling `[page N]` header at the tail.
+        while lines.last().is_some_and(|line| line.starts_with("[page ")) {
+            if let Some(removed) = lines.pop() {
+                used =
+                    used.saturating_sub(removed.chars().count() + usize::from(!lines.is_empty()));
+            }
+        }
+        if !lines.is_empty() && used + 1 + note_chars <= max_chars {
+            lines.push(note.to_string());
+        } else if lines.is_empty() && note_chars <= max_chars {
+            return note.to_string();
         }
     }
-    output
-}
-
-fn append_outline_line(
-    output: &mut String,
-    used: &mut usize,
-    max_chars: usize,
-    line: &str,
-) -> bool {
-    let newline = usize::from(!output.is_empty());
-    let needed = line.chars().count() + newline;
-    if used.saturating_add(needed) > max_chars {
-        return false;
-    }
-    if newline == 1 {
-        output.push('\n');
-    }
-    output.push_str(line);
-    *used += needed;
-    true
+    lines.join("\n")
 }
 
 fn outline_candidates(text: &str) -> Vec<String> {
@@ -1284,5 +1398,62 @@ Action: prepare the budget
                 "outline line not found in source: {line}"
             );
         }
+    }
+
+    #[test]
+    fn handles_unicode_tag_pieces_todo_boundaries_and_section_resets() {
+        let text = "\
+Decisions
+- Adopt option A
+Notes:
+Just commentary that should not be a decision.
+## Background
+More prose that should not be a decision.
+- Todoist is down right now
+- Todos ignore plural prefix
+Actions
+- [ ] Prepare slides — Owner: Marco, and
+- Action: Ship release — Owner: İlayda ẞ
+Decision: Keep weekly sync
+Owner: Stray owner after decision
+";
+        let analysis = analyze_transcript(text);
+        assert_eq!(
+            analysis.decisions,
+            vec!["Adopt option A".to_string(), "Keep weekly sync".to_string()]
+        );
+        assert_eq!(analysis.actions.len(), 2, "{analysis:?}");
+        assert_eq!(analysis.actions[0].text, "Prepare slides");
+        assert_eq!(analysis.actions[0].owner.as_deref(), Some("Marco"));
+        assert_eq!(analysis.actions[1].owner.as_deref(), Some("İlayda ẞ"));
+        assert!(
+            analysis
+                .open_questions
+                .iter()
+                .any(|q| q.contains("no preceding action")),
+            "{analysis:?}"
+        );
+    }
+
+    #[test]
+    fn outline_avoids_orphan_page_headers_and_marks_truncation() {
+        let pages = vec![
+            PageText {
+                page: 1,
+                text: "First\nThis is a sufficiently long informative sentence for page one."
+                    .into(),
+            },
+            PageText {
+                page: 2,
+                text:
+                    "Second\nThis is another sufficiently long informative sentence for page two."
+                        .into(),
+            },
+        ];
+        let outline = synthesis_outline(&pages, 50);
+        assert!(outline.chars().count() <= 50, "{outline:?}");
+        assert!(outline.ends_with("[outline truncated]"), "{outline:?}");
+        let lines: Vec<&str> = outline.lines().collect();
+        assert!(!lines.contains(&"[page 2]"), "{outline:?}");
     }
 }

@@ -125,6 +125,21 @@ fn event_refresh(kind: &str, conversation: &str) -> EventRefresh {
     }
 }
 
+fn choose_event_kind(current: &mut String, dirty: &mut bool, conversation: &str, kind: String) {
+    if !*dirty {
+        *current = kind;
+    } else {
+        let prev = event_refresh(current, conversation);
+        let next = event_refresh(&kind, conversation);
+        if matches!(next, EventRefresh::Approvals | EventRefresh::RoomTeam)
+            || matches!(prev, EventRefresh::History)
+        {
+            *current = kind;
+        }
+    }
+    *dirty = true;
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     Chat,
@@ -1301,22 +1316,18 @@ impl Session {
     /// Read `GET /v1/logs` with the tab's current filter (0.28.0). A manual
     /// Refresh calls this again; the section load does too, once per connect.
     pub fn refresh_logs(&mut self) {
-        if !self.state.connected || self.pending.is_some() {
-            if self.ready() {
-                self.schedule(
-                    Operation::Logs {
-                        level: self.logs_level.clone(),
-                        query: self.logs_query.clone(),
-                    },
-                    Duration::ZERO,
-                );
-            }
+        if !self.state.connected {
             return;
         }
-        self.start_request(Operation::Logs {
+        let op = Operation::Logs {
             level: self.logs_level.clone(),
             query: self.logs_query.clone(),
-        });
+        };
+        if self.pending.is_some() || !self.ready() {
+            self.queue_backlog(op);
+            return;
+        }
+        self.start_request(op);
     }
 
     /// Change the Logs tab filter and re-read.
@@ -1338,10 +1349,8 @@ impl Session {
             self.state.marketplace_loaded = false;
         }
         self.state.marketplace_error = None;
-        if self.pending.is_some() {
-            if self.ready() {
-                self.schedule(Operation::MarketplaceList, Duration::ZERO);
-            }
+        if self.pending.is_some() || !self.ready() {
+            self.queue_backlog(Operation::MarketplaceList);
             return;
         }
         self.start_request(Operation::MarketplaceList);
@@ -1422,13 +1431,14 @@ impl Session {
 
     /// Read the Wave A visibility bundle (0.29.0). Independent of the open chat.
     pub fn refresh_workflows(&mut self) {
-        if !self.state.connected || self.pending.is_some() {
-            if self.ready() {
-                self.schedule(Operation::Workflows, Duration::ZERO);
-            }
+        if !self.state.connected {
             return;
         }
         self.state.workflows_error = None;
+        if self.pending.is_some() || !self.ready() {
+            self.queue_backlog(Operation::Workflows);
+            return;
+        }
         self.start_request(Operation::Workflows);
     }
 
@@ -1750,6 +1760,11 @@ impl Session {
         self.credentials = None;
         self.token.zeroize();
         self.token.clear();
+        self.last_event_id = 0;
+        self.last_event_kind.clear();
+        self.usage_loading = false;
+        self.server_health_loading = false;
+        self.voice = VoiceDraft::default();
         self.state.user = None;
         self.session_expires = None;
         self.connecting = false;
@@ -3287,8 +3302,12 @@ impl Session {
                         ) {
                             continue;
                         }
-                        self.last_event_kind = kind;
-                        self.events_dirty = true;
+                        choose_event_kind(
+                            &mut self.last_event_kind,
+                            &mut self.events_dirty,
+                            &self.conversation,
+                            kind,
+                        );
                     }
                 }
             }
@@ -3305,7 +3324,10 @@ impl Session {
             || !self.state.history_loaded
             || self.refreshing
             || self.pending.is_some()
-            || self.scheduled.is_some()
+            || self
+                .scheduled
+                .as_ref()
+                .is_some_and(|(when, _)| *when <= Instant::now())
             || Instant::now() < self.next_request
         {
             return;
@@ -3320,9 +3342,11 @@ impl Session {
             EventRefresh::History => self.start_request(Operation::History),
             EventRefresh::RoomTeam => {
                 self.start_request(Operation::History);
-                self.state.team_loading = true;
-                self.state.team_error = None;
-                self.schedule(Operation::GetTeam, Duration::ZERO);
+                if self.credentials.is_some() && self.worker.is_some() {
+                    self.state.team_loading = true;
+                    self.state.team_error = None;
+                    self.queue_backlog(Operation::GetTeam);
+                }
             }
         }
     }
@@ -3338,6 +3362,22 @@ impl Session {
                 | Operation::TaskCalendar { .. }
                 | Operation::Workflows
                 | Operation::Logs { .. }
+                | Operation::MarketplaceList
+                | Operation::Catalog
+                | Operation::Approvals
+                | Operation::StandingGrants
+                | Operation::Providers
+                | Operation::Connectors
+                | Operation::ListBots
+                | Operation::ListSkills
+                | Operation::ListConversations { .. }
+                | Operation::ListArchived
+                | Operation::ListMemories { .. }
+                | Operation::MemoryStats
+                | Operation::JobsReliability
+                | Operation::ChatPlan
+                | Operation::GetTeam
+                | Operation::VoiceSettings
         );
         if read
             && let Some(slot) = self.backlog.iter_mut().find(|queued| {
@@ -3348,6 +3388,57 @@ impl Session {
             return;
         }
         self.backlog.push_back(operation);
+    }
+
+    /// Clear pre-dispatch guards and caller-owned loading/busy flags when a
+    /// request is aborted or fails before reaching the worker.
+    fn rollback_aborted_request(
+        &mut self,
+        operation: &Operation,
+        clear_all_caller_flags: Option<bool>,
+    ) {
+        match operation {
+            Operation::BotDetail { .. } => self.bot_detail_pending = None,
+            Operation::ListBotChats { .. } => self.bot_chats_pending = None,
+            Operation::MarketplaceAct { .. } | Operation::MarketplaceConfig { .. } => {
+                self.marketplace_busy = false;
+            }
+            Operation::UpdateBotConfig { .. } => self.bot_config_pending = None,
+            Operation::AvatarFetch { .. }
+            | Operation::AvatarUpload { .. }
+            | Operation::AvatarRemove { .. } => self.avatar_op = None,
+            Operation::PreviewArtifact { .. } => self.state.media_previews.fail_in_flight(),
+            Operation::DocPreview { hash } => {
+                self.doc_previews_pending.remove(hash);
+            }
+            _ => {}
+        }
+        let Some(disconnected) = clear_all_caller_flags else {
+            return;
+        };
+        match operation {
+            Operation::Usage { .. } => self.usage_loading = false,
+            Operation::ServerHealth if disconnected => self.server_health_loading = false,
+            Operation::VoiceSettings => self.voice.loading = false,
+            Operation::CreateNamedBot { .. } => self.creating_named_bot = false,
+            Operation::InstallShippedBot { .. } => self.state.shipped_installing = None,
+            Operation::OnboardingStart { .. }
+            | Operation::OnboardingReply { .. }
+            | Operation::OnboardingConfirm { .. }
+            | Operation::OnboardingLoad { .. } => self.onboarding_ui.waiting = false,
+            Operation::UpdateBot { .. } => self.bot_settings.reset_saving(),
+            Operation::SetBotEnabled { .. } | Operation::DeleteBot { .. } => {
+                self.bot_settings.reset_lifecycle();
+            }
+            Operation::GetTeam | Operation::SetTeam { .. } => self.state.team_loading = false,
+            Operation::Library => self.state.library_loading = false,
+            Operation::TranscribeAudio { .. } => self.state.transcript_loading = false,
+            Operation::UploadAttachment { .. } => {
+                self.uploading = false;
+                self.upload_thumb = None;
+            }
+            _ => {}
+        }
     }
 
     /// Send the oldest backlogged request. If the queue is still full, it goes
@@ -3361,9 +3452,11 @@ impl Session {
     fn start_request(&mut self, operation: Operation) {
         self.scheduled = None;
         let Some(credentials) = &self.credentials else {
+            self.rollback_aborted_request(&operation, Some(false));
             return;
         };
         let Some(worker) = &self.worker else {
+            self.rollback_aborted_request(&operation, Some(false));
             return;
         };
         let kind = operation.kind();
@@ -3408,20 +3501,20 @@ impl Session {
                 // dispatch cannot be replayed later, so it reports a busy queue.
                 std::sync::mpsc::TrySendError::Full(job) => {
                     if has_dispatch_guard(&job.operation) {
-                        self.state.media_previews.fail_in_flight();
+                        self.rollback_aborted_request(&job.operation, Some(true));
                         self.state.error =
                             Some("Another request is still running. Try again in a moment.".into());
                     } else {
+                        self.rollback_aborted_request(&job.operation, None);
                         self.queue_backlog(job.operation);
                     }
                     return;
                 }
-                std::sync::mpsc::TrySendError::Disconnected(_) => {
-                    self.marketplace_busy = false;
+                std::sync::mpsc::TrySendError::Disconnected(job) => {
+                    self.rollback_aborted_request(&job.operation, Some(true));
                     self.state.error = Some("Network worker unavailable. Reconnect.".into());
                     self.refreshing = false;
                     self.poll_paused = true;
-                    self.state.media_previews.fail_in_flight();
                     return;
                 }
             }
@@ -3511,6 +3604,7 @@ impl Session {
                     }
                 }
                 Err(error) if completion.kind == OperationKind::BotLifecycle => {
+                    self.bot_settings.reset_lifecycle();
                     self.toast = Some(format!("Could not change that bot: {error}"));
                     self.schedule(Operation::ListBots, Duration::ZERO);
                 }
@@ -3735,6 +3829,16 @@ impl Session {
                             self.toast = Some(format!("No preview for this file: {message}"));
                             self.state.error = None;
                         }
+                        OperationKind::CreateBot => {
+                            self.creating_named_bot = false;
+                        }
+                        OperationKind::VoiceSettings => {
+                            self.voice.loading = false;
+                            self.admin_error = Some(message);
+                            if !self.state.unknown_outcome && !dropped {
+                                self.state.error = None;
+                            }
+                        }
                         OperationKind::Submit => self.note_submit_failure(submit_failure),
                         _ => {}
                     }
@@ -3882,6 +3986,11 @@ impl Session {
                                 .error
                                 .clone()
                                 .or_else(|| Some("Server is not ready.".into()));
+                        }
+                        OperationKind::VoiceSettings => {
+                            self.voice.loading = false;
+                            self.admin_error = None;
+                            self.sync_voice_draft();
                         }
                         OperationKind::Catalog if self.refreshing => {
                             if self.state.history_loaded {
@@ -4066,7 +4175,7 @@ impl Session {
                                 },
                                 Duration::ZERO,
                             );
-                            self.schedule(Operation::ListArchived, Duration::ZERO);
+                            self.queue_backlog(Operation::ListArchived);
                         }
                         OperationKind::AddMemory
                         | OperationKind::DeleteMemory
@@ -4147,7 +4256,7 @@ impl Session {
                         }
                         OperationKind::MediaJobs => {
                             self.schedule(Operation::JobsReliability, Duration::ZERO);
-                            self.schedule(Operation::ChatPlan, Duration::ZERO);
+                            self.queue_backlog(Operation::ChatPlan);
                         }
                         OperationKind::OAuthSignIn => {
                             self.admin_error = None;
@@ -4391,7 +4500,11 @@ impl Session {
         if self.section == Section::Settings {
             self.ensure_telegram();
         }
-        if !self.state.connected || self.state.unknown_outcome || self.refreshing {
+        if !self.state.connected
+            || self.state.unknown_outcome
+            || self.refreshing
+            || self.poll_paused
+        {
             return;
         }
         let Some(operation) = self.missing_section_op() else {
@@ -4530,10 +4643,14 @@ impl Session {
     /// Refresh the live provider catalogs (GET /v1/models) and then reload
     /// provider status. Requires catalog_fetch on the server provider.
     pub fn fetch_models(&mut self) {
-        if self.pending.is_some() {
+        if !self.state.connected {
             return;
         }
         self.state.providers_loaded = false;
+        if self.pending.is_some() || !self.ready() {
+            self.queue_backlog(Operation::Catalog);
+            return;
+        }
         self.start_request(Operation::Catalog);
     }
 
@@ -4906,8 +5023,12 @@ impl Session {
     }
 
     pub fn refresh_approvals(&mut self) {
-        self.start_request(Operation::Approvals);
-        self.start_request(Operation::StandingGrants);
+        if self.pending.is_some() || !self.ready() {
+            self.queue_backlog(Operation::Approvals);
+        } else {
+            self.start_request(Operation::Approvals);
+        }
+        self.queue_backlog(Operation::StandingGrants);
     }
 
     pub fn revoke_standing_grant(&mut self, id: String) {
@@ -6232,5 +6353,86 @@ mod backlog_tests {
         session.start_request(Operation::ListTasks);
         assert!(session.backlog.is_empty());
         assert!(session.state.error.is_none());
+    }
+
+    #[test]
+    fn refresh_marketplace_logs_workflows_and_fetch_models_queue_when_pending() {
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        session.state.connected = true;
+        session.pending = Some(OperationKind::History);
+
+        session.refresh_marketplace();
+        session.refresh_marketplace();
+        session.refresh_logs();
+        session.refresh_logs();
+        session.refresh_workflows();
+        session.refresh_workflows();
+        session.fetch_models();
+        session.fetch_models();
+        session.refresh_approvals();
+
+        let kinds: Vec<OperationKind> = session.backlog.iter().map(Operation::kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                OperationKind::MarketplaceList,
+                OperationKind::Logs,
+                OperationKind::Workflows,
+                OperationKind::Catalog,
+                OperationKind::Approvals,
+                OperationKind::StandingGrants,
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_dispatch_and_lifecycle_errors_clear_loading_flags() {
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        session.state.connected = true;
+        session.creating_named_bot = true;
+        session.start_request(Operation::CreateNamedBot {
+            name: "Mia".into(),
+            model: None,
+            group: None,
+        });
+        assert!(!session.creating_named_bot);
+
+        session.voice.loading = true;
+        session.start_request(Operation::VoiceSettings);
+        assert!(!session.voice.loading);
+
+        session.bot_settings.lifecycle_busy = true;
+        session.start_request(Operation::DeleteBot { id: "mia".into() });
+        assert!(!session.bot_settings.lifecycle_busy);
+        assert!(!session.bot_settings.has_deleted());
+
+        session.last_event_id = 99;
+        let _ = session.clear_session();
+        assert_eq!(session.last_event_id, 0);
+    }
+
+    #[test]
+    fn poll_events_does_not_overwrite_pending_approvals_refresh_with_history() {
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        choose_event_kind(
+            &mut session.last_event_kind,
+            &mut session.events_dirty,
+            &session.conversation,
+            "approval.requested".into(),
+        );
+        choose_event_kind(
+            &mut session.last_event_kind,
+            &mut session.events_dirty,
+            &session.conversation,
+            "turn.completed".into(),
+        );
+        assert!(session.events_dirty);
+        assert_eq!(
+            event_refresh(&session.last_event_kind, &session.conversation),
+            EventRefresh::Approvals
+        );
     }
 }
