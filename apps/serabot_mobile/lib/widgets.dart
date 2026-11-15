@@ -4,8 +4,9 @@ import 'package:material_ui/material_ui.dart';
 
 import 'app_state.dart';
 
-/// Round avatar: the uploaded picture when there is one, else the bot's emoji
-/// or the first letter on a violet tile.
+/// Round avatar: the uploaded picture when there is one (rendered synchronously
+/// from [AppState.cachedAvatar] on frame 0 to prevent flicker), else a crisp
+/// per-bot gradient + glyph fallback, emoji, or initial.
 class SeraAvatar extends StatelessWidget {
   const SeraAvatar({
     super.key,
@@ -26,31 +27,109 @@ class SeraAvatar extends StatelessWidget {
   final String? version;
   final double radius;
 
-  @override
-  Widget build(BuildContext context) {
+  static ({List<Color> colors, IconData icon})? _botVisual(String? rawId) {
+    switch (rawId?.toLowerCase()) {
+      case 'main':
+        return (
+          colors: const [Color(0xFF6366F1), Color(0xFF8B5CF6)],
+          icon: Icons.auto_awesome,
+        );
+      case 'jobfinder':
+        return (
+          colors: const [Color(0xFF0D9488), Color(0xFF10B981)],
+          icon: Icons.work_outline_rounded,
+        );
+      case 'analyst':
+        return (
+          colors: const [Color(0xFF2563EB), Color(0xFF06B6D4)],
+          icon: Icons.analytics_outlined,
+        );
+      case 'legal':
+        return (
+          colors: const [Color(0xFFD97706), Color(0xFFB45309)],
+          icon: Icons.balance_rounded,
+        );
+      case 'maker':
+        return (
+          colors: const [Color(0xFFE11D48), Color(0xFFF97316)],
+          icon: Icons.construction_rounded,
+        );
+      case 'watcher':
+        return (
+          colors: const [Color(0xFF475569), Color(0xFF6366F1)],
+          icon: Icons.radar_rounded,
+        );
+      default:
+        return null;
+    }
+  }
+
+  Widget _buildFallback(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final visual = kind == 'bots' ? _botVisual(id) : null;
+    if (visual != null) {
+      return Container(
+        width: radius * 2,
+        height: radius * 2,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: visual.colors,
+          ),
+        ),
+        alignment: Alignment.center,
+        child: Icon(
+          visual.icon,
+          size: radius * 1.05,
+          color: Colors.white,
+        ),
+      );
+    }
     final initial = (emoji != null && emoji!.trim().isNotEmpty)
         ? emoji!
-        : (label.isEmpty ? '?' : String.fromCharCode(label.runes.first).toUpperCase());
-    final fallback = CircleAvatar(
+        : (label.isEmpty
+            ? '?'
+            : String.fromCharCode(label.runes.first).toUpperCase());
+    return CircleAvatar(
       radius: radius,
       backgroundColor: scheme.primaryContainer,
       foregroundColor: scheme.onPrimaryContainer,
       child: Text(initial, style: TextStyle(fontSize: radius * 0.8)),
     );
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final a = app;
     final i = id;
-    if (a == null || i == null || version == null || version!.isEmpty) {
-      return fallback;
+    final canFetch = a != null &&
+        i != null &&
+        i.isNotEmpty &&
+        (kind == 'bots' || (version != null && version!.isNotEmpty));
+    if (!canFetch) {
+      return _buildFallback(context);
+    }
+    final cached = a.cachedAvatar(kind, i, version);
+    if (cached != null) {
+      return CircleAvatar(
+        radius: radius,
+        backgroundImage: MemoryImage(cached),
+      );
     }
     return FutureBuilder<Uint8List?>(
       future: a.avatar(kind, i, version),
+      initialData: cached,
       builder: (context, snap) {
         final bytes = snap.data;
         if (bytes == null) {
-          return fallback;
+          return _buildFallback(context);
         }
-        return CircleAvatar(radius: radius, backgroundImage: MemoryImage(bytes));
+        return CircleAvatar(
+          radius: radius,
+          backgroundImage: MemoryImage(bytes),
+        );
       },
     );
   }
