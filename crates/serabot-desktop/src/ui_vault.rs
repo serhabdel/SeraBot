@@ -1010,7 +1010,11 @@ fn ProbeBanner(probe: PasswordManagerProbe) -> Element {
     } else {
         "vault-probe-banner err"
     };
-    let headline = if probe.ok { "Connection verified" } else { "Connection check failed" };
+    let headline = if probe.ok {
+        "Connection verified"
+    } else {
+        "Connection check failed"
+    };
     rsx! {
         div { class: "{banner_class}", role: "status",
             Icon { name: if probe.ok { "check" } else { "x" }, size: 13 }
@@ -1190,7 +1194,12 @@ fn ImportPickerView(session: Signal<Session>) -> Element {
 mod tests {
     use super::*;
 
-    fn sample_entry(name: &str, kind: VaultKind, source: VaultSource, domains: Vec<&str>) -> VaultEntry {
+    fn sample_entry(
+        name: &str,
+        kind: VaultKind,
+        source: VaultSource,
+        domains: Vec<&str>,
+    ) -> VaultEntry {
         VaultEntry {
             name: name.into(),
             kind,
@@ -1207,7 +1216,12 @@ mod tests {
 
     #[test]
     fn entry_matches_checks_name_username_domain_and_kind() {
-        let entry = sample_entry("stripe-key", VaultKind::ApiKey, VaultSource::Local, vec!["api.stripe.com"]);
+        let entry = sample_entry(
+            "stripe-key",
+            VaultKind::ApiKey,
+            VaultSource::Local,
+            vec!["api.stripe.com"],
+        );
         assert!(entry_matches(&entry, "", None));
         assert!(entry_matches(&entry, "stripe", Some(VaultKind::ApiKey)));
         assert!(entry_matches(&entry, "billing@", None));
@@ -1219,8 +1233,18 @@ mod tests {
     #[test]
     fn vault_stats_counts_sources_and_domain_rules() {
         let entries = vec![
-            sample_entry("a", VaultKind::Password, VaultSource::Local, vec!["a.com", "b.com"]),
-            sample_entry("b", VaultKind::Password, VaultSource::OnePassword, vec!["c.com"]),
+            sample_entry(
+                "a",
+                VaultKind::Password,
+                VaultSource::Local,
+                vec!["a.com", "b.com"],
+            ),
+            sample_entry(
+                "b",
+                VaultKind::Password,
+                VaultSource::OnePassword,
+                vec!["c.com"],
+            ),
             sample_entry("c", VaultKind::Note, VaultSource::Local, vec![]),
         ];
         assert_eq!(vault_stats(&entries), (3, 2, 1, 3));

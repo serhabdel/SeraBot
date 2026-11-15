@@ -105,11 +105,7 @@ struct TaskStats {
 
 impl TaskStats {
     fn completion_pct(self) -> usize {
-        if self.total == 0 {
-            0
-        } else {
-            (self.done * 100) / self.total
-        }
+        (self.done * 100).checked_div(self.total).unwrap_or(0)
     }
 }
 
