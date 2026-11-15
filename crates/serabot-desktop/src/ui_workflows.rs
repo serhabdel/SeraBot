@@ -372,12 +372,16 @@ fn RoutineCard(
                             onclick: move |_| {
                                 let t = draft_time.read().trim().to_owned();
                                 let tz = draft_tz.read().trim().to_owned();
+                                let lbl = draft_label.read().trim().to_owned();
+                                let pr = draft_prompt.read().trim().to_owned();
                                 let en = *draft_enabled.read();
-                                session.write().save_workflow_routine(
+                                session.write().update_routine(
                                     save_name.clone(),
                                     Some(en),
                                     (!t.is_empty()).then_some(t),
                                     (!tz.is_empty()).then_some(tz),
+                                    (!lbl.is_empty()).then_some(lbl),
+                                    (!pr.is_empty()).then_some(pr),
                                 );
                                 editing_routine.set(None);
                             },
@@ -608,11 +612,25 @@ fn ActivePlanCard(
 ) -> Element {
     let mut session = session;
     let mut draft_steps = use_signal(|| plan.items.clone());
+    let mut draft_goal = use_signal(|| plan.goal.clone());
+    let mut editing_goal = use_signal(|| false);
     let mut new_step_text = use_signal(String::new);
-    let mut last_conv = use_signal(|| plan.conversation_id.clone());
-    if *last_conv.read() != plan.conversation_id {
-        last_conv.set(plan.conversation_id.clone());
+    let mut last_conv = use_signal(|| {
+        (
+            plan.conversation_id.clone(),
+            plan.goal.clone(),
+            plan.items.clone(),
+        )
+    });
+    let cur_conv = (
+        plan.conversation_id.clone(),
+        plan.goal.clone(),
+        plan.items.clone(),
+    );
+    if *last_conv.read() != cur_conv {
+        last_conv.set(cur_conv);
         draft_steps.set(plan.items.clone());
+        draft_goal.set(plan.goal.clone());
     }
 
     let steps = draft_steps.read().clone();
@@ -631,6 +649,9 @@ fn ActivePlanCard(
     let label = workflows::plan_conversation_label(conversation.as_deref(), &plan.conversation_id);
     let conv_id_open = plan.conversation_id.clone();
     let conv_id_select = plan.conversation_id.clone();
+    let conv_id_goal = plan.conversation_id.clone();
+    let conv_id_add = plan.conversation_id.clone();
+    let conv_id_toggle = plan.conversation_id.clone();
     let card_cls = if selected {
         "wf-card selected"
     } else {
@@ -641,7 +662,35 @@ fn ActivePlanCard(
         div { class: "{card_cls}", role: "listitem",
             div { class: "wf-card-head",
                 div { class: "wf-name-col",
-                    span { class: "wf-name wf-name-wrap", title: "{plan.goal}", "{plan.goal}" }
+                    if *editing_goal.read() {
+                        div { class: "wf-editor-row",
+                            input {
+                                class: "wf-input",
+                                r#type: "text",
+                                value: "{draft_goal}",
+                                oninput: move |e| draft_goal.set(e.value()),
+                            }
+                            button {
+                                class: "btn primary sm",
+                                r#type: "button",
+                                disabled: draft_goal.read().trim().is_empty(),
+                                onclick: move |_| {
+                                    let g = draft_goal.read().trim().to_owned();
+                                    if !g.is_empty() {
+                                        session.write().update_active_workflow(
+                                            conv_id_goal.clone(),
+                                            Some(g),
+                                            None,
+                                        );
+                                        editing_goal.set(false);
+                                    }
+                                },
+                                "Save"
+                            }
+                        }
+                    } else {
+                        span { class: "wf-name wf-name-wrap", title: "{plan.goal}", "{plan.goal}" }
+                    }
                     if let Some(at) = plan.updated_at.as_deref() {
                         span { class: "wf-meta", title: "{at}",
                             "Updated {workflows::relative_time(at, workflows::now_secs())}"
@@ -659,6 +708,7 @@ fn ActivePlanCard(
                         {
                             let step_title = step.title.clone();
                             let step_done = step.done;
+                            let conv_id_step = conv_id_toggle.clone();
                             rsx! {
                                 label { key: "{idx}", class: if step_done { "wf-plan-step done" } else { "wf-plan-step" }, role: "listitem",
                                     input {
@@ -669,7 +719,16 @@ fn ActivePlanCard(
                                             if let Some(item) = next.get_mut(idx) {
                                                 item.done = !item.done;
                                             }
+                                            let payload: Vec<(String, bool)> = next
+                                                .iter()
+                                                .map(|s| (s.title.clone(), s.done))
+                                                .collect();
                                             draft_steps.set(next);
+                                            session.write().update_active_workflow(
+                                                conv_id_step.clone(),
+                                                None,
+                                                Some(payload),
+                                            );
                                         },
                                     }
                                     span { "{step_title}" }
@@ -696,8 +755,17 @@ fn ActivePlanCard(
                         if !title.is_empty() {
                             let mut next = draft_steps.read().clone();
                             next.push(WorkflowPlanStep { title, done: false });
+                            let payload: Vec<(String, bool)> = next
+                                .iter()
+                                .map(|s| (s.title.clone(), s.done))
+                                .collect();
                             draft_steps.set(next);
                             new_step_text.set(String::new());
+                            session.write().update_active_workflow(
+                                conv_id_add.clone(),
+                                None,
+                                Some(payload),
+                            );
                         }
                     },
                     "Add Step"
@@ -709,6 +777,12 @@ fn ActivePlanCard(
                     r#type: "button",
                     onclick: move |_| on_select.call(conv_id_select.clone()),
                     "Visual Flow"
+                }
+                button {
+                    class: "btn ghost sm",
+                    r#type: "button",
+                    onclick: move |_| editing_goal.toggle(),
+                    if *editing_goal.read() { "Cancel" } else { "Rename Goal" }
                 }
                 button {
                     class: "btn ghost sm wf-chat-link",
@@ -942,6 +1016,7 @@ pub fn WorkflowsView(session: Signal<Session>) -> Element {
                     if let Some(graph) = active_graph {
                         {
                             let sel_for_click = active_selection.clone();
+                            let active_for_click = snapshot.active.clone();
                             rsx! {
                                 WorkflowCanvas {
                                     graph,
@@ -953,6 +1028,32 @@ pub fn WorkflowsView(session: Signal<Session>) -> Element {
                                             }
                                             Some(SelectedWorkflow::Source(name)) if node_id == "source" => {
                                                 editing_source.set(Some(name.clone()));
+                                            }
+                                            Some(SelectedWorkflow::Plan(id)) if node_id.starts_with("step-") => {
+                                                if let Some(idx) = node_id
+                                                    .strip_prefix("step-")
+                                                    .and_then(|s| s.parse::<usize>().ok())
+                                                    .and_then(|one_based| one_based.checked_sub(1))
+                                                    && let Some(plan) = active_for_click.iter().find(|p| &p.conversation_id == id)
+                                                    && !plan.items.is_empty()
+                                                {
+                                                    let items_payload: Vec<(String, bool)> = plan
+                                                        .items
+                                                        .iter()
+                                                        .enumerate()
+                                                        .map(|(i, s)| {
+                                                            (
+                                                                s.title.clone(),
+                                                                if i == idx { !s.done } else { s.done },
+                                                            )
+                                                        })
+                                                        .collect();
+                                                    session.write().update_active_workflow(
+                                                        id.clone(),
+                                                        None,
+                                                        Some(items_payload),
+                                                    );
+                                                }
                                             }
                                             _ => {}
                                         }
