@@ -4118,6 +4118,10 @@ impl ApiClient {
         })
     }
 
+    fn task_sync_run_payload() -> serde_json::Value {
+        serde_json::json!({})
+    }
+
     /// Run one sync pass for the stored (or given) provider.
     pub fn run_task_sync(&self) -> Result<TaskSyncReport, ApiError> {
         #[derive(Deserialize)]
@@ -4125,8 +4129,13 @@ impl ApiClient {
             provider: String,
             report: SyncReport,
         }
-        let response: Envelope =
-            self.request::<Envelope, ()>(Method::POST, &["v1", "tasks", "sync", "run"], &[], None)?;
+        let body = Self::task_sync_run_payload();
+        let response: Envelope = self.request(
+            Method::POST,
+            &["v1", "tasks", "sync", "run"],
+            &[],
+            Some(&body),
+        )?;
         Ok(TaskSyncReport {
             provider: response.provider,
             report: response.report,
@@ -6451,6 +6460,11 @@ mod tests {
             client_for(serve_once(vec![])).put_active_workflow("   ", Some("Goal"), None),
             Err(ApiError::Validation(_))
         ));
+    }
+
+    #[test]
+    fn task_sync_run_payload_is_an_empty_json_object() {
+        assert_eq!(ApiClient::task_sync_run_payload(), serde_json::json!({}));
     }
 }
 
