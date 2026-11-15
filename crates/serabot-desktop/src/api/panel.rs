@@ -183,6 +183,26 @@ pub struct PasswordManagerProbe {
     pub message: String,
 }
 
+/// Result of `POST /v1/vault/providers/{id}/sync`.
+/// Accepts either `synced_items` or `entries` from the server.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct VaultProviderSyncResponse {
+    #[serde(default)]
+    pub synced_items: Option<usize>,
+    #[serde(default)]
+    pub entries: Option<Vec<VaultEntry>>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+impl VaultProviderSyncResponse {
+    pub fn synced_count(&self) -> usize {
+        self.synced_items
+            .or_else(|| self.entries.as_ref().map(Vec::len))
+            .unwrap_or(0)
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PasswordManagerList {
@@ -652,6 +672,16 @@ impl ApiClient {
         self.panel_json::<PasswordManagerProbe, ()>(
             Method::POST,
             &["v1", "vault", "providers", id, "test"],
+            None,
+        )
+    }
+
+    /// `POST /v1/vault/providers/{id}/sync`: sync credentials from the
+    /// configured password manager on the server.
+    pub fn sync_vault_provider(&self, id: &str) -> Result<VaultProviderSyncResponse, ApiError> {
+        self.panel_json::<VaultProviderSyncResponse, ()>(
+            Method::POST,
+            &["v1", "vault", "providers", id, "sync"],
             None,
         )
     }

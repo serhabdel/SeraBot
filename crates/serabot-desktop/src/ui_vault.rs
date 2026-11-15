@@ -74,6 +74,12 @@ pub fn VaultPage(session: Signal<Session>) -> Element {
     let mut local_query = use_signal(String::new);
     let mut kind_filter = use_signal(|| Option::<VaultKind>::None);
 
+    use_effect(move || {
+        if session.read().panel.has_auto_sync_candidate() {
+            session.write().panel.maybe_auto_sync_providers();
+        }
+    });
+
     let (loaded, loading, error, notice, entries, pending, domain_filter, has_form) = {
         let s = session.read();
         let v = &s.panel.vault;
@@ -891,6 +897,7 @@ fn ProviderCard(session: Signal<Session>, manager: PasswordManager) -> Element {
     let id = manager.id.clone();
     let busy = session.read().panel.vault.provider_busy.as_deref() == Some(id.as_str());
     let testing = session.read().panel.vault.provider_testing.as_deref() == Some(id.as_str());
+    let syncing = session.read().panel.vault.provider_syncing.as_deref() == Some(id.as_str());
     let probe = session.read().panel.vault.provider_tests.get(&id).cloned();
     let filled = !token.read().is_empty();
     let (status_label, status_class) = provider_status_pill(&manager);
@@ -930,7 +937,7 @@ fn ProviderCard(session: Signal<Session>, manager: PasswordManager) -> Element {
                 button {
                     class: "btn primary sm",
                     r#type: "button",
-                    disabled: busy || testing || !filled,
+                    disabled: busy || testing || syncing || !filled,
                     onclick: move |_| {
                         let secret = Zeroizing::new(std::mem::take(&mut *token.write()));
                         if !secret.is_empty() {
@@ -943,7 +950,7 @@ fn ProviderCard(session: Signal<Session>, manager: PasswordManager) -> Element {
                     button {
                         class: "btn ghost sm",
                         r#type: "button",
-                        disabled: busy || testing,
+                        disabled: busy || testing || syncing,
                         onclick: move |_| confirm_clear.set(true),
                         "Remove"
                     }
@@ -956,7 +963,7 @@ fn ProviderCard(session: Signal<Session>, manager: PasswordManager) -> Element {
                     button {
                         class: "btn danger sm",
                         r#type: "button",
-                        disabled: busy || testing,
+                        disabled: busy || testing || syncing,
                         onclick: move |_| {
                             confirm_clear.set(false);
                             session.write().panel.clear_password_manager(&clear_id);
@@ -966,7 +973,7 @@ fn ProviderCard(session: Signal<Session>, manager: PasswordManager) -> Element {
                     button {
                         class: "btn ghost sm",
                         r#type: "button",
-                        disabled: busy || testing,
+                        disabled: busy || testing || syncing,
                         onclick: move |_| confirm_clear.set(false),
                         "Keep"
                     }
@@ -975,22 +982,34 @@ fn ProviderCard(session: Signal<Session>, manager: PasswordManager) -> Element {
 
             div { class: "vault-provider-actions",
                 button {
+                    class: "btn primary sm",
+                    r#type: "button",
+                    title: "Sync credentials from {manager.name} on the server",
+                    disabled: !manager.enabled || !manager.configured || busy || testing || syncing,
+                    onclick: {
+                        let mgr = manager.clone();
+                        move |_| session.write().panel.sync_provider(mgr.clone())
+                    },
+                    Icon { name: "refresh", size: 14 }
+                    if syncing { "Syncing\u{2026}" } else { "Sync from Server" }
+                }
+                button {
                     class: "btn ghost sm",
                     r#type: "button",
                     title: "Check the saved token against the CLI on the server",
-                    disabled: busy || testing,
+                    disabled: busy || testing || syncing,
                     onclick: {
                         let test_id = id.clone();
                         move |_| session.write().panel.test_password_manager(test_id.clone())
                     },
-                    Icon { name: "refresh", size: 14 }
+                    Icon { name: "check", size: 14 }
                     if testing { "Testing\u{2026}" } else { "Test Connection" }
                 }
                 if let Some(source) = source {
                     button {
-                        class: "btn sm",
+                        class: "btn ghost sm",
                         r#type: "button",
-                        disabled: busy || testing,
+                        disabled: busy || testing || syncing,
                         onclick: move |_| session.write().panel.start_import(source),
                         "Import from this PC"
                     }

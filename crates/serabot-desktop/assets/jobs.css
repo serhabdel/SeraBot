@@ -1215,11 +1215,31 @@
 }
 
 /* --- Vault Redesign (.vault-*) --- */
-.vault-hero {
+.vault-page .pane-head {
+  flex-shrink: 0;
+}
+
+.vault-page .pane-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px 32px 40px;
+}
+
+.vault-page .vault-panel {
+  max-width: 960px;
+  width: 100%;
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  margin-bottom: 16px;
+  gap: 14px;
+}
+
+.vault-hero {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+  flex-shrink: 0;
+  margin-bottom: 4px;
 }
 
 .vault-stats {
@@ -1231,12 +1251,67 @@
 .vault-stat-card {
   display: flex;
   flex-direction: column;
+  flex-shrink: 0;
+  min-width: 0;
   gap: 2px;
   padding: 12px 14px;
   border-radius: var(--r-md);
   border: 1px solid var(--hairline);
   background: var(--card-bg);
   box-shadow: var(--shadow-1);
+}
+
+/* --- Browser Chrome & Take-Control Tactile Feedback --- */
+.omnibox-lock {
+  display: inline-flex;
+  align-items: center;
+  color: var(--label-3);
+  flex-shrink: 0;
+}
+
+.omnibox-lock.secure {
+  color: var(--ok);
+}
+
+.dock-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.dock-toolbar .dock-url.editable {
+  flex: 1;
+  min-width: 0;
+}
+
+.dock-autofill-notice {
+  margin-top: 2px;
+}
+
+.dock-click-ripple {
+  position: absolute;
+  width: 28px;
+  height: 28px;
+  margin-left: -14px;
+  margin-top: -14px;
+  border-radius: 50%;
+  border: 2px solid var(--accent);
+  background: var(--accent-soft);
+  pointer-events: none;
+  z-index: 4;
+  animation: dock-click-ring 450ms ease-out forwards;
+}
+
+@keyframes dock-click-ring {
+  from {
+    opacity: 0.95;
+    transform: scale(0.25);
+  }
+
+  to {
+    opacity: 0;
+    transform: scale(1.35);
+  }
 }
 
 .vault-stat-value {
