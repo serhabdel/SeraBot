@@ -6,11 +6,10 @@
 //! worker (`panel.rs`); this file only draws and forwards clicks.
 
 use crate::ui::Icon;
-use crate::ui_widgets::{SecretField, StatusChip};
+use crate::ui_widgets::SecretField;
 use dioxus::prelude::*;
 use serabot_desktop::panel::last_used_label;
 use serabot_desktop::session::Session;
-use serabot_desktop::theme::Tone;
 use serabot_desktop::{
     PasswordManager, PasswordManagerProbe, VaultEntry, VaultKind, VaultPendingSecret, VaultSource,
 };
@@ -32,24 +31,43 @@ fn entry_matches(entry: &VaultEntry, query: &str, kind: Option<VaultKind>) -> bo
             .as_deref()
             .is_some_and(|u| u.to_ascii_lowercase().contains(&needle))
         || entry
+            .reference
+            .as_deref()
+            .is_some_and(|r| r.to_ascii_lowercase().contains(&needle))
+        || entry
             .domains
             .iter()
             .any(|d| d.to_ascii_lowercase().contains(&needle))
         || entry.kind.label().to_ascii_lowercase().contains(&needle)
 }
 
-fn kind_icon(kind: VaultKind) -> &'static str {
+fn kind_badge_label(kind: VaultKind) -> &'static str {
     match kind {
-        VaultKind::Password => "lock",
-        VaultKind::ApiKey => "key",
-        VaultKind::Note => "edit",
+        VaultKind::Password => "\u{1f511} Password",
+        VaultKind::ApiKey => "\u{26a1} API key",
+        VaultKind::Note => "\u{1f4dd} Note",
     }
 }
 
-/// The Vault page: the passwords and keys list, or the add / replace form.
-/// One vault per user, shared by all of that user's bots; the page lists
-/// entries (never a value), adds or replaces one through a form whose value
-/// field is write-only, and deletes after a confirm step.
+/// Summary metrics for the Security Vault hero strip:
+/// `(total_credentials, local_sealed, manager_linked, domain_rules)`.
+fn vault_stats(entries: &[VaultEntry]) -> (usize, usize, usize, usize) {
+    let total = entries.len();
+    let local_sealed = entries
+        .iter()
+        .filter(|e| e.source == VaultSource::Local)
+        .count();
+    let manager_linked = entries.iter().filter(|e| e.source.is_reference()).count();
+    let domain_rules = entries.iter().map(|e| e.domains.len()).sum();
+    (total, local_sealed, manager_linked, domain_rules)
+}
+
+fn kind_count(entries: &[VaultEntry], kind: VaultKind) -> usize {
+    entries.iter().filter(|e| e.kind == kind).count()
+}
+
+/// The Vault page: Security Vault Dashboard with overview stats, password
+/// manager cards, search & filter toolbar, and credential cards.
 #[component]
 pub fn VaultPage(session: Signal<Session>) -> Element {
     let mut session = session;
@@ -78,6 +96,7 @@ pub fn VaultPage(session: Signal<Session>) -> Element {
     let any_filter_active = !domain_filter.trim().is_empty()
         || !local_query.read().trim().is_empty()
         || kind_filter().is_some();
+    let (total_creds, local_sealed, manager_linked, domain_rules) = vault_stats(&entries);
 
     rsx! {
         div {
@@ -91,9 +110,9 @@ pub fn VaultPage(session: Signal<Session>) -> Element {
             },
             div { class: "pane-head",
                 div {
-                    h1 { class: "pane-title", "Vault" }
+                    h1 { class: "pane-title", "Security Vault" }
                     p { class: "muted",
-                        "Passwords and keys your bots can use. They never see the values."
+                        "Passwords and keys your bots can use. Values are write-only and never exposed."
                     }
                 }
                 if !has_form && loaded {
@@ -102,7 +121,7 @@ pub fn VaultPage(session: Signal<Session>) -> Element {
                         r#type: "button",
                         onclick: move |_| session.write().panel.open_add_form(),
                         Icon { name: "plus", size: 15 }
-                        "Add"
+                        "Add credential"
                     }
                 }
             }
@@ -120,16 +139,41 @@ pub fn VaultPage(session: Signal<Session>) -> Element {
                                 span { "{message}" }
                             }
                         }
+
+                        // Security Overview Hero / Stats Strip
+                        div { class: "vault-hero", role: "region", "aria-label": "Vault overview",
+                            div { class: "vault-stat-card",
+                                span { class: "vault-stat-value", "{total_creds}" }
+                                span { class: "vault-stat-label", "Total Credentials" }
+                                span { class: "vault-stat-sub", "Across all sources" }
+                            }
+                            div { class: "vault-stat-card",
+                                span { class: "vault-stat-value", "{local_sealed}" }
+                                span { class: "vault-stat-label", "Local Sealed" }
+                                span { class: "vault-stat-sub", "AES-256 envelope" }
+                            }
+                            div { class: "vault-stat-card",
+                                span { class: "vault-stat-value", "{manager_linked}" }
+                                span { class: "vault-stat-label", "Manager Linked" }
+                                span { class: "vault-stat-sub", "1Password & Proton Pass" }
+                            }
+                            div { class: "vault-stat-card",
+                                span { class: "vault-stat-value", "{domain_rules}" }
+                                span { class: "vault-stat-label", "Domain Rules" }
+                                span { class: "vault-stat-sub", "Host allowlists" }
+                            }
+                        }
+
                         PasswordManagersPanel { session }
+
                         if loaded || !entries.is_empty() || !pending.is_empty() {
-                            div { class: "vault-filter",
-                                label { class: "field-label", r#for: "vault-domain-filter", "Search & filter" }
+                            div { class: "vault-toolbar",
                                 div { class: "vault-filter-row",
                                     input {
                                         class: "input",
                                         r#type: "search",
                                         value: "{local_query}",
-                                        placeholder: "Search name, user, or site\u{2026}",
+                                        placeholder: "Search name, user, reference, or site\u{2026}",
                                         "aria-label": "Search saved entries",
                                         oninput: move |event| local_query.set(event.value()),
                                     }
@@ -155,7 +199,7 @@ pub fn VaultPage(session: Signal<Session>) -> Element {
                                         r#type: "button",
                                         disabled: loading,
                                         onclick: move |_| session.write().panel.apply_vault_domain_filter(),
-                                        "Apply site"
+                                        "Apply"
                                     }
                                     if any_filter_active {
                                         button {
@@ -187,7 +231,7 @@ pub fn VaultPage(session: Signal<Session>) -> Element {
                                             class: if kind_filter() == Some(option) { "seg-btn active" } else { "seg-btn" },
                                             r#type: "button",
                                             onclick: move |_| kind_filter.set(Some(option)),
-                                            "{option.label()}"
+                                            "{option.label()} ({kind_count(&entries, option)})"
                                         }
                                     }
                                 }
@@ -196,7 +240,7 @@ pub fn VaultPage(session: Signal<Session>) -> Element {
                         if !pending.is_empty() {
                             section { class: "vault-pending", "aria-label": "Waiting in chat",
                                 h3 { class: "vault-form-title", "Waiting in chat" }
-                                ul { class: "vault-list", role: "list",
+                                div { class: "vault-entry-grid", role: "list",
                                     for item in pending.iter() {
                                         VaultPendingRow { key: "{item.card_id}", item: item.clone() }
                                     }
@@ -204,7 +248,7 @@ pub fn VaultPage(session: Signal<Session>) -> Element {
                             }
                         }
                         if loading && !loaded {
-                            div { class: "vault-list", "aria-busy": "true",
+                            div { class: "vault-entry-grid", "aria-busy": "true",
                                 div { class: "skeleton row", " " }
                                 div { class: "skeleton row", " " }
                             }
@@ -241,12 +285,11 @@ pub fn VaultPage(session: Signal<Session>) -> Element {
                                         class: "btn primary",
                                         r#type: "button",
                                         onclick: move |_| session.write().panel.open_add_form(),
-                                        "Add"
+                                        "Add credential"
                                     }
                                 }
                             }
                         } else if !loaded {
-                            // The first load failed: say so, offer a retry.
                             div { class: "vault-empty",
                                 p { class: "empty-text", "Could not load your vault entries." }
                                 button {
@@ -257,9 +300,9 @@ pub fn VaultPage(session: Signal<Session>) -> Element {
                                 }
                             }
                         } else {
-                            ul { class: "vault-list", role: "list",
+                            div { class: "vault-entry-grid", role: "list",
                                 for entry in filtered_entries {
-                                    VaultRow { key: "{entry.name}", session, entry }
+                                    VaultEntryCard { key: "{entry.name}", session, entry }
                                 }
                             }
                         }
@@ -272,23 +315,25 @@ pub fn VaultPage(session: Signal<Session>) -> Element {
 
 #[component]
 fn VaultPendingRow(item: VaultPendingSecret) -> Element {
-    let meta = [item.kind.label().to_owned(), "card".to_owned()];
-    let meta = meta.join(" \u{b7} ");
     rsx! {
-        li { class: "vault-row vault-row-pending",
-            span { class: "vault-kind", title: "{item.kind.label()}",
-                Icon { name: "lock", size: 15 }
-            }
-            div { class: "vault-row-main",
+        div { class: "vault-entry-card vault-row-pending", role: "listitem",
+            div { class: "vault-entry-head",
                 strong { class: "vault-name", "{item.name}" }
-                span { class: "vault-meta caption", "{meta}" }
-                if !item.domains.is_empty() {
-                    div { class: "vault-chips",
-                        for domain in item.domains.iter() {
-                            span { key: "{domain}", class: "chip mono", "{domain}" }
-                        }
+                div { class: "vault-entry-badges",
+                    span { class: "vault-kind-badge", "{kind_badge_label(item.kind)}" }
+                    span { class: "vault-source-badge", "Pending card" }
+                }
+            }
+            if !item.domains.is_empty() {
+                div { class: "vault-chips",
+                    for domain in item.domains.iter() {
+                        span { key: "{domain}", class: "vault-domain-pill mono", "{domain}" }
                     }
                 }
+            } else {
+                span { class: "vault-domain-pill warn", "Any domain" }
+            }
+            div { class: "vault-entry-foot",
                 span { class: "vault-used tiny", "Finish the card in chat" }
             }
         }
@@ -296,8 +341,9 @@ fn VaultPendingRow(item: VaultPendingSecret) -> Element {
 }
 
 #[component]
-fn VaultRow(session: Signal<Session>, entry: VaultEntry) -> Element {
+fn VaultEntryCard(session: Signal<Session>, entry: VaultEntry) -> Element {
     let mut session = session;
+    let mut copied_ref = use_signal(|| false);
     let (confirming, deleting) = {
         let s = session.read();
         (
@@ -305,66 +351,113 @@ fn VaultRow(session: Signal<Session>, entry: VaultEntry) -> Element {
             s.panel.vault.deleting.as_deref() == Some(entry.name.as_str()),
         )
     };
-    let mut meta = vec![entry.kind.label().to_owned()];
-    if entry.source.is_reference() {
-        meta.push(entry.source.label().to_owned());
-    }
-    if let Some(user) = entry.username.as_deref().filter(|u| !u.is_empty()) {
-        meta.push(user.to_owned());
-    }
-    let meta = meta.join(" \u{b7} ");
     let used = last_used_label(entry.last_used_at.as_deref());
     let name = entry.name.clone();
     let name_replace = entry.name.clone();
     let name_delete = entry.name.clone();
+    let source_label = entry.source.label();
     rsx! {
-        li { class: if deleting { "vault-row busy" } else { "vault-row" },
-            span { class: "vault-kind", title: "{entry.kind.label()}",
-                Icon { name: kind_icon(entry.kind), size: 15 }
-            }
-            div { class: "vault-row-main",
+        div {
+            class: if deleting { "vault-entry-card busy" } else { "vault-entry-card" },
+            role: "listitem",
+            div { class: "vault-entry-head",
                 strong { class: "vault-name", "{name}" }
-                span { class: "vault-meta caption", "{meta}" }
-                if !entry.domains.is_empty() {
-                    div { class: "vault-chips",
-                        for domain in entry.domains.iter() {
-                            span { key: "{domain}", class: "chip mono", "{domain}" }
+                div { class: "vault-entry-badges",
+                    span { class: "vault-kind-badge", "{kind_badge_label(entry.kind)}" }
+                    span { class: "vault-source-badge", "{source_label}" }
+                }
+            }
+
+            if let Some(user) = entry.username.as_deref().filter(|u| !u.is_empty()) {
+                div { class: "vault-chips",
+                    span { class: "vault-user-chip",
+                        Icon { name: "user", size: 12 }
+                        "{user}"
+                    }
+                }
+            }
+
+            if let Some(reference) = entry.reference.as_deref().filter(|r| !r.is_empty()) {
+                {
+                    let ref_copy = reference.to_owned();
+                    rsx! {
+                        button {
+                            class: "vault-ref-chip mono",
+                            r#type: "button",
+                            title: "Copy reference path",
+                            onclick: move |_| {
+                                let text = ref_copy.clone();
+                                copied_ref.set(true);
+                                #[cfg(target_os = "windows")]
+                                {
+                                    let _ = std::process::Command::new("cmd")
+                                        .args(["/C", &format!("echo|set /p={text}|clip")])
+                                        .spawn();
+                                }
+                            },
+                            Icon { name: if copied_ref() { "check" } else { "link" }, size: 12 }
+                            span { "{reference}" }
                         }
                     }
                 }
-                span { class: "vault-used tiny", "{used}" }
+            } else {
+                div { class: "vault-secret-preview", "aria-label": "Secret stored encrypted",
+                    Icon { name: "lock", size: 12 }
+                    span { class: "mono", "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}" }
+                }
             }
-            if confirming {
-                div { class: "vault-confirm", role: "group", "aria-label": "Confirm delete",
-                    span { class: "caption", "Delete?" }
-                    button {
-                        class: "btn danger sm",
-                        onclick: move |_| session.write().panel.confirm_delete(),
-                        "Delete"
+
+            div { class: "vault-chips",
+                if entry.domains.is_empty() {
+                    span { class: "vault-domain-pill warn", title: "Not restricted to specific hosts",
+                        "Any domain"
                     }
-                    button {
-                        class: "btn ghost sm",
-                        onclick: move |_| session.write().panel.cancel_delete(),
-                        "Cancel"
+                } else {
+                    for domain in entry.domains.iter() {
+                        span { key: "{domain}", class: "vault-domain-pill mono", "{domain}" }
                     }
                 }
-            } else {
-                div { class: "vault-actions",
-                    button {
-                        class: "icon-btn",
-                        title: "Edit",
-                        "aria-label": "Edit {name_replace}",
-                        disabled: deleting,
-                        onclick: move |_| session.write().panel.open_replace_form(&name_replace),
-                        Icon { name: "edit", size: 15 }
+            }
+
+            div { class: "vault-entry-foot",
+                span { class: "vault-used tiny", "{used}" }
+                if confirming {
+                    div { class: "vault-confirm", role: "group", "aria-label": "Confirm delete",
+                        span { class: "caption", "Delete?" }
+                        button {
+                            class: "btn danger sm",
+                            r#type: "button",
+                            onclick: move |_| session.write().panel.confirm_delete(),
+                            "Delete"
+                        }
+                        button {
+                            class: "btn ghost sm",
+                            r#type: "button",
+                            onclick: move |_| session.write().panel.cancel_delete(),
+                            "Cancel"
+                        }
                     }
-                    button {
-                        class: "icon-btn",
-                        title: "Delete",
-                        "aria-label": "Delete {name_delete}",
-                        disabled: deleting,
-                        onclick: move |_| session.write().panel.ask_delete(&name_delete),
-                        Icon { name: "trash", size: 15 }
+                } else {
+                    div { class: "vault-actions",
+                        button {
+                            class: "btn ghost sm",
+                            r#type: "button",
+                            title: "Edit",
+                            "aria-label": "Edit {name_replace}",
+                            disabled: deleting,
+                            onclick: move |_| session.write().panel.open_replace_form(&name_replace),
+                            Icon { name: "edit", size: 13 }
+                            "Edit"
+                        }
+                        button {
+                            class: "icon-btn",
+                            r#type: "button",
+                            title: "Delete",
+                            "aria-label": "Delete {name_delete}",
+                            disabled: deleting,
+                            onclick: move |_| session.write().panel.ask_delete(&name_delete),
+                            Icon { name: "trash", size: 14 }
+                        }
                     }
                 }
             }
@@ -433,7 +526,7 @@ fn VaultFormView(session: Signal<Session>) -> Element {
         VaultKind::Note => "Note text",
     };
     let title = if replacing {
-        "Edit saved item"
+        "Edit saved credential"
     } else {
         "Add a password or key"
     };
@@ -565,31 +658,31 @@ fn VaultFormView(session: Signal<Session>) -> Element {
                         }
                     }
                 } else {
-                div { class: "field",
-                    label { class: "field-label", r#for: "vault-value", "{value_label}" }
-                    input {
-                        id: "vault-value",
-                        class: "input",
-                        r#type: "password",
-                        autocomplete: "new-password",
-                        spellcheck: false,
-                        placeholder: if replacing { "Enter the new value" } else { "Stored encrypted, never shown again" },
-                        oninput: move |event| {
-                            if let Some(form) = session.write().panel.vault.form.as_mut() {
-                                let typed = event.value();
-                                (*form.value).zeroize();
-                                form.value.push_str(&typed);
+                    div { class: "field",
+                        label { class: "field-label", r#for: "vault-value", "{value_label}" }
+                        input {
+                            id: "vault-value",
+                            class: "input",
+                            r#type: "password",
+                            autocomplete: "new-password",
+                            spellcheck: false,
+                            placeholder: if replacing { "Enter the new value" } else { "Stored encrypted, never shown again" },
+                            oninput: move |event| {
+                                if let Some(form) = session.write().panel.vault.form.as_mut() {
+                                    let typed = event.value();
+                                    (*form.value).zeroize();
+                                    form.value.push_str(&typed);
+                                }
+                            },
+                        }
+                        span { class: "tiny vault-hint",
+                            if replacing {
+                                "Saved securely. You can't view it again, so enter the new one."
+                            } else {
+                                "Saved securely. You can't view it again."
                             }
-                        },
-                    }
-                    span { class: "tiny vault-hint",
-                        if replacing {
-                            "Saved securely. You can't view it again, so enter the new one."
-                        } else {
-                            "Saved securely. You can't view it again."
                         }
                     }
-                }
                 }
                 div { class: "field",
                     label { class: "field-label", r#for: "vault-domains", "Websites" }
@@ -718,89 +811,64 @@ fn source_of(id: &str) -> Option<VaultSource> {
     }
 }
 
-fn entry_count_for(source: VaultSource, entries: &[VaultEntry]) -> usize {
-    entries
-        .iter()
-        .filter(|entry| entry.source == source)
-        .count()
-}
-
-/// Short connection status for the Connected vaults summary. Never a token.
-fn provider_status_label(manager: &PasswordManager) -> &'static str {
+/// Clear status pill label + modifier class matching server report.
+fn provider_status_pill(manager: &PasswordManager) -> (&'static str, &'static str) {
     if !manager.enabled {
-        "off on this server"
+        ("Off on this server", "vault-provider-status off")
     } else if manager.configured && manager.cli_found {
-        "ready"
+        ("Connected", "vault-provider-status ok")
     } else if manager.configured {
-        "token saved · CLI missing"
+        ("Token saved", "vault-provider-status warn")
     } else if manager.cli_found {
-        "CLI found · no token"
+        ("CLI ready · no token", "vault-provider-status warn")
     } else {
-        "not connected"
+        ("CLI not installed", "vault-provider-status off")
     }
 }
 
-fn entries_label(count: usize) -> String {
-    match count {
-        0 => "no entries".to_owned(),
-        1 => "1 entry".to_owned(),
-        n => format!("{n} entries"),
+fn provider_token_hint(id: &str) -> &'static str {
+    match id {
+        "onepassword" => "OP_SERVICE_ACCOUNT_TOKEN",
+        "protonpass" => "PROTON_PASS_PERSONAL_ACCESS_TOKEN",
+        _ => "Access token",
     }
 }
 
-/// Password managers (0.23): each one's token and CLI status, and an import
-/// from this PC. A token is write-only, like a vault value: it is sent and
-/// never shown again. Requests run on the panel worker.
+fn provider_ref_snippet(id: &str) -> &'static str {
+    match id {
+        "protonpass" => "pass://Vault/Item/field",
+        _ => "op://Vault/Item/field",
+    }
+}
+
+/// Password managers (0.23): side-by-side cards for 1Password and Proton Pass.
 #[component]
 fn PasswordManagersPanel(session: Signal<Session>) -> Element {
-    let (
-        loaded,
-        vault_loaded,
-        entries,
-        providers,
-        tests,
-        error,
-        importing,
-        import_error,
-        picker_open,
-    ) = {
+    let (loaded, providers, error, importing, import_error, picker_open) = {
         let s = session.read();
         let v = &s.panel.vault;
         (
             v.providers_loaded,
-            v.loaded,
-            v.entries.clone(),
             v.providers.clone(),
-            v.provider_tests.clone(),
             v.provider_error.clone(),
             v.import_loading,
             v.import_error.clone(),
             v.import.is_some(),
         )
     };
-    let local_count = vault_loaded.then(|| entry_count_for(VaultSource::Local, &entries));
     rsx! {
         section { class: "vault-providers", "aria-label": "Password managers",
-            h2 { class: "vault-section-title", "Password managers" }
-            p { class: "tiny vault-hint",
-                "Use a login from 1Password or Proton Pass without copying it. The password stays in your manager and is read only when a bot types it."
-            }
-            if loaded || vault_loaded {
-                ConnectedVaultsSummary {
-                    providers: providers.clone(),
-                    tests: tests.clone(),
-                    entries: if vault_loaded { Some(entries.clone()) } else { None },
-                    local_count,
-                }
-            }
             if let Some(message) = error {
                 div { class: "error-text tiny", role: "alert", "{message}" }
             }
             if !loaded {
                 span { class: "caption", "Checking password managers\u{2026}" }
-            }
-            for manager in providers {
-                ProviderRow { key: "{manager.id}", session, manager }
+            } else if !providers.is_empty() {
+                div { class: "vault-provider-grid",
+                    for manager in providers {
+                        ProviderCard { key: "{manager.id}", session, manager }
+                    }
+                }
             }
             if let Some(source) = importing {
                 span { class: "caption", "Reading the logins from {source.label()}\u{2026}" }
@@ -815,105 +883,8 @@ fn PasswordManagersPanel(session: Signal<Session>) -> Element {
     }
 }
 
-/// Providers status, last Test result, and entry counts — never a token or value.
 #[component]
-fn ConnectedVaultsSummary(
-    providers: Vec<PasswordManager>,
-    tests: std::collections::BTreeMap<String, PasswordManagerProbe>,
-    entries: Option<Vec<VaultEntry>>,
-    local_count: Option<usize>,
-) -> Element {
-    rsx! {
-        div { class: "vault-connected", role: "status", "aria-label": "Connected vaults",
-            h3 { class: "vault-connected-title", "Connected vaults" }
-            ul { class: "vault-connected-list",
-                if let Some(count) = local_count {
-                    li { class: "vault-connected-row",
-                        span { class: "vault-connected-name", "Stored here" }
-                        span { class: "chip", "{entries_label(count)}" }
-                    }
-                }
-                for manager in providers {
-                    ConnectedProviderStatus {
-                        key: "{manager.id}",
-                        manager: manager.clone(),
-                        probe: tests.get(&manager.id).cloned(),
-                        entry_count: entries.as_ref().and_then(|list| {
-                            source_of(&manager.id).map(|source| entry_count_for(source, list))
-                        }),
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[component]
-fn ConnectedProviderStatus(
-    manager: PasswordManager,
-    probe: Option<PasswordManagerProbe>,
-    entry_count: Option<usize>,
-) -> Element {
-    let status = provider_status_label(&manager);
-    let chip = if !manager.enabled {
-        "chip muted"
-    } else if manager.configured && manager.cli_found {
-        "chip ok"
-    } else if manager.configured || manager.cli_found {
-        "chip warn"
-    } else {
-        "chip muted"
-    };
-    rsx! {
-        li { class: "vault-connected-row",
-            span { class: "vault-connected-name", "{manager.name}" }
-            span { class: "{chip}", "{status}" }
-            if let Some(count) = entry_count {
-                span { class: "chip", "{entries_label(count)}" }
-            }
-            if let Some(probe) = probe {
-                ProbeResult { probe, prefix: "Last test".to_owned() }
-            }
-        }
-    }
-}
-
-/// The Test result as a status chip (passed or failed) with the server's
-/// short message beside it. Never shows a token or a value.
-#[component]
-fn ProbeResult(probe: PasswordManagerProbe, #[props(default)] prefix: String) -> Element {
-    let (tone, text) = if probe.ok {
-        (Tone::Ok, "Test passed")
-    } else {
-        (Tone::Danger, "Test failed")
-    };
-    let cli = if probe.cli_found {
-        "CLI found"
-    } else {
-        "CLI not found"
-    };
-    let token = if probe.configured {
-        "Token saved"
-    } else {
-        "No token"
-    };
-    rsx! {
-        div { class: "health-status", role: "status",
-            if !prefix.is_empty() {
-                span { class: "tiny", "{prefix}:" }
-            }
-            StatusChip { tone, text: text.to_owned() }
-            span { class: "chip muted status-chip", "{cli}" }
-            span { class: "chip muted status-chip", "{token}" }
-            if !probe.message.is_empty() {
-                span { class: "tiny", "{probe.message}" }
-            }
-        }
-    }
-}
-
-#[component]
-fn ProviderRow(session: Signal<Session>, manager: PasswordManager) -> Element {
+fn ProviderCard(session: Signal<Session>, manager: PasswordManager) -> Element {
     let mut session = session;
     let mut token = use_signal(String::new);
     let mut confirm_clear = use_signal(|| false);
@@ -922,53 +893,45 @@ fn ProviderRow(session: Signal<Session>, manager: PasswordManager) -> Element {
     let testing = session.read().panel.vault.provider_testing.as_deref() == Some(id.as_str());
     let probe = session.read().panel.vault.provider_tests.get(&id).cloned();
     let filled = !token.read().is_empty();
-    let token_line = if manager.configured {
-        "Access token saved on this server"
-    } else {
-        "No access token saved"
-    };
-    let cli_line = if !manager.enabled {
-        format!(
-            "Off on this server: ask your admin to enable {} in [vault].",
-            manager.name
-        )
-    } else if manager.cli_found {
-        "CLI found on this server".to_owned()
-    } else {
-        format!(
-            "CLI not installed on this server. Install it from {}",
-            manager.install_url
-        )
-    };
+    let (status_label, status_class) = provider_status_pill(&manager);
+    let token_hint = provider_token_hint(&manager.id);
+    let ref_snippet = provider_ref_snippet(&manager.id);
     let save_id = manager.id.clone();
     let clear_id = manager.id.clone();
     let source = source_of(&manager.id);
     let input_label = format!("{} access token", manager.name);
     rsx! {
-        div { class: "vault-provider-row",
-            div { class: "vault-row-main",
-                strong { class: "vault-name", "{manager.name}" }
-                span { class: "caption", "{token_line}" }
-                span { class: "tiny vault-hint", "{cli_line}" }
+        div { class: "vault-provider-card",
+            div { class: "vault-provider-head",
+                div { class: "vault-provider-brand",
+                    span { class: "vault-provider-icon", "aria-hidden": "true",
+                        Icon { name: if manager.id == "onepassword" { "lock" } else { "key" }, size: 16 }
+                    }
+                    div {
+                        strong { class: "vault-name", "{manager.name}" }
+                        span { class: "vault-provider-sub mono", "{token_hint}" }
+                    }
+                }
+                span { class: "{status_class}", "{status_label}" }
             }
+
             div { class: "vault-provider-token",
                 SecretField {
                     value: token,
                     label: input_label.clone(),
-                    placeholder: "Access token".to_owned(),
+                    placeholder: "Paste token (write-only)".to_owned(),
                 }
                 button {
                     class: "btn primary sm",
                     r#type: "button",
                     disabled: busy || testing || !filled,
                     onclick: move |_| {
-                        // Move the token out of the signal: nothing is left behind.
                         let secret = Zeroizing::new(std::mem::take(&mut *token.write()));
                         if !secret.is_empty() {
                             session.write().panel.save_password_manager(save_id.clone(), secret);
                         }
                     },
-                    "Save token"
+                    "Save"
                 }
                 if manager.configured && !confirm_clear() {
                     button {
@@ -980,6 +943,7 @@ fn ProviderRow(session: Signal<Session>, manager: PasswordManager) -> Element {
                     }
                 }
             }
+
             if manager.configured && confirm_clear() {
                 div { class: "vault-confirm", role: "alertdialog", "aria-label": "Remove {manager.name} token?",
                     span { class: "caption", "Remove the saved {manager.name} token?" }
@@ -1002,9 +966,11 @@ fn ProviderRow(session: Signal<Session>, manager: PasswordManager) -> Element {
                     }
                 }
             }
+
             div { class: "vault-provider-actions",
                 button {
                     class: "btn ghost sm",
+                    r#type: "button",
                     title: "Check the saved token against the CLI on the server",
                     disabled: busy || testing,
                     onclick: {
@@ -1012,19 +978,45 @@ fn ProviderRow(session: Signal<Session>, manager: PasswordManager) -> Element {
                         move |_| session.write().panel.test_password_manager(test_id.clone())
                     },
                     Icon { name: "refresh", size: 14 }
-                    if testing { "Testing\u{2026}" } else { "Test" }
+                    if testing { "Testing\u{2026}" } else { "Test Connection" }
                 }
                 if let Some(source) = source {
                     button {
                         class: "btn sm",
+                        r#type: "button",
                         disabled: busy || testing,
                         onclick: move |_| session.write().panel.start_import(source),
                         "Import from this PC"
                     }
                 }
             }
+
             if let Some(probe) = probe {
-                ProbeResult { probe }
+                ProbeBanner { probe }
+            }
+
+            details { class: "vault-provider-snippet",
+                summary { "Reference format" }
+                code { class: "mono tiny", "{ref_snippet}" }
+            }
+        }
+    }
+}
+
+#[component]
+fn ProbeBanner(probe: PasswordManagerProbe) -> Element {
+    let banner_class = if probe.ok {
+        "vault-probe-banner ok"
+    } else {
+        "vault-probe-banner err"
+    };
+    let headline = if probe.ok { "Connection verified" } else { "Connection check failed" };
+    rsx! {
+        div { class: "{banner_class}", role: "status",
+            Icon { name: if probe.ok { "check" } else { "x" }, size: 13 }
+            span { strong { "{headline}" } }
+            if !probe.message.is_empty() {
+                span { class: "tiny", " — {probe.message}" }
             }
         }
     }
@@ -1198,25 +1190,41 @@ fn ImportPickerView(session: Signal<Session>) -> Element {
 mod tests {
     use super::*;
 
-    #[test]
-    fn entry_matches_checks_name_username_domain_and_kind() {
-        let entry = VaultEntry {
-            name: "stripe-key".into(),
-            kind: VaultKind::ApiKey,
-            source: VaultSource::Local,
-            reference: None,
+    fn sample_entry(name: &str, kind: VaultKind, source: VaultSource, domains: Vec<&str>) -> VaultEntry {
+        VaultEntry {
+            name: name.into(),
+            kind,
+            source,
+            reference: source.is_reference().then(|| "op://Work/Item/pw".into()),
             username: Some("billing@acme.test".into()),
-            domains: vec!["api.stripe.com".into()],
+            domains: domains.into_iter().map(String::from).collect(),
             note: None,
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             last_used_at: None,
-        };
+        }
+    }
+
+    #[test]
+    fn entry_matches_checks_name_username_domain_and_kind() {
+        let entry = sample_entry("stripe-key", VaultKind::ApiKey, VaultSource::Local, vec!["api.stripe.com"]);
         assert!(entry_matches(&entry, "", None));
         assert!(entry_matches(&entry, "stripe", Some(VaultKind::ApiKey)));
         assert!(entry_matches(&entry, "billing@", None));
         assert!(entry_matches(&entry, "api.stripe", None));
         assert!(!entry_matches(&entry, "stripe", Some(VaultKind::Password)));
         assert!(!entry_matches(&entry, "github", None));
+    }
+
+    #[test]
+    fn vault_stats_counts_sources_and_domain_rules() {
+        let entries = vec![
+            sample_entry("a", VaultKind::Password, VaultSource::Local, vec!["a.com", "b.com"]),
+            sample_entry("b", VaultKind::Password, VaultSource::OnePassword, vec!["c.com"]),
+            sample_entry("c", VaultKind::Note, VaultSource::Local, vec![]),
+        ];
+        assert_eq!(vault_stats(&entries), (3, 2, 1, 3));
+        assert_eq!(kind_count(&entries, VaultKind::Password), 2);
+        assert_eq!(kind_count(&entries, VaultKind::Note), 1);
     }
 }
