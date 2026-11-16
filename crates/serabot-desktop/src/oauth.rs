@@ -146,12 +146,33 @@ pub fn wait_for_callback_at(
     callback_path: &str,
     timeout: Duration,
 ) -> Result<Zeroizing<String>, OAuthError> {
+    wait_for_callback_cancellable(
+        listener,
+        expected_state,
+        callback_path,
+        timeout,
+        &AtomicBool::new(false),
+    )
+}
+
+/// Like [`wait_for_callback_at`], and the wait also ends when `cancel` is set,
+/// so a sign-in the member backed out of closes its listener at once.
+pub fn wait_for_callback_cancellable(
+    listener: &TcpListener,
+    expected_state: &str,
+    callback_path: &str,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> Result<Zeroizing<String>, OAuthError> {
     listener
         .set_nonblocking(true)
         .map_err(|_| OAuthError::Listen)?;
     let deadline = Instant::now() + timeout;
     let mut ignored = 0usize;
     loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(OAuthError::Cancelled);
+        }
         match listener.accept() {
             Ok((stream, _)) => {
                 if let Some(result) = handle_connection(stream, expected_state, callback_path) {
@@ -658,6 +679,20 @@ mod tests {
             matches!(result, Err(OAuthError::TooManyRequests)),
             "{result:?}"
         );
+    }
+
+    #[test]
+    fn a_provider_callback_wait_can_be_cancelled() {
+        let (listener, _port) = bind_loopback().unwrap();
+        let cancel = AtomicBool::new(true);
+        let result = wait_for_callback_cancellable(
+            &listener,
+            "expected-state",
+            CALLBACK_PATH,
+            Duration::from_secs(5),
+            &cancel,
+        );
+        assert!(matches!(result, Err(OAuthError::Cancelled)), "{result:?}");
     }
 
     #[test]

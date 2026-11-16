@@ -1,0 +1,391 @@
+/* Provider accounts, the Add account sheet, the bot route editor and the
+   composer's route chip (v0.49). Colours and timing come from the shared
+   tokens. Every transition is off when the system asks for reduced motion or
+   the console's own motion switch is set to reduce. */
+
+.acct-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.acct-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.acct-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.acct-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 4px 12px;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  transition: border-color var(--dur-2) var(--ease), background var(--dur-2) var(--ease),
+    opacity var(--dur-2) var(--ease);
+}
+
+.acct-row.is-off {
+  opacity: 0.62;
+}
+
+.acct-row.needs-attention {
+  border-color: var(--danger);
+}
+
+.acct-row.is-busy {
+  border-color: var(--accent);
+}
+
+.acct-order {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.acct-rank {
+  font-size: var(--fs-micro);
+  color: var(--label-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.acct-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.acct-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-weight: 600;
+  color: var(--label-1);
+}
+
+.acct-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.acct-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  color: var(--label-3);
+  font-size: var(--fs-caption);
+}
+
+.acct-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.acct-quota {
+  grid-column: 2 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.acct-quota .meter-fill {
+  transition: width var(--dur-3) var(--ease), background var(--dur-2) var(--ease);
+}
+
+.acct-quota-text {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: var(--fs-micro);
+  color: var(--label-3);
+}
+
+.acct-hint {
+  grid-column: 2 / -1;
+  margin: 0;
+  font-size: var(--fs-caption);
+  color: var(--label-3);
+}
+
+.acct-confirm {
+  grid-column: 1 / -1;
+}
+
+.acct-empty {
+  padding: 12px;
+  border: 1px dashed var(--hairline-strong);
+  border-radius: var(--r-md);
+  color: var(--label-3);
+  font-size: var(--fs-caption);
+}
+
+/* The Add account sheet: a method switch and a calm sign-in panel. */
+.method-seg {
+  margin-bottom: 12px;
+}
+
+.flow-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+}
+
+.flow-panel.is-ok {
+  border-color: var(--ok);
+}
+
+.flow-panel.is-bad {
+  border-color: var(--danger);
+}
+
+.flow-title {
+  margin: 0;
+  font-size: var(--fs-title);
+  font-weight: 600;
+  color: var(--label-1);
+}
+
+.device-code {
+  align-self: flex-start;
+  padding: 10px 16px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--hairline-strong);
+  background: var(--surface);
+  font-family: var(--font-mono);
+  font-size: 28px;
+  letter-spacing: 0.12em;
+  color: var(--label-1);
+  user-select: all;
+}
+
+.flow-count {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: var(--fs-caption);
+  color: var(--label-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.flow-bar {
+  flex: 1;
+  height: 4px;
+  border-radius: var(--r-pill);
+  background: var(--hairline);
+  overflow: hidden;
+}
+
+.flow-bar-fill {
+  height: 100%;
+  border-radius: var(--r-pill);
+  background: var(--accent);
+  transition: width 1s linear;
+}
+
+.flow-wait {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+}
+
+.flow-wait-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent-ink);
+  animation: jump-live-pulse 1.2s ease-in-out infinite;
+}
+
+.flow-link {
+  font-family: var(--font-mono);
+  font-size: var(--fs-micro);
+  color: var(--label-3);
+  word-break: break-all;
+  user-select: all;
+}
+
+.risk-banner {
+  margin-bottom: 12px;
+}
+
+/* The bot "Model route" editor. */
+.route-block {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+}
+
+.route-slot {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  transition: border-color var(--dur-2) var(--ease);
+}
+
+.route-slot.has-error {
+  border-color: var(--danger);
+}
+
+.route-slot-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: var(--fs-caption);
+  font-weight: 600;
+  color: var(--label-2);
+}
+
+.route-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.route-grid .field {
+  min-width: 0;
+}
+
+.route-effective {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: var(--fs-caption);
+  color: var(--label-2);
+}
+
+.route-consent {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: var(--fs-caption);
+  color: var(--label-2);
+}
+
+.route-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* The composer's route chip: one calm control, a thinking segmented control. */
+.route-chip {
+  max-width: 340px;
+}
+
+.route-chip span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.thinking-seg {
+  flex: none;
+}
+
+.thinking-seg .seg-btn {
+  padding: 3px 8px;
+  white-space: nowrap;
+}
+
+.pick-accounts {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 4px 12px 8px;
+}
+
+.pick-accounts .seg-btn {
+  flex: none;
+}
+
+/* A route switch in the transcript: quiet, centred, never louder than a message. */
+.route-switch {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin: 8px auto;
+  padding: 4px 12px;
+  width: fit-content;
+  max-width: 100%;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  border: 1px solid var(--hairline);
+  color: var(--label-3);
+  font-size: var(--fs-caption);
+  animation: fade-in var(--dur-2) var(--ease);
+}
+
+.fallback-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .acct-row,
+  .acct-quota .meter-fill,
+  .route-slot,
+  .flow-bar-fill {
+    transition: none;
+  }
+
+  .flow-wait-dot,
+  .route-switch {
+    animation: none;
+  }
+}
+
+.root[data-motion="reduce"] .acct-row,
+.root[data-motion="reduce"] .acct-quota .meter-fill,
+.root[data-motion="reduce"] .route-slot,
+.root[data-motion="reduce"] .flow-bar-fill {
+  transition: none;
+}
+
+.root[data-motion="reduce"] .flow-wait-dot,
+.root[data-motion="reduce"] .route-switch {
+  animation: none;
+}

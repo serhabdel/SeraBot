@@ -93,6 +93,9 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
                 Overlay::AddProvider => rsx! {
                     AddProviderSheet { session, overlay }
                 },
+                Overlay::AddAccount => rsx! {
+                    AddAccountSheet { session, overlay }
+                },
                 Overlay::Team => rsx! {
                     TeamSheet { session, overlay }
                 },

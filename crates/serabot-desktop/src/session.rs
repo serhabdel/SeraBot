@@ -28,10 +28,12 @@ use crate::{
 };
 mod bot_settings;
 mod flows;
+mod provider_accounts;
 
 pub use bot_settings::{BotDraft, BotSettings, SettingsTab, model_pick, model_value};
 use flows::AvatarOp;
 pub use flows::{ImageSlot, NewBotDraft, NewGroupDraft, OnboardingUi, PickedImage};
+pub use provider_accounts::{AccountOp, AccountsUi, RouteChange, RouteEditorUi};
 use secrecy::ExposeSecret;
 use std::{
     collections::BTreeMap,
@@ -661,6 +663,12 @@ pub struct Session {
     pub voice: VoiceDraft,
     /// The bot settings panel (0.16).
     pub bot_settings: BotSettings,
+    /// The Providers page's accounts, their sheet and sign-in (v0.49).
+    pub accounts_ui: AccountsUi,
+    /// The bot "Model route" editor (v0.49).
+    pub route_editor: RouteEditorUi,
+    /// The last message, waiting for "Retry on <fallback>" to land its pick.
+    pending_retry: Option<String>,
     pub admin_notice: Option<String>,
     /// Connector whose Test probe is in flight.
     pub connector_testing: Option<String>,
@@ -874,6 +882,9 @@ impl Session {
             audio: AudioDraft::default(),
             voice: VoiceDraft::default(),
             bot_settings: BotSettings::default(),
+            accounts_ui: AccountsUi::default(),
+            route_editor: RouteEditorUi::default(),
+            pending_retry: None,
             admin_notice: None,
             connector_testing: None,
             oauth_signing_in: None,
@@ -1206,6 +1217,7 @@ impl Session {
         self.upload_queue.clear();
         self.uploading = false;
         self.pending = None;
+        self.pending_retry = None;
         self.bot_detail_pending = None;
         self.bot_config_pending = None;
         self.link_down = false;
@@ -1941,6 +1953,8 @@ impl Session {
         self.reset_scope(false);
         self.reset_panel();
         self.sign_in.reset_transient();
+        self.accounts_ui = AccountsUi::default();
+        self.route_editor = RouteEditorUi::default();
         self.credentials = None;
         self.token.zeroize();
         self.token.clear();
@@ -3372,6 +3386,23 @@ impl Session {
         self.state.transcript.is_some().hash(&mut h);
         self.state.transcript_error.hash(&mut h);
         self.panel.epoch.hash(&mut h);
+        // The accounts sheet's countdown moves once a second; the route chip
+        // and rows move when the server records a switch.
+        if let Some(flow) = &self.accounts_ui.flow {
+            format!("{:?}", flow.phase).hash(&mut h);
+            flow.url.hash(&mut h);
+            flow.remaining_secs(self.accounts_ui.flow_elapsed())
+                .hash(&mut h);
+        }
+        self.accounts_ui.busy.hash(&mut h);
+        self.accounts_ui.sheet_error.hash(&mut h);
+        self.accounts_ui.force_prompt.is_some().hash(&mut h);
+        self.state.account_tests.len().hash(&mut h);
+        self.state.route_events.len().hash(&mut h);
+        self.state.route_chain.is_some().hash(&mut h);
+        self.route_editor.saving.hash(&mut h);
+        self.route_editor.error.hash(&mut h);
+        self.route_editor.notice.hash(&mut h);
         h.finish()
     }
 
@@ -3386,6 +3417,7 @@ impl Session {
         self.poll_updates();
         self.poll_status();
         self.poll_sign_in();
+        self.poll_provider_flow();
         self.poll_telegram();
         self.poll_download();
         self.poll_attachments();
@@ -3395,6 +3427,8 @@ impl Session {
         self.sync_local_agent();
         self.poll_launches();
         self.hydrate_bot_settings();
+        self.hydrate_route_editor();
+        self.poll_route_events();
         self.pump_panel();
         if self.link_down
             && self.pending.is_none()
@@ -3526,6 +3560,14 @@ impl Session {
                             &payload,
                         ) {
                             continue;
+                        }
+                        if kind == "route_switched"
+                            && payload
+                                .get("conversation_id")
+                                .and_then(|value| value.as_str())
+                                == Some(self.conversation.as_str())
+                        {
+                            self.state.route_events_stale = true;
                         }
                         if kind == "conversation.renamed"
                             && let Some(conv_id) = payload
@@ -3794,6 +3836,10 @@ impl Session {
             if completion.kind == OperationKind::Health {
                 self.connecting = false;
             }
+            // A route pick that failed ends a "Retry on <fallback>" waiting on it.
+            if completion.kind == OperationKind::Apply && completion.result.is_err() {
+                self.route_apply_failed();
+            }
             match completion.result {
                 // Who-am-I is a nicety: an older server, or a saved token the
                 // /v1/me route does not know, still signs in. The next read
@@ -3872,6 +3918,18 @@ impl Session {
                     self.toast = Some(format!("Could not change that: {error}"));
                     self.schedule(Operation::ListBots, Duration::ZERO);
                 }
+                Err(error) if completion.kind == OperationKind::ProviderAccount => {
+                    self.account_write_failed(&error);
+                }
+                Err(error) if completion.kind == OperationKind::RouteWrite => {
+                    self.route_save_failed(&error);
+                }
+                // The route events are optional: an older server has none, and
+                // the chip simply shows no switch rows.
+                Err(_) if completion.kind == OperationKind::RouteEvents => {
+                    self.state.route_events_loaded = true;
+                }
+
                 Err(error)
                     if matches!(
                         completion.kind,
@@ -4185,6 +4243,12 @@ impl Session {
                     }
                     let bot_config_saved = match &reply {
                         Reply::BotConfigSaved { restart_required } => Some(*restart_required),
+                        _ => None,
+                    };
+                    let account_added = match &reply {
+                        Reply::AccountDone(crate::worker::AccountDone::Added(added)) => {
+                            Some(added.clone())
+                        }
                         _ => None,
                     };
                     let avatar_saved = match &reply {
@@ -4589,6 +4653,9 @@ impl Session {
                             self.state.connectors_loaded = false;
                             self.schedule(Operation::Connectors, Duration::ZERO);
                         }
+                        OperationKind::ProviderAccount => self.account_write_done(account_added),
+                        OperationKind::RouteWrite => self.route_saved(),
+                        OperationKind::Apply => self.after_route_applied(),
                         OperationKind::ProviderKey => {
                             for value in self.provider_key_drafts.values_mut() {
                                 value.zeroize();
@@ -4984,18 +5051,6 @@ impl Session {
 
     pub fn can_admin(&self) -> bool {
         self.ready() && self.state.connected
-    }
-
-    pub fn sign_in_provider(&mut self, id: String, kind: String) {
-        if !self.can_admin() {
-            self.admin_error = Some("Wait for the current request, then retry.".into());
-            return;
-        }
-        self.admin_error = None;
-        self.admin_notice =
-            Some("Complete the sign-in in your browser. The console waits up to 3 minutes.".into());
-        self.oauth_signing_in = Some(id.clone());
-        self.start_request(Operation::OAuthSignIn { id, kind });
     }
 
     pub fn test_connector(&mut self, id: String) {

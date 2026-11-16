@@ -90,6 +90,12 @@ pub enum OperationKind {
     ProviderTest,
     /// Choose the account's default provider and model.
     DefaultRoute,
+    /// Add, change, remove or test one of the member's provider accounts.
+    ProviderAccount,
+    /// Save a bot's route chain.
+    RouteWrite,
+    /// Read the open conversation's route switches and the bot's chain.
+    RouteEvents,
     ConnectorTest,
     OAuthSignIn,
     ConnectorSignOut,
@@ -404,6 +410,43 @@ pub enum Operation {
         provider: String,
         model: String,
     },
+    /// POST /v1/providers/{id}/accounts: one more API key.
+    AddProviderAccount {
+        provider: String,
+        label: String,
+        key: Zeroizing<String>,
+    },
+    /// PATCH /v1/providers/{id}/accounts/{aid}.
+    PatchProviderAccount {
+        provider: String,
+        account: String,
+        patch: crate::api::AccountPatch,
+    },
+    /// DELETE /v1/providers/{id}/accounts/{aid}.
+    RemoveProviderAccount {
+        provider: String,
+        account: String,
+        force: bool,
+    },
+    /// POST /v1/providers/{id}/accounts/{aid}/test.
+    TestProviderAccount {
+        provider: String,
+        account: String,
+    },
+    /// GET /v1/providers/{id}/accounts/{aid}/quota?refresh=1.
+    RefreshAccountQuota {
+        provider: String,
+        account: String,
+    },
+    /// PUT /v1/bots/{id}/route.
+    SaveBotRoute {
+        id: String,
+        update: crate::api::RouteUpdate,
+    },
+    /// GET /v1/route-events for the open conversation, with the bot's chain.
+    RouteEvents {
+        bot: Option<String>,
+    },
     AdminRemoveProvider(String),
     AdminSetConnector {
         id: String,
@@ -416,11 +459,6 @@ pub enum Operation {
     AdminSetVoice(VoiceUpdate),
     TestConnector {
         id: String,
-    },
-    /// Browser sign-in for an OAuth provider. `kind` picks PKCE or device flow.
-    OAuthSignIn {
-        id: String,
-        kind: String,
     },
     /// Browser sign-in for a connector (ElevenLabs CIMD/PKCE). The callback
     /// URI is fixed by the server's public client metadata document.
@@ -607,10 +645,16 @@ impl Operation {
             Self::SaveProviderKey { .. } => OperationKind::ProviderKey,
             Self::TestProvider { .. } => OperationKind::ProviderTest,
             Self::SetDefaultRoute { .. } => OperationKind::DefaultRoute,
+            Self::AddProviderAccount { .. }
+            | Self::PatchProviderAccount { .. }
+            | Self::RemoveProviderAccount { .. }
+            | Self::TestProviderAccount { .. }
+            | Self::RefreshAccountQuota { .. } => OperationKind::ProviderAccount,
+            Self::SaveBotRoute { .. } => OperationKind::RouteWrite,
+            Self::RouteEvents { .. } => OperationKind::RouteEvents,
             Self::VoiceSettings => OperationKind::VoiceSettings,
             Self::AdminSetVoice(_) => OperationKind::AdminWrite,
             Self::TestConnector { .. } => OperationKind::ConnectorTest,
-            Self::OAuthSignIn { .. } => OperationKind::OAuthSignIn,
             Self::ConnectorOAuthSignIn { .. } => OperationKind::OAuthSignIn,
             Self::ConnectorSignOut { .. } => OperationKind::ConnectorSignOut,
             Self::UpdateBot { .. } => OperationKind::BotSettingsWrite,
@@ -739,6 +783,12 @@ pub enum Reply {
     AdminSaved,
     ProviderKeySaved,
     DefaultRouteSaved,
+    /// One account change landed.
+    AccountDone(AccountDone),
+    /// The bot's route chain was saved.
+    RouteSaved,
+    /// The open conversation's route switches and the bot's chain.
+    RouteEvents(crate::api::RouteEvents),
     ProviderTested {
         id: String,
         result: crate::api::ProviderTest,
@@ -773,6 +823,20 @@ pub enum Reply {
     ToolsSaved,
     /// An answer, decline or secret was accepted. The transcript reloads next.
     CardWritten,
+}
+
+/// What an account operation did.
+pub enum AccountDone {
+    Added(crate::api::AccountAdded),
+    Patched,
+    Removed,
+    Tested {
+        provider: String,
+        account: String,
+        result: crate::api::ProviderTest,
+    },
+    /// The quota was read again; the list reload shows it.
+    QuotaRead,
 }
 
 pub struct Job {
@@ -851,106 +915,6 @@ impl Drop for Worker {
     fn drop(&mut self) {
         self.epoch.fetch_add(1, Ordering::SeqCst);
     }
-}
-
-fn oauth_sign_in(client: &ApiClient, id: &str, kind: &str) -> Result<Reply, ApiError> {
-    use crate::oauth;
-    if kind == "muse-code" {
-        // Device flow: the server polls in the background. The console only
-        // opens the verification page and shows the code to type there.
-        let start = client.admin_oauth_start(id, &serde_json::json!({}))?;
-        let _ = webbrowser::open(&start.url);
-        return Ok(Reply::OAuthSignedIn {
-            id: id.to_owned(),
-            device_code: start.code,
-        });
-    }
-    if kind == "anthropic" {
-        return claude_plan_sign_in(client, id);
-    }
-    let (listener, port) = oauth::bind_loopback()
-        .map_err(|_| ApiError::Validation("Could not listen on 127.0.0.1 for the redirect."))?;
-    let pkce = oauth::new_pkce();
-    if kind == "openrouter" {
-        // OpenRouter documents localhost callbacks. The key is exchanged by
-        // the server and stored under this account; it never comes back here.
-        let redirect = oauth::redirect_uri(port).replace("127.0.0.1", "localhost");
-        let start = client.provider_oauth_start(
-            id,
-            &serde_json::json!({
-                "challenge": pkce.challenge,
-                "state": pkce.state,
-                "redirect_uri": redirect,
-            }),
-        )?;
-        webbrowser::open(&start.url)
-            .map_err(|_| ApiError::Validation("Could not open the browser for sign-in."))?;
-        let code =
-            oauth::wait_for_callback(&listener, &pkce.state, std::time::Duration::from_secs(180))
-                .map_err(|error| ApiError::Rejected(error.to_string()))?;
-        drop(listener);
-        client.provider_oauth_complete(id, &code, &pkce.verifier, &redirect)?;
-        return Ok(Reply::OAuthSignedIn {
-            id: id.to_owned(),
-            device_code: None,
-        });
-    }
-    let redirect = oauth::redirect_uri(port);
-    let start = client.admin_oauth_start(
-        id,
-        &serde_json::json!({
-            "challenge": pkce.challenge,
-            "state": pkce.state,
-            "redirect_uri": redirect,
-        }),
-    )?;
-    webbrowser::open(&start.url)
-        .map_err(|_| ApiError::Validation("Could not open the browser for sign-in."))?;
-    let code =
-        oauth::wait_for_callback(&listener, &pkce.state, std::time::Duration::from_secs(180))
-            .map_err(|error| ApiError::Rejected(error.to_string()))?;
-    drop(listener);
-    client.admin_oauth_complete(id, &code, &pkce.verifier, &redirect)?;
-    Ok(Reply::OAuthSignedIn {
-        id: id.to_owned(),
-        device_code: None,
-    })
-}
-
-/// Claude plan sign-in (admin only; the server refuses it unless the operator
-/// turned `plan_oauth` on). The registered redirect is `localhost:54545` with
-/// path `/callback`, so the listener binds exactly that port and there is no
-/// fallback. The server keeps the OAuth client id and does the token exchange.
-fn claude_plan_sign_in(client: &ApiClient, id: &str) -> Result<Reply, ApiError> {
-    use crate::oauth;
-    let listener = oauth::bind_loopback_fixed(oauth::CLAUDE_PORT).map_err(|_| {
-        ApiError::Validation("Could not listen on 127.0.0.1:54545 for the redirect (port busy?).")
-    })?;
-    let pkce = oauth::new_pkce();
-    let redirect = oauth::claude_redirect_uri();
-    let start = client.admin_oauth_start(
-        id,
-        &serde_json::json!({
-            "challenge": pkce.challenge,
-            "state": pkce.state,
-            "redirect_uri": redirect,
-        }),
-    )?;
-    webbrowser::open(&start.url)
-        .map_err(|_| ApiError::Validation("Could not open the browser for sign-in."))?;
-    let code = oauth::wait_for_callback_at(
-        &listener,
-        &pkce.state,
-        oauth::CLAUDE_CALLBACK_PATH,
-        std::time::Duration::from_secs(180),
-    )
-    .map_err(|error| ApiError::Rejected(error.to_string()))?;
-    drop(listener);
-    client.admin_oauth_complete(id, &code, &pkce.verifier, &redirect)?;
-    Ok(Reply::OAuthSignedIn {
-        id: id.to_owned(),
-        device_code: None,
-    })
 }
 
 /// Connector sign-in (ElevenLabs): the redirect URI is fixed by the CIMD
@@ -1324,6 +1288,45 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         Operation::SaveProviderKey { id, key } => client
             .set_provider_key(id, key)
             .map(|()| Reply::ProviderKeySaved),
+        Operation::AddProviderAccount {
+            provider,
+            label,
+            key,
+        } => client
+            .add_provider_account(provider, label, key)
+            .map(|added| Reply::AccountDone(AccountDone::Added(added))),
+        Operation::PatchProviderAccount {
+            provider,
+            account,
+            patch,
+        } => client
+            .patch_provider_account(provider, account, patch)
+            .map(|()| Reply::AccountDone(AccountDone::Patched)),
+        Operation::RemoveProviderAccount {
+            provider,
+            account,
+            force,
+        } => client
+            .delete_provider_account(provider, account, *force)
+            .map(|()| Reply::AccountDone(AccountDone::Removed)),
+        Operation::TestProviderAccount { provider, account } => client
+            .test_provider_account(provider, account)
+            .map(|result| {
+                Reply::AccountDone(AccountDone::Tested {
+                    provider: provider.clone(),
+                    account: account.clone(),
+                    result,
+                })
+            }),
+        Operation::RefreshAccountQuota { provider, account } => client
+            .provider_account_quota(provider, account, true)
+            .map(|_| Reply::AccountDone(AccountDone::QuotaRead)),
+        Operation::SaveBotRoute { id, update } => {
+            client.put_bot_route(id, update).map(|()| Reply::RouteSaved)
+        }
+        Operation::RouteEvents { bot } => client
+            .route_events(conversation, bot.as_deref())
+            .map(Reply::RouteEvents),
         Operation::TestProvider { id } => {
             client
                 .test_provider(id)
@@ -1338,7 +1341,6 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         Operation::AdminSetConnector { id, update } => client
             .admin_set_connector(id, update)
             .map(|_| Reply::AdminSaved),
-        Operation::OAuthSignIn { id, kind } => oauth_sign_in(client, id, kind),
         Operation::ConnectorOAuthSignIn { id, callback_uri } => {
             connector_oauth_sign_in(client, id, callback_uri)
         }

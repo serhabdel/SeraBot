@@ -821,6 +821,40 @@ fn route_view(state: &ApiState, user_id: &str, id: &str, config: Option<&BotConf
 }
 
 #[derive(Debug, Deserialize)]
+pub(super) struct RouteEventsQuery {
+    #[serde(default)]
+    conversation: Option<String>,
+    #[serde(default)]
+    bot: Option<String>,
+}
+
+/// `GET /v1/route-events?conversation=&bot=`: the session user's recorded
+/// route switches, newest first, for the chat's "Switched to X" rows. With
+/// `bot`, the reply also carries that bot's chain so a failed turn can offer
+/// "Retry on <fallback>". Another user's conversation yields no rows.
+pub(super) async fn list_route_events(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Query(query): Query<RouteEventsQuery>,
+) -> Result<Json<Value>> {
+    if let Some(conversation) = &query.conversation {
+        validate_conversation_id(conversation)?;
+    }
+    let events = state
+        .store
+        .route_events(&user.id, query.conversation.as_deref(), 50)?;
+    let chain = match query.bot.as_deref() {
+        Some(bot) if safe_bot_label(bot) => state
+            .runtime
+            .bot(&user.id, bot)
+            .map(|loaded| route_view(&state, &user.id, bot, Some(&loaded.config)))
+            .unwrap_or(Value::Null),
+        _ => Value::Null,
+    };
+    Ok(Json(json!({ "events": events, "chain": chain })))
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct UpdateRouteRequest {
     /// The primary route, or `null` to follow the default route.

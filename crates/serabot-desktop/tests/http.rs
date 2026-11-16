@@ -98,6 +98,7 @@ fn authenticates_and_routes_every_contract_endpoint() {
             &Selection {
                 provider: "p".into(),
                 model: "m".into(),
+                account: None,
             },
         )
         .unwrap();
@@ -2029,4 +2030,156 @@ fn provider_key_test_default_and_sign_in_calls_use_the_account_routes() {
     let (client, _handle) = server(Vec::new());
     assert!(client.test_provider("bad/id").is_err());
     assert!(client.set_provider_key("bad id", "k").is_err());
+}
+
+#[test]
+fn provider_accounts_sign_in_and_routes_follow_the_contract() {
+    use serabot_desktop::{AccountPatch, FailoverPolicy, RouteEntry, RouteUpdate};
+    let (client, handle) = server(vec![
+        (200, r#"{"id":"acct1","created":true,"verified":true}"#.into()),
+        (200, r#"{"account":{"id":"acct1"}}"#.into()),
+        (200, r#"{"id":"acct1","deleted":true,"unpinned":[]}"#.into()),
+        (200, r#"{"id":"acct1","ok":false,"status":"key_rejected","model_count":0}"#.into()),
+        (200, r#"{"id":"acct1","quota":null,"refresh":"throttled"}"#.into()),
+        (
+            200,
+            r#"{"flow_id":"flow-1","flow":"device","url":"https://verify.example/device","expires_in":600,"user_code":"ABCD-1234","interval":5}"#.into(),
+        ),
+        (200, r#"{"status":"ok","account_id":"acct2","created":true}"#.into()),
+        (200, r#"{"bot":"notes","route":{}}"#.into()),
+        (
+            200,
+            r#"{"events":[{"id":"e1","to_provider":"anthropic","to_model":"m","reason":"rate_limited","created_at":"2026-11-16T10:00:00Z"}],"chain":null}"#.into(),
+        ),
+        (200, r#"{"selection":{"provider":"p","model":"m","account":"acct1"}}"#.into()),
+    ]);
+    let added = client
+        .add_provider_account("openai", "Work", "sk-synthetic-key")
+        .unwrap();
+    assert_eq!(
+        (added.id.as_str(), added.created, added.verified),
+        ("acct1", true, true)
+    );
+    client
+        .patch_provider_account(
+            "openai",
+            "acct1",
+            &AccountPatch {
+                disabled: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    client
+        .delete_provider_account("openai", "acct1", true)
+        .unwrap();
+    let test = client.test_provider_account("openai", "acct1").unwrap();
+    assert!(!test.ok && test.status == "key_rejected");
+    client
+        .provider_account_quota("openai", "acct1", true)
+        .unwrap();
+    let started = client
+        .provider_signin_start("muse-code", &serde_json::json!({"flow": "device"}))
+        .unwrap();
+    assert_eq!(started.user_code.as_deref(), Some("ABCD-1234"));
+    let status = client
+        .provider_signin_status("muse-code", "flow-1")
+        .unwrap();
+    assert_eq!(
+        (status.status.as_str(), status.account_id.as_deref()),
+        ("ok", Some("acct2"))
+    );
+    client
+        .put_bot_route(
+            "notes",
+            &RouteUpdate {
+                route: Some(RouteEntry {
+                    provider: "openai".into(),
+                    model: "gpt-5".into(),
+                    thinking: None,
+                    account: Some("acct1".into()),
+                }),
+                fallbacks: Vec::new(),
+                failover: FailoverPolicy::default(),
+            },
+        )
+        .unwrap();
+    let events = client.route_events("dir:notes", Some("notes")).unwrap();
+    assert_eq!(events.events[0].reason, "rate_limited");
+    let picked = client
+        .select(
+            "owner:1",
+            &Selection {
+                provider: "p".into(),
+                model: "m".into(),
+                account: Some("acct1".into()),
+            },
+        )
+        .unwrap();
+    assert_eq!(picked.account.as_deref(), Some("acct1"));
+    let requests = handle.join().unwrap();
+    let routes = [
+        "POST /v1/providers/openai/accounts ",
+        "PATCH /v1/providers/openai/accounts/acct1 ",
+        "DELETE /v1/providers/openai/accounts/acct1?force=true ",
+        "POST /v1/providers/openai/accounts/acct1/test ",
+        "GET /v1/providers/openai/accounts/acct1/quota?refresh=1 ",
+        "POST /v1/providers/muse-code/signin/start ",
+        "GET /v1/providers/muse-code/signin/flow-1 ",
+        "PUT /v1/bots/notes/route ",
+        "GET /v1/route-events?conversation=dir%3Anotes&bot=notes ",
+        "PUT /v1/conversations/owner:1/model ",
+    ];
+    assert_eq!(requests.len(), routes.len());
+    for (request, route) in requests.iter().zip(routes) {
+        assert!(request.starts_with(route), "wrong route: {request}");
+    }
+    // The wire bodies carry exactly what the contract names.
+    assert!(requests[0].contains(r#""label":"Work""#) && requests[0].contains("sk-synthetic-key"));
+    assert!(requests[1].contains(r#"{"disabled":true}"#));
+    assert!(requests[7].contains(r#""account":"acct1""#));
+    assert!(requests[7].contains(r#""max_switches":3"#));
+    assert!(requests[9].contains(r#""account":"acct1""#));
+}
+
+#[test]
+fn a_sign_in_page_must_be_a_plain_https_page_and_bounded() {
+    let bad_pages = [
+        r#"{"flow_id":"f","flow":"device","url":"http://verify.example/x","expires_in":600}"#,
+        r#"{"flow_id":"f","flow":"device","url":"javascript:alert(1)","expires_in":600}"#,
+        r#"{"flow_id":"f","flow":"device","url":"https://u:p@verify.example/x","expires_in":600}"#,
+        r#"{"flow_id":"f","flow":"magic","url":"https://verify.example/x","expires_in":600}"#,
+        r#"{"flow_id":"f","flow":"device","url":"https://verify.example/x","expires_in":0}"#,
+        r#"{"flow_id":"f","flow":"device","url":"https://verify.example/x","expires_in":99999}"#,
+        r#"{"flow_id":"f","flow":"device","url":"https://verify.example/x","expires_in":600,"user_code":"\u0007"}"#,
+    ];
+    let (client, handle) = server(
+        bad_pages
+            .iter()
+            .map(|body| (200, (*body).to_owned()))
+            .collect(),
+    );
+    for body in bad_pages {
+        let result =
+            client.provider_signin_start("muse-code", &serde_json::json!({"flow": "device"}));
+        assert!(
+            matches!(result, Err(ApiError::InvalidResponse)),
+            "{body} was accepted"
+        );
+    }
+    handle.join().unwrap();
+    // Bad ids never reach the wire.
+    let (client, _handle) = server(Vec::new());
+    assert!(matches!(
+        client.provider_signin_status("muse-code", "../x"),
+        Err(ApiError::Validation(_))
+    ));
+    assert!(matches!(
+        client.patch_provider_account("openai", "a/b", &Default::default()),
+        Err(ApiError::Validation(_))
+    ));
+    assert!(matches!(
+        client.add_provider_account("openai", "x", "bad\nkey"),
+        Err(ApiError::Validation(_))
+    ));
 }

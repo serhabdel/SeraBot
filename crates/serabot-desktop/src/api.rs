@@ -897,6 +897,9 @@ pub struct BotDetail {
     /// Levels the bot's model accepts; empty when it has no thinking control.
     #[serde(default)]
     pub thinking_levels: Vec<String>,
+    /// The bot's route chain: primary, fallbacks and auto-switch policy.
+    #[serde(default)]
+    pub route: Option<Box<RouteView>>,
 }
 
 /// Body of `PUT /v1/admin/bots/{id}/config`. Every field is optional; the
@@ -1357,6 +1360,17 @@ pub struct ProviderStatus {
     pub model_count: usize,
     #[serde(default)]
     pub credential: CredentialState,
+    /// The member's own accounts for this provider (keys and sign-ins),
+    /// never a secret.
+    #[serde(default)]
+    pub accounts: Vec<ProviderAccount>,
+    /// Sign-in flows the page may offer: `pkce` and/or `device`. Empty for a
+    /// key-only provider.
+    #[serde(default)]
+    pub signin: Vec<String>,
+    /// A plain-words risk the page shows beside a plan sign-in.
+    #[serde(default)]
+    pub signin_risk: Option<String>,
     /// Set by the console, not the server: this is the account's default
     /// provider (its chosen route, else the server default).
     #[serde(skip)]
@@ -1374,6 +1388,226 @@ pub struct ProviderTest {
     pub status: String,
     #[serde(default)]
     pub model_count: usize,
+}
+
+/// What a provider reported about an account, already masked by the server
+/// (`p***@example.com`). Nothing here is a secret.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct AccountIdentity {
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub plan: Option<String>,
+    #[serde(default)]
+    pub tier: Option<String>,
+    #[serde(default)]
+    pub org: Option<String>,
+}
+
+/// One of the member's accounts for a provider: `accounts[]` of
+/// `GET /v1/providers`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct ProviderAccount {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    /// `api_key`, `oauth`, `device` or `minted`.
+    #[serde(default)]
+    pub auth_kind: String,
+    /// `ok`, `needs_reauth`, `rate_limited`, `quota_exhausted` or `disabled`.
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub priority: i64,
+    #[serde(default)]
+    pub weight: i64,
+    #[serde(default)]
+    pub identity: AccountIdentity,
+    /// The provider's last quota reading, when it gave one.
+    #[serde(default)]
+    pub quota: Option<serde_json::Value>,
+    #[serde(default)]
+    pub cooldown_until: Option<String>,
+    #[serde(default)]
+    pub last_used_at: Option<String>,
+}
+
+/// Reply of `POST /v1/providers/{id}/accounts`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct AccountAdded {
+    pub id: String,
+    #[serde(default)]
+    pub created: bool,
+    #[serde(default)]
+    pub verified: bool,
+}
+
+/// Body of `PATCH /v1/providers/{id}/accounts/{aid}`. Only what is set is sent.
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct AccountPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<bool>,
+}
+
+/// First leg of `POST /v1/providers/{id}/signin/start`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SigninStarted {
+    pub flow_id: String,
+    /// `pkce` or `device`.
+    pub flow: String,
+    pub url: String,
+    pub expires_in: u64,
+    /// The one-time code the member types on the provider page (device only).
+    #[serde(default)]
+    pub user_code: Option<String>,
+    /// Seconds between status polls the provider asks for (device only).
+    #[serde(default)]
+    pub interval: Option<u64>,
+    #[serde(default)]
+    pub state: Option<String>,
+}
+
+/// Reply of `POST /v1/providers/{id}/signin/complete`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct SigninDone {
+    pub account_id: String,
+    #[serde(default)]
+    pub created: bool,
+}
+
+/// Reply of `GET /v1/providers/{id}/signin/{flow_id}`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct SigninStatus {
+    /// `pending`, `ok`, `denied` or `expired`.
+    pub status: String,
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub created: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// One entry of a bot route: a provider, a model, an optional thinking level
+/// and an optional account (`None` means "any of the member's accounts").
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RouteEntry {
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+}
+
+/// When a turn may move to another account, model or provider.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct FailoverPolicy {
+    #[serde(default = "policy_on")]
+    pub enabled: bool,
+    #[serde(default = "policy_on")]
+    pub switch_account_first: bool,
+    #[serde(default = "policy_switches")]
+    pub max_switches: u8,
+    #[serde(default)]
+    pub allow_cross_provider: bool,
+}
+
+fn policy_on() -> bool {
+    true
+}
+
+fn policy_switches() -> u8 {
+    3
+}
+
+impl Default for FailoverPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            switch_account_first: true,
+            max_switches: 3,
+            allow_cross_provider: false,
+        }
+    }
+}
+
+/// One recorded route switch (`route_events`).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct RouteSwitch {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    #[serde(default)]
+    pub bot: Option<String>,
+    #[serde(default)]
+    pub from_provider: Option<String>,
+    #[serde(default)]
+    pub from_model: Option<String>,
+    #[serde(default)]
+    pub from_account: Option<String>,
+    #[serde(default)]
+    pub to_provider: Option<String>,
+    #[serde(default)]
+    pub to_model: Option<String>,
+    #[serde(default)]
+    pub to_account: Option<String>,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// Where a call for a bot would start now.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct EffectiveRoute {
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub thinking: Option<String>,
+}
+
+/// A bot's route as the server shows it (`route` of `GET /v1/bots/{id}`).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct RouteView {
+    #[serde(default)]
+    pub route: Option<RouteEntry>,
+    #[serde(default)]
+    pub fallbacks: Vec<RouteEntry>,
+    #[serde(default)]
+    pub failover: FailoverPolicy,
+    #[serde(default)]
+    pub effective: Option<EffectiveRoute>,
+    #[serde(default)]
+    pub last_switch: Option<RouteSwitch>,
+}
+
+/// Body of `PUT /v1/bots/{id}/route`.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RouteUpdate {
+    /// `None` is sent as `null`: follow the account's default route.
+    pub route: Option<RouteEntry>,
+    pub fallbacks: Vec<RouteEntry>,
+    pub failover: FailoverPolicy,
+}
+
+/// Reply of `GET /v1/route-events`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct RouteEvents {
+    #[serde(default)]
+    pub events: Vec<RouteSwitch>,
+    /// The asked-for bot's chain, when one was named and is loaded.
+    #[serde(default)]
+    pub chain: Option<Box<RouteView>>,
 }
 
 /// Read-only connector view from `GET /v1/connectors`.
@@ -1711,6 +1945,9 @@ pub const MAX_CONVERSATION_TITLE_CHARS: usize = 120;
 pub struct Selection {
     pub provider: String,
     pub model: String,
+    /// One of the member's own accounts; `None` means the provider's pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 
 impl Selection {
@@ -1718,6 +1955,7 @@ impl Selection {
         Self {
             provider: "auto".into(),
             model: String::new(),
+            account: None,
         }
     }
 
@@ -1753,6 +1991,9 @@ pub struct CatalogEntry {
     /// no thinking control.
     #[serde(default)]
     pub thinking: Vec<String>,
+    /// The member's usable account ids for this provider, best first.
+    #[serde(default)]
+    pub account_ids: Vec<String>,
 }
 
 /// The open conversation's thinking level and the levels its model accepts.
@@ -4335,6 +4576,13 @@ impl ApiClient {
                     .iter()
                     .any(|class| !bounded_text(class, 64))
                 || !valid_secret_map(&provider.secrets)
+                || !valid_accounts(&provider.accounts)
+                || provider.signin.len() > 4
+                || provider.signin.iter().any(|flow| !bounded_text(flow, 16))
+                || provider
+                    .signin_risk
+                    .as_deref()
+                    .is_some_and(|risk| !bounded_text(risk, 512))
             {
                 return Err(ApiError::InvalidResponse);
             }
@@ -4747,11 +4995,24 @@ impl ApiClient {
         route: &[&str],
         body: &B,
     ) -> Result<T, ApiError> {
+        self.admin_request_query(method, route, &[], body)
+    }
+
+    fn admin_request_query<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        method: Method,
+        route: &[&str],
+        query: &[(&str, &str)],
+        body: &B,
+    ) -> Result<T, ApiError> {
         let mut url = self.endpoint.clone();
         url.path_segments_mut()
             .map_err(|_| ApiError::InvalidResponse)?
             .clear()
             .extend(route);
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query.iter().copied());
+        }
         let response = self
             .client
             .request(method, url)
@@ -4996,6 +5257,190 @@ impl ApiClient {
             redirect_uri,
         )
         .map(|_| ())
+    }
+
+    /// Add an API key as one more account for a provider. The server checks
+    /// the key with one catalog call and recognises a key already held.
+    pub fn add_provider_account(
+        &self,
+        provider: &str,
+        label: &str,
+        api_key: &str,
+    ) -> Result<AccountAdded, ApiError> {
+        check_id(provider)?;
+        if !valid_credential(api_key) || !valid_account_label(label) {
+            return Err(ApiError::Validation("Check the label and the API key."));
+        }
+        self.admin_request(
+            Method::POST,
+            &["v1", "providers", provider, "accounts"],
+            &serde_json::json!({ "label": label, "api_key": api_key }),
+        )
+    }
+
+    /// Change an account's label, priority or disabled state.
+    pub fn patch_provider_account(
+        &self,
+        provider: &str,
+        account: &str,
+        patch: &AccountPatch,
+    ) -> Result<(), ApiError> {
+        check_id(provider)?;
+        check_account_id(account)?;
+        if patch
+            .label
+            .as_deref()
+            .is_some_and(|l| !valid_account_label(l))
+        {
+            return Err(ApiError::Validation("Check the account label."));
+        }
+        let _: serde_json::Value = self.admin_request(
+            Method::PATCH,
+            &["v1", "providers", provider, "accounts", account],
+            patch,
+        )?;
+        Ok(())
+    }
+
+    /// Remove an account and its sealed credential. Without `force` the
+    /// server refuses while a bot pins the account.
+    pub fn delete_provider_account(
+        &self,
+        provider: &str,
+        account: &str,
+        force: bool,
+    ) -> Result<(), ApiError> {
+        check_id(provider)?;
+        check_account_id(account)?;
+        let query: &[(&str, &str)] = if force { &[("force", "true")] } else { &[] };
+        let _: serde_json::Value = self.admin_request_query(
+            Method::DELETE,
+            &["v1", "providers", provider, "accounts", account],
+            query,
+            &serde_json::json!({}),
+        )?;
+        Ok(())
+    }
+
+    /// Ask the provider for its model list with one account's credential.
+    pub fn test_provider_account(
+        &self,
+        provider: &str,
+        account: &str,
+    ) -> Result<ProviderTest, ApiError> {
+        check_id(provider)?;
+        check_account_id(account)?;
+        self.admin_request(
+            Method::POST,
+            &["v1", "providers", provider, "accounts", account, "test"],
+            &serde_json::json!({}),
+        )
+    }
+
+    /// One account's quota snapshot; `refresh` asks the provider again (the
+    /// server allows that once per four minutes).
+    pub fn provider_account_quota(
+        &self,
+        provider: &str,
+        account: &str,
+        refresh: bool,
+    ) -> Result<serde_json::Value, ApiError> {
+        check_id(provider)?;
+        check_account_id(account)?;
+        let query: &[(&str, &str)] = if refresh { &[("refresh", "1")] } else { &[] };
+        self.request::<serde_json::Value, ()>(
+            Method::GET,
+            &["v1", "providers", provider, "accounts", account, "quota"],
+            query,
+            None,
+        )
+    }
+
+    /// Begin a sign-in for a provider. The page it returns is opened in the
+    /// system browser, so only a plain https page is accepted.
+    pub fn provider_signin_start(
+        &self,
+        provider: &str,
+        body: &serde_json::Value,
+    ) -> Result<SigninStarted, ApiError> {
+        check_id(provider)?;
+        let started: SigninStarted = self.admin_request(
+            Method::POST,
+            &["v1", "providers", provider, "signin", "start"],
+            body,
+        )?;
+        check_signin_started(started)
+    }
+
+    /// Finish a browser sign-in with the code the redirect carried.
+    pub fn provider_signin_complete(
+        &self,
+        provider: &str,
+        flow_id: &str,
+        code: &str,
+        redirect_uri: &str,
+        verifier: &str,
+    ) -> Result<SigninDone, ApiError> {
+        check_id(provider)?;
+        check_id(flow_id)?;
+        self.admin_request(
+            Method::POST,
+            &["v1", "providers", provider, "signin", "complete"],
+            &serde_json::json!({
+                "flow_id": flow_id,
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "verifier": verifier,
+            }),
+        )
+    }
+
+    /// Where one sign-in stands: pending, ok, denied or expired.
+    pub fn provider_signin_status(
+        &self,
+        provider: &str,
+        flow_id: &str,
+    ) -> Result<SigninStatus, ApiError> {
+        check_id(provider)?;
+        check_id(flow_id)?;
+        let status: SigninStatus =
+            self.get(&["v1", "providers", provider, "signin", flow_id], &[])?;
+        if !matches!(
+            status.status.as_str(),
+            "pending" | "ok" | "denied" | "expired"
+        ) {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(status)
+    }
+
+    /// Set a bot's route, fallbacks and auto-switch policy.
+    pub fn put_bot_route(&self, bot: &str, update: &RouteUpdate) -> Result<(), ApiError> {
+        if !valid_speaker(bot) {
+            return Err(ApiError::Validation("Bot id is not valid."));
+        }
+        let _: serde_json::Value =
+            self.admin_request(Method::PUT, &["v1", "bots", bot, "route"], update)?;
+        Ok(())
+    }
+
+    /// The conversation's recorded route switches and, with `bot`, that bot's
+    /// chain.
+    pub fn route_events(
+        &self,
+        conversation: &str,
+        bot: Option<&str>,
+    ) -> Result<RouteEvents, ApiError> {
+        check_id(conversation)?;
+        let mut query = vec![("conversation", conversation)];
+        if let Some(bot) = bot.filter(|bot| valid_speaker(bot)) {
+            query.push(("bot", bot));
+        }
+        let events: RouteEvents = self.get(&["v1", "route-events"], &query)?;
+        if events.events.len() > 200 {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(events)
     }
 
     pub fn admin_connector_oauth_start(
@@ -5329,6 +5774,61 @@ impl PublicApiClient {
             }
         }
     }
+}
+
+/// An account id as the server issues it: letters, digits, `_` and `-`.
+/// The account list of one provider: a handful of short rows.
+fn valid_accounts(accounts: &[ProviderAccount]) -> bool {
+    accounts.len() <= 32
+        && accounts.iter().all(|account| {
+            check_account_id(&account.id).is_ok()
+                && account.label.chars().count() <= 128
+                && !account.label.chars().any(char::is_control)
+                && account.status.len() <= 32
+                && account.auth_kind.len() <= 32
+        })
+}
+
+fn check_account_id(id: &str) -> Result<(), ApiError> {
+    if (1..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        Ok(())
+    } else {
+        Err(ApiError::Validation("Account id is not valid."))
+    }
+}
+
+/// The longest account label the server keeps.
+pub const MAX_ACCOUNT_LABEL_CHARS: usize = 64;
+
+/// A label for an account: empty (the server names it) or plain text.
+pub fn valid_account_label(label: &str) -> bool {
+    label.chars().count() <= MAX_ACCOUNT_LABEL_CHARS && !label.chars().any(char::is_control)
+}
+
+/// A started sign-in is shown to the member and its page is opened, so the
+/// server's text is bounded and the page must be a plain https URL.
+fn check_signin_started(started: SigninStarted) -> Result<SigninStarted, ApiError> {
+    let page = Url::parse(&started.url).map_err(|_| ApiError::InvalidResponse)?;
+    if page.scheme() != "https"
+        || page.host_str().is_none()
+        || !page.username().is_empty()
+        || page.password().is_some()
+        || !matches!(started.flow.as_str(), "pkce" | "device")
+        || !valid_id(&started.flow_id)
+        || started.expires_in == 0
+        || started.expires_in > 3_600
+        || started.interval.is_some_and(|secs| secs > 120)
+        || started.user_code.as_deref().is_some_and(|code| {
+            code.is_empty() || code.len() > 32 || code.chars().any(char::is_control)
+        })
+    {
+        return Err(ApiError::InvalidResponse);
+    }
+    Ok(started)
 }
 
 fn check_id(id: &str) -> Result<(), ApiError> {

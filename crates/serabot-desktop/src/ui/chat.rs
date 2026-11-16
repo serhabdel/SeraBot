@@ -170,6 +170,37 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         let index = chat_cards::insert_index(&message_times, &card.created_at);
         placed[index].push(card);
     }
+    // "Switched to X (reason)" rows from the server's route events, placed like
+    // resolved cards: before the first message made after them.
+    let switch_placed: Vec<Vec<route_chip::SwitchRow>> = {
+        let state = session.read();
+        let options = state.route_options();
+        route_chip::place_rows(
+            &message_times,
+            route_chip::switch_rows(&options, &state.state.route_events),
+        )
+    };
+    // A failed turn offers the next route of the bot's chain.
+    let (fallback_offer, failed_task) = {
+        let state = session.read();
+        let options = state.route_options();
+        let offer = route_chip::fallback_offer(
+            &options,
+            state.state.route_chain.as_deref(),
+            &state.state.draft,
+        );
+        let task = state.state.task.as_ref();
+        (
+            offer
+                .filter(|offer| route_chip::offer_retry(task.map(|task| task.status), Some(offer))),
+            task.filter(|task| task.status == TaskStatus::Failed)
+                .map(|task| task.id.clone()),
+        )
+    };
+    let mut dismissed_fallback = use_signal(|| Option::<String>::None);
+    let show_fallback = fallback_offer
+        .clone()
+        .filter(|_| failed_task.is_some() && dismissed_fallback() != failed_task);
     let live_task: Option<TaskStatus> = session
         .read()
         .state
@@ -194,6 +225,12 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let chat_plan = session.read().state.plan.clone();
     let mut composer_draft = use_signal(|| session.read().composer.clone());
     let can_send = session.read().state.can_send();
+    // "Retry on <fallback>" first picks the route, so it needs only an idle,
+    // connected chat (not that the draft matches the saved route).
+    let can_send_again = {
+        let state = session.read();
+        state.state.connected && state.state.history_loaded && state.ready()
+    };
     let accepts = session.read().conversation_accepts_turns();
     let (active_bot, active_name, active_avatar, roster) = {
         let state = session.read();
@@ -1017,6 +1054,9 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                             for card in placed[index].clone() {
                                 ChatCardRow { session, key: "{card.id}", card }
                             }
+                            for row in switch_placed[index].clone() {
+                                RouteSwitchRow { key: "{row.id}", text: row.text }
+                            }
                             if let Some(heading) = view.row.day.clone() {
                                 div { class: "day-sep", role: "separator",
                                     span { "{heading}" }
@@ -1039,6 +1079,9 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     // Resolved cards that come after the newest message.
                     for card in placed.last().cloned().unwrap_or_default() {
                         ChatCardRow { session, key: "{card.id}", card }
+                    }
+                    for row in switch_placed.last().cloned().unwrap_or_default() {
+                        RouteSwitchRow { key: "{row.id}", text: row.text }
                     }
                     // Files produced in an active turn that has no reply yet,
                     // plus any in-flight media jobs.
@@ -1165,6 +1208,29 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                         }
                     }
                     crate::ui_cards::InlineApprovals { session }
+                    if let Some(offer) = show_fallback.clone() {
+                        div { class: "banner err fallback-card", role: "alert",
+                            span { class: "grow", "{chat_failure::FAILED_TURN_WITH_FALLBACK}" }
+                            button {
+                                class: "btn primary sm",
+                                r#type: "button",
+                                disabled: !can_send_again,
+                                onclick: {
+                                    let offer = offer.clone();
+                                    move |_| session.write().retry_on_fallback(offer.clone())
+                                },
+                                "{offer.label}"
+                            }
+                            button {
+                                class: "btn ghost sm chat-banner-close",
+                                r#type: "button",
+                                title: "Dismiss",
+                                "aria-label": "Dismiss",
+                                onclick: move |_| dismissed_fallback.set(failed_task.clone()),
+                                Icon { name: "x", size: 13 }
+                            }
+                        }
+                    }
                     if let Some(failure) = show_failure.clone() {
                         div { class: "banner err", role: "alert",
                             span { "{failure.message}" }
@@ -2011,7 +2077,7 @@ pub(super) fn ModelBar(
 ) -> Element {
     // Picker items: (value, label). "auto" first, then the catalog entries
     // (or the static provider model lists when the catalog is empty).
-    let (items, current, allowed, saved, rows, kinds) = {
+    let (items, current, allowed, saved, rows, kinds, provider_accounts) = {
         let session = session.read();
         let catalog = session.state.catalog.as_ref();
         let mut items: Vec<(String, String)> =
@@ -2048,6 +2114,7 @@ pub(super) fn ModelBar(
                                 context_length: None,
                                 tags: Vec::new(),
                                 thinking: Vec::new(),
+                                account_ids: Vec::new(),
                             })
                     })
                     .collect();
@@ -2072,7 +2139,27 @@ pub(super) fn ModelBar(
                 )
             };
         }
-        (items, current, allowed, saved, rows, kinds)
+        // The account step of the picker: only for a provider where the
+        // member has two or more usable accounts.
+        let options = session.route_options();
+        let mut provider_accounts: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        for row in &rows {
+            if !provider_accounts.contains_key(&row.provider) {
+                provider_accounts.insert(
+                    row.provider.clone(),
+                    route_chip::picker_accounts(&options, &row.provider),
+                );
+            }
+        }
+        (
+            items,
+            current,
+            allowed,
+            saved,
+            rows,
+            kinds,
+            provider_accounts,
+        )
     };
     let value = {
         let draft = session.read().state.draft.clone();
@@ -2082,14 +2169,19 @@ pub(super) fn ModelBar(
             format!("{}|{}", draft.provider, draft.model)
         }
     };
-    let changed = value != current;
+    let (draft_account, saved_account) = {
+        let s = session.read();
+        (
+            s.state.draft.account.clone(),
+            s.state
+                .catalog
+                .as_ref()
+                .and_then(|catalog| catalog.selection.account.clone()),
+        )
+    };
+    let changed = value != current || draft_account != saved_account;
     // Only "auto" is left: the server offered no concrete model.
     let no_models = session.read().state.catalog.is_some() && items.len() <= 1;
-    let current_label = items
-        .iter()
-        .find(|(item_value, _)| *item_value == value)
-        .map(|(_, label)| label.clone())
-        .unwrap_or_else(|| "Auto · approved route".to_owned());
     // Thinking levels the saved model accepts, and the one in force. The
     // picker is absent for a model with no thinking control.
     let (thinking_levels, thinking_now) = {
@@ -2106,9 +2198,19 @@ pub(super) fn ModelBar(
             })
             .unwrap_or_default()
     };
+    // The chip: `provider/account · model · thinking`.
+    let current_label = {
+        let s = session.read();
+        let level = (!changed && !thinking_now.is_empty()).then_some(thinking_now.as_str());
+        route_chip::chip_label(&s.route_options(), &s.state.draft, level)
+    };
+    let segments = route_chip::thinking_segments(&thinking_levels, &thinking_now);
     let mut open = use_signal(|| false);
     let mut query = use_signal(String::new);
     let mut active_idx = use_signal(|| 0usize);
+    // The account the member chose for a provider in this picker; a provider
+    // never touched here keeps the draft's account when it is the draft's own.
+    let picked_account = use_signal(BTreeMap::<String, String>::new);
     // Case-insensitive substring match on the human label and on the raw
     // provider/model ids carried by the item value.
     let needle = query().trim().to_lowercase();
@@ -2192,10 +2294,11 @@ pub(super) fn ModelBar(
                             if let Some((_, item_value, _)) =
                                 keyed.get(active_idx().min(count.saturating_sub(1)))
                             {
+                                let account = picked_account_for(&session.read(), &picked_account.read(), item_value);
                                 let mut session = session.write();
-                                set_model_draft(&mut session, item_value);
+                                set_model_draft_with(&mut session, item_value, account);
                                 if compact {
-                                    let parsed = parse_model_value(item_value);
+                                    let parsed = session.state.draft.clone();
                                     if session
                                         .state
                                         .catalog
@@ -2218,8 +2321,9 @@ pub(super) fn ModelBar(
                     }
                 },
                 button {
-                    class: "btn ghost sm menu-trigger",
-                    title: "Pick the model route for the next turn",
+                    class: "btn ghost sm menu-trigger route-chip",
+                    title: "Pick the provider, account, model and thinking for the next turn",
+                    "aria-label": "Route: {current_label}",
                     onclick: move |_| {
                         if !open() {
                             query.set(String::new());
@@ -2261,16 +2365,30 @@ pub(super) fn ModelBar(
                                     BrandLogo { brand, size: 16 }
                                     span { "{name}" }
                                 }
+                                if let Some(choices) = row
+                                    .as_ref()
+                                    .and_then(|row| provider_accounts.get(&row.provider).cloned())
+                                    .filter(|choices| !choices.is_empty())
+                                {
+                                    PickAccounts {
+                                        session,
+                                        provider: row.as_ref().map(|row| row.provider.clone()).unwrap_or_default(),
+                                        choices,
+                                        compact,
+                                        picked: picked_account,
+                                    }
+                                }
                             }
                             button {
                                 class: if pos == active { "pop-item active" } else { "pop-item" },
                                 onclick: {
                                     let item_value = item_value.clone();
                                     move |_| {
+                                        let account = picked_account_for(&session.read(), &picked_account.read(), &item_value);
                                         let mut session = session.write();
-                                        set_model_draft(&mut session, &item_value);
+                                        set_model_draft_with(&mut session, &item_value, account);
                                         if compact {
-                                            let parsed = parse_model_value(&item_value);
+                                            let parsed = session.state.draft.clone();
                                             if session
                                                 .state
                                                 .catalog
@@ -2311,25 +2429,27 @@ pub(super) fn ModelBar(
                     }
                 }
             }
-            if !thinking_levels.is_empty() && !changed {
-                select {
-                    class: "select thinking-select",
+            if !segments.is_empty() && !changed {
+                div {
+                    class: "seg thinking-seg",
+                    role: "group",
                     title: "How hard the model thinks before it answers",
                     "aria-label": "Thinking level",
-                    value: "{thinking_now}",
-                    onchange: move |event| {
-                        let picked = event.value();
-                        session
-                            .write()
-                            .set_thinking((!picked.is_empty()).then_some(picked));
-                    },
-                    option { value: "", selected: thinking_now.is_empty(), "Thinking: default" }
-                    for level in thinking_levels.clone() {
-                        option {
-                            key: "{level}",
-                            value: "{level}",
-                            selected: level == thinking_now,
-                            "Thinking: {serabot_desktop::thinking_label(&level)}"
+                    for segment in segments {
+                        button {
+                            key: "{segment.label}",
+                            r#type: "button",
+                            class: if segment.active { "seg-btn active" } else { "seg-btn" },
+                            "aria-pressed": if segment.active { "true" } else { "false" },
+                            onclick: {
+                                let value = segment.value.clone();
+                                move |_| {
+                                    session
+                                        .write()
+                                        .set_thinking((!value.is_empty()).then(|| value.clone()));
+                                }
+                            },
+                            "{segment.label}"
                         }
                     }
                 }
@@ -2364,6 +2484,77 @@ pub(super) fn ModelBar(
             } else if !compact {
                 span { class: "tiny", "Saved {saved}" }
             }
+        }
+    }
+}
+
+/// The account step of the model picker: "Any account" or one of the member's
+/// own, for one provider. Picking one for the provider the conversation is on
+/// moves the draft at once.
+#[component]
+fn PickAccounts(
+    session: Signal<Session>,
+    provider: String,
+    choices: Vec<(String, String)>,
+    compact: bool,
+    picked: Signal<BTreeMap<String, String>>,
+) -> Element {
+    let mut picked = picked;
+    let shown = {
+        let s = session.read();
+        picked.read().get(&provider).cloned().unwrap_or_else(|| {
+            if s.state.draft.provider == provider {
+                s.state.draft.account.clone().unwrap_or_default()
+            } else {
+                String::new()
+            }
+        })
+    };
+    rsx! {
+        div { class: "pick-accounts", role: "group", "aria-label": "Account",
+            for (account_id, account_label) in choices {
+                button {
+                    key: "{account_id}",
+                    r#type: "button",
+                    class: if shown == account_id { "seg-btn active" } else { "seg-btn" },
+                    "aria-pressed": if shown == account_id { "true" } else { "false" },
+                    onclick: {
+                        let provider = provider.clone();
+                        let account_id = account_id.clone();
+                        move |_| {
+                            picked.write().insert(provider.clone(), account_id.clone());
+                            let mut s = session.write();
+                            if s.state.draft.provider == provider {
+                                s.state.draft.account =
+                                    (!account_id.is_empty()).then(|| account_id.clone());
+                                if compact {
+                                    let draft = s.state.draft.clone();
+                                    if s
+                                        .state
+                                        .catalog
+                                        .as_ref()
+                                        .is_some_and(|catalog| catalog.allows(&draft))
+                                    {
+                                        s.apply_model(draft);
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "{account_label}"
+                }
+            }
+        }
+    }
+}
+
+/// One quiet "Switched to X (reason)" line in the transcript.
+#[component]
+fn RouteSwitchRow(text: String) -> Element {
+    rsx! {
+        div { class: "route-switch", role: "status",
+            Icon { name: "refresh", size: 12 }
+            span { "{text}" }
         }
     }
 }

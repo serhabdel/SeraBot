@@ -1156,6 +1156,112 @@ async fn a_device_sign_in_finishes_in_the_background() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn a_conversation_can_pick_my_account_but_never_someone_elses() {
+    let env = env().await;
+    let (alice, bob) = (env.alice.1.clone(), env.bob.1.clone());
+    accept_key(&env.server, "sk-alice-1").await;
+    let (_, added) = call(
+        &env,
+        &alice,
+        "POST",
+        "/v1/providers/acme/accounts",
+        Some(json!({"label": "Mine", "api_key": "sk-alice-1"})),
+    )
+    .await;
+    let id = added["id"].as_str().unwrap().to_owned();
+    env.store
+        .ensure_conversation_accepts_turns(&env.alice.0, "dir:alice-pick")
+        .unwrap();
+    env.store
+        .ensure_conversation_accepts_turns(&env.bob.0, "dir:bob-pick")
+        .unwrap();
+    let pick = json!({"provider": "acme", "model": "acme-1", "account": id});
+    let (status, chosen) = call(
+        &env,
+        &alice,
+        "PUT",
+        "/v1/conversations/dir:alice-pick/model",
+        Some(pick.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{chosen}");
+    assert_eq!(chosen["selection"]["account"], json!(id));
+    // Bob naming alice's account id is a plain 404.
+    let (status, refused) = call(
+        &env,
+        &bob,
+        "PUT",
+        "/v1/conversations/dir:bob-pick/model",
+        Some(pick),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
+    // No account still means the provider's pool.
+    let (status, pooled) = call(
+        &env,
+        &alice,
+        "PUT",
+        "/v1/conversations/dir:alice-pick/model",
+        Some(json!({"provider": "acme", "model": "acme-1"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{pooled}");
+    assert!(pooled["selection"].get("account").is_none());
+}
+
+#[tokio::test]
+async fn route_events_list_only_the_members_own_switches() {
+    let env = env().await;
+    let (alice, bob) = (env.alice.1.clone(), env.bob.1.clone());
+    let from = crate::model_router::ModelSelection::new("acme", "acme-1");
+    let to = crate::model_router::ModelSelection::new("default", "test");
+    env.store
+        .record_route_event(
+            &env.alice.0,
+            &crate::route_chain::NewRouteEvent {
+                conversation_id: Some("dir:alice-pick"),
+                task_id: None,
+                bot: Some("main"),
+                from: &from,
+                to: &to,
+                reason: "rate_limited",
+            },
+        )
+        .unwrap();
+    let (status, mine) = call(
+        &env,
+        &alice,
+        "GET",
+        "/v1/route-events?conversation=dir:alice-pick&bot=main",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{mine}");
+    assert_eq!(mine["events"][0]["reason"], "rate_limited");
+    assert_eq!(mine["events"][0]["to_model"], "test");
+    assert!(mine["chain"].is_object(), "{mine}");
+    let (status, theirs) = call(
+        &env,
+        &bob,
+        "GET",
+        "/v1/route-events?conversation=dir:alice-pick",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(theirs["events"].as_array().unwrap().is_empty(), "{theirs}");
+    let (status, _) = call(
+        &env,
+        &bob,
+        "GET",
+        "/v1/route-events?conversation=bad%20id",
+        None,
+    )
+    .await;
+    assert!(!status.is_success());
+}
+
 #[test]
 fn emails_are_masked() {
     assert_eq!(mask_email("person@example.com"), "p***@example.com");
