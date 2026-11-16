@@ -1852,6 +1852,9 @@ mod tests {
                 accounts: Vec::new(),
                 signin: Vec::new(),
                 signin_risk: None,
+                plan_signin: None,
+                signin_setup: None,
+                pending_restart: false,
                 secrets: std::collections::BTreeMap::from([(
                     "api_key".into(),
                     SecretStatus {

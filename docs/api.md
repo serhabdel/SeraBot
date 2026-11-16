@@ -623,6 +623,21 @@ member while the flag is on; a Copilot provider lists `["device"]` the same way.
 `POST /v1/providers/{id}/accounts` with `{"label","api_key"}`, several per
 member, checked with one model-list call.
 
+Both listings also say why a sign-in is missing and when a provider is not in
+use yet (0.52), so a page can explain instead of hiding a button:
+
+| Field | Values | Meaning |
+|---|---|---|
+| `plan_signin` | `null`, `"off"`, `"admin_only"` | Why a plan sign-in (Claude, Codex, Copilot) is not offered: the operator set `plan_oauth = false`, or Claude's sign-in to a member. |
+| `signin_setup` | `null`, `"client_secret"` | What the server still lacks before the sign-in can finish: Antigravity's Google client secret. `signin/start` then answers `422 signin_not_set_up` before any browser opens. |
+| `pending_restart` | `true` / `false` | The console saved a newer copy of this provider than the one the model router was built from; bots use it after a restart (`POST /v1/admin/restart`). |
+
+A console-saved provider's last saved profile decides its sign-in at once (for
+example turning Claude's plan sign-in back on by saving it again); the router
+picks it up at the next restart. `POST /v1/admin/providers` saves an `anthropic`
+provider without an API key while its plan sign-in is on, so "Sign in with
+Claude" works on a provider that was never saved.
+
 ## Connector OAuth sign-in (ElevenLabs)
 
 Owner token required. Routes under `/v1/admin/connectors/{id}/oauth/`; only

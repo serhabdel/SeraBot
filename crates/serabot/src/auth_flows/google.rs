@@ -43,6 +43,9 @@ pub const DEFAULT_CLIENT_SECRET_NAME: &str = "antigravity_oauth_client_secret";
 pub const CALLBACK_PATH: &str = "/oauth-callback";
 /// The fixed loopback port the desktop tries first.
 pub const PREFERRED_PORT: u16 = 51121;
+/// What a member sees when the server has no Google client secret to sign in
+/// with. Names where the admin fixes it; carries no secret.
+pub const MISSING_CLIENT_SECRET: &str = "Antigravity sign-in is not set up on this server yet: the Google client secret is missing. The admin can paste it on the AI providers page (Google Antigravity, Set up sign-in) or set AGY_CLIENT_SECRET on the server.";
 /// How far apart `onboardUser` attempts are.
 const ONBOARD_PAUSE: Duration = Duration::from_secs(3);
 /// Longest email accepted from userinfo.
@@ -132,6 +135,12 @@ impl GoogleSignIn {
         }
     }
 
+    /// The OAuth client secret this sign-in would use (may be empty when the
+    /// build has no default and the operator set none).
+    fn client_secret(&self) -> String {
+        antigravity_client_secret(&self.secrets, &self.client_secret_name)
+    }
+
     fn client_id(&self) -> String {
         self.client_id_name
             .as_deref()
@@ -144,7 +153,15 @@ impl GoogleSignIn {
     /// credential: a console-saved value wins, then `AGY_CLIENT_SECRET`, then
     /// the compiled-in default, so sign-in never needs a setup step.
     fn spec(&self) -> Result<PkceSpec> {
-        let secret = antigravity_client_secret(&self.secrets, &self.client_secret_name);
+        let secret = self.client_secret();
+        if secret.trim().is_empty() {
+            // Google refuses the code exchange without the registration's
+            // secret. Say so before the member is sent to Google, not after.
+            return Err(SeraError::Rejected {
+                code: "signin_not_set_up",
+                message: MISSING_CLIENT_SECRET.into(),
+            });
+        }
         Ok(PkceSpec {
             authorize: self.authorize.clone(),
             token: self.token.clone(),
@@ -234,6 +251,13 @@ impl SignInProvider for GoogleSignIn {
             port: None,
             path: Some(CALLBACK_PATH),
         })
+    }
+
+    fn setup_missing(&self) -> Option<&'static str> {
+        self.client_secret()
+            .trim()
+            .is_empty()
+            .then_some("client_secret")
     }
 
     fn authorize_url(&self, redirect_uri: &str, challenge: &str, state: &str) -> Result<String> {
@@ -534,27 +558,58 @@ mod tests {
         }
     }
 
+    /// Whether this build or environment supplies a client secret without the
+    /// age store (the compiled-in default or `AGY_CLIENT_SECRET`).
+    fn built_in_secret() -> bool {
+        let env = std::env::var(crate::cloud_code::ANTIGRAVITY_CLIENT_SECRET_ENV).ok();
+        !crate::cloud_code::pick_antigravity_client_secret(None, env.as_deref())
+            .trim()
+            .is_empty()
+    }
+
     #[tokio::test]
-    async fn without_a_stored_client_secret_sign_in_still_starts() {
+    async fn without_a_stored_client_secret_sign_in_starts_only_with_a_built_in_one() {
         let harness = harness();
         let alice = member(&harness, "microsoft:google-nosecret");
         let server = MockServer::start().await;
         let service = service(&harness, &server, false);
-        let started = service
+        let result = service
             .start(
                 &alice,
                 "antigravity",
                 "google-antigravity",
                 pkce_request(REDIRECT),
             )
-            .await
-            .unwrap();
-        // The public default client secret is used server-side and never shown.
-        assert!(
-            ANTIGRAVITY_DEFAULT_CLIENT_SECRET.is_empty()
-                || !started.url.contains(ANTIGRAVITY_DEFAULT_CLIENT_SECRET)
-        );
-        assert!(!started.url.contains("client_secret"));
+            .await;
+        if built_in_secret() {
+            // The public default client secret is used server-side and never shown.
+            let started = result.unwrap();
+            assert!(
+                ANTIGRAVITY_DEFAULT_CLIENT_SECRET.is_empty()
+                    || !started.url.contains(ANTIGRAVITY_DEFAULT_CLIENT_SECRET)
+            );
+            assert!(!started.url.contains("client_secret"));
+        } else {
+            // No secret anywhere: refused before the member is sent to Google,
+            // with words that say where the admin fixes it.
+            match result {
+                Err(SeraError::Rejected { code, message }) => {
+                    assert_eq!(code, "signin_not_set_up");
+                    assert!(message.contains("AI providers"), "{message}");
+                }
+                Err(other) => panic!("unexpected error: {other}"),
+                Ok(_) => panic!("sign-in started without a client secret"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_client_secret_is_reported_as_setup_and_a_stored_one_is_ready() {
+        let stored = GoogleSignIn::for_test(age_store(true), "http://127.0.0.1:9");
+        assert_eq!(stored.setup_missing(), None);
+        let bare = GoogleSignIn::for_test(age_store(false), "http://127.0.0.1:9");
+        let expected = (!built_in_secret()).then_some("client_secret");
+        assert_eq!(bare.setup_missing(), expected);
     }
 
     #[test]

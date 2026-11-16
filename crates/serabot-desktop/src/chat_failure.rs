@@ -69,7 +69,7 @@ pub fn classify_send_error(error: &ApiError) -> ChatFailure {
         // Every route of the bot's chain failed or none was ready: the
         // server sends this code with stable reason words only.
         ApiError::Coded { code, .. } if code == ALL_ROUTES_FAILED => ChatFailure {
-            message: "None of this bot's routes could answer. Your message is still in the box. Check the accounts on AI keys, then send it again.".into(),
+            message: "None of this bot's routes could answer. Your message is still in the box. Check the accounts on AI providers, then send it again.".into(),
             action: ChatAction::OpenKeys,
         },
         ApiError::Coded { message, code, .. } => from_sentence(message, Some(code)),
@@ -96,7 +96,7 @@ fn from_sentence(message: &str, code: Option<&str>) -> ChatFailure {
 
 fn keys_failure() -> ChatFailure {
     ChatFailure {
-        message: "The provider rejected the API key. Open AI keys and check it. Your message is still in the box.".into(),
+        message: "The provider rejected the API key. Open AI providers and check it. Your message is still in the box.".into(),
         action: ChatAction::OpenKeys,
     }
 }
@@ -292,10 +292,10 @@ mod tests {
     }
 
     #[test]
-    fn a_rejected_key_points_at_ai_keys_and_json_is_not_shown() {
+    fn a_rejected_key_points_at_ai_providers_and_json_is_not_shown() {
         let key = classify_send_error(&ApiError::Rejected("missing api key".into()));
         assert_eq!(key.action, ChatAction::OpenKeys);
-        assert!(key.message.contains("AI keys"));
+        assert!(key.message.contains("AI providers"));
 
         let dumped = classify_send_error(&ApiError::Rejected(
             "{\"error\":\"boom\",\"api_key\":\"x\"}".into(),

@@ -12,7 +12,7 @@ Deterministic Rust around bounded LLM calls.</p>
 ## What it is
 
 SeraBot runs on your own server. Each person signs in with Microsoft and gets
-their own private space: chats, memory, documents, bots, AI keys, connected
+their own private space: chats, memory, documents, bots, AI providers, connected
 accounts and a vault of passwords and keys. Nobody can see anyone else's data.
 
 | Part | What it does |

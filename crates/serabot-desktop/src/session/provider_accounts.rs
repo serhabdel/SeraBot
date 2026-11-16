@@ -241,6 +241,82 @@ impl Session {
         });
     }
 
+    // ---- Provider drafts ----
+
+    /// Fill the Add provider draft from a preset, or from the provider already
+    /// saved for it (its id, kind, models and secret name are kept).
+    pub fn fill_provider_draft(
+        &mut self,
+        preset: &crate::provider_presets::ProviderPreset,
+        existing: Option<&crate::api::ProviderStatus>,
+    ) {
+        if let Some(cur) = existing {
+            self.provider.id = cur.id.clone();
+            self.provider.kind = cur.kind.clone();
+            self.provider.base_url = preset.base_url.to_owned();
+            self.provider.secret_name = cur
+                .secrets
+                .values()
+                .find_map(|secret| secret.name.clone())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| preset.secret_name.to_owned());
+            self.provider.models = cur.models.join(", ");
+            self.provider.catalog_fetch = cur.catalog_fetch;
+            self.provider.auth = cur.auth.clone();
+        } else {
+            self.provider.id = preset.default_id.to_owned();
+            self.provider.kind = preset.kind.to_owned();
+            self.provider.base_url = preset.base_url.to_owned();
+            self.provider.secret_name = preset.secret_name.to_owned();
+            self.provider.models = preset.models.join(", ");
+            self.provider.catalog_fetch = preset.catalog_fetch;
+            self.provider.auth = preset.auth.to_owned();
+        }
+        self.provider.api_key.clear();
+        self.provider.oauth_client_secret.zeroize();
+        self.admin_error = None;
+    }
+
+    /// Save a console-managed provider again as it stands, optionally with the
+    /// Antigravity client secret. A console save turns the plan sign-in on (it
+    /// is on by default), and a sign-in provider with no account goes straight
+    /// on to its sign-in.
+    pub fn resave_provider(&mut self, provider_id: &str, client_secret: Option<String>) {
+        let Some(existing) = self
+            .state
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(preset) = crate::provider_presets::presets()
+            .iter()
+            .find(|preset| {
+                crate::provider_presets::provider_matches_preset(
+                    &existing.id,
+                    &existing.kind,
+                    preset,
+                )
+            })
+            .copied()
+        else {
+            self.admin_error = Some("This provider cannot be saved from here.".into());
+            return;
+        };
+        self.fill_provider_draft(&preset, Some(&existing));
+        if let Some(secret) = client_secret {
+            let secret = secret.trim().to_owned();
+            if secret.is_empty() {
+                self.admin_error = Some("Paste the client secret first.".into());
+                return;
+            }
+            self.provider.oauth_client_secret = secret;
+        }
+        self.save_provider();
+    }
+
     // ---- Sign-in ----
 
     /// Whether saving the draft should go straight on to a sign-in: the preset
@@ -283,6 +359,12 @@ impl Session {
             return;
         };
         self.open_add_account(provider);
+        if let Some(blocker) = accounts::signin_blocker(&status, self.is_admin()) {
+            // Starting would send the member to the provider only to fail
+            // afterwards; say what is missing instead.
+            self.accounts_ui.sheet_error = Some(blocker.message().to_owned());
+            return;
+        }
         let preset = crate::provider_presets::presets().iter().find(|preset| {
             crate::provider_presets::provider_matches_preset(&status.id, &status.kind, preset)
         });
@@ -435,7 +517,32 @@ impl Session {
                     // The new account shows on the page at once.
                     self.state.providers_loaded = false;
                     self.schedule(Operation::Catalog, Duration::ZERO);
-                    self.admin_notice = Some("Account added.".into());
+                    let provider = self
+                        .accounts_ui
+                        .flow
+                        .as_ref()
+                        .map(|flow| flow.provider.clone());
+                    let waits_for_restart = provider.is_some_and(|id| {
+                        self.state
+                            .providers
+                            .iter()
+                            .any(|candidate| candidate.id == id && candidate.pending_restart)
+                    });
+                    if waits_for_restart && self.is_admin() {
+                        // Bots read providers when the server starts; a provider
+                        // saved in this session is not theirs until a restart.
+                        self.admin_notice = Some(
+                            "Account added. Restart the server so your bots can use it.".into(),
+                        );
+                        self.restart_pending = true;
+                    } else if waits_for_restart {
+                        self.admin_notice = Some(
+                            "Account added. Your bots can use it after the admin restarts the server."
+                                .into(),
+                        );
+                    } else {
+                        self.admin_notice = Some("Account added.".into());
+                    }
                 }
             }
             if let Some(flow) = self.accounts_ui.flow.as_mut() {

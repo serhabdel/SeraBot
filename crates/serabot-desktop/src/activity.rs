@@ -62,7 +62,7 @@ pub enum StepAction {
 
 impl StepAction {
     /// The server sends a sentence, not a button. The words of that sentence
-    /// decide whether Retry, Reconnect, or Open AI keys is offered.
+    /// decide whether Retry, Reconnect, or Open AI providers is offered.
     fn from_error(error: &str) -> Self {
         let lower = error.to_ascii_lowercase();
         if lower.contains("api key")

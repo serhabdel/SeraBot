@@ -54,6 +54,11 @@ jobs:
       - name: Build server release (glibc-matched)
         env:
           SERABOT_RELEASES_REPO: ${{ github.repository }}
+          # Google's public installed-app secret for the Antigravity client
+          # (crates/serabot/build.rs). Without it the deployed server has no
+          # built-in secret and Antigravity sign-in needs the console field or
+          # AGY_CLIENT_SECRET on the host. Empty when the secret is unset.
+          SERABOT_AGY_CLIENT_SECRET: ${{ secrets.SERABOT_AGY_CLIENT_SECRET }}
         run: cargo build --release --locked -p serabot
       - name: Verify glibc ceiling against the VPS
         shell: bash

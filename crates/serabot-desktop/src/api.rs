@@ -1371,6 +1371,19 @@ pub struct ProviderStatus {
     /// A plain-words risk the page shows beside a plan sign-in.
     #[serde(default)]
     pub signin_risk: Option<String>,
+    /// Why a plan sign-in is not offered: `off` (the operator turned it off)
+    /// or `admin_only` (Claude's, to a member). `None` when it is offered or
+    /// the provider has none. Older servers never send it.
+    #[serde(default)]
+    pub plan_signin: Option<String>,
+    /// What the server still lacks for this provider's sign-in to work:
+    /// `client_secret` (Antigravity's Google client secret). `None` when ready.
+    #[serde(default)]
+    pub signin_setup: Option<String>,
+    /// The console saved a newer copy of this provider than the one bots use;
+    /// a server restart applies it.
+    #[serde(default)]
+    pub pending_restart: bool,
     /// Set by the console, not the server: this is the account's default
     /// provider (its chosen route, else the server default).
     #[serde(skip)]
@@ -4811,6 +4824,14 @@ impl ApiClient {
                     .signin_risk
                     .as_deref()
                     .is_some_and(|risk| !bounded_text(risk, 512))
+                || provider
+                    .plan_signin
+                    .as_deref()
+                    .is_some_and(|word| !bounded_text(word, 32))
+                || provider
+                    .signin_setup
+                    .as_deref()
+                    .is_some_and(|word| !bounded_text(word, 32))
             {
                 return Err(ApiError::InvalidResponse);
             }

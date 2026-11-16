@@ -4,6 +4,7 @@
 //! tested on every platform.
 
 use crate::api::{CatalogEntry, ProviderStatus, ProviderTest};
+use crate::provider_presets::{ProviderPreset, presets, provider_matches_preset};
 use crate::theme::Tone;
 use std::collections::BTreeSet;
 
@@ -321,6 +322,97 @@ pub fn row_matches(row: &PickerRow, needle: &str) -> bool {
             .any(|tag| tag.to_lowercase().contains(&needle))
 }
 
+/// The preset a saved provider was made from: same id first, then the same
+/// kind (a generic OpenAI-compatible kind never matches by kind alone).
+pub fn preset_of(provider: &ProviderStatus) -> Option<&'static ProviderPreset> {
+    presets()
+        .iter()
+        .find(|preset| preset.id == provider.id)
+        .or_else(|| {
+            presets()
+                .iter()
+                .find(|preset| provider_matches_preset(&provider.id, &provider.kind, preset))
+        })
+}
+
+/// What a provider card is called: the preset's name when the provider is the
+/// preset's own (saved under its default id), the brand for a server's
+/// built-in provider, and the owner's own id for anything they named.
+pub fn card_title(provider: &ProviderStatus, brand_label: Option<&str>) -> String {
+    if let Some(preset) = preset_of(provider)
+        && (provider.id == preset.id
+            || provider.id == preset.default_id
+            || provider.id == provider.kind)
+    {
+        return preset.label.to_owned();
+    }
+    match brand_label {
+        Some(label) if provider.id == "default" || provider.id == provider.kind => label.to_owned(),
+        _ if provider.id == "default" => human_kind(&provider.kind).to_owned(),
+        _ => provider.id.clone(),
+    }
+}
+
+/// Whether the member can use this provider now: a working account, the
+/// server's sign-in, or a key.
+pub fn provider_usable(provider: &ProviderStatus, oauth_signed_in: bool) -> bool {
+    connection(provider, oauth_signed_in).is_connected()
+}
+
+/// The order of the cards: the default first, then the ones that work, then
+/// the rest, each group by title.
+pub fn card_order(
+    providers: &[ProviderStatus],
+    usable: impl Fn(&ProviderStatus) -> bool,
+) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..providers.len()).collect();
+    order.sort_by_key(|&index| {
+        let provider = &providers[index];
+        (
+            !provider.is_default,
+            !usable(provider),
+            card_title(provider, None).to_lowercase(),
+        )
+    });
+    order
+}
+
+/// Whether a preset adds an account by signing in (on its own or beside a key).
+pub fn preset_signs_in(preset: &ProviderPreset) -> bool {
+    preset.auth == "oauth" || !preset.sign_in.is_empty()
+}
+
+/// The presets the admin can still add, split into sign-in presets and key
+/// (or local, or custom) presets. A preset already saved on the server is a
+/// card above, so it is not offered twice. `query` matches name, summary, kind
+/// and model ids.
+pub fn presets_to_add(
+    saved: &[ProviderStatus],
+    query: &str,
+) -> (Vec<&'static ProviderPreset>, Vec<&'static ProviderPreset>) {
+    let needle = query.trim().to_lowercase();
+    let matches = |preset: &ProviderPreset| {
+        needle.is_empty()
+            || preset.label.to_lowercase().contains(&needle)
+            || preset.subtitle.to_lowercase().contains(&needle)
+            || preset.kind.to_lowercase().contains(&needle)
+            || preset
+                .models
+                .iter()
+                .any(|model| model.to_lowercase().contains(&needle))
+    };
+    let unsaved = |preset: &ProviderPreset| {
+        preset.id == "custom"
+            || !saved
+                .iter()
+                .any(|provider| provider_matches_preset(&provider.id, &provider.kind, preset))
+    };
+    presets()
+        .iter()
+        .filter(|preset| unsaved(preset) && matches(preset))
+        .partition(|preset| preset_signs_in(preset))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,5 +665,63 @@ mod tests {
         assert!(bad.base_url_error.is_some());
         assert!(bad.models_error.is_some());
         assert!(bad.secret_error.is_some());
+    }
+
+    fn saved(id: &str, kind: &str) -> ProviderStatus {
+        ProviderStatus {
+            id: id.into(),
+            kind: kind.into(),
+            ..ProviderStatus::default()
+        }
+    }
+
+    #[test]
+    fn a_card_is_named_after_its_preset_unless_the_owner_named_it() {
+        assert_eq!(
+            card_title(&saved("antigravity", "google-antigravity"), None),
+            "Google Antigravity"
+        );
+        assert_eq!(
+            card_title(&saved("codex", "openai-codex"), None),
+            "ChatGPT (Codex)"
+        );
+        assert_eq!(
+            card_title(&saved("anthropic", "anthropic"), None),
+            "Anthropic (Claude)"
+        );
+        assert_eq!(card_title(&saved("work", "openai"), None), "work");
+        assert_eq!(card_title(&saved("default", "xyz"), Some("Brand")), "Brand");
+    }
+
+    #[test]
+    fn the_add_section_offers_only_presets_not_saved_and_splits_sign_in_from_keys() {
+        let providers = vec![saved("codex", "openai-codex"), saved("openai", "openai")];
+        let (sign_in, keys) = presets_to_add(&providers, "");
+        let ids = |list: &[&ProviderPreset]| list.iter().map(|p| p.id).collect::<Vec<_>>();
+        let sign_in = ids(&sign_in);
+        let keys = ids(&keys);
+        assert!(!sign_in.contains(&"chatgpt-codex"), "{sign_in:?}");
+        assert!(sign_in.contains(&"anthropic") && sign_in.contains(&"antigravity"));
+        assert!(sign_in.contains(&"github-copilot"));
+        assert!(!keys.contains(&"openai") && keys.contains(&"mistral"));
+        assert!(
+            keys.contains(&"custom"),
+            "a custom endpoint can always be added"
+        );
+        let (sign_in, keys) = presets_to_add(&providers, "claude");
+        assert!(ids(&sign_in).contains(&"anthropic"));
+        assert!(!ids(&keys).contains(&"mistral"));
+    }
+
+    #[test]
+    fn cards_put_the_default_first_then_the_working_ones() {
+        let mut providers = vec![
+            saved("zeta", "openai"),
+            saved("alpha", "openai"),
+            saved("mid", "openai"),
+        ];
+        providers[2].is_default = true;
+        let order = card_order(&providers, |p| p.id == "zeta");
+        assert_eq!(order, vec![2, 0, 1]);
     }
 }

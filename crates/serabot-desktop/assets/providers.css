@@ -1,0 +1,629 @@
+/* AI providers page (0.52): the providers this server offers as cards, then
+   (admin) the providers that can still be added, sign-in first. Tokens only;
+   every transition is off under reduced motion (system or console switch). */
+
+.providers-page {
+  min-height: 0;
+}
+
+.providers-head {
+  align-items: flex-end;
+  padding-bottom: 4px;
+}
+
+.providers-intro {
+  max-width: 640px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.providers-intro .muted {
+  margin: 0;
+  line-height: 1.5;
+}
+
+.providers-head-actions {
+  flex: 0 0 auto;
+  gap: 8px;
+}
+
+.providers-body {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+  max-width: 1240px;
+}
+
+/* ---- Default model strip ---- */
+
+.prov-default {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px 24px;
+  flex-wrap: wrap;
+  padding: 14px 16px;
+  border: 1px solid var(--glass-edge);
+  border-radius: var(--r-md);
+  background: var(--card-bg);
+  box-shadow: var(--shadow-1), inset 0 1px 0 var(--glass-highlight);
+}
+
+.prov-default-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 220px;
+  flex: 1 1 260px;
+}
+
+.prov-eyebrow {
+  color: var(--label-1);
+  font-size: var(--fs-body-2);
+  font-weight: 600;
+}
+
+.prov-default-picker {
+  flex: 1 1 360px;
+  min-width: 0;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.prov-default-picker .model-bar {
+  width: 100%;
+  max-width: 560px;
+}
+
+/* The strip already says what the picker is for. */
+.prov-default-picker .model-bar > .micro {
+  display: none;
+}
+
+/* ---- Sections ---- */
+
+.prov-section {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.prov-section-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px 20px;
+  flex-wrap: wrap;
+}
+
+.prov-section-head .tiny {
+  margin: 4px 0 0;
+}
+
+.prov-section-title {
+  margin: 0;
+  color: var(--label-1);
+  font-size: var(--fs-title);
+  font-weight: 650;
+  letter-spacing: -0.015em;
+}
+
+.prov-count {
+  padding: 3px 10px;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+  font-weight: 550;
+  font-variant-numeric: tabular-nums;
+}
+
+.prov-sub-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 6px 0 0;
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.prov-search {
+  position: relative;
+  flex: 0 1 320px;
+  min-width: 220px;
+}
+
+.prov-search .search-glyph {
+  position: absolute;
+  left: 11px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  color: var(--label-3);
+  pointer-events: none;
+}
+
+.prov-search .input {
+  width: 100%;
+  padding-left: 32px;
+}
+
+/* ---- Provider cards ---- */
+
+.prov-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 440px), 1fr));
+  gap: 14px;
+  align-items: stretch;
+}
+
+.prov-card {
+  container-type: inline-size;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid var(--glass-edge);
+  border-radius: var(--r-lg);
+  background: var(--card-bg);
+  box-shadow: var(--shadow-1), inset 0 1px 0 var(--glass-highlight);
+  transition: border-color var(--dur-2) var(--ease), box-shadow var(--dur-2) var(--ease);
+}
+
+.prov-card:hover {
+  border-color: var(--hairline-strong);
+}
+
+.prov-card.is-default {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--glass-edge));
+  box-shadow: var(--shadow-1), 0 0 0 3px var(--accent-soft);
+}
+
+.prov-card.skeleton-card {
+  min-height: 180px;
+}
+
+.prov-card-head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.prov-card-title {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.prov-card-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.prov-card-name h3 {
+  margin: 0;
+  overflow: hidden;
+  color: var(--label-1);
+  font-size: var(--fs-body);
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prov-card-sub {
+  overflow: hidden;
+  color: var(--label-3);
+  font-size: var(--fs-caption);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prov-badge {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+  font-size: var(--fs-micro);
+  font-weight: 650;
+}
+
+.prov-badge.accent {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+
+.prov-models {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.prov-model {
+  max-width: 100%;
+  overflow: hidden;
+  padding: 3px 8px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-xs);
+  background: var(--surface-2);
+  color: var(--label-2);
+  font-family: var(--font-mono);
+  font-size: var(--fs-micro);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prov-model.more {
+  border-style: dashed;
+  background: var(--clear);
+  color: var(--label-3);
+  font-family: var(--font);
+}
+
+/* A notice inside a card: a problem, a pending restart, or a fix to make. */
+.prov-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+  line-height: 1.45;
+}
+
+.prov-note > svg {
+  flex: 0 0 auto;
+  margin-top: 2px;
+}
+
+.prov-note .grow {
+  flex: 1 1 auto;
+}
+
+.prov-note .btn {
+  flex: 0 0 auto;
+}
+
+.prov-note.warn {
+  border-color: color-mix(in srgb, var(--warn) 35%, var(--hairline));
+  background: var(--warn-soft);
+}
+
+.prov-note.warn > svg {
+  color: var(--warn);
+}
+
+.prov-note.info {
+  align-items: center;
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--hairline));
+  background: var(--accent-soft);
+}
+
+.prov-note.info > svg {
+  color: var(--accent-ink);
+}
+
+.prov-note.action {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--hairline));
+  background: var(--accent-soft);
+}
+
+.prov-note.action > svg {
+  color: var(--accent-ink);
+}
+
+.prov-note-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.prov-note-body > span:first-child {
+  color: var(--label-1);
+}
+
+.prov-secret-row {
+  display: flex;
+  gap: 8px;
+}
+
+.prov-secret-row .input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.prov-card-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: auto;
+  padding-top: 10px;
+  border-top: 1px solid var(--hairline);
+}
+
+.prov-card-foot:not(:has(> :not(.grow))) {
+  display: none;
+}
+
+.prov-card-foot .grow {
+  flex: 1 1 auto;
+}
+
+.prov-remove {
+  color: var(--label-3);
+}
+
+.prov-remove:hover {
+  color: var(--danger);
+}
+
+.prov-confirm {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* Accounts inside a card: the actions move under the name when the card is
+   narrow, so the name and its status never squeeze into a column. */
+.prov-card .acct-block {
+  margin-top: 0;
+}
+
+.prov-card .acct-row {
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  padding: 10px 12px 10px 8px;
+  background: var(--surface-2);
+}
+
+.prov-card .acct-name {
+  flex-wrap: nowrap;
+}
+
+.prov-card .acct-list {
+  gap: 6px;
+}
+
+/* One account has no order to change: drop the arrows and the rank. */
+.prov-card .acct-row:only-child {
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding-left: 12px;
+}
+
+.prov-card .acct-row:only-child .acct-order {
+  display: none;
+}
+
+.prov-card .acct-row:only-child > .acct-quota,
+.prov-card .acct-row:only-child > .acct-hint {
+  grid-column: 1 / -1;
+}
+
+.prov-card .acct-empty {
+  padding: 10px 12px;
+  font-size: var(--fs-caption);
+}
+
+@container (max-width: 620px) {
+  .prov-card .acct-row {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .prov-card .acct-actions {
+    grid-column: 2 / -1;
+    justify-content: flex-start;
+  }
+
+  .prov-card .acct-row:only-child {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .prov-card .acct-row:only-child .acct-actions {
+    grid-column: 1 / -1;
+  }
+}
+
+/* ---- Add a provider: sign-in tiles ---- */
+
+.prov-plan-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr));
+  gap: 12px;
+}
+
+.prov-plan {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid var(--glass-edge);
+  border-radius: var(--r-lg);
+  background:
+    radial-gradient(120% 90% at 0% 0%, var(--accent-soft), transparent 55%),
+    var(--card-bg);
+  box-shadow: var(--shadow-1), inset 0 1px 0 var(--glass-highlight);
+  transition: border-color var(--dur-2) var(--ease), transform var(--dur-2) var(--spring);
+}
+
+.prov-plan:hover {
+  border-color: var(--hairline-strong);
+}
+
+.prov-plan-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.prov-plan-title {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.prov-plan-title h4 {
+  margin: 0;
+  overflow: hidden;
+  color: var(--label-1);
+  font-size: var(--fs-body);
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prov-plan-text {
+  flex: 1 1 auto;
+  margin: 0;
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+  line-height: 1.45;
+}
+
+.prov-plan-risk {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  color: var(--label-3);
+  font-size: var(--fs-micro);
+  cursor: help;
+}
+
+.prov-plan-risk svg {
+  color: var(--warn);
+}
+
+.prov-plan-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* ---- Add a provider: API key tiles ---- */
+
+.prov-key-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 250px), 1fr));
+  gap: 8px;
+}
+
+.prov-key {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--card-bg);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color var(--dur-1) var(--ease), background var(--dur-1) var(--ease);
+}
+
+.prov-key:hover {
+  border-color: var(--hairline-strong);
+  background: var(--surface-2);
+}
+
+.prov-key:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.prov-key-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.prov-key-name {
+  overflow: hidden;
+  color: var(--label-1);
+  font-size: var(--fs-body-2);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prov-key-sub {
+  overflow: hidden;
+  color: var(--label-3);
+  font-size: var(--fs-micro);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prov-key-cta {
+  color: var(--accent-ink);
+  font-size: var(--fs-caption);
+  font-weight: 600;
+  white-space: nowrap;
+  opacity: 0.75;
+  transition: opacity var(--dur-1) var(--ease);
+}
+
+.prov-key:hover .prov-key-cta,
+.prov-key:focus-visible .prov-key-cta {
+  opacity: 1;
+}
+
+.prov-empty {
+  padding: 40px 16px;
+}
+
+.prov-usage {
+  margin-top: 4px;
+}
+
+@media (max-width: 760px) {
+  .providers-head {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .prov-default-picker {
+    justify-content: stretch;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .prov-card,
+  .prov-plan,
+  .prov-key,
+  .prov-key-cta {
+    transition: none;
+  }
+}
+
+.root[data-motion="reduce"] .prov-card,
+.root[data-motion="reduce"] .prov-plan,
+.root[data-motion="reduce"] .prov-key,
+.root[data-motion="reduce"] .prov-key-cta {
+  transition: none;
+}

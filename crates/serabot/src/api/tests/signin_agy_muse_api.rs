@@ -328,8 +328,17 @@ async fn a_member_signs_in_to_antigravity_and_nobody_else_sees_it() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// Whether this build or environment supplies an Antigravity client secret
+/// without the age store.
+fn built_in_client_secret() -> bool {
+    let env = std::env::var(crate::cloud_code::ANTIGRAVITY_CLIENT_SECRET_ENV).ok();
+    !crate::cloud_code::pick_antigravity_client_secret(None, env.as_deref())
+        .trim()
+        .is_empty()
+}
+
 #[tokio::test]
-async fn antigravity_sign_in_starts_without_any_stored_client_secret() {
+async fn antigravity_sign_in_without_a_stored_client_secret_starts_only_with_a_built_in_one() {
     let env = env(false).await;
     let (status, body) = call(
         &env,
@@ -339,9 +348,37 @@ async fn antigravity_sign_in_starts_without_any_stored_client_secret() {
         Some(json!({"flow": "pkce", "redirect_uri": REDIRECT})),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(!body.to_string().contains("not set up"), "{body}");
     no_secrets(&body.to_string());
+    let (_, listing) = call(&env, &env.alice, "GET", "/v1/providers/agy/accounts", None).await;
+    if built_in_client_secret() {
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!body.to_string().contains("not set up"), "{body}");
+        assert!(listing["signin_setup"].is_null(), "{listing}");
+    } else {
+        // Refused before Google, and the page is told what the admin must add.
+        assert!(status.is_client_error(), "{status} {body}");
+        assert!(body.to_string().contains("not set up"), "{body}");
+        assert_eq!(listing["signin_setup"], "client_secret", "{listing}");
+    }
+}
+
+#[tokio::test]
+async fn a_stored_client_secret_makes_antigravity_sign_in_ready() {
+    let env = env(true).await;
+    let (status, body) = call(
+        &env,
+        &env.alice,
+        "POST",
+        "/v1/providers/agy/signin/start",
+        Some(json!({"flow": "pkce", "redirect_uri": REDIRECT})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    no_secrets(&body.to_string());
+    let (_, listing) = call(&env, &env.alice, "GET", "/v1/providers/agy/accounts", None).await;
+    assert!(listing["signin_setup"].is_null(), "{listing}");
+    assert!(listing["plan_signin"].is_null(), "{listing}");
+    assert_eq!(listing["pending_restart"], false, "{listing}");
 }
 
 #[tokio::test]

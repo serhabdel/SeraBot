@@ -149,7 +149,7 @@ pub(super) fn IconRail(session: Signal<Session>, toast: Signal<Option<(String, b
         (Section::Vault, "lock", "Vault"),
         (Section::Usage, "usage", "Usage"),
         (Section::Workflows, "workflows", "Workflows"),
-        (Section::Providers, "providers", "AI keys"),
+        (Section::Providers, "providers", "AI providers"),
         (Section::Logs, "logs", "Logs"),
     ];
     rsx! {
@@ -1150,9 +1150,9 @@ pub(super) fn ActivityRow(mut session: Signal<Session>, step: Step) -> Element {
                             button {
                                 class: "btn ghost sm",
                                 r#type: "button",
-                                "aria-label": "Open AI keys",
+                                "aria-label": "Open AI providers",
                                 onclick: move |_| session.write().open_section(Section::Providers),
-                                "Open AI keys"
+                                "Open AI providers"
                             }
                         },
                         StepAction::Reconnect => rsx! {

@@ -76,7 +76,7 @@ pub(super) async fn list_providers(
                     is_admin,
                 );
             }
-            Ok(json!({
+            let mut view = json!({
                 "id": provider.id,
                 "kind": provider.kind,
                 "auth": if is_oauth { "oauth" } else { "api_key" },
@@ -111,7 +111,15 @@ pub(super) async fn list_providers(
                         &crate::providers::canonical_kind(&provider.kind)?,
                     ),
                 ),
-            }))
+            });
+            add_signin_status(
+                &mut view,
+                &state,
+                is_admin,
+                &provider.id,
+                &crate::providers::canonical_kind(&provider.kind)?,
+            );
+            Ok(view)
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -160,7 +168,7 @@ pub(super) async fn list_providers(
                     })
                     .map(|(name, _)| name.clone())
                     .collect::<Vec<_>>();
-                providers.push(json!({
+                let mut view = json!({
                     "id": id,
                     "kind": profile.kind,
                     "auth": if is_oauth { "oauth" } else { "api_key" },
@@ -195,7 +203,15 @@ pub(super) async fn list_providers(
                             &crate::providers::canonical_kind(&profile.kind)?,
                         ),
                     ),
-                }));
+                });
+                add_signin_status(
+                    &mut view,
+                    &state,
+                    is_admin,
+                    &id,
+                    &crate::providers::canonical_kind(&profile.kind)?,
+                );
+                providers.push(view);
             }
         }
     }
@@ -393,8 +409,35 @@ pub(super) fn provider_profile(state: &ApiState, id: &str) -> Result<ProviderCon
     state
         .admin
         .as_ref()
-        .and_then(|admin| admin.snapshot().providers.get(id).cloned())
+        .and_then(|admin| admin.provider(id))
         .ok_or_else(|| SeraError::NotFound(format!("provider {id}")))
+}
+
+/// A provider's profile as last saved. An owner-managed provider's console
+/// copy wins over the one loaded at startup, so a sign-in setting saved in the
+/// console (Claude's plan sign-in, for one) applies to sign-in at once. The
+/// model router still reads the startup copy until the server restarts; the
+/// listing says so with `pending_restart`.
+pub(super) fn live_provider_profile(state: &ApiState, id: &str) -> Result<ProviderConfig> {
+    validate_provider(id)?;
+    if id != "default"
+        && let Some(profile) = state.admin.as_ref().and_then(|admin| admin.provider(id))
+    {
+        return Ok(profile);
+    }
+    provider_profile(state, id)
+}
+
+/// Whether the console holds a newer copy of this provider than the one the
+/// model router was built from, so bots use the change only after a restart.
+pub(super) fn provider_pending_restart(state: &ApiState, id: &str) -> bool {
+    let Some(saved) = state.admin.as_ref().and_then(|admin| admin.provider(id)) else {
+        return false;
+    };
+    match state.config.llm.providers.get(id) {
+        None => true,
+        Some(loaded) => serde_json::to_value(&saved).ok() != serde_json::to_value(loaded).ok(),
+    }
 }
 
 /// Ask one provider for its live model list with the acting user's own key.

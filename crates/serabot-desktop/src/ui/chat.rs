@@ -1347,9 +1347,9 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     button {
                                         class: "btn ghost sm",
                                         r#type: "button",
-                                        "aria-label": "Open AI keys",
+                                        "aria-label": "Open AI providers",
                                         onclick: move |_| session.write().open_section(Section::Providers),
-                                        "Open AI keys"
+                                        "Open AI providers"
                                     }
                                 },
                                 ChatAction::None => rsx! {},
