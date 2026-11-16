@@ -133,6 +133,7 @@ pub(super) async fn select_model(
         ModelSelection {
             provider: request.provider,
             model: request.model,
+            account: None,
         }
     };
     let selection = state.runtime.select_model(&user.id, &id, selection)?;

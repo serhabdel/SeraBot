@@ -59,13 +59,25 @@ pub trait ProviderCredentials: Send + Sync {
 pub struct ModelSelection {
     pub provider: String,
     pub model: String,
+    /// The user's account to call with. `None` means the provider's pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 
 impl ModelSelection {
+    pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+            account: None,
+        }
+    }
+
     pub fn auto_mode() -> Self {
         Self {
             provider: AUTO_PROVIDER.into(),
             model: String::new(),
+            account: None,
         }
     }
 
@@ -159,10 +171,39 @@ struct CatalogState {
     checked_at: BTreeMap<String, DateTime<Utc>>,
 }
 
+/// One fallback in a pinned chain, with the provider configuration it was
+/// pinned against.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteHop {
+    pub selection: ModelSelection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    pub fingerprint: String,
+}
+
+/// A turn's pinned route chain: the head (`selection`), the fallbacks tried
+/// after it, and the failover policy. The fingerprint covers the head's
+/// provider configuration, its account and the whole chain, so changing any
+/// of them makes a queued pin stale. A plain route (no account, no chain)
+/// keeps the provider's own fingerprint.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PinnedRoute {
     pub selection: ModelSelection,
     pub fingerprint: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallbacks: Vec<RouteHop>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failover: Option<crate::config::FailoverPolicy>,
+}
+
+/// The chain a bot's own configuration contributes to a turn, resolved for
+/// one user: only routes that user can run right now are kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BotChain {
+    pub head: Option<ModelSelection>,
+    pub head_thinking: Option<String>,
+    pub hops: Vec<(ModelSelection, Option<String>)>,
+    pub failover: Option<crate::config::FailoverPolicy>,
 }
 
 #[derive(Clone)]
@@ -377,11 +418,12 @@ impl ModelRouter {
     /// disconnect, grant revocation).
     pub fn invalidate_user(&self, user_id: &str) {
         for provider in self.providers.values() {
+            let prefix = account_cache_key(user_id, "");
             provider
                 .user_clients
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .remove(user_id);
+                .retain(|key, _| key != user_id && !key.starts_with(&prefix));
         }
     }
 
@@ -621,6 +663,7 @@ impl ModelRouter {
             return ModelSelection {
                 provider: "default".into(),
                 model,
+                account: None,
             };
         }
         if let Some(selection) = self.find_available_model(user_id, &model) {
@@ -635,11 +678,13 @@ impl ModelRouter {
             return ModelSelection {
                 provider: provider.id.clone(),
                 model,
+                account: None,
             };
         }
         ModelSelection {
             provider: "default".into(),
             model,
+            account: None,
         }
     }
 
@@ -759,6 +804,7 @@ impl ModelRouter {
             return Some(ModelSelection {
                 provider: id.to_owned(),
                 model: model.to_owned(),
+                account: None,
             });
         }
         for (id, provider) in &self.providers {
@@ -766,6 +812,7 @@ impl ModelRouter {
                 return Some(ModelSelection {
                     provider: id.clone(),
                     model: model.to_owned(),
+                    account: None,
                 });
             }
         }
@@ -782,6 +829,7 @@ impl ModelRouter {
             .map(|provider| ModelSelection {
                 provider: provider.id.clone(),
                 model: model.to_owned(),
+                account: None,
             })
     }
 
@@ -827,6 +875,7 @@ impl ModelRouter {
                 return Some(ModelSelection {
                     provider,
                     model: other.clone(),
+                    account: None,
                 });
             }
         }
@@ -840,6 +889,7 @@ impl ModelRouter {
                     return Some(ModelSelection {
                         provider: id.clone(),
                         model,
+                        account: None,
                     });
                 }
             }
@@ -872,7 +922,136 @@ impl ModelRouter {
         Ok(PinnedRoute {
             selection: selection.clone(),
             fingerprint: provider.fingerprint.clone(),
+            fallbacks: Vec::new(),
+            failover: None,
         })
+    }
+
+    /// Pin `selection` with the fallbacks and policy a bot contributes. Every
+    /// hop must name a configured, egress-approved provider.
+    pub fn pin_chain(
+        &self,
+        selection: &ModelSelection,
+        hops: &[(ModelSelection, Option<String>)],
+        failover: Option<crate::config::FailoverPolicy>,
+    ) -> Result<PinnedRoute> {
+        let mut route = self.pin(selection)?;
+        for (hop, thinking) in hops {
+            let pinned = self.pin(hop)?;
+            route.fallbacks.push(RouteHop {
+                selection: hop.clone(),
+                thinking: thinking.clone(),
+                fingerprint: pinned.fingerprint,
+            });
+        }
+        route.failover = failover;
+        if route.selection.account.is_some() || !route.fallbacks.is_empty() || failover.is_some() {
+            route.fingerprint = chain_fingerprint(&route);
+        }
+        Ok(route)
+    }
+
+    /// Pin `selection` and attach the chain `config` contributes for `user_id`.
+    pub fn pin_for_bot(
+        &self,
+        user_id: &str,
+        selection: &ModelSelection,
+        config: &crate::config::BotConfig,
+    ) -> Result<PinnedRoute> {
+        let chain = self.bot_chain(user_id, config);
+        let hops: Vec<_> = chain
+            .hops
+            .into_iter()
+            .filter(|(hop, _)| hop != selection)
+            .collect();
+        self.pin_chain(selection, &hops, chain.failover)
+    }
+
+    /// The chain a bot's route, fallbacks and failover policy resolve to for
+    /// `user_id`. The primary resolves per user: a route naming a provider the
+    /// user cannot run yields no head, and the caller falls back to the user's
+    /// default route. A fallback the user cannot run (no credential, no egress
+    /// approval, model not offered) is left out here and checked again on
+    /// every call.
+    pub fn bot_chain(&self, user_id: &str, config: &crate::config::BotConfig) -> BotChain {
+        let ready = |route: &crate::config::BotRoute| {
+            let selection = ModelSelection {
+                provider: route.provider.clone(),
+                model: route.model.clone(),
+                account: route.account.clone(),
+            };
+            self.provider_ready(user_id, &selection)
+                .then_some((selection, route.thinking.clone()))
+        };
+        let head = config.route.as_ref().and_then(ready);
+        let hops = config.fallbacks.iter().filter_map(ready).collect();
+        let (head, head_thinking) = match head {
+            Some((selection, thinking)) => (Some(selection), thinking),
+            None => (None, None),
+        };
+        let has_chain = config.route.is_some() || !config.fallbacks.is_empty();
+        BotChain {
+            head,
+            head_thinking,
+            hops,
+            failover: (has_chain || !config.failover.is_default()).then_some(config.failover),
+        }
+    }
+
+    /// Whether `selection` can run for `user_id` now: the provider is
+    /// configured, the user holds a credential for it, it is egress-approved
+    /// and its model list offers the model.
+    pub fn provider_ready(&self, user_id: &str, selection: &ModelSelection) -> bool {
+        self.providers
+            .get(&selection.provider)
+            .is_some_and(|provider| provider.data_egress_approved)
+            && self.validate_selection(user_id, selection).is_ok()
+            && self.validate_selection_config(selection).is_ok()
+    }
+
+    /// Check one route entry for a bot save: the provider, the model against
+    /// the live catalog, the egress approval and the thinking level.
+    pub fn validate_route_entry(
+        &self,
+        user_id: &str,
+        route: &crate::config::BotRoute,
+    ) -> Result<()> {
+        route.validate_shape()?;
+        let selection = ModelSelection {
+            provider: route.provider.clone(),
+            model: route.model.clone(),
+            account: route.account.clone(),
+        };
+        self.validate_selection(user_id, &selection)?;
+        self.validate_selection_config(&selection)?;
+        let provider = &self.providers[&selection.provider];
+        if !provider.data_egress_approved {
+            return Err(SeraError::Rejected {
+                code: "egress_not_approved",
+                message: format!(
+                    "{} has no data-egress approval, so a route cannot use it",
+                    provider_label(provider)
+                ),
+            });
+        }
+        if let Some(level) = &route.thinking
+            && !self
+                .thinking_levels(user_id, &selection)
+                .contains(&level.as_str())
+        {
+            return Err(SeraError::Rejected {
+                code: "thinking_unavailable",
+                message: "That thinking level isn't available for this model".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The provider's kind (`openai`, `anthropic`, ...), when configured.
+    pub fn provider_kind(&self, provider: &str) -> Option<&str> {
+        self.providers
+            .get(provider)
+            .map(|entry| entry.kind.as_str())
     }
 
     /// Config-only selection validation (no credential check). Used by
@@ -890,8 +1069,13 @@ impl ModelRouter {
     }
 
     pub fn validate_pinned(&self, route: &PinnedRoute) -> Result<()> {
-        let current = self.pin(&route.selection)?;
-        if current.fingerprint != route.fingerprint {
+        let hops: Vec<_> = route
+            .fallbacks
+            .iter()
+            .map(|hop| (hop.selection.clone(), hop.thinking.clone()))
+            .collect();
+        let current = self.pin_chain(&route.selection, &hops, route.failover)?;
+        if current.fingerprint != route.fingerprint || current.fallbacks != route.fallbacks {
             return Err(SeraError::Forbidden(
                 "pinned provider configuration changed; owner must resubmit the request".into(),
             ));
@@ -933,36 +1117,96 @@ impl ModelRouter {
         thinking: Option<&str>,
     ) -> Result<LlmResponse> {
         self.validate_pinned(route)?;
-        let provider = &self.providers[&route.selection.provider];
+        self.complete_on(
+            user_id,
+            &route.selection,
+            messages,
+            tools,
+            temperature,
+            thinking,
+        )
+        .await
+    }
+
+    /// One model call on one candidate of a chain: the provider's client for
+    /// the selection's account (the pool's best when it names none). The
+    /// caller has validated the pin; this checks the user's credential and
+    /// the live catalog, never another candidate.
+    pub(crate) async fn complete_on(
+        &self,
+        user_id: &str,
+        selection: &ModelSelection,
+        messages: &[LlmMessage],
+        tools: &[ToolSpec],
+        temperature: Option<f32>,
+        thinking: Option<&str>,
+    ) -> Result<LlmResponse> {
+        let provider = self
+            .providers
+            .get(&selection.provider)
+            .ok_or_else(|| unknown_provider_error(&selection.provider))?;
         if !provider.available(user_id) {
-            return Err(no_credential_error(&route.selection.provider));
+            return Err(no_credential_error(&selection.provider));
         }
         if provider.catalog_fetch {
-            self.refresh_provider(&route.selection.provider, user_id)
-                .await?;
-            if !provider.verified_contains(user_id, &route.selection.model) {
-                return Err(model_unavailable_error(provider, &route.selection.model));
+            self.refresh_provider(&selection.provider, user_id).await?;
+            if !provider.verified_contains(user_id, &selection.model) {
+                return Err(model_unavailable_error(provider, &selection.model));
             }
         }
         let extra = thinking.and_then(|level| {
             crate::thinking::wire_fields(
                 &provider.kind,
-                &route.selection.model,
-                &provider.model_tags(user_id, &route.selection.model),
+                &selection.model,
+                &provider.model_tags(user_id, &selection.model),
                 level,
             )
         });
         provider
-            .client_for(&route.selection.provider, user_id)?
+            .client_for_account(&selection.provider, user_id, selection.account.as_deref())?
             .complete_with(
                 messages,
                 tools,
-                Some(&route.selection.model),
+                Some(&selection.model),
                 temperature,
                 extra.as_ref(),
             )
             .await
     }
+}
+
+/// The fingerprint of a whole chain: the head's provider configuration and
+/// account, each fallback's configuration, model, account and thinking level,
+/// and the policy.
+fn chain_fingerprint(route: &PinnedRoute) -> String {
+    let hops: Vec<_> = route
+        .fallbacks
+        .iter()
+        .map(|hop| {
+            (
+                &hop.fingerprint,
+                &hop.selection.provider,
+                &hop.selection.model,
+                &hop.selection.account,
+                &hop.thinking,
+            )
+        })
+        .collect();
+    sha256_hex(
+        serde_json::to_vec(&(
+            "chain.v1",
+            &route.fingerprint,
+            &route.selection.account,
+            hops,
+            &route.failover,
+        ))
+        .unwrap_or_default(),
+    )
+}
+
+/// Cache key of one account's client; `user_id` alone keys the pool client.
+fn account_cache_key(user_id: &str, account: &str) -> String {
+    format!("{user_id}\u{1}{account}")
 }
 
 /// A readable name for a provider in user-facing messages: the configured id,
@@ -1038,6 +1282,30 @@ impl Provider {
             .ok_or_else(|| SeraError::Internal("the provider credentials are missing".into()))?;
         let client = credentials.client(user_id, id, &self.profile)?;
         cache.insert(user_id.to_owned(), client.clone());
+        Ok(client)
+    }
+
+    /// The client for one named account, cached per (user, account). With no
+    /// account (or a router without a resolver) this is [`Self::client_for`].
+    fn client_for_account(
+        &self,
+        id: &str,
+        user_id: &str,
+        account: Option<&str>,
+    ) -> Result<LlmClient> {
+        let (Some(account), Some(credentials)) = (account, self.credentials()) else {
+            return self.client_for(id, user_id);
+        };
+        let key = account_cache_key(user_id, account);
+        let mut cache = self
+            .user_clients
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(client) = cache.get(&key) {
+            return Ok(client.clone());
+        }
+        let client = credentials.client_for_account(user_id, id, &self.profile, account)?;
+        cache.insert(key, client.clone());
         Ok(client)
     }
 
@@ -1322,6 +1590,7 @@ mod tests {
                 &ModelSelection {
                     provider: "default".into(),
                     model: "shared-model".into(),
+                    account: None,
                 },
             )
             .unwrap_err();
@@ -1482,6 +1751,7 @@ mod tests {
                 .pin(&ModelSelection {
                     provider: provider.into(),
                     model: model.into(),
+                    account: None,
                 })
                 .unwrap();
             router
@@ -1505,6 +1775,7 @@ mod tests {
             .pin(&ModelSelection {
                 provider: "second".into(),
                 model: "second-model".into(),
+                account: None,
             })
             .unwrap();
         config
@@ -1574,13 +1845,58 @@ mod tests {
                 router
                     .pin(&ModelSelection {
                         provider: provider.into(),
-                        model: model.into()
+                        model: model.into(),
+                        account: None,
                     })
                     .is_err()
             );
         }
         assert_eq!(first.received_requests().await.unwrap().len(), 0);
         assert_eq!(second.received_requests().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn route_entries_are_checked_for_catalog_thinking_and_egress() {
+        use crate::config::BotRoute;
+        let (mut config, clients, _first, _second) = fixture().await;
+        config
+            .providers
+            .get_mut("second")
+            .unwrap()
+            .data_egress_approved = false;
+        let router = ModelRouter::new(&config, clients).unwrap();
+        let entry = |provider: &str, model: &str, thinking: Option<&str>| BotRoute {
+            provider: provider.into(),
+            model: model.into(),
+            thinking: thinking.map(str::to_owned),
+            account: None,
+        };
+        router
+            .validate_route_entry("alice", &entry("default", "first-model", None))
+            .unwrap();
+        // A fallback provider without data-egress approval is refused.
+        assert!(
+            router
+                .validate_route_entry("alice", &entry("second", "second-model", None))
+                .is_err()
+        );
+        // A model the catalog does not offer.
+        assert!(
+            router
+                .validate_route_entry("alice", &entry("default", "nope", None))
+                .is_err()
+        );
+        // A thinking level the model has no control for.
+        let error = router
+            .validate_route_entry("alice", &entry("default", "first-model", Some("high")))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SeraError::Rejected {
+                code: "thinking_unavailable",
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -1627,6 +1943,7 @@ mod tests {
             ModelSelection {
                 provider: "second".into(),
                 model: "second-model".into(),
+                account: None,
             }
         );
         assert_eq!(
@@ -1636,6 +1953,7 @@ mod tests {
             ModelSelection {
                 provider: "default".into(),
                 model: "first-model".into(),
+                account: None,
             }
         );
         assert_eq!(
@@ -1645,6 +1963,7 @@ mod tests {
             ModelSelection {
                 provider: "default".into(),
                 model: "first-model".into(),
+                account: None,
             }
         );
     }
@@ -1692,6 +2011,7 @@ mod tests {
             ModelSelection {
                 provider: "default".into(),
                 model: "first-model".into(),
+                account: None,
             }
         );
     }
@@ -1784,6 +2104,7 @@ mod tests {
                     &ModelSelection {
                         provider: "default".into(),
                         model: "missing".into(),
+                        account: None,
                     }
                 )
                 .is_err()
@@ -1794,6 +2115,7 @@ mod tests {
                 &ModelSelection {
                     provider: "default".into(),
                     model: "extra".into(),
+                    account: None,
                 },
             )
             .unwrap();
@@ -1801,6 +2123,7 @@ mod tests {
             .pin(&ModelSelection {
                 provider: "default".into(),
                 model: "kept".into(),
+                account: None,
             })
             .unwrap();
         router
@@ -1817,6 +2140,7 @@ mod tests {
             .pin(&ModelSelection {
                 provider: "default".into(),
                 model: "missing".into(),
+                account: None,
             })
             .unwrap();
         assert!(
@@ -1875,6 +2199,7 @@ mod tests {
             .pin(&ModelSelection {
                 provider: "default".into(),
                 model: "kept".into(),
+                account: None,
             })
             .unwrap();
         router
@@ -1895,6 +2220,7 @@ mod tests {
                     &ModelSelection {
                         provider: "default".into(),
                         model: "other".into(),
+                        account: None,
                     }
                 )
                 .is_err()
@@ -1928,6 +2254,7 @@ mod tests {
                 .pin(&ModelSelection {
                     provider: "default".into(),
                     model: "kept".into(),
+                    account: None,
                 })
                 .is_err()
         );
@@ -2031,6 +2358,7 @@ mod tests {
                     &ModelSelection {
                         provider: "default".into(),
                         model: "MiniMax-M2".into(),
+                        account: None,
                     }
                 )
                 .is_err()
@@ -2172,6 +2500,7 @@ mod tests {
                     &ModelSelection {
                         provider: "default".into(),
                         model: "missing-model".into(),
+                        account: None,
                     }
                 )
                 .is_err()
@@ -2260,6 +2589,7 @@ mod tests {
                 &ModelSelection {
                     provider: "default".into(),
                     model: "live-a".into(),
+                    account: None,
                 },
             )
             .unwrap();
@@ -2270,6 +2600,7 @@ mod tests {
                     &ModelSelection {
                         provider: "default".into(),
                         model: "allow-a".into(),
+                        account: None,
                     }
                 )
                 .is_err()
@@ -2357,6 +2688,7 @@ mod tests {
             let selection = ModelSelection {
                 provider: entry.provider.clone(),
                 model: entry.model.clone(),
+                account: None,
             };
             router.pin(&selection).unwrap();
             router.catalog_gate("alice", &selection).unwrap();
@@ -2369,6 +2701,7 @@ mod tests {
             let selection = ModelSelection {
                 provider: "default".into(),
                 model: model.into(),
+                account: None,
             };
             assert!(
                 router.pin(&selection).is_err()
@@ -2386,6 +2719,7 @@ mod tests {
             let selection = ModelSelection {
                 provider: provider.clone(),
                 model: model.clone(),
+                account: None,
             };
             assert!(router.catalog_gate("bob", &selection).is_err());
         }
@@ -2445,6 +2779,7 @@ mod tests {
         let pick = |model: &str| ModelSelection {
             provider: "default".into(),
             model: model.into(),
+            account: None,
         };
         router.catalog_gate("alice", &pick("a-model")).unwrap();
         assert!(router.catalog_gate("alice", &pick("static-model")).is_err());
@@ -2494,6 +2829,7 @@ mod tests {
             Some(ModelSelection {
                 provider: "second".into(),
                 model: "second-model".into(),
+                account: None,
             })
         );
         assert_eq!(router.fallback_for_model("other"), None);
@@ -2532,6 +2868,7 @@ mod live_catalog_tests {
         ModelSelection {
             provider: "default".into(),
             model: id.into(),
+            account: None,
         }
     }
 

@@ -52,6 +52,7 @@ use crate::util::truncate_chars;
 mod activity;
 use activity::StepPhase;
 mod extract;
+mod failover;
 mod models;
 mod notifier;
 mod prompts;

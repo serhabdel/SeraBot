@@ -418,6 +418,7 @@ pub(super) async fn bot_detail(
         &ModelSelection {
             provider: provider.clone(),
             model: model.clone(),
+            account: None,
         },
     );
     let fallback = state.runtime.router().fallback_for_model(&model);
@@ -455,6 +456,7 @@ pub(super) async fn bot_detail(
         "thinking_levels": thinking_levels,
         "fallback_provider": fallback.as_ref().map(|route| route.provider.clone()),
         "fallback_model": fallback.as_ref().map(|route| route.model.clone()),
+        "route": route_view(&state, &user.id, &id, loaded.as_ref().map(|bot| &bot.config)),
         "routing_classes": routing_classes,
         "instructions": instructions,
         "instructions_bytes": instructions_bytes,
@@ -625,11 +627,30 @@ pub(super) async fn update_bot(
                     &ModelSelection {
                         provider: choice.provider.clone(),
                         model: choice.model.clone(),
+                        account: None,
                     },
                 )?;
                 Some(choice.model.clone())
             }
         };
+    }
+
+    if model_changed && config.route.is_some() {
+        // The route head is what the bot runs; a model edit moves it.
+        match &request.model {
+            Some(Some(choice)) => {
+                if let Some(route) = config.route.as_mut() {
+                    route.provider = choice.provider.clone();
+                    route.model = choice.model.clone();
+                    route.account = None;
+                    route.thinking = None;
+                }
+            }
+            _ => {
+                config.route = None;
+                config.fallbacks.clear();
+            }
+        }
     }
 
     if let Some(choice) = &request.thinking {
@@ -767,6 +788,135 @@ pub(super) async fn update_bot(
                 .unwrap_or_else(|| crate::browser_profiles::DEFAULT_PROFILE.to_owned()),
         }
     })))
+}
+
+/// The bot's route as the owner sees it: what is configured, where a call
+/// would start now, and the last time a turn switched away from it.
+fn route_view(state: &ApiState, user_id: &str, id: &str, config: Option<&BotConfig>) -> Value {
+    let Some(config) = config else {
+        return Value::Null;
+    };
+    let chain = state.runtime.router().bot_chain(user_id, config);
+    let last_switch = state
+        .store
+        .route_events(user_id, None, 100)
+        .ok()
+        .and_then(|events| {
+            events
+                .into_iter()
+                .find(|event| event.bot.as_deref() == Some(id))
+        });
+    json!({
+        "route": config.route,
+        "fallbacks": config.fallbacks,
+        "failover": config.failover,
+        "effective": chain.head.map(|head| json!({
+            "provider": head.provider,
+            "model": head.model,
+            "account": head.account,
+            "thinking": chain.head_thinking,
+        })),
+        "last_switch": last_switch,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct UpdateRouteRequest {
+    /// The primary route, or `null` to follow the default route.
+    #[serde(default, deserialize_with = "double_option")]
+    route: Option<Option<crate::config::BotRoute>>,
+    /// At most two routes tried after the primary.
+    #[serde(default)]
+    fallbacks: Option<Vec<crate::config::BotRoute>>,
+    #[serde(default)]
+    failover: Option<crate::config::FailoverPolicy>,
+}
+
+/// `PUT /v1/bots/{id}/route`: set the session user's bot route, fallbacks
+/// and failover policy. Every entry is checked against the live catalog, the
+/// model's thinking levels and the provider's egress approval before the
+/// write. Turns queued under the old chain are refused and resubmitted.
+pub(super) async fn update_bot_route(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+    Json(request): Json<UpdateRouteRequest>,
+) -> Result<Json<Value>> {
+    if !safe_bot_label(&id) {
+        return Err(SeraError::NotFound(format!("bot {id}")));
+    }
+    if request.route.is_none() && request.fallbacks.is_none() && request.failover.is_none() {
+        return Err(SeraError::Validation(
+            "at least one of route, fallbacks, failover is required".into(),
+        ));
+    }
+    let row = state
+        .runtime
+        .fleet()
+        .row(&user.id, &id)?
+        .ok_or_else(|| SeraError::NotFound(format!("bot {id}")))?;
+    let mut config = parse_bot_config(&row)?;
+    if let Some(route) = request.route {
+        config.route = route;
+    }
+    if let Some(fallbacks) = request.fallbacks {
+        config.fallbacks = fallbacks;
+    }
+    if let Some(failover) = request.failover {
+        config.failover = failover;
+    }
+    // Shape first (counts, duplicates), then the scan, then the live checks.
+    crate::config::validate_route(config.route.as_ref(), &config.fallbacks, &config.failover)?;
+    state.runtime.ensure_model_catalogs(&user.id).await;
+    for entry in config.route.iter().chain(&config.fallbacks) {
+        for text in [
+            Some(&entry.provider),
+            Some(&entry.model),
+            entry.account.as_ref(),
+            entry.thinking.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            state.runtime.scan_owner_output(&user.id, text)?;
+        }
+        state
+            .runtime
+            .router()
+            .validate_route_entry(&user.id, entry)?;
+    }
+    // The legacy fields stay in step with the head, for older readers.
+    if let Some(head) = &config.route {
+        config.model = Some(head.model.clone());
+        config.thinking = head.thinking.clone();
+    }
+    let value = serde_json::to_value(&config)?;
+    if !state
+        .store
+        .update_bot(&user.id, &id, &value, &row.prompt, row.enabled)?
+    {
+        return Err(SeraError::NotFound(format!("bot {id}")));
+    }
+    state.runtime.fleet().invalidate(&user.id);
+    state.store.record_audit(
+        &user.id,
+        "bot.route_updated",
+        None,
+        None,
+        None,
+        None,
+        Some(state.runtime.policy_version()),
+        Some(&json!({
+            "id": id,
+            "fallbacks": config.fallbacks.len(),
+            "allow_cross_provider": config.failover.allow_cross_provider,
+            "failover_enabled": config.failover.enabled,
+        })),
+    )?;
+    Ok(Json(
+        json!({ "bot": id, "route": route_view(&state, &user.id, &id, Some(&config)) }),
+    ))
 }
 
 /// `DELETE /v1/bots/{id}` — remove one specialist owned by the session user.

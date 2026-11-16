@@ -283,14 +283,17 @@ fn member_turn_payload(
             "bot {to_bot} cannot take part in a team turn"
         )));
     }
-    let selection = router.select_class(
-        user_id,
-        Some("routine"),
-        bot.config.model.as_deref(),
-        &bot.config.name,
-        &Default::default(),
-    )?;
-    let route = router.pin(&selection)?;
+    let selection = match router.bot_chain(user_id, &bot.config).head {
+        Some(head) => head,
+        None => router.select_class(
+            user_id,
+            Some("routine"),
+            bot.config.model.as_deref(),
+            &bot.config.name,
+            &Default::default(),
+        )?,
+    };
+    let route = router.pin_for_bot(user_id, &selection, &bot.config)?;
     Ok(json!({
         "conversation_id": conversation_id,
         "text": text,
@@ -857,6 +860,9 @@ mod tests {
                 thinking: None,
                 role,
                 delegates: vec![],
+                route: None,
+                fallbacks: Vec::new(),
+                failover: Default::default(),
             },
             prompt: name.into(),
         }

@@ -454,6 +454,7 @@ pub fn router(state: ApiState) -> Router {
             "/v1/bots/{id}",
             get(bot_detail).put(update_bot).delete(delete_bot),
         )
+        .route("/v1/bots/{id}/route", put(update_bot_route))
         .route("/v1/skills", get(list_skills).post(create_skill_pack))
         .route(
             "/v1/conversations",

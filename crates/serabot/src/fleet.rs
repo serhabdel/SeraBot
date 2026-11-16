@@ -672,6 +672,9 @@ mod tests {
                 thinking: None,
                 role,
                 delegates,
+                route: None,
+                fallbacks: Vec::new(),
+                failover: Default::default(),
             },
             prompt: format!("{name} prompt"),
         }

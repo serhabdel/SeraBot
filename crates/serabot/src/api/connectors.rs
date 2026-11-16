@@ -433,6 +433,7 @@ pub(super) async fn set_default_route(
         ModelSelection {
             provider: request.provider,
             model: request.model,
+            account: None,
         },
     )?;
     Ok(Json(json!({"selection": selection})))
@@ -1326,6 +1327,9 @@ mod tests {
                     thinking: None,
                     role: BotRole::Orchestrator,
                     delegates: vec![],
+                    route: None,
+                    fallbacks: Vec::new(),
+                    failover: Default::default(),
                 },
                 prompt: "test prompt".into(),
             }],
