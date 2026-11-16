@@ -106,6 +106,20 @@ impl OauthNet {
             && matches!(url.host_str(), Some("127.0.0.1" | "localhost"))
     }
 
+    /// The egress rule for an MCP server URL: [`crate::plugin_runtime::check_egress`],
+    /// except that tests may name a loopback mock server.
+    pub fn check_mcp_egress(&self, url: &str, hosts: &[String]) -> Result<()> {
+        if self.is_loopback_test_url(url) {
+            return Ok(());
+        }
+        crate::plugin_runtime::check_egress(url, hosts)
+    }
+
+    /// True only for a test net and a plain-http loopback URL.
+    pub fn is_loopback_test_url(&self, url: &str) -> bool {
+        Url::parse(url).is_ok_and(|parsed| self.is_test_loopback(&parsed))
+    }
+
     /// The URL must be `https`, carry no credentials and no fragment, and name
     /// a host whose every address is public. Returns the pinned addresses.
     async fn check(

@@ -78,6 +78,7 @@ const MIGRATION_36: &str = include_str!("../migrations/0036_console_pages.sql");
 const MIGRATION_37: &str = include_str!("../migrations/0037_provider_accounts.sql");
 const MIGRATION_38: &str = include_str!("../migrations/0038_handoffs.sql");
 const MIGRATION_39: &str = include_str!("../migrations/0039_marketplace_accounts.sql");
+const MIGRATION_40: &str = include_str!("../migrations/0040_marketplace_tool_policy.sql");
 
 /// One member's account for a marketplace plugin (no secret).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -747,6 +748,11 @@ impl Store {
         if version < 39 {
             connection.execute_batch(MIGRATION_39)?;
             connection.pragma_update(None, "user_version", 39)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 40 {
+            connection.execute_batch(MIGRATION_40)?;
+            connection.pragma_update(None, "user_version", 40)?;
         }
         // VACUUM INTO (backups) may renumber rowids; rebuild the external-content
         // FTS index only when its row count no longer matches `memories`.
@@ -4876,6 +4882,50 @@ impl Store {
         Ok(changed == 1)
     }
 
+    /// The caller's override for one plugin tool: `"ask"`, `"allow"` or none.
+    pub fn marketplace_tool_mode(
+        &self,
+        user_id: &str,
+        slug: &str,
+        tool: &str,
+    ) -> Result<Option<String>> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT mode FROM marketplace_tool_policy
+                 WHERE user_id = ?1 AND slug = ?2 AND tool = ?3",
+                params![user_id, slug, tool],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Set (`Some("ask" | "allow")`) or clear (`None`) the caller's override.
+    pub fn marketplace_tool_mode_set(
+        &self,
+        user_id: &str,
+        slug: &str,
+        tool: &str,
+        mode: Option<&str>,
+    ) -> Result<()> {
+        let connection = self.connection()?;
+        match mode {
+            Some(mode) => connection.execute(
+                "INSERT INTO marketplace_tool_policy(user_id, slug, tool, mode, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(user_id, slug, tool)
+                 DO UPDATE SET mode = excluded.mode, updated_at = excluded.updated_at",
+                params![user_id, slug, tool, mode, now_string()],
+            )?,
+            None => connection.execute(
+                "DELETE FROM marketplace_tool_policy
+                 WHERE user_id = ?1 AND slug = ?2 AND tool = ?3",
+                params![user_id, slug, tool],
+            )?,
+        };
+        Ok(())
+    }
+
     /// Remove the caller's install. `false` when there was none.
     pub fn marketplace_install_delete(&self, user_id: &str, slug: &str) -> Result<bool> {
         let connection = self.connection()?;
@@ -6223,7 +6273,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 39);
+        assert_eq!(version, 40);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
@@ -6288,7 +6338,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 39);
+        assert_eq!(version, 40);
         assert!(store.list_device_tokens().unwrap().is_empty());
         // The team table arrives with the same migration batch.
         assert!(
@@ -6362,7 +6412,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 39);
+        assert_eq!(version, 40);
         let admin = admin(&store);
         let memory = crate::memory::get(&store, &admin, "mem-legacy").unwrap();
         assert_eq!(memory.origin, "explicit");
@@ -6451,7 +6501,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 39);
+        assert_eq!(version, 40);
 
         let admin = store.admin_user().unwrap().unwrap();
         assert_eq!(admin.id, ADMIN_USER_ID);
@@ -6582,7 +6632,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 39);
+        assert_eq!(version, 40);
 
         // Every scoped table carries user_id = the admin, and the column is
         // NOT NULL with a real foreign key.
@@ -6737,7 +6787,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 39);
+        assert_eq!(version, 40);
 
         // The old row is now the admin's, with the empty prompt the migration
         // header documents; startup seeding fills it from the template.

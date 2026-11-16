@@ -661,6 +661,13 @@ impl Runtime {
             .collect::<Vec<_>>();
         tool_specs.extend(plugin_specs);
         upsert_tool_notice(&mut state.messages, &tool_specs);
+        // Only the main bot hears about an app that needs attention.
+        let app_notes = if bot.config.role == BotRole::Orchestrator {
+            self.gateway.plugin_notes(&user)
+        } else {
+            Vec::new()
+        };
+        upsert_app_notice(&mut state.messages, &app_notes);
         let temperature = bot.config.temperature;
         self.checked_route(&user, &state.route)?;
 

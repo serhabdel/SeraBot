@@ -32,12 +32,17 @@ pub const CATALOG_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_CATALOG_OWNERS: usize = 64;
 
 /// How the secret is presented to the MCP endpoint.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum McpAuth {
     /// The secret is the whole value of this header (an API key header).
     Header(&'static str),
     /// `Authorization: Bearer <secret>` (an OAuth access token).
     Bearer,
+    /// A header a plugin manifest names (already validated by the manifest
+    /// loader); `bearer` puts `Bearer ` before the secret.
+    Named { name: String, bearer: bool },
+    /// The server needs no credential; the secret passed in is ignored.
+    None,
 }
 
 /// Why an MCP exchange failed. Carries no credential.
@@ -210,9 +215,17 @@ impl McpClient {
         request: reqwest::RequestBuilder,
         secret: &str,
     ) -> reqwest::RequestBuilder {
-        match self.auth {
-            McpAuth::Header(name) => request.header(name, secret),
+        match &self.auth {
+            McpAuth::Header(name) => request.header(*name, secret),
             McpAuth::Bearer => request.bearer_auth(secret),
+            McpAuth::Named { name, bearer: true } => {
+                request.header(name.as_str(), format!("Bearer {secret}"))
+            }
+            McpAuth::Named {
+                name,
+                bearer: false,
+            } => request.header(name.as_str(), secret),
+            McpAuth::None => request,
         }
     }
 

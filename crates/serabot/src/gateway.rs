@@ -350,6 +350,21 @@ impl Gateway {
         specs
     }
 
+    /// The plugin runtime, when one is wired (the API clears its tool cache
+    /// after a sign-in or sign-out).
+    pub fn plugin_tools(&self) -> Option<&PluginTools> {
+        self.plugins.as_ref()
+    }
+
+    /// One line per marketplace app the user enabled that could not be used on
+    /// their last turn, such as "Canva needs sign-in".
+    pub fn plugin_notes(&self, user_id: &str) -> Vec<String> {
+        self.plugins
+            .as_ref()
+            .map(|plugins| plugins.notes_for(user_id))
+            .unwrap_or_default()
+    }
+
     /// The tool for `name`: a registered tool, or for a `plugin.` name, the
     /// caller's enabled plugin tool. Nothing else resolves.
     async fn resolve_tool(&self, name: &str, user_id: &str) -> Option<Arc<dyn Tool>> {

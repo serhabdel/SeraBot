@@ -1,6 +1,8 @@
 //! Plugin marketplace routes (v0.36). The catalog is read-only and shared.
 //! Installs, enablement and secrets are per user: a user never sees or changes
-//! another user's install, and secret values are write-only.
+//! another user's install, and secret values are write-only. v0.51 adds the
+//! OAuth sign-in routes, the account list and the per-tool approval override;
+//! tokens stay sealed server-side and no route returns one.
 
 use std::collections::BTreeMap;
 
@@ -11,6 +13,31 @@ use crate::marketplace::{self, AuthKind, PluginManifest, Server};
 #[serde(deny_unknown_fields)]
 pub(super) struct PluginConfigRequest {
     values: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct OauthStartRequest {
+    #[serde(default)]
+    app: Option<String>,
+    #[serde(default)]
+    account_id: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct OauthCompleteRequest {
+    code: String,
+    state: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ToolModeRequest {
+    /// `ask`, `allow`, or `default` to clear the override.
+    mode: String,
 }
 
 /// The secrets store name for one plugin field. Dotted names are allowed by
@@ -43,10 +70,44 @@ fn status(
         "available"
     } else if needs_config {
         "needs_config"
+    } else if needs_sign_in(state, user, manifest)? {
+        "needs_sign_in"
     } else {
         "installed"
     };
     Ok((installed, enabled, word))
+}
+
+/// An OAuth plugin with no account that can be used yet.
+fn needs_sign_in(state: &ApiState, user: &ActingUser, manifest: &PluginManifest) -> Result<bool> {
+    let oauth = manifest.apps.iter().any(|app| {
+        matches!(app.server, Server::Http { .. })
+            && app.auth.iter().any(|auth| auth.kind == AuthKind::Oauth)
+    });
+    if !oauth {
+        return Ok(false);
+    }
+    let accounts = state.store.marketplace_accounts(&user.id, &manifest.slug)?;
+    Ok(!accounts
+        .iter()
+        .any(|account| matches!(account.state.as_str(), "ready" | "unreachable")))
+}
+
+fn accounts_json(state: &ApiState, user: &ActingUser, slug: &str) -> Result<Vec<Value>> {
+    Ok(state
+        .store
+        .marketplace_accounts(&user.id, slug)?
+        .into_iter()
+        .map(|account| {
+            json!({
+                "account_id": account.account_id,
+                "label": account.label,
+                "state": account.state,
+                "last_error": account.last_error,
+                "last_ok_at": account.last_ok_at,
+            })
+        })
+        .collect())
 }
 
 fn all_fields_configured(
@@ -144,6 +205,7 @@ fn detail(state: &ApiState, user: &ActingUser, manifest: &PluginManifest) -> Res
         "installed": installed,
         "enabled": enabled,
         "status": word,
+        "accounts": accounts_json(state, user, &manifest.slug)?,
     }))
 }
 
@@ -289,8 +351,176 @@ pub(super) async fn uninstall_plugin(
             }
         }
     }
+    // Sign-ins go too: revoked at the server on a best-effort basis, then
+    // deleted here whatever the server answers.
+    for account in state.store.marketplace_accounts(&user.id, &slug)? {
+        if let Err(error) = state
+            .mcp_signin
+            .accounts()
+            .forget_account(&user.id, &slug, &account.account_id)
+            .await
+        {
+            tracing::warn!(error = %error, plugin = %slug, "could not remove a plugin account");
+        }
+    }
+    forget_tool_cache(&state, &user, &slug);
     audit(&state, &user, "marketplace.uninstalled", &slug)?;
     Ok(Json(json!({"slug": slug, "installed": false})))
+}
+
+fn forget_tool_cache(state: &ApiState, user: &ActingUser, slug: &str) {
+    if let Some(plugins) = state.runtime.gateway().plugin_tools() {
+        plugins.forget_cache(&user.id, slug);
+    }
+}
+
+fn require_install(state: &ApiState, user: &ActingUser, slug: &str) -> Result<()> {
+    if state.store.marketplace_install(&user.id, slug)?.is_none() {
+        return Err(SeraError::NotFound(format!(
+            "plugin {slug} is not installed"
+        )));
+    }
+    Ok(())
+}
+
+/// `POST /v1/marketplace/plugins/{slug}/oauth/start`: discovery, the client
+/// identity and the consent URL. The PKCE verifier stays on the server.
+pub(super) async fn oauth_start(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(slug): Path<String>,
+    Json(request): Json<OauthStartRequest>,
+) -> Result<Json<Value>> {
+    let manifest = find(&state, &slug)?;
+    require_install(&state, &user, &slug)?;
+    let account_id = request
+        .account_id
+        .as_deref()
+        .unwrap_or(crate::marketplace_auth::DEFAULT_ACCOUNT);
+    let started = state
+        .mcp_signin
+        .start(
+            &user.id,
+            manifest,
+            request.app.as_deref(),
+            account_id,
+            request.label.as_deref(),
+        )
+        .await?;
+    audit(&state, &user, "marketplace.oauth_started", &slug)?;
+    Ok(Json(json!({
+        "authorize_url": started.authorize_url,
+        "state": started.state,
+        "account_id": started.account_id,
+    })))
+}
+
+/// `POST /v1/marketplace/plugins/{slug}/oauth/complete`: the code and state the
+/// redirect carried. The response never includes a token.
+pub(super) async fn oauth_complete(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(slug): Path<String>,
+    Json(request): Json<OauthCompleteRequest>,
+) -> Result<Json<Value>> {
+    let manifest = find(&state, &slug)?;
+    require_install(&state, &user, &slug)?;
+    let done = state
+        .mcp_signin
+        .complete(&user.id, &slug, &request.code, &request.state)
+        .await?;
+    forget_tool_cache(&state, &user, &slug);
+    audit(&state, &user, "marketplace.oauth_completed", &slug)?;
+    let (_, _, word) = status(&state, &user, manifest)?;
+    Ok(Json(json!({
+        "slug": slug,
+        "account_id": done.account_id,
+        "status": word,
+        "accounts": accounts_json(&state, &user, &slug)?,
+    })))
+}
+
+/// `GET /v1/marketplace/plugins/{slug}/accounts`
+pub(super) async fn list_accounts(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(slug): Path<String>,
+) -> Result<Json<Value>> {
+    find(&state, &slug)?;
+    Ok(Json(
+        json!({"slug": slug, "accounts": accounts_json(&state, &user, &slug)?}),
+    ))
+}
+
+/// `DELETE /v1/marketplace/plugins/{slug}/accounts/{account_id}`: sign out.
+/// The token is revoked at the server on a best-effort basis and deleted here
+/// whatever the server answers.
+pub(super) async fn delete_account(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path((slug, account_id)): Path<(String, String)>,
+) -> Result<Json<Value>> {
+    let manifest = find(&state, &slug)?;
+    let known = state
+        .store
+        .marketplace_accounts(&user.id, &slug)?
+        .iter()
+        .any(|account| account.account_id == account_id);
+    if !known {
+        return Err(SeraError::NotFound(format!("account {account_id}")));
+    }
+    let revoked = state
+        .mcp_signin
+        .accounts()
+        .forget_account(&user.id, &slug, &account_id)
+        .await?;
+    forget_tool_cache(&state, &user, &slug);
+    audit(&state, &user, "marketplace.signed_out", &slug)?;
+    let (_, _, word) = status(&state, &user, manifest)?;
+    Ok(Json(json!({
+        "slug": slug,
+        "revoked": revoked,
+        "status": word,
+        "accounts": accounts_json(&state, &user, &slug)?,
+    })))
+}
+
+/// `PUT /v1/marketplace/plugins/{slug}/tools/{tool}`: the owner's approval
+/// override for one tool. `ask` always asks; `allow` skips the approval for a
+/// tool the server did not flag destructive (a destructive one still asks);
+/// `default` clears it.
+pub(super) async fn put_tool_mode(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path((slug, tool)): Path<(String, String)>,
+    Json(request): Json<ToolModeRequest>,
+) -> Result<Json<Value>> {
+    find(&state, &slug)?;
+    require_install(&state, &user, &slug)?;
+    if tool.is_empty()
+        || tool.len() > 128
+        || !tool
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        return Err(SeraError::Validation("tool name is not valid".into()));
+    }
+    let mode = match request.mode.as_str() {
+        "ask" | "allow" => Some(request.mode.as_str()),
+        "default" => None,
+        _ => {
+            return Err(SeraError::Validation(
+                "mode must be ask, allow or default".into(),
+            ));
+        }
+    };
+    state
+        .store
+        .marketplace_tool_mode_set(&user.id, &slug, &tool, mode)?;
+    audit(&state, &user, "marketplace.tool_mode", &slug)?;
+    Ok(Json(
+        json!({"slug": slug, "tool": tool, "mode": request.mode}),
+    ))
 }
 
 /// `PUT /v1/marketplace/plugins/{slug}/config`: values go to the caller's

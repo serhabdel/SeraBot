@@ -48,6 +48,7 @@ pub mod local_transfer;
 pub mod logging;
 pub mod maker;
 pub mod marketplace;
+pub mod marketplace_auth;
 pub mod mcp_client;
 pub mod mcp_oauth;
 pub mod media_jobs;

@@ -4763,3 +4763,25 @@ async fn load_fixture_children_do_not_starve_another_user_or_contend() {
         "user B waited for user A's whole backlog ({b_done:?} vs {all_done:?})"
     );
 }
+
+#[test]
+fn the_app_notice_is_one_line_updated_in_place_and_removed_when_clear() {
+    let mut messages = vec![LlmMessage::system("base"), LlmMessage::user("hi")];
+    upsert_app_notice(&mut messages, &["Canva needs sign-in".to_string()]);
+    upsert_app_notice(
+        &mut messages,
+        &[
+            "Canva needs sign-in".to_string(),
+            "Linear needs setup".to_string(),
+        ],
+    );
+    let notices: Vec<&str> = messages
+        .iter()
+        .filter_map(|m| m.content.as_deref())
+        .filter(|text| text.starts_with(APP_NOTICE_PREFIX))
+        .collect();
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].contains("Canva needs sign-in; Linear needs setup"));
+    upsert_app_notice(&mut messages, &[]);
+    assert_eq!(messages.len(), 2);
+}
