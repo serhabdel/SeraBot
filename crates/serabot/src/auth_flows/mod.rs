@@ -23,6 +23,7 @@
 //! the server's age store for its OAuth client secret and is registered by the
 //! API; the Claude sign-in registers the same way.
 
+pub mod claude;
 pub mod device;
 pub mod google;
 pub mod muse;
@@ -285,6 +286,19 @@ pub trait SignInProvider: Send + Sync {
         Err(unsupported())
     }
 
+    /// Like [`Self::exchange_pkce`], also given the `state` the flow started
+    /// with, for a provider whose token endpoint wants it back.
+    async fn exchange_pkce_with_state(
+        &self,
+        http: &reqwest::Client,
+        code: &str,
+        redirect_uri: &str,
+        verifier: &str,
+        _state: &str,
+    ) -> Result<SignedIn> {
+        self.exchange_pkce(http, code, redirect_uri, verifier).await
+    }
+
     /// Ask the provider for a device code.
     async fn device_start(&self, _http: &reqwest::Client) -> Result<DeviceStart> {
         Err(unsupported())
@@ -387,6 +401,8 @@ struct FlowRecord {
     provider: String,
     kind: FlowKind,
     redirect_uri: Option<String>,
+    /// The `state` a browser flow started with.
+    state: Option<String>,
     /// The verifier the server generated. `None` when the desktop holds it.
     verifier: Option<Zeroizing<String>>,
     client_holds_verifier: bool,
@@ -406,6 +422,8 @@ struct TakenFlow {
     client_holds_verifier: bool,
     /// The redirect the flow started with.
     redirect_uri: String,
+    /// The `state` the flow started with.
+    state: String,
 }
 
 /// The open flows, keyed by `(user, flow id)`.
@@ -495,6 +513,7 @@ impl FlowStore {
             verifier: record.verifier.clone(),
             client_holds_verifier: record.client_holds_verifier,
             redirect_uri: record.redirect_uri.clone().unwrap_or_default(),
+            state: record.state.clone().unwrap_or_default(),
         })
     }
 
@@ -707,6 +726,7 @@ impl SignInService {
                 provider: provider_id.to_owned(),
                 kind: FlowKind::Pkce,
                 redirect_uri: Some(redirect_uri),
+                state: Some(state.clone()),
                 verifier,
                 client_holds_verifier: client_holds,
                 expires: now + self.flows.ttl,
@@ -741,6 +761,7 @@ impl SignInService {
                 provider: provider_id.to_owned(),
                 kind: FlowKind::Device,
                 redirect_uri: None,
+                state: None,
                 verifier: None,
                 client_holds_verifier: false,
                 expires: now + lifetime,
@@ -883,7 +904,13 @@ impl SignInService {
                 .ok_or_else(|| SeraError::Internal("a sign-in flow lost its verifier".into()))?
         };
         let result = provider
-            .exchange_pkce(&self.http, &request.code, &taken.redirect_uri, &verifier)
+            .exchange_pkce_with_state(
+                &self.http,
+                &request.code,
+                &taken.redirect_uri,
+                &verifier,
+                &taken.state,
+            )
             .await
             .and_then(|signed_in| self.store_account(user_id, provider_id, signed_in));
         let status = match &result {

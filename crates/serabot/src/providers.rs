@@ -29,6 +29,7 @@ use crate::model_router::ProviderCredentials;
 use crate::secrets::SharedSecrets;
 use crate::store::Store;
 use crate::user_secrets::{ProviderCredential, UserCredentialWriter, UserSecrets};
+use crate::wire::Wire;
 
 pub const MUSE_CLIENT_ID: &str = "1031625952748946";
 pub const MUSE_API_VERSION: &str = "1.0.0";
@@ -73,6 +74,26 @@ const OFFICIAL_CATALOGS: &[OfficialCatalog] = &[
         host: "api.meta.ai",
         path: "/v1/models",
         strict: true,
+    },
+    // Anthropic's list is `{data, has_more, last_id}` with no `object` field,
+    // and is read page by page with `x-api-key`.
+    OfficialCatalog {
+        kind: "anthropic",
+        host: "api.anthropic.com",
+        path: "/v1/models",
+        strict: false,
+    },
+    OfficialCatalog {
+        kind: "opencode-go",
+        host: "opencode.ai",
+        path: "/zen/go/v1/models",
+        strict: false,
+    },
+    OfficialCatalog {
+        kind: "opencode-zen",
+        host: "opencode.ai",
+        path: "/zen/v1/models",
+        strict: false,
     },
     // Perplexity chats on the host root but lists models under /v1; its list
     // shape is not pinned, so the looser parser applies.
@@ -210,10 +231,28 @@ const BUILTINS: &[BuiltinProvider] = &[
         summary: "SambaNova Cloud; catalog GET {base}/models",
     },
     BuiltinProvider {
+        kind: "anthropic",
+        base_url: Some("https://api.anthropic.com/v1"),
+        auth: "api_key",
+        summary: "Anthropic Messages API with x-api-key (several keys per member); catalog GET https://api.anthropic.com/v1/models",
+    },
+    BuiltinProvider {
+        kind: "opencode-go",
+        base_url: Some("https://opencode.ai/zen/go/v1"),
+        auth: "api_key",
+        summary: "OpenCode Go subscription, OpenAI-compatible with an x-opencode-session header",
+    },
+    BuiltinProvider {
+        kind: "opencode-zen",
+        base_url: Some("https://opencode.ai/zen/v1"),
+        auth: "api_key",
+        summary: "OpenCode Zen pay-as-you-go, OpenAI-compatible",
+    },
+    BuiltinProvider {
         kind: "muse-code",
         base_url: Some("https://api.meta.ai/v1"),
         auth: "oauth",
-        summary: "Muse Code device login, minted key, catalog GET https://api.meta.ai/v1/models",
+        summary: "Muse Code device login, minted key, Responses chat, catalog GET https://api.meta.ai/v1/models",
     },
     BuiltinProvider {
         kind: "google-antigravity",
@@ -231,6 +270,8 @@ pub fn builtins() -> &'static [BuiltinProvider] {
 pub enum OAuthStyle {
     MuseMint,
     RefreshToken,
+    /// A Claude plan sign-in: a JSON refresh grant that rotates the token.
+    ClaudeRefresh,
 }
 
 pub enum AuthPlan {
@@ -440,6 +481,10 @@ pub fn enforce_oauth_target(style: OAuthStyle, token_url: &str) -> Result<String
         }
         OAuthStyle::RefreshToken => {
             host.eq_ignore_ascii_case(GOOGLE_TOKEN_HOST) && parsed.path() == GOOGLE_TOKEN_PATH
+        }
+        OAuthStyle::ClaudeRefresh => {
+            host.eq_ignore_ascii_case(crate::auth_flows::claude::TOKEN_HOST)
+                && parsed.path() == crate::auth_flows::claude::TOKEN_PATH
         }
     };
     if !ok {
@@ -660,7 +705,7 @@ fn model_meta(id: &str, entry: &Value) -> ModelMeta {
         tags,
     }
 }
-fn official_model_id(model: &str) -> bool {
+pub(crate) fn official_model_id(model: &str) -> bool {
     valid_model_id(model)
         && model
             .chars()
@@ -1320,6 +1365,16 @@ pub fn open_provider_client(
         ));
     }
     let endpoint = resolve_base_url(&profile.kind, &profile.base_url)?;
+    let kind = canonical_kind(&profile.kind)?;
+    // A Claude plan sign-in is an `anthropic` account that carries a refresh
+    // token. It exists only for the admin's own account, only while the
+    // operator's flag is on, and is never reachable through a grant.
+    let claude_plan = kind == "anthropic" && !credential.refresh_token.trim().is_empty();
+    if claude_plan && !(profile.plan_oauth && owner.account_id != DEFAULT_ACCOUNT) {
+        return Err(SeraError::Forbidden(
+            "Claude plan sign-in is turned off on this server".into(),
+        ));
+    }
     let mut client = LlmClient::new(
         &endpoint,
         credential.api_key.clone(),
@@ -1332,11 +1387,20 @@ pub fn open_provider_client(
     // config marker only matters for the operator's imported credential.
     let refreshable =
         !profile.refresh_token_secret.trim().is_empty() || owner.account_id != DEFAULT_ACCOUNT;
-    if let AuthPlan::OAuth {
-        style,
-        token_url,
-        client_id_fallback,
-    } = plan
+    let oauth_target = match plan {
+        AuthPlan::OAuth {
+            style,
+            token_url,
+            client_id_fallback,
+        } => Some((style, token_url, client_id_fallback)),
+        AuthPlan::ApiKey if claude_plan => Some((
+            OAuthStyle::ClaudeRefresh,
+            crate::auth_flows::claude::TOKEN_URL,
+            None,
+        )),
+        AuthPlan::ApiKey => None,
+    };
+    if let Some((style, token_url, client_id_fallback)) = oauth_target
         && refreshable
         && !credential.refresh_token.trim().is_empty()
     {
@@ -1353,6 +1417,11 @@ pub fn open_provider_client(
         if style == OAuthStyle::RefreshToken && client_secret.is_empty() {
             return Err(SeraError::Config(
                 "oauth client secret is required to refresh this provider".into(),
+            ));
+        }
+        if style == OAuthStyle::ClaudeRefresh && client_id.is_empty() {
+            return Err(SeraError::Config(
+                "the Claude sign-in client id is not configured".into(),
             ));
         }
         client = client.with_oauth(OAuthMaterial {
@@ -1392,9 +1461,21 @@ pub fn open_provider_client(
             }
         }
     }
-    let kind = canonical_kind(&profile.kind)?;
-    if kind == "muse-code" {
-        client = client.with_header("x-api-version", MUSE_API_VERSION);
+    match kind.as_str() {
+        "muse-code" => {
+            client = client
+                .with_header("x-api-version", MUSE_API_VERSION)
+                .with_wire(Wire::Responses);
+        }
+        "anthropic" => {
+            client = client.with_wire(if claude_plan {
+                Wire::AnthropicPlan
+            } else {
+                Wire::AnthropicKey
+            });
+        }
+        "opencode-go" => client = client.with_opencode_session(),
+        _ => {}
     }
     // The operator's own credential uses the provider's project; a member's
     // account never does, it has its own.
@@ -1425,7 +1506,7 @@ pub fn open_provider_client(
                 account_id: owner.account_id.to_owned(),
             },
             generation,
-            kind == "muse-code",
+            matches!(kind.as_str(), "muse-code" | "anthropic"),
         );
         if kind == "google-antigravity"
             && let Some(row) = row
@@ -1636,6 +1717,9 @@ pub fn import_age_oauth_sign_ins(
 
 #[cfg(test)]
 mod account_clients_tests;
+
+#[cfg(test)]
+mod wire_clients_tests;
 
 #[cfg(test)]
 mod tests {

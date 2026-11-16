@@ -20,6 +20,10 @@ use crate::gateway::ToolSpec;
 use crate::llm_failure;
 use crate::retry;
 use crate::secrets::{AgeCredentialWriter, CredentialWriter, SharedSecrets};
+use crate::wire::Wire;
+
+mod wire_calls;
+pub(crate) use wire_calls::opencode_session_id;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Usage {
@@ -136,6 +140,11 @@ pub struct LlmClient {
     project: Option<Arc<ProjectState>>,
     /// The Antigravity Hub version for the user agent, when configured.
     cloud_version: Option<String>,
+    /// The request and response format (chat completions unless set).
+    wire: Wire,
+    /// OpenCode Go wants `x-opencode-session` on every request. Holds the
+    /// seed used when no conversation is running (one per client).
+    opencode_session: Option<Arc<str>>,
 }
 
 impl std::fmt::Debug for LlmClient {
@@ -179,7 +188,45 @@ impl LlmClient {
             session_generation: Arc::new(AtomicI64::new(0)),
             project: None,
             cloud_version: None,
+            wire: Wire::ChatCompletions,
+            opencode_session: None,
         })
+    }
+
+    /// Speak another wire format (Muse chats on Responses, Anthropic on
+    /// Messages).
+    pub fn with_wire(mut self, wire: Wire) -> Self {
+        self.wire = wire;
+        self
+    }
+
+    /// Send `x-opencode-session` on every request (OpenCode Go). The id comes
+    /// from the running conversation, so a retry reuses it; outside one, from
+    /// a seed made for this client.
+    pub fn with_opencode_session(mut self) -> Self {
+        use rand::RngCore;
+        let mut seed = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut seed);
+        self.opencode_session = Some(Arc::from(hex::encode(seed)));
+        self
+    }
+
+    /// The headers every request carries: the provider's fixed ones and the
+    /// OpenCode session id.
+    fn decorate(&self, mut request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        for (name, value) in &self.extra_headers {
+            request = request.header(*name, *value);
+        }
+        if let Some(seed) = &self.opencode_session {
+            let conversation = current_conversation();
+            let basis = if conversation.is_empty() {
+                seed.as_ref()
+            } else {
+                conversation.as_str()
+            };
+            request = request.header("x-opencode-session", opencode_session_id(basis));
+        }
+        request
     }
 
     /// Send `name: value` on every request.
@@ -369,6 +416,19 @@ impl LlmClient {
                 .complete_cloud_code(messages, tools, &model, temperature, level)
                 .await;
         }
+        match self.wire {
+            Wire::Responses => {
+                return self
+                    .complete_responses(messages, tools, &model, extra)
+                    .await;
+            }
+            Wire::AnthropicKey | Wire::AnthropicPlan => {
+                return self
+                    .complete_anthropic(messages, tools, &model, temperature, extra)
+                    .await;
+            }
+            Wire::ChatCompletions => {}
+        }
         let mut body = json!({
             "model": model,
             "messages": messages.iter().map(message_to_json).collect::<Vec<_>>(),
@@ -407,11 +467,8 @@ impl LlmClient {
         for attempt in 0..=self.max_retries + 1 {
             let mut key = self.bearer();
             let used = zeroize::Zeroizing::new(key.clone());
-            let mut request = self.http.post(&url).bearer_auth(&key).json(&body);
-            for (name, value) in &self.extra_headers {
-                request = request.header(*name, *value);
-            }
-            let response = request.send().await;
+            let request = self.http.post(&url).bearer_auth(&key).json(&body);
+            let response = self.decorate(request).send().await;
             key.zeroize();
             match response {
                 Ok(response) => {
@@ -506,22 +563,22 @@ impl LlmClient {
         {
             return self.fetch_cloud_code_catalog(catalog_url).await;
         }
+        if self.wire.is_anthropic() {
+            return self.fetch_anthropic_catalog(catalog_url).await;
+        }
         let url = validate_base_url(catalog_url)?;
         let mut refreshed = false;
         let mut last_error = None;
         for attempt in 0..=self.max_retries + 1 {
             let mut key = self.bearer();
             let used = zeroize::Zeroizing::new(key.clone());
-            let mut request = self
+            let request = self
                 .http
                 .get(&url)
                 .bearer_auth(&key)
                 .header("user-agent", USER_AGENT)
                 .header("accept", "application/json");
-            for (name, value) in &self.extra_headers {
-                request = request.header(*name, *value);
-            }
-            let response = request.send().await;
+            let response = self.decorate(request).send().await;
             key.zeroize();
             match response {
                 Ok(response) => {
@@ -734,6 +791,13 @@ impl LlmClient {
             .as_ref()
             .ok_or_else(|| SeraError::External("oauth refresh is not configured".into()))?;
         let token = match oauth.style {
+            // A rotating token cannot be refreshed outside the single-flight
+            // account path: a lost write would lock the account out.
+            OAuthStyle::ClaudeRefresh => {
+                return Err(SeraError::Forbidden(
+                    "Claude plan tokens refresh only through a member account".into(),
+                ));
+            }
             OAuthStyle::MuseMint => {
                 let refresh = oauth
                     .refresh_token
@@ -1121,6 +1185,10 @@ async fn exchange_for_grant(
                 }) => Err(RefreshError::InvalidGrant),
                 Err(error) => Err(RefreshError::Failed(error)),
             }
+        }
+        OAuthStyle::ClaudeRefresh => {
+            crate::auth_flows::claude::refresh_exchange(http, token_url, refresh_token, client_id)
+                .await
         }
         OAuthStyle::RefreshToken => {
             let grant =

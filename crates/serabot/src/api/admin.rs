@@ -215,6 +215,7 @@ pub(super) async fn admin_provider_oauth_start(
     let admin = admin_store(&state)?;
     let profile = oauth_profile(&state, admin, &id).map_err(admin_error)?;
     let kind = crate::providers::canonical_kind(&profile.kind).map_err(admin_error)?;
+    super::provider_accounts::plan_signin_gate(&user, &profile, &kind).map_err(admin_error)?;
     let flows = state.signin.registry().flows_for(&kind);
     let Some(first) = flows.first().copied() else {
         return Err(admin_error(SeraError::Validation(
@@ -270,6 +271,7 @@ pub(super) async fn admin_provider_oauth_complete(
     let admin = admin_store(&state)?;
     let profile = oauth_profile(&state, admin, &id).map_err(admin_error)?;
     let kind = crate::providers::canonical_kind(&profile.kind).map_err(admin_error)?;
+    super::provider_accounts::plan_signin_gate(&user, &profile, &kind).map_err(admin_error)?;
     if !state.signin.registry().flows_for(&kind).contains(&"pkce") {
         return Err(admin_error(SeraError::Validation(
             "this provider does not use a browser code sign-in".into(),

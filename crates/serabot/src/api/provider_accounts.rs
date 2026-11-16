@@ -40,6 +40,61 @@ pub(super) fn mask_email(email: &str) -> String {
     }
 }
 
+/// The sign-in flows a member's page may offer for a provider. A Claude plan
+/// sign-in shows only to the admin, and only on a provider the operator turned
+/// it on for.
+pub(super) fn signin_flows(
+    state: &ApiState,
+    is_admin: bool,
+    provider_id: &str,
+    kind: &str,
+) -> Vec<&'static str> {
+    if kind == "anthropic" {
+        let enabled = state
+            .config
+            .llm
+            .providers
+            .get(provider_id)
+            .is_some_and(|profile| profile.plan_oauth);
+        if !(enabled && is_admin) {
+            return Vec::new();
+        }
+    }
+    state.signin.registry().flows_for(kind)
+}
+
+/// The risk a plan sign-in carries, for the banner the page shows beside it.
+/// `None` for every sign-in that is the vendor's supported path.
+pub(super) fn signin_risk(kind: &str, flows: &[&'static str]) -> Option<&'static str> {
+    (kind == "anthropic" && !flows.is_empty()).then_some(
+        "Anthropic's terms do not allow a third-party product to offer Claude plan sign-in. This account is yours alone, is never shared, and may be suspended. API keys are the supported path.",
+    )
+}
+
+/// Claude plan sign-in is for the admin, on a provider the operator turned it
+/// on for. Every other provider's sign-in is open to members.
+pub(super) fn plan_signin_gate(
+    user: &ActingUser,
+    profile: &ProviderConfig,
+    kind: &str,
+) -> Result<()> {
+    if kind != "anthropic" {
+        return Ok(());
+    }
+    if !profile.plan_oauth {
+        return Err(SeraError::Rejected {
+            code: "signin_unsupported",
+            message: "This provider has no sign-in; add its API key".into(),
+        });
+    }
+    if !user.is_admin() {
+        return Err(SeraError::Forbidden(
+            "Claude plan sign-in is only available to the server admin".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// The identity a provider reported, cut down to what the page shows.
 fn masked_identity(identity: &Value) -> Value {
     let mut shown = serde_json::Map::new();
@@ -96,6 +151,7 @@ pub(super) fn provider_account_views(
 pub(super) fn parked_provider_views(
     state: &ApiState,
     user_id: &str,
+    is_admin: bool,
     listed: &[Value],
 ) -> Result<Vec<Value>> {
     let mut parked = Vec::new();
@@ -134,7 +190,8 @@ pub(super) fn parked_provider_views(
             "secrets": {},
             "credential": credential_view(state, user_id, &account.provider)?,
             "accounts": provider_account_views(state, user_id, &account.provider)?,
-            "signin": state.signin.registry().flows_for(&kind),
+            "signin": signin_flows(state, is_admin, &account.provider, &kind),
+            "signin_risk": signin_risk(&kind, &signin_flows(state, is_admin, &account.provider, &kind)),
         }));
     }
     Ok(parked)
@@ -167,9 +224,11 @@ pub(super) async fn list_provider_accounts(
     Path(id): Path<String>,
 ) -> Result<Json<Value>> {
     let (_, kind) = provider_context(&state, &id)?;
+    let flows = signin_flows(&state, user.is_admin(), &id, &kind);
     Ok(Json(json!({
         "accounts": provider_account_views(&state, &user.id, &id)?,
-        "signin": state.signin.registry().flows_for(&kind),
+        "signin_risk": signin_risk(&kind, &flows),
+        "signin": flows,
     })))
 }
 
@@ -599,7 +658,8 @@ pub(super) async fn provider_signin_start(
     Path(id): Path<String>,
     Json(request): Json<SigninStartRequest>,
 ) -> Result<Json<Value>> {
-    let (_, kind) = provider_context(&state, &id)?;
+    let (profile, kind) = provider_context(&state, &id)?;
+    plan_signin_gate(&user, &profile, &kind)?;
     let flow = match request.flow.as_deref() {
         None => None,
         Some(word) => Some(FlowKind::parse(word).ok_or_else(|| SeraError::Rejected {
@@ -642,7 +702,8 @@ pub(super) async fn provider_signin_complete(
     Path(id): Path<String>,
     Json(request): Json<SigninCompleteRequest>,
 ) -> Result<Json<Value>> {
-    let (_, kind) = provider_context(&state, &id)?;
+    let (profile, kind) = provider_context(&state, &id)?;
+    plan_signin_gate(&user, &profile, &kind)?;
     let outcome = state
         .signin
         .complete(
@@ -715,7 +776,8 @@ pub(super) async fn provider_oauth_start(
     Path(id): Path<String>,
     Json(request): Json<ProviderOauthStart>,
 ) -> Result<Json<Value>> {
-    let (_, kind) = provider_context(&state, &id)?;
+    let (profile, kind) = provider_context(&state, &id)?;
+    plan_signin_gate(&user, &profile, &kind)?;
     let started = state
         .signin
         .start(
@@ -742,7 +804,8 @@ pub(super) async fn provider_oauth_complete(
     Path(id): Path<String>,
     Json(request): Json<ProviderOauthComplete>,
 ) -> Result<Json<Value>> {
-    let (_, kind) = provider_context(&state, &id)?;
+    let (profile, kind) = provider_context(&state, &id)?;
+    plan_signin_gate(&user, &profile, &kind)?;
     let outcome = state
         .signin
         .complete(

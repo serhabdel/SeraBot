@@ -459,10 +459,74 @@ const PRESETS: &[ProviderPreset] = &[
         sign_in: "",
     },
     ProviderPreset {
+        id: "anthropic",
+        label: "Anthropic (Claude)",
+        subtitle: "Claude models on the native Messages API. Add several API keys; each member's keys are their own.",
+        base_url: "https://api.anthropic.com/v1",
+        kind: "anthropic",
+        default_id: "anthropic",
+        models: &["claude-sonnet-5-5", "claude-opus-5-5"],
+        secret_name: "anthropic_api_key",
+        catalog_fetch: true,
+        auth: "api_key",
+        badge: "API Key",
+        note: "Anthropic API key. Claude plan sign-in is off by default and admin-only",
+        key_url: "https://console.anthropic.com/settings/keys",
+        sign_in: "",
+    },
+    ProviderPreset {
+        id: "opencode-go",
+        label: "OpenCode Go",
+        subtitle: "OpenCode Go subscription: open coding models behind one key",
+        base_url: "https://opencode.ai/zen/go/v1",
+        kind: "opencode-go",
+        default_id: "opencode-go",
+        models: &["glm-5.3-flash", "glm-5.3", "kimi-k2.7-code"],
+        secret_name: "opencode_go_api_key",
+        catalog_fetch: true,
+        auth: "api_key",
+        badge: "API Key",
+        note: "OpenCode Go key; every request carries a session id",
+        key_url: "https://opencode.ai/auth",
+        sign_in: "",
+    },
+    ProviderPreset {
+        id: "opencode-zen",
+        label: "OpenCode Zen",
+        subtitle: "OpenCode Zen pay-as-you-go models behind one key",
+        base_url: "https://opencode.ai/zen/v1",
+        kind: "opencode-zen",
+        default_id: "opencode-zen",
+        models: &["claude-fable-5-1"],
+        secret_name: "opencode_zen_api_key",
+        catalog_fetch: true,
+        auth: "api_key",
+        badge: "API Key",
+        note: "OpenCode Zen key (pay as you go)",
+        key_url: "https://opencode.ai/auth",
+        sign_in: "",
+    },
+    ProviderPreset {
+        id: "nous",
+        label: "Nous Portal (Hermes)",
+        subtitle: "Nous Research's Hermes models, OpenAI-compatible, with an API key",
+        base_url: "https://inference-api.nousresearch.com/v1",
+        kind: "openai-compatible",
+        default_id: "nous",
+        models: &[],
+        secret_name: "nous_api_key",
+        catalog_fetch: true,
+        auth: "api_key",
+        badge: "API Key",
+        note: "Base URL not verified against Nous docs: confirm it before approving egress",
+        key_url: "https://portal.nousresearch.com",
+        sign_in: "",
+    },
+    ProviderPreset {
         id: "muse-code",
         label: "Muse Code",
         subtitle: "Muse Spark OAuth device sign-in",
-        base_url: "https://api.musecode.ai/v1",
+        base_url: "https://api.meta.ai/v1",
         kind: "muse-code",
         default_id: "muse",
         models: &["muse-spark-1.3"],
@@ -507,6 +571,16 @@ const PRESETS: &[ProviderPreset] = &[
         sign_in: "",
     },
 ];
+
+/// Presets whose base URL or key page no research note confirms. The sheet
+/// shows their note, and the owner checks the vendor's docs before approving
+/// egress.
+pub const UNVERIFIED_PRESETS: &[&str] = &["nous"];
+
+/// Whether a preset's endpoint is unconfirmed (see [`UNVERIFIED_PRESETS`]).
+pub fn is_unverified(id: &str) -> bool {
+    UNVERIFIED_PRESETS.contains(&id)
+}
 
 /// The preset catalog, in picker order.
 pub fn presets() -> &'static [ProviderPreset] {
@@ -596,6 +670,9 @@ mod tests {
                         | "together"
                         | "fireworks"
                         | "muse-code"
+                        | "anthropic"
+                        | "opencode-go"
+                        | "opencode-zen"
                         | "gemini"
                         | "perplexity"
                         | "huggingface"
@@ -639,6 +716,39 @@ mod tests {
             "http://127.0.0.1:11434/v1"
         );
         assert!(preset_for("nope").is_none());
+    }
+
+    #[test]
+    fn the_v049_provider_presets_match_the_server() {
+        let anthropic = preset_for("anthropic").unwrap();
+        assert_eq!(anthropic.kind, "anthropic");
+        assert_eq!(anthropic.base_url, "https://api.anthropic.com/v1");
+        // API keys only: the plan sign-in is an admin flag, not a preset.
+        assert_eq!((anthropic.auth, anthropic.sign_in), ("api_key", ""));
+        let go = preset_for("opencode-go").unwrap();
+        assert_eq!(go.kind, "opencode-go");
+        assert_eq!(go.base_url, "https://opencode.ai/zen/go/v1");
+        let zen = preset_for("opencode-zen").unwrap();
+        assert_eq!(zen.kind, "opencode-zen");
+        assert_eq!(zen.base_url, "https://opencode.ai/zen/v1");
+        // Nous is a plain OpenAI-compatible provider; its URL is flagged.
+        let nous = preset_for("nous").unwrap();
+        assert_eq!(nous.kind, "openai-compatible");
+        assert!(is_unverified("nous"));
+        assert!(nous.note.contains("not verified"));
+        for verified in ["anthropic", "opencode-go", "opencode-zen", "muse-code"] {
+            assert!(!is_unverified(verified), "{verified}");
+        }
+        // Muse's catalog is pinned to the documented host.
+        assert_eq!(
+            preset_for("muse-code").unwrap().base_url,
+            "https://api.meta.ai/v1"
+        );
+        // Matching a configured provider to a preset works by kind for the
+        // native kinds and by id for the shared OpenAI-compatible kind.
+        assert!(provider_matches_preset("mine", "anthropic", anthropic));
+        assert!(provider_matches_preset("nous", "openai-compatible", nous));
+        assert!(!provider_matches_preset("other", "openai-compatible", nous));
     }
 
     #[test]

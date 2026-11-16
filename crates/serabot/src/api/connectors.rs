@@ -90,10 +90,21 @@ pub(super) async fn list_providers(
                 "secrets": secrets,
                 "credential": credential_view(&state, &user.id, &provider.id)?,
                 "accounts": provider_account_views(&state, &user.id, &provider.id)?,
-                "signin": state
-                    .signin
-                    .registry()
-                    .flows_for(&crate::providers::canonical_kind(&provider.kind)?),
+                "signin": signin_flows(
+                    &state,
+                    is_admin,
+                    &provider.id,
+                    &crate::providers::canonical_kind(&provider.kind)?,
+                ),
+                "signin_risk": signin_risk(
+                    &crate::providers::canonical_kind(&provider.kind)?,
+                    &signin_flows(
+                        &state,
+                        is_admin,
+                        &provider.id,
+                        &crate::providers::canonical_kind(&provider.kind)?,
+                    ),
+                ),
             }))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -160,17 +171,28 @@ pub(super) async fn list_providers(
                     "secrets": secrets,
                     "credential": credential_view(&state, &user.id, &id)?,
                     "accounts": provider_account_views(&state, &user.id, &id)?,
-                    "signin": state
-                        .signin
-                        .registry()
-                        .flows_for(&crate::providers::canonical_kind(&profile.kind)?),
+                    "signin": signin_flows(
+                        &state,
+                        is_admin,
+                        &id,
+                        &crate::providers::canonical_kind(&profile.kind)?,
+                    ),
+                    "signin_risk": signin_risk(
+                        &crate::providers::canonical_kind(&profile.kind)?,
+                        &signin_flows(
+                            &state,
+                            is_admin,
+                            &id,
+                            &crate::providers::canonical_kind(&profile.kind)?,
+                        ),
+                    ),
                 }));
             }
         }
     }
     // A provider whose accounts are all disabled leaves the router's list;
     // keep it on the page so an account can be turned back on.
-    let parked = parked_provider_views(&state, &user.id, &providers)?;
+    let parked = parked_provider_views(&state, &user.id, is_admin, &providers)?;
     providers.extend(parked);
 
     Ok(Json(json!({"providers": providers})))

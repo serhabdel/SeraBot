@@ -1412,7 +1412,11 @@ fn tool_declarations(tools: &[ToolSpec]) -> Vec<Value> {
 /// A thought signature is opaque base64-ish text; refuse anything that is not
 /// a bounded printable token.
 fn signature_ok(value: &str) -> bool {
-    (1..=16_384).contains(&value.len()) && value.chars().all(|c| c.is_ascii_graphic())
+    // Another provider's replay data (Anthropic thinking blocks) is not a
+    // Google signature and is never sent to Google.
+    (1..=16_384).contains(&value.len())
+        && value.chars().all(|c| c.is_ascii_graphic())
+        && !value.starts_with(crate::wire::anthropic::SIGNATURE_PREFIX)
 }
 
 fn sanitize_tool_name(name: &str) -> String {

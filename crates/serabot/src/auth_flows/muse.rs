@@ -204,6 +204,7 @@ mod tests {
             provider: provider.into(),
             kind: FlowKind::Device,
             redirect_uri: None,
+            state: None,
             verifier: None,
             client_holds_verifier: false,
             expires: now + Duration::from_secs(900),

@@ -1,6 +1,7 @@
 //! Quota readers for providers that report an account's remaining allowance:
-//! Meta Muse Code (`POST /muse-code/key`) and Google Antigravity
-//! (`retrieveUserQuotaSummary`, with `fetchAvailableModels` as the fallback).
+//! Meta Muse Code (`POST /muse-code/key`), Google Antigravity
+//! (`retrieveUserQuotaSummary`, with `fetchAvailableModels` as the fallback)
+//! and OpenCode Go (`GET /zen/go/v1/usage`).
 //!
 //! A reading is a small JSON snapshot kept in the account's `quota_json`:
 //!
@@ -19,6 +20,8 @@ use super::*;
 
 /// Where Muse reports the subscription's usage.
 const MUSE_QUOTA_URL: &str = "https://api.meta.ai/muse-code/key";
+/// Where OpenCode Go reports the subscription's usage meters.
+const OPENCODE_GO_USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
 
 /// The readers every server has, by provider kind.
 pub(super) fn standard_readers() -> HashMap<String, Arc<dyn QuotaReader>> {
@@ -29,6 +32,13 @@ pub(super) fn standard_readers() -> HashMap<String, Arc<dyn QuotaReader>> {
             Arc::new(MuseQuota {
                 http: http.clone(),
                 url: MUSE_QUOTA_URL.into(),
+            }),
+        );
+        readers.insert(
+            "opencode-go".into(),
+            Arc::new(OpenCodeGoQuota {
+                http: http.clone(),
+                url: OPENCODE_GO_USAGE_URL.into(),
             }),
         );
         if let Ok(origins) =
@@ -181,6 +191,91 @@ fn muse_window(entry: &Value, label: &str) -> Option<Value> {
     }))
 }
 
+/// OpenCode Go: the account's API key reads the rolling, weekly and monthly
+/// usage meters. The request carries a session id like every Go request.
+pub(super) struct OpenCodeGoQuota {
+    http: reqwest::Client,
+    url: String,
+}
+
+#[async_trait::async_trait]
+impl QuotaReader for OpenCodeGoQuota {
+    async fn read(
+        &self,
+        credential: &ProviderCredential,
+        _identity: &Value,
+    ) -> Result<Option<Value>> {
+        let key = credential.api_key.trim();
+        if key.is_empty() {
+            return Ok(None);
+        }
+        let session = {
+            use rand::RngCore;
+            let mut seed = [0u8; 16];
+            rand::rngs::OsRng.fill_bytes(&mut seed);
+            crate::llm::opencode_session_id(&hex::encode(seed))
+        };
+        let response = self
+            .http
+            .get(&self.url)
+            .header("accept", "application/json")
+            .header("x-opencode-session", session)
+            .timeout(Duration::from_secs(20))
+            .bearer_auth(key)
+            .send()
+            .await
+            .map_err(|_| SeraError::External("quota could not be read".into()))?;
+        let status = response.status();
+        let body = crate::auth_flows::read_capped(response).await?;
+        if !status.is_success() {
+            return Ok(None);
+        }
+        Ok(serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|value| parse_opencode_go_usage(&value)))
+    }
+}
+
+/// An OpenCode Go usage reply as a snapshot: `usage.rolling` (5h),
+/// `usage.weekly` and `usage.monthly`, each `{status, percent, resetsAt}`. A
+/// meter whose status is neither absent nor `ok` is skipped. `None` when no
+/// meter is readable.
+pub(super) fn parse_opencode_go_usage(value: &Value) -> Option<Value> {
+    let usage = value.get("usage")?;
+    let mut windows = Vec::new();
+    for (key, label) in [("rolling", "5h"), ("weekly", "week"), ("monthly", "month")] {
+        let Some(entry) = usage.get(key) else {
+            continue;
+        };
+        if entry
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| status != "ok")
+        {
+            continue;
+        }
+        let Some(used) = entry.get("percent").and_then(number) else {
+            continue;
+        };
+        let used = used.clamp(0.0, 100.0);
+        windows.push(json!({
+            "scope": "subscription",
+            "label": label,
+            "used_percent": used,
+            "remaining": ((100.0 - used) / 100.0 * 1000.0).round() / 1000.0,
+            "resets_at": entry.get("resetsAt").and_then(reset_time),
+        }));
+    }
+    (!windows.is_empty()).then(|| {
+        json!({
+            "sampled_at": sampled_at(),
+            "source": "opencode-go",
+            "state": "ok",
+            "windows": windows,
+        })
+    })
+}
+
 /// Google Antigravity: the account's Google access token asks Cloud Code.
 pub(super) struct AntigravityQuota {
     http: reqwest::Client,
@@ -211,6 +306,16 @@ impl QuotaReader for AntigravityQuota {
 
 #[cfg(test)]
 impl MuseQuota {
+    pub(super) fn for_test(url: &str) -> Self {
+        Self {
+            http: crate::auth_flows::http_client().unwrap(),
+            url: url.to_owned(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl OpenCodeGoQuota {
     pub(super) fn for_test(url: &str) -> Self {
         Self {
             http: crate::auth_flows::http_client().unwrap(),
@@ -396,6 +501,79 @@ mod tests {
         );
     }
 
+    #[test]
+    fn opencode_go_usage_reads_the_three_meters() {
+        let snapshot = parse_opencode_go_usage(&json!({"usage": {
+            "rolling": {"status": "ok", "percent": 12.5, "resetsAt": "2026-11-16T15:00:00Z"},
+            "weekly": {"percent": "40", "resetsAt": "2026-11-20T00:00:00Z"},
+            "monthly": {"status": "rate_limited", "percent": 99, "resetsAt": "2026-12-01T00:00:00Z"}
+        }}))
+        .unwrap();
+        assert_eq!(snapshot["source"], "opencode-go");
+        let windows = windows(&snapshot);
+        // The monthly meter is not "ok", so it is skipped.
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0]["label"], "5h");
+        assert_eq!(windows[0]["remaining"], 0.875);
+        assert_eq!(windows[0]["resets_at"], "2026-11-16T15:00:00Z");
+        assert_eq!(windows[1]["label"], "week");
+        assert_eq!(windows[1]["used_percent"], 40.0);
+        for bad in [
+            json!({}),
+            json!({"usage": {}}),
+            json!({"usage": {"rolling": {"status": "ok"}}}),
+        ] {
+            assert!(parse_opencode_go_usage(&bad).is_none(), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn opencode_go_quota_sends_the_key_and_a_session_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/zen/go/v1/usage"))
+            .and(header("authorization", "Bearer sk-go-synthetic"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"usage": {
+                "rolling": {"percent": 10, "resetsAt": "2026-11-16T15:00:00Z"}
+            }})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let reader = OpenCodeGoQuota::for_test(&format!("{}/zen/go/v1/usage", server.uri()));
+        let credential = ProviderCredential {
+            api_key: "sk-go-synthetic".into(),
+            ..Default::default()
+        };
+        let reading = reader.read(&credential, &json!({})).await.unwrap().unwrap();
+        assert_eq!(reading["windows"][0]["label"], "5h");
+        let requests = server.received_requests().await.unwrap();
+        let session = requests[0].headers.get("x-opencode-session").unwrap();
+        assert!(session.to_str().unwrap().starts_with("ses_"));
+        assert_eq!(session.to_str().unwrap().len(), 4 + 12 + 14);
+        // No key, no request; a refusal is "no reading".
+        assert!(
+            reader
+                .read(&ProviderCredential::default(), &json!({}))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        let refused = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&refused)
+            .await;
+        let reader = OpenCodeGoQuota::for_test(&format!("{}/usage", refused.uri()));
+        assert!(
+            reader
+                .read(&credential, &json!({}))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn antigravity_quota_reads_the_summary_for_the_accounts_project() {
         let server = MockServer::start().await;
@@ -426,6 +604,8 @@ mod tests {
         let readers = standard_readers();
         assert!(readers.contains_key("muse-code"));
         assert!(readers.contains_key("google-antigravity"));
+        assert!(readers.contains_key("opencode-go"));
+        assert!(!readers.contains_key("opencode-zen"));
         assert!(!readers.contains_key("openai"));
     }
 }

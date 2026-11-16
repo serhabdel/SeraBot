@@ -865,6 +865,9 @@ fn oauth_sign_in(client: &ApiClient, id: &str, kind: &str) -> Result<Reply, ApiE
             device_code: start.code,
         });
     }
+    if kind == "anthropic" {
+        return claude_plan_sign_in(client, id);
+    }
     let (listener, port) = oauth::bind_loopback()
         .map_err(|_| ApiError::Validation("Could not listen on 127.0.0.1 for the redirect."))?;
     let pkce = oauth::new_pkce();
@@ -906,6 +909,42 @@ fn oauth_sign_in(client: &ApiClient, id: &str, kind: &str) -> Result<Reply, ApiE
     let code =
         oauth::wait_for_callback(&listener, &pkce.state, std::time::Duration::from_secs(180))
             .map_err(|error| ApiError::Rejected(error.to_string()))?;
+    drop(listener);
+    client.admin_oauth_complete(id, &code, &pkce.verifier, &redirect)?;
+    Ok(Reply::OAuthSignedIn {
+        id: id.to_owned(),
+        device_code: None,
+    })
+}
+
+/// Claude plan sign-in (admin only; the server refuses it unless the operator
+/// turned `plan_oauth` on). The registered redirect is `localhost:54545` with
+/// path `/callback`, so the listener binds exactly that port and there is no
+/// fallback. The server keeps the OAuth client id and does the token exchange.
+fn claude_plan_sign_in(client: &ApiClient, id: &str) -> Result<Reply, ApiError> {
+    use crate::oauth;
+    let listener = oauth::bind_loopback_fixed(oauth::CLAUDE_PORT).map_err(|_| {
+        ApiError::Validation("Could not listen on 127.0.0.1:54545 for the redirect (port busy?).")
+    })?;
+    let pkce = oauth::new_pkce();
+    let redirect = oauth::claude_redirect_uri();
+    let start = client.admin_oauth_start(
+        id,
+        &serde_json::json!({
+            "challenge": pkce.challenge,
+            "state": pkce.state,
+            "redirect_uri": redirect,
+        }),
+    )?;
+    webbrowser::open(&start.url)
+        .map_err(|_| ApiError::Validation("Could not open the browser for sign-in."))?;
+    let code = oauth::wait_for_callback_at(
+        &listener,
+        &pkce.state,
+        oauth::CLAUDE_CALLBACK_PATH,
+        std::time::Duration::from_secs(180),
+    )
+    .map_err(|error| ApiError::Rejected(error.to_string()))?;
     drop(listener);
     client.admin_oauth_complete(id, &code, &pkce.verifier, &redirect)?;
     Ok(Reply::OAuthSignedIn {

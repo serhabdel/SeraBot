@@ -9,6 +9,7 @@ use axum::http::Request;
 use tower::ServiceExt;
 
 mod a8_smoke_api;
+mod anthropic_claude_api;
 mod big_wave_b3_b4;
 mod bot_chats_api;
 mod browser_api;

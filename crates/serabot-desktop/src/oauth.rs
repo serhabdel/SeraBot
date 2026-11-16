@@ -14,6 +14,10 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 pub const CALLBACK_PATH: &str = "/oauth-callback";
+/// The fixed loopback port and path a Claude plan sign-in registers (admin
+/// only, behind the server's `plan_oauth` flag).
+pub const CLAUDE_PORT: u16 = 54545;
+pub const CLAUDE_CALLBACK_PATH: &str = "/callback";
 /// Where the server sends the browser after a native sign-in.
 pub const AUTH_DONE_PATH: &str = "/auth-done";
 const PREFERRED_PORT: u16 = 51121;
@@ -117,6 +121,11 @@ pub fn redirect_uri(port: u16) -> String {
     format!("http://127.0.0.1:{port}{CALLBACK_PATH}")
 }
 
+/// The redirect a Claude plan sign-in uses: `localhost` on the fixed port.
+pub fn claude_redirect_uri() -> String {
+    format!("http://localhost:{CLAUDE_PORT}{CLAUDE_CALLBACK_PATH}")
+}
+
 /// Wait for the provider redirect and return its authorization code. Requests
 /// for any other path are answered 404 and ignored; a wrong state is refused.
 /// Like [`wait_for_auth_done`], the wait gives up after [`MAX_IGNORED_REQUESTS`]
@@ -124,6 +133,17 @@ pub fn redirect_uri(port: u16) -> String {
 pub fn wait_for_callback(
     listener: &TcpListener,
     expected_state: &str,
+    timeout: Duration,
+) -> Result<Zeroizing<String>, OAuthError> {
+    wait_for_callback_at(listener, expected_state, CALLBACK_PATH, timeout)
+}
+
+/// Like [`wait_for_callback`], for a provider whose registered callback path
+/// is not `/oauth-callback`.
+pub fn wait_for_callback_at(
+    listener: &TcpListener,
+    expected_state: &str,
+    callback_path: &str,
     timeout: Duration,
 ) -> Result<Zeroizing<String>, OAuthError> {
     listener
@@ -134,7 +154,7 @@ pub fn wait_for_callback(
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
-                if let Some(result) = handle_connection(stream, expected_state) {
+                if let Some(result) = handle_connection(stream, expected_state, callback_path) {
                     return result;
                 }
                 ignored += 1;
@@ -330,9 +350,10 @@ const PAGE_FAILED: &str = "<!doctype html><meta charset=\"utf-8\"><title>SeraBot
 fn handle_connection(
     mut stream: TcpStream,
     expected_state: &str,
+    callback_path: &str,
 ) -> Option<Result<Zeroizing<String>, OAuthError>> {
     let url = read_request_url(&mut stream)?;
-    if url.path() != CALLBACK_PATH {
+    if url.path() != callback_path {
         respond(&mut stream, "404 Not Found", "Not found");
         return None;
     }
@@ -424,6 +445,26 @@ mod tests {
         });
         let code = wait_for_callback(&listener, "expected-state", Duration::from_secs(5)).unwrap();
         assert_eq!(code.as_str(), "synthetic-code");
+        client.join().unwrap();
+    }
+
+    #[test]
+    fn the_claude_callback_is_localhost_on_its_fixed_port_and_path() {
+        assert_eq!(claude_redirect_uri(), "http://localhost:54545/callback");
+        let (listener, port) = bind_loopback().unwrap();
+        let client = std::thread::spawn(move || {
+            // The generic path is not this provider's callback.
+            get(port, "/oauth-callback?code=wrong-path&state=expected-state");
+            get(port, "/callback?code=claude-code&state=expected-state");
+        });
+        let code = wait_for_callback_at(
+            &listener,
+            "expected-state",
+            CLAUDE_CALLBACK_PATH,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(code.as_str(), "claude-code");
         client.join().unwrap();
     }
 

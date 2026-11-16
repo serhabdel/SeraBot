@@ -499,12 +499,20 @@ fn add_muse(env: &Env, email: &str, meta_token: &str) -> String {
 async fn every_muse_call_carries_the_api_version() {
     let env = env();
     let server = MockServer::start().await;
+    // Muse chats on the Responses transport.
     Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
+        .and(path("/v1/responses"))
         .and(header("x-api-version", "1.0.0"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}]
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            "event: response.output_text.delta
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}
+
+event: response.completed
+data: {\"type\":\"response.completed\",\"response\":{}}
+
+",
+            "text/event-stream",
+        ))
         .expect(1)
         .mount(&server)
         .await;
@@ -572,7 +580,7 @@ async fn a_rejected_muse_key_with_no_meta_token_parks_the_account() {
     let env = env();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
+        .and(path("/v1/responses"))
         .respond_with(ResponseTemplate::new(401))
         .mount(&server)
         .await;

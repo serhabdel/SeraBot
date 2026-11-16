@@ -144,7 +144,7 @@ type PickerItem = (
 );
 
 /// The provider kinds the server understands.
-const PROVIDER_KINDS: [&str; 20] = [
+const PROVIDER_KINDS: [&str; 23] = [
     "openai-compatible",
     "google-antigravity",
     "mistral",
@@ -165,6 +165,9 @@ const PROVIDER_KINDS: [&str; 20] = [
     "nebius",
     "sambanova",
     "muse-code",
+    "anthropic",
+    "opencode-go",
+    "opencode-zen",
 ];
 
 /// Global key bindings, installed once in the WebView.

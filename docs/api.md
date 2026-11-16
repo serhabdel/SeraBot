@@ -561,9 +561,25 @@ returned; no restart is needed.
   Cloud Code project, stores the account, and returns
   `{"signed_in":true,"account_id","created","project_discovered"}`.
 
+- `anthropic` (Claude plan sign-in, PKCE): off by default. It exists only for a
+  provider with `plan_oauth = true`, and only the admin can start it (a member
+  gets `403`; a provider without the flag answers `422 signin_unsupported`).
+  `redirect_uri` must be `http://localhost:54545/callback` (or the `127.0.0.1`
+  spelling). `.../oauth/complete` (and the member route `signin/complete`) accept
+  the code as `code`, `code#state` or the whole callback URL. The account is the
+  admin's own and is never shared. See `docs/providers.md`, "Claude plan sign-in".
+
 A provider with no sign-in answers `422`; an unknown id `404`. Audit entries
 (`config.provider_oauth_signed_in` / `config.provider_oauth_failed`) carry the
 provider id, kind and account id only.
+
+`GET /v1/providers` and `GET /v1/providers/{id}/accounts` list the sign-in
+flows a caller may use in `signin`. For a Claude plan sign-in, `signin` is empty
+for members and `signin_risk` (a short text for a banner) is `null`; for the
+admin on an enabled provider `signin` is `["pkce"]` and `signin_risk` carries the
+risk text. An `anthropic` provider otherwise takes API keys:
+`POST /v1/providers/{id}/accounts` with `{"label","api_key"}`, several per
+member, checked with one model-list call.
 
 ## Connector OAuth sign-in (ElevenLabs)
 
