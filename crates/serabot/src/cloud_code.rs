@@ -9,13 +9,14 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use base64::Engine;
 use rand::RngCore;
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
+// The PKCE helpers moved to the shared sign-in framework.
+pub use crate::auth_flows::pkce::pkce_s256;
+use crate::auth_flows::pkce::{pkce_token_ok, random_state as random_token, state_ok};
 use crate::domain::{LlmMessage, Role};
 use crate::error::{Result, SeraError};
 use crate::gateway::ToolSpec;
@@ -161,15 +162,6 @@ pub fn chat_targets(base: &str) -> Result<Vec<ChatTarget>> {
             generate: format!("{origin}/v1internal:generateContent"),
         })
         .collect())
-}
-
-pub fn pkce_s256() -> (String, String) {
-    let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
-    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(Sha256::digest(verifier.as_bytes()));
-    (verifier, challenge)
 }
 
 pub fn authorize_url(redirect_uri: &str, challenge: &str, state: &str) -> Result<String> {
@@ -1118,26 +1110,6 @@ fn credential_ok(value: &str) -> bool {
         && !value.chars().any(char::is_control)
 }
 
-fn pkce_token_ok(value: &str) -> bool {
-    (43..=128).contains(&value.len())
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-}
-
-fn state_ok(value: &str) -> bool {
-    (16..=128).contains(&value.len())
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-}
-
-fn random_token() -> String {
-    let mut bytes = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-}
-
 fn fresh_session_id() -> String {
     let mut bytes = [0u8; 8];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
@@ -1512,8 +1484,10 @@ fn default_tier(value: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use crate::domain::ToolCall;
+    use base64::Engine;
     use secrecy::ExposeSecret;
     use serde_json::json;
+    use sha2::{Digest, Sha256};
     use std::sync::{Arc, Mutex};
     use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

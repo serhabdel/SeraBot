@@ -438,6 +438,30 @@ impl Store {
         Ok(changed == 1)
     }
 
+    /// Cache a quota reading for one account. False when the acting user has
+    /// no such account row.
+    pub fn set_provider_account_quota(
+        &self,
+        user_id: &str,
+        provider: &str,
+        account_id: &str,
+        quota: &Value,
+    ) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE provider_accounts SET quota_json = ?4, updated_at = ?5
+             WHERE user_id = ?1 AND provider = ?2 AND account_id = ?3",
+            params![
+                user_id,
+                provider,
+                account_id,
+                serde_json::to_string(quota)?,
+                now_string()
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// Delete an account row and its sealed credential together. Returns
     /// false when the acting user has no such account.
     pub(crate) fn delete_provider_account(
@@ -502,6 +526,10 @@ pub struct Accounts {
 impl Accounts {
     pub fn new(store: Store, secrets: Arc<UserSecrets>) -> Self {
         Self { store, secrets }
+    }
+
+    pub fn store(&self) -> &Store {
+        &self.store
     }
 
     /// The acting user's accounts for `provider`, best first, including the
@@ -816,6 +844,368 @@ impl Accounts {
             .provider_account(user_id, provider, &account_id)?
             .ok_or_else(|| SeraError::Internal("the moved account is missing".into()))
     }
+}
+
+impl Accounts {
+    /// The keyed fingerprint of a pasted API key (see
+    /// [`UserSecrets::key_fingerprint`]).
+    pub fn key_fingerprint(&self, user_id: &str, provider: &str, key: &str) -> String {
+        self.secrets.key_fingerprint(user_id, provider, key)
+    }
+
+    /// Replace an account's credential only while it still matches `expected`.
+    ///
+    /// The read, compare and write run under the secret store's write lock, so
+    /// a refresh that started from an older copy cannot overwrite a newer
+    /// sign-in or an earlier refresh. Returns false (and writes nothing) when
+    /// the stored credential has moved on or the account is gone.
+    pub fn swap_credential(
+        &self,
+        user_id: &str,
+        provider: &str,
+        account_id: &str,
+        expected: &CredentialStamp,
+        next: &ProviderCredential,
+    ) -> Result<bool> {
+        next.encode()?;
+        let change = |credential: &mut ProviderCredential| {
+            if &CredentialStamp::of(credential) != expected {
+                return Err(SeraError::InvalidState(STALE_CREDENTIAL.into()));
+            }
+            *credential = next.clone();
+            Ok(())
+        };
+        let result = if account_id == DEFAULT_ACCOUNT {
+            self.secrets.update_provider(user_id, provider, change)
+        } else {
+            if !valid_account_id(account_id) {
+                return Ok(false);
+            }
+            self.secrets
+                .update_account(user_id, provider, account_id, change)
+        };
+        match result {
+            Ok(()) => Ok(true),
+            Err(SeraError::InvalidState(message)) if message == STALE_CREDENTIAL => Ok(false),
+            Err(SeraError::NotFound(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+const STALE_CREDENTIAL: &str = "the stored credential changed";
+
+/// What a caller knew about an account's credential when its request failed.
+/// Two stamps are equal only when the access token, the refresh token and the
+/// generation all match, so a credential that someone else already refreshed
+/// compares unequal. Holds secrets; `Debug` redacts them.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CredentialStamp {
+    generation: Option<String>,
+    refresh_token: String,
+    access_token: String,
+}
+
+impl CredentialStamp {
+    pub fn of(credential: &ProviderCredential) -> Self {
+        Self {
+            generation: credential.generation.clone(),
+            refresh_token: credential.refresh_token.clone(),
+            access_token: credential.api_key.clone(),
+        }
+    }
+
+    /// A stamp from loose parts, for a client that tracks them separately.
+    pub fn new(generation: Option<String>, refresh_token: &str, access_token: &str) -> Self {
+        Self {
+            generation,
+            refresh_token: refresh_token.to_owned(),
+            access_token: access_token.to_owned(),
+        }
+    }
+}
+
+impl std::fmt::Debug for CredentialStamp {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CredentialStamp")
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Refresh an access token this many seconds before it expires.
+pub const REFRESH_SKEW_SECS: i64 = 300;
+
+/// What a successful token exchange returned.
+pub struct RefreshGrant {
+    pub access_token: String,
+    /// Set when the provider rotated the refresh token.
+    pub refresh_token: Option<String>,
+    /// Unix seconds when `access_token` stops working, when the provider said.
+    pub expires_at: Option<i64>,
+}
+
+impl std::fmt::Debug for RefreshGrant {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RefreshGrant")
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why a token exchange failed.
+#[derive(Debug)]
+pub enum RefreshError {
+    /// The provider refused the refresh token (`invalid_grant`, a revoked or
+    /// expired sign-in). Retrying cannot help; the member must sign in again.
+    InvalidGrant,
+    /// Anything else (network, 5xx). The credential is untouched.
+    Failed(SeraError),
+}
+
+impl RefreshError {
+    pub fn into_error(self) -> SeraError {
+        match self {
+            Self::InvalidGrant => needs_reauth_error(),
+            Self::Failed(error) => error,
+        }
+    }
+}
+
+/// The error a refresh returns once the account is parked in `needs_reauth`.
+pub fn needs_reauth_error() -> SeraError {
+    SeraError::Rejected {
+        code: "needs_reauth",
+        message: "This account's sign-in expired. Sign in again.".into(),
+    }
+}
+
+/// The result of asking for a fresh credential.
+#[derive(Debug)]
+pub struct Refreshed {
+    /// The credential to use now.
+    pub credential: ProviderCredential,
+    /// True when this call ran the exchange. False when another caller had
+    /// already refreshed (or a newer sign-in replaced the credential) and this
+    /// call adopted what was stored.
+    pub performed: bool,
+}
+
+type LockKey = (String, String, String);
+
+/// Single-flight token refresh, one lock per `(user, provider, account)`.
+///
+/// Rotating refresh tokens make a race destructive: two turns that refresh the
+/// same account at once spend the old token twice, and the second spend gets
+/// `invalid_grant`. Every refresh therefore takes the account's lock, re-reads
+/// the stored credential and compares it with what the caller saw. If it
+/// changed, someone else already refreshed and the caller adopts the stored
+/// value. If not, the lock holder runs the exchange and writes the result back
+/// (compare-and-swap) before releasing, so the next waiter reads it.
+pub struct AccountRefresher {
+    accounts: Arc<Accounts>,
+    locks: std::sync::Mutex<std::collections::HashMap<LockKey, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl AccountRefresher {
+    pub fn new(accounts: Arc<Accounts>) -> Self {
+        Self {
+            accounts,
+            locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    pub fn accounts(&self) -> &Arc<Accounts> {
+        &self.accounts
+    }
+
+    fn lock_for(
+        &self,
+        user_id: &str,
+        provider: &str,
+        account_id: &str,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if locks.len() >= 256 {
+            // Only entries nobody holds or waits on can go.
+            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        }
+        locks
+            .entry((
+                user_id.to_owned(),
+                provider.to_owned(),
+                account_id.to_owned(),
+            ))
+            .or_default()
+            .clone()
+    }
+
+    /// Whether `credential`'s access token expires within the refresh skew.
+    /// Unknown expiry is not "near": the first rejected request renews it.
+    pub fn is_near_expiry(credential: &ProviderCredential, now: i64) -> bool {
+        !credential.refresh_token.is_empty()
+            && credential
+                .expires_at
+                .is_some_and(|at| at - now <= REFRESH_SKEW_SECS)
+    }
+
+    /// Refresh one account's credential, or adopt a refresh someone else did.
+    ///
+    /// `seen` is what the caller held when its request was rejected.
+    /// `exchange` gets the stored refresh token and runs the provider call; it
+    /// runs at most once and only while the lock is held.
+    pub async fn refresh<F, Fut>(
+        &self,
+        user_id: &str,
+        provider: &str,
+        account_id: &str,
+        seen: &CredentialStamp,
+        exchange: F,
+    ) -> Result<Refreshed>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<RefreshGrant, RefreshError>>,
+    {
+        let lock = self.lock_for(user_id, provider, account_id);
+        let _guard = lock.lock().await;
+        let current = self
+            .accounts
+            .credential(user_id, provider, account_id)?
+            .ok_or_else(|| SeraError::NotFound("account".into()))?;
+        if &CredentialStamp::of(&current) != seen {
+            return Ok(Refreshed {
+                credential: current,
+                performed: false,
+            });
+        }
+        if current.refresh_token.is_empty() {
+            return Err(self.park(user_id, provider, account_id, "no refresh token"));
+        }
+        let grant = match exchange(current.refresh_token.clone()).await {
+            Ok(grant) => grant,
+            Err(RefreshError::InvalidGrant) => {
+                return Err(self.park(user_id, provider, account_id, "refresh token rejected"));
+            }
+            Err(RefreshError::Failed(error)) => return Err(error),
+        };
+        let mut next = current.clone();
+        next.api_key = grant.access_token;
+        if let Some(rotated) = grant.refresh_token.filter(|token| !token.is_empty()) {
+            next.refresh_token = rotated;
+        }
+        next.expires_at = grant.expires_at;
+        next.generation = Some(new_generation());
+        if !self.accounts.swap_credential(
+            user_id,
+            provider,
+            account_id,
+            &CredentialStamp::of(&current),
+            &next,
+        )? {
+            // A new sign-in landed while the exchange ran. It wins; what the
+            // exchange returned belonged to the old chain.
+            let latest = self
+                .accounts
+                .credential(user_id, provider, account_id)?
+                .ok_or_else(|| SeraError::NotFound("account".into()))?;
+            return Ok(Refreshed {
+                credential: latest,
+                performed: false,
+            });
+        }
+        // A refresh that worked proves the sign-in is good again.
+        if let Some(account) = self.accounts.get(user_id, provider, account_id)?
+            && account.status == AccountStatus::NeedsReauth
+        {
+            self.accounts.set_status(
+                user_id,
+                provider,
+                account_id,
+                AccountStatus::Ok,
+                None,
+                None,
+            )?;
+        }
+        Ok(Refreshed {
+            credential: next,
+            performed: true,
+        })
+    }
+
+    /// Refresh ahead of expiry: when the stored access token expires within
+    /// [`REFRESH_SKEW_SECS`], run [`Self::refresh`] against what is stored now.
+    /// Returns the credential to use.
+    pub async fn ensure_fresh<F, Fut>(
+        &self,
+        user_id: &str,
+        provider: &str,
+        account_id: &str,
+        now: i64,
+        exchange: F,
+    ) -> Result<ProviderCredential>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<RefreshGrant, RefreshError>>,
+    {
+        let stored = self
+            .accounts
+            .credential(user_id, provider, account_id)?
+            .ok_or_else(|| SeraError::NotFound("account".into()))?;
+        if !Self::is_near_expiry(&stored, now) {
+            return Ok(stored);
+        }
+        Ok(self
+            .refresh(
+                user_id,
+                provider,
+                account_id,
+                &CredentialStamp::of(&stored),
+                exchange,
+            )
+            .await?
+            .credential)
+    }
+
+    /// Park an account whose sign-in cannot be renewed. The row and its
+    /// sealed credential stay, so the audit trail and the label survive and
+    /// the member can sign in again over it.
+    fn park(&self, user_id: &str, provider: &str, account_id: &str, reason: &str) -> SeraError {
+        if let Err(error) = self.accounts.set_status(
+            user_id,
+            provider,
+            account_id,
+            AccountStatus::NeedsReauth,
+            Some(reason),
+            None,
+        ) {
+            tracing::warn!(%error, "could not mark an account as needing sign-in");
+        }
+        if let Err(error) = self.accounts.store.record_audit(
+            user_id,
+            "provider.account_needs_reauth",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&json!({"provider": provider, "account": account_id})),
+        ) {
+            tracing::warn!(%error, "could not audit an account needing sign-in");
+        }
+        needs_reauth_error()
+    }
+}
+
+fn new_generation() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 8];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
 }
 
 fn clamp_priority(priority: i64) -> i64 {
@@ -1493,5 +1883,501 @@ mod tests {
             identity_fingerprint("p", "id"),
             identity_fingerprint("q", "id")
         );
+    }
+
+    // ---- single-flight refresh (P11) ----
+
+    use crate::domain::LlmMessage;
+    use crate::llm::{AccountRefreshTarget, LlmClient};
+    use crate::providers::{OAuthMaterial, OAuthStyle};
+    use wiremock::matchers::{body_string_contains, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn refresher() -> (Store, Arc<Accounts>, Arc<AccountRefresher>) {
+        let (store, secrets, _) = setup();
+        let accounts = Arc::new(Accounts::new(store.clone(), secrets));
+        let refresher = Arc::new(AccountRefresher::new(accounts.clone()));
+        (store, accounts, refresher)
+    }
+
+    fn sign_in(accounts: &Accounts, user: &str, expires_at: Option<i64>) -> String {
+        let mut request = oauth("google-antigravity", "p@example.example", "old-access");
+        request.credential.refresh_token = "refresh-old".into();
+        request.credential.expires_at = expires_at;
+        accounts.add(user, request).unwrap().account_id
+    }
+
+    fn chat_ok() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        }))
+    }
+
+    /// A mock identity provider: the old refresh token yields a rotated pair
+    /// (slowly, so concurrent turns really overlap); the chat endpoint rejects
+    /// the old access token and accepts the new one.
+    async fn idp() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("refresh_token=refresh-old"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(150))
+                    .set_body_json(json!({
+                        "access_token": "new-access",
+                        "refresh_token": "refresh-new",
+                        "expires_in": 3600
+                    })),
+            )
+            .mount(&server)
+            .await;
+        // A second spend of the old token is the failure single-flight prevents.
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("refresh_token=refresh-new"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_json(json!({"error": "invalid_grant"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("authorization", "Bearer old-access"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("authorization", "Bearer new-access"))
+            .respond_with(chat_ok())
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn account_client(
+        server: &MockServer,
+        refresher: &Arc<AccountRefresher>,
+        user: &str,
+        account: &str,
+        expires_at: Option<i64>,
+    ) -> LlmClient {
+        LlmClient::new(server.uri(), "old-access", 10, 64)
+            .unwrap()
+            .with_model("synthetic-model")
+            .with_oauth_unpinned(OAuthMaterial {
+                style: OAuthStyle::RefreshToken,
+                refresh_token: "refresh-old".into(),
+                token_url: format!("{}/token", server.uri()),
+                client_id: "client".into(),
+                client_secret: "secret".into(),
+            })
+            .unwrap()
+            .with_account_refresh(
+                AccountRefreshTarget {
+                    refresher: refresher.clone(),
+                    user_id: user.into(),
+                    provider: "google-antigravity".into(),
+                    account_id: account.into(),
+                },
+                None,
+                expires_at,
+            )
+            .unwrap()
+    }
+
+    async fn token_calls(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/token")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn eight_concurrent_turns_on_one_client_refresh_exactly_once() {
+        let (store, accounts, refresher) = refresher();
+        let alice = member(&store, "microsoft:refresh-one");
+        let account = sign_in(&accounts, &alice, None);
+        let server = idp().await;
+        let client = account_client(&server, &refresher, &alice, &account, None);
+        let mut turns = Vec::new();
+        for _ in 0..8 {
+            let client = client.clone();
+            turns.push(tokio::spawn(async move {
+                client
+                    .complete(&[LlmMessage::user("hello")], &[], None, None)
+                    .await
+            }));
+        }
+        for turn in turns {
+            assert_eq!(
+                turn.await.unwrap().unwrap().message.content.as_deref(),
+                Some("hi")
+            );
+        }
+        assert_eq!(token_calls(&server).await, 1);
+        // The rotated pair and a new generation were written back.
+        let stored = accounts
+            .credential(&alice, "google-antigravity", &account)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.api_key, "new-access");
+        assert_eq!(stored.refresh_token, "refresh-new");
+        assert!(stored.generation.is_some());
+        assert!(stored.expires_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn eight_separate_clients_for_one_account_refresh_exactly_once() {
+        // Each turn can hold its own client built from the same stale copy.
+        let (store, accounts, refresher) = refresher();
+        let alice = member(&store, "microsoft:refresh-eight");
+        let account = sign_in(&accounts, &alice, None);
+        let server = idp().await;
+        let mut turns = Vec::new();
+        for _ in 0..8 {
+            let client = account_client(&server, &refresher, &alice, &account, None);
+            turns.push(tokio::spawn(async move {
+                client
+                    .complete(&[LlmMessage::user("hello")], &[], None, None)
+                    .await
+            }));
+        }
+        for turn in turns {
+            assert!(turn.await.unwrap().is_ok());
+        }
+        assert_eq!(token_calls(&server).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_stale_write_is_refused_and_changes_nothing() {
+        let (store, accounts, _refresher) = refresher();
+        let alice = member(&store, "microsoft:refresh-stale");
+        let account = sign_in(&accounts, &alice, None);
+        let before = accounts
+            .credential(&alice, "google-antigravity", &account)
+            .unwrap()
+            .unwrap();
+        let old = CredentialStamp::of(&before);
+        let mut newer = before.clone();
+        newer.api_key = "newer-access".into();
+        newer.generation = Some("g1".into());
+        assert!(
+            accounts
+                .swap_credential(&alice, "google-antigravity", &account, &old, &newer)
+                .unwrap()
+        );
+        // A writer still holding the first copy is refused.
+        let mut late = before.clone();
+        late.api_key = "late-access".into();
+        late.generation = Some("g2".into());
+        assert!(
+            !accounts
+                .swap_credential(&alice, "google-antigravity", &account, &old, &late)
+                .unwrap()
+        );
+        let stored = accounts
+            .credential(&alice, "google-antigravity", &account)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.api_key, "newer-access");
+        assert_eq!(stored.generation.as_deref(), Some("g1"));
+        // Another user's id cannot be swapped either.
+        let bob = member(&store, "microsoft:refresh-stale-bob");
+        assert!(
+            !accounts
+                .swap_credential(
+                    &bob,
+                    "google-antigravity",
+                    &account,
+                    &CredentialStamp::of(&newer),
+                    &late
+                )
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_that_lost_the_race_adopts_the_stored_credential() {
+        let (store, accounts, refresher) = refresher();
+        let alice = member(&store, "microsoft:refresh-adopt");
+        let account = sign_in(&accounts, &alice, None);
+        let seen = CredentialStamp::of(
+            &accounts
+                .credential(&alice, "google-antigravity", &account)
+                .unwrap()
+                .unwrap(),
+        );
+        let first = refresher
+            .refresh(
+                &alice,
+                "google-antigravity",
+                &account,
+                &seen,
+                |refresh| async move {
+                    assert_eq!(refresh, "refresh-old");
+                    Ok(RefreshGrant {
+                        access_token: "a2".into(),
+                        refresh_token: Some("r2".into()),
+                        expires_at: Some(4_000_000_000),
+                    })
+                },
+            )
+            .await
+            .unwrap();
+        assert!(first.performed);
+        // The second caller still holds the old stamp: no exchange runs.
+        let second = refresher
+            .refresh(&alice, "google-antigravity", &account, &seen, |_| async {
+                panic!("the exchange must not run twice");
+            })
+            .await
+            .unwrap();
+        assert!(!second.performed);
+        assert_eq!(second.credential.api_key, "a2");
+        assert_eq!(second.credential.refresh_token, "r2");
+    }
+
+    #[tokio::test]
+    async fn a_new_sign_in_during_the_exchange_wins() {
+        let (store, accounts, refresher) = refresher();
+        let alice = member(&store, "microsoft:refresh-signin");
+        let account = sign_in(&accounts, &alice, None);
+        let seen = CredentialStamp::of(
+            &accounts
+                .credential(&alice, "google-antigravity", &account)
+                .unwrap()
+                .unwrap(),
+        );
+        let during = accounts.clone();
+        let user = alice.clone();
+        let outcome = refresher
+            .refresh(
+                &alice,
+                "google-antigravity",
+                &account,
+                &seen,
+                move |_| async move {
+                    // The member signs in again while the exchange is in flight.
+                    let mut again =
+                        oauth("google-antigravity", "p@example.example", "fresh-signin");
+                    again.credential.refresh_token = "fresh-refresh".into();
+                    during.add(&user, again).unwrap();
+                    Ok(RefreshGrant {
+                        access_token: "from-old-chain".into(),
+                        refresh_token: Some("old-chain-rotated".into()),
+                        expires_at: None,
+                    })
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!outcome.performed);
+        assert_eq!(outcome.credential.api_key, "fresh-signin");
+        let stored = accounts
+            .credential(&alice, "google-antigravity", &account)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.api_key, "fresh-signin");
+        assert_eq!(stored.refresh_token, "fresh-refresh");
+    }
+
+    #[tokio::test]
+    async fn invalid_grant_parks_the_account_and_keeps_the_row() {
+        let (store, accounts, refresher) = refresher();
+        let alice = member(&store, "microsoft:refresh-grant");
+        let account = sign_in(&accounts, &alice, None);
+        let seen = CredentialStamp::of(
+            &accounts
+                .credential(&alice, "google-antigravity", &account)
+                .unwrap()
+                .unwrap(),
+        );
+        let error = refresher
+            .refresh(&alice, "google-antigravity", &account, &seen, |_| async {
+                Err(RefreshError::InvalidGrant)
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SeraError::Rejected {
+                code: "needs_reauth",
+                ..
+            }
+        ));
+        let row = accounts
+            .get(&alice, "google-antigravity", &account)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, AccountStatus::NeedsReauth);
+        assert!(row.last_error.is_some());
+        // The sealed credential is still there for the audit trail, and signing
+        // in again over it makes the account usable.
+        assert!(
+            accounts
+                .credential(&alice, "google-antigravity", &account)
+                .unwrap()
+                .is_some()
+        );
+        let again = accounts
+            .add(
+                &alice,
+                oauth("google-antigravity", "p@example.example", "back"),
+            )
+            .unwrap();
+        assert_eq!(again.account_id, account);
+        assert_eq!(
+            accounts
+                .get(&alice, "google-antigravity", &account)
+                .unwrap()
+                .unwrap()
+                .status,
+            AccountStatus::Ok
+        );
+        // A transient failure changes nothing.
+        let seen = CredentialStamp::of(
+            &accounts
+                .credential(&alice, "google-antigravity", &account)
+                .unwrap()
+                .unwrap(),
+        );
+        let error = refresher
+            .refresh(&alice, "google-antigravity", &account, &seen, |_| async {
+                Err(RefreshError::Failed(SeraError::External("down".into())))
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SeraError::External(_)));
+        assert_eq!(
+            accounts
+                .get(&alice, "google-antigravity", &account)
+                .unwrap()
+                .unwrap()
+                .status,
+            AccountStatus::Ok
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_grant_from_the_token_endpoint_marks_needs_reauth() {
+        let (store, accounts, refresher) = refresher();
+        let alice = member(&store, "microsoft:refresh-endpoint");
+        let account = sign_in(&accounts, &alice, None);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_json(json!({"error": "invalid_grant"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let client = account_client(&server, &refresher, &alice, &account, None);
+        let error = client
+            .complete(&[LlmMessage::user("hello")], &[], None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SeraError::Rejected {
+                code: "needs_reauth",
+                ..
+            }
+        ));
+        assert_eq!(
+            accounts
+                .get(&alice, "google-antigravity", &account)
+                .unwrap()
+                .unwrap()
+                .status,
+            AccountStatus::NeedsReauth
+        );
+        assert!(!error.to_string().contains("refresh-old"));
+    }
+
+    #[tokio::test]
+    async fn a_token_near_expiry_is_refreshed_before_the_request() {
+        let (store, accounts, refresher) = refresher();
+        let alice = member(&store, "microsoft:refresh-early");
+        let soon = chrono::Utc::now().timestamp() + 120;
+        let account = sign_in(&accounts, &alice, Some(soon));
+        let server = idp().await;
+        let client = account_client(&server, &refresher, &alice, &account, Some(soon));
+        client
+            .complete(&[LlmMessage::user("hello")], &[], None, None)
+            .await
+            .unwrap();
+        assert_eq!(token_calls(&server).await, 1);
+        // The old token was never sent: the chat request used the new one.
+        let chats = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.url.path() == "/chat/completions")
+            .count();
+        assert_eq!(chats, 1);
+
+        // A token with time left is left alone.
+        let (store, accounts, refresher) = self::refresher();
+        let bob = member(&store, "microsoft:refresh-late");
+        let later = chrono::Utc::now().timestamp() + 3600;
+        let account = sign_in(&accounts, &bob, Some(later));
+        let calm = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("authorization", "Bearer old-access"))
+            .respond_with(chat_ok())
+            .mount(&calm)
+            .await;
+        let client = account_client(&calm, &refresher, &bob, &account, Some(later));
+        client
+            .complete(&[LlmMessage::user("hello")], &[], None, None)
+            .await
+            .unwrap();
+        assert_eq!(token_calls(&calm).await, 0);
+        assert!(AccountRefresher::is_near_expiry(
+            &ProviderCredential {
+                api_key: "a".into(),
+                refresh_token: "r".into(),
+                expires_at: Some(100),
+                ..Default::default()
+            },
+            100 - REFRESH_SKEW_SECS
+        ));
+        // No refresh token, or an unknown expiry, is never "near".
+        assert!(!AccountRefresher::is_near_expiry(
+            &ProviderCredential {
+                api_key: "a".into(),
+                ..Default::default()
+            },
+            0
+        ));
+    }
+
+    #[tokio::test]
+    async fn refreshing_another_users_account_finds_nothing() {
+        let (store, accounts, refresher) = refresher();
+        let alice = member(&store, "microsoft:refresh-iso-a");
+        let bob = member(&store, "microsoft:refresh-iso-b");
+        let account = sign_in(&accounts, &alice, None);
+        let seen = CredentialStamp::new(None, "refresh-old", "old-access");
+        let error = refresher
+            .refresh(&bob, "google-antigravity", &account, &seen, |_| async {
+                panic!("must not run for another user's account");
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SeraError::NotFound(_)));
     }
 }

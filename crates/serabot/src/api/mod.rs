@@ -72,6 +72,7 @@ mod messages;
 mod monitoring;
 mod preview;
 mod profiles;
+mod provider_accounts;
 mod routines;
 mod settings;
 mod skills;
@@ -102,6 +103,7 @@ use memories::*;
 use messages::*;
 use monitoring::*;
 use preview::*;
+use provider_accounts::*;
 use routines::*;
 use settings::*;
 use skills::*;
@@ -157,6 +159,9 @@ impl Notifier for ApiNotifier {
     }
 }
 
+/// When each `(user, provider, account)` quota was last read.
+type QuotaReadTimes = HashMap<(String, String, String), Instant>;
+
 #[derive(Clone)]
 pub struct ApiState {
     runtime: Runtime,
@@ -208,6 +213,16 @@ pub struct ApiState {
     card_claims: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Password manager CLIs for vault references (see `vault_providers`).
     vault_providers: Arc<crate::vault_providers::Providers>,
+    /// Per-user AI provider accounts (several keys or sign-ins per provider).
+    accounts: Arc<crate::accounts::Accounts>,
+    /// The single-flight token refresh shared with the model clients.
+    refresher: Arc<crate::accounts::AccountRefresher>,
+    /// Browser and device sign-ins for provider accounts.
+    signin: Arc<crate::auth_flows::SignInService>,
+    /// Provider quota readers by provider kind; none until a provider adds one.
+    quota_readers: Arc<HashMap<String, Arc<dyn QuotaReader>>>,
+    /// When each account's quota was last read from its provider.
+    quota_read_at: Arc<std::sync::Mutex<QuotaReadTimes>>,
 }
 
 impl ApiState {
@@ -242,6 +257,9 @@ impl ApiState {
             &config,
             users.clone(),
         )?);
+        let accounts = Arc::new(crate::accounts::Accounts::new(store.clone(), users.clone()));
+        let refresher = Arc::new(crate::accounts::AccountRefresher::new(accounts.clone()));
+        let signin = Arc::new(crate::auth_flows::SignInService::new(accounts.clone())?);
         let (marketplace, plugin_problems) = marketplace::load(&config);
         for problem in &plugin_problems {
             tracing::warn!(%problem, "plugin skipped");
@@ -273,8 +291,40 @@ impl ApiState {
             sys_status: Arc::new(crate::sysstatus::StatusMonitor::new()),
             card_claims: Arc::default(),
             vault_providers: Arc::new(crate::vault_providers::Providers::new(&config.vault)),
+            accounts,
+            refresher,
+            signin,
+            quota_readers: Arc::default(),
+            quota_read_at: Arc::default(),
             config,
         })
+    }
+
+    /// Share the account refresher the model clients use, so a token renewed
+    /// by a request here and one renewed by a turn take the same lock.
+    pub fn with_refresher(
+        mut self,
+        refresher: Arc<crate::accounts::AccountRefresher>,
+    ) -> Result<Self> {
+        self.accounts = refresher.accounts().clone();
+        self.signin = Arc::new(
+            crate::auth_flows::SignInService::new(self.accounts.clone())?
+                .with_registry(self.signin.registry().clone()),
+        );
+        self.refresher = refresher;
+        Ok(self)
+    }
+
+    /// Replace the sign-in service (tests point providers at mock servers).
+    pub fn with_signin(mut self, signin: Arc<crate::auth_flows::SignInService>) -> Self {
+        self.signin = signin;
+        self
+    }
+
+    /// Register quota readers by provider kind.
+    pub fn with_quota_readers(mut self, readers: HashMap<String, Arc<dyn QuotaReader>>) -> Self {
+        self.quota_readers = Arc::new(readers);
+        self
     }
 
     /// Share the relay the local folder tools use, so the desktop's polls
@@ -447,6 +497,35 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/providers", get(list_providers))
         .route("/v1/providers/{id}/key", put(set_provider_key))
         .route("/v1/providers/{id}/test", post(test_provider_endpoint))
+        .route(
+            "/v1/providers/{id}/accounts",
+            get(list_provider_accounts).post(add_provider_account),
+        )
+        .route(
+            "/v1/providers/{id}/accounts/{aid}",
+            patch(patch_provider_account).delete(delete_provider_account),
+        )
+        .route(
+            "/v1/providers/{id}/accounts/{aid}/test",
+            post(test_provider_account),
+        )
+        .route(
+            "/v1/providers/{id}/accounts/{aid}/quota",
+            get(provider_account_quota),
+        )
+        .route(
+            "/v1/providers/{id}/signin/start",
+            post(provider_signin_start),
+        )
+        .route(
+            "/v1/providers/{id}/signin/complete",
+            post(provider_signin_complete),
+        )
+        .route(
+            "/v1/providers/{id}/signin/{flow_id}",
+            get(provider_signin_status),
+        )
+        // The routes that predate accounts stay, as aliases of signin/*.
         .route("/v1/providers/{id}/oauth/start", post(provider_oauth_start))
         .route(
             "/v1/providers/{id}/oauth/complete",
@@ -713,10 +792,12 @@ fn secret_status(secrets: &SharedSecrets, name: Option<&str>) -> Value {
 /// admin grant, or neither. Presence only — never a value.
 fn credential_view(state: &ApiState, user_id: &str, provider: &str) -> Result<Value> {
     let status = state.users.credential_status(user_id, provider)?;
+    let accounts = state.store.usable_account_ids(user_id, provider)?.len();
     Ok(json!({
-        "configured": status.usable(),
-        "own": status.own,
+        "configured": status.usable() || accounts > 0,
+        "own": status.own || accounts > 0,
         "granted": status.granted,
+        "accounts": accounts,
     }))
 }
 

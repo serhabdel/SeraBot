@@ -7,10 +7,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeroize::Zeroize;
 
+use crate::accounts::{AccountRefresher, CredentialStamp, RefreshError, RefreshGrant, Refreshed};
 use crate::cloud_code::{self, CLOUD_CODE_API_CLIENT, CLOUD_CODE_USER_AGENT, CloudCodeCompletion};
 use crate::providers::{
     ModelCatalog, OAuthMaterial, OAuthStyle, USER_AGENT, enforce_oauth_target, muse_mint_api_key,
-    parse_model_catalog, refresh_token_grant,
+    parse_model_catalog, refresh_token_exchange, refresh_token_grant,
 };
 
 use crate::domain::{LlmMessage, Role, ToolCall};
@@ -44,6 +45,24 @@ struct RefreshPersistence {
     writer: Arc<dyn CredentialWriter>,
 }
 
+/// Where a client's token refresh goes when its credential is a member's
+/// account: through the shared single-flight refresher, which re-reads the
+/// stored credential and writes the result back to the account row.
+#[derive(Clone)]
+pub struct AccountRefreshTarget {
+    pub refresher: Arc<AccountRefresher>,
+    pub user_id: String,
+    pub provider: String,
+    pub account_id: String,
+}
+
+/// What a client knows about the stored credential it was built from.
+struct AccountRefreshState {
+    target: AccountRefreshTarget,
+    generation: Option<String>,
+    expires_at: Option<i64>,
+}
+
 struct OAuthState {
     style: OAuthStyle,
     refresh_token: Mutex<SecretString>,
@@ -51,6 +70,9 @@ struct OAuthState {
     client_id: String,
     client_secret: SecretString,
     persistence: Mutex<Option<RefreshPersistence>>,
+    /// Set for a member's account: refreshes go through the account refresher
+    /// and `persistence` is not used.
+    account: Mutex<Option<AccountRefreshState>>,
     /// Set when a provider rotated the refresh token and the age store does not
     /// yet contain that value. Stays set until `persist` succeeds.
     refresh_unpersisted: AtomicBool,
@@ -139,6 +161,7 @@ impl LlmClient {
             client_id: material.client_id,
             client_secret: SecretString::new(material.client_secret),
             persistence: Mutex::new(None),
+            account: Mutex::new(None),
             refresh_unpersisted: AtomicBool::new(false),
         }));
         Ok(self)
@@ -168,6 +191,30 @@ impl LlmClient {
             .persistence
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(RefreshPersistence { writer });
+        Ok(self)
+    }
+
+    /// Route this client's refreshes through the account refresher.
+    /// `generation` and `expires_at` describe the credential the client was
+    /// built from, so a refresh can tell whether someone else already renewed it.
+    pub fn with_account_refresh(
+        self,
+        target: AccountRefreshTarget,
+        generation: Option<String>,
+        expires_at: Option<i64>,
+    ) -> Result<Self> {
+        let oauth = self
+            .oauth
+            .as_ref()
+            .ok_or_else(|| SeraError::Config("account refresh requires oauth".into()))?;
+        *oauth
+            .account
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(AccountRefreshState {
+            target,
+            generation,
+            expires_at,
+        });
         Ok(self)
     }
 
@@ -213,6 +260,7 @@ impl LlmClient {
         if model.is_empty() {
             return Err(SeraError::Config("LLM model is not configured".into()));
         }
+        self.ensure_fresh_token().await?;
         if self.cloud_code.is_some() {
             return self
                 .complete_cloud_code(messages, tools, &model, temperature)
@@ -255,6 +303,7 @@ impl LlmClient {
         let mut refreshed = false;
         for attempt in 0..=self.max_retries + 1 {
             let mut key = self.bearer();
+            let used = zeroize::Zeroizing::new(key.clone());
             let response = self
                 .http
                 .post(&url)
@@ -268,7 +317,7 @@ impl LlmClient {
                     let status = response.status();
                     if status.as_u16() == 401 && self.oauth.is_some() && !refreshed {
                         refreshed = true;
-                        self.refresh_oauth().await?;
+                        self.refresh_oauth(&used).await?;
                         continue;
                     }
                     if status.is_success() {
@@ -346,6 +395,7 @@ impl LlmClient {
         catalog_url: &str,
         strict: bool,
     ) -> Result<ModelCatalog> {
+        self.ensure_fresh_token().await?;
         if url::Url::parse(catalog_url)
             .ok()
             .is_some_and(|url| url.path().ends_with(":fetchAvailableModels"))
@@ -357,6 +407,7 @@ impl LlmClient {
         let mut last_error = None;
         for attempt in 0..=self.max_retries + 1 {
             let mut key = self.bearer();
+            let used = zeroize::Zeroizing::new(key.clone());
             let response = self
                 .http
                 .get(&url)
@@ -371,7 +422,7 @@ impl LlmClient {
                     let status = response.status();
                     if status.as_u16() == 401 && self.oauth.is_some() && !refreshed {
                         refreshed = true;
-                        self.refresh_oauth().await?;
+                        self.refresh_oauth(&used).await?;
                         continue;
                     }
                     if catalog_body_too_large(&response) {
@@ -427,7 +478,143 @@ impl LlmClient {
             .unwrap_or_else(|| llm_failure::transport_error("model catalog request failed".into())))
     }
 
-    async fn refresh_oauth(&self) -> Result<()> {
+    /// Renew the access token after a request made with `used` was rejected
+    /// (or is about to expire). A member's account refreshes through the
+    /// single-flight refresher; other clients refresh on their own.
+    async fn refresh_oauth(&self, used: &str) -> Result<()> {
+        let oauth = self
+            .oauth
+            .as_ref()
+            .ok_or_else(|| SeraError::External("oauth refresh is not configured".into()))?;
+        let account = oauth
+            .account
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|state| (state.target.clone(), state.generation.clone()));
+        match account {
+            Some((target, generation)) => {
+                self.refresh_account(oauth, &target, generation, used).await
+            }
+            None => self.refresh_unshared().await,
+        }
+    }
+
+    async fn refresh_account(
+        &self,
+        oauth: &OAuthState,
+        target: &AccountRefreshTarget,
+        generation: Option<String>,
+        used: &str,
+    ) -> Result<()> {
+        // A sibling request on this client already replaced the token that
+        // was rejected: retry with it instead of refreshing again.
+        if self.bearer() != used {
+            return Ok(());
+        }
+        let refresh = oauth
+            .refresh_token
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .expose_secret()
+            .to_owned();
+        let seen = CredentialStamp::new(generation, &refresh, used);
+        let style = oauth.style;
+        let http = self.http.clone();
+        let token_url = oauth.token_url.clone();
+        let client_id = oauth.client_id.clone();
+        let client_secret = oauth.client_secret.expose_secret().to_owned();
+        let exchange = move |stored_refresh: String| async move {
+            exchange_for_grant(
+                &http,
+                style,
+                &token_url,
+                &stored_refresh,
+                &client_id,
+                &client_secret,
+            )
+            .await
+        };
+        let Refreshed { credential, .. } = target
+            .refresher
+            .refresh(
+                &target.user_id,
+                &target.provider,
+                &target.account_id,
+                &seen,
+                exchange,
+            )
+            .await?;
+        self.adopt_credential(oauth, &credential);
+        Ok(())
+    }
+
+    /// Take over a credential the refresher stored (ours, or a sibling's).
+    fn adopt_credential(
+        &self,
+        oauth: &OAuthState,
+        credential: &crate::user_secrets::ProviderCredential,
+    ) {
+        *self
+            .api_key
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            SecretString::new(credential.api_key.clone());
+        if !credential.refresh_token.is_empty() {
+            *oauth
+                .refresh_token
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) =
+                SecretString::new(credential.refresh_token.clone());
+        }
+        if let Some(state) = oauth
+            .account
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_mut()
+        {
+            state.generation = credential.generation.clone();
+            state.expires_at = credential.expires_at;
+        }
+    }
+
+    /// Refresh ahead of expiry: when this account's access token expires within
+    /// five minutes, renew it before the request instead of after a 401. A
+    /// transient failure is ignored (the current token still works for now);
+    /// a refused sign-in is reported.
+    async fn ensure_fresh_token(&self) -> Result<()> {
+        let Some(oauth) = self.oauth.as_ref() else {
+            return Ok(());
+        };
+        let near = oauth
+            .account
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .and_then(|state| state.expires_at)
+            .is_some_and(|at| {
+                at - chrono::Utc::now().timestamp() <= crate::accounts::REFRESH_SKEW_SECS
+            });
+        if !near {
+            return Ok(());
+        }
+        let used = zeroize::Zeroizing::new(self.bearer());
+        match self.refresh_oauth(&used).await {
+            Err(
+                error @ SeraError::Rejected {
+                    code: "needs_reauth",
+                    ..
+                },
+            ) => Err(error),
+            Err(error) => {
+                tracing::debug!(%error, "early token refresh failed; using the current token");
+                Ok(())
+            }
+            Ok(()) => Ok(()),
+        }
+    }
+
+    async fn refresh_unshared(&self) -> Result<()> {
         let oauth = self
             .oauth
             .as_ref()
@@ -544,6 +731,7 @@ impl LlmClient {
                         self.max_output_tokens,
                         temperature,
                     )?;
+                    let used = zeroize::Zeroizing::new(self.bearer());
                     match self
                         .post_cloud(&target.stream, &envelope, model, true)
                         .await?
@@ -555,7 +743,7 @@ impl LlmClient {
                         }
                         CloudPost::Unauthorized if !refreshed && self.oauth.is_some() => {
                             refreshed = true;
-                            self.refresh_oauth().await?;
+                            self.refresh_oauth(&used).await?;
                             restart = true;
                             break;
                         }
@@ -564,6 +752,7 @@ impl LlmClient {
                             continue;
                         }
                         CloudPost::NotFound => {
+                            let used = zeroize::Zeroizing::new(self.bearer());
                             match self
                                 .post_cloud(&target.generate, &envelope, model, false)
                                 .await?
@@ -575,7 +764,7 @@ impl LlmClient {
                                 }
                                 CloudPost::Unauthorized if !refreshed && self.oauth.is_some() => {
                                     refreshed = true;
-                                    self.refresh_oauth().await?;
+                                    self.refresh_oauth(&used).await?;
                                     restart = true;
                                     break;
                                 }
@@ -630,6 +819,7 @@ impl LlmClient {
         for _ in 0..2 {
             let mut restart = false;
             for url in &urls {
+                let used = zeroize::Zeroizing::new(self.bearer());
                 match self.post_cloud(url, &body, "", false).await? {
                     CloudPost::Ready(bytes) => {
                         return cloud_code::parse_cloud_code_catalog(&bytes).map(|ids| {
@@ -640,7 +830,7 @@ impl LlmClient {
                     }
                     CloudPost::Unauthorized if !refreshed && self.oauth.is_some() => {
                         refreshed = true;
-                        self.refresh_oauth().await?;
+                        self.refresh_oauth(&used).await?;
                         restart = true;
                         break;
                     }
@@ -695,6 +885,46 @@ impl LlmClient {
             Err(_) => return Ok(CloudPost::Transport),
         };
         Ok(classify_cloud(response, stream).await)
+    }
+}
+
+/// Run one token exchange for an account: a Google-style refresh grant, or a
+/// Muse re-mint from the identity token.
+async fn exchange_for_grant(
+    http: &reqwest::Client,
+    style: OAuthStyle,
+    token_url: &str,
+    refresh_token: &str,
+    client_id: &str,
+    client_secret: &str,
+) -> std::result::Result<RefreshGrant, RefreshError> {
+    match style {
+        OAuthStyle::MuseMint => {
+            match muse_mint_api_key(http, token_url, refresh_token).await {
+                Ok(key) => Ok(RefreshGrant {
+                    access_token: key,
+                    refresh_token: None,
+                    expires_at: None,
+                }),
+                // A refused identity token cannot mint again: sign in again.
+                Err(SeraError::Upstream {
+                    status: 401 | 403, ..
+                }) => Err(RefreshError::InvalidGrant),
+                Err(error) => Err(RefreshError::Failed(error)),
+            }
+        }
+        OAuthStyle::RefreshToken => {
+            let grant =
+                refresh_token_exchange(http, token_url, refresh_token, client_id, client_secret)
+                    .await?;
+            Ok(RefreshGrant {
+                access_token: grant.access_token,
+                refresh_token: grant.refresh_token,
+                expires_at: grant
+                    .expires_in
+                    .map(|seconds| chrono::Utc::now().timestamp() + seconds as i64),
+            })
+        }
     }
 }
 

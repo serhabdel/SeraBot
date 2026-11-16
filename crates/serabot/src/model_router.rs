@@ -41,6 +41,18 @@ pub trait ProviderCredentials: Send + Sync {
 
     /// Build the client for the acting user from their resolved credential.
     fn client(&self, user_id: &str, provider: &str, profile: &ProviderConfig) -> Result<LlmClient>;
+
+    /// Build the client for one named account of the acting user. A resolver
+    /// with no notion of accounts uses its one credential.
+    fn client_for_account(
+        &self,
+        user_id: &str,
+        provider: &str,
+        profile: &ProviderConfig,
+        _account_id: &str,
+    ) -> Result<LlmClient> {
+        self.client(user_id, provider, profile)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

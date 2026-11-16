@@ -238,6 +238,26 @@ impl UserSecrets {
         self.get_unchecked(user_id, &id)
     }
 
+    /// Read, change and write back one account's JSON credential under the
+    /// write lock, like [`Self::update_provider`] for the legacy row.
+    /// `change` returns an error to leave the blob as it is.
+    pub(crate) fn update_account(
+        &self,
+        user_id: &str,
+        provider: &str,
+        account_id: &str,
+        change: impl FnOnce(&mut ProviderCredential) -> Result<()>,
+    ) -> Result<()> {
+        let id = account_provider_id(provider, account_id)?;
+        let _write = self.lock_writes();
+        let secret = self
+            .get_unchecked(user_id, &id)?
+            .ok_or_else(|| SeraError::NotFound("account".into()))?;
+        let mut credential = ProviderCredential::parse(&secret)?;
+        change(&mut credential)?;
+        self.seal_and_store(user_id, &id, &credential.encode()?)
+    }
+
     /// Delete the acting user's credential for one account.
     pub fn delete_account(&self, user_id: &str, provider: &str, account_id: &str) -> Result<bool> {
         let id = account_provider_id(provider, account_id)?;
@@ -459,7 +479,9 @@ pub struct ProviderCredential {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
     /// OAuth only: identifies one sign-in. A new sign-in gets a new value, and
-    /// a rotation written for an older sign-in is refused.
+    /// a rotation written for an older sign-in is refused. The account
+    /// refresher also gives every refreshed token set a new value, so a writer
+    /// holding an older copy cannot overwrite a newer one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<String>,
 }

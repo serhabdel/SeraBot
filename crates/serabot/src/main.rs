@@ -631,6 +631,9 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         config.llm.timeout_secs,
         config.llm.max_output_tokens,
     ));
+    // The API and the model clients refresh account tokens through one
+    // single-flight refresher, so a rotated token is never spent twice.
+    let account_refresher = credentials.refresher().clone();
     let router = serabot::model_router::ModelRouter::with_credentials(&config.llm, credentials)?;
 
     let embedder: Arc<dyn Embedder> = Arc::new(LazyEmbedder::new(
@@ -1024,6 +1027,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
             users.clone(),
             onedrive_registry.clone(),
         )?
+        .with_refresher(account_refresher.clone())?
         .with_personal(personal_connectors.clone())
         .with_local_relay(local_relay.clone())
         .with_elevenlabs(elevenlabs.clone())
