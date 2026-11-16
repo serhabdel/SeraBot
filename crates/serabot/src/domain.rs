@@ -154,6 +154,10 @@ pub enum TaskStatus {
     Done,
     Failed,
     Cancelled,
+    /// Parked until a model route is ready; resumes from the stored turn.
+    WaitingModel,
+    /// An outbound effect may have happened; never replayed.
+    NeedsReview,
 }
 
 impl TaskStatus {
@@ -165,6 +169,8 @@ impl TaskStatus {
             Self::Done => "done",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::WaitingModel => "waiting_model",
+            Self::NeedsReview => "needs_review",
         }
     }
 }
@@ -202,6 +208,8 @@ impl Task {
             "done" => Some(TaskStatus::Done),
             "failed" => Some(TaskStatus::Failed),
             "cancelled" => Some(TaskStatus::Cancelled),
+            "waiting_model" => Some(TaskStatus::WaitingModel),
+            "needs_review" => Some(TaskStatus::NeedsReview),
             _ => None,
         }
     }

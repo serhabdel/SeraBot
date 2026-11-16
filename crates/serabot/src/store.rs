@@ -84,6 +84,12 @@ const MIGRATION_38: &str = include_str!("../migrations/0038_handoffs.sql");
 /// lets tests and migrations agree without copying the literal around.
 pub const ADMIN_USER_ID: &str = "00000000-0000-7000-8000-000000000001";
 
+/// Task status for work whose outbound effect may have happened: it is never
+/// replayed and waits for the owner.
+pub const TASK_NEEDS_REVIEW: &str = "needs_review";
+/// Task status for a turn parked until a model route is ready.
+pub const TASK_WAITING_MODEL: &str = "waiting_model";
+
 /// The acting user's role. The admin sees audit records and manages users,
 /// invites, and server configuration; members act only within their own
 /// scope.
@@ -2513,7 +2519,7 @@ impl Store {
         Ok(connection.query_row(
             "SELECT COUNT(*) FROM tasks
              WHERE user_id = ?1
-               AND status IN ('queued','running','awaiting_approval')
+               AND status IN ('queued','running','awaiting_approval','waiting_model')
                AND json_extract(payload_json, '$.team.root_task_id') = ?2",
             params![user_id, root_task_id],
             |row| row.get(0),
@@ -2952,6 +2958,61 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Flip the acting user's turn from `limit_reached` to `continuing`, once.
+    /// False when the turn is not in that state (already continued, never
+    /// limited, or another user's).
+    pub fn begin_turn_continue(&self, user_id: &str, id: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE turns SET status='continuing', updated_at=?1
+             WHERE id=?2 AND user_id=?3 AND status=?4",
+            params![
+                now_string(),
+                id,
+                user_id,
+                crate::runtime::LIMIT_REACHED_STATUS
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Undo [`Store::begin_turn_continue`] when the resume could not be queued.
+    pub fn restore_turn_limit(&self, user_id: &str, id: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE turns SET status=?4, updated_at=?1
+             WHERE id=?2 AND user_id=?3 AND status='continuing'",
+            params![
+                now_string(),
+                id,
+                user_id,
+                crate::runtime::LIMIT_REACHED_STATUS
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// The acting user's newest turn in a conversation that stopped at a tool
+    /// limit, if it is still the conversation's latest turn.
+    pub fn latest_limit_turn_id(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<String>> {
+        let connection = self.connection()?;
+        let row = connection
+            .query_row(
+                "SELECT id, status FROM turns WHERE user_id=?1 AND conversation_id=?2
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                params![user_id, conversation_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        Ok(row
+            .filter(|(_, status)| status == crate::runtime::LIMIT_REACHED_STATUS)
+            .map(|(id, _)| id))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4124,7 +4185,7 @@ impl Store {
                     fencing_token=fencing_token+1, attempts=attempts+1, updated_at=?3
                  WHERE id = (
                     SELECT id FROM tasks
-                    WHERE status='queued' AND run_after <= ?3
+                    WHERE status IN ('queued','waiting_model') AND run_after <= ?3
                     ORDER BY priority DESC, created_at ASC LIMIT 1
                  )
                  RETURNING id, kind, bot, payload_json, status, priority, attempts, max_attempts,
@@ -4196,7 +4257,11 @@ impl Store {
         let Some((attempts, max_attempts, uncertain)) = task else {
             return Ok(false);
         };
-        let (status, run_after) = if uncertain || attempts >= max_attempts {
+        let (status, run_after) = if uncertain {
+            // An outbound effect may have happened: never replay, hand it to
+            // the owner.
+            (TASK_NEEDS_REVIEW, now)
+        } else if attempts >= max_attempts {
             ("failed", now)
         } else {
             let delay = retry_backoff_secs.saturating_mul(attempts.max(1) as u64);
@@ -4230,9 +4295,16 @@ impl Store {
     ) -> Result<bool> {
         let connection = self.connection()?;
         let changed = connection.execute(
-            "UPDATE tasks SET status='failed', last_error=?1, lease_until=NULL, worker_id=NULL, updated_at=?2
+            "UPDATE tasks SET status=CASE WHEN uncertain=1 THEN 'needs_review' ELSE 'failed' END,
+                last_error=?1, lease_until=NULL, worker_id=NULL, updated_at=?2
              WHERE id=?3 AND fencing_token=?4 AND status='running' AND user_id=?5",
-            params![truncate(error, 2000), now_string(), id, fencing_token, user_id],
+            params![
+                truncate(error, 2000),
+                now_string(),
+                id,
+                fencing_token,
+                user_id
+            ],
         )?;
         Ok(changed == 1)
     }
@@ -4247,11 +4319,62 @@ impl Store {
         Ok(changed == 1)
     }
 
+    /// Flag the acting user's running task: an outbound effect is being
+    /// dispatched and its outcome is not yet known. A flagged task is never
+    /// replayed; if its worker dies or fails it goes to `needs_review`.
+    pub fn mark_task_uncertain(&self, user_id: &str, id: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE tasks SET uncertain=1, updated_at=?1
+             WHERE id=?2 AND user_id=?3 AND status='running'",
+            params![now_string(), id, user_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Clear the flag once the dispatched effect has a known outcome
+    /// (executed, or failed without having been sent).
+    pub fn clear_task_uncertain(&self, user_id: &str, id: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE tasks SET uncertain=0, updated_at=?1
+             WHERE id=?2 AND user_id=?3 AND status='running'",
+            params![now_string(), id, user_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Park a running task until a model route is ready. Releases the lease
+    /// and does not count the pause as an attempt. The worker claims it again
+    /// at `run_after`, and the turn resumes from its stored state.
+    pub fn park_task_waiting_model(
+        &self,
+        user_id: &str,
+        id: &str,
+        fencing_token: i64,
+        run_after: DateTime<Utc>,
+    ) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE tasks SET status='waiting_model', run_after=?1, attempts=MAX(attempts-1, 0),
+                lease_until=NULL, worker_id=NULL, updated_at=?2
+             WHERE id=?3 AND fencing_token=?4 AND status='running' AND user_id=?5",
+            params![
+                to_string(run_after),
+                now_string(),
+                id,
+                fencing_token,
+                user_id
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
     pub fn requeue_task(&self, user_id: &str, id: &str, run_after: DateTime<Utc>) -> Result<bool> {
         let connection = self.connection()?;
         let changed = connection.execute(
             "UPDATE tasks SET status='queued', run_after=?1, lease_until=NULL, worker_id=NULL, updated_at=?2
-             WHERE id=?3 AND user_id=?4 AND status IN ('awaiting_approval','running')",
+             WHERE id=?3 AND user_id=?4 AND status IN ('awaiting_approval','running','waiting_model')",
             params![to_string(run_after), now_string(), id, user_id],
         )?;
         Ok(changed == 1)
@@ -4264,7 +4387,7 @@ impl Store {
         let connection = self.connection()?;
         Ok(connection.execute(
             "UPDATE tasks SET
-                status=CASE WHEN uncertain=1 THEN 'failed' ELSE 'queued' END,
+                status=CASE WHEN uncertain=1 THEN 'needs_review' ELSE 'queued' END,
                 last_error=CASE WHEN uncertain=1 THEN 'outcome unknown after worker lease expiry' ELSE last_error END,
                 lease_until=NULL, worker_id=NULL, updated_at=?1
              WHERE status='running' AND lease_until IS NOT NULL AND lease_until < ?1",
@@ -4418,7 +4541,7 @@ impl Store {
         let connection = self.connection()?;
         Ok(connection.query_row(
             "SELECT COUNT(*) FROM tasks
-             WHERE user_id = ?1 AND status IN ('queued','running','awaiting_approval')",
+             WHERE user_id = ?1 AND status IN ('queued','running','awaiting_approval','waiting_model')",
             params![user_id],
             |row| row.get(0),
         )?)
@@ -4430,7 +4553,7 @@ impl Store {
     pub fn pending_task_count_all(&self) -> Result<i64> {
         let connection = self.connection()?;
         Ok(connection.query_row(
-            "SELECT COUNT(*) FROM tasks WHERE status IN ('queued','running','awaiting_approval')",
+            "SELECT COUNT(*) FROM tasks WHERE status IN ('queued','running','awaiting_approval','waiting_model')",
             [],
             |row| row.get(0),
         )?)
@@ -4441,7 +4564,7 @@ impl Store {
         let connection = self.connection()?;
         let changed = connection.execute(
             "UPDATE tasks SET status='cancelled', last_error=?1, lease_until=NULL, worker_id=NULL, updated_at=?2
-             WHERE id=?3 AND user_id=?4 AND status IN ('queued','running','awaiting_approval')",
+             WHERE id=?3 AND user_id=?4 AND status IN ('queued','running','awaiting_approval','waiting_model')",
             params![truncate(reason, 2000), now_string(), id, user_id],
         )?;
         Ok(changed == 1)
@@ -7331,8 +7454,108 @@ mod tests {
         drop(connection);
         store.recover_expired_tasks().unwrap();
         let recovered = store.get_task(&admin, &task.id).unwrap();
-        assert_eq!(recovered.status, "failed");
+        assert_eq!(recovered.status, "needs_review");
         assert_eq!(recovered.fencing_token, claimed.fencing_token);
+        assert!(store.claim_task("worker", 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn marking_a_task_uncertain_is_scoped_to_its_owner_and_running_state() {
+        let store = store();
+        let admin = admin(&store);
+        let other = store
+            .create_user(
+                "microsoft:uncertain-other",
+                "other@example.example",
+                "Other",
+            )
+            .unwrap()
+            .id;
+        let task = store
+            .enqueue_task(&admin, "turn", "main", &serde_json::json!({}), 0, utc_now())
+            .unwrap();
+        // Queued, not running: nothing to flag.
+        assert!(!store.mark_task_uncertain(&admin, &task.id).unwrap());
+        store.claim_task("worker", 60).unwrap().unwrap();
+        // Another user cannot flag it.
+        assert!(!store.mark_task_uncertain(&other, &task.id).unwrap());
+        assert!(!store.get_task(&admin, &task.id).unwrap().uncertain);
+        assert!(store.mark_task_uncertain(&admin, &task.id).unwrap());
+        assert!(store.get_task(&admin, &task.id).unwrap().uncertain);
+        assert!(!store.clear_task_uncertain(&other, &task.id).unwrap());
+        assert!(store.get_task(&admin, &task.id).unwrap().uncertain);
+        assert!(store.clear_task_uncertain(&admin, &task.id).unwrap());
+    }
+
+    #[test]
+    fn an_uncertain_failure_goes_to_review_and_a_plain_one_retries() {
+        let store = store();
+        let admin = admin(&store);
+        let flagged = store
+            .enqueue_task(&admin, "turn", "main", &serde_json::json!({}), 0, utc_now())
+            .unwrap();
+        let claimed = store.claim_task("worker", 60).unwrap().unwrap();
+        assert!(store.mark_task_uncertain(&admin, &flagged.id).unwrap());
+        assert!(
+            store
+                .fail_task(&admin, &flagged.id, claimed.fencing_token, "lost", 5)
+                .unwrap()
+        );
+        assert_eq!(
+            store.get_task(&admin, &flagged.id).unwrap().status,
+            "needs_review"
+        );
+
+        let plain = store
+            .enqueue_task(&admin, "turn", "main", &serde_json::json!({}), 0, utc_now())
+            .unwrap();
+        let claimed = store.claim_task("worker", 60).unwrap().unwrap();
+        assert!(
+            store
+                .fail_task(&admin, &plain.id, claimed.fencing_token, "flaky", 5)
+                .unwrap()
+        );
+        assert_eq!(store.get_task(&admin, &plain.id).unwrap().status, "queued");
+    }
+
+    #[test]
+    fn a_parked_task_waits_for_its_time_and_keeps_its_attempts() {
+        let store = store();
+        let admin = admin(&store);
+        let task = store
+            .enqueue_task(&admin, "turn", "main", &serde_json::json!({}), 0, utc_now())
+            .unwrap();
+        let claimed = store.claim_task("worker", 60).unwrap().unwrap();
+        assert_eq!(claimed.attempts, 1);
+        let until = utc_now() + chrono::Duration::seconds(60);
+        assert!(
+            store
+                .park_task_waiting_model(&admin, &task.id, claimed.fencing_token, until)
+                .unwrap()
+        );
+        let parked = store.get_task(&admin, &task.id).unwrap();
+        assert_eq!(parked.status, "waiting_model");
+        assert_eq!(parked.attempts, 0);
+        assert!(parked.lease_until.is_none());
+        assert!(store.claim_task("worker", 60).unwrap().is_none());
+        assert_eq!(store.pending_task_count(&admin).unwrap(), 1);
+        // Due: claimed again like a queued task.
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET run_after=?1 WHERE id=?2",
+                params![to_string(utc_now() - chrono::Duration::seconds(1)), task.id],
+            )
+            .unwrap();
+        let again = store.claim_task("worker", 60).unwrap().unwrap();
+        assert_eq!(again.id, task.id);
+        // A stale token cannot park it.
+        assert!(
+            !store
+                .park_task_waiting_model(&admin, &task.id, claimed.fencing_token, until)
+                .unwrap()
+        );
     }
 
     #[test]

@@ -245,6 +245,18 @@ impl Runtime {
                     warn!(task = %task.id, "task completion rejected by fencing token");
                 }
             }
+            Ok(TurnOutcome::Waiting { until }) => {
+                // Release the lease; the turn resumes from its stored state
+                // when the worker claims the task again at `until`.
+                if !self.store.park_task_waiting_model(
+                    &user,
+                    &task.id,
+                    task.fencing_token,
+                    until,
+                )? {
+                    warn!(task = %task.id, "task could not be parked: no longer held under this claim");
+                }
+            }
             Ok(TurnOutcome::Suspended) => {
                 self.store.record_audit(
                     &user,

@@ -74,6 +74,13 @@ impl Runtime {
             candidates.truncate(1);
         }
         if candidates.is_empty() {
+            // Every candidate is on hold or cooling and one of them comes
+            // back: the turn waits for it instead of failing.
+            if let Some(ready) = plan.earliest_ready {
+                return Err(SeraError::ModelWaiting {
+                    until: wait_until(ready, now),
+                });
+            }
             return Err(all_routes_failed(
                 plan.skipped
                     .iter()
@@ -272,6 +279,23 @@ impl Runtime {
     }
 }
 
+/// Shortest and longest a turn parks before it looks again. The cap lets a
+/// fresh sign-in or a cleared hold be noticed without waiting out a long hold.
+const MIN_MODEL_WAIT_SECS: i64 = 5;
+const MAX_MODEL_WAIT_SECS: i64 = 900;
+
+/// When a parked turn should try again: the earliest hold expiry, kept
+/// between [`MIN_MODEL_WAIT_SECS`] and [`MAX_MODEL_WAIT_SECS`] from now.
+pub(super) fn wait_until(
+    ready: chrono::DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
+) -> chrono::DateTime<Utc> {
+    ready.clamp(
+        now + chrono::Duration::seconds(MIN_MODEL_WAIT_SECS),
+        now + chrono::Duration::seconds(MAX_MODEL_WAIT_SECS),
+    )
+}
+
 /// Whether `error` means this one account cannot be used (its credential is
 /// missing or unreadable) while other candidates may work.
 fn is_unusable_account(error: &SeraError, candidate: &Candidate) -> bool {
@@ -295,7 +319,7 @@ fn strip_provider_reasoning(messages: &[LlmMessage]) -> Vec<LlmMessage> {
 
 /// Every candidate failed or none was ready. The message carries stable
 /// reason words only, never provider text.
-fn all_routes_failed(reasons: Vec<String>) -> SeraError {
+pub(super) fn all_routes_failed(reasons: Vec<String>) -> SeraError {
     let detail = if reasons.is_empty() {
         "no route is ready".to_owned()
     } else {

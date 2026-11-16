@@ -665,6 +665,10 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/v1/conversations/{id}/cancel", post(cancel_conversation))
         .route(
+            "/v1/conversations/{id}/continue",
+            post(continue_conversation),
+        )
+        .route(
             "/v1/conversations/{id}/auto-approve",
             get(get_auto_approve).put(set_auto_approve),
         )

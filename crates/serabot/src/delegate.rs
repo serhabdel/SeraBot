@@ -413,7 +413,7 @@ pub fn effective_status(
                 "queued"
             }
         }
-        Some("running" | "awaiting_approval") => {
+        Some("running" | "awaiting_approval" | "waiting_model") => {
             if resumed {
                 "resumed"
             } else {
@@ -421,6 +421,8 @@ pub fn effective_status(
             }
         }
         Some("done") => "completed",
+        // An uncertain task is never resumed: its effect may have happened.
+        Some("needs_review") => "failed",
         Some("failed" | "cancelled") => {
             if row.effects_unknown || task_uncertain || row.resume_count >= MAX_RESUMES {
                 "failed"
@@ -730,7 +732,7 @@ impl Store {
         let connection = self.connection()?;
         let count: i64 = connection.query_row(
             "SELECT COUNT(*) FROM tasks
-             WHERE user_id = ?1 AND bot = ?2 AND status IN ('running','awaiting_approval')
+             WHERE user_id = ?1 AND bot = ?2 AND status IN ('running','awaiting_approval','waiting_model')
                AND (?3 IS NULL OR id <> ?3)",
             params![user_id, bot, except_task],
             |row| row.get(0),

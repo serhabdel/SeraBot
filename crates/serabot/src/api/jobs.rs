@@ -6,14 +6,14 @@
 use super::*;
 
 /// Task statuses that count as in flight for the jobs panel.
-const ACTIVE_TASK_STATUSES: [&str; 3] = ["queued", "running", "awaiting_approval"];
+const ACTIVE_TASK_STATUSES: [&str; 4] = ["queued", "running", "awaiting_approval", "waiting_model"];
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct JobsQuery {
     #[serde(default)]
     limit: Option<usize>,
-    /// Optional task status filter: queued, running or awaiting_approval.
+    /// Optional task status filter: queued, running, awaiting_approval or waiting_model.
     #[serde(default)]
     status: Option<String>,
 }
@@ -31,7 +31,7 @@ pub(super) async fn list_jobs(
         Some(status) if ACTIVE_TASK_STATUSES.contains(&status) => Some(status),
         Some(_) => {
             return Err(SeraError::Validation(
-                "status must be queued, running or awaiting_approval".into(),
+                "status must be queued, running, awaiting_approval or waiting_model".into(),
             ));
         }
     };
@@ -68,7 +68,7 @@ fn list_active_tasks(
     let mut sql = String::from(
         "SELECT id, kind, bot, payload_json, status, priority, attempts, max_attempts,
                 run_after, lease_until, worker_id, uncertain, last_error, created_at, updated_at
-         FROM tasks WHERE user_id = ?1 AND status IN ('queued','running','awaiting_approval')",
+         FROM tasks WHERE user_id = ?1 AND status IN ('queued','running','awaiting_approval','waiting_model')",
     );
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(user_id.to_owned())];
     if let Some(status) = status {

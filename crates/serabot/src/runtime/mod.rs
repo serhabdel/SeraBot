@@ -50,6 +50,7 @@ use crate::teams::{
 use crate::util::truncate_chars;
 
 mod activity;
+mod compaction;
 use activity::StepPhase;
 mod extract;
 mod failover;
@@ -109,6 +110,10 @@ pub struct ResumePayload {
     pub turn_id: String,
     pub action_id: String,
     pub decision: String,
+    /// Set by "Continue after limit": the turn ended at a tool limit, has no
+    /// pending approval, and carries on with a fresh tool budget.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub continue_after_limit: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +168,12 @@ struct TurnState {
     /// the `model.used` audit row).
     #[serde(default)]
     history_messages: usize,
+    /// Context compactions this turn has used (at most `MAX_COMPACTIONS`).
+    #[serde(default)]
+    compactions: u8,
+    /// Seconds this turn has spent parked in `waiting_model`.
+    #[serde(default)]
+    waited_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,6 +206,11 @@ pub struct Runtime {
 enum TurnOutcome {
     Completed,
     Suspended,
+    /// No model route is ready: the task parks until `until`, and the turn
+    /// resumes from its stored state.
+    Waiting {
+        until: chrono::DateTime<Utc>,
+    },
 }
 
 impl Runtime {

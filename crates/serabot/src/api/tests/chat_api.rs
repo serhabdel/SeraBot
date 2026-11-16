@@ -152,6 +152,69 @@ async fn cancel_is_owner_scoped_and_reports_nothing_running_when_idle() {
 }
 
 #[tokio::test]
+async fn continue_after_limit_queues_one_resume_for_the_owner_only() {
+    let (app, _, store) = app();
+    let owner = store
+        .create_user("subject-cont-a", "ca@example.example", "Synthetic CA")
+        .unwrap();
+    let other = store
+        .create_user("subject-cont-b", "cb@example.example", "Synthetic CB")
+        .unwrap();
+    let owner_token = mint_for(&store, &owner.id, "cont-a");
+    let other_token = mint_for(&store, &other.id, "cont-b");
+    store
+        .ensure_conversation_accepts_turns(&owner.id, "dir:limited")
+        .unwrap();
+    let uri = "/v1/conversations/dir:limited/continue";
+
+    // Nothing stopped at a limit yet.
+    let idle = call(&app, &owner_token, "POST", uri, None).await;
+    assert!(!idle.status().is_success());
+
+    let task = store
+        .enqueue_task(
+            &owner.id,
+            "turn",
+            "main",
+            &serde_json::json!({}),
+            0,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    let turn = store
+        .create_turn(
+            &owner.id,
+            &task.id,
+            "main",
+            "dir:limited",
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    store
+        .update_turn(
+            &owner.id,
+            &turn.id,
+            crate::runtime::LIMIT_REACHED_STATUS,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+
+    let foreign = call(&app, &other_token, "POST", uri, None).await;
+    assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+    let queued = call(&app, &owner_token, "POST", uri, None).await;
+    assert_eq!(queued.status(), StatusCode::OK);
+    let body = read_json(queued).await;
+    let resume = store
+        .get_task(&owner.id, body["task_id"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(resume.kind, "resume");
+    assert_eq!(resume.payload["continue_after_limit"], true);
+    // A second click finds nothing to continue.
+    let again = call(&app, &owner_token, "POST", uri, None).await;
+    assert!(!again.status().is_success());
+}
+
+#[tokio::test]
 async fn history_pages_back_with_a_cursor_and_reports_more() {
     let (app, _, store) = app();
     let user = store

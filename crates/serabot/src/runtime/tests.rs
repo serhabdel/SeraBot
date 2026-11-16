@@ -3922,3 +3922,358 @@ async fn a_queued_turn_fails_over_to_the_next_account() {
     assert_eq!(events[0].to_account.as_deref(), Some("a2"));
     assert_eq!(first.received_requests().await.unwrap().len(), 2);
 }
+
+// ---- B4, B5, B8: parking, compaction and continue-after-limit ----
+
+/// Replies popped in order; the last stays for any further request.
+struct Scripted {
+    replies: Mutex<VecDeque<ResponseTemplate>>,
+}
+
+impl Scripted {
+    fn new(replies: Vec<ResponseTemplate>) -> Self {
+        Self {
+            replies: Mutex::new(replies.into()),
+        }
+    }
+}
+
+impl Respond for Scripted {
+    fn respond(&self, _request: &MockRequest) -> ResponseTemplate {
+        self.replies
+            .lock()
+            .expect("script mutex")
+            .pop_front()
+            .expect("scripted reply")
+    }
+}
+
+fn context_too_long() -> ResponseTemplate {
+    ResponseTemplate::new(400).set_body_json(
+        serde_json::json!({"error": {"code": "context_length_exceeded", "message": "synthetic"}}),
+    )
+}
+
+fn ok_reply(text: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(chat_ok(text))
+}
+
+/// A prior conversation long enough for a compaction to have something to fold.
+fn seed_history(store: &Store, user: &str, conversation: &str, pairs: usize) {
+    for index in 0..pairs {
+        store
+            .append_message(
+                user,
+                conversation,
+                None,
+                Role::User,
+                &format!("synthetic question {index}"),
+            )
+            .unwrap();
+        store
+            .append_message(
+                user,
+                conversation,
+                None,
+                Role::Assistant,
+                &format!("synthetic answer {index}"),
+            )
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_turn_with_every_route_on_hold_parks_and_resumes_when_one_is_ready() {
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_ok("back online")))
+        .mount(&first)
+        .await;
+    let (runtime, store) = failover_rig(&first.uri(), &second.uri());
+    let user = admin(&store);
+    add_account(&store, &user, "default", "a1", 0);
+    add_account(&store, &user, "other", "b1", 0);
+    set_route(
+        &runtime,
+        &store,
+        Some(route_to("default", "test")),
+        vec![route_to("other", "other-model")],
+        cross_provider(),
+    );
+    let until = chrono::Utc::now() + chrono::Duration::minutes(5);
+    for (provider, account) in [("default", "a1"), ("other", "b1")] {
+        store
+            .set_provider_hold(
+                &user,
+                provider,
+                account,
+                "*",
+                "rate_limit",
+                until,
+                "rate_limited",
+            )
+            .unwrap();
+    }
+    let submitted = runtime.submit_text(&user, "owner", "hello", None).unwrap();
+    let task = store.claim_task("worker", 30).unwrap().unwrap();
+    assert_eq!(task.id, submitted.id);
+    runtime.process_task(task).await.unwrap();
+
+    // No model was asked; the task is parked, not failed, and keeps its attempt.
+    assert!(first.received_requests().await.unwrap().is_empty());
+    assert!(second.received_requests().await.unwrap().is_empty());
+    let parked = store.get_task(&user, &submitted.id).unwrap();
+    assert_eq!(parked.status, "waiting_model");
+    assert_eq!(parked.attempts, 0);
+    assert!(parked.lease_until.is_none());
+    let wait = (parked.run_after - chrono::Utc::now()).num_seconds();
+    assert!(
+        (250..=300).contains(&wait),
+        "waits for the earliest expiry, got {wait}s"
+    );
+    let turn = store
+        .get_turn_by_task(&user, &submitted.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(turn.status, "waiting_model");
+    assert!(
+        store
+            .list_audit(50)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.event == "task.waiting_model")
+    );
+    // Not claimable before its time.
+    assert!(store.claim_task("worker", 30).unwrap().is_none());
+
+    // A hold clears and the time comes: the same turn finishes.
+    store.clear_provider_holds(&user, "default", "a1").unwrap();
+    store
+        .connection()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET run_after=?1 WHERE id=?2",
+            rusqlite::params![
+                (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(),
+                submitted.id
+            ],
+        )
+        .unwrap();
+    let again = store.claim_task("worker", 30).unwrap().unwrap();
+    assert_eq!(again.id, submitted.id);
+    runtime.process_task(again).await.unwrap();
+    assert_eq!(store.get_task(&user, &submitted.id).unwrap().status, "done");
+    let turn = store
+        .get_turn_by_task(&user, &submitted.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(turn.status, "completed");
+    let replies = store.list_visible_messages(&user, "owner", 20).unwrap();
+    assert_eq!(replies.last().unwrap().content, "back online");
+    assert_eq!(
+        replies
+            .iter()
+            .filter(|message| message.content == "hello")
+            .count(),
+        1,
+        "the owner's message is posted once"
+    );
+    assert_eq!(first.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_held_route_waits_per_user() {
+    // A hold on one user's account never parks another user's turn.
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_ok("bob answered")))
+        .mount(&first)
+        .await;
+    let (runtime, store) = failover_rig(&first.uri(), &second.uri());
+    let alice = admin(&store);
+    let bob = store
+        .create_user("microsoft:parking-bob", "bob@example.example", "Bob")
+        .unwrap()
+        .id;
+    let until = chrono::Utc::now() + chrono::Duration::minutes(5);
+    store
+        .set_provider_hold(
+            &alice,
+            "default",
+            "a1",
+            "*",
+            "rate_limit",
+            until,
+            "rate_limited",
+        )
+        .unwrap();
+    let plan = crate::route_chain::plan_candidates(
+        &store,
+        &runtime.router,
+        &bob,
+        &runtime
+            .router
+            .pin(&route_to_selection("default", "test"))
+            .unwrap(),
+        None,
+        "conv",
+        chrono::Utc::now(),
+    )
+    .unwrap();
+    assert!(!plan.candidates.is_empty());
+    assert!(plan.earliest_ready.is_none());
+}
+
+#[tokio::test]
+async fn context_too_long_compacts_and_retries_on_the_same_route() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(Scripted::new(vec![
+            context_too_long(),
+            ok_reply("SYNTHETIC SUMMARY"),
+            ok_reply("the final answer"),
+        ]))
+        .mount(&server)
+        .await;
+    let (runtime, store) = setup(
+        &server.uri(),
+        Arc::new(Capture::default()),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    );
+    let user = admin(&store);
+    seed_history(&store, &user, "owner", 8);
+    let submitted = runtime
+        .submit_text(&user, "owner", "the newest request", None)
+        .unwrap();
+    let task = store.claim_task("worker", 30).unwrap().unwrap();
+    runtime.process_task(task).await.unwrap();
+
+    let bodies = received_bodies(&server).await;
+    assert_eq!(bodies.len(), 3, "refused call, summary call, retry");
+    let retry = serde_json::to_string(&bodies[2]["messages"]).unwrap();
+    assert!(retry.contains("EARLIER IN THIS CONVERSATION"));
+    assert!(retry.contains("SYNTHETIC SUMMARY"));
+    assert!(retry.contains("the newest request"));
+    assert!(!retry.contains("synthetic question 0"));
+    assert_eq!(store.get_task(&user, &submitted.id).unwrap().status, "done");
+    let replies = store.list_visible_messages(&user, "owner", 40).unwrap();
+    assert_eq!(replies.last().unwrap().content, "the final answer");
+    // The rolling conversation summary row is stored, for this user only.
+    let summary = crate::memory::latest_summary(&store, &user, "owner")
+        .unwrap()
+        .expect("summary row");
+    assert!(summary.summary.contains("SYNTHETIC SUMMARY"));
+    let turn = store
+        .get_turn_by_task(&user, &submitted.id)
+        .unwrap()
+        .unwrap();
+    let state: TurnState = serde_json::from_value(turn.state).unwrap();
+    assert_eq!(state.compactions, 1);
+    let audit = store
+        .list_audit(80)
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.event == "turn.compacted")
+        .expect("compaction is audited");
+    assert_eq!(
+        audit
+            .details
+            .as_ref()
+            .and_then(|d| d.get("reason"))
+            .and_then(Value::as_str),
+        Some("context_too_long")
+    );
+}
+
+#[tokio::test]
+async fn compaction_stops_after_two_attempts_that_do_not_help() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(context_too_long())
+        .mount(&server)
+        .await;
+    let (runtime, store) = setup(
+        &server.uri(),
+        Arc::new(Capture::default()),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    );
+    let user = admin(&store);
+    seed_history(&store, &user, "owner", 8);
+    runtime
+        .submit_text(&user, "owner", "too much", None)
+        .unwrap();
+    let task = store.claim_task("worker", 30).unwrap().unwrap();
+    let error = runtime.run_turn(&task).await.expect_err("still too long");
+    assert!(compaction::is_context_too_long(&error));
+    // main, summary, main, summary, main: two compactions and no third.
+    assert_eq!(server.received_requests().await.unwrap().len(), 5);
+    let turn = store.get_turn_by_task(&user, &task.id).unwrap().unwrap();
+    let state: TurnState = serde_json::from_value(turn.state).unwrap();
+    assert_eq!(state.compactions, 2);
+}
+
+#[tokio::test]
+async fn continue_after_limit_resumes_the_turn_once_with_a_fresh_budget() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(Sequence::new(vec![
+            tool_round_reply("round_one", 1),
+            tool_round_reply("round_two", 1),
+            text_reply("Here is what I found so far."),
+            text_reply("Finished the rest."),
+        ]))
+        .mount(&server)
+        .await;
+    let (runtime, store) = setup_orchestration(&server.uri(), Arc::new(Capture::default()));
+    let user = admin(&store);
+    store
+        .set_user_turn_limits(
+            &user,
+            crate::turn_limits::TurnLimits {
+                max_tool_calls_per_turn: 150,
+                max_tool_rounds: 2,
+            },
+        )
+        .unwrap();
+    runtime
+        .submit_text(&user, "owner", "read the root folder", None)
+        .unwrap();
+    let task = store.claim_task("worker", 30).unwrap().unwrap();
+    runtime.process_task(task.clone()).await.unwrap();
+    let turn = store.get_turn_by_task(&user, &task.id).unwrap().unwrap();
+    assert_eq!(turn.status, LIMIT_REACHED_STATUS);
+    let daily_before = store.daily_task_count(&user).unwrap();
+
+    let resume = runtime.continue_after_limit(&user, &turn.id).unwrap();
+    // One click, one resume: a second request is refused.
+    assert!(runtime.continue_after_limit(&user, &turn.id).is_err());
+    // Another user cannot continue it.
+    let other = store
+        .create_user("microsoft:continue-other", "o@example.example", "Other")
+        .unwrap()
+        .id;
+    assert!(runtime.continue_after_limit(&other, &turn.id).is_err());
+    assert_eq!(store.daily_task_count(&user).unwrap(), daily_before + 1);
+
+    let claimed = store.claim_task("worker", 30).unwrap().unwrap();
+    assert_eq!(claimed.id, resume.id);
+    runtime.process_task(claimed).await.unwrap();
+    let turn = store.get_turn(&user, &turn.id).unwrap();
+    assert_eq!(turn.status, "completed");
+    let replies = store.list_visible_messages(&user, "owner", 20).unwrap();
+    assert_eq!(replies.last().unwrap().content, "Finished the rest.");
+    assert!(!replies.last().unwrap().limit_reached);
+    assert!(
+        store
+            .list_audit(80)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.event == "turn.continued_after_limit")
+    );
+}
