@@ -1305,7 +1305,16 @@ fn orchestrator_bots() -> Vec<LoadedBot> {
 }
 
 fn setup_orchestration(server_uri: &str, notifier: Arc<Capture>) -> (Runtime, Store) {
+    setup_orchestration_with(server_uri, notifier, |_| {})
+}
+
+fn setup_orchestration_with(
+    server_uri: &str,
+    notifier: Arc<Capture>,
+    tweak: impl FnOnce(&mut Config),
+) -> (Runtime, Store) {
     let mut config = Config::default();
+    tweak(&mut config);
     config.llm.data_egress_approved = true;
     config.llm.base_url = server_uri.into();
     config.llm.model = "test".into();
@@ -3536,6 +3545,20 @@ async fn a_429_moves_to_the_next_account_and_is_recorded() {
     assert_eq!(events[0].from_account.as_deref(), Some("a1"));
     assert_eq!(events[0].to_account.as_deref(), Some("a2"));
     assert_eq!(events[0].reason, "rate_limited");
+    // The switch and the hold reach the event stream with ids only.
+    let failovers = events_of(&store, &user, "model.failover");
+    assert_eq!(failovers.len(), 1);
+    assert_eq!(failovers[0]["from"]["account"], "a1");
+    assert_eq!(failovers[0]["to"]["account"], "a2");
+    assert_eq!(failovers[0]["reason"], "rate_limited");
+    assert_eq!(failovers[0]["conversation_id"], "conv-1");
+    assert!(
+        events_of(&store, &user, "provider.hold_set")
+            .iter()
+            .any(|hold| hold["account_id"] == "a1"
+                && hold["kind"] == "rate_limit"
+                && hold["until"].is_string())
+    );
     let holds = store
         .active_provider_holds(&user, chrono::Utc::now())
         .unwrap();
@@ -4045,11 +4068,17 @@ async fn a_turn_with_every_route_on_hold_parks_and_resumes_when_one_is_ready() {
             .iter()
             .any(|entry| entry.event == "task.waiting_model")
     );
+    let waiting = events_of(&store, &user, "task.waiting_model");
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0]["task_id"], json!(submitted.id));
+    assert!(waiting[0]["until"].is_string() && waiting[0].get("text").is_none());
     // Not claimable before its time.
     assert!(store.claim_task("worker", 30).unwrap().is_none());
 
     // A hold clears and the time comes: the same turn finishes.
-    store.clear_provider_holds(&user, "default", "a1").unwrap();
+    assert!(store.clear_provider_holds(&user, "default", "a1").unwrap() > 0);
+    let cleared = events_of(&store, &user, "provider.hold_cleared");
+    assert!(cleared.iter().any(|hold| hold["account_id"] == "a1"));
     store
         .connection()
         .unwrap()
@@ -4275,5 +4304,462 @@ async fn continue_after_limit_resumes_the_turn_once_with_a_fresh_budget() {
             .unwrap()
             .iter()
             .any(|entry| entry.event == "turn.continued_after_limit")
+    );
+}
+
+fn delegate_call_reply(objective: &str) -> Value {
+    json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_delegate",
+                    "type": "function",
+                    "function": {
+                        "name": "delegate",
+                        "arguments": json!({
+                            "to_bot": "analyst",
+                            "objective": objective,
+                            "model_class": "routine",
+                        }).to_string()
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    })
+}
+
+/// A user's events of one kind, oldest first.
+fn events_of(store: &Store, user: &str, kind: &str) -> Vec<Value> {
+    store
+        .events_after(user, 0, 500)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == kind)
+        .map(|event| event.payload)
+        .collect()
+}
+
+/// Queue main's delegation to the analyst, run it, and claim the child.
+async fn delegated_child(runtime: &Runtime, store: &Store, user: &str) -> Task {
+    runtime
+        .submit_text(user, "owner", "review cash", None)
+        .unwrap();
+    let parent = store.claim_task("worker", 30).unwrap().unwrap();
+    runtime.process_task(parent).await.unwrap();
+    store.claim_task("worker", 30).unwrap().unwrap()
+}
+
+fn failed_chain_error() -> SeraError {
+    failover::all_routes_failed(vec![
+        "default/test: rate_limited".into(),
+        "default/test-b: quota_exhausted".into(),
+    ])
+}
+
+#[tokio::test]
+async fn a_failed_subagent_becomes_resumable_and_main_gets_one_follow_up() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(Sequence::new(vec![
+            delegate_call_reply("Summarize synthetic cash position."),
+            text_reply("Synthetic analyst summary."),
+        ]))
+        .mount(&server)
+        .await;
+    let (runtime, store) = setup_orchestration(&server.uri(), Arc::new(Capture::default()));
+    let user = admin(&store);
+    let child = delegated_child(&runtime, &store, &user).await;
+    assert!(
+        store
+            .fail_task_final(&user, &child.id, child.fencing_token, "all routes failed")
+            .unwrap()
+    );
+    assert!(runtime.on_task_failed(&child, &failed_chain_error()));
+    // A second report of the same failure changes and queues nothing.
+    assert!(!runtime.on_task_failed(&child, &failed_chain_error()));
+
+    let handoffs = store.list_handoffs(&user, Some("owner"), 10).unwrap();
+    assert_eq!(handoffs.len(), 1);
+    let view = &handoffs[0];
+    assert_eq!(view.status, "failed_resumable");
+    assert_eq!(view.outcome_code.as_deref(), Some("rate_limited"));
+    assert!(!view.effects_unknown);
+    let row = store.get_handoff(&user, &view.id).unwrap();
+    assert_eq!(row.status, "failed_resumable");
+
+    // handoff.failed carries ids and codes only.
+    let failed = events_of(&store, &user, "handoff.failed");
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0]["handoff_id"], json!(view.id));
+    assert_eq!(failed[0]["child_task_id"], json!(child.id));
+    assert_eq!(failed[0]["status"], "failed_resumable");
+    assert!(failed[0].get("text").is_none() && failed[0].get("error").is_none());
+
+    // Exactly one synthetic follow-up to main, built from codes, not error text.
+    let followup = store.claim_task("worker", 30).unwrap().unwrap();
+    assert!(store.claim_task("worker", 30).unwrap().is_none());
+    assert_eq!(followup.bot, "main");
+    assert_eq!(followup.payload["source"], auto_resume::FOLLOWUP_SOURCE);
+    let text = followup.payload["text"].as_str().unwrap();
+    assert!(text.contains("analyst") && text.contains("rate_limited, quota_exhausted"));
+    assert!(text.contains("subagent_retry"));
+    // The generic "this request failed" notice is not sent for a reported failure.
+    assert!(crate::orchestration::safe_bot_label("analyst"));
+
+    // main's retry (what subagent_retry runs) queues a new child, records the
+    // resume as a route event, and counts it.
+    let config = runtime.fleet.load(&user).unwrap()["analyst"].config.clone();
+    let resumed = crate::delegate::resume_handoff(
+        &store,
+        runtime.router(),
+        &config,
+        &user,
+        &view.id,
+        &crate::delegate::ResumeOptions {
+            actor: &user,
+            tool: Some("subagent_retry"),
+            task_id: Some(&followup.id),
+            route: None,
+            max_resumes: Some(crate::delegate::MAX_RESUMES),
+            accept_unknown_effects: false,
+            daily_limit: 500,
+        },
+    )
+    .unwrap();
+    assert_eq!(resumed.resume_count, 1);
+    let switches = store.route_events(&user, Some("owner"), 10).unwrap();
+    assert!(switches.iter().any(|event| event.reason == "handoff_resume"
+        && event.task_id.as_deref() == Some(resumed.child_task_id.as_str())));
+
+    // The resumed child answers; the answer is posted once and the ledger closes.
+    let second = store.claim_task("worker", 30).unwrap().unwrap();
+    assert_eq!(second.id, resumed.child_task_id);
+    runtime.process_task(second).await.unwrap();
+    let answers = store
+        .list_messages(&user, "owner", 50)
+        .unwrap()
+        .into_iter()
+        .filter(|message| message.content == "Synthetic analyst summary.")
+        .count();
+    assert_eq!(answers, 1);
+    assert_eq!(
+        store.handoff_view(&user, &view.id).unwrap().status,
+        "completed"
+    );
+    assert_eq!(events_of(&store, &user, "handoff.started").len(), 1);
+    assert_eq!(events_of(&store, &user, "handoff.completed").len(), 1);
+}
+
+#[tokio::test]
+async fn unknown_effects_are_reported_but_never_retried() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(Sequence::new(vec![delegate_call_reply(
+            "Send the synthetic report.",
+        )]))
+        .mount(&server)
+        .await;
+    let (runtime, store) = setup_orchestration(&server.uri(), Arc::new(Capture::default()));
+    let user = admin(&store);
+    let child = delegated_child(&runtime, &store, &user).await;
+    // The gateway flagged the dispatch before the failure.
+    assert!(store.mark_task_uncertain(&user, &child.id).unwrap());
+    store
+        .fail_task_final(&user, &child.id, child.fencing_token, "lost")
+        .unwrap();
+    assert!(runtime.on_task_failed(&child, &failed_chain_error()));
+    let view = store.list_handoffs(&user, None, 10).unwrap().remove(0);
+    assert_eq!(view.status, "failed");
+    assert!(view.effects_unknown);
+    let followup = store.claim_task("worker", 30).unwrap().unwrap();
+    let text = followup.payload["text"].as_str().unwrap();
+    assert!(text.contains("effects_unknown: true") && text.contains("will refuse"));
+    assert!(!text.contains("chain_index"));
+    let config = runtime.fleet.load(&user).unwrap()["analyst"].config.clone();
+    let error = crate::delegate::resume_handoff(
+        &store,
+        runtime.router(),
+        &config,
+        &user,
+        &view.id,
+        &crate::delegate::ResumeOptions {
+            actor: &user,
+            tool: Some("subagent_retry"),
+            task_id: None,
+            route: None,
+            max_resumes: Some(crate::delegate::MAX_RESUMES),
+            accept_unknown_effects: false,
+            daily_limit: 500,
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        SeraError::Rejected {
+            code: "effects_unknown",
+            ..
+        }
+    ));
+    // No new child exists.
+    assert!(store.claim_task("worker", 30).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn auto_resume_stops_at_the_retry_cap_without_a_loop() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(Sequence::new(vec![delegate_call_reply(
+            "Summarize synthetic payables.",
+        )]))
+        .mount(&server)
+        .await;
+    let (runtime, store) = setup_orchestration(&server.uri(), Arc::new(Capture::default()));
+    let user = admin(&store);
+    let mut child = delegated_child(&runtime, &store, &user).await;
+    let config = runtime.fleet.load(&user).unwrap()["analyst"].config.clone();
+    let mut followups = 0;
+    for expected_resumes in 0..=crate::delegate::MAX_RESUMES {
+        store
+            .fail_task_final(&user, &child.id, child.fencing_token, "failed")
+            .unwrap();
+        assert!(runtime.on_task_failed(&child, &failed_chain_error()));
+        let followup = store.claim_task("worker", 30).unwrap().unwrap();
+        followups += 1;
+        let view = store.list_handoffs(&user, None, 10).unwrap().remove(0);
+        let text = followup.payload["text"].as_str().unwrap().to_owned();
+        if expected_resumes < crate::delegate::MAX_RESUMES {
+            assert_eq!(view.status, "failed_resumable");
+            let resumed = crate::delegate::resume_handoff(
+                &store,
+                runtime.router(),
+                &config,
+                &user,
+                &view.id,
+                &crate::delegate::ResumeOptions {
+                    actor: &user,
+                    tool: Some("subagent_retry"),
+                    task_id: None,
+                    route: None,
+                    max_resumes: Some(crate::delegate::MAX_RESUMES),
+                    accept_unknown_effects: false,
+                    daily_limit: 500,
+                },
+            )
+            .unwrap();
+            child = store.claim_task("worker", 30).unwrap().unwrap();
+            assert_eq!(child.id, resumed.child_task_id);
+        } else {
+            // The third failure is final: told to main, but not resumable.
+            assert_eq!(view.status, "failed");
+            assert!(text.contains("No retries remain"));
+            let error = crate::delegate::resume_handoff(
+                &store,
+                runtime.router(),
+                &config,
+                &user,
+                &view.id,
+                &crate::delegate::ResumeOptions {
+                    actor: &user,
+                    tool: Some("subagent_retry"),
+                    task_id: None,
+                    route: None,
+                    max_resumes: Some(crate::delegate::MAX_RESUMES),
+                    accept_unknown_effects: false,
+                    daily_limit: 500,
+                },
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("resumed 2 times"), "{error}");
+        }
+    }
+    assert_eq!(followups, 3);
+    assert!(store.claim_task("worker", 30).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn follow_up_chains_are_bounded_in_depth() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(Sequence::new(vec![delegate_call_reply("Deep objective.")]))
+        .mount(&server)
+        .await;
+    let (runtime, store) = setup_orchestration(&server.uri(), Arc::new(Capture::default()));
+    let user = admin(&store);
+    let child = delegated_child(&runtime, &store, &user).await;
+    // The delegating turn is itself the third follow-up in a chain.
+    let handoff = store.list_handoffs(&user, None, 10).unwrap().remove(0);
+    store
+        .connection()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET payload_json = json_set(payload_json, '$.followup_depth', 3)
+             WHERE id = ?1",
+            rusqlite::params![handoff.parent_task_id],
+        )
+        .unwrap();
+    store
+        .fail_task_final(&user, &child.id, child.fencing_token, "failed")
+        .unwrap();
+    // The failure is recorded, but no further follow-up is queued.
+    assert!(!runtime.on_task_failed(&child, &failed_chain_error()));
+    assert_eq!(
+        store.handoff_view(&user, &handoff.id).unwrap().status,
+        "failed_resumable"
+    );
+    assert!(store.claim_task("worker", 30).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn another_users_handoff_failure_is_reported_only_to_its_owner() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(Sequence::new(vec![delegate_call_reply("Owner objective.")]))
+        .mount(&server)
+        .await;
+    let (runtime, store) = setup_orchestration(&server.uri(), Arc::new(Capture::default()));
+    let user = admin(&store);
+    let other = store
+        .create_user("microsoft:resume-other", "r@example.example", "Other")
+        .unwrap()
+        .id;
+    let child = delegated_child(&runtime, &store, &user).await;
+    store
+        .fail_task_final(&user, &child.id, child.fencing_token, "failed")
+        .unwrap();
+    assert!(runtime.on_task_failed(&child, &failed_chain_error()));
+    assert!(events_of(&store, &other, "handoff.failed").is_empty());
+    assert!(store.list_handoffs(&other, None, 10).unwrap().is_empty());
+    let followup = store.claim_task("worker", 30).unwrap().unwrap();
+    assert_eq!(followup.user_id, user);
+}
+
+fn load_setting(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+/// The B7 load fixture (0.50). It runs the real worker loop against a file
+/// database and a slow synthetic provider: one user queues many subagent turns
+/// and another user sends one message. It passes when every task finishes, none
+/// fails (a "database is locked" error would fail a task), and the second
+/// user's turn finishes before the first user's backlog drains.
+///
+/// Ignored in the normal suite; `scripts/load-fixture.sh` (or `.bat`) runs it.
+/// Knobs: `LOAD_WORKERS` (default 4), `LOAD_CHILDREN` (16), `LOAD_DELAY_MS` (150).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "load fixture: run scripts/load-fixture.sh"]
+async fn load_fixture_children_do_not_starve_another_user_or_contend() {
+    let workers = load_setting("LOAD_WORKERS", 4) as usize;
+    let children = load_setting("LOAD_CHILDREN", 16) as usize;
+    let delay = std::time::Duration::from_millis(load_setting("LOAD_DELAY_MS", 150));
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(text_reply("Synthetic load answer."))
+                .set_delay(delay),
+        )
+        .mount(&server)
+        .await;
+    let (runtime, store) =
+        setup_orchestration_with(&server.uri(), Arc::new(Capture::default()), |config| {
+            config.runtime.max_concurrent_turns = workers;
+            config.runtime.worker_poll_ms = 50;
+        });
+    let a = admin(&store);
+    let b = store
+        .create_user("microsoft:load-b", "load-b@example.example", "B")
+        .unwrap()
+        .id;
+    let fleet = runtime.fleet.load(&a).unwrap();
+    let route = runtime
+        .router()
+        .pin_for_bot(
+            &a,
+            &crate::model_router::ModelSelection::new("default", "test"),
+            &fleet["analyst"].config,
+        )
+        .unwrap();
+    // User A's backlog goes in first, so FIFO alone would starve user B.
+    for i in 0..children {
+        store
+            .enqueue_task(
+                &a,
+                "turn",
+                "analyst",
+                &json!({
+                    "conversation_id": "dir:load-a",
+                    "text": format!("Synthetic child objective {i}"),
+                    "bot": "analyst",
+                    "source": "handoff",
+                    "route": route,
+                    "handoff": {
+                        "handoff_id": format!("load-{i}"),
+                        "parent_task_id": "load-parent",
+                        "parent_turn_id": "load-turn",
+                    },
+                }),
+                0,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+    }
+    let b_task = runtime
+        .submit_text(&b, "dir:load-b", "A single synthetic question.", None)
+        .unwrap();
+    let started = std::time::Instant::now();
+    let worker = tokio::spawn(runtime.clone().run_worker());
+    let mut b_done = None;
+    let mut all_done = None;
+    while started.elapsed() < std::time::Duration::from_secs(180) {
+        if b_done.is_none() && store.get_task(&b, &b_task.id).unwrap().status == "done" {
+            b_done = Some(started.elapsed());
+        }
+        if store.pending_task_count_all().unwrap() == 0 {
+            all_done = Some(started.elapsed());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    runtime.shutdown.cancel();
+    let _ = worker.await;
+    let failed: i64 = store
+        .connection()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let sample: Option<String> = store
+        .connection()
+        .unwrap()
+        .query_row(
+            "SELECT status || ': ' || COALESCE(last_error, '') FROM tasks WHERE status NOT IN ('done') LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    if let Some(sample) = sample {
+        println!("load fixture: first task not done: {sample}");
+    }
+    println!(
+        "load fixture: workers={workers} children={children} delay={}ms user_b_done={:?} all_done={:?} not_done={failed}",
+        delay.as_millis(),
+        b_done,
+        all_done
+    );
+    let all_done = all_done.expect("every task finished before the deadline");
+    let b_done = b_done.expect("user B's turn finished");
+    assert_eq!(failed, 0, "no task failed or was left behind");
+    assert!(
+        b_done < all_done,
+        "user B waited for user A's whole backlog ({b_done:?} vs {all_done:?})"
     );
 }

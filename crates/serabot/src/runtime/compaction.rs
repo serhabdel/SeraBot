@@ -340,13 +340,13 @@ impl Runtime {
         }
         self.store.append_event(
             &user,
-            "task.waiting_model",
-            &json!({
-                "task_id": task.id,
-                "turn_id": turn.id,
-                "conversation_id": conversation_id,
-                "until": until.to_rfc3339(),
-            }),
+            activity::EVENT_WAITING_MODEL,
+            &activity::waiting_model_payload(
+                &task.id,
+                &turn.id,
+                conversation_id,
+                &until.to_rfc3339(),
+            ),
         )?;
         Ok(TurnOutcome::Waiting { until })
     }

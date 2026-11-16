@@ -243,6 +243,27 @@ parent must **not** await the child inside `process_task` while holding that
 permit — that would deadlock when `max_concurrent_turns` is saturated. The
 delegate tool enqueues the child and ends the parent turn before the child runs.
 
+## Subagent failure, resume and fairness (0.50)
+
+- **Auto-resume.** When a subagent's route chain is exhausted (or it times out)
+  its handoff becomes `failed_resumable`, and main gets one synthetic follow-up
+  turn (`source = "handoff_followup"`) naming the subagent and stable reason
+  codes. The follow-up text is written by the server; no provider or specialist
+  text is copied into it. Main may call `subagent_retry`, at most twice per
+  handoff (`resume_count <= 2`). It refuses when `effects_unknown`. Every resume
+  is a `route_events` row (`reason = handoff_resume`). A follow-up chain stops
+  after three levels.
+- **Fairness.** `[runtime] max_concurrent_turns` is 1..=8 (code default 4;
+  the shipped `serabot.toml` pins 2). `claim_task` skips a user already at
+  `max_turns_per_user` running owner turns (default 2) or
+  `max_active_children` running subagent turns (default 4), prefers owner turns
+  over subagent turns at equal priority, and then takes the user with the fewest
+  running tasks first. `ModelRouter` holds a semaphore per
+  `(user, provider, account)` (`max_inflight_per_account`, default 3).
+- **Load fixture.** `scripts/load-fixture.sh` (or `.bat`) runs the real worker
+  loop with one user's 16 subagent turns and another user's single message. Run
+  it on the target host before relying on more than 2 workers there.
+
 ## Non-goals
 
 - Free-form agent-to-agent messaging (peer exchange inside a team room is

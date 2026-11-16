@@ -520,7 +520,10 @@ approvals cancel suspended tasks.
 
 Event kinds include `message`, `approval`, `task.queued`, `turn.completed`,
 `turn.step`, `help.queued`, `memory.added`, `memory.deleted`,
-`approval.grants_revoked`, `model.selected`, and `model.used`. Client code
+`approval.grants_revoked`, `model.selected`, `model.used`, and the 0.50
+orchestration kinds `handoff.started|completed|failed`, `model.failover`,
+`provider.hold_set|cleared` and `task.waiting_model` (see
+[Events](events.md)). Client code
 should treat unknown event kinds as informational.
 
 `turn.step` is the live tool card. Phases are `running`, `progress`,

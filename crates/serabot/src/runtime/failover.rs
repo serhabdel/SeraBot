@@ -271,6 +271,18 @@ impl Runtime {
                 )?;
                 self.store
                     .append_event(call.user, "route_switched", &details)?;
+                self.store.append_event(
+                    call.user,
+                    activity::EVENT_MODEL_FAILOVER,
+                    &activity::failover_payload(
+                        call.conversation_id,
+                        call.task_id,
+                        call.bot,
+                        from,
+                        to,
+                        reason,
+                    ),
+                )?;
                 Ok(())
             });
         if let Err(error) = outcome {

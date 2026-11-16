@@ -273,10 +273,26 @@ impl Config {
                 "telegram.owner_user_id and telegram.owner_chat_id are required".into(),
             ));
         }
-        if self.runtime.max_concurrent_turns == 0 || self.runtime.max_concurrent_turns > 2 {
-            return Err(SeraError::Config(
-                "runtime.max_concurrent_turns must be 1 or 2".into(),
-            ));
+        if self.runtime.max_concurrent_turns == 0
+            || self.runtime.max_concurrent_turns > MAX_CONCURRENT_TURNS_CEILING
+        {
+            return Err(SeraError::Config(format!(
+                "runtime.max_concurrent_turns must be between 1 and {MAX_CONCURRENT_TURNS_CEILING}"
+            )));
+        }
+        for (name, value) in [
+            ("max_turns_per_user", self.runtime.max_turns_per_user),
+            ("max_active_children", self.runtime.max_active_children),
+            (
+                "max_inflight_per_account",
+                self.runtime.max_inflight_per_account,
+            ),
+        ] {
+            if value == 0 || value > MAX_CONCURRENT_TURNS_CEILING {
+                return Err(SeraError::Config(format!(
+                    "runtime.{name} must be between 1 and {MAX_CONCURRENT_TURNS_CEILING}"
+                )));
+            }
         }
         if self.render.max_pages == 0 || self.render.max_pages > 200 {
             return Err(SeraError::Config(
@@ -1567,8 +1583,20 @@ impl Default for RenderConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
+    /// Worker slots. The ceiling is [`MAX_CONCURRENT_TURNS_CEILING`]; the
+    /// default is 4, gated on the load fixture (`scripts/load-fixture.sh`).
     #[serde(default = "default_max_turns")]
     pub max_concurrent_turns: usize,
+    /// Most owner-facing (non-handoff) turns one user may have running at once,
+    /// so one user cannot take every worker slot.
+    #[serde(default = "default_max_turns_per_user")]
+    pub max_turns_per_user: usize,
+    /// Most handoff (subagent) turns one user may have running at once.
+    #[serde(default = "default_max_active_children")]
+    pub max_active_children: usize,
+    /// Most model calls in flight on one `(user, provider, account)`.
+    #[serde(default = "default_max_inflight_per_account")]
+    pub max_inflight_per_account: usize,
     #[serde(default = "default_max_tool_calls")]
     pub max_tool_calls_per_turn: usize,
     #[serde(default = "default_tool_iterations")]
@@ -1590,7 +1618,10 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            max_concurrent_turns: 2,
+            max_concurrent_turns: default_max_turns(),
+            max_turns_per_user: default_max_turns_per_user(),
+            max_active_children: default_max_active_children(),
+            max_inflight_per_account: default_max_inflight_per_account(),
             max_tool_calls_per_turn: default_max_tool_calls(),
             max_tool_iterations: default_tool_iterations(),
             task_lease_secs: default_lease(),
@@ -2894,8 +2925,21 @@ fn default_artifacts_dir() -> String {
 fn default_max_deck_pages() -> usize {
     30
 }
+/// Highest `runtime.max_concurrent_turns` the config accepts (0.50).
+pub const MAX_CONCURRENT_TURNS_CEILING: usize = 8;
+/// Raised from 2 once `scripts/load-fixture.sh` passed at 4 and 8 workers
+/// (owner decision O4). Re-run it on the target host before relying on it.
 fn default_max_turns() -> usize {
+    4
+}
+fn default_max_turns_per_user() -> usize {
     2
+}
+fn default_max_active_children() -> usize {
+    4
+}
+fn default_max_inflight_per_account() -> usize {
+    3
 }
 fn default_max_tool_calls() -> usize {
     crate::turn_limits::DEFAULT_TOOL_CALLS_PER_TURN
@@ -3908,5 +3952,29 @@ tasks_per_user_per_day = 500
         assert_eq!(config.secrets.master_key_file, "private/master.key");
         assert_eq!(config.onedrive.folder, "SeraBot");
         assert!(config.onedrive.redirect_base_url.is_empty());
+    }
+
+    #[test]
+    fn concurrency_limits_have_a_ceiling_of_eight() {
+        let defaults = RuntimeConfig::default();
+        assert_eq!(defaults.max_concurrent_turns, 4);
+        assert_eq!(defaults.max_turns_per_user, 2);
+        assert_eq!(defaults.max_active_children, 4);
+        assert_eq!(defaults.max_inflight_per_account, 3);
+        let with = |edit: &dyn Fn(&mut Config)| {
+            let mut config = valid_config();
+            edit(&mut config);
+            config.validate()
+        };
+        with(&|c| c.runtime.max_concurrent_turns = 8).unwrap();
+        with(&|c| c.runtime.max_concurrent_turns = 4).unwrap();
+        assert!(with(&|c| c.runtime.max_concurrent_turns = 9).is_err());
+        assert!(with(&|c| c.runtime.max_concurrent_turns = 0).is_err());
+        assert!(with(&|c| c.runtime.max_turns_per_user = 0).is_err());
+        assert!(with(&|c| c.runtime.max_active_children = 9).is_err());
+        assert!(with(&|c| c.runtime.max_inflight_per_account = 0).is_err());
+        // The new keys are optional in a config file.
+        let parsed: RuntimeConfig = toml::from_str("max_concurrent_turns = 3").unwrap();
+        assert_eq!(parsed.max_active_children, 4);
     }
 }

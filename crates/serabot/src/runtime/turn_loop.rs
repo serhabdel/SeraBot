@@ -110,9 +110,26 @@ impl Runtime {
             &payload.conversation_id,
             &json!({}),
         )?;
+        if let Some(handoff) = &payload.handoff {
+            let _ = self.store.append_event(
+                &user,
+                activity::EVENT_HANDOFF_STARTED,
+                &activity::handoff_payload(&activity::HandoffRef {
+                    handoff_id: &handoff.handoff_id,
+                    child_task_id: &task.id,
+                    parent_task_id: &handoff.parent_task_id,
+                    to_bot: &payload.bot,
+                    conversation_id: &payload.conversation_id,
+                }),
+            );
+        }
         // A handoff or team turn reposts an objective the room already holds as
-        // the owner's message; only an owner turn appends it again.
-        if payload.handoff.is_none() && payload.team.is_none() {
+        // the owner's message; only an owner turn appends it again. A resume
+        // follow-up is server-written, so it is not shown as the owner's message.
+        if payload.handoff.is_none()
+            && payload.team.is_none()
+            && payload.source != auto_resume::FOLLOWUP_SOURCE
+        {
             self.store.append_message(
                 &user,
                 &payload.conversation_id,
@@ -425,6 +442,17 @@ impl Runtime {
             {
                 tracing::warn!(%error, "could not mark the handoff completed");
             }
+            let _ = self.store.append_event(
+                user_id,
+                activity::EVENT_HANDOFF_COMPLETED,
+                &activity::handoff_payload(&activity::HandoffRef {
+                    handoff_id: &handoff.handoff_id,
+                    child_task_id: &task.id,
+                    parent_task_id: &handoff.parent_task_id,
+                    to_bot: &turn.bot,
+                    conversation_id,
+                }),
+            );
         } else {
             self.record_assistant(user_id, conversation_id, turn, text, false)?;
         }
@@ -793,7 +821,8 @@ impl Runtime {
                     "turn.completed",
                     &json!({"turn_id": turn.id, "task_id": task.id}),
                 )?;
-                if state.handoff.is_none() && state.team.is_none() {
+                let followup = auto_resume::is_followup(&task.payload);
+                if state.handoff.is_none() && state.team.is_none() && !followup {
                     let owner_prompt = extract::owner_text(&state.messages).unwrap_or("");
                     self.maybe_auto_name_conversation(
                         &user,
@@ -807,6 +836,7 @@ impl Runtime {
                 // is stored, in the background, and never fail the turn.
                 if state.handoff.is_none()
                     && state.team.is_none()
+                    && !followup
                     && !state.ask_mode
                     && let Some(owner) = extract::owner_text(&state.messages)
                 {

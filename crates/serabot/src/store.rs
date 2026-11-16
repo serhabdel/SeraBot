@@ -87,6 +87,22 @@ pub const ADMIN_USER_ID: &str = "00000000-0000-7000-8000-000000000001";
 /// Task status for work whose outbound effect may have happened: it is never
 /// replayed and waits for the owner.
 pub const TASK_NEEDS_REVIEW: &str = "needs_review";
+
+/// Per-user limits [`Store::claim_task_with`] applies when it picks a task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimLimits {
+    /// Running owner-facing (non-handoff) tasks one user may hold.
+    pub max_turns_per_user: usize,
+    /// Running handoff (subagent) tasks one user may hold.
+    pub max_active_children: usize,
+}
+
+impl ClaimLimits {
+    pub const UNLIMITED: Self = Self {
+        max_turns_per_user: usize::MAX,
+        max_active_children: usize::MAX,
+    };
+}
 /// Task status for a turn parked until a model route is ready.
 pub const TASK_WAITING_MODEL: &str = "waiting_model";
 
@@ -4171,27 +4187,66 @@ impl Store {
         Ok(inserted == 1)
     }
 
-    /// Claim the next runnable task for a worker. Cross-user by design: the
-    /// worker pool is shared — a task runs under its owning user (returned
-    /// on the task), regardless of which worker claims it.
+    /// Claim the next runnable task for a worker with no per-user limits.
+    /// Cross-user by design: the worker pool is shared; a task runs under its
+    /// owning user (returned on the task), regardless of which worker claims
+    /// it. The worker uses [`Store::claim_task_with`].
     pub fn claim_task(&self, worker_id: &str, lease_secs: u64) -> Result<Option<Task>> {
+        self.claim_task_with(worker_id, lease_secs, ClaimLimits::UNLIMITED)
+    }
+
+    /// Claim the next runnable task under the fairness limits (0.50). Within a
+    /// priority an owner turn goes before a subagent turn, then the user with
+    /// the fewest running tasks goes first (a round robin across users), then
+    /// the oldest. A user already at `max_turns_per_user` running owner turns,
+    /// or `max_active_children` running subagent turns, is skipped, so one
+    /// user's fan-out can never fill every worker slot.
+    pub fn claim_task_with(
+        &self,
+        worker_id: &str,
+        lease_secs: u64,
+        limits: ClaimLimits,
+    ) -> Result<Option<Task>> {
         let connection = self.connection()?;
         let now = utc_now();
         let lease_until = now + chrono::Duration::seconds(lease_secs as i64);
+        let cap = |value: usize| i64::try_from(value).unwrap_or(i64::MAX);
         let transaction = connection.unchecked_transaction()?;
         let task = transaction
             .query_row(
                 "UPDATE tasks SET status='running', worker_id=?1, lease_until=?2,
                     fencing_token=fencing_token+1, attempts=attempts+1, updated_at=?3
                  WHERE id = (
-                    SELECT id FROM tasks
-                    WHERE status IN ('queued','waiting_model') AND run_after <= ?3
-                    ORDER BY priority DESC, created_at ASC LIMIT 1
+                    SELECT t.id FROM tasks t
+                    WHERE t.status IN ('queued','waiting_model') AND t.run_after <= ?3
+                      AND (
+                        (COALESCE(json_extract(t.payload_json, '$.source'), '') = 'handoff'
+                         AND (SELECT COUNT(*) FROM tasks r
+                              WHERE r.user_id = t.user_id AND r.status = 'running'
+                                AND COALESCE(json_extract(r.payload_json, '$.source'), '') = 'handoff') < ?5)
+                        OR
+                        (COALESCE(json_extract(t.payload_json, '$.source'), '') <> 'handoff'
+                         AND (SELECT COUNT(*) FROM tasks r
+                              WHERE r.user_id = t.user_id AND r.status = 'running'
+                                AND COALESCE(json_extract(r.payload_json, '$.source'), '') <> 'handoff') < ?4)
+                      )
+                    ORDER BY t.priority DESC,
+                             COALESCE(json_extract(t.payload_json, '$.source'), '') = 'handoff' ASC,
+                             (SELECT COUNT(*) FROM tasks r
+                              WHERE r.user_id = t.user_id AND r.status = 'running') ASC,
+                             t.created_at ASC
+                    LIMIT 1
                  )
                  RETURNING id, kind, bot, payload_json, status, priority, attempts, max_attempts,
                     run_after, lease_until, worker_id, fencing_token, uncertain, last_error,
                     created_at, updated_at, user_id",
-                params![worker_id, to_string(lease_until), to_string(now)],
+                params![
+                    worker_id,
+                    to_string(lease_until),
+                    to_string(now),
+                    cap(limits.max_turns_per_user),
+                    cap(limits.max_active_children)
+                ],
                 map_task,
             )
             .optional()?;
@@ -8427,5 +8482,90 @@ mod tests {
         let b_jobs = store.list_media_jobs_for_user(&user_b.id, 10).unwrap();
         assert_eq!(b_jobs.len(), 1);
         assert_eq!(b_jobs[0].external_id, "ext-b1");
+    }
+
+    fn queue_for(store: &Store, user: &str, source: &str, n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| {
+                store
+                    .enqueue_task(
+                        user,
+                        "turn",
+                        "analyst",
+                        &serde_json::json!({"source": source, "text": format!("synthetic {i}")}),
+                        0,
+                        chrono::Utc::now(),
+                    )
+                    .unwrap()
+                    .id
+            })
+            .collect()
+    }
+
+    #[test]
+    fn one_users_sixteen_children_do_not_block_another_users_turn() {
+        let store = Store::open_in_memory(384).unwrap();
+        let a = store.admin_user_id().unwrap();
+        let b = store
+            .create_user("microsoft:fair-b", "fair-b@example.example", "B")
+            .unwrap()
+            .id;
+        // A's children are queued first, so plain FIFO would run all 16 before B.
+        queue_for(&store, &a, "handoff", 16);
+        let b_turn = queue_for(&store, &b, "owner", 1).remove(0);
+        let limits = ClaimLimits {
+            max_turns_per_user: 2,
+            max_active_children: 4,
+        };
+        let mut claimed = Vec::new();
+        while let Some(task) = store.claim_task_with("w", 30, limits).unwrap() {
+            claimed.push(task);
+        }
+        // B's turn starts within one claim cycle (the second claim: A, then B).
+        let position = claimed.iter().position(|task| task.id == b_turn).unwrap();
+        assert!(position <= 1, "B's turn was claimed at position {position}");
+        // A never holds more than four subagent slots, and B's turn ran.
+        let a_running = claimed.iter().filter(|task| task.user_id == a).count();
+        assert_eq!(a_running, 4);
+        assert_eq!(claimed.len(), 5);
+        // A slot frees when a child finishes: the next child is claimed.
+        let first = claimed.iter().find(|task| task.user_id == a).unwrap();
+        assert!(
+            store
+                .complete_task(&a, &first.id, first.fencing_token)
+                .unwrap()
+        );
+        assert!(store.claim_task_with("w", 30, limits).unwrap().is_some());
+        assert!(store.claim_task_with("w", 30, limits).unwrap().is_none());
+    }
+
+    #[test]
+    fn owner_turns_go_before_children_and_are_capped_per_user() {
+        let store = Store::open_in_memory(384).unwrap();
+        let a = store.admin_user_id().unwrap();
+        queue_for(&store, &a, "handoff", 2);
+        let owner = queue_for(&store, &a, "owner", 3);
+        let limits = ClaimLimits {
+            max_turns_per_user: 2,
+            max_active_children: 4,
+        };
+        // Same priority: an owner turn goes before the older children.
+        let first = store.claim_task_with("w", 30, limits).unwrap().unwrap();
+        assert_eq!(first.id, owner[0]);
+        let second = store.claim_task_with("w", 30, limits).unwrap().unwrap();
+        // The owner-turn cap is 2 and the next claim is the user's own: with
+        // round robin on running counts it can be a child, but never a third
+        // owner turn.
+        let rest: Vec<Task> =
+            std::iter::from_fn(|| store.claim_task_with("w", 30, limits).unwrap()).collect();
+        let owner_claimed = [first, second]
+            .iter()
+            .chain(&rest)
+            .filter(|task| owner.contains(&task.id))
+            .count();
+        assert_eq!(owner_claimed, 2);
+        assert_eq!(rest.len(), 2);
+        // The unlimited wrapper keeps the old behavior for callers without limits.
+        assert!(store.claim_task("w", 30).unwrap().is_some());
     }
 }

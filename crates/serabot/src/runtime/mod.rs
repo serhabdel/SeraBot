@@ -49,7 +49,8 @@ use crate::teams::{
 };
 use crate::util::truncate_chars;
 
-mod activity;
+pub(crate) mod activity;
+mod auto_resume;
 mod compaction;
 use activity::StepPhase;
 mod extract;

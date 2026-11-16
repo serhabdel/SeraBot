@@ -15,6 +15,7 @@ use crate::memory;
 use crate::model_router::{ModelRouter, ModelSelection, PinnedRoute};
 use crate::orchestration::HandoffContext;
 use crate::orchestration::{BotRole, Handoff, ModelClass, ORCHESTRATOR_BOT, validate_handoff};
+use crate::route_chain::NewRouteEvent;
 use crate::store::{Store, insert_task_row, now_string, start_of_utc_day, to_string};
 use crate::util::sha256_hex;
 
@@ -725,6 +726,38 @@ impl Store {
         Ok(())
     }
 
+    /// Record that a handoff's child failed for good: `failed_resumable` when
+    /// a retry is still allowed, else `failed`. Only the handoff's current
+    /// child may write it, so a late failure of a replaced child changes
+    /// nothing. Returns whether the row changed.
+    pub fn mark_handoff_failed(
+        &self,
+        user_id: &str,
+        handoff_id: &str,
+        child_task_id: &str,
+        status: &str,
+        outcome_code: &str,
+        effects_unknown: bool,
+    ) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE handoffs
+             SET status = ?4, outcome_code = ?5, effects_unknown = ?6, updated_at = ?7
+             WHERE id = ?1 AND user_id = ?2 AND child_task_id = ?3
+               AND status NOT IN ('completed', 'failed', 'failed_resumable')",
+            params![
+                handoff_id,
+                user_id,
+                child_task_id,
+                status,
+                outcome_code,
+                i64::from(effects_unknown),
+                now_string()
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// Whether the acting user's bot has a turn running or waiting on an
     /// approval, other than `except_task`. A route change waits for this to
     /// be false.
@@ -794,6 +827,20 @@ pub fn resume_route(
         },
     };
     router.pin_for_bot(user_id, &selection, bot)
+}
+
+/// The chain slot after the one a failed child ran on: 0 is the primary route,
+/// then the fallbacks. `None` when the child was on the last slot, or its slot
+/// is not in the chain any more.
+pub fn next_chain_slot(bot: &BotConfig, previous: Option<&Value>) -> Option<usize> {
+    let ran = serde_json::from_value::<PinnedRoute>(previous?.clone())
+        .ok()?
+        .selection;
+    let chain = bot.route.iter().chain(&bot.fallbacks).collect::<Vec<_>>();
+    let slot = chain.iter().position(|entry| {
+        entry.provider == ran.provider && entry.model == ran.model && entry.account == ran.account
+    })?;
+    (slot + 1 < chain.len()).then_some(slot + 1)
 }
 
 /// How a handoff is resumed.
@@ -879,6 +926,26 @@ pub fn resume_handoff(
         Some(&json!(route)),
         options.daily_limit,
     )?;
+    // Every resume is a route event, so the switch shows beside the failovers.
+    let previous = view
+        .route
+        .as_ref()
+        .and_then(|value| serde_json::from_value::<PinnedRoute>(value.clone()).ok())
+        .map(|route| route.selection)
+        .unwrap_or_else(|| route.selection.clone());
+    if let Err(error) = store.record_route_event(
+        user_id,
+        &NewRouteEvent {
+            conversation_id: view.conversation_id.as_deref(),
+            task_id: Some(&new_child),
+            bot: Some(&view.to_bot),
+            from: &previous,
+            to: &route.selection,
+            reason: "handoff_resume",
+        },
+    ) {
+        warn!(%error, "handoff resume was not recorded as a route event");
+    }
     store.append_event(
         user_id,
         "handoff.resumed",
