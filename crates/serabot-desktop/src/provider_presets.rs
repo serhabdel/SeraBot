@@ -377,8 +377,6 @@ const PRESETS: &[ProviderPreset] = &[
             "zai-org/GLM-5.3",
             "zai-org/GLM-5.3-Flash",
             "zai-org/GLM-5.2",
-            "deepseek-ai/DeepSeek-V4.1-Flash-1017",
-            "deepseek-ai/DeepSeek-V4-Pro-0813",
             "MiniMaxAI/MiniMax-M3.1-Flash",
             "Qwen/Qwen3.7-Max",
             "Qwen/Qwen3.7-Plus",
@@ -724,6 +722,19 @@ pub fn preset_for(id: &str) -> Option<&'static ProviderPreset> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn no_preset_pins_a_dated_snapshot_model_id() {
+        // Dated snapshot ids go stale and cannot be confirmed offline; the
+        // live "Fetch models" catalog supplies those instead.
+        for preset in presets() {
+            for model in preset.models {
+                let tail = model.rsplit('-').next().unwrap_or("");
+                let dated = tail.len() == 4 && tail.chars().all(|c| c.is_ascii_digit());
+                assert!(!dated, "{}: {model}", preset.id);
+            }
+        }
+    }
 
     #[test]
     fn every_preset_is_complete_and_unique() {
