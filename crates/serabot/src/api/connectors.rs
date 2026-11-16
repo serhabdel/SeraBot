@@ -46,11 +46,11 @@ pub(super) async fn list_providers(
                     c.auth.eq_ignore_ascii_case("oauth")
                         || matches!(
                             c.kind.as_str(),
-                            "google-antigravity" | "muse-code" | "openai-codex"
+                            "google-antigravity" | "muse-code" | "openai-codex" | "github-copilot"
                         )
                 }) || matches!(
                     provider.kind.as_str(),
-                    "google-antigravity" | "muse-code" | "openai-codex"
+                    "google-antigravity" | "muse-code" | "openai-codex" | "github-copilot"
                 );
             let mut secrets = json!({
                 "api_key": visible_secret_status(&state.secrets, config.map(|c| c.api_key_secret.as_str()), is_admin),
@@ -124,7 +124,7 @@ pub(super) async fn list_providers(
                 let is_oauth = profile.auth.eq_ignore_ascii_case("oauth")
                     || matches!(
                         profile.kind.as_str(),
-                        "google-antigravity" | "muse-code" | "openai-codex"
+                        "google-antigravity" | "muse-code" | "openai-codex" | "github-copilot"
                     );
                 let mut secrets = json!({
                     "api_key": visible_secret_status(&state.secrets, Some(profile.api_key_secret.as_str()), is_admin),

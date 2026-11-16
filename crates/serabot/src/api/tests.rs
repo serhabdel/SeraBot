@@ -17,6 +17,7 @@ mod cards_api;
 mod chat_api;
 mod codex_api;
 mod composio_api;
+mod copilot_api;
 mod desktop_tabs_api;
 mod digest_api;
 mod files_api;

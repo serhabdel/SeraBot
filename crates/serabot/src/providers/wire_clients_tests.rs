@@ -1739,3 +1739,363 @@ async fn a_refused_codex_refresh_parks_the_account_and_keeps_the_row() {
     );
     assert!(env.accounts.list(&env.bob, CODEX).unwrap().is_empty());
 }
+
+// ---- GitHub Copilot (v0.51) ----
+
+const COPILOT: &str = "copilot";
+
+fn copilot_profile(server: &MockServer, plan_oauth: bool) -> ProviderConfig {
+    ProviderConfig {
+        kind: "github-copilot".into(),
+        base_url: server.uri(),
+        data_egress_approved: true,
+        plan_oauth,
+        ..Default::default()
+    }
+}
+
+fn add_copilot(env: &Env, user: &str, access: &str, github: &str) -> String {
+    env.accounts
+        .add(
+            user,
+            AddAccount {
+                provider: COPILOT.into(),
+                label: "synthetic-user".into(),
+                auth_kind: AuthKind::Device,
+                fingerprint: identity_fingerprint("github-copilot", "id:42"),
+                identity: json!({"login": "synthetic-user"}),
+                credential: ProviderCredential {
+                    api_key: access.into(),
+                    refresh_token: github.into(),
+                    expires_at: None,
+                    generation: None,
+                },
+                priority: 0,
+            },
+        )
+        .unwrap()
+        .account_id
+}
+
+fn chat_reply(text: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": "stop"}]
+    }))
+}
+
+#[test]
+fn copilot_is_a_builtin_oauth_kind_with_a_pinned_token_exchange() {
+    assert_eq!(canonical_kind("github-copilot").unwrap(), "github-copilot");
+    assert_eq!(
+        resolve_base_url("github-copilot", "").unwrap(),
+        "https://api.githubcopilot.com"
+    );
+    match auth_plan("github-copilot", "").unwrap() {
+        AuthPlan::OAuth {
+            style,
+            token_url,
+            client_id_fallback,
+        } => {
+            assert_eq!(style, OAuthStyle::CopilotExchange);
+            assert_eq!(
+                token_url,
+                "https://api.github.com/copilot_internal/v2/token"
+            );
+            assert_eq!(client_id_fallback, None);
+        }
+        AuthPlan::ApiKey => panic!("copilot signs in"),
+    }
+    assert!(
+        enforce_oauth_target(
+            OAuthStyle::CopilotExchange,
+            "https://api.github.com/copilot_internal/v2/token"
+        )
+        .is_ok()
+    );
+    for bad in [
+        "https://evil.example/copilot_internal/v2/token",
+        "https://api.github.com/user",
+    ] {
+        assert!(enforce_oauth_target(OAuthStyle::CopilotExchange, bad).is_err());
+    }
+}
+
+#[test]
+fn copilot_catalog_keeps_only_chat_models_the_picker_shows() {
+    let catalog = parse_model_catalog(
+        json!({"data": [
+            {"id": "cp-chat", "name": "Chat", "model_picker_enabled": true,
+             "supported_endpoints": ["/chat/completions"],
+             "capabilities": {"type": "chat",
+                "limits": {"max_context_window_tokens": 400000, "max_prompt_tokens": 128000,
+                           "max_output_tokens": 16000},
+                "supports": {"vision": true, "tool_calls": true, "thinking": true}}},
+            {"id": "cp-legacy", "model_picker_enabled": true, "capabilities": {"type": "chat"}},
+            {"id": "cp-responses-only", "model_picker_enabled": true,
+             "supported_endpoints": ["/responses"], "capabilities": {"type": "chat"}},
+            {"id": "cp-hidden", "model_picker_enabled": false,
+             "supported_endpoints": ["/chat/completions"], "capabilities": {"type": "chat"}},
+            {"id": "cp-embedding", "model_picker_enabled": true,
+             "capabilities": {"type": "embeddings"}}
+        ]})
+        .to_string()
+        .as_bytes(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        catalog.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["cp-chat", "cp-legacy"]
+    );
+    let chat = &catalog["cp-chat"];
+    // The prompt limit, not the native window, is what a conversation must fit.
+    assert_eq!(chat.context_length, Some(128_000));
+    assert_eq!(chat.max_output_tokens, Some(16_000));
+    assert_eq!(chat.tags, ["vision", "tools", "reasoning"]);
+}
+
+#[tokio::test]
+async fn a_copilot_account_chats_and_lists_models_with_the_editor_headers() {
+    let env = env();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(header("authorization", "Bearer tid=copilot-token"))
+        .and(header("user-agent", "GitHubCopilotChat/0.32.4"))
+        .and(header("editor-version", "vscode/1.105.1"))
+        .and(header("editor-plugin-version", "copilot-chat/0.32.4"))
+        .and(header("copilot-integration-id", "vscode-chat"))
+        .and(header("x-github-api-version", "2026-08-01"))
+        .respond_with(chat_reply("from copilot"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .and(header("authorization", "Bearer tid=copilot-token"))
+        .and(header("openai-intent", "model-access"))
+        .and(header("copilot-integration-id", "vscode-chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [
+            {"id": "cp-chat", "model_picker_enabled": true,
+             "supported_endpoints": ["/chat/completions"], "capabilities": {"type": "chat"}}
+        ]})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let profile = copilot_profile(&server, true);
+    let account = add_copilot(&env, &env.alice, "tid=copilot-token", "gho_synthetic");
+    let client = env
+        .credentials
+        .client_for_account(&env.alice, COPILOT, &profile, &account)
+        .unwrap()
+        .with_model("cp-chat");
+    let reply = client
+        .complete(&[LlmMessage::user("hi")], &[], None, None)
+        .await
+        .unwrap();
+    assert_eq!(reply.message.content.as_deref(), Some("from copilot"));
+    // The model list is read from this client's own host, whatever URL is passed.
+    let catalog = client
+        .fetch_model_catalog("https://api.githubcopilot.com/models", false)
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["cp-chat"]
+    );
+    // Exactly one user agent went out on the catalog call.
+    let requests = server.received_requests().await.unwrap();
+    let listing = requests.iter().find(|r| r.url.path() == "/models").unwrap();
+    assert_eq!(listing.headers.get_all("user-agent").iter().count(), 1);
+    // Another member holds no account.
+    assert!(env.accounts.list(&env.bob, COPILOT).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_copilot_account_is_refused_while_the_flag_is_off_or_as_a_default_or_without_a_github_token()
+ {
+    let env = env();
+    let server = MockServer::start().await;
+    let account = add_copilot(&env, &env.alice, "tid=copilot-token", "gho_synthetic");
+    let off = copilot_profile(&server, false);
+    assert!(matches!(
+        env.credentials
+            .client_for_account(&env.alice, COPILOT, &off, &account),
+        Err(SeraError::Forbidden(_))
+    ));
+    let on = copilot_profile(&server, true);
+    let build = |account_id: &str, github: &str| {
+        open_provider_client(
+            &on,
+            &ProviderCredential {
+                api_key: "tid=copilot-token".into(),
+                refresh_token: github.into(),
+                ..Default::default()
+            },
+            &env.credentials.server_secrets,
+            10,
+            4096,
+            CredentialOwner {
+                users: &env.credentials.users,
+                user_id: &env.alice,
+                provider: COPILOT,
+                account_id,
+                refresher: None,
+            },
+        )
+    };
+    assert!(matches!(
+        build(DEFAULT_ACCOUNT, "gho_synthetic"),
+        Err(SeraError::Forbidden(_))
+    ));
+    assert!(matches!(build(&account, ""), Err(SeraError::Forbidden(_))));
+    assert!(build(&account, "gho_synthetic").is_ok());
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_expired_copilot_token_is_exchanged_again_once_for_eight_turns() {
+    let env = env();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/copilot_internal/v2/token"))
+        .and(header("authorization", "Bearer gho_synthetic"))
+        .and(header("editor-version", "vscode/1.105.1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "token": "tid=renewed",
+            "expires_at": chrono::Utc::now().timestamp() + 1800,
+            "endpoints": {"api": "https://api.githubcopilot.com"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(header("authorization", "Bearer tid=expired"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(header("authorization", "Bearer tid=renewed"))
+        .respond_with(chat_reply("renewed"))
+        .mount(&server)
+        .await;
+    let account = add_copilot(&env, &env.alice, "tid=expired", "gho_synthetic");
+    let mut turns = Vec::new();
+    for _ in 0..8 {
+        let client = LlmClient::new(server.uri(), "tid=expired", 10, 4096)
+            .unwrap()
+            .with_model("cp-chat")
+            .with_oauth_unpinned(OAuthMaterial {
+                style: OAuthStyle::CopilotExchange,
+                refresh_token: "gho_synthetic".into(),
+                token_url: format!("{}/copilot_internal/v2/token", server.uri()),
+                client_id: String::new(),
+                client_secret: String::new(),
+            })
+            .unwrap()
+            .with_account_refresh(
+                AccountRefreshTarget {
+                    refresher: env.credentials.refresher().clone(),
+                    user_id: env.alice.clone(),
+                    provider: COPILOT.into(),
+                    account_id: account.clone(),
+                },
+                None,
+                None,
+            )
+            .unwrap()
+            .with_copilot();
+        turns.push(tokio::spawn(async move {
+            client
+                .complete(&[LlmMessage::user("hi")], &[], None, None)
+                .await
+        }));
+    }
+    for turn in turns {
+        assert_eq!(
+            turn.await.unwrap().unwrap().message.content.as_deref(),
+            Some("renewed")
+        );
+    }
+    let exchanges = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path() == "/copilot_internal/v2/token")
+        .count();
+    assert_eq!(exchanges, 1);
+    // The new Copilot token is stored; the GitHub token is unchanged.
+    let stored = env
+        .accounts
+        .credential(&env.alice, COPILOT, &account)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.api_key, "tid=renewed");
+    assert_eq!(stored.refresh_token, "gho_synthetic");
+    assert!(stored.expires_at.is_some());
+}
+
+#[tokio::test]
+async fn a_github_token_that_github_refuses_parks_the_copilot_account_and_keeps_the_row() {
+    let env = env();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/copilot_internal/v2/token"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let account = add_copilot(&env, &env.alice, "tid=expired", "gho_revoked");
+    let client = LlmClient::new(server.uri(), "tid=expired", 10, 4096)
+        .unwrap()
+        .with_model("cp-chat")
+        .with_oauth_unpinned(OAuthMaterial {
+            style: OAuthStyle::CopilotExchange,
+            refresh_token: "gho_revoked".into(),
+            token_url: format!("{}/copilot_internal/v2/token", server.uri()),
+            client_id: String::new(),
+            client_secret: String::new(),
+        })
+        .unwrap()
+        .with_account_refresh(
+            AccountRefreshTarget {
+                refresher: env.credentials.refresher().clone(),
+                user_id: env.alice.clone(),
+                provider: COPILOT.into(),
+                account_id: account.clone(),
+            },
+            None,
+            None,
+        )
+        .unwrap()
+        .with_copilot();
+    let error = client
+        .complete(&[LlmMessage::user("hi")], &[], None, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        SeraError::Rejected {
+            code: "needs_reauth",
+            ..
+        }
+    ));
+    let row = env
+        .accounts
+        .get(&env.alice, COPILOT, &account)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, AccountStatus::NeedsReauth);
+    assert!(
+        env.accounts
+            .credential(&env.alice, COPILOT, &account)
+            .unwrap()
+            .is_some()
+    );
+}

@@ -126,6 +126,10 @@ pub const PLAN_RISK_CLAUDE: &str = "This signs in through Claude's own client, n
 /// its own text.
 pub const PLAN_RISK_CODEX: &str = "This signs in through ChatGPT's own Codex client, not an API contract. OpenAI may restrict or suspend an account used this way. It is your own account and is never shared. API keys on the OpenAI provider are the supported path.";
 
+/// Shown beside a GitHub Copilot sign-in when the server does not send its own
+/// text.
+pub const PLAN_RISK_COPILOT: &str = "This signs in through GitHub Copilot's own editor client, not an API contract. GitHub may restrict or suspend an account used this way. It is your own account and is never shared. A GitHub account without a Copilot plan cannot use it.";
+
 const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "antigravity",
@@ -291,6 +295,34 @@ const PRESETS: &[ProviderPreset] = &[
         key_url: "",
         sign_in: "pkce",
         risk: PLAN_RISK_CODEX,
+    },
+    ProviderPreset {
+        id: "github-copilot",
+        label: "GitHub Copilot",
+        subtitle: "The models your Copilot plan includes, with no API key. Sign in with GitHub using a code; add several accounts.",
+        base_url: "https://api.githubcopilot.com",
+        kind: "github-copilot",
+        default_id: "copilot",
+        // HielCowork's static list is only "auto" and the real list comes from
+        // the plan's own catalog. The server does not use the auto router, but
+        // a provider needs an allowlist, so this seeds it with ids HielCowork
+        // names; the live catalog (`catalog_fetch`) then limits it to what the
+        // plan actually serves on chat completions.
+        models: &[
+            "claude-sonnet-5.5",
+            "claude-opus-5.5",
+            "claude-haiku-5.5",
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
+        ],
+        secret_name: "copilot_access_token",
+        catalog_fetch: true,
+        auth: "oauth",
+        badge: "OAuth",
+        note: "Sign in with GitHub (device code, several accounts)",
+        key_url: "",
+        sign_in: "device",
+        risk: PLAN_RISK_COPILOT,
     },
     ProviderPreset {
         id: "openrouter",
@@ -847,6 +879,7 @@ mod tests {
                         | "muse-code"
                         | "anthropic"
                         | "openai-codex"
+                        | "github-copilot"
                         | "opencode-go"
                         | "opencode-zen"
                         | "gemini"
@@ -962,6 +995,27 @@ mod tests {
         assert_eq!(preset_for("openai").unwrap().risk, "");
     }
 
+    /// The Copilot card follows the owner's HielCowork client: the same
+    /// `api.githubcopilot.com` base, GitHub's device sign-in, no key, and a
+    /// model list that is read from the plan (HielCowork's static list is only
+    /// "auto").
+    #[test]
+    fn the_copilot_preset_matches_hielcowork() {
+        let copilot = preset_for("github-copilot").unwrap();
+        assert_eq!(copilot.kind, "github-copilot");
+        assert_eq!(copilot.base_url, "https://api.githubcopilot.com");
+        assert_eq!((copilot.auth, copilot.sign_in), ("oauth", "device"));
+        assert!(copilot.key_url.is_empty() && copilot.catalog_fetch);
+        assert_eq!(copilot.models.first(), Some(&"claude-sonnet-5.5"));
+        assert!(!copilot.models.contains(&"auto"));
+        assert!(!is_unverified("github-copilot"));
+        assert!(provider_matches_preset("mine", "github-copilot", copilot));
+        for query in ["copilot", "github"] {
+            let found = filter_presets(query, DirectoryFilter::OAuth, |_| false);
+            assert!(found.iter().any(|p| p.id == "github-copilot"), "{query}");
+        }
+    }
+
     #[test]
     fn fallback_model_lists_are_unique_well_formed_and_cover_the_flagships() {
         for preset in presets() {
@@ -1051,6 +1105,8 @@ mod tests {
                 "anthropic" => "pkce",
                 // Codex: a ChatGPT browser sign-in (the server adds the device code).
                 "chatgpt-codex" => "pkce",
+                // Copilot: GitHub's device code (it has no browser flow).
+                "github-copilot" => "device",
                 _ => "",
             };
             assert_eq!(preset.sign_in, expected_sign_in, "{:?}", preset.id);
@@ -1083,7 +1139,16 @@ mod tests {
             .filter(|preset| !preset.risk.is_empty())
             .map(|preset| preset.id)
             .collect();
-        assert_eq!(risky, ["antigravity", "chatgpt-codex", "anthropic"]);
+        assert_eq!(
+            risky,
+            [
+                "antigravity",
+                "chatgpt-codex",
+                "github-copilot",
+                "anthropic"
+            ]
+        );
+        assert!(PLAN_RISK_COPILOT.contains("suspend"));
         assert!(PLAN_RISK_GOOGLE.contains("suspend"));
         assert!(PLAN_RISK_CODEX.contains("API keys on the OpenAI provider"));
         assert!(PLAN_RISK_CLAUDE.contains("API keys are the supported path"));

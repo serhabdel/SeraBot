@@ -147,6 +147,9 @@ pub struct LlmClient {
     opencode_session: Option<Arc<str>>,
     /// A Codex (ChatGPT plan) account's request identity.
     codex: Option<Arc<CodexRequest>>,
+    /// A GitHub Copilot account: the editor headers are on every request, and
+    /// the model list comes from the plan's own host.
+    copilot: bool,
 }
 
 /// What a Codex request carries beyond the bearer: the ChatGPT workspace the
@@ -200,7 +203,20 @@ impl LlmClient {
             wire: Wire::ChatCompletions,
             opencode_session: None,
             codex: None,
+            copilot: false,
         })
+    }
+
+    /// Send the editor identity GitHub Copilot requires on every request
+    /// (`User-Agent`, `Editor-Version`, `Editor-Plugin-Version`,
+    /// `Copilot-Integration-Id`, `X-GitHub-Api-Version`), as the owner's
+    /// HielCowork client does.
+    pub fn with_copilot(mut self) -> Self {
+        self.copilot = true;
+        for (name, value) in crate::auth_flows::copilot::EDITOR_HEADERS {
+            self.extra_headers.push((name, value));
+        }
+        self
     }
 
     /// Send the Codex request identity (`ChatGPT-Account-Id`, `originator`,
@@ -591,18 +607,30 @@ impl LlmClient {
         if self.wire.is_anthropic() {
             return self.fetch_anthropic_catalog(catalog_url).await;
         }
-        let url = validate_base_url(catalog_url)?;
+        // A Copilot plan lists its models on its own host, which is this
+        // client's base (the configured one is the individual plan's).
+        let url = if self.copilot {
+            validate_base_url(&format!("{}/models", self.base_url))?
+        } else {
+            validate_base_url(catalog_url)?
+        };
         let mut refreshed = false;
         let mut last_error = None;
         for attempt in 0..=self.max_retries + 1 {
             let mut key = self.bearer();
             let used = zeroize::Zeroizing::new(key.clone());
-            let request = self
+            let mut request = self
                 .http
                 .get(&url)
                 .bearer_auth(&key)
-                .header("user-agent", USER_AGENT)
                 .header("accept", "application/json");
+            if self.copilot {
+                // The editor identity (its own user agent) comes from `decorate`.
+                let (name, value) = crate::auth_flows::copilot::CATALOG_INTENT;
+                request = request.header(name, value);
+            } else {
+                request = request.header("user-agent", USER_AGENT);
+            }
             let response = self.decorate(request).send().await;
             key.zeroize();
             match response {
@@ -826,6 +854,11 @@ impl LlmClient {
             OAuthStyle::CodexRefresh => {
                 return Err(SeraError::Forbidden(
                     "Codex plan tokens refresh only through a member account".into(),
+                ));
+            }
+            OAuthStyle::CopilotExchange => {
+                return Err(SeraError::Forbidden(
+                    "Copilot tokens refresh only through a member account".into(),
                 ));
             }
             OAuthStyle::MuseMint => {
@@ -1222,6 +1255,10 @@ async fn exchange_for_grant(
         }
         OAuthStyle::CodexRefresh => {
             crate::auth_flows::codex::refresh_exchange(http, token_url, refresh_token, client_id)
+                .await
+        }
+        OAuthStyle::CopilotExchange => {
+            crate::auth_flows::copilot::refresh_exchange(http, token_url, refresh_token, client_id)
                 .await
         }
         OAuthStyle::RefreshToken => {

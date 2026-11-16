@@ -307,7 +307,7 @@ impl AddMethod {
 /// The provider kinds whose sign-in is a vendor plan, which the operator can
 /// turn off (`plan_oauth = false`).
 fn is_plan_kind(kind: &str) -> bool {
-    matches!(kind, "anthropic" | "openai-codex")
+    matches!(kind, "anthropic" | "openai-codex" | "github-copilot")
 }
 
 /// The ways to add an account to `provider`. The server's own list of
@@ -856,6 +856,29 @@ mod tests {
         let card_preset = preset_for("chatgpt-codex").unwrap();
         assert!(directory_offers_sign_in(None, card_preset));
         assert!(directory_offers_sign_in(Some(&codex), card_preset));
+        assert!(!directory_offers_sign_in(Some(&off), card_preset));
+    }
+
+    /// The GitHub Copilot card: a device code only, a risk banner, no key box.
+    #[test]
+    fn the_copilot_card_signs_in_with_a_code_and_never_takes_a_key() {
+        use crate::provider_presets::PLAN_RISK_COPILOT;
+        let copilot = kinded("github-copilot", "oauth", &["device"]);
+        let (methods, empty, filled, first, _text) = card(&copilot, "github-copilot");
+        assert_eq!(methods, vec![AddMethod::Device]);
+        assert_eq!((empty, filled), ("Sign in", "Add account"));
+        assert_eq!(first, Some(AddMethod::Device));
+        assert_eq!(
+            risk_text(&copilot, preset_for("github-copilot")).as_deref(),
+            Some(PLAN_RISK_COPILOT)
+        );
+        // An empty list means the operator turned it off: no button, no banner.
+        let off = kinded("github-copilot", "oauth", &[]);
+        assert!(add_methods(&off, preset_for("github-copilot")).is_empty());
+        assert_eq!(risk_text(&off, preset_for("github-copilot")), None);
+        let card_preset = preset_for("github-copilot").unwrap();
+        assert!(directory_offers_sign_in(None, card_preset));
+        assert!(directory_offers_sign_in(Some(&copilot), card_preset));
         assert!(!directory_offers_sign_in(Some(&off), card_preset));
     }
 

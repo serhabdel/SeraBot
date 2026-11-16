@@ -15,6 +15,7 @@ else takes an API key, and the console shows a "Get a key" link instead.
 | Muse Code | Sign in (device code) | Per member, several accounts each. The server runs the device flow, mints the key with `onboard: true` once (retrying a 429 or 5xx after 5 s, then 10 s) and keeps Meta's identity token only to mint again and to read quota. `x-api-version: 1.0.0` goes on every call. No API key to paste. Chat uses the Responses transport (`POST https://api.meta.ai/v1/responses`, see "Wire formats"). |
 | OpenAI | API key | Keys at platform.openai.com. |
 | ChatGPT (Codex) | Sign in (browser or device code) | Per member, several accounts each (a plan, not an API key; keys belong to the OpenAI provider). On by default with a risk banner, off with `plan_oauth = false`: see "Codex plan sign-in". Chat uses the Responses transport at `https://chatgpt.com/backend-api/codex`. |
+| GitHub Copilot | Sign in (GitHub device code) | Per member, several accounts each (a plan, not an API key). On by default with a risk banner, off with `plan_oauth = false`: see "GitHub Copilot sign-in". Chat uses chat completions at `https://api.githubcopilot.com` (or the plan's own host). |
 | Mistral AI | API key | console.mistral.ai. |
 | Google Gemini | API key | Key from Google AI Studio, used on the OpenAI-compatible endpoint. Google's OAuth for the Gemini API needs a Google Cloud project per user, so it is not a one-click sign-in. |
 | Anthropic (Claude) | API keys, several per member; admin plan sign-in | The native Messages API (`POST https://api.anthropic.com/v1/messages`) with `x-api-key`. Each member adds as many keys as they like, each sealed under their own id. The admin can also Sign in with Claude (several accounts; on by default, admin-only, with a risk banner): see "Claude plan sign-in". |
@@ -171,6 +172,65 @@ follows the owner's HielCowork client (`OAuthService.cs`).
 * *Not verified:* every request and sign-in here is checked against synthetic
   fixtures only. No ChatGPT account was used. Encrypted reasoning items are not
   replayed between tool rounds, and the plan usage meter is not read.
+
+## GitHub Copilot sign-in
+
+On by default, with a risk banner (owner decision; `plan_oauth = false` under
+`[llm.providers.<id>]` turns it off for a provider of kind `github-copilot`).
+Nothing here is a published GitHub API for third-party apps: the client id and
+the editor headers are the VS Code Copilot extension's, so the page says GitHub
+may restrict an account used this way. Like Codex's it is open to every member:
+each account is its member's own, sealed under their key, and never shared (a
+grant carries only the grantor's default credential, which Copilot refuses). It
+follows the owner's HielCowork client (`OAuthService.cs`, `CopilotService.cs`).
+
+* Device code only (GitHub's Copilot client has no browser flow): `POST
+  https://github.com/login/device/code` with the extension's public client id
+  and scope `read:user`; the member enters the code at
+  `https://github.com/login/device`; `https://github.com/login/oauth/access_token`
+  is polled (RFC 8628; GitHub answers a pending poll with HTTP 200 and an
+  `error`). The verification page is pinned to `github.com`.
+* The GitHub token is long-lived and does not rotate; it is kept as the
+  credential's refresh token. `GET https://api.github.com/copilot_internal/v2/token`
+  (bearer = the GitHub token) trades it for a Copilot token that lasts about half
+  an hour (the credential's access token, with its `expires_at`) and names the
+  plan's API host in `endpoints.api`. That host (an `https` `*.githubcopilot.com`
+  name only) is kept in the account's identity and used as the chat base, because
+  individual, business and enterprise plans are served from different hosts.
+  Every refresh repeats the exchange through the single-flight account refresher;
+  a 401 sets `needs_reauth` and keeps the row, a 403, 404 or 5xx leaves the
+  credential untouched. A sign-in whose exchange answers 403 or 404 is refused
+  with `copilot_not_subscribed` and stores nothing.
+* `GET https://api.github.com/user` names the account. The numeric GitHub id is
+  the stable identity (fingerprint `sha256("github-copilot:id:<id>")`, the login
+  when no id is given; neither is refused). Two GitHub users are two accounts;
+  signing in twice as one user updates it and a rename does not split it.
+* Every Copilot call carries the editor identity as HielCowork sends it:
+  `User-Agent: GitHubCopilotChat/0.32.4`, `Editor-Version: vscode/1.105.1`,
+  `Editor-Plugin-Version: copilot-chat/0.32.4`, `Copilot-Integration-Id:
+  vscode-chat`, `X-GitHub-Api-Version: 2026-08-01`. The model list also sends
+  `OpenAI-Intent: model-access`.
+* Chat is chat completions. The model list is `GET {plan host}/models`, read per
+  account, keeping chat models that the picker shows and that are served on
+  `/chat/completions` (embeddings, Responses-only models and hidden models are
+  dropped). A model's context is its prompt limit (`max_prompt_tokens`), which is
+  often under its native window, and its output limit is taken from the same
+  entry. HielCowork's own static list is only `auto`; because a provider needs an
+  allowlist, the desktop card seeds it with ids HielCowork names
+  (`claude-sonnet-5.5`, `claude-opus-5.5`, `claude-haiku-5.5`, `gpt-6.1-sol`,
+  `gpt-6.1-terra`) and the live catalog narrows it to what the plan serves. An id
+  that is on the plan but not in the allowlist must be added to the provider's
+  models.
+* *Not done:* the `auto` model (HielCowork resolves it through a session API that
+  GitHub restricts to its own editors, and falls back to a catalog pick), so a
+  plan whose catalog lists only Auto (some Free and student plans) shows no model;
+  the Responses API for Responses-only models (such as GPT-6 Luna); per-model
+  `reasoning_effort` (thinking levels are not offered for Copilot); the Copilot
+  quota meter; and a refresh that picks up a changed plan host (the host is
+  recorded at sign-in).
+* *Not verified:* every sign-in and request here is checked against synthetic
+  wiremock fixtures only. No GitHub account or Copilot plan was used, and the
+  editor versions and API version are copied from HielCowork as they stand.
 
 ## Claude plan sign-in
 

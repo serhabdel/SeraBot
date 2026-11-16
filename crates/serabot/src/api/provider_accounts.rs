@@ -49,7 +49,7 @@ pub(super) fn signin_flows(
     provider_id: &str,
     kind: &str,
 ) -> Vec<&'static str> {
-    if matches!(kind, "anthropic" | "openai-codex") {
+    if matches!(kind, "anthropic" | "openai-codex" | "github-copilot") {
         let enabled = state
             .config
             .llm
@@ -77,6 +77,9 @@ pub(super) fn signin_risk(kind: &str, flows: &[&'static str]) -> Option<&'static
         "openai-codex" => Some(
             "This signs in through ChatGPT's own Codex client, not an API contract. OpenAI may restrict or suspend an account used this way. It is your own account and is never shared. API keys on the OpenAI provider are the supported path.",
         ),
+        "github-copilot" => Some(
+            "This signs in through GitHub Copilot's own editor client, not an API contract. GitHub may restrict or suspend an account used this way. It is your own account and is never shared. A GitHub account without a Copilot plan cannot use it.",
+        ),
         _ => None,
     }
 }
@@ -89,7 +92,7 @@ pub(super) fn plan_signin_gate(
     profile: &ProviderConfig,
     kind: &str,
 ) -> Result<()> {
-    if !matches!(kind, "anthropic" | "openai-codex") {
+    if !matches!(kind, "anthropic" | "openai-codex" | "github-copilot") {
         return Ok(());
     }
     if !profile.plan_oauth_enabled() {

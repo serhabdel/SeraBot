@@ -134,7 +134,7 @@ static BRANDS: &[Brand] = &[
         mark: png!("composio"),
     },
     Brand {
-        keys: &["github", "github-mcp"],
+        keys: &["github", "github-mcp", "github-copilot"],
         label: "GitHub",
         mark: Mark::Svg(SVG_GITHUB),
     },
@@ -381,6 +381,7 @@ mod tests {
         "composio",
         "github",
         "github-mcp",
+        "github-copilot",
         "todoist",
         "slack",
         "slack-mcp",

@@ -627,8 +627,8 @@ pub struct ProviderConfig {
     /// example `2.25.0`). Empty uses the version pinned in the build.
     #[serde(default)]
     pub client_version: String,
-    /// Allow plan sign-in (`anthropic` and `openai-codex` providers only;
-    /// ignored for every other kind). On by default, by the owner's decision;
+    /// Allow plan sign-in (`anthropic`, `openai-codex` and `github-copilot`
+    /// providers only; ignored for every other kind). On by default, by the owner's decision;
     /// set `plan_oauth = false` to turn it off. A plan is consumer access, not
     /// an API contract (Anthropic's terms do not allow a third-party product to
     /// offer a Claude plan sign-in), so the page shows a risk banner and each
@@ -648,12 +648,17 @@ impl ProviderConfig {
     /// Whether this provider offers plan sign-in: an `anthropic` or
     /// `openai-codex` kind whose `plan_oauth` is on.
     pub fn plan_oauth_enabled(&self) -> bool {
-        self.plan_oauth && (self.is_anthropic() || self.is_codex())
+        self.plan_oauth && (self.is_anthropic() || self.is_codex() || self.is_copilot())
     }
 
     /// Whether this provider's kind is `anthropic`.
     pub fn is_anthropic(&self) -> bool {
         crate::providers::canonical_kind(&self.kind).is_ok_and(|kind| kind == "anthropic")
+    }
+
+    /// Whether this provider's kind is `github-copilot`.
+    pub fn is_copilot(&self) -> bool {
+        crate::providers::canonical_kind(&self.kind).is_ok_and(|kind| kind == "github-copilot")
     }
 
     /// Whether this provider's kind is `openai-codex`.
@@ -3320,6 +3325,25 @@ plan_oauth = false",
         .unwrap_err()
         .to_string();
         assert!(error.contains("oauth_client_id_secret"), "{error}");
+    }
+
+    /// GitHub Copilot sign-in follows the same flag.
+    #[test]
+    fn copilot_sign_in_is_on_by_default_and_can_be_turned_off() {
+        let on: ProviderConfig = toml::from_str("kind = \"github-copilot\"").unwrap();
+        assert!(on.is_copilot() && !on.is_codex() && on.plan_oauth_enabled());
+        let off: ProviderConfig = toml::from_str(
+            "kind = \"github-copilot\"
+plan_oauth = false",
+        )
+        .unwrap();
+        assert!(!off.plan_oauth_enabled());
+        config_with_provider(ProviderConfig {
+            kind: "github-copilot".into(),
+            ..ProviderConfig::default()
+        })
+        .validate()
+        .unwrap();
     }
 
     /// Codex plan sign-in follows the same flag: on by default, off with

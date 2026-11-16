@@ -261,6 +261,12 @@ const BUILTINS: &[BuiltinProvider] = &[
         summary: "ChatGPT plan (Codex) sign-in; Responses chat at chatgpt.com/backend-api/codex, static model list",
     },
     BuiltinProvider {
+        kind: "github-copilot",
+        base_url: Some(crate::auth_flows::copilot::BASE_URL),
+        auth: "oauth",
+        summary: "GitHub Copilot device sign-in; chat completions at api.githubcopilot.com (or the plan's own host), catalog GET {base}/models",
+    },
+    BuiltinProvider {
         kind: "google-antigravity",
         base_url: Some("https://daily-cloudcode-pa.googleapis.com"),
         auth: "oauth",
@@ -280,6 +286,9 @@ pub enum OAuthStyle {
     ClaudeRefresh,
     /// A Codex (ChatGPT plan) sign-in: a form refresh grant that rotates the token.
     CodexRefresh,
+    /// A GitHub Copilot sign-in: the long-lived GitHub token is exchanged for a
+    /// short-lived Copilot token. The refresh token never rotates.
+    CopilotExchange,
 }
 
 pub enum AuthPlan {
@@ -368,7 +377,7 @@ pub fn auth_plan(kind: &str, auth: &str) -> Result<AuthPlan> {
     let mode = if requested.is_empty() {
         if matches!(
             kind.as_str(),
-            "muse-code" | "google-antigravity" | "openai-codex"
+            "muse-code" | "google-antigravity" | "openai-codex" | "github-copilot"
         ) {
             "oauth"
         } else {
@@ -395,8 +404,13 @@ pub fn auth_plan(kind: &str, auth: &str) -> Result<AuthPlan> {
                 token_url: crate::auth_flows::codex::TOKEN_URL,
                 client_id_fallback: Some(crate::auth_flows::codex::CLIENT_ID),
             }),
+            "github-copilot" => Ok(AuthPlan::OAuth {
+                style: OAuthStyle::CopilotExchange,
+                token_url: crate::auth_flows::copilot::TOKEN_URL,
+                client_id_fallback: None,
+            }),
             _ => Err(SeraError::Config(
-                "oauth auth is only supported for muse-code, google-antigravity and openai-codex"
+                "oauth auth is only supported for muse-code, google-antigravity, openai-codex and github-copilot"
                     .into(),
             )),
         },
@@ -499,6 +513,10 @@ pub fn enforce_oauth_target(style: OAuthStyle, token_url: &str) -> Result<String
         OAuthStyle::CodexRefresh => {
             host.eq_ignore_ascii_case(crate::auth_flows::codex::AUTH_HOST)
                 && parsed.path() == crate::auth_flows::codex::TOKEN_PATH
+        }
+        OAuthStyle::CopilotExchange => {
+            host.eq_ignore_ascii_case(crate::auth_flows::copilot::API_HOST)
+                && parsed.path() == crate::auth_flows::copilot::TOKEN_PATH
         }
     };
     if !ok {
@@ -625,6 +643,31 @@ const NON_CHAT_ID_HINTS: [&str; 10] = [
 ];
 
 fn chat_capable(id: &str, entry: &Value) -> bool {
+    // GitHub Copilot's list carries embeddings too, models that only take the
+    // Responses API (this client speaks chat completions) and models its
+    // picker hides.
+    if entry
+        .pointer("/capabilities/type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| !kind.eq_ignore_ascii_case("chat"))
+    {
+        return false;
+    }
+    if entry
+        .get("supported_endpoints")
+        .and_then(Value::as_array)
+        .is_some_and(|endpoints| {
+            !endpoints.is_empty()
+                && !endpoints
+                    .iter()
+                    .any(|item| item.as_str() == Some("/chat/completions"))
+        })
+    {
+        return false;
+    }
+    if entry.get("model_picker_enabled").and_then(Value::as_bool) == Some(false) {
+        return false;
+    }
     if let Some(chat) = entry
         .pointer("/capabilities/completion_chat")
         .and_then(Value::as_bool)
@@ -663,6 +706,10 @@ fn model_meta(id: &str, entry: &Value) -> ModelMeta {
         .filter(|name| !name.chars().any(char::is_control))
         .map(str::to_owned);
     let context_length = [
+        // Copilot's prompt limit is what a conversation must fit, and is often
+        // well under the model's native window.
+        "/capabilities/limits/max_prompt_tokens",
+        "/capabilities/limits/max_context_window_tokens",
         "/max_context_length",
         "/context_length",
         "/context_window",
@@ -682,18 +729,21 @@ fn model_meta(id: &str, entry: &Value) -> ModelMeta {
     let flag = |pointer: &str| entry.pointer(pointer).and_then(Value::as_bool) == Some(true);
     let mut tags = Vec::new();
     if flag("/capabilities/vision")
+        || flag("/capabilities/supports/vision")
         || flag("/supports_image_input")
         || has_item("/architecture/input_modalities", "image")
     {
         tags.push("vision".to_owned());
     }
     if flag("/capabilities/function_calling")
+        || flag("/capabilities/supports/tool_calls")
         || flag("/supports_tools")
         || has_item("/supported_parameters", "tools")
     {
         tags.push("tools".to_owned());
     }
     if flag("/capabilities/reasoning")
+        || flag("/capabilities/supports/thinking")
         || has_item("/supported_parameters", "reasoning")
         || has_item("/supported_parameters", "include_reasoning")
     {
@@ -715,7 +765,10 @@ fn model_meta(id: &str, entry: &Value) -> ModelMeta {
     ModelMeta {
         name,
         context_length,
-        max_output_tokens: None,
+        max_output_tokens: entry
+            .pointer("/capabilities/limits/max_output_tokens")
+            .and_then(Value::as_u64)
+            .filter(|tokens| *tokens > 0),
         tags,
     }
 }
@@ -1403,6 +1456,35 @@ pub fn open_provider_client(
             "Codex plan sign-in is turned off on this server".into(),
         ));
     }
+    // A GitHub Copilot account is likewise a member's own sign-in only.
+    if kind == "github-copilot"
+        && !(profile.plan_oauth_enabled()
+            && owner.account_id != DEFAULT_ACCOUNT
+            && !credential.refresh_token.trim().is_empty())
+    {
+        return Err(SeraError::Forbidden(
+            "GitHub Copilot sign-in is turned off on this server".into(),
+        ));
+    }
+    // The plan decides the Copilot host (individual, business, enterprise); the
+    // sign-in remembered the one GitHub named.
+    let endpoint = if kind == "github-copilot"
+        && profile.base_url.trim().is_empty()
+        && let Some(refresher) = owner.refresher
+        && let Some(base) = refresher
+            .accounts()
+            .store()
+            .provider_account(owner.user_id, owner.provider, owner.account_id)?
+            .and_then(|row| {
+                row.identity
+                    .get("api_base")
+                    .and_then(Value::as_str)
+                    .and_then(crate::auth_flows::copilot::api_base_ok)
+            }) {
+        base
+    } else {
+        endpoint
+    };
     let mut client = LlmClient::new(
         &endpoint,
         credential.api_key.clone(),
@@ -1506,6 +1588,7 @@ pub fn open_provider_client(
             });
         }
         "openai-codex" => client = client.with_wire(Wire::Responses),
+        "github-copilot" => client = client.with_copilot(),
         "opencode-go" => client = client.with_opencode_session(),
         _ => {}
     }
@@ -1538,7 +1621,10 @@ pub fn open_provider_client(
                 account_id: owner.account_id.to_owned(),
             },
             generation,
-            matches!(kind.as_str(), "muse-code" | "anthropic" | "openai-codex"),
+            matches!(
+                kind.as_str(),
+                "muse-code" | "anthropic" | "openai-codex" | "github-copilot"
+            ),
         );
         if kind == "openai-codex" {
             // The ChatGPT workspace the sign-in named goes on every request.
