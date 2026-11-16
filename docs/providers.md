@@ -11,12 +11,12 @@ else takes an API key, and the console shows a "Get a key" link instead.
 | Provider | How you connect | Notes |
 |---|---|---|
 | OpenRouter | Sign in (OAuth PKCE) or API key | [OAuth PKCE guide](https://openrouter.ai/docs/use-cases/oauth-pkce). No app registration and no client secret. The code is exchanged at `POST /api/v1/auth/keys` for a normal API key in the user's own account. The server does the exchange and stores the key sealed under the signed-in user. Callback is a `localhost` address with a free port. |
-| Google Antigravity | Sign in (Google OAuth PKCE) | Per member, several accounts each (`docs/antigravity.md`). Cloud Code, no API key. The client secret is the server's (age store); each account has its own tokens, email and project. |
+| Google Antigravity | Sign in (Google OAuth PKCE) | Per member, several accounts each (`docs/antigravity.md`). Cloud Code, no API key. The OAuth client is Google's public installed-app credential, compiled in (override: age store, then `AGY_CLIENT_SECRET`); each account has its own tokens, email and project. |
 | Muse Code | Sign in (device code) | Per member, several accounts each. The server runs the device flow, mints the key with `onboard: true` once (retrying a 429 or 5xx after 5 s, then 10 s) and keeps Meta's identity token only to mint again and to read quota. `x-api-version: 1.0.0` goes on every call. No API key to paste. Chat uses the Responses transport (`POST https://api.meta.ai/v1/responses`, see "Wire formats"). |
 | OpenAI | API key | Keys at platform.openai.com. ChatGPT sign-in is not offered to third-party apps. |
 | Mistral AI | API key | console.mistral.ai. |
 | Google Gemini | API key | Key from Google AI Studio, used on the OpenAI-compatible endpoint. Google's OAuth for the Gemini API needs a Google Cloud project per user, so it is not a one-click sign-in. |
-| Anthropic (Claude) | API keys, several per member | The native Messages API (`POST https://api.anthropic.com/v1/messages`) with `x-api-key`. Each member adds as many keys as they like, each sealed under their own id. A Claude plan sign-in exists but is off by default and admin-only: see "Claude plan sign-in". |
+| Anthropic (Claude) | API keys, several per member; admin plan sign-in | The native Messages API (`POST https://api.anthropic.com/v1/messages`) with `x-api-key`. Each member adds as many keys as they like, each sealed under their own id. The admin can also Sign in with Claude (several accounts; on by default, admin-only, with a risk banner): see "Claude plan sign-in". |
 | OpenCode Go | API key | `https://opencode.ai/zen/go/v1`, OpenAI-compatible. Every request carries `x-opencode-session: ses_<12 hex><14 base62>`, derived from the conversation so a retry reuses it. Usage meters: `GET /zen/go/v1/usage`. Key from `https://opencode.ai/auth`. |
 | OpenCode Zen | API key | `https://opencode.ai/zen/v1`, plain OpenAI-compatible, pay as you go. No session header. The OpenCode Free lane is not supported. |
 | Nous Portal (Hermes) | API key | Added as an `openai-compatible` provider. The desktop preset's base URL (`https://inference-api.nousresearch.com/v1`) is **not verified** against Nous's documentation by this release; check it before approving egress. No Nous sign-in is claimed. |
@@ -135,21 +135,32 @@ only the request and response shape differ.
 
 ## Claude plan sign-in
 
-Off by default and admin-only (owner decision O1). Anthropic's terms do not let
-a third-party product offer a claude.ai sign-in or route requests through plan
-credentials, and the owner's HielCowork audit and openbot's notes both rate a
-multi-user server as the risky shape. It is built and tested but ships off.
+On by default and admin-only (owner decision, replacing the earlier ship-off
+default). Anthropic's terms do not let a third-party product offer a claude.ai
+sign-in or route requests through plan credentials, and the owner's HielCowork
+audit and openbot's notes both rate a multi-user server as the risky shape, so
+the page shows a risk banner beside the sign-in (it signs in through Claude's own
+client, Anthropic may restrict it, your own account, never shared). The Claude
+card offers both Sign in with Claude (several accounts) and API keys (several
+keys). HielCowork has no raw Claude OAuth of its own (it drives the Claude Code
+CLI); the client details below follow the owner's aio-proxy `claude-code`
+plugin.
 
-* It exists only for a provider of kind `anthropic` with `plan_oauth = true`
+* It exists for a provider of kind `anthropic` unless `plan_oauth = false` is set
   under `[llm.providers.<id>]`, and only the server admin can start it. Members
   get a plain 403, and listings hide the sign-in from them. Turning the flag off
-  again stops the stored plan accounts from being used (they are kept).
-* `oauth_client_id_secret` names the age-store secret that holds the OAuth client
-  id. The id is never committed.
+  stops the stored plan accounts from being used (they are kept). A provider
+  saved through the console before this default carries `plan_oauth = false` in
+  its stored overlay; save it again from the card to pick up the default.
+* The OAuth client id is Claude Code's public installed-app client id, compiled
+  in (an identifier, not a secret). `oauth_client_id_secret` optionally names an
+  age-store secret that overrides it.
 * PKCE through the desktop's loopback `http://localhost:54545/callback` (fixed
   port), or a pasted `code#state`. The token exchange is JSON at
   `https://api.anthropic.com/v1/oauth/token`. No `claude-code` user agent is
-  imitated and no CLI credential file is read.
+  imitated and no CLI credential file is read; refresh and chat requests carry
+  the `anthropic-sdk-typescript/0.112.1 userOAuthProvider` user agent that
+  aio-proxy sends.
 * One account per Claude account: the fingerprint is
   `sha256("claude:account:<uuid>")`, and a login that does not say a stable
   account id is refused. Signing in twice updates the same row.

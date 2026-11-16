@@ -2373,8 +2373,8 @@ fn a_server_refusal_reaches_the_member_in_plain_words() {
     use std::sync::atomic::AtomicBool;
     for (message, expect, forbid) in [
         (
-            "Antigravity sign-in is not set up on this server. Ask the owner to store its OAuth client secret.",
-            "OAuth client secret under Advanced settings",
+            "Google did not say who signed in. Start the sign-in again.",
+            "Google did not say who signed in",
             "",
         ),
         (

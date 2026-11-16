@@ -580,14 +580,15 @@ returned; no restart is needed.
   minutes) and returns `{"flow":"device","url","code","flow_id","expires_in","interval"}`;
   the owner enters the code on the page and the minted key is stored when approved.
 - `POST .../oauth/complete` — PKCE only: body `{"code","verifier","redirect_uri"}`.
-  The server exchanges the code with the OAuth client secret already in its
-  store (`antigravity_oauth_client_secret` by default), reads the email, finds the
+  The server exchanges the code with the OAuth client secret (the compiled-in
+  public installed-app default, unless `antigravity_oauth_client_secret` in its
+  store or `AGY_CLIENT_SECRET` overrides it), reads the email, finds the
   Cloud Code project, stores the account, and returns
   `{"signed_in":true,"account_id","created","project_discovered"}`.
 
-- `anthropic` (Claude plan sign-in, PKCE): off by default. It exists only for a
-  provider with `plan_oauth = true`, and only the admin can start it (a member
-  gets `403`; a provider without the flag answers `422 signin_unsupported`).
+- `anthropic` (Claude plan sign-in, PKCE): on by default. It exists for a
+  provider unless `plan_oauth = false`, and only the admin can start it (a member
+  gets `403`; a provider with the flag off answers `422 signin_unsupported`).
   `redirect_uri` must be `http://localhost:54545/callback` (or the `127.0.0.1`
   spelling). `.../oauth/complete` (and the member route `signin/complete`) accept
   the code as `code`, `code#state` or the whole callback URL. The account is the

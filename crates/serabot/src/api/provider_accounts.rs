@@ -41,8 +41,8 @@ pub(super) fn mask_email(email: &str) -> String {
 }
 
 /// The sign-in flows a member's page may offer for a provider. A Claude plan
-/// sign-in shows only to the admin, and only on a provider the operator turned
-/// it on for.
+/// sign-in shows only to the admin, and only on a provider that has not turned
+/// `plan_oauth` off.
 pub(super) fn signin_flows(
     state: &ApiState,
     is_admin: bool,
@@ -55,7 +55,8 @@ pub(super) fn signin_flows(
             .llm
             .providers
             .get(provider_id)
-            .is_some_and(|profile| profile.plan_oauth);
+            // Not saved yet: the directory offers the sign-in (it is on by default).
+            .is_none_or(ProviderConfig::plan_oauth_enabled);
         if !(enabled && is_admin) {
             return Vec::new();
         }
@@ -67,12 +68,12 @@ pub(super) fn signin_flows(
 /// `None` for every sign-in that is the vendor's supported path.
 pub(super) fn signin_risk(kind: &str, flows: &[&'static str]) -> Option<&'static str> {
     (kind == "anthropic" && !flows.is_empty()).then_some(
-        "Anthropic's terms do not allow a third-party product to offer Claude plan sign-in. This account is yours alone, is never shared, and may be suspended. API keys are the supported path.",
+        "This signs in through Claude's own client, not an API contract. Anthropic may restrict or suspend an account used this way. It is your own account and is never shared. API keys are the supported path.",
     )
 }
 
-/// Claude plan sign-in is for the admin, on a provider the operator turned it
-/// on for. Every other provider's sign-in is open to members.
+/// Claude plan sign-in is for the admin, on a provider that has not turned
+/// `plan_oauth` off. Every other provider's sign-in is open to members.
 pub(super) fn plan_signin_gate(
     user: &ActingUser,
     profile: &ProviderConfig,
@@ -81,7 +82,7 @@ pub(super) fn plan_signin_gate(
     if kind != "anthropic" {
         return Ok(());
     }
-    if !profile.plan_oauth {
+    if !profile.plan_oauth_enabled() {
         return Err(SeraError::Rejected {
             code: "signin_unsupported",
             message: "This provider has no sign-in; add its API key".into(),

@@ -2,14 +2,14 @@
 
 `google-antigravity` talks to Google Cloud Code Private Assist over HTTPS. SeraBot does not shell out to a proprietary binary. Chat uses the documented JSON envelope. The model list is a separate POST. Neither path was exercised against a live Google account in this tree; tests use synthetic fixtures.
 
-Since 0.49 every member signs in to Antigravity from the desktop and keeps their own accounts (several per member). Each account's tokens are sealed under that member's own key; the age store keeps only the OAuth client secret. Errors, events and audit rows do not include access tokens, refresh tokens, authorization codes, or PKCE verifiers. Antigravity is a vendor-internal endpoint: it can change or ban without notice, and an account that Google refuses shows `needs_reauth`.
+Since 0.49 every member signs in to Antigravity from the desktop and keeps their own accounts (several per member). Each account's tokens are sealed under that member's own key; no setup is needed: the OAuth client is Google's public installed-application credential, compiled in as a default (see below). Errors, events and audit rows do not include access tokens, refresh tokens, authorization codes, or PKCE verifiers. Antigravity is a vendor-internal endpoint: it can change or ban without notice, and an account that Google refuses shows `needs_reauth`.
 
 ## Member sign-in (0.49)
 
 The desktop starts `POST /v1/providers/{id}/signin/start` (`flow: "pkce"`), opens the returned Google URL, catches the redirect on `http://127.0.0.1:<port>/oauth-callback` (51121 first, any free loopback port if that one is busy), and sends the code to `POST .../signin/complete`. The server follows the reference client exactly:
 
 - scopes are `cloud-platform`, `userinfo.email`, `userinfo.profile`, `cclog` and `experimentsandconfigs`, and never `openid` (Google hangs a desktop PKCE flow that asks for it); `access_type=offline` and `prompt=consent` make Google return a refresh token, and a login without one is refused;
-- the OAuth client secret comes from the age store (`antigravity_oauth_client_secret`, or the provider's `oauth_client_secret_secret`); without it sign-in answers "not set up on this server";
+- the OAuth client id and secret are Google's public installed-application credential for the Antigravity desktop app, compiled in as defaults exactly as the owner's HielCowork ships them (it is not a private secret, and PKCE protects the exchange). Sign-in works with no setup step. An optional override wins, in this order: a secret saved in the age store (`antigravity_oauth_client_secret`, or the provider's `oauth_client_secret_secret`; the console's Advanced field writes it), then the `AGY_CLIENT_SECRET` environment variable, then the compiled-in default;
 - the email comes from `GET https://www.googleapis.com/oauth2/v1/userinfo?alt=json` and names the account (a login with no email and no Google id is refused);
 - project discovery runs `loadCodeAssist` and, when the account has no project, `onboardUser` up to three times, three seconds apart, asking the daily host and then prod. The project and tier are stored in the account's identity. A member's account never uses the provider's configured `project_id`; an account whose discovery found nothing omits `project` and looks again on first use (at most once an hour).
 
@@ -33,15 +33,7 @@ None of this was run against a live Google account; tests use synthetic fixtures
 
 Full browser UI is out of scope. Login is a loopback PKCE flow, the same shape as the reference app's Antigravity sign-in:
 
-1. Store the published Antigravity desktop OAuth **client secret** (the secret that pairs with the built-in client id). Do not commit it.
-
-   ```text
-   serabot secrets set antigravity_oauth_client_secret
-   ```
-
-   The Windows console can store it too: Providers, Add provider, Google Antigravity, **OAuth client secret** (under the form). It is written to the same encrypted store, never shown again, and the first **Save and sign in** then opens your browser on Google's consent page. Members sign in from the provider's card; no restart is needed.
-
-   Paste the secret on stdin. Leave `oauth_client_id_secret` empty so refresh uses the built-in client id. If you set that secret, it must be exactly that client id or login refuses.
+1. Nothing to store: the built-in client secret is used. To override it, either set `AGY_CLIENT_SECRET` or store a secret (`serabot secrets set antigravity_oauth_client_secret`; the Windows console's Providers, Add provider, Google Antigravity, **Advanced settings**, **OAuth client secret (optional override)** writes the same encrypted store and never shows it again). Members sign in from the provider's card with no restart. Leave `oauth_client_id_secret` empty so refresh uses the built-in client id; if you set that secret, it must be exactly that client id or login refuses.
 
 2. Point a provider at Cloud Code. `base_url` may be empty (the daily host below) or one of the documented origins. `project_id` may stay empty until login prints one.
 
@@ -51,7 +43,7 @@ Full browser UI is out of scope. Login is a loopback PKCE flow, the same shape a
    auth = "oauth"
    api_key_secret = "antigravity_access_token"
    refresh_token_secret = "antigravity_refresh_token"
-   oauth_client_secret_secret = "antigravity_oauth_client_secret"
+   # optional override: oauth_client_secret_secret = "antigravity_oauth_client_secret"
    project_id = ""
    models = ["example-model"]
    catalog_fetch = true

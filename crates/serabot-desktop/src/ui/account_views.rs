@@ -87,8 +87,6 @@ pub(super) fn AccountsBlock(
     let signs_in_methods = accounts::first_sign_in_method(&methods).is_some();
     let takes_key = methods.contains(&AddMethod::Key);
     let add_label = accounts::add_button_label(&methods, !ordered.is_empty());
-    let is_admin = session.read().is_admin();
-    let needs_secret = is_admin && accounts::client_secret_missing(&provider);
     let shared_key = ordered.is_empty() && provider.credential.configured;
     if methods.is_empty() && ordered.is_empty() {
         return rsx! {};
@@ -157,13 +155,6 @@ pub(super) fn AccountsBlock(
             } else if ordered.is_empty() {
                 div { class: "acct-empty", role: "status",
                     "{accounts::empty_card_text(&methods)}"
-                }
-            }
-            if needs_secret {
-                div { class: "banner info", role: "status",
-                    span {
-                        "Google's sign-in needs its OAuth client secret once. Open Add provider, choose Google Antigravity and paste it under Advanced settings."
-                    }
                 }
             }
             if !ordered.is_empty() {

@@ -329,7 +329,7 @@ async fn a_member_signs_in_to_antigravity_and_nobody_else_sees_it() {
 }
 
 #[tokio::test]
-async fn antigravity_sign_in_needs_the_servers_client_secret() {
+async fn antigravity_sign_in_starts_without_any_stored_client_secret() {
     let env = env(false).await;
     let (status, body) = call(
         &env,
@@ -339,11 +339,8 @@ async fn antigravity_sign_in_needs_the_servers_client_secret() {
         Some(json!({"flow": "pkce", "redirect_uri": REDIRECT})),
     )
     .await;
-    assert!(status.is_client_error(), "{status} {body}");
-    assert!(
-        body["error"].as_str().unwrap_or("").contains("not set up"),
-        "{body}"
-    );
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.to_string().contains("not set up"), "{body}");
     no_secrets(&body.to_string());
 }
 

@@ -24,6 +24,43 @@ use crate::llm::validate_base_url;
 
 pub const ANTIGRAVITY_CLIENT_ID: &str =
     "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
+/// The Antigravity desktop client's secret. This is Google's published
+/// installed-application credential, the same one the Antigravity app and the
+/// owner's HielCowork ship as a default; it is not a private secret (Google's
+/// installed-app flow treats it as public, and PKCE protects the exchange).
+/// It is compiled in from the git-ignored `config/agy.local.toml` (see
+/// `build.rs`; GitHub push protection rejects it as a literal) so owner builds
+/// need no setup step. Without that file the default is empty.
+pub const ANTIGRAVITY_DEFAULT_CLIENT_SECRET: &str = env!("SERABOT_AGY_CLIENT_SECRET");
+/// Environment override for the client secret (the same name HielCowork reads).
+pub const ANTIGRAVITY_CLIENT_SECRET_ENV: &str = "AGY_CLIENT_SECRET";
+
+/// Choose the Antigravity client secret: the age-store / console-saved value,
+/// then the `AGY_CLIENT_SECRET` environment value, then the compiled-in default.
+/// Blank values are skipped at every step.
+pub fn pick_antigravity_client_secret(stored: Option<&str>, env: Option<&str>) -> String {
+    [stored, env]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .unwrap_or(ANTIGRAVITY_DEFAULT_CLIENT_SECRET)
+        .to_owned()
+}
+
+/// The Antigravity client secret for a provider whose override lives under
+/// `stored_name` in the age store (empty or absent means no override).
+pub fn antigravity_client_secret(
+    secrets: &crate::secrets::SharedSecrets,
+    stored_name: &str,
+) -> String {
+    let stored = Some(stored_name.trim())
+        .filter(|name| !name.is_empty())
+        .and_then(|name| secrets.get(name));
+    let env = std::env::var(ANTIGRAVITY_CLIENT_SECRET_ENV).ok();
+    pick_antigravity_client_secret(stored.as_deref(), env.as_deref())
+}
+
 pub const ANTIGRAVITY_SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs";
 pub const CLOUD_CODE_USER_AGENT: &str =
     "antigravity/hub/2.25.0 (aidev_client; os_type=windows; arch=amd64; cl=1003475615)";
