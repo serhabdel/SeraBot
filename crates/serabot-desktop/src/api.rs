@@ -1689,6 +1689,10 @@ pub struct NewProvider {
     pub catalog_fetch: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// The OAuth client secret of a sign-in provider (Antigravity). Stored in
+    /// the server's encrypted store and never shown again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth_client_secret: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -5140,6 +5144,10 @@ impl ApiClient {
                 .api_key
                 .as_deref()
                 .is_some_and(|key| !valid_credential(key))
+            || request
+                .oauth_client_secret
+                .as_deref()
+                .is_some_and(|secret| !valid_credential(secret))
         {
             return Err(ApiError::Validation(
                 "Check the provider id, kind, base URL, models, secret name and key.",

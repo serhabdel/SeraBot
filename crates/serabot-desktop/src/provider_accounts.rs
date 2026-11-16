@@ -351,6 +351,97 @@ pub fn risk_text(provider: &ProviderStatus, preset: Option<&ProviderPreset>) -> 
     sign_in_offered.then(|| text.to_owned())
 }
 
+/// The words on a card's add button. A provider that signs in says "Sign in"
+/// until it has an account and "Add account" after; a key provider says
+/// "Add account" (the sheet then asks for the key).
+pub fn add_button_label(methods: &[AddMethod], has_accounts: bool) -> &'static str {
+    let signs_in = methods.iter().any(|method| *method != AddMethod::Key);
+    if signs_in && !has_accounts {
+        "Sign in"
+    } else {
+        "Add account"
+    }
+}
+
+/// The line on a card with no account yet.
+pub fn empty_card_text(methods: &[AddMethod]) -> &'static str {
+    let signs_in = methods.iter().any(|method| *method != AddMethod::Key);
+    let takes_key = methods.contains(&AddMethod::Key);
+    match (signs_in, takes_key) {
+        (true, true) => "No account yet. Sign in, or add an API key.",
+        (true, false) => "Not signed in yet. Sign in to use this provider.",
+        (false, _) => "No account yet. Add an API key to use this provider.",
+    }
+}
+
+/// The method a one-press "Sign in" starts with: the browser when the
+/// provider offers it, else the device code.
+pub fn first_sign_in_method(methods: &[AddMethod]) -> Option<AddMethod> {
+    [AddMethod::Browser, AddMethod::Device]
+        .into_iter()
+        .find(|method| methods.contains(method))
+}
+
+/// What a signed-in provider's card shows the owner when its browser sign-in
+/// cannot start yet. Antigravity's Google client has a secret that lives only
+/// in the server's encrypted store; the owner pastes it once.
+pub fn client_secret_missing(provider: &ProviderStatus) -> bool {
+    provider.kind == "google-antigravity"
+        && provider
+            .secrets
+            .get("oauth_client_secret")
+            .is_some_and(|secret| !secret.configured)
+}
+
+/// Whether the directory must open the Add provider sheet (so the owner can
+/// paste the client secret) instead of signing in at once.
+pub fn directory_needs_setup(existing: Option<&ProviderStatus>, preset_kind: &str) -> bool {
+    preset_kind == "google-antigravity" && existing.is_none_or(client_secret_missing)
+}
+
+/// The sign-in a refused server secret asks for: `(provider kind, title)`.
+/// Older servers named the age-store secret in the error.
+fn sign_in_target(message: &str) -> Option<(&'static str, &'static str)> {
+    let lower = message.to_ascii_lowercase();
+    if !(lower.contains("is empty; provide credentials")
+        || lower.contains("refresh_token is empty")
+        || lower.contains("_identity is empty"))
+    {
+        return None;
+    }
+    if lower.contains("antigravity") {
+        Some(("google-antigravity", "Google Antigravity"))
+    } else if lower.contains("muse") {
+        Some(("muse-code", "Muse Code"))
+    } else {
+        Some(("", "this provider"))
+    }
+}
+
+/// The provider kind whose sign-in an error asks for, when it asks for one.
+pub fn sign_in_needed_for(message: &str) -> Option<&'static str> {
+    sign_in_target(message)
+        .map(|(kind, _)| kind)
+        .filter(|kind| !kind.is_empty())
+}
+
+/// An API refusal in plain words. A raw "secret ..._refresh_token is empty"
+/// never reaches the member: it becomes "Sign in to <Provider>". The not-set-up
+/// refusal says what the owner does next.
+pub fn plain_error(message: &str) -> String {
+    if let Some((_, title)) = sign_in_target(message) {
+        return format!("Sign in to {title} to use it. Press Sign in on its card.");
+    }
+    // Claude's plan sign-in is set up in the server config, not pasted here.
+    if message.contains("Antigravity sign-in is not set up on this server") {
+        return format!(
+            "{} In the console, open Add provider, choose Google Antigravity and paste the OAuth client secret under Advanced settings. It is stored encrypted and never shown again.",
+            message.trim_end()
+        );
+    }
+    message.to_owned()
+}
+
 /// Whether the server refused a Remove because bots pin the account. It says
 /// so in plain words; the page then offers "Remove anyway".
 pub fn is_pinned_refusal(message: &str) -> bool {
@@ -610,5 +701,178 @@ mod tests {
             summary_line(&[account("a", "A", 0, "ok")]),
             "1 account, 1 ready"
         );
+    }
+
+    fn kinded(kind: &str, auth: &str, signin: &[&str]) -> ProviderStatus {
+        ProviderStatus {
+            id: kind.into(),
+            kind: kind.into(),
+            ..provider(auth, signin)
+        }
+    }
+
+    /// (label with no account, label with one, first method, empty-card line).
+    fn card(
+        provider: &ProviderStatus,
+        preset_id: &str,
+    ) -> (
+        Vec<AddMethod>,
+        &'static str,
+        &'static str,
+        Option<AddMethod>,
+        &'static str,
+    ) {
+        let preset = preset_for(preset_id);
+        let methods = add_methods(provider, preset);
+        (
+            methods.clone(),
+            add_button_label(&methods, false),
+            add_button_label(&methods, true),
+            first_sign_in_method(&methods),
+            empty_card_text(&methods),
+        )
+    }
+
+    #[test]
+    fn a_card_reads_right_for_each_kind_of_provider() {
+        // Antigravity: sign-in only, in the browser. Never a key.
+        let (methods, empty, filled, first, text) = card(
+            &kinded("google-antigravity", "oauth", &["pkce"]),
+            "antigravity",
+        );
+        assert_eq!(methods, vec![AddMethod::Browser]);
+        assert_eq!((empty, filled), ("Sign in", "Add account"));
+        assert_eq!(first, Some(AddMethod::Browser));
+        assert_eq!(text, "Not signed in yet. Sign in to use this provider.");
+        // An older server that lists no flows: the preset still offers the browser.
+        let (methods, empty, ..) = card(&kinded("google-antigravity", "oauth", &[]), "antigravity");
+        assert_eq!((methods, empty), (vec![AddMethod::Browser], "Sign in"));
+        // Muse: a device code.
+        let (methods, empty, _, first, _) =
+            card(&kinded("muse-code", "oauth", &["device"]), "muse-code");
+        assert_eq!(methods, vec![AddMethod::Device]);
+        assert_eq!((empty, first), ("Sign in", Some(AddMethod::Device)));
+        // OpenRouter: a key or a sign-in; the sign-in leads.
+        let (methods, empty, _, first, text) =
+            card(&kinded("openrouter", "api_key", &["pkce"]), "openrouter");
+        assert_eq!(methods, vec![AddMethod::Key, AddMethod::Browser]);
+        assert_eq!((empty, first), ("Sign in", Some(AddMethod::Browser)));
+        assert_eq!(text, "No account yet. Sign in, or add an API key.");
+        // Claude with the plan sign-in on: a key or a browser sign-in.
+        let (methods, ..) = card(&kinded("anthropic", "api_key", &["pkce"]), "anthropic");
+        assert_eq!(methods, vec![AddMethod::Key, AddMethod::Browser]);
+        // Claude with it off, and OpenAI: a key only. No sign-in words anywhere.
+        for (kind, preset) in [("anthropic", "anthropic"), ("openai", "openai")] {
+            let (methods, empty, filled, first, text) = card(&kinded(kind, "api_key", &[]), preset);
+            assert_eq!(methods, vec![AddMethod::Key], "{kind}");
+            assert_eq!((empty, filled, first), ("Add account", "Add account", None));
+            assert_eq!(text, "No account yet. Add an API key to use this provider.");
+        }
+        // A local server needs neither.
+        let (methods, ..) = card(&kinded("openai-compatible", "none", &[]), "ollama");
+        assert!(methods.is_empty());
+    }
+
+    #[test]
+    fn an_oauth_only_provider_never_offers_a_key() {
+        for (kind, flows, preset) in [
+            ("google-antigravity", "pkce", "antigravity"),
+            ("muse-code", "device", "muse-code"),
+        ] {
+            let methods = add_methods(&kinded(kind, "oauth", &[flows]), preset_for(preset));
+            assert!(!methods.contains(&AddMethod::Key), "{kind}");
+        }
+    }
+
+    #[test]
+    fn the_legacy_secret_error_becomes_a_sign_in_prompt() {
+        for raw in [
+            "secret antigravity_refresh_token is empty; provide credentials",
+            "secret muse_code_identity is empty; provide credentials",
+        ] {
+            let plain = plain_error(raw);
+            assert!(plain.starts_with("Sign in to "), "{plain}");
+            assert!(
+                !plain.contains("secret") && !plain.contains("_token"),
+                "{plain}"
+            );
+            assert!(!plain.contains("provide credentials"), "{plain}");
+        }
+        assert!(
+            plain_error("secret antigravity_refresh_token is empty; provide credentials")
+                .contains("Google Antigravity")
+        );
+        assert!(
+            plain_error("secret muse_code_identity is empty; provide credentials")
+                .contains("Muse Code")
+        );
+        assert_eq!(
+            sign_in_needed_for("secret antigravity_refresh_token is empty; provide credentials"),
+            Some("google-antigravity")
+        );
+        assert_eq!(
+            sign_in_needed_for("secret muse_code_identity is empty; provide credentials"),
+            Some("muse-code")
+        );
+        // An unknown secret still never shows its name, and starts no flow.
+        let other = "secret work_refresh_token is empty; provide credentials";
+        assert_eq!(
+            plain_error(other),
+            "Sign in to this provider to use it. Press Sign in on its card."
+        );
+        assert_eq!(sign_in_needed_for(other), None);
+        // Ordinary messages pass through; a missing API key is not a sign-in.
+        assert_eq!(plain_error("Something else broke"), "Something else broke");
+        assert_eq!(
+            sign_in_needed_for("secret WORK_API_KEY is empty; provide an API key"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_missing_client_secret_says_what_the_owner_does_next() {
+        let text = plain_error(
+            "Antigravity sign-in is not set up on this server. Ask the owner to store its OAuth client secret.",
+        );
+        assert!(text.contains("not set up on this server"));
+        assert!(text.contains("Advanced settings"));
+        assert!(text.contains("never shown again"));
+        // Claude's is the operator's to set up in config, so no console hint.
+        let claude = "Claude plan sign-in is not set up on this server. The owner must turn it on and store its OAuth client id.";
+        assert_eq!(plain_error(claude), claude);
+    }
+
+    #[test]
+    fn the_directory_asks_for_the_client_secret_only_when_it_is_missing() {
+        let mut agy = kinded("google-antigravity", "oauth", &["pkce"]);
+        // Never saved: open the sheet so the secret can be pasted.
+        assert!(directory_needs_setup(None, "google-antigravity"));
+        // Saved, secret reported missing: same.
+        agy.secrets.insert(
+            "oauth_client_secret".into(),
+            crate::api::SecretStatus {
+                name: None,
+                configured: false,
+            },
+        );
+        assert!(client_secret_missing(&agy));
+        assert!(directory_needs_setup(Some(&agy), "google-antigravity"));
+        // Stored: sign in at once.
+        agy.secrets.insert(
+            "oauth_client_secret".into(),
+            crate::api::SecretStatus {
+                name: None,
+                configured: true,
+            },
+        );
+        assert!(!client_secret_missing(&agy));
+        assert!(!directory_needs_setup(Some(&agy), "google-antigravity"));
+        // Other providers have no client secret to ask for.
+        assert!(!directory_needs_setup(None, "muse-code"));
+        assert!(!client_secret_missing(&kinded(
+            "muse-code",
+            "oauth",
+            &["device"]
+        )));
     }
 }

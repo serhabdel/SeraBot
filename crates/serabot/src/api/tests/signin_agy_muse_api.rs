@@ -586,3 +586,76 @@ async fn quota_is_read_through_the_provider_and_cached_on_the_account() {
     assert_eq!(listed["accounts"][0]["quota"]["windows"][0]["label"], "5h");
     no_secrets(&listed.to_string());
 }
+
+/// What the desktop's Add provider sheet posts for a sign-in preset: no key,
+/// no refresh token, no client id. The owner's save must work with exactly
+/// that, and the member's sign-in must start at once, with no restart.
+#[tokio::test]
+async fn a_console_saved_sign_in_provider_signs_in_without_secrets_or_restart() {
+    let env = env(true).await;
+    muse(&env.server).await;
+    let agy = json!({
+        "id": "antigravity", "kind": "google-antigravity",
+        "base_url": "https://daily-cloudcode-pa.googleapis.com",
+        "models": ["gemini-4-argon-high", "claude-sonnet-5-5"],
+        "api_key_secret": "antigravity_access_token", "catalog_fetch": true,
+    });
+    let muse_body = json!({
+        "id": "muse-console", "kind": "muse-code",
+        "base_url": "https://api.meta.ai/v1",
+        "models": ["muse-spark-1.3"],
+        "api_key_secret": "muse_code_api_key", "catalog_fetch": true,
+    });
+    for body in [agy, muse_body] {
+        let (status, saved) = call(
+            &env,
+            OWNER,
+            "POST",
+            "/v1/admin/providers",
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{saved}");
+        assert!(
+            !saved.to_string().contains("provide credentials"),
+            "the legacy secret error must not surface: {saved}"
+        );
+    }
+    // The saved provider is found by the sign-in routes straight away.
+    let (status, started) = call(
+        &env,
+        &env.alice,
+        "POST",
+        "/v1/providers/antigravity/signin/start",
+        Some(json!({"flow": "pkce", "redirect_uri": REDIRECT})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    assert!(
+        started["url"]
+            .as_str()
+            .unwrap()
+            .contains("access_type=offline")
+    );
+    no_secrets(&started.to_string());
+    let (status, started) = call(
+        &env,
+        &env.alice,
+        "POST",
+        "/v1/providers/muse-console/signin/start",
+        Some(json!({"flow": "device"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    assert_eq!(started["user_code"], "ABCD-1234");
+    // The member's account list for it answers too (no 404 before a restart).
+    let (status, listed) = call(
+        &env,
+        &env.alice,
+        "GET",
+        "/v1/providers/antigravity/accounts",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+}

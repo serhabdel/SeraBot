@@ -199,7 +199,7 @@ pub(super) fn parked_provider_views(
 
 /// The configured provider and its canonical kind, or a 404 / 422.
 fn provider_context(state: &ApiState, id: &str) -> Result<(ProviderConfig, String)> {
-    let profile = provider_profile(&state.config, id)?;
+    let profile = provider_profile(state, id)?;
     let kind = canonical_kind(&profile.kind)?;
     Ok((profile, kind))
 }

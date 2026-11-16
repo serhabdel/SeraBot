@@ -54,7 +54,15 @@ pub struct AccountsUi {
     last_op: Option<AccountOp>,
     /// Shown in the sheet; the page uses the shared error banner.
     pub sheet_error: Option<String>,
+    /// A provider being saved whose sign-in starts as soon as the save lands.
+    pub save_signin: Option<String>,
+    /// A saved provider waiting to show up on the page so its sign-in can
+    /// start, and since when (it gives up after [`PENDING_SIGNIN_WAIT`]).
+    pub pending_signin: Option<(String, Instant)>,
 }
+
+/// How long a saved provider may take to appear before the page says so.
+const PENDING_SIGNIN_WAIT: Duration = Duration::from_secs(20);
 
 impl AccountsUi {
     pub fn flow_running(&self) -> bool {
@@ -234,6 +242,104 @@ impl Session {
     }
 
     // ---- Sign-in ----
+
+    /// Whether saving the draft should go straight on to a sign-in: the preset
+    /// signs in (and no key was pasted for one that also takes a key), and the
+    /// provider has no account yet.
+    pub fn draft_signs_in(&self, id: &str, kind: &str, key_empty: bool) -> bool {
+        let preset = crate::provider_presets::presets()
+            .iter()
+            .find(|preset| crate::provider_presets::provider_matches_preset(id, kind, preset));
+        let sign_in_only =
+            self.provider.auth == "oauth" || preset.is_some_and(|p| p.auth == "oauth");
+        let offers = sign_in_only || preset.is_some_and(|p| !p.sign_in.is_empty());
+        if !offers || !(sign_in_only || key_empty) {
+            return false;
+        }
+        !self
+            .state
+            .providers
+            .iter()
+            .any(|provider| provider.id == id && !provider.accounts.is_empty())
+    }
+
+    /// The saved provider's sign-in starts once its card is on the page.
+    pub(super) fn sign_in_after_save(&mut self, provider: String) {
+        self.accounts_ui.pending_signin = Some((provider, Instant::now()));
+        self.state.providers_loaded = false;
+        self.schedule(Operation::Catalog, Duration::ZERO);
+    }
+
+    /// Open the Add account sheet for `provider` and start its first sign-in
+    /// (browser, else device code) at once.
+    pub fn sign_in_now(&mut self, provider: &str) {
+        let Some(status) = self
+            .state
+            .providers
+            .iter()
+            .find(|candidate| candidate.id == provider)
+            .cloned()
+        else {
+            return;
+        };
+        self.open_add_account(provider);
+        let preset = crate::provider_presets::presets().iter().find(|preset| {
+            crate::provider_presets::provider_matches_preset(&status.id, &status.kind, preset)
+        });
+        let methods = accounts::add_methods(&status, preset);
+        match accounts::first_sign_in_method(&methods) {
+            Some(method) => {
+                self.accounts_ui.method = Some(method);
+                self.start_provider_signin(status.id.clone(), status.kind.clone(), method);
+            }
+            None => {
+                self.accounts_ui.sheet_error =
+                    Some("This provider has no sign-in. Add an API key instead.".into());
+            }
+        }
+    }
+
+    /// Start a saved provider's sign-in when it appears; say so if it never does.
+    pub(super) fn poll_pending_signin(&mut self) {
+        let Some((id, since)) = self.accounts_ui.pending_signin.clone() else {
+            return;
+        };
+        if !self.state.providers_loaded {
+            return;
+        }
+        if self
+            .state
+            .providers
+            .iter()
+            .any(|provider| provider.id == id)
+        {
+            self.accounts_ui.pending_signin = None;
+            self.sign_in_now(&id);
+        } else if since.elapsed() > PENDING_SIGNIN_WAIT {
+            self.accounts_ui.pending_signin = None;
+            self.admin_error = Some(
+                "Saved, but the provider is not listed yet. Press Refresh, then Sign in on its card."
+                    .into(),
+            );
+        }
+    }
+
+    /// An error that asks for a sign-in becomes the sign-in itself: the sheet
+    /// opens on that provider and its flow starts.
+    pub(super) fn prompt_sign_in_for(&mut self, message: &str) {
+        let Some(kind) = accounts::sign_in_needed_for(message) else {
+            return;
+        };
+        let target = self
+            .state
+            .providers
+            .iter()
+            .find(|provider| provider.kind == kind && provider.accounts.is_empty())
+            .map(|provider| provider.id.clone());
+        if let Some(id) = target {
+            self.sign_in_now(&id);
+        }
+    }
 
     /// Start the browser or device sign-in for the sheet's provider.
     pub fn start_provider_signin(&mut self, provider: String, kind: String, method: AddMethod) {
@@ -517,7 +623,7 @@ impl Session {
                 "That account is gone, or this server has no accounts yet. Refresh the page."
                     .to_owned()
             }
-            other => other.to_string(),
+            other => accounts::plain_error(&other.to_string()),
         };
         let last = self.accounts_ui.last_op.take();
         if let Some(AccountOp::Remove {
@@ -739,6 +845,135 @@ mod tests {
         let mut session = Session::new();
         session.state.connected = true;
         session
+    }
+
+    fn listed(id: &str, kind: &str, auth: &str, signin: &[&str]) -> crate::api::ProviderStatus {
+        crate::api::ProviderStatus {
+            id: id.into(),
+            kind: kind.into(),
+            auth: auth.into(),
+            signin: signin.iter().map(|flow| (*flow).to_owned()).collect(),
+            ..crate::api::ProviderStatus::default()
+        }
+    }
+
+    #[test]
+    fn saving_a_sign_in_preset_goes_straight_on_to_its_sign_in() {
+        let mut session = connected_session();
+        // Sign-in only: always.
+        session.provider.auth = "oauth".into();
+        assert!(session.draft_signs_in("antigravity", "google-antigravity", true));
+        assert!(session.draft_signs_in("muse", "muse-code", true));
+        // A provider that takes a key too: only when no key was pasted.
+        session.provider.auth = "api_key".into();
+        assert!(session.draft_signs_in("openrouter", "openrouter", true));
+        assert!(!session.draft_signs_in("openrouter", "openrouter", false));
+        // A key-only provider never signs in.
+        assert!(!session.draft_signs_in("openai", "openai", true));
+        // Saving again once an account exists does not reopen the browser.
+        let mut agy = listed("antigravity", "google-antigravity", "oauth", &["pkce"]);
+        agy.accounts = vec![crate::api::ProviderAccount::default()];
+        session.state.providers = vec![agy];
+        session.provider.auth = "oauth".into();
+        assert!(!session.draft_signs_in("antigravity", "google-antigravity", true));
+    }
+
+    #[test]
+    fn a_saved_provider_signs_in_as_soon_as_its_card_is_listed() {
+        let mut session = connected_session();
+        session.accounts_ui.pending_signin = Some(("antigravity".into(), Instant::now()));
+        // The list has not reloaded yet: nothing opens.
+        session.state.providers_loaded = false;
+        session.poll_pending_signin();
+        assert!(session.accounts_ui.sheet_provider.is_none());
+        assert!(session.accounts_ui.pending_signin.is_some());
+        // It loads with the new provider: the sheet opens on the browser sign-in.
+        session.state.providers = vec![listed(
+            "antigravity",
+            "google-antigravity",
+            "oauth",
+            &["pkce"],
+        )];
+        session.state.providers_loaded = true;
+        session.poll_pending_signin();
+        assert_eq!(
+            session.accounts_ui.sheet_provider.as_deref(),
+            Some("antigravity")
+        );
+        assert_eq!(session.accounts_ui.method, Some(AddMethod::Browser));
+        assert!(session.accounts_ui.pending_signin.is_none());
+        // (No credentials in a unit test, so the runner says it cannot start.)
+        assert_eq!(
+            session.accounts_ui.sheet_error.as_deref(),
+            Some("Connect to the server first.")
+        );
+    }
+
+    #[test]
+    fn a_provider_that_never_appears_is_reported_after_the_wait() {
+        let mut session = connected_session();
+        let long_ago = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or_else(Instant::now);
+        session.accounts_ui.pending_signin = Some(("antigravity".into(), long_ago));
+        session.state.providers_loaded = true;
+        session.poll_pending_signin();
+        assert!(session.accounts_ui.pending_signin.is_none());
+        assert!(
+            session
+                .admin_error
+                .as_deref()
+                .unwrap()
+                .contains("not listed yet")
+        );
+    }
+
+    #[test]
+    fn a_device_provider_starts_with_a_code_and_a_key_only_one_has_no_sign_in() {
+        let mut session = connected_session();
+        session.state.providers = vec![
+            listed("muse", "muse-code", "oauth", &["device"]),
+            listed("openai", "openai", "api_key", &[]),
+        ];
+        session.sign_in_now("muse");
+        assert_eq!(session.accounts_ui.method, Some(AddMethod::Device));
+        session.close_add_account();
+        session.sign_in_now("openai");
+        assert!(
+            session
+                .accounts_ui
+                .sheet_error
+                .as_deref()
+                .unwrap()
+                .contains("no sign-in")
+        );
+        // An unknown provider opens nothing.
+        session.close_add_account();
+        session.sign_in_now("nowhere");
+        assert!(session.accounts_ui.sheet_provider.is_none());
+    }
+
+    #[test]
+    fn the_legacy_secret_error_opens_that_providers_sign_in() {
+        let mut session = connected_session();
+        session.state.providers = vec![
+            listed("antigravity", "google-antigravity", "oauth", &["pkce"]),
+            listed("muse", "muse-code", "oauth", &["device"]),
+        ];
+        session
+            .prompt_sign_in_for("secret antigravity_refresh_token is empty; provide credentials");
+        assert_eq!(
+            session.accounts_ui.sheet_provider.as_deref(),
+            Some("antigravity")
+        );
+        session.close_add_account();
+        // A provider that already has an account is not signed in to again.
+        session.state.providers[1].accounts = vec![crate::api::ProviderAccount::default()];
+        session.prompt_sign_in_for("secret muse_code_identity is empty; provide credentials");
+        assert!(session.accounts_ui.sheet_provider.is_none());
+        // An unrelated error starts nothing.
+        session.prompt_sign_in_for("Something else broke");
+        assert!(session.accounts_ui.sheet_provider.is_none());
     }
 
     #[test]

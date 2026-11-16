@@ -126,21 +126,26 @@ const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "antigravity",
         label: "Google Antigravity",
-        subtitle: "Google Cloud Code OAuth (PKCE) — Gemini & Claude models",
+        subtitle: "Sign in with Google (browser) — Gemini & Claude models",
         base_url: "https://daily-cloudcode-pa.googleapis.com",
         kind: "google-antigravity",
         default_id: "antigravity",
         models: &[
-            "gemini-2.5-pro",
-            "gemini-2.5-flash",
-            "claude-sonnet-4-5",
-            "claude-opus-4",
+            "gemini-4-argon-high",
+            "gemini-4-argon-medium",
+            "gemini-4-argon-low",
+            "gemini-3.8-flash-tiered",
+            "gemini-3.1-pro-low",
+            "claude-opus-5-5-thinking",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5-thinking",
+            "claude-sonnet-5-5",
         ],
         secret_name: "antigravity_access_token",
         catalog_fetch: true,
         auth: "oauth",
         badge: "OAuth",
-        note: "Google Cloud Code OAuth (PKCE) — Gemini & Claude models",
+        note: "Sign in with Google (browser) — Gemini & Claude models",
         key_url: "",
         sign_in: "pkce_google",
         risk: PLAN_RISK_GOOGLE,
@@ -148,16 +153,16 @@ const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "deepseek",
         label: "DeepSeek",
-        subtitle: "DeepSeek V3, R1 & Reasoner API",
+        subtitle: "DeepSeek V4 Flash & V4 Pro API",
         base_url: "https://api.deepseek.com/v1",
         kind: "deepseek",
         default_id: "deepseek",
-        models: &["deepseek-chat", "deepseek-reasoner"],
+        models: &["deepseek-flash", "deepseek-v4-pro"],
         secret_name: "deepseek_api_key",
         catalog_fetch: true,
         auth: "api_key",
         badge: "API Key",
-        note: "DeepSeek V3, R1 & Reasoner API",
+        note: "DeepSeek V4 Flash & V4 Pro API",
         key_url: "https://platform.deepseek.com/api_keys",
         sign_in: "",
         risk: "",
@@ -241,27 +246,32 @@ const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "openai",
         label: "OpenAI",
-        subtitle: "GPT-5, GPT-4.1, GPT-4o & o-series reasoning",
+        subtitle: "GPT-6, GPT-5.6, GPT-4o & o-series reasoning",
         base_url: "https://api.openai.com/v1",
         kind: "openai",
         default_id: "openai",
         // Static fallback list; the live /models fetch is authoritative.
         models: &[
-            "gpt-5",
-            "gpt-5-mini",
-            "gpt-5-nano",
-            "gpt-4o-mini",
-            "gpt-4.1",
-            "gpt-4.1-mini",
+            "gpt-6-astra",
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.4",
             "gpt-4o",
+            "gpt-4o-mini",
             "o3",
+            "o3-mini",
             "o4-mini",
         ],
         secret_name: "openai_api_key",
         catalog_fetch: true,
         auth: "api_key",
         badge: "API Key",
-        note: "GPT-5, GPT-4.1, GPT-4o & o-series reasoning",
+        note: "GPT-6, GPT-5.6, GPT-4o & o-series reasoning",
         key_url: "https://platform.openai.com/api-keys",
         sign_in: "",
         risk: "",
@@ -274,9 +284,10 @@ const PRESETS: &[ProviderPreset] = &[
         kind: "openrouter",
         default_id: "openrouter",
         models: &[
-            "anthropic/claude-sonnet-4",
-            "google/gemini-2.5-pro",
-            "deepseek/deepseek-r1",
+            "anthropic/claude-sonnet-5.5",
+            "openai/gpt-6.1-sol",
+            "google/gemini-3.8-flash",
+            "deepseek/deepseek-v4-pro",
         ],
         secret_name: "openrouter_api_key",
         catalog_fetch: true,
@@ -315,7 +326,7 @@ const PRESETS: &[ProviderPreset] = &[
         base_url: "https://api.x.ai/v1",
         kind: "xai",
         default_id: "xai",
-        models: &["grok-3-beta", "grok-3-mini-beta"],
+        models: &["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"],
         secret_name: "xai_api_key",
         catalog_fetch: true,
         auth: "api_key",
@@ -332,7 +343,7 @@ const PRESETS: &[ProviderPreset] = &[
         base_url: "https://api.moonshot.ai/v1",
         kind: "moonshot",
         default_id: "moonshot",
-        models: &["kimi-k2-0711-preview", "moonshot-v1-128k"],
+        models: &["kimi-k3", "kimi-k2.7-code"],
         secret_name: "moonshot_api_key",
         catalog_fetch: true,
         auth: "api_key",
@@ -402,11 +413,11 @@ const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "gemini",
         label: "Google Gemini",
-        subtitle: "Gemini 2.5 Pro, Flash and newer, through Google's OpenAI-compatible endpoint",
+        subtitle: "Gemini 3.x Flash and newer, through Google's OpenAI-compatible endpoint",
         base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
         kind: "gemini",
         default_id: "gemini",
-        models: &["gemini-2.5-pro", "gemini-2.5-flash"],
+        models: &["gemini-3.8-flash", "gemini-3.7-flash"],
         secret_name: "gemini_api_key",
         catalog_fetch: true,
         auth: "api_key",
@@ -494,7 +505,17 @@ const PRESETS: &[ProviderPreset] = &[
         base_url: "https://api.anthropic.com/v1",
         kind: "anthropic",
         default_id: "anthropic",
-        models: &["claude-sonnet-5-5", "claude-opus-5-5"],
+        models: &[
+            "claude-opus-5-5",
+            "claude-fable-5-1",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-haiku-4-5",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-opus-4-8",
+            "claude-sonnet-4-6",
+        ],
         secret_name: "anthropic_api_key",
         catalog_fetch: true,
         auth: "api_key",
@@ -511,7 +532,21 @@ const PRESETS: &[ProviderPreset] = &[
         base_url: "https://opencode.ai/zen/go/v1",
         kind: "opencode-go",
         default_id: "opencode-go",
-        models: &["glm-5.3-flash", "glm-5.3", "kimi-k2.7-code"],
+        models: &[
+            "glm-5.3-flash",
+            "glm-5.3",
+            "kimi-k2.7-code",
+            "kimi-k3",
+            "deepseek-v4.1-flash",
+            "deepseek-v4-pro",
+            "qwen3.8-max",
+            "qwen3.8-flash",
+            "mimo-v2.6-flash",
+            "mimo-v2.6-pro",
+            "minimax-m3",
+            "grok-4.7",
+            "muse-spark-1.3-contributor",
+        ],
         secret_name: "opencode_go_api_key",
         catalog_fetch: true,
         auth: "api_key",
@@ -528,7 +563,25 @@ const PRESETS: &[ProviderPreset] = &[
         base_url: "https://opencode.ai/zen/v1",
         kind: "opencode-zen",
         default_id: "opencode-zen",
-        models: &["claude-fable-5-1"],
+        models: &[
+            "claude-fable-5-1",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-haiku-4-5",
+            "gemini-3.8-flash",
+            "gpt-6-astra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "grok-4.6",
+            "muse-spark-1.3",
+            "kimi-k3",
+            "glm-5.3",
+            "deepseek-v4-flash-free",
+            "mimo-v2.6-flash-free",
+            "muse-spark-1.3-contributor-free",
+            "union-alpha",
+            "jev-1.13-free",
+        ],
         secret_name: "opencode_zen_api_key",
         catalog_fetch: true,
         auth: "api_key",
@@ -562,7 +615,13 @@ const PRESETS: &[ProviderPreset] = &[
         base_url: "https://api.meta.ai/v1",
         kind: "muse-code",
         default_id: "muse",
-        models: &["muse-spark-1.3"],
+        models: &[
+            "muse-spark-1.3",
+            "muse-spark-1.3-contributor",
+            "muse-spark-1.2",
+            "muse-spark-1.2-contributor",
+            "muse-spark-1.1",
+        ],
         secret_name: "muse_code_api_key",
         catalog_fetch: true,
         auth: "oauth",
@@ -579,7 +638,16 @@ const PRESETS: &[ProviderPreset] = &[
         base_url: "http://127.0.0.1:11434/v1",
         kind: "openai-compatible",
         default_id: "ollama",
-        models: &["llama3.3", "qwen2.5-coder:32b"],
+        models: &[
+            "qwen3.8",
+            "qwen3.5",
+            "qwen3-coder",
+            "gemma4",
+            "llama3.2",
+            "deepseek-r1",
+            "gpt-oss",
+            "phi4",
+        ],
         secret_name: "ollama_api_key",
         catalog_fetch: true,
         auth: "none",
@@ -811,9 +879,48 @@ mod tests {
             assert!(mistral.models.contains(&expected), "{expected}");
         }
         let openai = preset_for("openai").unwrap();
-        for expected in ["gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4o-mini"] {
+        for expected in ["gpt-6.1-sol", "gpt-6-astra", "gpt-5.6-luna", "gpt-4o-mini"] {
             assert!(openai.models.contains(&expected), "{expected}");
         }
+    }
+
+    /// The lists follow the owner's HielCowork reference (dated 2026-11-02).
+    /// These are the ids that reference no longer offers; none may come back.
+    #[test]
+    fn no_preset_offers_a_retired_model() {
+        const RETIRED: &[&str] = &[
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "claude-sonnet-4-5",
+            "claude-opus-4",
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-5-nano",
+            "deepseek-chat",
+            "deepseek-reasoner",
+            "gpt-oss-120b",
+        ];
+        for preset in presets() {
+            for model in preset.models {
+                assert!(
+                    !RETIRED.contains(model),
+                    "{:?} offers retired model {model:?}",
+                    preset.id
+                );
+            }
+        }
+        let antigravity = preset_for("antigravity").unwrap();
+        for expected in [
+            "gemini-4-argon-high",
+            "gemini-3.8-flash-tiered",
+            "claude-opus-5-5-thinking",
+            "claude-sonnet-5-5",
+        ] {
+            assert!(antigravity.models.contains(&expected), "{expected}");
+        }
+        let muse = preset_for("muse-code").unwrap();
+        assert_eq!(muse.models.first(), Some(&"muse-spark-1.3"));
+        assert!(muse.models.contains(&"muse-spark-1.1"));
     }
 
     #[test]
@@ -882,7 +989,7 @@ mod tests {
         assert_eq!(connected.len(), 1);
         assert_eq!(connected[0].id, "openai");
 
-        let by_model = filter_presets("deepseek-reasoner", DirectoryFilter::All, |_| false);
+        let by_model = filter_presets("deepseek-v4-pro", DirectoryFilter::All, |_| false);
         assert!(by_model.iter().any(|p| p.id == "deepseek"));
         assert!(provider_matches_preset(
             "openai",

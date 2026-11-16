@@ -514,15 +514,12 @@ impl AdminStore {
             secrets.persist(&to_persist)?;
         }
 
-        if is_oauth {
-            if !secrets.has(&profile.refresh_token_secret) && !secrets.has(&profile.api_key_secret)
-            {
-                return Err(SeraError::Validation(format!(
-                    "secret {} is empty; provide credentials",
-                    profile.refresh_token_secret
-                )));
-            }
-        } else if !secrets.has(&profile.api_key_secret) {
+        // A sign-in provider holds no server secret of its own: each member
+        // signs in and the tokens are sealed per user. The profile saves
+        // without any, and the owner's Sign in button does the rest. OpenRouter
+        // takes either a key or a sign-in, so it may save without a key too.
+        let signs_in = is_oauth || profile.kind == "openrouter";
+        if !signs_in && !secrets.has(&profile.api_key_secret) {
             return Err(SeraError::Validation(format!(
                 "secret {} is empty; provide an API key",
                 profile.api_key_secret
