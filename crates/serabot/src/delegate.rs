@@ -715,15 +715,24 @@ impl Store {
         Ok(row)
     }
 
-    /// Mark a handoff finished once its specialist has answered.
-    pub fn mark_handoff_completed(&self, user_id: &str, handoff_id: &str) -> Result<()> {
+    /// Mark a handoff finished once its specialist has answered. Only the
+    /// handoff's current child may write it, and not over a recorded failure,
+    /// so a late completion of a replaced child changes nothing. Returns
+    /// whether the row changed.
+    pub fn mark_handoff_completed(
+        &self,
+        user_id: &str,
+        handoff_id: &str,
+        child_task_id: &str,
+    ) -> Result<bool> {
         let connection = self.connection()?;
-        connection.execute(
-            "UPDATE handoffs SET status = 'completed', outcome_code = NULL, updated_at = ?3
-             WHERE id = ?1 AND user_id = ?2",
-            params![handoff_id, user_id, now_string()],
+        let changed = connection.execute(
+            "UPDATE handoffs SET status = 'completed', outcome_code = NULL, updated_at = ?4
+             WHERE id = ?1 AND user_id = ?2 AND child_task_id = ?3
+               AND status NOT IN ('failed', 'failed_resumable')",
+            params![handoff_id, user_id, child_task_id, now_string()],
         )?;
-        Ok(())
+        Ok(changed == 1)
     }
 
     /// Record that a handoff's child failed for good: `failed_resumable` when
@@ -897,7 +906,27 @@ pub fn resume_handoff(
     let mut payload = child.payload.clone();
     payload["route"] = json!(route);
     payload["resume"] = json!(view.resume_count + 1);
+    // A retry asked for by a follow-up turn carries that turn's depth, so
+    // the follow-up depth bound holds across retries.
+    if let Some(depth) = options
+        .task_id
+        .and_then(|id| store.get_task(user_id, id).ok())
+        .and_then(|task| task.payload.get("followup_depth").and_then(Value::as_u64))
+    {
+        payload["followup_depth"] = json!(depth);
+    }
     let new_child = new_id();
+    store.resume_handoff_task(
+        user_id,
+        &view.id,
+        &view.child_task_id,
+        &new_child,
+        &view.to_bot,
+        &payload,
+        Some(&json!(route)),
+        options.daily_limit,
+    )?;
+    // Audited only once the transaction has committed.
     store.record_audit(
         options.actor,
         "handoff.resumed",
@@ -915,16 +944,6 @@ pub fn resume_handoff(
             "provider": route.selection.provider,
             "model": route.selection.model,
         })),
-    )?;
-    store.resume_handoff_task(
-        user_id,
-        &view.id,
-        &view.child_task_id,
-        &new_child,
-        &view.to_bot,
-        &payload,
-        Some(&json!(route)),
-        options.daily_limit,
     )?;
     // Every resume is a route event, so the switch shows beside the failovers.
     let previous = view
@@ -1460,5 +1479,135 @@ mod tests {
         let mut confirmed = resume_options(500, None, &admin);
         confirmed.accept_unknown_effects = true;
         resume_handoff(&store, &router, &bot, &admin, &other_id, &confirmed).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_refused_resume_leaves_no_resumed_audit_row() {
+        let (store, parent) = store();
+        let fleet = fleet(&store);
+        let router = router();
+        let tool = DelegateTool::new(store.clone(), fleet.clone(), router.clone());
+        let turn = store
+            .create_turn(&admin(&store), &parent, ORCHESTRATOR_BOT, ROOM, &json!({}))
+            .unwrap();
+        let context = context(&store, &parent, &turn.id);
+        let output = tool.execute(args(), &context).await.unwrap();
+        let admin = admin(&store);
+        let bot = fleet.load(&admin).unwrap()["analyst"].config.clone();
+        set_task_status(&store, &child_of(&output), "failed");
+        // The daily quota (1 child already) refuses the resume transaction.
+        resume_handoff(
+            &store,
+            &router,
+            &bot,
+            &admin,
+            &handoff_of(&output),
+            &resume_options(1, None, &admin),
+        )
+        .unwrap_err();
+        let resumed = |store: &Store| {
+            store
+                .list_audit_for_user(&admin, 100)
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.event == "handoff.resumed")
+                .count()
+        };
+        assert_eq!(resumed(&store), 0);
+        resume_handoff(
+            &store,
+            &router,
+            &bot,
+            &admin,
+            &handoff_of(&output),
+            &resume_options(500, None, &admin),
+        )
+        .unwrap();
+        assert_eq!(resumed(&store), 1);
+    }
+
+    #[tokio::test]
+    async fn only_the_current_child_completes_a_handoff() {
+        let (store, parent) = store();
+        let fleet = fleet(&store);
+        let router = router();
+        let tool = DelegateTool::new(store.clone(), fleet.clone(), router.clone());
+        let turn = store
+            .create_turn(&admin(&store), &parent, ORCHESTRATOR_BOT, ROOM, &json!({}))
+            .unwrap();
+        let context = context(&store, &parent, &turn.id);
+        let output = tool.execute(args(), &context).await.unwrap();
+        let admin = admin(&store);
+        let id = handoff_of(&output);
+        let old_child = child_of(&output);
+        let bot = fleet.load(&admin).unwrap()["analyst"].config.clone();
+        set_task_status(&store, &old_child, "failed");
+        let view = resume_handoff(
+            &store,
+            &router,
+            &bot,
+            &admin,
+            &id,
+            &resume_options(500, None, &admin),
+        )
+        .unwrap();
+        // A late completion from the replaced child changes nothing.
+        assert!(
+            !store
+                .mark_handoff_completed(&admin, &id, &old_child)
+                .unwrap()
+        );
+        assert_eq!(store.get_handoff(&admin, &id).unwrap().status, "resumed");
+        // A failure already recorded for the current child is not overwritten.
+        assert!(
+            store
+                .mark_handoff_failed(&admin, &id, &view.child_task_id, "failed", "error", false)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .mark_handoff_completed(&admin, &id, &view.child_task_id)
+                .unwrap()
+        );
+        assert_eq!(store.get_handoff(&admin, &id).unwrap().status, "failed");
+    }
+
+    #[tokio::test]
+    async fn a_retry_carries_the_follow_up_depth_of_the_asking_turn() {
+        let (store, parent) = store();
+        let fleet = fleet(&store);
+        let router = router();
+        let tool = DelegateTool::new(store.clone(), fleet.clone(), router.clone());
+        let turn = store
+            .create_turn(&admin(&store), &parent, ORCHESTRATOR_BOT, ROOM, &json!({}))
+            .unwrap();
+        let context = context(&store, &parent, &turn.id);
+        let output = tool.execute(args(), &context).await.unwrap();
+        let admin = admin(&store);
+        let bot = fleet.load(&admin).unwrap()["analyst"].config.clone();
+        set_task_status(&store, &child_of(&output), "failed");
+        let asking = store
+            .enqueue_task(
+                &admin,
+                "turn",
+                ORCHESTRATOR_BOT,
+                &json!({"followup_depth": 2}),
+                0,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        let mut options = resume_options(500, None, &admin);
+        options.task_id = Some(&asking.id);
+        let view = resume_handoff(
+            &store,
+            &router,
+            &bot,
+            &admin,
+            &handoff_of(&output),
+            &options,
+        )
+        .unwrap();
+        let child = store.get_task(&admin, &view.child_task_id).unwrap();
+        assert_eq!(child.payload["followup_depth"], 2);
     }
 }

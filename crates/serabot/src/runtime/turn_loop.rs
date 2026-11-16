@@ -436,9 +436,9 @@ impl Runtime {
                     "specialist": turn.bot,
                 })),
             )?;
-            if let Err(error) = self
-                .store
-                .mark_handoff_completed(user_id, &handoff.handoff_id)
+            if let Err(error) =
+                self.store
+                    .mark_handoff_completed(user_id, &handoff.handoff_id, &task.id)
             {
                 tracing::warn!(%error, "could not mark the handoff completed");
             }

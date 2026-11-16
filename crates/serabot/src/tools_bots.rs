@@ -11,7 +11,10 @@
 //! - the acting user comes from the tool context, never from the arguments;
 //!   an argument named `user_id` is rejected like any other unknown field;
 //! - a bot never widens `tools`, `skills`, `require_approval`, its prompt or
-//!   cross-provider egress consent (see `fleet_mutation::guard_no_widening`);
+//!   cross-provider egress consent (see `fleet_mutation::guard_no_widening`).
+//!   Delegates are not covered by that guard: adding one gives main that
+//!   specialist's tools indirectly, so `bot_set_delegates` states this on its
+//!   approval card and the owner's approval is the control;
 //! - `main`'s role and enabled state are never touched;
 //! - targets are `main` itself (profile only) and the bots in `main.delegates`;
 //! - a route change or a pause needs an idle target: no running task and no
@@ -579,6 +582,7 @@ impl BotTool {
     async fn set_delegates(&self, args: &Value, context: &ToolContext) -> Result<ToolOutput> {
         let (_fleet, task_id) = self.caller(context)?;
         let args: SetDelegatesArgs = parse_args(args)?;
+        self.require_idle(context, &task_id, ORCHESTRATOR_BOT)?;
         let mutation = self
             .mutate(
                 context,
@@ -593,9 +597,35 @@ impl BotTool {
         Self::output(json!({ "delegates": mutation.config.delegates }))
     }
 
-    fn retry(&self, args: &Value, context: &ToolContext) -> Result<ToolOutput> {
+    async fn retry(&self, args: &Value, context: &ToolContext) -> Result<ToolOutput> {
         let (fleet, task_id) = self.caller(context)?;
         let args: RetryArgs = parse_args(args)?;
+        // A route the bot supplies is scanned and checked against the live
+        // catalog, like the owner's own retry.
+        if let Some(RouteOverride::Route(route)) = &args.route_override {
+            for text in [&route.provider, &route.model]
+                .into_iter()
+                .chain(route.account.as_ref())
+            {
+                if !self.deps.policy.is_allowed(text) {
+                    self.deps.store.record_audit(
+                        &context.user_id,
+                        "policy.blocked_egress",
+                        None,
+                        Some(&task_id),
+                        None,
+                        None,
+                        Some(self.deps.policy.version()),
+                        None,
+                    )?;
+                    return Err(SeraError::PolicyViolation);
+                }
+            }
+            self.deps
+                .router
+                .ensure_catalogs(&context.user_id, std::time::Duration::from_secs(8))
+                .await;
+        }
         // The handoff is looked up under the acting user, so another user's id
         // is a plain not-found.
         let view = self
@@ -805,7 +835,9 @@ impl Tool for BotTool {
                             .join(", ")
                     })
                     .unwrap_or_default();
-                format!("Set main's delegates to [{list}]")
+                format!(
+                    "Set main's delegates to [{list}]. Adding a delegate gives main that specialist's tools indirectly"
+                )
             }
             Kind::SubagentRetry => format!(
                 "Run subagent {} again on {}",
@@ -838,7 +870,7 @@ impl Tool for BotTool {
             Kind::SetRoute => self.set_route(&args, context).await,
             Kind::SetEnabled => self.set_enabled(&args, context).await,
             Kind::SetDelegates => self.set_delegates(&args, context).await,
-            Kind::SubagentRetry => self.retry(&args, context),
+            Kind::SubagentRetry => self.retry(&args, context).await,
         }
     }
 }
@@ -1786,6 +1818,23 @@ mod tests {
             .filter(|entry| entry.event == "handoff.resumed")
             .count();
         assert_eq!(resumed, 2);
+    }
+
+    #[tokio::test]
+    async fn subagent_retry_scans_a_route_the_bot_supplies() {
+        let rig = rig();
+        let context = owner_context(&rig, &rig.admin);
+        let (handoff, _) = add_handoff(&rig, &rig.admin, "scan objective", "failed");
+        let result = approve_and_run(
+            &rig,
+            SUBAGENT_RETRY_TOOL,
+            json!({"handoff_id": handoff, "route_override": {"provider": "default", "model": "test", "account": "TopSecret"}}),
+            &context,
+        )
+        .await;
+        assert!(result.is_err());
+        let view = rig.store.handoff_view(&rig.admin, &handoff).unwrap();
+        assert_eq!(view.resume_count, 0);
     }
 
     #[tokio::test]

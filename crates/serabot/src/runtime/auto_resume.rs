@@ -31,6 +31,14 @@ pub(super) fn is_followup(payload: &Value) -> bool {
     payload.get("source").and_then(Value::as_str) == Some(FOLLOWUP_SOURCE)
 }
 
+/// Follow-up levels already spent on a failing child. A retry keeps the
+/// handoff's original parent, so the depth the retrying follow-up carried is
+/// copied into the resumed child's own payload; the larger of the two counts.
+fn followup_depth(parent: &Value, child: &Value) -> u64 {
+    let read = |payload: &Value| payload.get("followup_depth").and_then(Value::as_u64);
+    read(parent).max(read(child)).unwrap_or(0)
+}
+
 /// Stable reason words for a failure: the route-chain codes for an exhausted
 /// chain, else one word for the error kind. Never error text.
 pub(super) fn reason_codes(error: &SeraError) -> Vec<String> {
@@ -163,12 +171,7 @@ impl Runtime {
 
         // One follow-up to main per failure, bounded in depth.
         let parent = self.store.get_task(user, &row.parent_task_id)?;
-        let depth = parent
-            .payload
-            .get("followup_depth")
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-            + 1;
+        let depth = followup_depth(&parent.payload, &task.payload) + 1;
         if depth > MAX_FOLLOWUP_DEPTH {
             return Ok(false);
         }
@@ -259,6 +262,17 @@ fn followup_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn follow_up_depth_counts_the_retrying_turns_depth() {
+        // The original parent has no depth; the resumed child carries 2.
+        assert_eq!(followup_depth(&json!({}), &json!({})), 0);
+        assert_eq!(followup_depth(&json!({}), &json!({"followup_depth": 2})), 2);
+        assert_eq!(
+            followup_depth(&json!({"followup_depth": 1}), &json!({"followup_depth": 2})),
+            2
+        );
+    }
 
     #[test]
     fn reason_codes_keep_stable_words_only() {

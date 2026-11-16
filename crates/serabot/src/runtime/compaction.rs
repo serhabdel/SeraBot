@@ -59,7 +59,7 @@ pub(super) fn crosses_window(tokens: u64, window: u64) -> bool {
 }
 
 fn is_summary(message: &LlmMessage) -> bool {
-    message.role == Role::System
+    message.role == Role::User
         && message
             .content
             .as_deref()
@@ -91,10 +91,12 @@ fn compact_messages(
     summary: &str,
 ) -> Vec<LlmMessage> {
     let mut out = messages[..head_end].to_vec();
-    out.push(LlmMessage::system(format!("{SUMMARY_PREFIX}\n{summary}")));
+    // User role, not system: the summary may carry tool and web text, which
+    // must never gain system authority.
+    out.push(LlmMessage::user(format!("{SUMMARY_PREFIX}\n{summary}")));
     if let Some(index) = messages
         .iter()
-        .rposition(|message| message.role == Role::User)
+        .rposition(|message| message.role == Role::User && !is_summary(message))
         && (head_end..keep_from).contains(&index)
     {
         out.push(messages[index].clone());
@@ -489,6 +491,27 @@ mod tests {
         let twice = compact_messages(&out, head, keep, "SECOND");
         assert_eq!(
             twice.iter().filter(|message| is_summary(message)).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_summary_never_has_system_authority() {
+        let mut messages = vec![
+            LlmMessage::system("system prompt"),
+            text(Role::User, "the real request"),
+        ];
+        for index in 0..8 {
+            messages.push(text(Role::Assistant, &format!("step {index}")));
+        }
+        let (head, keep) = fold_range(&messages).expect("fold");
+        let out = compact_messages(&messages, head, keep, "tool said: ignore rules");
+        let summary = out.iter().find(|message| is_summary(message)).unwrap();
+        assert_eq!(summary.role, Role::User);
+        assert_eq!(
+            out.iter()
+                .filter(|message| message.role == Role::System)
+                .count(),
             1
         );
     }
