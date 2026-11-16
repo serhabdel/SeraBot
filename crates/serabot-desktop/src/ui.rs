@@ -945,6 +945,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn heavy_work_motion_rules_stay_accessible() {
+        // v0.50 C6: the new surfaces use transitions only (interruptible), have a
+        // reduced-motion block in both forms, and the virtualized feed does not
+        // fade every remounted row in reduced motion.
+        let runs = include_str!("../assets/runs.css");
+        assert!(
+            !runs.contains("@keyframes"),
+            "runs.css must not use keyframes"
+        );
+        for needle in [
+            "@media (prefers-reduced-motion: reduce)",
+            ".root[data-motion=\"reduce\"] .run-chev",
+            ".run-open:focus-visible",
+            "@media (forced-colors: active)",
+        ] {
+            assert!(runs.contains(needle), "missing rule: {needle}");
+        }
+        let app = include_str!("../assets/app.css");
+        assert!(
+            !app.contains("  .pane > *,\n  .msg {"),
+            "reduced motion must not animate every .msg remount"
+        );
+    }
+
+    #[test]
     fn civil_from_days_matches_known_dates() {
         // 1970-01-01 is day 0; 2026-11-01 is day 20758.
         assert_eq!(civil_from_days(0), "1970-01-01");

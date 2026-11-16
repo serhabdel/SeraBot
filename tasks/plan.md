@@ -167,3 +167,14 @@ framework, Antigravity and Muse member sign-in, Anthropic/OpenCode backends,
 single-flight refresh, bot routes with a failover engine, and the matching
 desktop pages. Claude plan OAuth is implemented but off by default (O1).
 Optional P19 (Mistral sign-in) is not done. No live provider was used.
+
+## Status after 0.49.0 (orchestration, 0.50.0)
+
+0.50.0 adds the single fleet mutation path and `main`'s management tools,
+the handoff ledger (migration 0038) with auto-resume, `waiting_model` parking,
+context compaction, `needs_review` for unknown effects, per-user fairness
+(`max_turns_per_user`, `max_active_children`, per-account inflight caps), and
+the desktop virtualized feed, event coalescing, runs sidebar, composer queue,
+failure and wait cards, plus a motion/accessibility pass. No live provider was
+used and the desktop was not visually verified on a device. B7 worker counts
+above 2 are gated on running the load fixture on the target host.

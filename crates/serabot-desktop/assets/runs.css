@@ -15,6 +15,7 @@
   border: 1px solid var(--hairline);
   border-radius: var(--r-md);
   background: var(--surface-2);
+  scrollbar-gutter: stable;
 }
 
 .runs-head {
@@ -127,7 +128,8 @@
 .run-chip[data-tone="live"] { background: var(--accent-2-soft); color: var(--accent-ink); border-color: transparent; }
 .run-chip[data-tone="wait"] { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
 .run-chip[data-tone="bad"] { background: var(--danger-soft); color: var(--danger); border-color: transparent; }
-.run-chip[data-tone="ok"] { background: var(--ok-soft); color: var(--ok); border-color: transparent; }
+/* --ok alone is 4.2:1 on the light panel; darken the text toward label-1 for AA. */
+.run-chip[data-tone="ok"] { background: var(--ok-soft); color: color-mix(in srgb, var(--ok) 75%, var(--label-1)); border-color: transparent; }
 
 .run-resumes {
   flex: none;
@@ -389,6 +391,26 @@
   color: var(--label-1);
   font-family: var(--font-mono);
   font-size: var(--fs-micro);
+}
+
+/* ---- Focus: the shared :focus-visible ring, kept inside clipped panels ---- */
+.run-open:focus-visible,
+.run-group:focus-visible,
+.failed-alt-item:focus-visible,
+.shortcuts-link:focus-visible,
+.queue-edit:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* ---- Forced colors: chips and tones keep a visible edge ---- */
+@media (forced-colors: active) {
+  .run-chip,
+  .reason-chip,
+  .hold-badge,
+  .compaction-note {
+    border: 1px solid CanvasText;
+  }
 }
 
 /* ---- Reduced motion: opacity only, no movement ---- */

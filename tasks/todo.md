@@ -132,3 +132,15 @@ never merge without the owner's OK.
 - [x] P18 docs, release notes, version 0.49.0.
 - [ ] P19 (optional) Mistral sign-in.
 - [ ] Live verification against owner-approved accounts (none claimed).
+
+## Release 0.50.0 — orchestration
+
+- [x] B1 fleet mutation path; B2 management tools; B3 handoff ledger.
+- [x] B4 `needs_review`; B5 `waiting_model`; B6 auto-resume; B8 compaction and continue.
+- [x] B7 fairness caps and load fixture (passed at 2, 4, 8 workers locally); B9 orchestration events.
+- [x] C1 virtualized feed; C2 event coalescing; C3 runs sidebar; C4 composer queue; C5 failure and wait UX.
+- [x] C6 motion/accessibility pass (transition audit, focus, contrast computed, reduced-motion fix for remounted rows).
+- [x] C7 docs, release notes, version 0.50.0.
+- [ ] Visual screenshot review (light and dark) of chat, runs sidebar and composer on a device.
+- [ ] Load fixture on the target host before raising workers above 2.
+- [ ] Live verification against owner-approved accounts (none claimed).

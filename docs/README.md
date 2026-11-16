@@ -38,6 +38,7 @@ artifacts.
 | [Release 0.47.0](release-0.47.0.md) | Wave 10 `jobfinder` specialist bot, smart conversation titles & `conversation.renamed` SSE, inline approvals (desktop/mobile/Telegram), 1-click Browser Vault autofill, Vault provider sync, compiled-in default bot avatars, and mobile Tasks/Chat/Preview upgrades. |
 | [Release 0.48.0](release-0.48.0.md) | Logging hardening (noisy-crate caps, shared default filter, per-layer ring filter, durable owner-only `[logging] dir`), approval expiry check at decision time, and negative tests for jobs, workflows, preview, vault autofill and approvals. |
 | [Release 0.49.0](release-0.49.0.md) | Provider accounts (several per member, sealed, write-only), member sign-in for Antigravity and Muse Code, native Anthropic and OpenCode backends, flag-gated Claude plan OAuth, single-flight refresh, bot routes with account/provider failover, and the desktop Providers, route editor and composer route chip. |
+| [Release 0.50.0](release-0.50.0.md) | Orchestration at scale: fleet mutation path and `main` management tools, handoff ledger with auto-resume, `waiting_model` parking, context compaction, `needs_review` for unknown effects, per-user fairness, and the desktop virtualized feed, runs sidebar, composer queue and failure/wait UX. |
 | [Events](events.md) | `turn.step` payload for desktop and Android step cards. |
 | [Tool results](tool-results.md) | Audio, file, image, link, and table cards. |
 | [Console pages](console-pages.md) | Tasks, Memory, Connectors, and Providers fields the next desktop pages read. |
