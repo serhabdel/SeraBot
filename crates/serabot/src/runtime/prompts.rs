@@ -66,6 +66,19 @@ impl Runtime {
         if bot.config.role != BotRole::Orchestrator {
             allowed_tools.remove(DELEGATE_TOOL);
         }
+        // Bot management belongs to main, in a turn the owner started. A
+        // handoff, team or help turn never gets it: a specialist's output must
+        // not be able to steer the fleet.
+        if bot.config.role != BotRole::Orchestrator
+            || bot.config.name != ORCHESTRATOR_BOT
+            || state.team.is_some()
+            || state.handoff.is_some()
+            || !crate::tools_bots::turn_may_manage(&task.payload)
+        {
+            for tool in crate::tools_bots::MANAGEMENT_TOOLS {
+                allowed_tools.remove(tool);
+            }
+        }
         // Team tools are granted by the runtime, never by a bot's tool list: a
         // member only gets `team_reply` inside a team turn, and only the
         // orchestrator gets `team_ask` in a selected-mode room team.

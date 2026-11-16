@@ -738,10 +738,6 @@ pub(super) async fn admin_set_bot_profile(
     Ok(Json(json!({"saved": true, "restart_required": false})))
 }
 
-/// Every console ability on at once is ~95 tools plus `delegate`.
-pub(super) const MAX_BOT_CONFIG_TOOLS: usize = 128;
-pub(super) const MAX_BOT_CONFIG_SKILLS: usize = 16;
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct BotConfigRequest {
@@ -753,110 +749,33 @@ pub(super) struct BotConfigRequest {
     require_approval: Option<Vec<String>>,
 }
 
-/// Tool list rules matching the desktop `validate_tool_list` semantics on top
-/// of the server's tool registry: unique safe ids, `delegate` only for the
-/// orchestrator, and every other tool must be a registered tool -- or one the
-/// bot already has (`kept`). A tool whose service is switched off (for example
-/// `tavily_search` while Tavily is disabled) is unregistered, and without the
-/// `kept` exception every later edit of that bot's tools was refused (0.14.0).
+/// Tool list rules; see `fleet_mutation::validate_tool_list`.
 pub(super) fn validate_bot_tool_list(
     state: &ApiState,
     tools: &[String],
     role: BotRole,
     kept: &[String],
 ) -> Result<Vec<String>> {
-    if tools.len() > MAX_BOT_CONFIG_TOOLS {
-        return Err(SeraError::Validation(format!(
-            "at most {MAX_BOT_CONFIG_TOOLS} tools are allowed"
-        )));
-    }
-    let mut seen = HashSet::with_capacity(tools.len());
-    let mut out = Vec::with_capacity(tools.len());
-    for tool in tools {
-        if !safe_bot_label(tool) {
-            return Err(SeraError::Validation(format!("invalid tool id '{tool}'")));
-        }
-        if tool == crate::delegate::DELEGATE_TOOL {
-            if role != BotRole::Orchestrator {
-                return Err(SeraError::Validation(
-                    "specialists cannot be granted delegate".into(),
-                ));
-            }
-        } else if !state.runtime.gateway().registry().is_registered(tool)
-            && !kept.iter().any(|existing| existing == tool)
-            && !crate::tools::known_tool_names().contains(&tool.as_str())
-        {
-            return Err(SeraError::Validation(format!("unknown tool '{tool}'")));
-        }
-        if !seen.insert(tool.clone()) {
-            return Err(SeraError::Validation(format!("duplicate tool '{tool}'")));
-        }
-        out.push(tool.clone());
-    }
-    Ok(out)
+    crate::fleet_mutation::validate_tool_list(tools, role, kept, &|tool| {
+        state.runtime.gateway().registry().is_registered(tool)
+    })
 }
 
-/// Skill list rules matching the desktop `parse_skill_list` semantics plus the
-/// acting user's effective catalog check: at most 16 unique, valid skill ids
-/// that exist in the shipped catalog or the user's own rows.
+/// Skill list rules; see `fleet_mutation::validate_skill_list`.
 pub(super) fn validate_bot_skill_list(
     state: &ApiState,
     user_id: &str,
     skills: &[String],
 ) -> Result<Vec<String>> {
-    if skills.len() > MAX_BOT_CONFIG_SKILLS {
-        return Err(SeraError::Validation(format!(
-            "at most {MAX_BOT_CONFIG_SKILLS} skills are allowed"
-        )));
-    }
-    let known = state.runtime.fleet().effective_skill_ids(user_id)?;
-    let mut seen = HashSet::with_capacity(skills.len());
-    let mut out = Vec::with_capacity(skills.len());
-    for skill in skills {
-        crate::skills::validate_skill_id(skill)?;
-        if !known.iter().any(|id| id == skill) {
-            return Err(SeraError::Validation(format!("unknown skill '{skill}'")));
-        }
-        if !seen.insert(skill.clone()) {
-            return Err(SeraError::Validation(format!("duplicate skill '{skill}'")));
-        }
-        out.push(skill.clone());
-    }
-    Ok(out)
+    crate::fleet_mutation::validate_skill_list(&state.runtime.fleet(), user_id, skills)
 }
 
-/// `require_approval` entries must be safe ids contained in the bot's
-/// effective tool list (the new tools when the request sets them).
+/// `require_approval` entries; see `fleet_mutation::validate_require_approval_list`.
 pub(super) fn validate_require_approval_list(
     list: &[String],
     tools: &[String],
 ) -> Result<Vec<String>> {
-    if list.len() > MAX_BOT_CONFIG_TOOLS {
-        return Err(SeraError::Validation(format!(
-            "at most {MAX_BOT_CONFIG_TOOLS} require_approval entries are allowed"
-        )));
-    }
-    let mut seen = HashSet::with_capacity(list.len());
-    let mut out = Vec::with_capacity(list.len());
-    for item in list {
-        if !safe_bot_label(item) {
-            return Err(SeraError::Validation(format!(
-                "invalid require_approval entry '{item}'"
-            )));
-        }
-        if !tools.iter().any(|tool| tool == item) {
-            return Err(SeraError::Validation(format!(
-                "require_approval entry '{item}' is not in the bot's tools"
-            )));
-        }
-        if !seen.insert(item.clone()) {
-            return Err(SeraError::Validation(format!(
-                "duplicate require_approval entry '{item}'"
-            )));
-        }
-        out.push(item.clone());
-    }
-    Ok(out)
+    crate::fleet_mutation::validate_require_approval_list(list, tools)
 }
 
 /// `PUT /v1/admin/bots/{id}/config` — validate and persist a partial bot

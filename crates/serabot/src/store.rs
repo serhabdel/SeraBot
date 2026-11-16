@@ -76,6 +76,7 @@ const MIGRATION_34: &str = include_str!("../migrations/0034_bot_chats.sql");
 const MIGRATION_35: &str = include_str!("../migrations/0035_marketplace_installs.sql");
 const MIGRATION_36: &str = include_str!("../migrations/0036_console_pages.sql");
 const MIGRATION_37: &str = include_str!("../migrations/0037_provider_accounts.sql");
+const MIGRATION_38: &str = include_str!("../migrations/0038_handoffs.sql");
 
 /// Fixed admin id written by migration 0008 and mirrored in
 /// `kv['admin_user_id']`. Code resolves the admin through the kv entry (the
@@ -701,6 +702,11 @@ impl Store {
         if version < 37 {
             connection.execute_batch(MIGRATION_37)?;
             connection.pragma_update(None, "user_version", 37)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 38 {
+            connection.execute_batch(MIGRATION_38)?;
+            connection.pragma_update(None, "user_version", 38)?;
         }
         // VACUUM INTO (backups) may renumber rowids; rebuild the external-content
         // FTS index only when its row count no longer matches `memories`.
@@ -5031,7 +5037,7 @@ fn parse_role(value: &str) -> Role {
 /// Insert one queued task row. Shared by the plain and quota-checked
 /// enqueue paths so the row shape (and its owner) has one definition.
 #[allow(clippy::too_many_arguments)]
-fn insert_task_row(
+pub(crate) fn insert_task_row(
     connection: &rusqlite::Connection,
     id: &str,
     user_id: &str,
@@ -5923,7 +5929,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 37);
+        assert_eq!(version, 38);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
@@ -5988,7 +5994,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 37);
+        assert_eq!(version, 38);
         assert!(store.list_device_tokens().unwrap().is_empty());
         // The team table arrives with the same migration batch.
         assert!(
@@ -6062,7 +6068,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 37);
+        assert_eq!(version, 38);
         let admin = admin(&store);
         let memory = crate::memory::get(&store, &admin, "mem-legacy").unwrap();
         assert_eq!(memory.origin, "explicit");
@@ -6151,7 +6157,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 37);
+        assert_eq!(version, 38);
 
         let admin = store.admin_user().unwrap().unwrap();
         assert_eq!(admin.id, ADMIN_USER_ID);
@@ -6282,7 +6288,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 37);
+        assert_eq!(version, 38);
 
         // Every scoped table carries user_id = the admin, and the column is
         // NOT NULL with a real foreign key.
@@ -6437,7 +6443,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 37);
+        assert_eq!(version, 38);
 
         // The old row is now the admin's, with the empty prompt the migration
         // header documents; startup seeding fills it from the template.

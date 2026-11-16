@@ -1,20 +1,22 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use serde::Serialize;
 use serde_json::{Value, json};
 use tracing::warn;
 
-use crate::config::LoadedBot;
+use crate::config::{BotConfig, BotRoute, LoadedBot};
 use crate::domain::new_id;
 use crate::error::{Result, SeraError};
 use crate::fleet::{Fleet, FleetRegistry};
 use crate::gateway::{Tool, ToolContext, ToolOutput, ToolSpec};
 use crate::memory;
-use crate::model_router::ModelRouter;
+use crate::model_router::{ModelRouter, ModelSelection, PinnedRoute};
 use crate::orchestration::HandoffContext;
 use crate::orchestration::{BotRole, Handoff, ModelClass, ORCHESTRATOR_BOT, validate_handoff};
-use crate::store::Store;
-use crate::teams::enqueue_turn_task_with_id;
+use crate::store::{Store, insert_task_row, now_string, start_of_utc_day, to_string};
+use crate::util::sha256_hex;
 
 pub const DELEGATE_TOOL: &str = "delegate";
 pub const HANDOFF_QUEUED_KEY: &str = "handoff_queued";
@@ -22,12 +24,17 @@ pub const HANDOFF_QUEUED_KEY: &str = "handoff_queued";
 /// 16 in 0.28). Several `delegate` calls in the same round fan out to
 /// parallel specialist subagents.
 pub const MAX_HANDOFFS_PER_TURN: usize = 16;
+/// Default for `[users] child_daily_limit`.
+pub const DEFAULT_CHILD_DAILY_LIMIT: u64 = 500;
+/// Most times one handoff may be resumed by a bot (the owner is not capped).
+pub const MAX_RESUMES: i64 = 2;
 
 #[derive(Clone)]
 pub struct DelegateTool {
     store: Store,
     fleet: Arc<FleetRegistry>,
     router: ModelRouter,
+    child_daily_limit: u64,
 }
 
 impl DelegateTool {
@@ -36,7 +43,14 @@ impl DelegateTool {
             store,
             fleet,
             router,
+            child_daily_limit: DEFAULT_CHILD_DAILY_LIMIT,
         }
+    }
+
+    /// Cap handoff and resume tasks per user per UTC day.
+    pub fn with_child_daily_limit(mut self, limit: u64) -> Self {
+        self.child_daily_limit = limit;
+        self
     }
 
     fn orchestrator<'a>(&self, fleet: &'a Fleet) -> Result<&'a LoadedBot> {
@@ -175,6 +189,16 @@ impl Tool for DelegateTool {
         };
         validate_handoff(&handoff, &specialist.config.skills)?;
 
+        // A repeated call (same parent turn, specialist and objective) returns
+        // the child it already queued instead of queuing a second one.
+        let key_hash = handoff_key_hash(turn_id, &to_bot, &objective);
+        if let Some(existing) =
+            self.store
+                .find_handoff_by_key(&context.user_id, task_id, &key_hash)?
+        {
+            return Ok(duplicate_output(&existing));
+        }
+
         let class_name = match model_class {
             ModelClass::Routine => "routine",
             ModelClass::Synthesis => "synthesis",
@@ -258,15 +282,32 @@ impl Tool for DelegateTool {
                 "to_bot": to_bot,
             }),
         )?;
-        if let Err(error) = enqueue_turn_task_with_id(
-            &self.store,
+        // The ledger row and the child task are written in one transaction, so
+        // a handoff never exists without its child or the reverse.
+        let new = NewHandoff {
+            id: &handoff.id,
+            parent_task_id: task_id,
+            parent_turn_id: Some(turn_id),
+            child_task_id: &child_task_id,
+            to_bot: &to_bot,
+            key_hash: &key_hash,
+            route: Some(&json!(route)),
+        };
+        let (row, created) = match self.store.create_subagent_handoff(
             &context.user_id,
-            &child_task_id,
-            &to_bot,
+            &new,
             &payload,
+            self.child_daily_limit,
         ) {
-            warn!(bot = %to_bot, %error, "audited handoff was not queued");
-            return Err(error);
+            Ok(result) => result,
+            Err(error) => {
+                warn!(bot = %to_bot, %error, "audited handoff was not queued");
+                return Err(error);
+            }
+        };
+        if !created {
+            // A concurrent identical call won the race.
+            return Ok(duplicate_output(&row));
         }
 
         Ok(ToolOutput {
@@ -280,6 +321,572 @@ impl Tool for DelegateTool {
             ..ToolOutput::default()
         })
     }
+}
+
+/// The idempotency key of a handoff: the parent turn, the specialist and the
+/// objective. The same call from the same turn always hashes the same.
+pub fn handoff_key_hash(parent_turn_id: &str, to_bot: &str, objective: &str) -> String {
+    sha256_hex(format!("{parent_turn_id}\0{to_bot}\0{objective}"))
+}
+
+fn duplicate_output(existing: &HandoffRow) -> ToolOutput {
+    ToolOutput {
+        content: format!(
+            "Handoff {id} to {to_bot} was already queued for this request; not queued again.",
+            id = existing.id,
+            to_bot = existing.to_bot
+        ),
+        data: Some(json!({
+            "duplicate": true,
+            "handoff_id": existing.id,
+            "child_task_id": existing.child_task_id,
+            "to_bot": existing.to_bot,
+        })),
+        ..ToolOutput::default()
+    }
+}
+
+/// One ledger row, as stored.
+#[derive(Debug, Clone, Serialize)]
+pub struct HandoffRow {
+    pub id: String,
+    pub parent_task_id: String,
+    pub parent_turn_id: Option<String>,
+    pub child_task_id: String,
+    pub to_bot: String,
+    pub key_hash: String,
+    pub status: String,
+    pub outcome_code: Option<String>,
+    pub effects_unknown: bool,
+    pub resume_count: i64,
+    pub route: Option<Value>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A ledger row with the live state of its child task folded in. This is what
+/// the API and `handoff_status` show.
+#[derive(Debug, Clone, Serialize)]
+pub struct HandoffView {
+    pub id: String,
+    pub parent_task_id: String,
+    pub parent_turn_id: Option<String>,
+    pub child_task_id: String,
+    pub to_bot: String,
+    /// `queued`, `running`, `completed`, `failed_resumable`, `failed` or
+    /// `resumed`, from the stored row and the child task's own status.
+    pub status: &'static str,
+    pub outcome_code: Option<String>,
+    pub effects_unknown: bool,
+    pub resume_count: i64,
+    pub route: Option<Value>,
+    pub conversation_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// What the ledger needs to record one handoff.
+pub struct NewHandoff<'a> {
+    pub id: &'a str,
+    pub parent_task_id: &'a str,
+    pub parent_turn_id: Option<&'a str>,
+    pub child_task_id: &'a str,
+    pub to_bot: &'a str,
+    pub key_hash: &'a str,
+    pub route: Option<&'a Value>,
+}
+
+/// The status a handoff shows now. A child that failed or was cancelled can
+/// be resumed while resumes remain and no effect has an unknown outcome;
+/// otherwise it is plainly `failed`.
+pub fn effective_status(
+    row: &HandoffRow,
+    task_status: Option<&str>,
+    task_uncertain: bool,
+) -> &'static str {
+    let resumed = row.status == "resumed";
+    match task_status {
+        Some("queued") => {
+            if resumed {
+                "resumed"
+            } else {
+                "queued"
+            }
+        }
+        Some("running" | "awaiting_approval") => {
+            if resumed {
+                "resumed"
+            } else {
+                "running"
+            }
+        }
+        Some("done") => "completed",
+        Some("failed" | "cancelled") => {
+            if row.effects_unknown || task_uncertain || row.resume_count >= MAX_RESUMES {
+                "failed"
+            } else {
+                "failed_resumable"
+            }
+        }
+        // A child row that is gone, or a status this build does not know,
+        // falls back to what the ledger stored.
+        _ => match row.status.as_str() {
+            "completed" => "completed",
+            "failed_resumable" => "failed_resumable",
+            "resumed" => "resumed",
+            "running" => "running",
+            "failed" => "failed",
+            _ => "queued",
+        },
+    }
+}
+
+const HANDOFF_COLUMNS: &str = "id, parent_task_id, parent_turn_id, child_task_id, to_bot, key_hash,
+    status, outcome_code, effects_unknown, resume_count, route_json, created_at, updated_at";
+
+fn handoff_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HandoffRow> {
+    Ok(HandoffRow {
+        id: row.get(0)?,
+        parent_task_id: row.get(1)?,
+        parent_turn_id: row.get(2)?,
+        child_task_id: row.get(3)?,
+        to_bot: row.get(4)?,
+        key_hash: row.get(5)?,
+        status: row.get(6)?,
+        outcome_code: row.get(7)?,
+        effects_unknown: row.get::<_, i64>(8)? != 0,
+        resume_count: row.get(9)?,
+        route: row
+            .get::<_, Option<String>>(10)?
+            .and_then(|text| serde_json::from_str(&text).ok()),
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+    })
+}
+
+fn find_by_key(
+    connection: &rusqlite::Connection,
+    user_id: &str,
+    parent_task_id: &str,
+    key_hash: &str,
+) -> Result<Option<HandoffRow>> {
+    Ok(connection
+        .query_row(
+            &format!(
+                "SELECT {HANDOFF_COLUMNS} FROM handoffs
+                 WHERE user_id = ?1 AND parent_task_id = ?2 AND key_hash = ?3"
+            ),
+            params![user_id, parent_task_id, key_hash],
+            handoff_from_row,
+        )
+        .optional()?)
+}
+
+/// Handoff and resume turns the user queued since UTC midnight. They count
+/// against `[users] child_daily_limit`.
+fn child_tasks_today(connection: &rusqlite::Connection, user_id: &str) -> Result<i64> {
+    let day_start = start_of_utc_day(chrono::Utc::now().date_naive())?;
+    Ok(connection.query_row(
+        "SELECT COUNT(*) FROM tasks
+         WHERE user_id = ?1 AND created_at >= ?2
+           AND json_extract(payload_json, '$.source') = 'handoff'",
+        params![user_id, to_string(day_start)],
+        |row| row.get(0),
+    )?)
+}
+
+fn check_child_quota(connection: &rusqlite::Connection, user_id: &str, limit: u64) -> Result<()> {
+    let used = child_tasks_today(connection, user_id)?;
+    if used >= i64::try_from(limit).unwrap_or(i64::MAX) {
+        return Err(SeraError::Validation(format!(
+            "daily subagent quota exceeded: {limit} handoff tasks per user per UTC day"
+        )));
+    }
+    Ok(())
+}
+
+impl Store {
+    /// The acting user's handoff with this idempotency key under a parent
+    /// task, if one was already queued.
+    pub fn find_handoff_by_key(
+        &self,
+        user_id: &str,
+        parent_task_id: &str,
+        key_hash: &str,
+    ) -> Result<Option<HandoffRow>> {
+        let connection = self.connection()?;
+        find_by_key(&connection, user_id, parent_task_id, key_hash)
+    }
+
+    /// Queue one child turn and write its ledger row in a single immediate
+    /// transaction, after the daily child quota check. Returns the row and
+    /// whether this call created it: when the key already exists nothing is
+    /// written and the existing row comes back.
+    pub fn create_subagent_handoff(
+        &self,
+        user_id: &str,
+        new: &NewHandoff<'_>,
+        payload: &Value,
+        daily_limit: u64,
+    ) -> Result<(HandoffRow, bool)> {
+        let connection = self.connection()?;
+        let transaction = Transaction::new_unchecked(&connection, TransactionBehavior::Immediate)?;
+        if let Some(existing) =
+            find_by_key(&transaction, user_id, new.parent_task_id, new.key_hash)?
+        {
+            return Ok((existing, false));
+        }
+        check_child_quota(&transaction, user_id, daily_limit)?;
+        let now = chrono::Utc::now();
+        insert_task_row(
+            &transaction,
+            new.child_task_id,
+            user_id,
+            "turn",
+            new.to_bot,
+            payload,
+            0,
+            now,
+            now,
+        )?;
+        let stamp = to_string(now);
+        let route_json = new.route.map(serde_json::to_string).transpose()?;
+        transaction.execute(
+            "INSERT INTO handoffs(id, user_id, parent_task_id, parent_turn_id, child_task_id,
+                 to_bot, key_hash, status, outcome_code, effects_unknown, resume_count,
+                 route_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', NULL, 0, 0, ?8, ?9, ?9)",
+            params![
+                new.id,
+                user_id,
+                new.parent_task_id,
+                new.parent_turn_id,
+                new.child_task_id,
+                new.to_bot,
+                new.key_hash,
+                route_json,
+                stamp
+            ],
+        )?;
+        let row = transaction.query_row(
+            &format!("SELECT {HANDOFF_COLUMNS} FROM handoffs WHERE id = ?1 AND user_id = ?2"),
+            params![new.id, user_id],
+            handoff_from_row,
+        )?;
+        transaction.commit()?;
+        Ok((row, true))
+    }
+
+    /// One of the acting user's handoffs. Another user's is a plain 404.
+    pub fn get_handoff(&self, user_id: &str, id: &str) -> Result<HandoffRow> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                &format!("SELECT {HANDOFF_COLUMNS} FROM handoffs WHERE id = ?1 AND user_id = ?2"),
+                params![id, user_id],
+                handoff_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| SeraError::NotFound(format!("handoff {id}")))
+    }
+
+    /// The acting user's handoffs, newest first, with each child's live state.
+    /// With a conversation id, only that conversation's subagents.
+    pub fn list_handoffs(
+        &self,
+        user_id: &str,
+        conversation_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<HandoffView>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT h.id, h.parent_task_id, h.parent_turn_id, h.child_task_id, h.to_bot, h.key_hash,
+                    h.status, h.outcome_code, h.effects_unknown, h.resume_count, h.route_json,
+                    h.created_at, h.updated_at,
+                    t.status, COALESCE(t.uncertain, 0),
+                    json_extract(t.payload_json, '$.conversation_id')
+             FROM handoffs h
+             LEFT JOIN tasks t ON t.id = h.child_task_id AND t.user_id = h.user_id
+             WHERE h.user_id = ?1
+               AND (?2 IS NULL OR json_extract(t.payload_json, '$.conversation_id') = ?2)
+             ORDER BY h.created_at DESC, h.id DESC
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![user_id, conversation_id, limit.min(200) as i64],
+            |row| {
+                let handoff = handoff_from_row(row)?;
+                let task_status: Option<String> = row.get(13)?;
+                let uncertain: i64 = row.get(14)?;
+                let conversation: Option<String> = row.get(15)?;
+                Ok((handoff, task_status, uncertain != 0, conversation))
+            },
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (handoff, task_status, uncertain, conversation_id) = row?;
+            out.push(view_of(
+                handoff,
+                task_status.as_deref(),
+                uncertain,
+                conversation_id,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// One handoff with its child's live state.
+    pub fn handoff_view(&self, user_id: &str, id: &str) -> Result<HandoffView> {
+        let row = self.get_handoff(user_id, id)?;
+        let task = self.get_task(user_id, &row.child_task_id).ok();
+        let conversation = task
+            .as_ref()
+            .and_then(|task| task.payload.get("conversation_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        Ok(view_of(
+            row,
+            task.as_ref().map(|task| task.status.as_str()),
+            task.as_ref().is_some_and(|task| task.uncertain),
+            conversation,
+        ))
+    }
+
+    /// Queue a fresh child turn for an existing handoff and point the ledger
+    /// at it, in one immediate transaction: the new task, `resume_count + 1`,
+    /// status `resumed`. `expected_child` guards against two resumes racing;
+    /// the loser changes nothing. Counts against the daily child quota.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume_handoff_task(
+        &self,
+        user_id: &str,
+        handoff_id: &str,
+        expected_child: &str,
+        new_child_id: &str,
+        bot: &str,
+        payload: &Value,
+        route: Option<&Value>,
+        daily_limit: u64,
+    ) -> Result<HandoffRow> {
+        let connection = self.connection()?;
+        let transaction = Transaction::new_unchecked(&connection, TransactionBehavior::Immediate)?;
+        check_child_quota(&transaction, user_id, daily_limit)?;
+        let now = chrono::Utc::now();
+        let route_json = route.map(serde_json::to_string).transpose()?;
+        let changed = transaction.execute(
+            "UPDATE handoffs
+             SET child_task_id = ?4, status = 'resumed', resume_count = resume_count + 1,
+                 outcome_code = NULL, route_json = COALESCE(?5, route_json), updated_at = ?6
+             WHERE id = ?1 AND user_id = ?2 AND child_task_id = ?3",
+            params![
+                handoff_id,
+                user_id,
+                expected_child,
+                new_child_id,
+                route_json,
+                to_string(now)
+            ],
+        )?;
+        if changed != 1 {
+            return Err(SeraError::InvalidState(
+                "this handoff was already resumed".into(),
+            ));
+        }
+        insert_task_row(
+            &transaction,
+            new_child_id,
+            user_id,
+            "turn",
+            bot,
+            payload,
+            0,
+            now,
+            now,
+        )?;
+        let row = transaction.query_row(
+            &format!("SELECT {HANDOFF_COLUMNS} FROM handoffs WHERE id = ?1 AND user_id = ?2"),
+            params![handoff_id, user_id],
+            handoff_from_row,
+        )?;
+        transaction.commit()?;
+        Ok(row)
+    }
+
+    /// Mark a handoff finished once its specialist has answered.
+    pub fn mark_handoff_completed(&self, user_id: &str, handoff_id: &str) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "UPDATE handoffs SET status = 'completed', outcome_code = NULL, updated_at = ?3
+             WHERE id = ?1 AND user_id = ?2",
+            params![handoff_id, user_id, now_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Whether the acting user's bot has a turn running or waiting on an
+    /// approval, other than `except_task`. A route change waits for this to
+    /// be false.
+    pub fn bot_is_busy(&self, user_id: &str, bot: &str, except_task: Option<&str>) -> Result<bool> {
+        let connection = self.connection()?;
+        let count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM tasks
+             WHERE user_id = ?1 AND bot = ?2 AND status IN ('running','awaiting_approval')
+               AND (?3 IS NULL OR id <> ?3)",
+            params![user_id, bot, except_task],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+}
+
+fn view_of(
+    row: HandoffRow,
+    task_status: Option<&str>,
+    uncertain: bool,
+    conversation_id: Option<String>,
+) -> HandoffView {
+    let status = effective_status(&row, task_status, uncertain);
+    HandoffView {
+        effects_unknown: row.effects_unknown || uncertain,
+        status,
+        id: row.id,
+        parent_task_id: row.parent_task_id,
+        parent_turn_id: row.parent_turn_id,
+        child_task_id: row.child_task_id,
+        to_bot: row.to_bot,
+        outcome_code: row.outcome_code,
+        resume_count: row.resume_count,
+        route: row.route,
+        conversation_id,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    }
+}
+
+/// Pin the route a resumed child starts on: the explicit override when given
+/// (checked against the live catalog and the provider's egress approval), else
+/// the bot's own current head, else the route the child ran on. The bot's
+/// failover chain rides along, like a first handoff.
+pub fn resume_route(
+    router: &ModelRouter,
+    user_id: &str,
+    bot: &BotConfig,
+    override_route: Option<&BotRoute>,
+    previous: Option<&Value>,
+) -> Result<PinnedRoute> {
+    let selection = match override_route {
+        Some(route) => {
+            router.validate_route_entry(user_id, route)?;
+            ModelSelection {
+                provider: route.provider.clone(),
+                model: route.model.clone(),
+                account: route.account.clone(),
+            }
+        }
+        None => match router.bot_chain(user_id, bot).head {
+            Some(head) => head,
+            None => previous
+                .and_then(|value| serde_json::from_value::<PinnedRoute>(value.clone()).ok())
+                .map(|route| route.selection)
+                .ok_or_else(|| SeraError::InvalidState("no route to resume on".into()))?,
+        },
+    };
+    router.pin_for_bot(user_id, &selection, bot)
+}
+
+/// How a handoff is resumed.
+pub struct ResumeOptions<'a> {
+    pub actor: &'a str,
+    /// The tool that asked, for the audit row; `None` for the owner's API call.
+    pub tool: Option<&'a str>,
+    pub task_id: Option<&'a str>,
+    pub route: Option<&'a BotRoute>,
+    /// Refuse past this many resumes (the bot path); the owner is not capped.
+    pub max_resumes: Option<i64>,
+    /// The owner confirmed the earlier attempt's effects are acceptable to
+    /// repeat. Never set for a bot.
+    pub accept_unknown_effects: bool,
+    pub daily_limit: u64,
+}
+
+/// Queue a failed handoff's specialist turn again, for the acting user. The
+/// original turn payload is reused with a freshly pinned route, so the
+/// resumed child answers the same objective in the same conversation. A child
+/// that may have had an external effect with an unknown outcome is never
+/// replayed unless the owner confirms it.
+pub fn resume_handoff(
+    store: &Store,
+    router: &ModelRouter,
+    bot: &BotConfig,
+    user_id: &str,
+    handoff_id: &str,
+    options: &ResumeOptions<'_>,
+) -> Result<HandoffView> {
+    let view = store.handoff_view(user_id, handoff_id)?;
+    if view.status != "failed_resumable" && view.status != "failed" {
+        return Err(SeraError::InvalidState(format!(
+            "handoff {handoff_id} is {} and cannot be resumed",
+            view.status
+        )));
+    }
+    if view.effects_unknown && !options.accept_unknown_effects {
+        return Err(SeraError::Rejected {
+            code: "effects_unknown",
+            message: "the earlier attempt may have had an effect with an unknown outcome; verify it first".into(),
+        });
+    }
+    if let Some(max) = options.max_resumes
+        && view.resume_count >= max
+    {
+        return Err(SeraError::Rejected {
+            code: "resume_limit",
+            message: format!("this handoff was already resumed {max} times"),
+        });
+    }
+    let child = store.get_task(user_id, &view.child_task_id)?;
+    let route = resume_route(router, user_id, bot, options.route, view.route.as_ref())?;
+    let mut payload = child.payload.clone();
+    payload["route"] = json!(route);
+    payload["resume"] = json!(view.resume_count + 1);
+    let new_child = new_id();
+    store.record_audit(
+        options.actor,
+        "handoff.resumed",
+        options.tool,
+        options.task_id,
+        None,
+        None,
+        None,
+        Some(&json!({
+            "handoff_id": view.id,
+            "old_child_task_id": view.child_task_id,
+            "child_task_id": new_child,
+            "to_bot": view.to_bot,
+            "resume_count": view.resume_count + 1,
+            "provider": route.selection.provider,
+            "model": route.selection.model,
+        })),
+    )?;
+    store.resume_handoff_task(
+        user_id,
+        &view.id,
+        &view.child_task_id,
+        &new_child,
+        &view.to_bot,
+        &payload,
+        Some(&json!(route)),
+        options.daily_limit,
+    )?;
+    store.append_event(
+        user_id,
+        "handoff.resumed",
+        &json!({
+            "handoff_id": view.id,
+            "child_task_id": new_child,
+            "to_bot": view.to_bot,
+        }),
+    )?;
+    store.handoff_view(user_id, handoff_id)
 }
 
 #[cfg(test)]
@@ -484,5 +1091,305 @@ mod tests {
         // No specialist turn was queued: the audit came first and failed.
         assert_eq!(queued_specialist_tasks(&store), 0);
         assert_eq!(store.pending_task_count(&admin(&store)).unwrap(), 1);
+    }
+
+    fn child_of(output: &ToolOutput) -> String {
+        output
+            .data
+            .as_ref()
+            .and_then(|data| data.get("child_task_id"))
+            .and_then(Value::as_str)
+            .expect("child task id")
+            .to_owned()
+    }
+
+    fn handoff_of(output: &ToolOutput) -> String {
+        output
+            .data
+            .as_ref()
+            .and_then(|data| data.get("handoff_id"))
+            .and_then(Value::as_str)
+            .expect("handoff id")
+            .to_owned()
+    }
+
+    fn set_task_status(store: &Store, task: &str, status: &str) {
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = ?2 WHERE id = ?1",
+                params![task, status],
+            )
+            .unwrap();
+    }
+
+    fn resume_options(limit: u64, max: Option<i64>, actor: &str) -> ResumeOptions<'_> {
+        ResumeOptions {
+            actor,
+            tool: None,
+            task_id: None,
+            route: None,
+            max_resumes: max,
+            accept_unknown_effects: false,
+            daily_limit: limit,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_repeated_delegate_returns_the_existing_child() {
+        let (store, parent) = store();
+        let tool = DelegateTool::new(store.clone(), fleet(&store), router());
+        let turn = store
+            .create_turn(&admin(&store), &parent, ORCHESTRATOR_BOT, ROOM, &json!({}))
+            .unwrap();
+        let context = context(&store, &parent, &turn.id);
+        let first = tool.execute(args(), &context).await.unwrap();
+        let second = tool.execute(args(), &context).await.unwrap();
+        assert_eq!(child_of(&first), child_of(&second));
+        assert_eq!(handoff_of(&first), handoff_of(&second));
+        assert_eq!(
+            second.data.as_ref().and_then(|d| d.get("duplicate")),
+            Some(&json!(true))
+        );
+        // One child task, one ledger row, one audit row.
+        assert_eq!(queued_specialist_tasks(&store), 1);
+        let connection = store.connection().unwrap();
+        let rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM handoffs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+        drop(connection);
+        let audited = store
+            .list_audit(50)
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.event == "handoff.queued")
+            .count();
+        assert_eq!(audited, 1);
+        // A different objective is a different handoff.
+        let mut other = args();
+        other["objective"] = json!("Summarize the synthetic payables.");
+        let third = tool.execute(other, &context).await.unwrap();
+        assert_ne!(child_of(&first), child_of(&third));
+        assert_eq!(queued_specialist_tasks(&store), 2);
+    }
+
+    #[tokio::test]
+    async fn the_ledger_row_matches_the_child_and_stays_with_its_owner() {
+        let (store, parent) = store();
+        let tool = DelegateTool::new(store.clone(), fleet(&store), router());
+        let turn = store
+            .create_turn(&admin(&store), &parent, ORCHESTRATOR_BOT, ROOM, &json!({}))
+            .unwrap();
+        let context = context(&store, &parent, &turn.id);
+        let output = tool.execute(args(), &context).await.unwrap();
+        let admin = admin(&store);
+        let row = store.get_handoff(&admin, &handoff_of(&output)).unwrap();
+        assert_eq!(row.child_task_id, child_of(&output));
+        assert_eq!(row.parent_task_id, parent);
+        assert_eq!(row.parent_turn_id.as_deref(), Some(turn.id.as_str()));
+        assert_eq!(row.to_bot, "analyst");
+        assert_eq!(row.status, "queued");
+        assert_eq!(
+            row.key_hash,
+            handoff_key_hash(
+                &turn.id,
+                "analyst",
+                "Summarize the synthetic cash position."
+            )
+        );
+        let listed = store.list_handoffs(&admin, Some(ROOM), 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, "queued");
+        assert_eq!(listed[0].conversation_id.as_deref(), Some(ROOM));
+        assert!(
+            store
+                .list_handoffs(&admin, Some("room:other"), 10)
+                .unwrap()
+                .is_empty()
+        );
+        // Another user sees nothing and cannot read the row.
+        let member = store
+            .create_user("microsoft:ledger", "ledger@example.example", "L")
+            .unwrap();
+        assert!(
+            store
+                .list_handoffs(&member.id, None, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            store.get_handoff(&member.id, &row.id),
+            Err(SeraError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_child_daily_limit_counts_handoffs_and_resumes() {
+        let (store, parent) = store();
+        let fleet = fleet(&store);
+        let router = router();
+        let tool = DelegateTool::new(store.clone(), fleet.clone(), router.clone())
+            .with_child_daily_limit(2);
+        let turn = store
+            .create_turn(&admin(&store), &parent, ORCHESTRATOR_BOT, ROOM, &json!({}))
+            .unwrap();
+        let context = context(&store, &parent, &turn.id);
+        let first = tool.execute(args(), &context).await.unwrap();
+        // The handoff bypasses the general task quota but not the child cap.
+        let mut other = args();
+        other["objective"] = json!("Second synthetic objective.");
+        tool.execute(other, &context).await.unwrap();
+        let mut third = args();
+        third["objective"] = json!("Third synthetic objective.");
+        let refused = tool.execute(third, &context).await.unwrap_err();
+        assert!(
+            refused.to_string().contains("daily subagent quota"),
+            "{refused}"
+        );
+        assert_eq!(queued_specialist_tasks(&store), 2);
+
+        // A resume is a child task too, so it is refused at the cap.
+        set_task_status(&store, &child_of(&first), "failed");
+        let admin = admin(&store);
+        let bot = fleet.load(&admin).unwrap()["analyst"].config.clone();
+        let error = resume_handoff(
+            &store,
+            &router,
+            &bot,
+            &admin,
+            &handoff_of(&first),
+            &resume_options(2, None, &admin),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("daily subagent quota"),
+            "{error}"
+        );
+        // With room under the cap it queues a new child and counts.
+        let view = resume_handoff(
+            &store,
+            &router,
+            &bot,
+            &admin,
+            &handoff_of(&first),
+            &resume_options(3, None, &admin),
+        )
+        .unwrap();
+        assert_eq!(view.resume_count, 1);
+        assert_eq!(view.status, "resumed");
+        assert_ne!(view.child_task_id, child_of(&first));
+        assert_eq!(
+            child_tasks_today(&store.connection().unwrap(), &admin).unwrap(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_is_capped_and_never_replays_unknown_effects() {
+        let (store, parent) = store();
+        let fleet = fleet(&store);
+        let router = router();
+        let tool = DelegateTool::new(store.clone(), fleet.clone(), router.clone());
+        let turn = store
+            .create_turn(&admin(&store), &parent, ORCHESTRATOR_BOT, ROOM, &json!({}))
+            .unwrap();
+        let context = context(&store, &parent, &turn.id);
+        let output = tool.execute(args(), &context).await.unwrap();
+        let admin = admin(&store);
+        let id = handoff_of(&output);
+        let bot = fleet.load(&admin).unwrap()["analyst"].config.clone();
+        // A running child is not resumable.
+        let error = resume_handoff(
+            &store,
+            &router,
+            &bot,
+            &admin,
+            &id,
+            &resume_options(500, Some(MAX_RESUMES), &admin),
+        )
+        .unwrap_err();
+        assert!(matches!(error, SeraError::InvalidState(_)), "{error}");
+
+        // The cap holds: two resumes, then a plain failure.
+        let mut child = child_of(&output);
+        for expected in 1..=MAX_RESUMES {
+            set_task_status(&store, &child, "failed");
+            let view = resume_handoff(
+                &store,
+                &router,
+                &bot,
+                &admin,
+                &id,
+                &resume_options(500, Some(MAX_RESUMES), &admin),
+            )
+            .unwrap();
+            assert_eq!(view.resume_count, expected);
+            child = view.child_task_id;
+        }
+        set_task_status(&store, &child, "failed");
+        let view = store.handoff_view(&admin, &id).unwrap();
+        assert_eq!(view.status, "failed");
+        let error = resume_handoff(
+            &store,
+            &router,
+            &bot,
+            &admin,
+            &id,
+            &resume_options(500, Some(MAX_RESUMES), &admin),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("resumed 2 times"), "{error}");
+        // The resumed child's payload is the original objective on a fresh pin.
+        let resumed = store.get_task(&admin, &child).unwrap();
+        assert_eq!(
+            resumed.payload["text"],
+            "Summarize the synthetic cash position."
+        );
+        assert_eq!(resumed.payload["source"], "handoff");
+        assert_eq!(resumed.payload["resume"], 2);
+
+        // An unknown effect is never replayed without the owner's word.
+        let mut second = args();
+        second["objective"] = json!("Another synthetic objective.");
+        let other = tool.execute(second, &context).await.unwrap();
+        let other_child = child_of(&other);
+        set_task_status(&store, &other_child, "failed");
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET uncertain = 1 WHERE id = ?1",
+                params![other_child],
+            )
+            .unwrap();
+        let other_id = handoff_of(&other);
+        assert_eq!(
+            store.handoff_view(&admin, &other_id).unwrap().status,
+            "failed"
+        );
+        let error = resume_handoff(
+            &store,
+            &router,
+            &bot,
+            &admin,
+            &other_id,
+            &resume_options(500, Some(MAX_RESUMES), &admin),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SeraError::Rejected {
+                    code: "effects_unknown",
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        let mut confirmed = resume_options(500, None, &admin);
+        confirmed.accept_unknown_effects = true;
+        resume_handoff(&store, &router, &bot, &admin, &other_id, &confirmed).unwrap();
     }
 }

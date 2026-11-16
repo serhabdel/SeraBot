@@ -35,7 +35,29 @@ or sends something to a third party that cannot be recalled. The list lives in
 - Image tools (image_inspect, image_resize, image_convert): run without approval; results are new artifacts with metadata removed.
 - Read-only connectors: `google_drive_list`, `google_sheets_read`, `google_calendar_list_events`, `gmail_list_messages`, `outlook_list_messages`, `outlook_calendar_list_events`, `notion_query_database`, `agentmail_inboxes_list`, `onedrive_list`, `github_search_repos`, `github_list_issues`, `github_get_issue`, `github_get_file`, `todoist_list_tasks`, `slack_list_channels`, `slack_read_channel`, `exa_search`, `exa_get_contents`.
 - Orchestration: `delegate`, `team_ask`, `team_reply`, `skill_list`, `skill_search`, `skill_load`.
+- Fleet reads (v0.50, `main` only, audited): `bot_list`, `bot_read`, `model_list`, `handoff_status`. `model_list` shows accounts as id, label and state only.
 - Chat cards: `ask_user` (asks the owner a question in the chat; it sends nothing outside SeraBot and returns at once). See [API](api.md#chat-cards-023).
+
+## Fleet management (approval required) — v0.50
+
+These tools belong to `main` and run only in a turn the owner started. A
+handoff, team, help or routine turn never gets them, and a specialist cannot be
+granted them. Each call is bound to the user, the canonical arguments, the
+policy version and the expiry; changing any argument needs a new approval.
+None of them accepts a standing grant, and YOLO never covers them: "always"
+acts as "once".
+
+| Tool | Why |
+| --- | --- |
+| `bot_set_route` | Changes a bot's route, fallbacks, failover policy or thinking level. The target must be `main` or one of its delegates, and idle (no running task, no approval pending). It can never grant cross-provider consent. |
+| `bot_set_enabled` | Pauses one of `main`'s delegates (it also leaves `main`'s delegate list). It cannot switch a bot on or touch `main`. |
+| `bot_set_delegates` | Sets `main`'s delegate list to enabled specialists. |
+| `subagent_retry` | Runs a failed subagent again, at most twice per handoff, never after an effect with an unknown outcome. Approval is needed only when `route_override` names a full route (a possibly new provider); `{chain_index}` stays inside the bot's own chain and needs none. |
+
+Every change goes through the same path as the owner's own edit (`PUT
+/v1/bots/{id}`), including the policy scan and the `bot.profile_changed` audit
+row with the before and after values. A bot never widens `tools`, `skills`,
+`require_approval`, its instructions or egress consent.
 
 ## Bot `require_approval` lists
 

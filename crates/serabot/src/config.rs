@@ -1034,12 +1034,19 @@ pub struct UsersConfig {
     /// at the cap gets an explicit validation error, never a silent drop.
     #[serde(default = "default_users_task_quota")]
     pub tasks_per_user_per_day: u64,
+    /// Daily budget for subagent turns per user (default 500): handoff
+    /// children and their resumes. These continue an already counted request,
+    /// so they bypass `tasks_per_user_per_day`; this cap bounds a runaway
+    /// fan-out. Same UTC-day window.
+    #[serde(default = "default_users_task_quota")]
+    pub child_daily_limit: u64,
 }
 
 impl Default for UsersConfig {
     fn default() -> Self {
         Self {
             tasks_per_user_per_day: default_users_task_quota(),
+            child_daily_limit: default_users_task_quota(),
         }
     }
 }
@@ -1049,6 +1056,11 @@ impl UsersConfig {
         if self.tasks_per_user_per_day == 0 || self.tasks_per_user_per_day > 10_000 {
             return Err(SeraError::Config(
                 "users.tasks_per_user_per_day must be between 1 and 10000".into(),
+            ));
+        }
+        if self.child_daily_limit == 0 || self.child_daily_limit > 10_000 {
+            return Err(SeraError::Config(
+                "users.child_daily_limit must be between 1 and 10000".into(),
             ));
         }
         Ok(())
@@ -3809,6 +3821,13 @@ enabled = false
         config.users.tasks_per_user_per_day = 0;
         assert!(config.validate().is_err());
         config.users.tasks_per_user_per_day = 500;
+        config.validate().unwrap();
+        assert_eq!(config.users.child_daily_limit, 500);
+        config.users.child_daily_limit = 0;
+        assert!(config.validate().is_err());
+        config.users.child_daily_limit = 10_001;
+        assert!(config.validate().is_err());
+        config.users.child_daily_limit = 250;
         config.validate().unwrap();
     }
 

@@ -1,6 +1,6 @@
 use super::*;
-use crate::browser_profiles::{MAX_BOT_DESCRIPTION_CHARS, MAX_BOT_DISPLAY_NAME_CHARS};
 use crate::default_avatars::default_avatar_version;
+use crate::fleet_mutation::{self, BotPatch, ModelChoice, MutationEnv, Origin};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -330,17 +330,6 @@ pub(super) fn bot_lists_with_override(
 
 /// Cap for the `instructions` field of `GET /v1/bots/{id}`.
 pub(super) const MAX_INSTRUCTIONS_BYTES: usize = 32 * 1024;
-/// Spec cap for a bot system prompt.
-pub(super) const MAX_BOT_PROMPT_BYTES: usize = 100_000;
-
-pub(super) fn parse_bot_config(row: &crate::store::StoredBot) -> Result<BotConfig> {
-    let mut config: BotConfig = serde_json::from_value(row.config.clone())
-        .map_err(|_| SeraError::InvalidState(format!("bot '{}' config is invalid", row.name)))?;
-    config.name = row.name.clone();
-    config.enabled = row.enabled;
-    Ok(config)
-}
-
 /// `GET /v1/bots/{id}` — one bot's full owner-facing detail. No secrets and no
 /// secret values; the response passes the egress scan. Another user's bot is a
 /// 404.
@@ -503,13 +492,6 @@ pub(super) struct UpdateBotRequest {
     pub(super) browser_profile: Option<Option<String>>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct ModelChoice {
-    provider: String,
-    model: String,
-}
-
 /// Distinguishes an absent field (`None`) from an explicit `null` (`Some(None)`).
 fn double_option<'de, T, D>(deserializer: D) -> std::result::Result<Option<Option<T>>, D::Error>
 where
@@ -523,6 +505,8 @@ where
 /// prompt edits are ordinary scoped DB writes; the fleet cache is invalidated
 /// so the next turn sees them. A change that would leave the fleet invalid
 /// (for example disabling `main` or a delegate) is rejected before the write.
+/// The change runs through `fleet_mutation::apply`, the same path the main
+/// bot's management tools use.
 pub(super) async fn update_bot(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
@@ -532,262 +516,59 @@ pub(super) async fn update_bot(
     if !safe_bot_label(&id) {
         return Err(SeraError::NotFound(format!("bot {id}")));
     }
-    if request.enabled.is_none()
-        && request.prompt.is_none()
-        && request.tools.is_none()
-        && request.skills.is_none()
-        && request.require_approval.is_none()
-        && request.display_name.is_none()
-        && request.description.is_none()
-        && request.model.is_none()
-        && request.thinking.is_none()
-        && request.browser_profile.is_none()
-    {
-        return Err(SeraError::Validation(
-            "at least one of enabled, prompt, tools, skills, require_approval, display_name, description, model, thinking, browser_profile is required".into(),
-        ));
-    }
-    if request.model.as_ref().is_some_and(Option::is_some) {
-        // A live-only model must be checked against the live list.
-        state.runtime.ensure_model_catalogs(&user.id).await;
-    }
-    // Untrusted input is scanned before it is validated or stored.
-    for list in [&request.tools, &request.skills, &request.require_approval]
-        .into_iter()
-        .flatten()
-    {
-        for item in list {
-            state.runtime.scan_owner_output(&user.id, item)?;
-        }
-    }
-    let row = state
-        .runtime
-        .fleet()
-        .row(&user.id, &id)?
-        .ok_or_else(|| SeraError::NotFound(format!("bot {id}")))?;
-    let mut config = parse_bot_config(&row)?;
-
-    // Owner-editable profile fields (0.16): validated and scanned before any write.
-    let mut settings = state.store.bot_settings(&user.id, &id)?;
-    let settings_changed = request.display_name.is_some()
-        || request.description.is_some()
-        || request.browser_profile.is_some();
-    if let Some(name) = &request.display_name {
-        let name = name.trim();
-        let count = name.chars().count();
-        if count == 0 || count > MAX_BOT_DISPLAY_NAME_CHARS || name.chars().any(char::is_control) {
-            return Err(SeraError::Validation(format!(
-                "display_name must be 1 to {MAX_BOT_DISPLAY_NAME_CHARS} characters"
-            )));
-        }
-        state.runtime.scan_owner_output(&user.id, name)?;
-        settings.display_name = Some(name.to_owned());
-    }
-    if let Some(description) = &request.description {
-        let description = description.trim();
-        if description.chars().count() > MAX_BOT_DESCRIPTION_CHARS
-            || description
-                .chars()
-                .any(|c| c.is_control() && !matches!(c, '\n' | '\t'))
-        {
-            return Err(SeraError::Validation(format!(
-                "description must be at most {MAX_BOT_DESCRIPTION_CHARS} characters"
-            )));
-        }
-        state.runtime.scan_owner_output(&user.id, description)?;
-        settings.description = (!description.is_empty()).then(|| description.to_owned());
-    }
-    if let Some(choice) = &request.browser_profile {
-        settings.browser_profile = match choice.as_deref() {
-            None | Some(crate::browser_profiles::DEFAULT_PROFILE) => None,
-            Some(profile) => {
-                if !crate::browser_profiles::valid_profile_id(profile)
-                    || state
-                        .store
-                        .get_browser_profile(&user.id, profile)?
-                        .is_none()
-                {
-                    return Err(SeraError::Validation("unknown browser profile".into()));
-                }
-                Some(profile.to_owned())
-            }
-        };
-    }
-    let model_changed = request.model.is_some();
-    if let Some(choice) = &request.model {
-        config.model = match choice {
-            None => None,
-            Some(choice) => {
-                state
-                    .runtime
-                    .scan_owner_output(&user.id, &choice.provider)?;
-                state.runtime.scan_owner_output(&user.id, &choice.model)?;
-                state.runtime.router().validate_selection(
-                    &user.id,
-                    &ModelSelection {
-                        provider: choice.provider.clone(),
-                        model: choice.model.clone(),
-                        account: None,
-                    },
-                )?;
-                Some(choice.model.clone())
-            }
-        };
-    }
-
-    if model_changed && config.route.is_some() {
-        // The route head is what the bot runs; a model edit moves it.
-        match &request.model {
-            Some(Some(choice)) => {
-                if let Some(route) = config.route.as_mut() {
-                    route.provider = choice.provider.clone();
-                    route.model = choice.model.clone();
-                    route.account = None;
-                    route.thinking = None;
-                }
-            }
-            _ => {
-                config.route = None;
-                config.fallbacks.clear();
-            }
-        }
-    }
-
-    if let Some(choice) = &request.thinking {
-        config.thinking = match choice.as_deref() {
-            None | Some("") => None,
-            Some(level) if crate::thinking::is_known_level(level) => Some(level.to_owned()),
-            Some(_) => {
-                return Err(SeraError::Rejected {
-                    code: "thinking_unavailable",
-                    message: "That thinking level isn't available".into(),
-                });
-            }
-        };
-    }
-
-    let prompt_changed = request.prompt.is_some();
-    let prompt = match request.prompt {
-        Some(prompt) => {
-            if prompt.trim().is_empty() {
-                return Err(SeraError::Validation("bot prompt must not be empty".into()));
-            }
-            if prompt.len() > MAX_BOT_PROMPT_BYTES {
-                return Err(SeraError::Validation(format!(
-                    "bot prompt exceeds {MAX_BOT_PROMPT_BYTES} bytes"
-                )));
-            }
-            if prompt
-                .chars()
-                .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
-            {
-                return Err(SeraError::Validation(
-                    "bot prompt contains unsupported control characters".into(),
-                ));
-            }
-            state.runtime.scan_owner_output(&user.id, &prompt)?;
-            prompt
-        }
-        None => row.prompt.clone(),
+    let patch = BotPatch {
+        enabled: request.enabled,
+        prompt: request.prompt,
+        tools: request.tools,
+        skills: request.skills,
+        require_approval: request.require_approval,
+        display_name: request.display_name,
+        description: request.description,
+        model: request.model,
+        thinking: request.thinking,
+        browser_profile: request.browser_profile,
+        ..BotPatch::default()
     };
-    let tools = match &request.tools {
-        Some(tools) => validate_bot_tool_list(&state, tools, config.role, &config.tools)?,
-        None => config.tools.clone(),
-    };
-    let skills = match &request.skills {
-        Some(skills) => validate_bot_skill_list(&state, &user.id, skills)?,
-        None => config.skills.clone(),
-    };
-    let require_approval = match &request.require_approval {
-        Some(list) => validate_require_approval_list(list, &tools)?,
-        None => {
-            // The tools were replaced without a new approval list: drop the
-            // entries the new list no longer covers instead of refusing the
-            // whole save (0.26.0 — capability toggles used to break Save).
-            let mut kept_list = config.require_approval.clone();
-            if request.tools.is_some() {
-                kept_list.retain(|item| tools.iter().any(|tool| tool == item));
-            }
-            validate_require_approval_list(&kept_list, &tools)?
-        }
-    };
-    let enabled = request.enabled.unwrap_or(row.enabled);
-    if !enabled && config.role == BotRole::Orchestrator {
-        return Err(SeraError::Validation(
-            "the orchestrator cannot be disabled".into(),
-        ));
-    }
-
-    // Validate the fleet the write would produce, not just the row.
-    let mut candidate = state.runtime.fleet().candidates(&user.id)?;
-    let Some(bot) = candidate.iter_mut().find(|bot| bot.config.name == id) else {
-        return Err(SeraError::NotFound(format!("bot {id}")));
-    };
-    bot.config.enabled = enabled;
-    bot.config.tools = tools.clone();
-    bot.config.skills = skills.clone();
-    bot.config.require_approval = require_approval.clone();
-    bot.config.model = config.model.clone();
-    bot.prompt = prompt.clone();
-    crate::fleet::FleetRegistry::validate_fleet(&candidate)?;
-
-    config.enabled = enabled;
-    config.tools = tools.clone();
-    config.skills = skills.clone();
-    config.require_approval = require_approval.clone();
-    let role = config.role.as_str().to_owned();
-    let config_model = config.model.clone();
-    let config_thinking = config.thinking.clone();
-    let config = serde_json::to_value(&config)?;
-    if !state
-        .store
-        .update_bot(&user.id, &id, &config, &prompt, enabled)?
-    {
-        return Err(SeraError::NotFound(format!("bot {id}")));
-    }
-    if settings_changed {
-        state.store.put_bot_settings(&user.id, &id, &settings)?;
-    }
-    state.runtime.fleet().invalidate(&user.id);
-    state.store.record_audit(
-        &user.id,
-        "bot.updated",
-        None,
-        None,
-        None,
-        None,
-        Some(state.runtime.policy_version()),
-        Some(&json!({
-            "id": id,
-            "enabled": enabled,
-            "role": role,
-            "prompt_changed": prompt_changed,
-            "tools_changed": request.tools.is_some(),
-            "skills_changed": request.skills.is_some(),
-            "require_approval_changed": request.require_approval.is_some(),
-            "profile_changed": settings_changed,
-            "model_changed": model_changed,
-        })),
-    )?;
+    let mutation = run_mutation(&state, &user, &id, patch).await?;
     Ok(Json(json!({
         "bot": {
             "id": id,
-            "enabled": enabled,
-            "role": role,
+            "enabled": mutation.enabled,
+            "role": mutation.role,
             "live": state.runtime.bot_loaded(&user.id, &id),
-            "tools": tools,
-            "skills": skills,
-            "require_approval": require_approval,
-            "display_name": settings.display_name,
-            "description": settings.description,
-            "model": config_model,
-            "thinking": config_thinking,
-            "browser_profile": settings
+            "tools": mutation.config.tools,
+            "skills": mutation.config.skills,
+            "require_approval": mutation.config.require_approval,
+            "display_name": mutation.settings.display_name,
+            "description": mutation.settings.description,
+            "model": mutation.config.model,
+            "thinking": mutation.config.thinking,
+            "browser_profile": mutation
+                .settings
                 .browser_profile
                 .clone()
                 .unwrap_or_else(|| crate::browser_profiles::DEFAULT_PROFILE.to_owned()),
         }
     })))
+}
+
+/// Run one change through the shared fleet mutation path as the owner.
+async fn run_mutation(
+    state: &ApiState,
+    user: &ActingUser,
+    id: &str,
+    patch: BotPatch,
+) -> Result<crate::fleet_mutation::Mutation> {
+    let fleet = state.runtime.fleet();
+    let registered = |tool: &str| state.runtime.gateway().registry().is_registered(tool);
+    let env = MutationEnv {
+        store: &state.store,
+        fleet: &fleet,
+        router: state.runtime.router(),
+        policy: state.runtime.policy(),
+        tool_registered: &registered,
+    };
+    fleet_mutation::apply(&env, &user.id, id, patch, Origin::owner(&user.id)).await
 }
 
 /// The bot's route as the owner sees it: what is configured, where a call
@@ -885,71 +666,15 @@ pub(super) async fn update_bot_route(
             "at least one of route, fallbacks, failover is required".into(),
         ));
     }
-    let row = state
-        .runtime
-        .fleet()
-        .row(&user.id, &id)?
-        .ok_or_else(|| SeraError::NotFound(format!("bot {id}")))?;
-    let mut config = parse_bot_config(&row)?;
-    if let Some(route) = request.route {
-        config.route = route;
-    }
-    if let Some(fallbacks) = request.fallbacks {
-        config.fallbacks = fallbacks;
-    }
-    if let Some(failover) = request.failover {
-        config.failover = failover;
-    }
-    // Shape first (counts, duplicates), then the scan, then the live checks.
-    crate::config::validate_route(config.route.as_ref(), &config.fallbacks, &config.failover)?;
-    state.runtime.ensure_model_catalogs(&user.id).await;
-    for entry in config.route.iter().chain(&config.fallbacks) {
-        for text in [
-            Some(&entry.provider),
-            Some(&entry.model),
-            entry.account.as_ref(),
-            entry.thinking.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            state.runtime.scan_owner_output(&user.id, text)?;
-        }
-        state
-            .runtime
-            .router()
-            .validate_route_entry(&user.id, entry)?;
-    }
-    // The legacy fields stay in step with the head, for older readers.
-    if let Some(head) = &config.route {
-        config.model = Some(head.model.clone());
-        config.thinking = head.thinking.clone();
-    }
-    let value = serde_json::to_value(&config)?;
-    if !state
-        .store
-        .update_bot(&user.id, &id, &value, &row.prompt, row.enabled)?
-    {
-        return Err(SeraError::NotFound(format!("bot {id}")));
-    }
-    state.runtime.fleet().invalidate(&user.id);
-    state.store.record_audit(
-        &user.id,
-        "bot.route_updated",
-        None,
-        None,
-        None,
-        None,
-        Some(state.runtime.policy_version()),
-        Some(&json!({
-            "id": id,
-            "fallbacks": config.fallbacks.len(),
-            "allow_cross_provider": config.failover.allow_cross_provider,
-            "failover_enabled": config.failover.enabled,
-        })),
-    )?;
+    let patch = BotPatch {
+        route: request.route,
+        fallbacks: request.fallbacks,
+        failover: request.failover,
+        ..BotPatch::default()
+    };
+    let mutation = run_mutation(&state, &user, &id, patch).await?;
     Ok(Json(
-        json!({ "bot": id, "route": route_view(&state, &user.id, &id, Some(&config)) }),
+        json!({ "bot": id, "route": route_view(&state, &user.id, &id, Some(&mutation.config)) }),
     ))
 }
 
