@@ -110,7 +110,12 @@ fn detail(state: &ApiState, user: &ActingUser, manifest: &PluginManifest) -> Res
             }
             auth.push(json!({
                 "id": entry.id,
-                "kind": match entry.kind { AuthKind::OauthLink => "oauth-link", AuthKind::ApiKey => "api-key" },
+                "kind": match entry.kind {
+                    AuthKind::OauthLink => "oauth-link",
+                    AuthKind::ApiKey => "api-key",
+                    AuthKind::Oauth => "oauth",
+                    AuthKind::None => "none",
+                },
                 "fields": fields,
             }));
         }

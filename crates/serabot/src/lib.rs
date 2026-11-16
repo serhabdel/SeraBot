@@ -49,6 +49,7 @@ pub mod logging;
 pub mod maker;
 pub mod marketplace;
 pub mod mcp_client;
+pub mod mcp_oauth;
 pub mod media_jobs;
 pub mod mem0;
 pub mod memory;
