@@ -694,3 +694,36 @@ async fn tool_rows_carry_hints_and_the_callers_own_override_only() {
         .id;
     assert!(world.tools.tool_rows(&other, "fixture").await.is_err());
 }
+
+#[test]
+fn an_override_is_keyed_by_app_when_a_plugin_has_several_http_apps() {
+    let app = |id: &str| App {
+        id: id.into(),
+        name: id.into(),
+        server: Server::Http {
+            url: "https://example.invalid/mcp".into(),
+        },
+        auth: vec![],
+        tools: None,
+        accounts: None,
+    };
+    let single = plugin("one", vec![app("a")]);
+    assert_eq!(tool_mode_key(&single, None, "post").unwrap(), "post");
+    assert_eq!(tool_mode_key(&single, Some("a"), "post").unwrap(), "post");
+    let multi = plugin("two", vec![app("a"), app("b")]);
+    // The same tool name on two apps never shares a switch.
+    assert_eq!(tool_mode_key(&multi, Some("a"), "post").unwrap(), "a/post");
+    assert_eq!(tool_mode_key(&multi, Some("b"), "post").unwrap(), "b/post");
+    assert!(tool_mode_key(&multi, None, "post").is_err());
+    assert!(tool_mode_key(&multi, Some("c"), "post").is_err());
+}
+
+#[tokio::test]
+async fn refresh_locks_are_per_key() {
+    let locks = crate::auth_flows::KeyedLocks::default();
+    let first = locks.get("alice");
+    let _held = first.lock().await;
+    // Another key is free while alice's lock is held; the same key is shared.
+    assert!(locks.get("bob").try_lock().is_ok());
+    assert!(locks.get("alice").try_lock().is_err());
+}

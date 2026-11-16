@@ -38,6 +38,9 @@ pub(super) struct OauthCompleteRequest {
 pub(super) struct ToolModeRequest {
     /// `ask`, `allow`, or `default` to clear the override.
     mode: String,
+    /// The app the tool belongs to; required when the plugin has several.
+    #[serde(default)]
+    app: Option<String>,
 }
 
 /// The secrets store name for one plugin field. Dotted names are allowed by
@@ -515,7 +518,7 @@ pub(super) async fn put_tool_mode(
     Path((slug, tool)): Path<(String, String)>,
     Json(request): Json<ToolModeRequest>,
 ) -> Result<Json<Value>> {
-    find(&state, &slug)?;
+    let manifest = find(&state, &slug)?;
     require_install(&state, &user, &slug)?;
     if tool.is_empty()
         || tool.len() > 128
@@ -534,9 +537,10 @@ pub(super) async fn put_tool_mode(
             ));
         }
     };
+    let key = crate::plugin_runtime::tool_mode_key(manifest, request.app.as_deref(), &tool)?;
     state
         .store
-        .marketplace_tool_mode_set(&user.id, &slug, &tool, mode)?;
+        .marketplace_tool_mode_set(&user.id, &slug, &key, mode)?;
     audit(&state, &user, "marketplace.tool_mode", &slug)?;
     Ok(Json(
         json!({"slug": slug, "tool": tool, "mode": request.mode}),

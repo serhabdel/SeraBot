@@ -786,3 +786,145 @@ async fn disconnecting_deletes_the_tokens_and_the_row_and_names_the_apps_page() 
     assert!(!world.connector.disconnect(&world.user).unwrap());
     assert_eq!(world.connector.view(&world.user).unwrap()["state"], "ready");
 }
+
+// ---- Review fixes ----
+
+#[tokio::test]
+async fn a_403_or_other_stray_4xx_on_refresh_keeps_the_tokens() {
+    for status in [403u16, 404, 422] {
+        let server = MockServer::start().await;
+        mount_refresh(
+            &server,
+            ResponseTemplate::new(status).set_body_json(json!({"message": "secondary rate limit"})),
+            1,
+        )
+        .await;
+        let world = world(&server);
+        seed(&world, 60, 100_000);
+        let failure = world
+            .connector
+            .access_token(&world.user, None)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.problem, Problem::Unreachable, "{status}");
+        let row = world.store.github_connector(&world.user).unwrap().unwrap();
+        assert_eq!(row.state, "connected", "{status}");
+        assert!(world.connector.unseal(&world.user).unwrap().is_some());
+    }
+}
+
+#[tokio::test]
+async fn a_400_or_an_invalid_grant_on_refresh_is_terminal() {
+    for template in [
+        ResponseTemplate::new(400).set_body_json(json!({"message": "bad"})),
+        ResponseTemplate::new(401).set_body_json(json!({"message": "bad"})),
+        ResponseTemplate::new(403).set_body_json(json!({"error": "invalid_grant"})),
+    ] {
+        let server = MockServer::start().await;
+        mount_refresh(&server, template, 1).await;
+        let world = world(&server);
+        seed(&world, 60, 100_000);
+        let failure = world
+            .connector
+            .access_token(&world.user, None)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.problem, Problem::NeedsSignIn);
+        assert_eq!(
+            world
+                .store
+                .github_connector(&world.user)
+                .unwrap()
+                .unwrap()
+                .state,
+            "expired"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_sign_in_cancelled_while_whoami_runs_seals_nothing() {
+    let server = MockServer::start().await;
+    mount_polls(&server, vec![approved()]).await;
+    Mock::given(method("GET"))
+        .and(path("/user"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"login": "synthetic-octocat", "id": 4242}))
+                .set_delay(Duration::from_millis(300)),
+        )
+        .mount(&server)
+        .await;
+    let world = world(&server);
+    world.connector.lock_runs().insert(
+        world.user.clone(),
+        Run {
+            id: 1,
+            status: DeviceStatus::Pending,
+        },
+    );
+    let run = world.connector.run_device(
+        &world.user,
+        1,
+        Zeroizing::new("dc-synthetic".to_owned()),
+        5,
+        900,
+        |_| async {},
+    );
+    let cancel = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        world.connector.disconnect(&world.user).unwrap();
+    };
+    tokio::join!(run, cancel);
+    assert!(world.store.github_connector(&world.user).unwrap().is_none());
+    assert!(world.connector.unseal(&world.user).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_sign_in_replaced_while_whoami_runs_seals_nothing() {
+    let server = MockServer::start().await;
+    mount_polls(&server, vec![approved()]).await;
+    Mock::given(method("GET"))
+        .and(path("/user"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"login": "synthetic-octocat", "id": 4242}))
+                .set_delay(Duration::from_millis(300)),
+        )
+        .mount(&server)
+        .await;
+    let world = world(&server);
+    world.connector.lock_runs().insert(
+        world.user.clone(),
+        Run {
+            id: 1,
+            status: DeviceStatus::Pending,
+        },
+    );
+    let run = world.connector.run_device(
+        &world.user,
+        1,
+        Zeroizing::new("dc-synthetic".to_owned()),
+        5,
+        900,
+        |_| async {},
+    );
+    let replace = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        world.connector.lock_runs().insert(
+            world.user.clone(),
+            Run {
+                id: 2,
+                status: DeviceStatus::Pending,
+            },
+        );
+    };
+    tokio::join!(run, replace);
+    assert!(world.store.github_connector(&world.user).unwrap().is_none());
+    assert!(world.connector.unseal(&world.user).unwrap().is_none());
+    // The newer run still owns the slot.
+    assert_eq!(
+        world.connector.device_status(&world.user),
+        Some(DeviceStatus::Pending)
+    );
+}

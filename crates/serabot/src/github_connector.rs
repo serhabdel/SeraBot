@@ -185,8 +185,8 @@ pub struct GithubConnector {
     net: OauthNet,
     http: reqwest::Client,
     cache: Arc<CatalogCache>,
-    /// One token refresh at a time.
-    refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    /// One token refresh at a time per member.
+    refresh_locks: crate::auth_flows::KeyedLocks,
     runs: Arc<Mutex<HashMap<String, Run>>>,
     next_run: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -217,7 +217,7 @@ impl GithubConnector {
             net,
             http: http_client()?,
             cache: Arc::default(),
-            refresh_lock: Arc::default(),
+            refresh_locks: Default::default(),
             runs: Arc::default(),
             next_run: Arc::default(),
         })
@@ -396,7 +396,7 @@ impl GithubConnector {
         )
         .await;
         let status = match end {
-            PollEnd::Done(tokens) => match self.finish_sign_in(user_id, tokens).await {
+            PollEnd::Done(tokens) => match self.finish_sign_in(user_id, run_id, tokens).await {
                 Ok(login) => DeviceStatus::Connected { login },
                 Err(error) => DeviceStatus::Denied {
                     reason: match error {
@@ -436,23 +436,39 @@ impl GithubConnector {
     }
 
     /// Learn who signed in, then seal the tokens and record the login.
-    async fn finish_sign_in(&self, user_id: &str, tokens: TokenSet) -> Result<String> {
+    async fn finish_sign_in(&self, user_id: &str, run_id: u64, tokens: TokenSet) -> Result<String> {
         let (login, gh_user_id) = self.whoami(&tokens.access_token).await?;
         let (access_at, refresh_at) = expiries(&tokens);
-        self.seal(
-            user_id,
-            &Sealed {
-                access_token: tokens.access_token,
-                refresh_token: tokens.refresh_token,
-            },
-        )?;
-        self.store.github_connector_put(
-            user_id,
-            &login,
-            gh_user_id,
-            access_at.as_deref(),
-            refresh_at.as_deref(),
-        )?;
+        {
+            // Seal only while this run still owns the slot. The guard is held
+            // across the (synchronous) writes, and `disconnect` and a newer
+            // start change the slot under the same lock, so a run that was
+            // replaced or disconnected during `whoami` writes nothing.
+            let runs = self.lock_runs();
+            let current = runs
+                .get(user_id)
+                .is_some_and(|run| run.id == run_id && run.status == DeviceStatus::Pending);
+            if !current {
+                return Err(SeraError::Rejected {
+                    code: "superseded",
+                    message: "this GitHub sign-in was replaced or cancelled".into(),
+                });
+            }
+            self.seal(
+                user_id,
+                &Sealed {
+                    access_token: tokens.access_token,
+                    refresh_token: tokens.refresh_token,
+                },
+            )?;
+            self.store.github_connector_put(
+                user_id,
+                &login,
+                gh_user_id,
+                access_at.as_deref(),
+                refresh_at.as_deref(),
+            )?;
+        }
         self.cache.forget(&cache_owner(user_id));
         if let Err(error) = self.store.record_audit(
             user_id,
@@ -523,9 +539,10 @@ impl GithubConnector {
     /// caller shows [`GithubConnector::manage_url`] so the member can also
     /// revoke the app on GitHub. `false` when nothing was connected.
     pub fn disconnect(&self, user_id: &str) -> Result<bool> {
+        // Cancel any sign-in in flight first, so it cannot seal after this.
+        self.lock_runs().remove(user_id);
         let had_tokens = self.users.delete(user_id, SECRET_ID)?;
         let had_row = self.store.github_connector_delete(user_id)?;
-        self.lock_runs().remove(user_id);
         self.cache.forget(&cache_owner(user_id));
         Ok(had_tokens || had_row)
     }
@@ -560,7 +577,8 @@ impl GithubConnector {
         };
         let (mut sealed, stale) = load()?;
         if stale {
-            let _guard = self.refresh_lock.lock().await;
+            let lock = self.refresh_locks.get(user_id);
+            let _guard = lock.lock().await;
             // Another call may have refreshed while this one waited.
             let (again, still_stale) = load()?;
             sealed = again;
@@ -611,10 +629,15 @@ impl GithubConnector {
         let tokens = match TokenSet::from_body(&body) {
             Ok(tokens) if status.is_success() => tokens,
             // GitHub rejects a bad or revoked refresh token with an error body
-            // (HTTP 200 or 4xx). The grant is gone: keep the login, ask again.
+            // (HTTP 200 or 4xx). Only that, or a 400/401, means the grant is
+            // gone: keep the login, ask again. Anything else (a 403 secondary
+            // rate limit, a stray 4xx) may pass, so the tokens stay.
             _ => {
-                self.expire(user_id);
-                return Err(Failure::needs(Problem::NeedsSignIn));
+                if refresh_is_terminal(status.as_u16(), &body) {
+                    self.expire(user_id);
+                    return Err(Failure::needs(Problem::NeedsSignIn));
+                }
+                return Err(transient());
             }
         };
         let (access_at, refresh_at) = expiries(&tokens);
@@ -860,6 +883,23 @@ fn timestamp(text: &str) -> Option<i64> {
 
 fn rfc3339(seconds: i64) -> Option<String> {
     DateTime::from_timestamp(seconds, 0).map(|at| at.to_rfc3339_opts(SecondsFormat::Secs, true))
+}
+
+/// Whether a failed refresh reply means the grant is dead: HTTP 400 or 401, or
+/// an OAuth error of `bad_refresh_token` or `invalid_grant`.
+fn refresh_is_terminal(status: u16, body: &[u8]) -> bool {
+    if matches!(status, 400 | 401) {
+        return true;
+    }
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .is_some_and(|error| matches!(error.as_str(), "bad_refresh_token" | "invalid_grant"))
 }
 
 /// The access and refresh expiry times of a token set, as stored.

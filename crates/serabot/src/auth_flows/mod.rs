@@ -51,6 +51,27 @@ use crate::user_secrets::ProviderCredential;
 use device::{DevicePoll, DeviceStart, PollEnd};
 use pkce::RedirectSpec;
 
+/// One async lock per key (a user and account), so a slow token endpoint
+/// stalls only that account's refresh and a rotating refresh token is still
+/// never spent twice.
+#[derive(Clone, Default)]
+pub struct KeyedLocks {
+    locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+impl KeyedLocks {
+    /// The lock for `key`; callers `.lock().await` it. Idle entries are
+    /// dropped when the map grows, which cannot break a lock in use because
+    /// holders keep their own `Arc`.
+    pub fn get(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        if locks.len() > 256 {
+            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        }
+        locks.entry(key.to_owned()).or_default().clone()
+    }
+}
+
 /// How long a started flow is remembered.
 pub const FLOW_TTL: Duration = Duration::from_secs(600);
 /// Most flows one member can have open at once; the oldest is dropped.

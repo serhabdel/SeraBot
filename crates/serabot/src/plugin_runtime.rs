@@ -167,6 +167,8 @@ pub fn hints_of(tool: &Value) -> Hints {
 /// override (`"ask"`, `"allow"` or none).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ToolRow {
+    /// The app the tool belongs to; sent back when setting an override.
+    pub app: String,
     pub name: String,
     pub description: String,
     pub read_only: bool,
@@ -192,8 +194,9 @@ pub struct PluginTools {
     cache: Arc<CatalogCache>,
     oauth: OauthAccounts,
     net: OauthNet,
-    /// One token refresh at a time, so a rotating refresh token is not spent twice.
-    refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    /// One token refresh at a time per user and account, so a rotating refresh
+    /// token is not spent twice and one slow server stalls no other user.
+    refresh_locks: crate::auth_flows::KeyedLocks,
     /// Per user, the plugins that could not be used on the last turn.
     problems: Arc<Mutex<HashMap<String, BTreeMap<String, Problem>>>>,
 }
@@ -208,7 +211,7 @@ impl PluginTools {
             users,
             catalog: Arc::new(catalog),
             cache: Arc::new(CatalogCache::default()),
-            refresh_lock: Arc::default(),
+            refresh_locks: Default::default(),
             problems: Arc::default(),
         }
     }
@@ -359,9 +362,10 @@ impl PluginTools {
                 let hints = hints_of(tool);
                 let mode = self
                     .store
-                    .marketplace_tool_mode(user_id, slug, name)?
+                    .marketplace_tool_mode(user_id, slug, &mode_key(manifest, app, name))?
                     .filter(|word| ToolMode::parse(word).is_some());
                 rows.push(ToolRow {
+                    app: app.id.clone(),
                     name: name.to_owned(),
                     description: truncate(
                         tool.get("description")
@@ -394,7 +398,11 @@ impl PluginTools {
                     .find(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name))?;
                 let mode = self
                     .store
-                    .marketplace_tool_mode(user_id, &manifest.slug, tool_name)
+                    .marketplace_tool_mode(
+                        user_id,
+                        &manifest.slug,
+                        &mode_key(manifest, app, tool_name),
+                    )
                     .ok()
                     .flatten()
                     .and_then(|word| ToolMode::parse(&word));
@@ -611,7 +619,10 @@ impl PluginTools {
             record.needs_refresh(now) || rejected == Some(record.access_token.as_str())
         };
         if stale(&record) {
-            let _guard = self.refresh_lock.lock().await;
+            let lock = self
+                .refresh_locks
+                .get(&format!("{user_id}\n{slug}\n{account}"));
+            let _guard = lock.lock().await;
             // Another call may have refreshed while this one waited.
             record = self
                 .oauth
@@ -713,6 +724,36 @@ fn http_apps(manifest: &PluginManifest) -> impl Iterator<Item = &App> {
         .apps
         .iter()
         .filter(|app| matches!(app.server, Server::Http { .. }))
+}
+
+/// The key an approval override is stored under. A plugin with one http app
+/// keys by the tool name alone; with several, by `app/tool`, so a switch set
+/// for one app's tool never reaches a same-named tool on another app.
+fn mode_key(manifest: &PluginManifest, app: &App, tool: &str) -> String {
+    if http_apps(manifest).count() > 1 {
+        format!("{}/{tool}", app.id)
+    } else {
+        tool.to_owned()
+    }
+}
+
+/// The override key for a console request. `app` is required when the plugin
+/// has several http apps and must name one of them.
+pub fn tool_mode_key(manifest: &PluginManifest, app: Option<&str>, tool: &str) -> Result<String> {
+    let apps: Vec<&App> = http_apps(manifest).collect();
+    let chosen = match (apps.as_slice(), app) {
+        ([only], None) => *only,
+        (apps, Some(id)) => *apps
+            .iter()
+            .find(|candidate| candidate.id == id)
+            .ok_or_else(|| SeraError::Validation("app is not part of this plugin".into()))?,
+        _ => {
+            return Err(SeraError::Validation(
+                "this plugin has several apps: name one".into(),
+            ));
+        }
+    };
+    Ok(mode_key(manifest, chosen, tool))
 }
 
 /// The name space of an app's tools: the slug, plus the app id when the plugin
