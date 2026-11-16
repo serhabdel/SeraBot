@@ -306,11 +306,7 @@ pub(crate) fn upstream_error(status: u16, body: &Value, key: &str) -> SeraError 
     } else {
         format!("{base} Composio suggests: {fix}")
     };
-    SeraError::Upstream {
-        status,
-        code,
-        message,
-    }
+    SeraError::upstream(status, code, message)
 }
 
 /// What to do about a rejected key, by the kind its prefix announces. Never
@@ -349,11 +345,11 @@ pub(crate) fn transport_failure(error: reqwest::Error) -> SeraError {
     } else {
         "request failed"
     };
-    SeraError::Upstream {
-        status: 0,
-        code: "composio_unavailable",
-        message: format!("Composio could not be reached ({detail})."),
-    }
+    SeraError::upstream(
+        0,
+        "composio_unavailable",
+        format!("Composio could not be reached ({detail})."),
+    )
 }
 
 pub struct ComposioService {
@@ -1391,6 +1387,7 @@ mod tests {
                 status: got_status,
                 code: got_code,
                 message,
+                ..
             } => {
                 assert_eq!(*got_status, status, "{error:?}");
                 assert_eq!(*got_code, code, "{error:?}");
@@ -2073,6 +2070,7 @@ mod consumer_tests {
             status,
             code,
             message,
+            ..
         } = &error
         else {
             panic!("{error:?}");

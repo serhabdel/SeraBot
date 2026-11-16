@@ -4,8 +4,10 @@ SeraBot talks to OpenAI-compatible chat-completion endpoints. Routing is
 configuration-driven. Builtin kinds supply an OpenAI-compatible base. A live
 model catalog is optional and cached in process memory per user and provider. When it
 loads, it is the list offered and accepted; the allowlist is the fallback. See
-[providers.md](providers.md). There is no automatic cross-provider fallback and no client-supplied
-endpoint.
+[providers.md](providers.md). A bot may list a route and up to two fallbacks, and a turn may move along
+them when a call fails (see [Bot routes and failover](#bot-routes-and-failover)).
+Cross-provider failover is off unless the bot's policy allows it. There is no
+client-supplied endpoint.
 
 ## Providers and allowed models
 
@@ -122,6 +124,53 @@ during that turn re-validate the pinned route. Consequently:
 Approval flow and gateway policy are unchanged: a provider change never bypasses
 approvals, the blocklist, or audit.
 
+## Bot routes and failover
+
+A bot's configuration may carry a `route` (provider, model, optional thinking
+level, optional account), up to two `fallbacks`, and a `failover` policy:
+
+```toml
+[route]
+provider = "anthropic"
+model = "claude-example"
+thinking = "high"
+
+[[fallbacks]]
+provider = "default"
+model = "mistral-large-latest"
+
+[failover]
+enabled = true
+switch_account_first = true
+max_switches = 3
+allow_cross_provider = false
+```
+
+Set it through `PUT /v1/bots/{id}/route`. The save is refused for more than two
+fallbacks, a repeated route, a model the catalog does not offer, a thinking
+level the model does not support, or a provider without data-egress approval.
+A template may name a provider; it resolves per user, and a user who cannot run
+it follows their default route. The route head wins over a delegate's model
+class. Editing the route, fallbacks or policy makes queued pins stale, so the
+owner resubmits.
+
+On every model call the runtime orders candidates: the head provider's accounts
+that are not disabled, signed out, cooling or quota-held (best account first,
+the conversation's last account before the rest), then fallback 1, then fallback
+2. A failure records a hold in `provider_holds` (a rate limit until its
+`retry_after`, a spent quota until its reset, a model failure for ten minutes),
+writes a `route_events` row and emits a `route_switched` event. At most
+`max_switches` switches happen in one call. When every candidate fails the call
+returns `all_routes_failed` with stable reason words only.
+
+Failover never happens for a policy or content block, a blocked egress, a
+cancelled call, a rejected request or a context that is too long. It never
+happens while the turn has an action that is `dispatching` or `outcome_unknown`.
+A fallback on another provider runs only with `allow_cross_provider`; it
+strips provider-bound reasoning, drops a thinking level the new model lacks, and
+re-runs the blocklist and egress scans. Holds and accounts are scoped to the
+acting user.
+
 ## Policy and audit
 
 Provider/model identifiers, the catalog, selections, tool specifications, and
@@ -186,4 +235,4 @@ Keep the in-process allowlist `ModelRouter`. Do not adopt LiteLLM, RouteLLM, or 
 
 **Optional later fine-tune.** Offline training on owner labels only. The classifier may emit only `routine`, `synthesis`, or abstain, and that label still goes through `select_class`. An embedded 8B router stays out of the process. This does not put a fine-tuned chat model on the deployment host.
 
-**Deferred.** Host-pinning `openrouter` and the other loose kinds, keyword class hints, a learned router, and cross-provider retry.
+**Deferred.** Host-pinning `openrouter` and the other loose kinds, keyword class hints, and a learned router.

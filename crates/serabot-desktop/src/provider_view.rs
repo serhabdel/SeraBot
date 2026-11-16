@@ -179,6 +179,29 @@ pub fn validate_provider_draft(
 /// state of an OAuth provider (Antigravity, Muse); every other provider is
 /// judged by the account's own credential and the last model-list fetch.
 pub fn connection(provider: &ProviderStatus, oauth_signed_in: bool) -> Connection {
+    // Accounts decide first: one that works is a connection; accounts that
+    // all need a new key or sign-in say so, in the provider's own words.
+    if !provider.accounts.is_empty() {
+        let state =
+            |account: &crate::api::ProviderAccount| crate::provider_accounts::state_of(account);
+        let any_usable = provider
+            .accounts
+            .iter()
+            .any(|account| state(account).usable());
+        let any_stale = provider
+            .accounts
+            .iter()
+            .any(|account| state(account) == crate::provider_accounts::AccountState::NeedsReauth);
+        let signs_in = provider.auth == "oauth";
+        return match (any_usable, any_stale, signs_in) {
+            (true, _, true) => Connection::SignedIn,
+            (true, _, false) => Connection::Connected,
+            (false, true, true) => Connection::NotSignedIn,
+            (false, true, false) => Connection::KeyRejected,
+            (false, false, true) => Connection::SignedIn,
+            (false, false, false) => Connection::Connected,
+        };
+    }
     if provider.auth == "oauth" {
         return if oauth_signed_in {
             Connection::SignedIn
@@ -258,6 +281,10 @@ pub struct PickerRow {
     pub model: String,
     pub context: Option<String>,
     pub tags: Vec<&'static str>,
+    /// The thinking levels the model accepts, weakest first.
+    pub thinking: Vec<String>,
+    /// The member's usable account ids for this provider, best first.
+    pub account_ids: Vec<String>,
 }
 
 /// Rows for the picker, in server order, each tagged with its provider so the
@@ -272,6 +299,8 @@ pub fn picker_rows(entries: &[CatalogEntry], tidy: impl Fn(&str) -> String) -> V
             model: entry.model.clone(),
             context: entry.context_length.map(format_context),
             tags: entry.tags.iter().filter_map(|tag| tag_label(tag)).collect(),
+            thinking: entry.thinking.clone(),
+            account_ids: entry.account_ids.clone(),
         })
         .collect()
 }
@@ -349,6 +378,47 @@ mod tests {
     }
 
     #[test]
+    fn accounts_decide_the_connection_before_the_legacy_key() {
+        use crate::api::ProviderAccount;
+        let with = |auth: &str, statuses: &[&str]| {
+            let mut p = provider(auth, false, "unchecked", "fallback");
+            p.accounts = statuses
+                .iter()
+                .enumerate()
+                .map(|(n, status)| ProviderAccount {
+                    id: format!("a{n}"),
+                    status: (*status).into(),
+                    ..ProviderAccount::default()
+                })
+                .collect();
+            p
+        };
+        // One working account is a connection even with no legacy key.
+        assert_eq!(
+            connection(&with("api_key", &["ok", "needs_reauth"]), false).label(),
+            "Connected"
+        );
+        assert_eq!(
+            connection(&with("oauth", &["ok"]), false).label(),
+            "Signed in"
+        );
+        // Every account stale: ask for a new key or a new sign-in.
+        assert_eq!(
+            connection(&with("api_key", &["needs_reauth"]), false).label(),
+            "Key rejected"
+        );
+        assert_eq!(
+            connection(&with("oauth", &["needs_reauth"]), false).label(),
+            "Not signed in"
+        );
+        // Cooling or out of quota is still a connection; the row says why.
+        assert_eq!(
+            connection(&with("api_key", &["rate_limited", "disabled"]), false).label(),
+            "Connected"
+        );
+    }
+
+    #[test]
     fn model_line_says_where_the_list_came_from() {
         let mut live = provider("api_key", true, "ok", "live");
         live.model_count = 42;
@@ -393,6 +463,7 @@ mod tests {
                 context_length: Some(131_072),
                 tags: vec!["vision".into(), "tools".into(), "mystery".into()],
                 thinking: Vec::new(),
+                account_ids: Vec::new(),
             },
             CatalogEntry {
                 provider: "default".into(),
@@ -402,12 +473,14 @@ mod tests {
                 context_length: None,
                 tags: Vec::new(),
                 thinking: Vec::new(),
+                account_ids: Vec::new(),
             },
         ];
         let rows = picker_rows(&entries, |model| model.replace('-', " "));
         assert_eq!(rows[0].title, "Mistral Large 3");
         assert_eq!(rows[0].context.as_deref(), Some("128K"));
         assert_eq!(rows[0].tags, vec!["Vision", "Tools"]);
+        assert!(rows[0].thinking.is_empty() && rows[0].account_ids.is_empty());
         assert_eq!(rows[0].value, "default|mistral-large-latest");
         assert_eq!(rows[1].title, "codestral latest");
         assert!(rows[1].context.is_none());
@@ -442,6 +515,14 @@ mod tests {
         let bare: CatalogEntry =
             serde_json::from_str(r#"{"provider":"default","model":"m"}"#).unwrap();
         assert!(bare.tags.is_empty() && bare.name.is_none());
+        // The new fields arrive with the account-aware server and default without it.
+        let rich: CatalogEntry = serde_json::from_str(
+            r#"{"provider":"p","model":"m","thinking_levels":["low"],"thinking":["low"],"account_ids":["a1","a2"]}"#,
+        )
+        .unwrap();
+        assert_eq!(rich.account_ids, ["a1", "a2"]);
+        assert_eq!(picker_rows(&[rich], |m| m.to_owned())[0].thinking, ["low"]);
+        assert!(bare.account_ids.is_empty());
     }
 
     #[test]

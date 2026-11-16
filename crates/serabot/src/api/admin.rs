@@ -186,24 +186,24 @@ pub(super) fn oauth_profile(
         .ok_or_else(|| SeraError::NotFound(format!("provider {id}")))
 }
 
-pub(super) fn oauth_secret_name(configured: &str, default: &str) -> String {
-    if configured.trim().is_empty() {
-        default.to_owned()
-    } else {
-        configured.to_owned()
+/// A sign-in failure as the admin console reads it: our own words for a
+/// refusal, and a plain sentence for anything the provider did.
+fn signin_admin_error(error: SeraError) -> (StatusCode, Json<Value>) {
+    match error {
+        SeraError::Rejected { message, .. } => admin_error(SeraError::Validation(message)),
+        SeraError::Validation(_) | SeraError::Config(_) | SeraError::NotFound(_) => {
+            admin_error(error)
+        }
+        _ => admin_error(SeraError::Validation(
+            "Sign-in could not be completed. Start it again.".into(),
+        )),
     }
 }
 
-pub(super) fn release_oauth(state: &ApiState, id: &str) {
-    state
-        .oauth_inflight
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .remove(id);
-}
-
-/// Begin a provider sign-in. PKCE providers get their authorization URL; the
-/// browser leg and loopback listener run on the owner's machine. Device
+/// Begin a provider sign-in for the acting admin. The result is the admin's own
+/// account in the per-user store, exactly as a member's would be; the pre-0.49
+/// age-store path is gone. PKCE providers get their authorization URL (the
+/// browser leg and loopback listener run on the owner's machine); device
 /// providers start a bounded background poll and return the code to enter.
 pub(super) async fn admin_provider_oauth_start(
     State(state): State<Arc<ApiState>>,
@@ -214,100 +214,53 @@ pub(super) async fn admin_provider_oauth_start(
     require_admin(&user).map_err(admin_error)?;
     let admin = admin_store(&state)?;
     let profile = oauth_profile(&state, admin, &id).map_err(admin_error)?;
-    let request = body.map(|Json(body)| body).unwrap_or_default();
-    match crate::providers::canonical_kind(&profile.kind)
-        .map_err(admin_error)?
-        .as_str()
-    {
-        "google-antigravity" => {
-            let url = crate::cloud_code::authorize_url(
-                &request.redirect_uri,
-                &request.challenge,
-                &request.state,
-            )
-            .map_err(|_| admin_error(SeraError::Validation("invalid sign-in request".into())))?;
-            Ok(Json(json!({"flow": "pkce", "url": url})))
-        }
-        "muse-code" => {
-            let api_name = oauth_secret_name(&profile.api_key_secret, "muse_code_api_key");
-            let identity_name =
-                oauth_secret_name(&profile.refresh_token_secret, "muse_code_identity");
-            let first = state
-                .oauth_inflight
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .insert(id.clone());
-            if !first {
-                return Err(admin_error(SeraError::InvalidState(
-                    "a sign-in for this provider is already running".into(),
-                )));
-            }
-            let (tx, rx) = tokio::sync::oneshot::channel::<(String, String)>();
-            let task_state = state.clone();
-            let task_id = id.clone();
-            let task_user_id = user.id.clone();
-            tokio::spawn(async move {
-                use secrecy::ExposeSecret;
-                let outcome = async {
-                    let http = reqwest::Client::builder()
-                        .timeout(Duration::from_secs(30))
-                        .redirect(reqwest::redirect::Policy::none())
-                        .build()
-                        .map_err(|_| SeraError::External("sign-in could not start".into()))?;
-                    let mut tx = Some(tx);
-                    tokio::time::timeout(
-                        Duration::from_secs(900),
-                        crate::providers::login_muse_code(&http, |url, code| {
-                            if let Some(tx) = tx.take() {
-                                let _ = tx.send((url.to_owned(), code.to_owned()));
-                            }
-                        }),
-                    )
-                    .await
-                    .map_err(|_| SeraError::External("sign-in timed out".into()))?
-                }
-                .await;
-                let event = match outcome {
-                    Ok(credentials) => match task_state.secrets.persist(&[
-                        (api_name.as_str(), credentials.api_key.expose_secret()),
-                        (
-                            identity_name.as_str(),
-                            credentials.identity_token.expose_secret(),
-                        ),
-                    ]) {
-                        Ok(()) => "config.provider_oauth_signed_in",
-                        Err(_) => "config.provider_oauth_failed",
-                    },
-                    Err(_) => "config.provider_oauth_failed",
-                };
-                let _ = audit_config(
-                    &task_state,
-                    &task_user_id,
-                    event,
-                    json!({"provider": task_id, "kind": "muse-code"}),
-                );
-                release_oauth(&task_state, &task_id);
-            });
-            match tokio::time::timeout(Duration::from_secs(15), rx).await {
-                Ok(Ok((url, code))) => {
-                    Ok(Json(json!({"flow": "device", "url": url, "code": code})))
-                }
-                _ => {
-                    release_oauth(&state, &id);
-                    Err(admin_error(SeraError::Validation(
-                        "sign-in could not be started".into(),
-                    )))
-                }
-            }
-        }
-        _ => Err(admin_error(SeraError::Validation(
+    let kind = crate::providers::canonical_kind(&profile.kind).map_err(admin_error)?;
+    super::provider_accounts::plan_signin_gate(&user, &profile, &kind).map_err(admin_error)?;
+    let flows = state.signin.registry().flows_for(&kind);
+    let Some(first) = flows.first().copied() else {
+        return Err(admin_error(SeraError::Validation(
             "this provider does not use OAuth sign-in".into(),
-        ))),
-    }
+        )));
+    };
+    let flow = crate::auth_flows::FlowKind::parse(first)
+        .ok_or_else(|| admin_error(SeraError::Internal("unknown sign-in flow".into())))?;
+    let request = body.map(|Json(body)| body).unwrap_or_default();
+    let some = |value: String| Some(value).filter(|value| !value.is_empty());
+    let started = state
+        .signin
+        .start(
+            &user.id,
+            &id,
+            &kind,
+            crate::auth_flows::StartRequest {
+                flow: Some(flow),
+                redirect_uri: some(request.redirect_uri),
+                challenge: some(request.challenge),
+                state: some(request.state),
+            },
+        )
+        .await
+        .map_err(signin_admin_error)?;
+    Ok(Json(match flow {
+        crate::auth_flows::FlowKind::Pkce => json!({
+            "flow": "pkce",
+            "url": started.url,
+            "flow_id": started.flow_id,
+        }),
+        crate::auth_flows::FlowKind::Device => json!({
+            "flow": "device",
+            "url": started.url,
+            "code": started.user_code,
+            "flow_id": started.flow_id,
+            "expires_in": started.expires_in,
+            "interval": started.interval,
+        }),
+    }))
 }
 
 /// Finish a PKCE sign-in with the code the console caught on its loopback
-/// listener. Tokens are stored server-side and never returned.
+/// listener. The account is stored sealed under the acting admin; nothing
+/// secret is returned and no restart is needed.
 pub(super) async fn admin_provider_oauth_complete(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
@@ -315,63 +268,60 @@ pub(super) async fn admin_provider_oauth_complete(
     Json(request): Json<OAuthCompleteRequest>,
 ) -> AdminResult<Json<Value>> {
     require_admin(&user).map_err(admin_error)?;
-    use secrecy::ExposeSecret;
     let admin = admin_store(&state)?;
     let profile = oauth_profile(&state, admin, &id).map_err(admin_error)?;
-    if crate::providers::canonical_kind(&profile.kind).map_err(admin_error)? != "google-antigravity"
-    {
+    let kind = crate::providers::canonical_kind(&profile.kind).map_err(admin_error)?;
+    super::provider_accounts::plan_signin_gate(&user, &profile, &kind).map_err(admin_error)?;
+    if !state.signin.registry().flows_for(&kind).contains(&"pkce") {
         return Err(admin_error(SeraError::Validation(
             "this provider does not use a browser code sign-in".into(),
         )));
     }
-    let access_name = oauth_secret_name(&profile.api_key_secret, "antigravity_access_token");
-    let refresh_name =
-        oauth_secret_name(&profile.refresh_token_secret, "antigravity_refresh_token");
-    let client_name = oauth_secret_name(
-        &profile.oauth_client_secret_secret,
-        "antigravity_oauth_client_secret",
-    );
-    let client_secret = state.secrets.get(&client_name).ok_or_else(|| {
-        admin_error(SeraError::Validation(format!(
-            "store the OAuth client secret as {client_name} first"
-        )))
-    })?;
-    let login = crate::cloud_code::complete_antigravity_login(
-        &client_secret,
-        &request.code,
-        &request.redirect_uri,
-        &request.verifier,
-    )
-    .await
-    .map_err(|error| match error {
-        SeraError::Validation(_) | SeraError::Config(_) => admin_error(error),
-        _ => admin_error(SeraError::Validation(
-            "Google sign-in could not be completed. Start it again.".into(),
-        )),
-    })?;
-    state
-        .secrets
-        .persist(&[
-            (access_name.as_str(), login.access_token.expose_secret()),
-            (refresh_name.as_str(), login.refresh_token.expose_secret()),
-        ])
-        .map_err(admin_error)?;
-    let project_saved = match login.project_id.as_deref() {
-        Some(project) => admin
-            .set_provider_project_if_empty(&id, project)
-            .unwrap_or(false),
-        None => false,
+    let outcome = state
+        .signin
+        .complete(
+            &user.id,
+            &id,
+            &kind,
+            crate::auth_flows::CompleteRequest {
+                flow_id: None,
+                code: request.code,
+                redirect_uri: Some(request.redirect_uri).filter(|uri| !uri.is_empty()),
+                verifier: Some(request.verifier),
+            },
+        )
+        .await;
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            audit_config(
+                &state,
+                &user.id,
+                "config.provider_oauth_failed",
+                json!({"provider": id, "kind": kind}),
+            )?;
+            return Err(signin_admin_error(error));
+        }
     };
+    state.runtime.invalidate_model_credentials(Some(&user.id));
+    let project_discovered = state
+        .accounts
+        .get(&user.id, &id, &outcome.account_id)
+        .ok()
+        .flatten()
+        .is_some_and(|account| account.identity.get("project_id").is_some());
     audit_config(
         &state,
         &user.id,
         "config.provider_oauth_signed_in",
-        json!({"provider": id, "kind": "google-antigravity", "project_discovered": login.project_id.is_some()}),
+        json!({"provider": id, "kind": kind, "account": outcome.account_id,
+               "project_discovered": project_discovered}),
     )?;
     Ok(Json(json!({
         "signed_in": true,
-        "project_saved": project_saved,
-        "restart_required": true
+        "account_id": outcome.account_id,
+        "created": outcome.created,
+        "project_discovered": project_discovered,
     })))
 }
 

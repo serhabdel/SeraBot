@@ -241,6 +241,25 @@ impl Config {
             .map_err(|error| SeraError::Config(format!("llm.providers.{id}: {error}")))?;
             crate::cloud_code::validate_project_id(&profile.kind, &profile.project_id)
                 .map_err(|error| SeraError::Config(format!("llm.providers.{id}: {error}")))?;
+            if !profile.client_version.is_empty()
+                && !crate::cloud_code::client_version_ok(&profile.client_version)
+            {
+                return Err(SeraError::Config(format!(
+                    "llm.providers.{id}: client_version must look like 2.25.0"
+                )));
+            }
+            if profile.plan_oauth {
+                if crate::providers::canonical_kind(&profile.kind)? != "anthropic" {
+                    return Err(SeraError::Config(format!(
+                        "llm.providers.{id}: plan_oauth is only for kind = \"anthropic\""
+                    )));
+                }
+                if !valid_secret_name(&profile.oauth_client_id_secret) {
+                    return Err(SeraError::Config(format!(
+                        "llm.providers.{id}: plan_oauth needs oauth_client_id_secret (the secret that holds the Claude OAuth client id)"
+                    )));
+                }
+            }
         }
         if self.embeddings.dimension == 0 || self.embeddings.dimension > 4096 {
             return Err(SeraError::Config(
@@ -592,6 +611,16 @@ pub struct ProviderConfig {
     /// Cloud Code companion project. Empty omits `project` from the envelope.
     #[serde(default)]
     pub project_id: String,
+    /// The Antigravity Hub version the Cloud Code user agent reports (for
+    /// example `2.25.0`). Empty uses the version pinned in the build.
+    #[serde(default)]
+    pub client_version: String,
+    /// Allow the admin to sign in with a Claude plan (`anthropic` providers
+    /// only). Off by default: Anthropic's terms do not allow a third-party
+    /// product to offer plan sign-in, so it is opt-in and the account is never
+    /// shared. The OAuth client id comes from `oauth_client_id_secret`.
+    #[serde(default)]
+    pub plan_oauth: bool,
 }
 
 impl Default for ProviderConfig {
@@ -609,6 +638,8 @@ impl Default for ProviderConfig {
             oauth_client_id_secret: String::new(),
             oauth_client_secret_secret: String::new(),
             project_id: String::new(),
+            client_version: String::new(),
+            plan_oauth: false,
         }
     }
 }
@@ -631,6 +662,8 @@ impl LlmConfig {
             oauth_client_id_secret: self.oauth_client_id_secret.clone(),
             oauth_client_secret_secret: self.oauth_client_secret_secret.clone(),
             project_id: self.project_id.clone(),
+            client_version: String::new(),
+            plan_oauth: false,
         }
     }
 }
@@ -1888,6 +1921,144 @@ pub const MAX_BOT_TITLE_CHARS: usize = 40;
 /// Longest shipped bot description, in characters.
 pub const MAX_BOT_TEMPLATE_DESCRIPTION_CHARS: usize = 200;
 
+/// Most fallbacks a bot route may list.
+pub const MAX_ROUTE_FALLBACKS: usize = 2;
+
+/// One model route: a provider, a model, an optional thinking level and an
+/// optional account. With no `account` the user's whole pool for the provider
+/// is eligible, best account first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BotRoute {
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+}
+
+/// When a turn may move to another account, model or provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailoverPolicy {
+    /// Switch at all. Off means the first candidate is the only one tried.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    /// Try the provider's other accounts before the next fallback.
+    #[serde(default = "default_enabled")]
+    pub switch_account_first: bool,
+    /// Most switches in one model call.
+    #[serde(default = "default_max_switches")]
+    pub max_switches: u8,
+    /// Let a fallback name another provider. Each such provider must also be
+    /// egress-approved.
+    #[serde(default)]
+    pub allow_cross_provider: bool,
+}
+
+fn default_max_switches() -> u8 {
+    3
+}
+
+/// Largest `max_switches` a route may ask for.
+pub const MAX_ROUTE_SWITCHES: u8 = 8;
+
+impl Default for FailoverPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            switch_account_first: true,
+            max_switches: default_max_switches(),
+            allow_cross_provider: false,
+        }
+    }
+}
+
+impl FailoverPolicy {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl BotRoute {
+    /// Shape checks that need no catalog: ids, a known thinking level, a
+    /// well-formed account id. The live catalog, the model's thinking levels
+    /// and the egress approval are checked where the router is available.
+    pub fn validate_shape(&self) -> Result<()> {
+        let bad = |what: &str| SeraError::Validation(format!("route {what} is invalid"));
+        if self.provider.is_empty()
+            || self.provider.len() > 64
+            || !self
+                .provider
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(bad("provider"));
+        }
+        if !crate::providers::valid_model_id(&self.model) {
+            return Err(bad("model"));
+        }
+        if let Some(level) = &self.thinking
+            && !crate::thinking::is_known_level(level)
+        {
+            return Err(SeraError::Rejected {
+                code: "thinking_unavailable",
+                message: "That thinking level isn't available".into(),
+            });
+        }
+        if let Some(account) = &self.account
+            && account != "default"
+            && !crate::user_secrets::valid_account_id(account)
+        {
+            return Err(bad("account"));
+        }
+        Ok(())
+    }
+}
+
+/// Check a bot's route, fallbacks and failover policy: at most
+/// [`MAX_ROUTE_FALLBACKS`] fallbacks, no repeated route, fallbacks only with a
+/// primary, and each entry well formed.
+pub fn validate_route(
+    route: Option<&BotRoute>,
+    fallbacks: &[BotRoute],
+    failover: &FailoverPolicy,
+) -> Result<()> {
+    if fallbacks.len() > MAX_ROUTE_FALLBACKS {
+        return Err(SeraError::Rejected {
+            code: "too_many_fallbacks",
+            message: format!("A bot can list at most {MAX_ROUTE_FALLBACKS} fallbacks"),
+        });
+    }
+    if route.is_none() && !fallbacks.is_empty() {
+        return Err(SeraError::Validation(
+            "fallbacks need a primary route".into(),
+        ));
+    }
+    if failover.max_switches > MAX_ROUTE_SWITCHES {
+        return Err(SeraError::Validation(format!(
+            "max_switches must be at most {MAX_ROUTE_SWITCHES}"
+        )));
+    }
+    let mut seen: Vec<&BotRoute> = Vec::new();
+    for entry in route.into_iter().chain(fallbacks) {
+        entry.validate_shape()?;
+        if seen.iter().any(|other| {
+            other.provider == entry.provider
+                && other.model == entry.model
+                && other.account == entry.account
+        }) {
+            return Err(SeraError::Rejected {
+                code: "duplicate_route",
+                message: "A route can appear only once in a bot's chain".into(),
+            });
+        }
+        seen.push(entry);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BotConfig {
     pub name: String,
@@ -1921,6 +2092,15 @@ pub struct BotConfig {
     pub role: BotRole,
     #[serde(default)]
     pub delegates: Vec<String>,
+    /// Where this bot's model calls go first. `None` follows the user's
+    /// default route, then the legacy `model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<BotRoute>,
+    /// Up to two routes tried after `route` when it fails.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallbacks: Vec<BotRoute>,
+    #[serde(default, skip_serializing_if = "FailoverPolicy::is_default")]
+    pub failover: FailoverPolicy,
 }
 
 impl BotConfig {
@@ -2005,6 +2185,8 @@ pub fn load_bots(config: &Config, dir: impl AsRef<Path>) -> Result<Vec<LoadedBot
             )));
         }
         bot.validate_metadata()
+            .map_err(|error| SeraError::Config(format!("{}: {error}", path.display())))?;
+        validate_route(bot.route.as_ref(), &bot.fallbacks, &bot.failover)
             .map_err(|error| SeraError::Config(format!("{}: {error}", path.display())))?;
         let prompt_path = config.path(&bot.system_prompt);
         let canonical = prompt_path.canonicalize().map_err(|error| {
@@ -2335,6 +2517,9 @@ pub fn build_specialist_bot(
         thinking: None,
         role: BotRole::Specialist,
         delegates: Vec::new(),
+        route: None,
+        fallbacks: Vec::new(),
+        failover: Default::default(),
     };
     Ok(ScaffoldedSpecialist {
         id: id.to_owned(),
@@ -2858,6 +3043,113 @@ fn default_link_selector() -> String {
 mod tests {
     use super::*;
 
+    fn route(provider: &str, model: &str) -> BotRoute {
+        BotRoute {
+            provider: provider.into(),
+            model: model.into(),
+            thinking: None,
+            account: None,
+        }
+    }
+
+    #[test]
+    fn routes_allow_two_distinct_fallbacks_and_nothing_more() {
+        let policy = FailoverPolicy::default();
+        let primary = route("default", "a");
+        validate_route(
+            Some(&primary),
+            &[route("default", "b"), route("other", "c")],
+            &policy,
+        )
+        .unwrap();
+        let error = validate_route(
+            Some(&primary),
+            &[
+                route("default", "b"),
+                route("default", "c"),
+                route("other", "d"),
+            ],
+            &policy,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SeraError::Rejected {
+                code: "too_many_fallbacks",
+                ..
+            }
+        ));
+        let error = validate_route(Some(&primary), &[route("default", "a")], &policy).unwrap_err();
+        assert!(matches!(
+            error,
+            SeraError::Rejected {
+                code: "duplicate_route",
+                ..
+            }
+        ));
+        assert!(validate_route(None, &[route("default", "b")], &policy).is_err());
+        let mut unknown_level = primary.clone();
+        unknown_level.thinking = Some("ludicrous".into());
+        let error = validate_route(Some(&unknown_level), &[], &policy).unwrap_err();
+        assert!(matches!(
+            error,
+            SeraError::Rejected {
+                code: "thinking_unavailable",
+                ..
+            }
+        ));
+        let greedy = FailoverPolicy {
+            max_switches: MAX_ROUTE_SWITCHES + 1,
+            ..policy
+        };
+        assert!(validate_route(Some(&primary), &[], &greedy).is_err());
+    }
+
+    #[test]
+    fn legacy_bot_rows_without_a_route_still_load() {
+        let config: BotConfig = serde_json::from_value(serde_json::json!({
+            "name": "old",
+            "trigger": "command",
+            "model": "legacy-model",
+            "thinking": "low",
+            "system_prompt": "prompts/old.txt"
+        }))
+        .unwrap();
+        assert!(config.route.is_none());
+        assert!(config.fallbacks.is_empty());
+        assert!(config.failover.is_default());
+        // An unchanged policy is not written back.
+        let value = serde_json::to_value(&config).unwrap();
+        assert!(value.get("failover").is_none() && value.get("route").is_none());
+    }
+
+    #[test]
+    fn a_template_may_name_a_provider_route() {
+        let config: BotConfig = toml::from_str(
+            r#"
+name = "tpl"
+trigger = "command"
+system_prompt = "prompts/tpl.txt"
+
+[route]
+provider = "anthropic"
+model = "synthetic-model"
+thinking = "high"
+
+[[fallbacks]]
+provider = "default"
+model = "synthetic-small"
+
+[failover]
+allow_cross_provider = true
+"#,
+        )
+        .unwrap();
+        validate_route(config.route.as_ref(), &config.fallbacks, &config.failover).unwrap();
+        assert_eq!(config.route.unwrap().provider, "anthropic");
+        assert!(config.failover.allow_cross_provider);
+    }
+
     #[test]
     fn shipped_bots_only_name_known_tools() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bots");
@@ -2889,6 +3181,48 @@ mod tests {
             checked += 1;
         }
         assert!(checked >= 5, "expected the shipped bot files");
+    }
+
+    fn config_with_provider(profile: ProviderConfig) -> Config {
+        let mut config = Config::default();
+        config.api.enabled = false;
+        config.llm.base_url = "https://api.example.com/v1".into();
+        config.llm.model = "synthetic".into();
+        config.llm.providers.insert("claude".into(), profile);
+        config
+    }
+
+    /// Claude plan sign-in is opt-in per provider, only for `anthropic`, and
+    /// needs the secret that holds its OAuth client id.
+    #[test]
+    fn plan_oauth_is_off_by_default_and_validated() {
+        let parsed: ProviderConfig = toml::from_str("kind = \"anthropic\"").unwrap();
+        assert!(!parsed.plan_oauth);
+        assert!(!ProviderConfig::default().plan_oauth);
+        let enabled = |kind: &str, client_id: &str| ProviderConfig {
+            kind: kind.into(),
+            plan_oauth: true,
+            oauth_client_id_secret: client_id.into(),
+            ..ProviderConfig::default()
+        };
+        // On, on the right kind, with a client-id secret: fine.
+        config_with_provider(enabled("anthropic", "claude_client_id"))
+            .validate()
+            .unwrap();
+        // Off, with no secret: fine too.
+        config_with_provider(ProviderConfig {
+            kind: "anthropic".into(),
+            ..ProviderConfig::default()
+        })
+        .validate()
+        .unwrap();
+        for (kind, secret) in [("openai", "claude_client_id"), ("anthropic", "")] {
+            let error = config_with_provider(enabled(kind, secret))
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("plan_oauth"), "{kind}: {error}");
+        }
     }
 
     /// A row stored before 0.23 has no title or description and still parses;
@@ -2933,6 +3267,9 @@ mod tests {
             thinking: None,
             role: BotRole::default(),
             delegates: Vec::new(),
+            route: None,
+            fallbacks: Vec::new(),
+            failover: Default::default(),
         };
         let long_title = "t".repeat(MAX_BOT_TITLE_CHARS + 1);
         let long_description = "d".repeat(MAX_BOT_TEMPLATE_DESCRIPTION_CHARS + 1);
@@ -3217,6 +3554,9 @@ mod tests {
                 thinking: None,
                 role: BotRole::default(),
                 delegates: Vec::new(),
+                route: None,
+                fallbacks: Vec::new(),
+                failover: Default::default(),
             },
             prompt: String::new(),
         };

@@ -89,6 +89,22 @@ pub(super) async fn list_providers(
                 "managed": managed,
                 "secrets": secrets,
                 "credential": credential_view(&state, &user.id, &provider.id)?,
+                "accounts": provider_account_views(&state, &user.id, &provider.id)?,
+                "signin": signin_flows(
+                    &state,
+                    is_admin,
+                    &provider.id,
+                    &crate::providers::canonical_kind(&provider.kind)?,
+                ),
+                "signin_risk": signin_risk(
+                    &crate::providers::canonical_kind(&provider.kind)?,
+                    &signin_flows(
+                        &state,
+                        is_admin,
+                        &provider.id,
+                        &crate::providers::canonical_kind(&provider.kind)?,
+                    ),
+                ),
             }))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -154,10 +170,30 @@ pub(super) async fn list_providers(
                     "managed": true,
                     "secrets": secrets,
                     "credential": credential_view(&state, &user.id, &id)?,
+                    "accounts": provider_account_views(&state, &user.id, &id)?,
+                    "signin": signin_flows(
+                        &state,
+                        is_admin,
+                        &id,
+                        &crate::providers::canonical_kind(&profile.kind)?,
+                    ),
+                    "signin_risk": signin_risk(
+                        &crate::providers::canonical_kind(&profile.kind)?,
+                        &signin_flows(
+                            &state,
+                            is_admin,
+                            &id,
+                            &crate::providers::canonical_kind(&profile.kind)?,
+                        ),
+                    ),
                 }));
             }
         }
     }
+    // A provider whose accounts are all disabled leaves the router's list;
+    // keep it on the page so an account can be turned back on.
+    let parked = parked_provider_views(&state, &user.id, is_admin, &providers)?;
+    providers.extend(parked);
 
     Ok(Json(json!({"providers": providers})))
 }
@@ -397,97 +433,12 @@ pub(super) async fn set_default_route(
         ModelSelection {
             provider: request.provider,
             model: request.model,
+            account: None,
         },
     )?;
     Ok(Json(json!({"selection": selection})))
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct ProviderOauthStart {
-    challenge: String,
-    state: String,
-    redirect_uri: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub(super) struct ProviderOauthComplete {
-    code: String,
-    verifier: String,
-    /// Sent by the desktop for symmetry with other flows; the exchange does
-    /// not use it.
-    #[serde(default)]
-    #[allow(dead_code)]
-    redirect_uri: String,
-}
-
-/// Providers that offer a documented browser sign-in for a user. Today that
-/// is OpenRouter only; every other provider takes an API key.
-fn user_sign_in_kind(config: &Config, id: &str) -> Result<()> {
-    let profile = provider_profile(config, id)?;
-    if crate::providers::canonical_kind(&profile.kind)? == "openrouter" {
-        Ok(())
-    } else {
-        Err(SeraError::Validation(
-            "this provider has no sign-in; add its API key".into(),
-        ))
-    }
-}
-
-/// Begin "Sign in with OpenRouter": returns the authorization page for the
-/// desktop to open. The code verifier stays on the desktop.
-pub(super) async fn provider_oauth_start(
-    State(state): State<Arc<ApiState>>,
-    Extension(_user): Extension<ActingUser>,
-    Path(id): Path<String>,
-    Json(request): Json<ProviderOauthStart>,
-) -> Result<Json<Value>> {
-    user_sign_in_kind(&state.config, &id)?;
-    let url = crate::openrouter::authorize_url(
-        &request.redirect_uri,
-        &request.challenge,
-        &request.state,
-    )?;
-    Ok(Json(json!({"flow": "pkce", "url": url})))
-}
-
-/// Finish the sign-in: exchange the one-time code for the user's own
-/// OpenRouter key and store it sealed under their account. The key is never
-/// returned.
-pub(super) async fn provider_oauth_complete(
-    State(state): State<Arc<ApiState>>,
-    Extension(user): Extension<ActingUser>,
-    Path(id): Path<String>,
-    Json(request): Json<ProviderOauthComplete>,
-) -> Result<Json<Value>> {
-    user_sign_in_kind(&state.config, &id)?;
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| SeraError::External("sign-in could not start".into()))?;
-    let key = crate::openrouter::exchange_code(
-        &http,
-        crate::openrouter::KEYS_URL,
-        &request.code,
-        &request.verifier,
-    )
-    .await?;
-    let credential = ProviderCredential {
-        api_key: key,
-        refresh_token: String::new(),
-        ..Default::default()
-    };
-    state.users.set(&user.id, &id, &credential.encode()?)?;
-    state.runtime.invalidate_model_credentials(Some(&user.id));
-    audit_auth(
-        &state,
-        &user.id,
-        "provider.signed_in",
-        json!({"provider": id, "method": "oauth_pkce"}),
-    )?;
-    Ok(Json(json!({"id": id, "configured": true})))
-}
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct SetProviderKeyRequest {
@@ -1376,6 +1327,9 @@ mod tests {
                     thinking: None,
                     role: BotRole::Orchestrator,
                     delegates: vec![],
+                    route: None,
+                    fallbacks: Vec::new(),
+                    failover: Default::default(),
                 },
                 prompt: "test prompt".into(),
             }],

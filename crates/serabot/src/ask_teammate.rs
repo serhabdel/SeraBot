@@ -154,14 +154,19 @@ impl Tool for AskTeammateTool {
             MAX_REASON,
         );
 
-        let selection = self.router.select_class(
-            &context.user_id,
-            Some("routine"),
-            target.config.model.as_deref(),
-            &target.config.name,
-            &Default::default(),
-        )?;
-        let route = self.router.pin(&selection)?;
+        let selection = match self.router.bot_chain(&context.user_id, &target.config).head {
+            Some(head) => head,
+            None => self.router.select_class(
+                &context.user_id,
+                Some("routine"),
+                target.config.model.as_deref(),
+                &target.config.name,
+                &Default::default(),
+            )?,
+        };
+        let route = self
+            .router
+            .pin_for_bot(&context.user_id, &selection, &target.config)?;
         let child_task_id = new_id();
         let text = objective_text(&context.bot, &reason, &objective);
         let payload = json!({
@@ -272,6 +277,9 @@ mod tests {
                 thinking: None,
                 role,
                 delegates: vec![],
+                route: None,
+                fallbacks: Vec::new(),
+                failover: Default::default(),
             },
             prompt: name.into(),
         }

@@ -34,8 +34,12 @@ pub mod oauth;
 pub mod panel;
 pub mod pc_stats;
 pub mod preview;
+pub mod provider_accounts;
+pub mod provider_flow;
 pub mod provider_presets;
 pub mod provider_view;
+pub mod route_chip;
+pub mod route_editor;
 pub mod row_menu;
 pub mod session;
 pub mod signin;
@@ -268,15 +272,18 @@ mod tests {
         assert!(!catalog.allows(&catalog.selection));
         assert!(catalog.allows(&Selection {
             provider: "allowed".into(),
-            model: "small".into()
+            model: "small".into(),
+            account: None,
         }));
         assert!(!catalog.allows(&Selection {
             provider: "allowed".into(),
-            model: "private".into()
+            model: "private".into(),
+            account: None,
         }));
         assert!(!catalog.allows(&Selection {
             provider: "invented".into(),
-            model: "small".into()
+            model: "small".into(),
+            account: None,
         }));
     }
 

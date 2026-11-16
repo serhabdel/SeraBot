@@ -179,14 +179,25 @@ impl Tool for DelegateTool {
             ModelClass::Routine => "routine",
             ModelClass::Synthesis => "synthesis",
         };
-        let selection = self.router.select_class(
-            &context.user_id,
-            Some(class_name),
-            specialist.config.model.as_deref(),
-            &specialist.config.name,
-            &Default::default(),
-        )?;
-        let route = self.router.pin(&selection)?;
+        // The specialist's own route head wins over the class: its owner chose
+        // that model for it. Without one, the class picks.
+        let selection = match self
+            .router
+            .bot_chain(&context.user_id, &specialist.config)
+            .head
+        {
+            Some(head) => head,
+            None => self.router.select_class(
+                &context.user_id,
+                Some(class_name),
+                specialist.config.model.as_deref(),
+                &specialist.config.name,
+                &Default::default(),
+            )?,
+        };
+        let route = self
+            .router
+            .pin_for_bot(&context.user_id, &selection, &specialist.config)?;
 
         let parent_task = self.store.get_task(&context.user_id, task_id)?;
         let help_depth = parent_task
@@ -323,6 +334,9 @@ mod tests {
                 thinking: None,
                 role,
                 delegates,
+                route: None,
+                fallbacks: Vec::new(),
+                failover: Default::default(),
             },
             prompt: name.into(),
         }

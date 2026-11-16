@@ -82,15 +82,15 @@ fn failure(error: McpError, key: &str) -> SeraError {
         McpError::Other(message) => SeraError::External(message),
         McpError::Rpc { code, message } => {
             let text = clean(&scrub_key(&message, key), 240);
-            SeraError::Upstream {
-                status: 400,
-                code: "composio_bad_request",
-                message: if text.is_empty() {
+            SeraError::upstream(
+                400,
+                "composio_bad_request",
+                if text.is_empty() {
                     format!("Composio Connect refused the request (error {code}).")
                 } else {
                     format!("Composio Connect refused the request (error {code}): {text}")
                 },
-            }
+            )
         }
     }
 }

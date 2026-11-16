@@ -3,6 +3,13 @@
 
 use crate::ApiError;
 
+/// The server's code when no model route in a bot's chain could answer.
+pub const ALL_ROUTES_FAILED: &str = "all_routes_failed";
+
+/// The line on the failed-turn card that offers "Retry on <fallback>".
+pub const FAILED_TURN_WITH_FALLBACK: &str =
+    "That turn failed. Your message is still above; send it again on the next route.";
+
 /// The button next to a send failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChatAction {
@@ -52,6 +59,12 @@ pub fn classify_send_error(error: &ApiError) -> ChatFailure {
         ApiError::Http(429) => ChatFailure {
             message: "Too many requests right now. Your message is still in the box. Wait a moment, then send it again.".into(),
             action: ChatAction::Retry,
+        },
+        // Every route of the bot's chain failed or none was ready: the
+        // server sends this code with stable reason words only.
+        ApiError::Coded { code, .. } if code == ALL_ROUTES_FAILED => ChatFailure {
+            message: "None of this bot's routes could answer. Your message is still in the box. Check the accounts on AI keys, then send it again.".into(),
+            action: ChatAction::OpenKeys,
         },
         ApiError::Coded { message, code, .. } => from_sentence(message, Some(code)),
         ApiError::Rejected(message) => from_sentence(message, None),
@@ -146,6 +159,19 @@ mod tests {
         assert!(!dumped.message.contains("api_key"));
         assert!(!dumped.message.contains('{'));
         assert_eq!(dumped.action, ChatAction::Retry);
+    }
+
+    #[test]
+    fn every_route_failing_points_at_the_accounts_not_at_json() {
+        let all_failed = classify_send_error(&ApiError::Coded {
+            status: 422,
+            code: ALL_ROUTES_FAILED.into(),
+            message: "No model route could answer (rate_limited; quota_exhausted)".into(),
+        });
+        assert_eq!(all_failed.action, ChatAction::OpenKeys);
+        assert!(all_failed.message.contains("routes could answer"));
+        assert!(!all_failed.message.contains("rate_limited"));
+        assert!(FAILED_TURN_WITH_FALLBACK.contains("next route"));
     }
 
     #[test]

@@ -211,6 +211,94 @@ impl UserSecrets {
             .delete_user_credential(user_id, &vault_provider_token_id(provider_id))
     }
 
+    /// Seal one provider account's credential under the reserved id
+    /// `acct:<provider>:<account_id>`. The associated data binds the blob to
+    /// the user and to that id, so it cannot be moved to another account.
+    pub fn set_account(
+        &self,
+        user_id: &str,
+        provider: &str,
+        account_id: &str,
+        value: &str,
+    ) -> Result<()> {
+        let id = account_provider_id(provider, account_id)?;
+        validate_value(value)?;
+        let _write = self.lock_writes();
+        self.seal_and_store(user_id, &id, value)
+    }
+
+    /// The acting user's credential for one account, if it exists.
+    pub fn get_account(
+        &self,
+        user_id: &str,
+        provider: &str,
+        account_id: &str,
+    ) -> Result<Option<SecretString>> {
+        let id = account_provider_id(provider, account_id)?;
+        self.get_unchecked(user_id, &id)
+    }
+
+    /// Read, change and write back one account's JSON credential under the
+    /// write lock, like [`Self::update_provider`] for the legacy row.
+    /// `change` returns an error to leave the blob as it is.
+    pub(crate) fn update_account(
+        &self,
+        user_id: &str,
+        provider: &str,
+        account_id: &str,
+        change: impl FnOnce(&mut ProviderCredential) -> Result<()>,
+    ) -> Result<()> {
+        let id = account_provider_id(provider, account_id)?;
+        let _write = self.lock_writes();
+        let secret = self
+            .get_unchecked(user_id, &id)?
+            .ok_or_else(|| SeraError::NotFound("account".into()))?;
+        let mut credential = ProviderCredential::parse(&secret)?;
+        change(&mut credential)?;
+        self.seal_and_store(user_id, &id, &credential.encode()?)
+    }
+
+    /// Delete the acting user's credential for one account.
+    pub fn delete_account(&self, user_id: &str, provider: &str, account_id: &str) -> Result<bool> {
+        let id = account_provider_id(provider, account_id)?;
+        self.store.delete_user_credential(user_id, &id)
+    }
+
+    /// Seal an account credential without storing it, so the store can write
+    /// the blob and the account row in one transaction.
+    pub(crate) fn seal_account(
+        &self,
+        user_id: &str,
+        provider: &str,
+        account_id: &str,
+        value: &str,
+    ) -> Result<(Vec<u8>, [u8; NONCE_BYTES])> {
+        let id = account_provider_id(provider, account_id)?;
+        validate_value(value)?;
+        if self.store.get_user(user_id)?.is_none() {
+            return Err(SeraError::NotFound(format!("user {user_id}")));
+        }
+        let dek = self.dek(user_id)?;
+        seal(&dek, &credential_aad(user_id, &id), value.as_bytes())
+    }
+
+    /// A stable fingerprint of an API key that is safe to store: SHA-256 over
+    /// the server's master key, the user, the provider and the key. Without the
+    /// master key it cannot be tested against guessed keys, and it never
+    /// equals a hash of the bare token.
+    pub fn key_fingerprint(&self, user_id: &str, provider: &str, key: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(self.master_key.as_slice());
+        hasher.update(b"|fp|");
+        hasher.update(user_id.as_bytes());
+        hasher.update(b"|");
+        hasher.update(provider.as_bytes());
+        hasher.update(b"|");
+        hasher.update(key.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
     fn seal_and_store(&self, user_id: &str, provider: &str, value: &str) -> Result<()> {
         if self.store.get_user(user_id)?.is_none() {
             return Err(SeraError::NotFound(format!("user {user_id}")));
@@ -319,6 +407,7 @@ impl UserSecrets {
         names.retain(|name| {
             !name.starts_with(VAULT_PROVIDER_PREFIX)
                 && !name.starts_with(VAULT_PROVIDER_TOKEN_PREFIX)
+                && !name.starts_with(ACCOUNT_PROVIDER_PREFIX)
         });
         for grant in self.store.list_active_grants_for(user_id)? {
             names.push(grant.provider);
@@ -390,7 +479,9 @@ pub struct ProviderCredential {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
     /// OAuth only: identifies one sign-in. A new sign-in gets a new value, and
-    /// a rotation written for an older sign-in is refused.
+    /// a rotation written for an older sign-in is refused. The account
+    /// refresher also gives every refreshed token set a new value, so a writer
+    /// holding an older copy cannot overwrite a newer one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<String>,
 }
@@ -603,6 +694,43 @@ pub(crate) const VAULT_PROVIDER_TOKEN_PREFIX: &str = "vaultprov:";
 /// The sealed-credential provider id for a password manager's token.
 fn vault_provider_token_id(provider_id: &str) -> String {
     format!("{VAULT_PROVIDER_TOKEN_PREFIX}{provider_id}")
+}
+
+/// Provider-id prefix under which one provider account's credential is sealed.
+pub(crate) const ACCOUNT_PROVIDER_PREFIX: &str = "acct:";
+/// Characters in an account id.
+pub const ACCOUNT_ID_CHARS: usize = 12;
+/// Longest provider id that still fits `acct:<provider>:<id>` in 64 characters.
+pub const MAX_ACCOUNT_PROVIDER_CHARS: usize =
+    MAX_PROVIDER_CHARS - ACCOUNT_PROVIDER_PREFIX.len() - 1 - ACCOUNT_ID_CHARS;
+
+/// Whether `id` has the shape of a generated account id.
+pub fn valid_account_id(id: &str) -> bool {
+    id.len() == ACCOUNT_ID_CHARS
+        && id
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// A fresh random account id.
+pub fn new_account_id() -> String {
+    let mut bytes = [0u8; ACCOUNT_ID_CHARS / 2];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+/// The sealed-credential provider id for one account, at most 64 characters.
+pub(crate) fn account_provider_id(provider: &str, account_id: &str) -> Result<String> {
+    validate_provider(provider)?;
+    if provider.len() > MAX_ACCOUNT_PROVIDER_CHARS {
+        return Err(SeraError::Validation(format!(
+            "an account provider id is at most {MAX_ACCOUNT_PROVIDER_CHARS} characters"
+        )));
+    }
+    if !valid_account_id(account_id) {
+        return Err(SeraError::Validation("invalid account id".into()));
+    }
+    Ok(format!("{ACCOUNT_PROVIDER_PREFIX}{provider}:{account_id}"))
 }
 
 /// Provider ids are config keys: letters, digits, `-`, `_`, and `.`.

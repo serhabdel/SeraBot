@@ -55,6 +55,7 @@ impl Runtime {
                 payload.bot
             )));
         }
+        self.chain_is_current(&user, bot, &payload.route)?;
         if let Some(existing) = self.store.get_turn_by_task(&user, &task.id)? {
             if existing.status == "sending_response" {
                 return Err(SeraError::External(
@@ -72,6 +73,7 @@ impl Runtime {
             let state: TurnState = serde_json::from_value(existing.state.clone())
                 .map_err(|_| SeraError::InvalidState("stored turn state is invalid".into()))?;
             self.checked_route(&user, &state.route)?;
+            self.chain_is_current(&user, bot, &state.route)?;
             if state.route != payload.route {
                 return Err(SeraError::Forbidden(
                     "turn route does not match queued route".into(),
@@ -213,6 +215,7 @@ impl Runtime {
         let bot = fleet
             .get(&turn.bot)
             .ok_or_else(|| SeraError::NotFound(format!("bot {}", turn.bot)))?;
+        self.chain_is_current(&user, bot, &state.route)?;
         let pending = state
             .pending
             .clone()
@@ -271,6 +274,7 @@ impl Runtime {
                         tool_calls: Vec::new(),
                         tool_call_id: Some(pending.call.id.clone()),
                         name: Some(pending.call.name.clone()),
+                        is_error: true,
                     });
                 }
             }
@@ -293,6 +297,7 @@ impl Runtime {
                 tool_calls: Vec::new(),
                 tool_call_id: Some(pending.call.id.clone()),
                 name: Some(pending.call.name.clone()),
+                is_error: true,
             });
         }
         state.pending = None;
@@ -304,6 +309,7 @@ impl Runtime {
                     tool_calls: Vec::new(),
                     tool_call_id: Some(call.id.clone()),
                     name: Some(call.name.clone()),
+                    is_error: true,
                 });
             }
         } else if !pending.remaining.is_empty()
@@ -630,17 +636,26 @@ impl Runtime {
             // Vault values never reach a model: redact a copy of the request.
             let outgoing = self.gateway.redact_messages(&user, &state.messages)?;
             let thinking = self.turn_thinking(&user, conversation_id, &bot);
-            let response = self
-                .router
-                .complete_with_thinking(
-                    &user,
+            let may_switch = self.turn_may_switch(&user, &state);
+            let routed = self
+                .complete_with_failover(
+                    &failover::RouteCall {
+                        user: &user,
+                        task_id: Some(&task.id),
+                        conversation_id,
+                        bot: &turn.bot,
+                    },
                     route,
+                    thinking.as_deref(),
+                    &state.messages,
                     &outgoing,
                     &tool_specs,
                     temperature,
-                    thinking.as_deref(),
+                    may_switch,
                 )
                 .await?;
+            let used = routed.used;
+            let response = routed.response;
             if let Some(reasoning) = response.reasoning.as_deref() {
                 self.emit_thinking(&user, task, turn, reasoning);
             }
@@ -653,7 +668,7 @@ impl Runtime {
                 None,
                 Some(self.gateway.policy().version()),
                 Some(&json!({
-                    "provider": route.selection.provider, "model": route.selection.model,
+                    "provider": used.provider, "model": used.model, "account": used.account,
                     "usage": response.usage,
                     "history_messages": state.history_messages,
                     "prompt_chars_est": estimate_prompt_chars(&state.messages),
@@ -935,18 +950,26 @@ impl Runtime {
         self.scan_model_messages(user, transcript).ok()?;
         let outgoing = self.gateway.redact_messages(user, transcript).ok()?;
         let thinking = self.turn_thinking(user, conversation_id, bot);
+        let may_switch = self.turn_may_switch(user, state);
         let response = self
-            .router
-            .complete_with_thinking(
-                user,
+            .complete_with_failover(
+                &failover::RouteCall {
+                    user,
+                    task_id: None,
+                    conversation_id,
+                    bot: &bot.config.name,
+                },
                 route,
+                thinking.as_deref(),
+                transcript,
                 &outgoing,
                 &[],
                 bot.config.temperature,
-                thinking.as_deref(),
+                may_switch,
             )
             .await
-            .ok()?;
+            .ok()?
+            .response;
         // With no tools offered, any tool calls in the response are ignored.
         let text = response.message.content?;
         let text = text.trim();
@@ -1132,6 +1155,7 @@ impl Runtime {
                         tool_calls: Vec::new(),
                         tool_call_id: Some(call.id.clone()),
                         name: Some(call.name.clone()),
+                        is_error: true,
                     });
                 }
                 Err(error) => {
@@ -1158,6 +1182,7 @@ impl Runtime {
                         tool_calls: Vec::new(),
                         tool_call_id: Some(call.id.clone()),
                         name: Some(call.name.clone()),
+                        is_error: true,
                     });
                 }
             }
@@ -1191,6 +1216,7 @@ impl Runtime {
             tool_calls: Vec::new(),
             tool_call_id: Some(call.id.clone()),
             name: Some(call.name.clone()),
+            is_error: false,
         });
     }
 

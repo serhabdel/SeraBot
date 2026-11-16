@@ -347,6 +347,7 @@ impl Session {
             .map(|(provider, model)| Selection {
                 provider: provider.to_owned(),
                 model: model.to_owned(),
+                account: None,
             });
         let group = NewGroup {
             name,

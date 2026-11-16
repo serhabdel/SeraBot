@@ -117,6 +117,10 @@ pub(super) struct SelectModelRequest {
     provider: String,
     #[serde(default)]
     model: String,
+    /// One of the member's own accounts for the provider; omitted means the
+    /// provider's pool.
+    #[serde(default)]
+    account: Option<String>,
 }
 
 pub(super) async fn select_model(
@@ -130,9 +134,20 @@ pub(super) async fn select_model(
     let selection = if request.provider == crate::model_router::AUTO_PROVIDER {
         ModelSelection::auto_mode()
     } else {
+        let account = request.account.filter(|account| !account.is_empty());
+        // An account id that is not the member's own is a plain 404.
+        if let Some(account) = &account
+            && state
+                .accounts
+                .get(&user.id, &request.provider, account)?
+                .is_none()
+        {
+            return Err(SeraError::NotFound("account".into()));
+        }
         ModelSelection {
             provider: request.provider,
             model: request.model,
+            account,
         }
     };
     let selection = state.runtime.select_model(&user.id, &id, selection)?;

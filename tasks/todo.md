@@ -119,3 +119,16 @@ never merge without the owner's OK.
 - [x] T7.4 Spot-check: workflow/routine rows are `user_id`-scoped; artifact
       preview is gated by `user_owns_artifact` and a 64-hex hash; jobfinder
       `require_approval = []` is consistent (no outbound-effect tools).
+
+## Release 0.49.0 — providers, accounts, routes
+
+- [x] P1 typed errors/classifier; P2 account store; P3 accounts API; P4 sign-in framework.
+- [x] P5-P6c Antigravity member sign-in, wire parity, catalog, quota.
+- [x] P7a/P7b Muse device sign-in and Responses transport.
+- [x] P8 thinking catalog; P9a/P9b Anthropic Messages and thinking; P10 OpenCode/Nous.
+- [x] P11 single-flight refresh; P12 bot routes; P13 failover engine.
+- [x] P14-P16 desktop Providers page, route editor, composer chip.
+- [x] P17 Claude plan OAuth (flag-gated, default off).
+- [x] P18 docs, release notes, version 0.49.0.
+- [ ] P19 (optional) Mistral sign-in.
+- [ ] Live verification against owner-approved accounts (none claimed).

@@ -88,4 +88,6 @@ OVH is read-only unless the owner explicitly authorizes an additive installation
 - `crates/serabot/src/vault.rs`, `vault_providers.rs`, `api/vault.rs`, `api/browser.rs` — per-user vault, password-manager CLIs (cleared child env, `Zeroizing`), and browser autofill (host-bound).
 - `crates/serabot/src/job_tools.rs`, `bots/jobfinder.toml` — `jobfinder` tools; task/calendar tools use the acting user's id.
 - `crates/serabot/src/api/preview.rs`, `api/workflows.rs`, `api/routines.rs` — artifact preview (owner-only, hash-addressed), per-user workflow plans and routines.
-- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.48.0.
+- `crates/serabot/src/accounts.rs`, `api/accounts.rs`, `auth_flows/`, `llm_failure.rs` — per-user provider accounts (sealed, write-only), sign-in flows (PKCE/device; Antigravity, Muse, Claude plan OAuth flag-gated off), single-flight refresh, typed failure classifier (0.49).
+- `crates/serabot/src/wire/`, `route_chain.rs`, `thinking.rs` — Anthropic and Responses transports, bot route chain with failover and holds, thinking levels (0.49).
+- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.49.0.

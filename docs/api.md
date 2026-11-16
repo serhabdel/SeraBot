@@ -543,27 +543,43 @@ about every 5 seconds (roughly 12–20 reads per minute). On `429`, wait for the
 
 ## Provider OAuth sign-in
 
-Owner token required. Both routes live under `/v1/admin/providers/{id}/oauth/`.
-Tokens are stored in the server's encrypted store and are never returned.
+Owner token required. Both routes live under `/v1/admin/providers/{id}/oauth/`
+and since 0.49 write the owner's own account in the per-user store, exactly like
+the member routes `/v1/providers/{id}/signin/*`. Tokens are sealed and never
+returned; no restart is needed.
 
 - `POST .../oauth/start` — `google-antigravity` (PKCE): body
   `{"challenge","state","redirect_uri"}` where `redirect_uri` is the console's
   loopback listener (`http://127.0.0.1:<port>/oauth-callback`). Returns
-  `{"flow":"pkce","url":"https://accounts.google.com/..."}`. `muse-code` (device
-  flow): no body. The server polls in the background (bounded to 15 minutes, one
-  per provider) and returns `{"flow":"device","url","code"}`; the owner enters
-  the code on the page and the key is stored when approved.
+  `{"flow":"pkce","url":"https://accounts.google.com/...","flow_id"}`. `muse-code`
+  (device flow): send `{}`. The server polls in the background (bounded to 15
+  minutes) and returns `{"flow":"device","url","code","flow_id","expires_in","interval"}`;
+  the owner enters the code on the page and the minted key is stored when approved.
 - `POST .../oauth/complete` — PKCE only: body `{"code","verifier","redirect_uri"}`.
   The server exchanges the code with the OAuth client secret already in its
-  store (`antigravity_oauth_client_secret` by default), stores the access and
-  refresh tokens under the provider's secret names, records the discovered Cloud
-  Code project on an owner-managed provider that has none, and returns
-  `{"signed_in":true,"project_saved":bool,"restart_required":true}`.
+  store (`antigravity_oauth_client_secret` by default), reads the email, finds the
+  Cloud Code project, stores the account, and returns
+  `{"signed_in":true,"account_id","created","project_discovered"}`.
 
-A provider of another kind answers `422`; an unknown id `404`. Audit entries
+- `anthropic` (Claude plan sign-in, PKCE): off by default. It exists only for a
+  provider with `plan_oauth = true`, and only the admin can start it (a member
+  gets `403`; a provider without the flag answers `422 signin_unsupported`).
+  `redirect_uri` must be `http://localhost:54545/callback` (or the `127.0.0.1`
+  spelling). `.../oauth/complete` (and the member route `signin/complete`) accept
+  the code as `code`, `code#state` or the whole callback URL. The account is the
+  admin's own and is never shared. See `docs/providers.md`, "Claude plan sign-in".
+
+A provider with no sign-in answers `422`; an unknown id `404`. Audit entries
 (`config.provider_oauth_signed_in` / `config.provider_oauth_failed`) carry the
-provider id and kind only. `GET /v1/providers` reports sign-in state through
-`secrets.refresh_token.configured` (PKCE) or `secrets.api_key.configured` (device).
+provider id, kind and account id only.
+
+`GET /v1/providers` and `GET /v1/providers/{id}/accounts` list the sign-in
+flows a caller may use in `signin`. For a Claude plan sign-in, `signin` is empty
+for members and `signin_risk` (a short text for a banner) is `null`; for the
+admin on an enabled provider `signin` is `["pkce"]` and `signin_risk` carries the
+risk text. An `anthropic` provider otherwise takes API keys:
+`POST /v1/providers/{id}/accounts` with `{"label","api_key"}`, several per
+member, checked with one model-list call.
 
 ## Connector OAuth sign-in (ElevenLabs)
 

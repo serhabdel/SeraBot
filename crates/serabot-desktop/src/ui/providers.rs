@@ -2,7 +2,6 @@ use super::*;
 use crate::ui_widgets::StatusChip;
 use serabot_desktop::provider_presets::{DirectoryFilter, filter_presets, provider_matches_preset};
 use serabot_desktop::theme::Tone;
-use std::collections::BTreeSet;
 
 /// The "Add provider" sheet.
 ///
@@ -177,13 +176,13 @@ pub(super) fn AddProviderSheet(session: Signal<Session>, overlay: Signal<Overlay
                         if preset.auth == "oauth" {
                             div { class: "banner info",
                                 span {
-                                    "Sign-in only. Save the provider first, then press Sign in on its card on the Providers page."
+                                    "Sign-in only. Save the provider first, then press Sign in on its card on the Providers page. You can sign in with more than one account."
                                 }
                             }
                         } else if preset.sign_in == "pkce" {
                             div { class: "banner info",
                                 span {
-                                    "Paste an API key below, or save and use Sign in with {preset.label} on its card."
+                                    "Paste an API key below, or save the provider and use Add account on its card to sign in."
                                 }
                             }
                         } else if preset.auth == "none" {
@@ -261,7 +260,7 @@ pub(super) fn AddProviderSheet(session: Signal<Session>, overlay: Signal<Overlay
                             span { class: "field-label", "Sign-in" }
                             div { class: "banner info",
                                 span {
-                                    "After saving, use the Sign in button on this provider's card. Tokens are encrypted on the server ({secret_name})."
+                                    "After saving, use the Sign in button on this provider's card. Each account's tokens are encrypted for you alone."
                                 }
                             }
                         }
@@ -385,7 +384,6 @@ pub(super) fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) 
     let mut overlay = overlay;
     let mut dir_query = use_signal(String::new);
     let mut dir_filter = use_signal(DirectoryFilter::default);
-    let mut revealed_keys = use_signal(BTreeSet::<String>::new);
     let providers = session.read().state.providers.clone();
     let provider_tests = session.read().state.provider_tests.clone();
     let loaded = session.read().state.providers_loaded;
@@ -458,6 +456,9 @@ pub(super) fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) 
         providers.iter().any(|p| {
             provider_matches_preset(&p.id, &p.kind, preset)
                 && (p.credential.configured
+                    || p.accounts
+                        .iter()
+                        .any(|a| serabot_desktop::provider_accounts::state_of(a).usable())
                     || (p.auth == "oauth" && p.secrets.values().any(|s| s.configured)))
         })
     };
@@ -468,7 +469,7 @@ pub(super) fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) 
             div { class: "pane-head",
                 div {
                     h1 { class: "pane-title", "Providers" }
-                    p { class: "muted", "Add a provider, pull its live models, and pick the route per conversation." }
+                    p { class: "muted", "Add a provider, sign in with one or more accounts, and pick the route per conversation or per bot." }
                 }
                 div { class: "row",
                     button {
@@ -535,7 +536,6 @@ pub(super) fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) 
                             let provider_id = provider.id.clone();
                             let signed_in = provider_signed_in(&provider.kind, &provider.secrets);
                             let conn = provider_view::connection(&provider, signed_in);
-                            let is_oauth = provider.auth == "oauth";
                             let preset = provider_presets::presets()
                                 .iter()
                                 .find(|preset| preset.id == provider.id)
@@ -556,19 +556,9 @@ pub(super) fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) 
                                 branding::brand_label(&provider.kind),
                             );
                             let key_url = preset.map(|p| p.key_url).filter(|url| !url.is_empty());
-                            let takes_key = !is_oauth && preset.is_none_or(|p| p.auth != "none");
-                            let pkce_sign_in = provider.kind == "openrouter";
-                            let signing_in = session.read().oauth_signing_in.as_deref() == Some(provider.id.as_str());
                             let testing = session.read().provider_testing.as_deref() == Some(provider.id.as_str());
                             let test_outcome = provider_tests.get(&provider.id).map(provider_view::format_provider_test);
-                            let draft_key = session
-                                .read()
-                                .provider_key_drafts
-                                .get(&provider.id)
-                                .cloned()
-                                .unwrap_or_default();
-                            let has_key_text = !draft_key.trim().is_empty();
-                            let key_revealed = has_key_text && revealed_keys.read().contains(&provider.id);
+                            let has_accounts = !provider.accounts.is_empty();
                             let model_line = provider_view::model_line(&provider);
                             let shown: Vec<String> = provider.models.iter().take(6).cloned().collect();
                             let extra = provider.models.len().saturating_sub(shown.len());
@@ -629,105 +619,8 @@ pub(super) fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) 
                                     if !routing.is_empty() {
                                         p { class: "tiny", "Used for: {routing}" }
                                     }
-                                    if takes_key {
-                                        div { class: "provider-key-row",
-                                            div { class: "secret-field",
-                                                input {
-                                                    class: "input",
-                                                    r#type: if key_revealed { "text" } else { "password" },
-                                                    autocomplete: "off",
-                                                    spellcheck: false,
-                                                    "aria-label": "API key for {title}",
-                                                    value: "{draft_key}",
-                                                    placeholder: if provider.credential.own { "Paste a new key to replace yours" } else { "Paste your API key" },
-                                                    oninput: {
-                                                        let id = provider.id.clone();
-                                                        move |event| {
-                                                            let next = event.value();
-                                                            if next.is_empty() {
-                                                                revealed_keys.write().remove(&id);
-                                                            }
-                                                            session.write().provider_key_drafts.insert(id.clone(), next);
-                                                        }
-                                                    },
-                                                    onkeydown: {
-                                                        let id = provider.id.clone();
-                                                        move |event: KeyboardEvent| {
-                                                            if event.key() == Key::Enter && can_save && has_key_text {
-                                                                event.prevent_default();
-                                                                session.write().save_provider_key(id.clone());
-                                                            }
-                                                        }
-                                                    },
-                                                }
-                                                button {
-                                                    class: "btn icon ghost sm secret-toggle",
-                                                    r#type: "button",
-                                                    title: if key_revealed { "Hide key" } else { "Show key" },
-                                                    "aria-label": if key_revealed { format!("Hide API key for {title}") } else { format!("Show API key for {title}") },
-                                                    "aria-pressed": if key_revealed { "true" } else { "false" },
-                                                    onclick: {
-                                                        let id = provider.id.clone();
-                                                        move |_| {
-                                                            let mut set = revealed_keys.write();
-                                                            if !set.remove(&id) {
-                                                                set.insert(id.clone());
-                                                            }
-                                                        }
-                                                    },
-                                                    Icon { name: if key_revealed { "eye-off".to_owned() } else { "eye".to_owned() }, size: 14 }
-                                                }
-                                            }
-                                            button {
-                                                class: "btn primary sm",
-                                                r#type: "button",
-                                                disabled: !can_save || !has_key_text,
-                                                title: "Saved to your account only, encrypted. It is never shown again.",
-                                                onclick: {
-                                                    let id = provider.id.clone();
-                                                    move |_| session.write().save_provider_key(id.clone())
-                                                },
-                                                if provider.credential.own { "Replace key" } else { "Save key" }
-                                            }
-                                        }
-                                    }
+                                    AccountsBlock { session, provider_id: provider_id.clone(), overlay }
                                     div { class: "card-actions",
-                                        if pkce_sign_in {
-                                            button {
-                                                class: "btn ghost sm",
-                                                r#type: "button",
-                                                title: "Sign in on openrouter.ai. Your key is created for you and saved to your account.",
-                                                disabled: !can_save || signing_in,
-                                                onclick: {
-                                                    let id = provider.id.clone();
-                                                    let kind = provider.kind.clone();
-                                                    move |_| session.write().sign_in_provider(id.clone(), kind.clone())
-                                                },
-                                                BrandLogo { brand: "openrouter".to_owned(), size: 16 }
-                                                if signing_in { "Waiting for browser…" } else { "Sign in with OpenRouter" }
-                                            }
-                                        }
-                                        if is_oauth {
-                                            button {
-                                                class: if conn.is_connected() { "btn ghost sm" } else { "btn primary sm" },
-                                                r#type: "button",
-                                                title: "Sign in through your browser. Tokens are stored on the server and never shown here.",
-                                                disabled: !can_save || signing_in,
-                                                onclick: {
-                                                    let id = provider.id.clone();
-                                                    let kind = provider.kind.clone();
-                                                    move |_| session.write().sign_in_provider(id.clone(), kind.clone())
-                                                },
-                                                BrandLogo { brand: brand.clone(), size: 16 }
-                                                if signing_in {
-                                                    "Waiting for browser…"
-                                                } else if conn.is_connected() {
-                                                    "Sign in again"
-                                                } else {
-                                                    "Sign in with {title}"
-                                                }
-                                            }
-                                        }
                                         if let Some(url) = key_url {
                                             button {
                                                 class: "btn ghost sm",
@@ -738,17 +631,19 @@ pub(super) fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) 
                                                 "Get a key"
                                             }
                                         }
-                                        button {
-                                            class: "btn ghost sm",
-                                            r#type: "button",
-                                            title: "Ask the provider for its model list with your key",
-                                            disabled: !can_save || testing || !conn.is_connected(),
-                                            onclick: {
-                                                let id = provider.id.clone();
-                                                move |_| session.write().test_provider(id.clone())
-                                            },
-                                            Icon { name: "refresh", size: 14 }
-                                            if testing { "Testing…" } else { "Test" }
+                                        if !has_accounts {
+                                            button {
+                                                class: "btn ghost sm",
+                                                r#type: "button",
+                                                title: "Ask the provider for its model list with the saved key",
+                                                disabled: !can_save || testing || !conn.is_connected(),
+                                                onclick: {
+                                                    let id = provider.id.clone();
+                                                    move |_| session.write().test_provider(id.clone())
+                                                },
+                                                Icon { name: "refresh", size: 14 }
+                                                if testing { "Testing…" } else { "Test" }
+                                            }
                                         }
                                         if !is_default && conn.is_connected() && star_model.is_some() {
                                             button {
@@ -879,6 +774,9 @@ pub(super) fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) 
                                         .cloned();
                                     let is_connected = existing.as_ref().is_some_and(|p| {
                                         p.credential.configured
+                                            || p.accounts.iter().any(|a| {
+                                                serabot_desktop::provider_accounts::state_of(a).usable()
+                                            })
                                             || (p.auth == "oauth" && p.secrets.values().any(|s| s.configured))
                                     });
                                     rsx! {

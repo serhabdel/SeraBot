@@ -1494,6 +1494,7 @@ fn model_command(
                 crate::model_router::ModelSelection {
                     provider: (*provider).to_owned(),
                     model: (*model).to_owned(),
+                    account: None,
                 },
             ) {
                 Ok(selection) => format!(
@@ -2203,6 +2204,9 @@ mod tests {
                 thinking: None,
                 role: crate::orchestration::BotRole::Orchestrator,
                 delegates: vec![],
+                route: None,
+                fallbacks: Vec::new(),
+                failover: Default::default(),
             },
             prompt: "test".into(),
         };

@@ -238,6 +238,9 @@ fn bot() -> LoadedBot {
             thinking: None,
             role: crate::orchestration::BotRole::Orchestrator,
             delegates: vec![],
+            route: None,
+            fallbacks: Vec::new(),
+            failover: Default::default(),
         },
         prompt: "test prompt".into(),
     }
@@ -396,7 +399,8 @@ async fn bot_defaults_catalog_and_unapproved_reads_are_preserved() {
                 "owner",
                 ModelSelection {
                     provider: "default".into(),
-                    model: "test".into()
+                    model: "test".into(),
+                    account: None,
                 }
             )
             .is_err()
@@ -497,6 +501,7 @@ async fn auto_mode_stores_explicit_preference_and_pins_resolved_route() {
         ModelSelection {
             provider: "default".into(),
             model: "test".into(),
+            account: None,
         }
     );
     let task = runtime
@@ -508,6 +513,7 @@ async fn auto_mode_stores_explicit_preference_and_pins_resolved_route() {
         ModelSelection {
             provider: "default".into(),
             model: "test".into(),
+            account: None,
         }
     );
     let persisted: ModelSelection = serde_json::from_str(
@@ -575,6 +581,7 @@ async fn conversation_selection_is_isolated_persisted_and_pinned_at_enqueue() {
     let alternative = ModelSelection {
         provider: "default".into(),
         model: "alternative".into(),
+        account: None,
     };
     runtime
         .select_model(&admin(&store), "one", alternative.clone())
@@ -652,6 +659,7 @@ async fn policy_scans_catalog_selection_and_all_message_metadata() {
     let selection = ModelSelection {
         provider: "default".into(),
         model: "restricted".into(),
+        account: None,
     };
     assert!(
         runtime
@@ -1081,6 +1089,7 @@ async fn approval_suspends_then_resumes_once() {
             ModelSelection {
                 provider: "default".into(),
                 model: "alternative".into(),
+                account: None,
             },
         )
         .unwrap();
@@ -1242,6 +1251,9 @@ fn orchestrator_bots() -> Vec<LoadedBot> {
                 thinking: None,
                 role: crate::orchestration::BotRole::Orchestrator,
                 delegates: vec!["analyst".into(), "maker".into()],
+                route: None,
+                fallbacks: Vec::new(),
+                failover: Default::default(),
             },
             prompt: "orchestrator".into(),
         },
@@ -1261,6 +1273,9 @@ fn orchestrator_bots() -> Vec<LoadedBot> {
                 thinking: None,
                 role: crate::orchestration::BotRole::Specialist,
                 delegates: vec![],
+                route: None,
+                fallbacks: Vec::new(),
+                failover: Default::default(),
             },
             prompt: "analyst".into(),
         },
@@ -1280,6 +1295,9 @@ fn orchestrator_bots() -> Vec<LoadedBot> {
                 thinking: None,
                 role: crate::orchestration::BotRole::Specialist,
                 delegates: vec![],
+                route: None,
+                fallbacks: Vec::new(),
+                failover: Default::default(),
             },
             prompt: "maker".into(),
         },
@@ -2989,6 +3007,7 @@ async fn changing_model_loads_the_list_and_explains_a_refusal() {
     let pick = |model: &str| ModelSelection {
         provider: "default".into(),
         model: model.into(),
+        account: None,
     };
     runtime
         .select_model(&user, "owner", pick("magistral-medium-latest"))
@@ -3099,6 +3118,42 @@ async fn thinking_level_is_applied_and_the_reasoning_shows_as_a_step() {
 }
 
 #[tokio::test]
+async fn a_model_switch_keeps_a_supported_level_or_resets_it() {
+    let server = MockServer::start().await;
+    let (runtime, store, _notifier) = thinking_runtime(&server).await;
+    let user = admin(&store);
+    let small = ModelSelection {
+        provider: "default".into(),
+        model: "mistral-small-2603".into(),
+        account: None,
+    };
+    let large = ModelSelection {
+        provider: "default".into(),
+        model: "mistral-large-latest".into(),
+        account: None,
+    };
+    runtime.select_model(&user, "s", small.clone()).unwrap();
+    runtime
+        .set_conversation_thinking(&user, "s", "main", Some("high"))
+        .unwrap();
+    // Re-selecting a model that accepts the level keeps it.
+    runtime.select_model(&user, "s", small.clone()).unwrap();
+    assert_eq!(
+        runtime
+            .conversation_thinking(&user, "s")
+            .unwrap()
+            .as_deref(),
+        Some("high")
+    );
+    // A model with no thinking control clears the choice.
+    runtime.select_model(&user, "s", large).unwrap();
+    assert_eq!(runtime.conversation_thinking(&user, "s").unwrap(), None);
+    // A conversation that never chose a level stays on the bot's default.
+    runtime.select_model(&user, "t", small).unwrap();
+    assert_eq!(runtime.conversation_thinking(&user, "t").unwrap(), None);
+}
+
+#[tokio::test]
 async fn bot_thinking_applies_unless_the_conversation_overrides_and_unsupported_is_dropped() {
     let server = MockServer::start().await;
     let (runtime, store, _notifier) = thinking_runtime(&server).await;
@@ -3137,6 +3192,7 @@ async fn bot_thinking_applies_unless_the_conversation_overrides_and_unsupported_
             ModelSelection {
                 provider: "default".into(),
                 model: "mistral-large-latest".into(),
+                account: None,
             },
         )
         .unwrap();
@@ -3195,10 +3251,12 @@ async fn thinking_and_model_selection_kv_keys_are_uid_scoped() {
     let admin_pick = ModelSelection {
         provider: "default".into(),
         model: "mistral-large-latest".into(),
+        account: None,
     };
     let member_pick = ModelSelection {
         provider: "default".into(),
         model: "mistral-small-2603".into(),
+        account: None,
     };
     runtime
         .select_model(&admin_id, "dir:alpha", admin_pick.clone())
@@ -3284,4 +3342,583 @@ async fn thinking_and_model_selection_kv_keys_are_uid_scoped() {
             .model,
         "mistral-small-2603"
     );
+}
+
+// ---- P12/P13: route chains and failover ----
+
+fn chat_ok(text: &str) -> Value {
+    serde_json::json!({
+        "choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": "stop"}]
+    })
+}
+
+fn quota_failure() -> ResponseTemplate {
+    ResponseTemplate::new(402).set_body_json(
+        serde_json::json!({"error": {"code": "insufficient_quota", "message": "synthetic"}}),
+    )
+}
+
+fn route_to(provider: &str, model: &str) -> crate::config::BotRoute {
+    crate::config::BotRoute {
+        provider: provider.into(),
+        model: model.into(),
+        thinking: None,
+        account: None,
+    }
+}
+
+/// A runtime with two providers, `default` (model `test`) and `other`
+/// (model `other-model`), each on its own fake server, both egress-approved.
+fn failover_rig(first: &str, second: &str) -> (Runtime, Store) {
+    let (runtime, store) = setup(
+        first,
+        Arc::new(Capture::default()),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    );
+    let mut config = (*runtime.config).clone();
+    config.llm.providers.insert(
+        "other".into(),
+        serde_json::from_value(serde_json::json!({
+            "base_url": second,
+            "api_key_secret": "other_key",
+            "models": ["other-model"],
+            "data_egress_approved": true
+        }))
+        .unwrap(),
+    );
+    let clients = std::collections::BTreeMap::from([
+        (
+            "default".to_owned(),
+            LlmClient::new(first, "test", 10, 100)
+                .unwrap()
+                .with_model("test"),
+        ),
+        (
+            "other".to_owned(),
+            LlmClient::new(second, "test", 10, 100)
+                .unwrap()
+                .with_model("other-model"),
+        ),
+    ]);
+    let router = ModelRouter::new(&config.llm, clients).unwrap();
+    let runtime = Runtime::new(
+        Arc::new(config),
+        store.clone(),
+        runtime.gateway.clone(),
+        router,
+        vec![bot()],
+        runtime.notifier.clone(),
+        CancellationToken::new(),
+    )
+    .unwrap();
+    (runtime, store)
+}
+
+fn add_account(store: &Store, user: &str, provider: &str, id: &str, priority: i64) {
+    let now = crate::store::now_string();
+    store
+        .connection()
+        .unwrap()
+        .execute(
+            "INSERT INTO provider_accounts(user_id, provider, account_id, label, auth_kind,
+                 fingerprint, priority, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3, 'api_key', ?4, ?5, ?6, ?6)",
+            rusqlite::params![
+                user,
+                provider,
+                id,
+                format!("fp-{provider}-{id}"),
+                priority,
+                now
+            ],
+        )
+        .unwrap();
+}
+
+fn set_route(
+    runtime: &Runtime,
+    store: &Store,
+    route: Option<crate::config::BotRoute>,
+    fallbacks: Vec<crate::config::BotRoute>,
+    failover: crate::config::FailoverPolicy,
+) -> BotConfig {
+    let admin = admin(store);
+    let mut config = bot().config;
+    config.route = route;
+    config.fallbacks = fallbacks;
+    config.failover = failover;
+    store
+        .upsert_bot(
+            &admin,
+            "main",
+            &serde_json::to_value(&config).unwrap(),
+            "test prompt",
+            true,
+        )
+        .unwrap();
+    runtime.fleet().invalidate(&admin);
+    config
+}
+
+async fn run_call(
+    runtime: &Runtime,
+    store: &Store,
+    config: &BotConfig,
+    may_switch: bool,
+) -> Result<failover::RoutedResponse> {
+    let user = admin(store);
+    let chain = runtime.router.bot_chain(&user, config);
+    let head = chain.head.clone().expect("route head");
+    let route = runtime.router.pin_for_bot(&user, &head, config).unwrap();
+    let messages = vec![LlmMessage::user("hello")];
+    runtime
+        .complete_with_failover(
+            &failover::RouteCall {
+                user: &user,
+                task_id: None,
+                conversation_id: "conv-1",
+                bot: "main",
+            },
+            &route,
+            chain.head_thinking.as_deref(),
+            &messages,
+            &messages,
+            &[],
+            None,
+            may_switch,
+        )
+        .await
+}
+
+fn cross_provider() -> crate::config::FailoverPolicy {
+    crate::config::FailoverPolicy {
+        allow_cross_provider: true,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn a_429_moves_to_the_next_account_and_is_recorded() {
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    // The client retries a 429 twice before giving up on the account.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
+        .up_to_n_times(3)
+        .mount(&first)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_ok("from second account")))
+        .mount(&first)
+        .await;
+    let (runtime, store) = failover_rig(&first.uri(), &second.uri());
+    let user = admin(&store);
+    add_account(&store, &user, "default", "a1", 5);
+    add_account(&store, &user, "default", "a2", 1);
+    let config = set_route(
+        &runtime,
+        &store,
+        Some(route_to("default", "test")),
+        vec![],
+        Default::default(),
+    );
+
+    let routed = run_call(&runtime, &store, &config, true).await.unwrap();
+    assert_eq!(
+        routed.response.message.content.as_deref(),
+        Some("from second account")
+    );
+    assert_eq!(routed.used.account.as_deref(), Some("a2"));
+    let events = store.route_events(&user, Some("conv-1"), 10).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].from_account.as_deref(), Some("a1"));
+    assert_eq!(events[0].to_account.as_deref(), Some("a2"));
+    assert_eq!(events[0].reason, "rate_limited");
+    let holds = store
+        .active_provider_holds(&user, chrono::Utc::now())
+        .unwrap();
+    assert!(
+        holds
+            .iter()
+            .any(|hold| hold.account_id == "a1" && hold.kind == "rate_limit")
+    );
+    // The next call starts on the account that worked.
+    let again = run_call(&runtime, &store, &config, true).await.unwrap();
+    assert_eq!(again.used.account.as_deref(), Some("a2"));
+}
+
+#[tokio::test]
+async fn an_exhausted_quota_holds_the_account_and_the_fallback_runs() {
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(quota_failure())
+        .mount(&first)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_ok("from fallback")))
+        .mount(&second)
+        .await;
+    let (runtime, store) = failover_rig(&first.uri(), &second.uri());
+    let user = admin(&store);
+    add_account(&store, &user, "default", "a1", 0);
+    let config = set_route(
+        &runtime,
+        &store,
+        Some(route_to("default", "test")),
+        vec![route_to("other", "other-model")],
+        cross_provider(),
+    );
+
+    let routed = run_call(&runtime, &store, &config, true).await.unwrap();
+    assert_eq!(routed.used.provider, "other");
+    assert_eq!(first.received_requests().await.unwrap().len(), 1);
+    let holds = store
+        .active_provider_holds(&user, chrono::Utc::now())
+        .unwrap();
+    assert!(
+        holds
+            .iter()
+            .any(|hold| hold.account_id == "a1" && hold.kind == "quota")
+    );
+    let account = store
+        .provider_account(&user, "default", "a1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        account.status,
+        crate::accounts::AccountStatus::QuotaExhausted
+    );
+    let events = store.route_events(&user, None, 10).unwrap();
+    assert_eq!(events[0].reason, "quota_exhausted");
+    assert_eq!(events[0].to_provider.as_deref(), Some("other"));
+
+    // The held account is skipped on the next call: the first provider is
+    // not asked again.
+    let again = run_call(&runtime, &store, &config, true).await.unwrap();
+    assert_eq!(again.used.provider, "other");
+    assert_eq!(first.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_rejected_credential_flags_the_account_and_fails_over() {
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("bad key"))
+        .up_to_n_times(1)
+        .mount(&first)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_ok("fine")))
+        .mount(&first)
+        .await;
+    let (runtime, store) = failover_rig(&first.uri(), &second.uri());
+    let user = admin(&store);
+    add_account(&store, &user, "default", "a1", 5);
+    add_account(&store, &user, "default", "a2", 1);
+    let config = set_route(
+        &runtime,
+        &store,
+        Some(route_to("default", "test")),
+        vec![],
+        Default::default(),
+    );
+    let routed = run_call(&runtime, &store, &config, true).await.unwrap();
+    assert_eq!(routed.used.account.as_deref(), Some("a2"));
+    let account = store
+        .provider_account(&user, "default", "a1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(account.status, crate::accounts::AccountStatus::NeedsReauth);
+}
+
+#[tokio::test]
+async fn a_policy_or_content_block_never_switches() {
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_json(serde_json::json!({"error": {"code": "content_filter"}})),
+        )
+        .mount(&first)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_ok("must not run")))
+        .mount(&second)
+        .await;
+    let (runtime, store) = failover_rig(&first.uri(), &second.uri());
+    let user = admin(&store);
+    add_account(&store, &user, "default", "a1", 5);
+    add_account(&store, &user, "default", "a2", 1);
+    let config = set_route(
+        &runtime,
+        &store,
+        Some(route_to("default", "test")),
+        vec![route_to("other", "other-model")],
+        cross_provider(),
+    );
+    assert!(run_call(&runtime, &store, &config, true).await.is_err());
+    assert_eq!(first.received_requests().await.unwrap().len(), 1);
+    assert!(second.received_requests().await.unwrap().is_empty());
+    assert!(store.route_events(&user, None, 10).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn cross_provider_failover_is_off_by_default() {
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(quota_failure())
+        .mount(&first)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_ok("must not run")))
+        .mount(&second)
+        .await;
+    let (runtime, store) = failover_rig(&first.uri(), &second.uri());
+    let user = admin(&store);
+    add_account(&store, &user, "default", "a1", 0);
+    let config = set_route(
+        &runtime,
+        &store,
+        Some(route_to("default", "test")),
+        vec![route_to("other", "other-model")],
+        Default::default(),
+    );
+    assert!(run_call(&runtime, &store, &config, true).await.is_err());
+    assert!(second.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_turn_that_may_not_switch_stays_on_its_first_route() {
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(quota_failure())
+        .mount(&first)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_ok("must not run")))
+        .mount(&second)
+        .await;
+    let (runtime, store) = failover_rig(&first.uri(), &second.uri());
+    let user = admin(&store);
+    add_account(&store, &user, "default", "a1", 5);
+    add_account(&store, &user, "default", "a2", 1);
+    let config = set_route(
+        &runtime,
+        &store,
+        Some(route_to("default", "test")),
+        vec![route_to("other", "other-model")],
+        cross_provider(),
+    );
+    // A dispatching or outcome-unknown action pins the turn: one candidate.
+    assert!(run_call(&runtime, &store, &config, false).await.is_err());
+    assert_eq!(first.received_requests().await.unwrap().len(), 1);
+    assert!(second.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn when_every_route_fails_the_error_lists_the_reasons() {
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    for server in [&first, &second] {
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(quota_failure())
+            .mount(server)
+            .await;
+    }
+    let (runtime, store) = failover_rig(&first.uri(), &second.uri());
+    let user = admin(&store);
+    add_account(&store, &user, "default", "a1", 0);
+    let config = set_route(
+        &runtime,
+        &store,
+        Some(route_to("default", "test")),
+        vec![route_to("other", "other-model")],
+        cross_provider(),
+    );
+    match run_call(&runtime, &store, &config, true).await {
+        Err(SeraError::Rejected { code, message }) => {
+            assert_eq!(code, "all_routes_failed");
+            assert!(message.contains("quota_exhausted"));
+        }
+        other => panic!("expected all_routes_failed, got {:?}", other.map(|_| ())),
+    }
+}
+
+#[tokio::test]
+async fn holds_are_per_user() {
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    let (runtime, store) = failover_rig(&first.uri(), &second.uri());
+    let alice = admin(&store);
+    let bob = store
+        .create_user("microsoft:failover-bob", "bob@example.example", "Bob")
+        .unwrap()
+        .id;
+    let until = chrono::Utc::now() + chrono::Duration::minutes(5);
+    store
+        .set_provider_hold(
+            &alice,
+            "default",
+            "a1",
+            "*",
+            "quota",
+            until,
+            "quota_exhausted",
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .active_provider_holds(&alice, chrono::Utc::now())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .active_provider_holds(&bob, chrono::Utc::now())
+            .unwrap()
+            .is_empty()
+    );
+    // Bob's own account of the same id is not held by Alice's failure.
+    add_account(&store, &bob, "default", "a1", 0);
+    let config = set_route(
+        &runtime,
+        &store,
+        Some(route_to("default", "test")),
+        vec![],
+        Default::default(),
+    );
+    let route = runtime
+        .router
+        .pin_for_bot(&bob, &route_to_selection("default", "test"), &config)
+        .unwrap();
+    let plan = crate::route_chain::plan_candidates(
+        &store,
+        &runtime.router,
+        &bob,
+        &route,
+        None,
+        "conv-bob",
+        chrono::Utc::now(),
+    )
+    .unwrap();
+    assert_eq!(plan.candidates.len(), 1);
+    assert_eq!(plan.candidates[0].selection.account.as_deref(), Some("a1"));
+    assert!(
+        runtime
+            .chain_is_current(
+                &bob,
+                &LoadedBot {
+                    config,
+                    prompt: String::new()
+                },
+                &Some(route)
+            )
+            .is_ok()
+    );
+}
+
+fn route_to_selection(provider: &str, model: &str) -> ModelSelection {
+    ModelSelection {
+        provider: provider.into(),
+        model: model.into(),
+        account: None,
+    }
+}
+
+#[tokio::test]
+async fn editing_the_chain_invalidates_queued_pins() {
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    let (runtime, store) = failover_rig(&first.uri(), &second.uri());
+    let user = admin(&store);
+    let before = set_route(
+        &runtime,
+        &store,
+        Some(route_to("default", "test")),
+        vec![route_to("other", "other-model")],
+        cross_provider(),
+    );
+    let pinned = Some(
+        runtime
+            .router
+            .pin_for_bot(&user, &route_to_selection("default", "test"), &before)
+            .unwrap(),
+    );
+    let loaded = |config: &BotConfig| LoadedBot {
+        config: config.clone(),
+        prompt: String::new(),
+    };
+    runtime
+        .chain_is_current(&user, &loaded(&before), &pinned)
+        .unwrap();
+    // Dropping the fallback, or changing the policy, makes the pin stale.
+    let mut dropped = before.clone();
+    dropped.fallbacks.clear();
+    assert!(
+        runtime
+            .chain_is_current(&user, &loaded(&dropped), &pinned)
+            .is_err()
+    );
+    let mut policy = before.clone();
+    policy.failover.max_switches = 1;
+    assert!(
+        runtime
+            .chain_is_current(&user, &loaded(&policy), &pinned)
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn a_queued_turn_fails_over_to_the_next_account() {
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(quota_failure())
+        .up_to_n_times(1)
+        .mount(&first)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_ok("turn answered")))
+        .mount(&first)
+        .await;
+    let (runtime, store) = failover_rig(&first.uri(), &second.uri());
+    let user = admin(&store);
+    add_account(&store, &user, "default", "a1", 5);
+    add_account(&store, &user, "default", "a2", 1);
+    set_route(
+        &runtime,
+        &store,
+        Some(route_to("default", "test")),
+        vec![],
+        Default::default(),
+    );
+    runtime.submit_text(&user, "owner", "hi", None).unwrap();
+    let task = store.claim_task("test", 30).unwrap().unwrap();
+    runtime.process_task(task).await.unwrap();
+    let events = store.route_events(&user, None, 10).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].bot.as_deref(), Some("main"));
+    assert_eq!(events[0].to_account.as_deref(), Some("a2"));
+    assert_eq!(first.received_requests().await.unwrap().len(), 2);
 }

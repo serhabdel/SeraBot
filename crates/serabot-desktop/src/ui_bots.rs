@@ -7,7 +7,11 @@
 use crate::ui::{Icon, Overlay, avatar_style, group_avatar_style, human_model, human_provider};
 use dioxus::prelude::*;
 use serabot_desktop::capabilities;
-use serabot_desktop::session::{ImageSlot, Section, Session};
+use serabot_desktop::route_chip;
+use serabot_desktop::route_editor::{
+    self, MAX_FALLBACKS, MAX_SWITCHES, ModelChoice, ProviderChoice, RouteCheck, RouteSlot,
+};
+use serabot_desktop::session::{ImageSlot, RouteChange, Section, Session};
 use serabot_desktop::state::{meet_order, shipped_label};
 use serabot_desktop::{AVATAR_FILE_ACCEPT, MAX_AVATAR_UPLOAD_BYTES, MAX_TEAM_MEMBERS, preview_id};
 
@@ -993,6 +997,359 @@ pub fn CapabilityToggles(session: Signal<Session>, bot: String) -> Element {
                         span { class: "hint", "None" }
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Everything one row of the route editor draws, prepared as plain data so the
+/// markup holds no borrow of the session.
+#[derive(Clone, PartialEq)]
+struct RouteRowView {
+    row: usize,
+    title: &'static str,
+    slot: RouteSlot,
+    providers: Vec<ProviderChoice>,
+    accounts: Vec<(String, String)>,
+    models: Vec<ModelChoice>,
+    levels: Vec<String>,
+    error: Option<String>,
+    /// This fallback names another provider than the primary.
+    consent_row: bool,
+    consent: bool,
+    provider_label: String,
+}
+
+fn route_row_views(session: &Session) -> (Vec<RouteRowView>, RouteCheck) {
+    let options = session.route_options();
+    let draft = &session.route_editor.draft;
+    // Until the catalog arrives every provider would read "not available".
+    let check = if session.state.catalog.is_some() {
+        draft.check(&options)
+    } else {
+        RouteCheck::default()
+    };
+    let rows = (0..=MAX_FALLBACKS)
+        .map(|row| {
+            let slot = match row {
+                0 => draft.primary.clone(),
+                other => draft.fallbacks[other - 1].clone(),
+            };
+            let (title, error) = match row {
+                0 => ("Primary", check.primary.clone()),
+                1 => ("Fallback 1", check.fallbacks[0].clone()),
+                _ => ("Fallback 2", check.fallbacks[1].clone()),
+            };
+            let chosen = !slot.is_empty();
+            RouteRowView {
+                row,
+                title,
+                providers: options.provider_choices(),
+                accounts: if chosen {
+                    options.account_choices(&slot.provider)
+                } else {
+                    Vec::new()
+                },
+                models: if chosen {
+                    options.model_choices(&slot.provider)
+                } else {
+                    Vec::new()
+                },
+                levels: options.thinking_levels(&slot.provider, &slot.model),
+                consent_row: row > 0 && check.needs_consent[row - 1],
+                consent: row > 0 && draft.consent[row - 1],
+                provider_label: options.provider_label(&slot.provider),
+                error,
+                slot,
+            }
+        })
+        .collect();
+    (rows, check)
+}
+
+/// The bot's "Model route": a primary route and up to two fallbacks, each with
+/// a provider, an account (or any), a model and a thinking level, plus the
+/// auto-switch switches. Saved on its own with the Save route button; the rest
+/// of the settings form keeps its own Save.
+#[component]
+pub fn RouteEditor(session: Signal<Session>, bot: String) -> Element {
+    let _ = &bot;
+    let (rows, check, hydrated, saving, dirty, error, notice, failover, effective, last_switch) = {
+        let s = session.read();
+        let (rows, check) = route_row_views(&s);
+        let options = s.route_options();
+        let view = s
+            .bot_settings
+            .bot
+            .as_deref()
+            .and_then(|id| s.state.bot_details.get(id))
+            .and_then(|detail| detail.route.as_ref());
+        (
+            rows,
+            check,
+            s.route_editor.hydrated,
+            s.route_editor.saving,
+            s.route_editor.dirty(),
+            s.route_editor.error.clone(),
+            s.route_editor.notice.clone(),
+            s.route_editor.draft.failover,
+            view.and_then(|view| view.effective.as_ref())
+                .map(|effective| route_editor::effective_line(&options, effective)),
+            view.and_then(|view| view.last_switch.as_ref())
+                .map(|switch| route_editor::switch_line(&options, switch)),
+        )
+    };
+    let can_save = hydrated && dirty && !saving && check.is_ok();
+    rsx! {
+        div { class: "field route-field",
+            span { class: "field-label", "Model route" }
+            div { class: "route-block", role: "group", "aria-label": "Model route",
+                if !hydrated {
+                    div { class: "banner info", role: "status",
+                        span { class: "spinner" }
+                        span { "Loading the route\u{2026}" }
+                    }
+                }
+                for view in rows {
+                    RouteRow { session, view, hydrated }
+                }
+                div { class: "route-slot",
+                    div { class: "route-slot-title", span { "When a route fails" } }
+                    label { class: "check",
+                        input {
+                            class: "switch",
+                            r#type: "checkbox",
+                            checked: failover.enabled,
+                            disabled: !hydrated,
+                            onchange: move |event| {
+                                let mut s = session.write();
+                                s.route_editor.draft.failover.enabled = event.checked();
+                                s.route_editor.error = None;
+                                s.route_editor.notice = None;
+                            },
+                        }
+                        span { "Switch automatically" }
+                    }
+                    label { class: "check",
+                        input {
+                            class: "switch",
+                            r#type: "checkbox",
+                            checked: failover.switch_account_first,
+                            disabled: !hydrated || !failover.enabled,
+                            onchange: move |event| {
+                                let mut s = session.write();
+                                s.route_editor.draft.failover.switch_account_first = event.checked();
+                                s.route_editor.error = None;
+                                s.route_editor.notice = None;
+                            },
+                        }
+                        span { "Try the provider's other accounts first" }
+                    }
+                    div { class: "field",
+                        label { class: "field-label", r#for: "route-max-switches", "Most switches per turn" }
+                        select {
+                            id: "route-max-switches",
+                            class: "select",
+                            value: "{failover.max_switches}",
+                            disabled: !hydrated || !failover.enabled,
+                            onchange: move |event| {
+                                if let Ok(count) = event.value().parse::<u8>() {
+                                    let mut s = session.write();
+                                    s.route_editor.draft.failover.max_switches = count.clamp(1, MAX_SWITCHES);
+                                    s.route_editor.error = None;
+                                    s.route_editor.notice = None;
+                                }
+                            },
+                            for count in 1..=MAX_SWITCHES {
+                                option { key: "{count}", value: "{count}", selected: count == failover.max_switches, "{count}" }
+                            }
+                        }
+                    }
+                }
+                if effective.is_some() || last_switch.is_some() {
+                    div { class: "route-effective", role: "status",
+                        if let Some(line) = effective {
+                            span { "Starts on: {line}" }
+                        }
+                        if let Some(line) = last_switch {
+                            span { "Last switch: {line}" }
+                        }
+                    }
+                }
+                if let Some(message) = error {
+                    div { class: "banner err", role: "alert", span { "{message}" } }
+                }
+                if let Some(message) = notice {
+                    div { class: "banner ok", role: "status", span { "{message}" } }
+                }
+                div { class: "route-actions",
+                    button {
+                        class: "btn primary sm",
+                        r#type: "button",
+                        disabled: !can_save,
+                        onclick: move |_| session.write().save_bot_route(),
+                        if saving { "Saving\u{2026}" } else { "Save route" }
+                    }
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        disabled: !dirty || saving,
+                        onclick: move |_| session.write().reset_route_editor(),
+                        "Reset"
+                    }
+                    if dirty {
+                        span { class: "hint", role: "status", "Unsaved route changes. Save route to keep them." }
+                    } else {
+                        span { class: "hint", "Applies to the next turn. A turn already running keeps its route." }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn RouteRow(session: Signal<Session>, view: RouteRowView, hydrated: bool) -> Element {
+    let row = view.row;
+    let primary = row == 0;
+    let chosen = !view.slot.is_empty();
+    let segments = route_chip::thinking_segments(&view.levels, &view.slot.thinking);
+    let class = if view.error.is_some() {
+        "route-slot has-error"
+    } else {
+        "route-slot"
+    };
+    let none_label = if primary {
+        "Follow my default route"
+    } else {
+        "No fallback"
+    };
+    let id = |part: &str| format!("route-{row}-{part}");
+    rsx! {
+        div { class: "{class}",
+            div { class: "route-slot-title",
+                span { "{view.title}" }
+                if chosen && !primary {
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        "aria-label": "Remove {view.title}",
+                        onclick: move |_| session.write().route_change(row, RouteChange::Provider(String::new())),
+                        "Remove"
+                    }
+                }
+            }
+            div { class: "route-grid",
+                div { class: "field",
+                    label { class: "field-label", r#for: "{id(\"provider\")}", "Provider" }
+                    select {
+                        id: "{id(\"provider\")}",
+                        class: "select",
+                        value: "{view.slot.provider}",
+                        disabled: !hydrated,
+                        onchange: move |event| session.write().route_change(row, RouteChange::Provider(event.value())),
+                        option { value: "", selected: !chosen, "{none_label}" }
+                        for choice in view.providers.clone() {
+                            option {
+                                key: "{choice.id}",
+                                value: "{choice.id}",
+                                selected: choice.id == view.slot.provider,
+                                disabled: !choice.egress_approved,
+                                if choice.egress_approved {
+                                    "{choice.label}"
+                                } else {
+                                    "{choice.label} (no data-egress approval)"
+                                }
+                            }
+                        }
+                    }
+                }
+                if chosen {
+                    div { class: "field",
+                        label { class: "field-label", r#for: "{id(\"account\")}", "Account" }
+                        select {
+                            id: "{id(\"account\")}",
+                            class: "select",
+                            value: "{view.slot.account}",
+                            disabled: !hydrated,
+                            onchange: move |event| session.write().route_change(row, RouteChange::Account(event.value())),
+                            for (account_id, label) in view.accounts.clone() {
+                                option {
+                                    key: "{account_id}",
+                                    value: "{account_id}",
+                                    selected: account_id == view.slot.account,
+                                    "{label}"
+                                }
+                            }
+                        }
+                    }
+                    div { class: "field",
+                        label { class: "field-label", r#for: "{id(\"model\")}", "Model" }
+                        select {
+                            id: "{id(\"model\")}",
+                            class: "select",
+                            value: "{view.slot.model}",
+                            disabled: !hydrated,
+                            onchange: move |event| session.write().route_change(row, RouteChange::Model(event.value())),
+                            if !view.slot.model.is_empty()
+                                && !view.models.iter().any(|choice| choice.model == view.slot.model)
+                            {
+                                option { value: "{view.slot.model}", selected: true, "{view.slot.model} (not in your list)" }
+                            }
+                            for choice in view.models.clone() {
+                                option {
+                                    key: "{choice.model}",
+                                    value: "{choice.model}",
+                                    selected: choice.model == view.slot.model,
+                                    "{choice.title}"
+                                }
+                            }
+                        }
+                    }
+                    if !segments.is_empty() {
+                        div { class: "field",
+                            span { class: "field-label", "Thinking" }
+                            div { class: "seg", role: "group", "aria-label": "Thinking level for {view.title}",
+                                for segment in segments {
+                                    button {
+                                        key: "{segment.label}",
+                                        r#type: "button",
+                                        class: if segment.active { "seg-btn active" } else { "seg-btn" },
+                                        "aria-pressed": if segment.active { "true" } else { "false" },
+                                        disabled: !hydrated,
+                                        onclick: {
+                                            let value = segment.value.clone();
+                                            move |_| session.write().route_change(row, RouteChange::Thinking(value.clone()))
+                                        },
+                                        "{segment.label}"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if view.consent_row {
+                label { class: "route-consent",
+                    input {
+                        class: "switch",
+                        r#type: "checkbox",
+                        checked: view.consent,
+                        disabled: !hydrated,
+                        onchange: move |event| {
+                            let mut s = session.write();
+                            if let Some(slot) = s.route_editor.draft.consent.get_mut(row - 1) {
+                                *slot = event.checked();
+                            }
+                            s.route_editor.error = None;
+                            s.route_editor.notice = None;
+                        },
+                    }
+                    span { "If the first route fails, allow sending my prompts to {view.provider_label}." }
+                }
+            }
+            if let Some(message) = view.error.clone() {
+                p { class: "field-error", role: "alert", "{message}" }
             }
         }
     }

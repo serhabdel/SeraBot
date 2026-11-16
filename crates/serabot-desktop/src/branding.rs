@@ -297,6 +297,21 @@ static BRANDS: &[Brand] = &[
         mark: Mark::Svg(GENERIC_CODE),
     },
     Brand {
+        keys: &["anthropic"],
+        label: "Anthropic",
+        mark: Mark::Svg(GENERIC_CODE),
+    },
+    Brand {
+        keys: &["opencode-go", "opencode-zen"],
+        label: "OpenCode",
+        mark: Mark::Svg(GENERIC_CODE),
+    },
+    Brand {
+        keys: &["nous"],
+        label: "Nous Portal",
+        mark: Mark::Svg(GENERIC_PLUG),
+    },
+    Brand {
         keys: &["openai-compatible"],
         label: "OpenAI-Compatible",
         mark: Mark::Svg(GENERIC_PLUG),
@@ -393,6 +408,10 @@ mod tests {
         "google-antigravity",
         "antigravity",
         "muse-code",
+        "anthropic",
+        "opencode-go",
+        "opencode-zen",
+        "nous",
         "ollama",
         "gemini",
         "perplexity",

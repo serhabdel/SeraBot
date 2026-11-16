@@ -181,6 +181,19 @@ pub struct State {
     pub connector_tests: std::collections::BTreeMap<String, ConnectorTestResult>,
     /// Latest provider Test result per provider id.
     pub provider_tests: std::collections::BTreeMap<String, crate::api::ProviderTest>,
+    /// Latest Test result per account, keyed `provider/account`.
+    pub account_tests: std::collections::BTreeMap<String, crate::api::ProviderTest>,
+    /// The open conversation's route switches, newest first.
+    pub route_events: Vec<crate::api::RouteSwitch>,
+    /// The open conversation's bot's chain (route, fallbacks, policy).
+    pub route_chain: Option<Box<crate::api::RouteView>>,
+    /// The route events were read for the open conversation.
+    pub route_events_loaded: bool,
+    /// They were asked for in this conversation (so a failed read is not
+    /// repeated on every tick).
+    pub route_events_asked: bool,
+    /// A switch was recorded since: read them again.
+    pub route_events_stale: bool,
     /// Provider id and device code of the last finished sign-in step.
     pub oauth_result: Option<(String, Option<String>)>,
     /// Team of the open room conversation. Conversation-scoped: it is cleared
@@ -344,6 +357,12 @@ impl Default for State {
             connectors_loaded: false,
             connector_tests: std::collections::BTreeMap::new(),
             provider_tests: std::collections::BTreeMap::new(),
+            account_tests: std::collections::BTreeMap::new(),
+            route_events: Vec::new(),
+            route_chain: None,
+            route_events_loaded: false,
+            route_events_asked: false,
+            route_events_stale: false,
             oauth_result: None,
             team: None,
             team_loaded: false,
@@ -463,6 +482,7 @@ impl State {
         let connectors_loaded = self.connectors_loaded;
         let connector_tests = self.connector_tests.clone();
         let provider_tests = self.provider_tests.clone();
+        let account_tests = self.account_tests.clone();
         *self = Self {
             scope: Scope {
                 epoch,
@@ -518,6 +538,7 @@ impl State {
             connectors_loaded,
             connector_tests,
             provider_tests,
+            account_tests,
             ..Self::default()
         };
         if connected {
@@ -560,6 +581,7 @@ impl State {
         self.connectors_loaded = false;
         self.connector_tests.clear();
         self.provider_tests.clear();
+        self.account_tests.clear();
     }
 
     /// Zero the badge of one conversation, e.g. the one just opened.
@@ -981,6 +1003,24 @@ impl State {
             Reply::ProviderTested { id, result } => {
                 self.provider_tests.insert(id, result);
             }
+            Reply::AccountDone(done) => {
+                if let crate::worker::AccountDone::Tested {
+                    provider,
+                    account,
+                    result,
+                } = done
+                {
+                    self.account_tests
+                        .insert(format!("{provider}/{account}"), result);
+                }
+            }
+            // The session applies the saved route (it owns the editor).
+            Reply::RouteSaved => {}
+            Reply::RouteEvents(events) => {
+                self.route_events = events.events;
+                self.route_chain = events.chain;
+                self.route_events_loaded = true;
+            }
             Reply::AvatarImage {
                 target,
                 version,
@@ -1186,6 +1226,7 @@ mod tests {
             Reply::Selection(Selection {
                 provider: "approved".into(),
                 model: "large".into(),
+                account: None,
             }),
         );
         assert_eq!(state.catalog.as_ref().unwrap().selection.model, "large");
@@ -1799,6 +1840,9 @@ mod tests {
                 },
                 is_default: false,
                 default_model: None,
+                accounts: Vec::new(),
+                signin: Vec::new(),
+                signin_risk: None,
                 secrets: std::collections::BTreeMap::from([(
                     "api_key".into(),
                     SecretStatus {

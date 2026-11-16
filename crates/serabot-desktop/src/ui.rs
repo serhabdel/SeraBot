@@ -15,8 +15,8 @@ use serabot_desktop::{
     branding,
     chat_cards::{self, CardState, CardView},
     chat_compose,
-    chat_failure::ChatAction,
-    chat_feed, chat_links, chat_scroll, file_icons, provider_presets, provider_view,
+    chat_failure::{self, ChatAction},
+    chat_feed, chat_links, chat_scroll, file_icons, provider_presets, provider_view, route_chip,
     session::{Section, Session, SettingsSection, SignInPhase, Theme, humanize_label},
     teams, ui_highlight,
     working::BotActivity,
@@ -47,6 +47,7 @@ use crate::ui_settings_page::{
 use crate::ui_usage::UsagePage;
 use crate::ui_vault::VaultPage;
 
+mod account_views;
 mod chat;
 mod connect;
 mod conversations;
@@ -57,6 +58,7 @@ mod row_menu;
 mod settings_view;
 mod sheets;
 mod shell;
+pub(crate) use account_views::*;
 pub(crate) use chat::*;
 pub(crate) use connect::*;
 pub(crate) use conversations::*;
@@ -77,7 +79,8 @@ const CSS_PAGES: &str = concat!(
     include_str!("../assets/settings.css"),
     include_str!("../assets/files.css"),
     include_str!("../assets/jobs.css"),
-    include_str!("../assets/foundation.css")
+    include_str!("../assets/foundation.css"),
+    include_str!("../assets/accounts.css")
 );
 
 /// The `data-activity` value the stylesheet keys the avatar ring and the
@@ -144,7 +147,7 @@ type PickerItem = (
 );
 
 /// The provider kinds the server understands.
-const PROVIDER_KINDS: [&str; 20] = [
+const PROVIDER_KINDS: [&str; 23] = [
     "openai-compatible",
     "google-antigravity",
     "mistral",
@@ -165,6 +168,9 @@ const PROVIDER_KINDS: [&str; 20] = [
     "nebius",
     "sambanova",
     "muse-code",
+    "anthropic",
+    "opencode-go",
+    "opencode-zen",
 ];
 
 /// Global key bindings, installed once in the WebView.
@@ -313,6 +319,9 @@ pub(crate) enum Overlay {
     NewConversation,
     /// The guided "Add provider" sheet.
     AddProvider,
+    /// The "Add account" sheet: a key, a browser sign-in or a device code. The
+    /// provider it adds to lives in the session.
+    AddAccount,
     Team,
     /// "Meet your team": the shipped bots the owner can add.
     MeetTeam,
@@ -632,14 +641,37 @@ fn parse_model_value(raw: &str) -> Selection {
             Selection {
                 provider: provider.to_owned(),
                 model: model.to_owned(),
+                account: None,
             }
         }
     }
 }
 
-/// Set the draft model selection from a picker value.
-fn set_model_draft(session: &mut Session, raw: &str) {
-    session.state.draft = parse_model_value(raw);
+/// Set the draft model selection from a picker value and the account chosen
+/// for its provider (`None` is "any account").
+fn set_model_draft_with(session: &mut Session, raw: &str, account: Option<String>) {
+    let mut selection = parse_model_value(raw);
+    if !selection.is_auto() {
+        selection.account = account;
+    }
+    session.state.draft = selection;
+}
+
+/// The account a picked model row should carry: the one chosen in the picker's
+/// account step for that provider, else the draft's own when the row is on the
+/// draft's provider. Never an account of another provider.
+fn picked_account_for(
+    session: &Session,
+    picked: &BTreeMap<String, String>,
+    raw: &str,
+) -> Option<String> {
+    let provider = raw.split_once('|').map(|(provider, _)| provider)?;
+    match picked.get(provider) {
+        Some(account) => (!account.is_empty()).then(|| account.clone()),
+        None => (session.state.draft.provider == provider)
+            .then(|| session.state.draft.account.clone())
+            .flatten(),
+    }
 }
 
 /// Taskbar / title-bar icon: a 64x64 RGBA bitmap generated from the brand

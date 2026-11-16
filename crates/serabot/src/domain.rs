@@ -97,6 +97,11 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: Value,
+    /// An opaque signature the provider attached to this call's thinking
+    /// (Cloud Code `thoughtSignature`). Replayed with the call on the next
+    /// request of the same turn; never shown and never sent to another provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -109,6 +114,9 @@ pub struct LlmMessage {
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// True on a tool message whose tool failed, was denied or was blocked.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_error: bool,
 }
 
 impl LlmMessage {

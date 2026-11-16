@@ -159,3 +159,11 @@ hardens logging (`[logging]`, noisy-crate caps), rejects expired approvals at
 decision time, and adds negative isolation/approval tests. Future releases
 should split server/security changes from UI churn and add wrong-user,
 missing-approval and stale-approval tests alongside each new surface.
+
+## Status after 0.48.0 (providers, 0.49.0)
+
+0.49.0 adds per-user provider accounts (migration 0037), the sign-in flow
+framework, Antigravity and Muse member sign-in, Anthropic/OpenCode backends,
+single-flight refresh, bot routes with a failover engine, and the matching
+desktop pages. Claude plan OAuth is implemented but off by default (O1).
+Optional P19 (Mistral sign-in) is not done. No live provider was used.

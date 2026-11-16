@@ -105,7 +105,7 @@ impl Runtime {
         let hint = self.bot_model_hint(bot);
         let intended = match self.stored_model_selection(user_id, conversation_id)? {
             Some(stored) => stored,
-            None => self.user_default_selection(user_id, hint.as_deref()),
+            None => self.bot_default_selection(user_id, bot),
         };
         let (resolved, fell_back) =
             self.selection_or_fallback(user_id, intended.clone(), hint.as_deref())?;
@@ -258,6 +258,12 @@ impl Runtime {
                 bot.config
                     .thinking
                     .clone()
+                    .or_else(|| {
+                        bot.config
+                            .route
+                            .as_ref()
+                            .and_then(|route| route.thinking.clone())
+                    })
                     .filter(|level| crate::thinking::is_known_level(level))
             })
     }
@@ -275,7 +281,16 @@ impl Runtime {
         &self,
         user_id: &str,
     ) -> Result<Vec<crate::model_router::CatalogEntry>> {
-        let entries = self.router.catalog_entries(user_id);
+        let mut entries = self.router.catalog_entries(user_id);
+        let mut accounts: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for entry in &mut entries {
+            if !accounts.contains_key(&entry.provider) {
+                let ids = self.store.usable_account_ids(user_id, &entry.provider)?;
+                accounts.insert(entry.provider.clone(), ids);
+            }
+            entry.account_ids = accounts[&entry.provider].clone();
+        }
         self.gateway
             .scan_egress(user_id, &serde_json::to_string(&entries)?)?;
         Ok(entries)
@@ -295,6 +310,51 @@ impl Runtime {
             return chosen;
         }
         self.router.default_selection(user_id, bot_hint)
+    }
+
+    /// The route a conversation with no choice of its own starts on: the
+    /// bot's own route when the user can run it, otherwise the user's default
+    /// route, the bot's legacy `model` and the server default, in that order.
+    fn bot_default_selection(
+        &self,
+        user_id: &str,
+        bot: &crate::config::LoadedBot,
+    ) -> ModelSelection {
+        match self.router.bot_chain(user_id, &bot.config).head {
+            Some(head) => head,
+            None => self.user_default_selection(user_id, self.bot_model_hint(bot).as_deref()),
+        }
+    }
+
+    /// Whether a pinned chain still matches what the bot is configured with
+    /// now. Editing a bot's route, fallbacks or failover policy makes the
+    /// pins of queued and suspended turns stale, so the owner resubmits.
+    pub(super) fn chain_is_current(
+        &self,
+        user_id: &str,
+        bot: &crate::config::LoadedBot,
+        route: &Option<PinnedRoute>,
+    ) -> Result<()> {
+        let Some(route) = route else {
+            return Ok(());
+        };
+        let chain = self.router.bot_chain(user_id, &bot.config);
+        let expected: Vec<_> = chain
+            .hops
+            .into_iter()
+            .filter(|(hop, _)| *hop != route.selection)
+            .collect();
+        let pinned: Vec<_> = route
+            .fallbacks
+            .iter()
+            .map(|hop| (hop.selection.clone(), hop.thinking.clone()))
+            .collect();
+        if pinned != expected || route.failover != chain.failover {
+            return Err(SeraError::Forbidden(
+                "the bot's model route changed; owner must resubmit the request".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// The account's chosen default route, if it is still routable for them.
@@ -444,7 +504,7 @@ impl Runtime {
             .ok_or_else(|| SeraError::NotFound("bot not found".into()))?;
         let selection = match self.stored_model_selection(user_id, conversation_id)? {
             Some(stored) => stored,
-            None => self.user_default_selection(user_id, self.bot_model_hint(bot).as_deref()),
+            None => self.bot_default_selection(user_id, bot),
         };
         let (selection, _) =
             self.selection_or_fallback(user_id, selection, self.bot_model_hint(bot).as_deref())?;
@@ -467,7 +527,7 @@ impl Runtime {
             .ok_or_else(|| SeraError::NotFound("bot not found".into()))?;
         let stored = match self.stored_model_selection(user_id, conversation_id)? {
             Some(stored) => stored,
-            None => self.user_default_selection(user_id, self.bot_model_hint(bot).as_deref()),
+            None => self.bot_default_selection(user_id, bot),
         };
         let (stored, _) =
             self.selection_or_fallback(user_id, stored, self.bot_model_hint(bot).as_deref())?;
@@ -517,7 +577,35 @@ impl Runtime {
         )?;
         self.store
             .kv_set(&Self::model_selection_key(user_id, conversation_id), &value)?;
+        if !stored.is_auto_mode() {
+            self.carry_thinking_to_model(user_id, conversation_id, &stored)?;
+        }
         Ok(stored)
+    }
+
+    /// After a model switch, keep the conversation's thinking level when the
+    /// new model accepts it; otherwise use that model's default, or clear the
+    /// choice when it has no levels. A conversation with no chosen level keeps
+    /// following the bot's default.
+    fn carry_thinking_to_model(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        selection: &ModelSelection,
+    ) -> Result<()> {
+        let Some(current) = self.conversation_thinking(user_id, conversation_id)? else {
+            return Ok(());
+        };
+        let levels = self.router.thinking_levels(user_id, selection);
+        if levels.contains(&current.as_str()) {
+            return Ok(());
+        }
+        let key = Self::thinking_key(user_id, conversation_id);
+        match crate::thinking::level_after_switch(&levels, &current) {
+            Some(level) => self.store.kv_set(&key, level)?,
+            None => self.store.kv_set(&key, "")?,
+        }
+        Ok(())
     }
 
     /// One bounded model call with no tools, outside any turn: used by the
@@ -558,6 +646,7 @@ impl Runtime {
                 ModelSelection {
                     provider,
                     model: model.to_owned(),
+                    account: None,
                 }
             }
             None => {

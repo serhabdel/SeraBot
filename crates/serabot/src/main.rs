@@ -616,6 +616,20 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
             "imported the operator's provider credentials into the admin account"
         );
     }
+    let admin_accounts = serabot::accounts::Accounts::new(store.clone(), users.clone());
+    let reimported = serabot::providers::import_age_oauth_sign_ins(
+        &config,
+        &secrets,
+        &admin_accounts,
+        &store,
+        &admin_user_id,
+    )?;
+    if reimported > 0 {
+        tracing::info!(
+            accounts = reimported,
+            "added the operator's new sign-ins to the admin accounts"
+        );
+    }
     // The admin must be able to route the default provider, exactly like the
     // single-operator build required its key at startup. The credential may
     // come from the age store (imported above) or from the console.
@@ -631,6 +645,9 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         config.llm.timeout_secs,
         config.llm.max_output_tokens,
     ));
+    // The API and the model clients refresh account tokens through one
+    // single-flight refresher, so a rotated token is never spent twice.
+    let account_refresher = credentials.refresher().clone();
     let router = serabot::model_router::ModelRouter::with_credentials(&config.llm, credentials)?;
 
     let embedder: Arc<dyn Embedder> = Arc::new(LazyEmbedder::new(
@@ -1024,6 +1041,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
             users.clone(),
             onedrive_registry.clone(),
         )?
+        .with_refresher(account_refresher.clone())?
         .with_personal(personal_connectors.clone())
         .with_local_relay(local_relay.clone())
         .with_elevenlabs(elevenlabs.clone())

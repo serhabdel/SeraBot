@@ -789,6 +789,7 @@ mod tests {
             id: "c1".into(),
             name: "fetch_url".into(),
             arguments: json!({}),
+            reasoning_signature: None,
         };
         let messages = vec![
             LlmMessage::user("read the page"),

@@ -7,7 +7,7 @@
 //! the validation are in `session/bot_settings.rs`; this file draws.
 
 use crate::ui::{Icon, Overlay, PinToggle, avatar_style, human_model, human_provider, stamp};
-use crate::ui_bots::{AvatarPicker, CapabilityToggles, model_groups};
+use crate::ui_bots::{AvatarPicker, CapabilityToggles};
 use dioxus::prelude::*;
 use serabot_desktop::session::{ImageSlot, Section, Session, SettingsTab, humanize_label};
 use serabot_desktop::{
@@ -260,8 +260,6 @@ fn BotForm(session: Signal<Session>, id: String) -> Element {
             s.bot_avatar(&id),
         )
     };
-    let groups = model_groups(&session.read());
-    let thinking_levels = session.read().bot_thinking_levels();
     let profiles = session.read().panel.profiles.clone();
     let name_error = draft.name_error();
     let description_error = draft.description_error();
@@ -269,19 +267,6 @@ fn BotForm(session: Signal<Session>, id: String) -> Element {
     let description_left =
         MAX_BOT_SETTINGS_DESCRIPTION_CHARS as i64 - draft.description.chars().count() as i64;
     let can_save = hydrated && dirty && !saving && draft.first_error().is_none();
-    // A model the list no longer offers stays visible instead of silently
-    // switching to "Default" on save.
-    let unknown_model = (!draft.model.is_empty()
-        && !groups.iter().any(|(provider, models)| {
-            models
-                .iter()
-                .any(|model| serabot_desktop::session::model_value(provider, model) == draft.model)
-        }))
-    .then(|| {
-        serabot_desktop::session::model_pick(&draft.model)
-            .map(|pick| human_model(&pick.model))
-            .unwrap_or_else(|| "Current model".to_owned())
-    });
     let profile_value = if draft.browser_profile.is_empty() {
         DEFAULT_PROFILE.to_owned()
     } else {
@@ -382,65 +367,7 @@ fn BotForm(session: Signal<Session>, id: String) -> Element {
                         span { class: "field-error", "{message}" }
                     }
                 }
-                div { class: "field",
-                    label { class: "field-label", r#for: "bot-model", "Model" }
-                    select {
-                        id: "bot-model",
-                        class: "select",
-                        value: "{draft.model}",
-                        disabled: !hydrated,
-                        onchange: move |event| {
-                            let mut s = session.write();
-                            s.bot_settings.draft.model = event.value();
-                            s.bot_settings.error = None;
-                            s.bot_settings.notice = None;
-                        },
-                        option { value: "", selected: draft.model.is_empty(), "Default" }
-                        if let Some(label) = unknown_model {
-                            option { value: "{draft.model}", selected: true, "{label} (not in your list)" }
-                        }
-                        for (provider, models) in groups {
-                            optgroup { key: "{provider}", label: "{human_provider(&provider)}",
-                                for item in models {
-                                    option {
-                                        key: "{item}",
-                                        value: "{serabot_desktop::session::model_value(&provider, &item)}",
-                                        selected: serabot_desktop::session::model_value(&provider, &item) == draft.model,
-                                        "{human_model(&item)}"
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    span { class: "hint", "Default uses the model picked for the chat." }
-                }
-                if !thinking_levels.is_empty() {
-                    div { class: "field",
-                        label { class: "field-label", r#for: "bot-thinking", "Thinking" }
-                        select {
-                            id: "bot-thinking",
-                            class: "select",
-                            value: "{draft.thinking}",
-                            disabled: !hydrated,
-                            onchange: move |event| {
-                                let mut s = session.write();
-                                s.bot_settings.draft.thinking = event.value();
-                                s.bot_settings.error = None;
-                                s.bot_settings.notice = None;
-                            },
-                            option { value: "", selected: draft.thinking.is_empty(), "Default" }
-                            for level in thinking_levels.clone() {
-                                option {
-                                    key: "{level}",
-                                    value: "{level}",
-                                    selected: level == draft.thinking,
-                                    "{serabot_desktop::thinking_label(&level)}"
-                                }
-                            }
-                        }
-                        span { class: "hint", "Only applies when the model supports it." }
-                    }
-                }
+                crate::ui_bots::RouteEditor { session, bot: id.clone() }
                 div { class: "field",
                     label { class: "field-label", r#for: "bot-profile", "Browser profile" }
                     select {

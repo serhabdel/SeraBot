@@ -21,13 +21,15 @@ use std::time::{Duration, Instant};
 use secrecy::SecretString;
 use serde_json::Value;
 
+use crate::accounts::{AccountRefresher, AccountStatus, Accounts, DEFAULT_ACCOUNT, RefreshError};
 use crate::config::{Config, ProviderConfig};
 use crate::error::{Result, SeraError};
-use crate::llm::{LlmClient, validate_base_url};
+use crate::llm::{AccountRefreshTarget, LlmClient, validate_base_url};
 use crate::model_router::ProviderCredentials;
 use crate::secrets::SharedSecrets;
 use crate::store::Store;
 use crate::user_secrets::{ProviderCredential, UserCredentialWriter, UserSecrets};
+use crate::wire::Wire;
 
 pub const MUSE_CLIENT_ID: &str = "1031625952748946";
 pub const MUSE_API_VERSION: &str = "1.0.0";
@@ -72,6 +74,26 @@ const OFFICIAL_CATALOGS: &[OfficialCatalog] = &[
         host: "api.meta.ai",
         path: "/v1/models",
         strict: true,
+    },
+    // Anthropic's list is `{data, has_more, last_id}` with no `object` field,
+    // and is read page by page with `x-api-key`.
+    OfficialCatalog {
+        kind: "anthropic",
+        host: "api.anthropic.com",
+        path: "/v1/models",
+        strict: false,
+    },
+    OfficialCatalog {
+        kind: "opencode-go",
+        host: "opencode.ai",
+        path: "/zen/go/v1/models",
+        strict: false,
+    },
+    OfficialCatalog {
+        kind: "opencode-zen",
+        host: "opencode.ai",
+        path: "/zen/v1/models",
+        strict: false,
     },
     // Perplexity chats on the host root but lists models under /v1; its list
     // shape is not pinned, so the looser parser applies.
@@ -209,10 +231,28 @@ const BUILTINS: &[BuiltinProvider] = &[
         summary: "SambaNova Cloud; catalog GET {base}/models",
     },
     BuiltinProvider {
+        kind: "anthropic",
+        base_url: Some("https://api.anthropic.com/v1"),
+        auth: "api_key",
+        summary: "Anthropic Messages API with x-api-key (several keys per member); catalog GET https://api.anthropic.com/v1/models",
+    },
+    BuiltinProvider {
+        kind: "opencode-go",
+        base_url: Some("https://opencode.ai/zen/go/v1"),
+        auth: "api_key",
+        summary: "OpenCode Go subscription, OpenAI-compatible with an x-opencode-session header",
+    },
+    BuiltinProvider {
+        kind: "opencode-zen",
+        base_url: Some("https://opencode.ai/zen/v1"),
+        auth: "api_key",
+        summary: "OpenCode Zen pay-as-you-go, OpenAI-compatible",
+    },
+    BuiltinProvider {
         kind: "muse-code",
         base_url: Some("https://api.meta.ai/v1"),
         auth: "oauth",
-        summary: "Muse Code device login, minted key, catalog GET https://api.meta.ai/v1/models",
+        summary: "Muse Code device login, minted key, Responses chat, catalog GET https://api.meta.ai/v1/models",
     },
     BuiltinProvider {
         kind: "google-antigravity",
@@ -230,6 +270,8 @@ pub fn builtins() -> &'static [BuiltinProvider] {
 pub enum OAuthStyle {
     MuseMint,
     RefreshToken,
+    /// A Claude plan sign-in: a JSON refresh grant that rotates the token.
+    ClaudeRefresh,
 }
 
 pub enum AuthPlan {
@@ -440,6 +482,10 @@ pub fn enforce_oauth_target(style: OAuthStyle, token_url: &str) -> Result<String
         OAuthStyle::RefreshToken => {
             host.eq_ignore_ascii_case(GOOGLE_TOKEN_HOST) && parsed.path() == GOOGLE_TOKEN_PATH
         }
+        OAuthStyle::ClaudeRefresh => {
+            host.eq_ignore_ascii_case(crate::auth_flows::claude::TOKEN_HOST)
+                && parsed.path() == crate::auth_flows::claude::TOKEN_PATH
+        }
     };
     if !ok {
         return Err(SeraError::Config(
@@ -464,6 +510,9 @@ pub struct ModelMeta {
     pub name: Option<String>,
     /// Context window in tokens.
     pub context_length: Option<u64>,
+    /// Largest reply in tokens, when the API says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
     /// Capability tags from the API: `vision`, `tools`, `reasoning`, `free`,
     /// `cheap`.
     pub tags: Vec<String>,
@@ -652,55 +701,155 @@ fn model_meta(id: &str, entry: &Value) -> ModelMeta {
     ModelMeta {
         name,
         context_length,
+        max_output_tokens: None,
         tags,
     }
 }
-fn official_model_id(model: &str) -> bool {
+pub(crate) fn official_model_id(model: &str) -> bool {
     valid_model_id(model)
         && model
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '+'))
 }
 
+/// How long the sign-in mint waits before each retry on a 429 or 5xx. The
+/// device code is one-shot, so a transient mint failure must not fail the login.
+pub const MUSE_MINT_RETRY_WAITS: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(10)];
+
+/// What a successful Muse key mint says. The key is a secret; `Debug` hides it.
+pub struct MuseMint {
+    pub api_key: String,
+    /// Lower-cased account email, when Meta said.
+    pub email: Option<String>,
+    /// The subscription tier name, when Meta said.
+    pub tier: Option<String>,
+    /// Meta's stable user id, when it said.
+    pub user_id: Option<String>,
+}
+
+impl fmt::Debug for MuseMint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MuseMint")
+            .field("email", &self.email)
+            .field("tier", &self.tier)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Re-mint a Muse API key from the Meta identity token. Never sends `onboard`;
+/// only the interactive sign-in does (see [`muse_mint`]).
 pub async fn muse_mint_api_key(
     http: &reqwest::Client,
     token_url: &str,
     identity_token: &str,
 ) -> Result<String> {
-    let response = http
-        .post(token_url)
-        .header("user-agent", USER_AGENT)
-        .header("accept", "application/json")
-        .header("x-api-version", MUSE_API_VERSION)
-        .bearer_auth(identity_token)
-        .json(&serde_json::json!({}))
-        .send()
+    muse_mint(http, token_url, identity_token, false, &[])
         .await
-        .map_err(|_| SeraError::External("Muse API-key mint failed".into()))?;
-    let status = response.status();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|_| SeraError::External("Muse API-key mint failed".into()))?;
-    if bytes.len() > 65_536 || !status.is_success() {
-        return Err(SeraError::External(format!(
-            "Muse API-key mint failed with status {}",
-            status.as_u16()
-        )));
+        .map(|mint| mint.api_key)
+}
+
+/// Mint a Muse Code API key. `onboard: true` is for the interactive sign-in
+/// only: it creates the subscription record. On a 429 or a 5xx the mint waits
+/// for each of `retry_waits` and tries again.
+pub async fn muse_mint(
+    http: &reqwest::Client,
+    token_url: &str,
+    identity_token: &str,
+    onboard: bool,
+    retry_waits: &[Duration],
+) -> Result<MuseMint> {
+    let body = if onboard {
+        serde_json::json!({"onboard": true})
+    } else {
+        serde_json::json!({})
+    };
+    let mut attempt = 0;
+    let (status, bytes) = loop {
+        let response = http
+            .post(token_url)
+            .header("user-agent", USER_AGENT)
+            .header("accept", "application/json")
+            .header("x-api-version", MUSE_API_VERSION)
+            .bearer_auth(identity_token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| SeraError::External("Muse API-key mint failed".into()))?;
+        let status = response.status();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|_| SeraError::External("Muse API-key mint failed".into()))?;
+        let transient = status.as_u16() == 429 || status.is_server_error();
+        match retry_waits.get(attempt) {
+            Some(wait) if transient => {
+                attempt += 1;
+                tokio::time::sleep(*wait).await;
+            }
+            _ => break (status, bytes),
+        }
+    };
+    if !status.is_success() {
+        // Typed, so a re-mint that is refused (401/403) can park the account.
+        return Err(SeraError::upstream(
+            status.as_u16(),
+            "mint_failed",
+            format!("Muse API-key mint failed with status {}", status.as_u16()),
+        ));
+    }
+    if bytes.len() > 65_536 {
+        return Err(SeraError::External("Muse API-key mint failed".into()));
     }
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|_| SeraError::External("Muse API-key mint failed".into()))?;
+    if value.get("is_subs_active").and_then(Value::as_bool) == Some(false) {
+        return Err(SeraError::Rejected {
+            code: "muse_inactive",
+            message: "Your Muse Code subscription is inactive. Activate it on muse.ai first."
+                .into(),
+        });
+    }
     let key = value
         .get("api_key")
         .and_then(Value::as_str)
-        .filter(|key| credential_ok(key))
-        .ok_or_else(|| SeraError::External("Muse API-key mint failed".into()))?;
-    Ok(key.to_owned())
+        .filter(|key| credential_ok(key));
+    let Some(key) = key else {
+        let payment = value.get("require_payment").and_then(Value::as_bool) == Some(true)
+            || value.get("action_url").is_some_and(|url| !url.is_null())
+            || value
+                .get("require_payment_action_url")
+                .is_some_and(|url| !url.is_null());
+        return Err(if payment {
+            SeraError::Rejected {
+                code: "muse_subscription_required",
+                message: "A Muse Code subscription is required. Subscribe on muse.ai first.".into(),
+            }
+        } else {
+            SeraError::External("Muse API-key mint failed: the reply had no API key".into())
+        });
+    };
+    let text = |field: &str, max: usize| {
+        value
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty() && text.len() <= max)
+            .filter(|text| !text.chars().any(char::is_control))
+            .map(str::to_owned)
+    };
+    Ok(MuseMint {
+        api_key: key.to_owned(),
+        email: text("user_email", 254).map(|email| email.to_lowercase()),
+        tier: text("subs_tier_name", 64),
+        user_id: text("user_id", 128),
+    })
 }
 
 pub struct AccessGrant {
     pub access_token: String,
     pub refresh_token: Option<String>,
+    /// Seconds the access token lives, when the provider said.
+    pub expires_in: Option<u64>,
 }
 
 impl fmt::Debug for AccessGrant {
@@ -722,6 +871,22 @@ pub async fn refresh_token_grant(
     client_id: &str,
     client_secret: &str,
 ) -> Result<AccessGrant> {
+    refresh_token_exchange(http, token_url, refresh_token, client_id, client_secret)
+        .await
+        .map_err(RefreshError::into_error)
+}
+
+/// Like [`refresh_token_grant`], but tells a refused refresh token
+/// (`invalid_grant`, or a 401) apart from a transient failure, so the caller
+/// can park the account instead of retrying.
+pub async fn refresh_token_exchange(
+    http: &reqwest::Client,
+    token_url: &str,
+    refresh_token: &str,
+    client_id: &str,
+    client_secret: &str,
+) -> std::result::Result<AccessGrant, RefreshError> {
+    let failed = |message: &str| RefreshError::Failed(SeraError::External(message.into()));
     let response = http
         .post(token_url)
         .header("user-agent", USER_AGENT)
@@ -734,33 +899,52 @@ pub async fn refresh_token_grant(
         ])
         .send()
         .await
-        .map_err(|_| SeraError::External("oauth token refresh failed".into()))?;
+        .map_err(|_| failed("oauth token refresh failed"))?;
     let status = response.status();
     let bytes = response
         .bytes()
         .await
-        .map_err(|_| SeraError::External("oauth token refresh failed".into()))?;
-    if bytes.len() > 65_536 || !status.is_success() {
-        return Err(SeraError::External(format!(
+        .map_err(|_| failed("oauth token refresh failed"))?;
+    let value: Option<Value> = if bytes.len() > 65_536 {
+        None
+    } else {
+        serde_json::from_slice(&bytes).ok()
+    };
+    if !status.is_success() {
+        let refused = matches!(status.as_u16(), 400 | 401)
+            && (status.as_u16() == 401
+                || value
+                    .as_ref()
+                    .and_then(|body| body.get("error"))
+                    .and_then(Value::as_str)
+                    == Some("invalid_grant"));
+        if refused {
+            return Err(RefreshError::InvalidGrant);
+        }
+        return Err(RefreshError::Failed(SeraError::External(format!(
             "oauth token refresh failed with status {}",
             status.as_u16()
-        )));
+        ))));
     }
-    let value: Value = serde_json::from_slice(&bytes)
-        .map_err(|_| SeraError::External("oauth token refresh failed".into()))?;
+    let value = value.ok_or_else(|| failed("oauth token refresh failed"))?;
     let token = value
         .get("access_token")
         .and_then(Value::as_str)
         .filter(|token| credential_ok(token))
-        .ok_or_else(|| SeraError::External("oauth token refresh failed".into()))?;
+        .ok_or_else(|| failed("oauth token refresh failed"))?;
     let rotated = value
         .get("refresh_token")
         .and_then(Value::as_str)
         .filter(|token| credential_ok(token))
         .map(str::to_owned);
+    let expires_in = value
+        .get("expires_in")
+        .and_then(Value::as_u64)
+        .filter(|seconds| *seconds > 0);
     Ok(AccessGrant {
         access_token: token.to_owned(),
         refresh_token: rotated,
+        expires_in,
     })
 }
 
@@ -869,7 +1053,15 @@ where
     let Some(identity) = identity else {
         return Err(SeraError::External("Muse login request expired".into()));
     };
-    let api_key = muse_mint_api_key(http, &endpoints.mint, &identity).await?;
+    let api_key = muse_mint(
+        http,
+        &endpoints.mint,
+        &identity,
+        true,
+        &MUSE_MINT_RETRY_WAITS,
+    )
+    .await?
+    .api_key;
     Ok(MuseCredentials {
         api_key: SecretString::new(api_key),
         identity_token: SecretString::new(identity),
@@ -982,6 +1174,8 @@ pub struct UserProviderCredentials {
     server_secrets: SharedSecrets,
     timeout_secs: u64,
     max_output_tokens: u32,
+    /// Account reads, and the single-flight refresh every OAuth client uses.
+    refresher: Arc<AccountRefresher>,
 }
 
 impl std::fmt::Debug for UserProviderCredentials {
@@ -1001,24 +1195,83 @@ impl UserProviderCredentials {
         timeout_secs: u64,
         max_output_tokens: u32,
     ) -> Self {
+        let accounts = Arc::new(Accounts::new(users.store().clone(), users.clone()));
         Self {
             users,
             server_secrets,
             timeout_secs,
             max_output_tokens,
+            refresher: Arc::new(AccountRefresher::new(accounts)),
         }
+    }
+
+    /// Use a refresher shared with the API, so a token refreshed there and a
+    /// token refreshed by a turn take the same lock.
+    pub fn with_refresher(mut self, refresher: Arc<AccountRefresher>) -> Self {
+        self.refresher = refresher;
+        self
+    }
+
+    pub fn refresher(&self) -> &Arc<AccountRefresher> {
+        &self.refresher
+    }
+
+    /// The account a client built without a pin uses: the acting user's own
+    /// best account. Healthy accounts come first (priority, then oldest); the
+    /// legacy `default` credential sits where priority 0 puts it. `None` when
+    /// the user has no account of their own (an admin grant may still apply).
+    fn pick_account(&self, user_id: &str, provider: &str) -> Result<Option<String>> {
+        let accounts = self.refresher.accounts();
+        let mut candidates: Vec<(i64, AccountStatus, String)> = accounts
+            .store()
+            .provider_accounts(user_id, Some(provider))?
+            .into_iter()
+            .filter(|account| account.status != AccountStatus::Disabled)
+            .map(|account| (account.priority, account.status, account.account_id))
+            .collect();
+        if accounts
+            .store()
+            .user_credential(user_id, provider)?
+            .is_some()
+        {
+            let at = candidates
+                .iter()
+                .position(|(priority, _, _)| *priority < 0)
+                .unwrap_or(candidates.len());
+            candidates.insert(at, (0, AccountStatus::Ok, DEFAULT_ACCOUNT.to_owned()));
+        }
+        let rank = |status: AccountStatus| match status {
+            AccountStatus::Ok => 0,
+            AccountStatus::RateLimited | AccountStatus::QuotaExhausted => 1,
+            AccountStatus::NeedsReauth | AccountStatus::Disabled => 2,
+        };
+        // A stable sort keeps the priority order inside each rank.
+        candidates.sort_by_key(|(_, status, _)| rank(*status));
+        Ok(candidates.into_iter().next().map(|(_, _, id)| id))
     }
 }
 
 impl ProviderCredentials for UserProviderCredentials {
     fn available(&self, user_id: &str, provider: &str) -> bool {
-        self.users
+        let granted_or_default = self
+            .users
             .credential_status(user_id, provider)
             .map(|status| status.usable())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        granted_or_default
+            || self
+                .users
+                .store()
+                .usable_account_ids(user_id, provider)
+                .map(|ids| !ids.is_empty())
+                .unwrap_or(false)
     }
 
     fn client(&self, user_id: &str, provider: &str, profile: &ProviderConfig) -> Result<LlmClient> {
+        if let Some(account_id) = self.pick_account(user_id, provider)? {
+            return self.client_for_account(user_id, provider, profile, &account_id);
+        }
+        // No account of the user's own: an admin grant, or nothing.
         let (owner, secret) = self
             .users
             .resolve_with_owner(user_id, provider)?
@@ -1038,6 +1291,40 @@ impl ProviderCredentials for UserProviderCredentials {
                 users: &self.users,
                 user_id: &owner,
                 provider,
+                account_id: DEFAULT_ACCOUNT,
+                refresher: Some(&self.refresher),
+            },
+        )
+    }
+
+    fn client_for_account(
+        &self,
+        user_id: &str,
+        provider: &str,
+        profile: &ProviderConfig,
+        account_id: &str,
+    ) -> Result<LlmClient> {
+        let credential = self
+            .refresher
+            .accounts()
+            .credential(user_id, provider, account_id)?
+            .ok_or_else(|| {
+                SeraError::Forbidden(format!(
+                    "no credential is configured for provider '{provider}'; add a key or ask the admin for a grant"
+                ))
+            })?;
+        open_provider_client(
+            profile,
+            &credential,
+            &self.server_secrets,
+            self.timeout_secs,
+            self.max_output_tokens,
+            CredentialOwner {
+                users: &self.users,
+                user_id,
+                provider,
+                account_id,
+                refresher: Some(&self.refresher),
             },
         )
     }
@@ -1050,13 +1337,19 @@ pub struct CredentialOwner<'a> {
     /// The credential's owner: the acting user, or the grantor for a grant.
     pub user_id: &'a str,
     pub provider: &'a str,
+    /// The owner's account the credential came from ([`DEFAULT_ACCOUNT`] for a
+    /// pre-accounts credential or a grant).
+    pub account_id: &'a str,
+    /// When set, an OAuth client refreshes through this single-flight
+    /// refresher and the rotated tokens are written to the account row.
+    pub refresher: Option<&'a Arc<AccountRefresher>>,
 }
 
 /// Build one provider client from a resolved credential.
 ///
 /// `credential.api_key` is the bearer (an API key, or the access token for an
 /// OAuth provider); `credential.refresh_token` enables the refresh flow. The
-/// OAuth *app* client id/secret stay server-level in the age store â€” they are
+/// OAuth *app* client id/secret stay server-level in the age store - they are
 /// the registration, not the user's secret.
 pub fn open_provider_client(
     profile: &ProviderConfig,
@@ -1072,6 +1365,16 @@ pub fn open_provider_client(
         ));
     }
     let endpoint = resolve_base_url(&profile.kind, &profile.base_url)?;
+    let kind = canonical_kind(&profile.kind)?;
+    // A Claude plan sign-in is an `anthropic` account that carries a refresh
+    // token. It exists only for the admin's own account, only while the
+    // operator's flag is on, and is never reachable through a grant.
+    let claude_plan = kind == "anthropic" && !credential.refresh_token.trim().is_empty();
+    if claude_plan && !(profile.plan_oauth && owner.account_id != DEFAULT_ACCOUNT) {
+        return Err(SeraError::Forbidden(
+            "Claude plan sign-in is turned off on this server".into(),
+        ));
+    }
     let mut client = LlmClient::new(
         &endpoint,
         credential.api_key.clone(),
@@ -1080,12 +1383,25 @@ pub fn open_provider_client(
     )?;
     let plan = auth_plan(&profile.kind, &profile.auth)?;
     let mut oauth_installed = false;
-    if let AuthPlan::OAuth {
-        style,
-        token_url,
-        client_id_fallback,
-    } = plan
-        && !profile.refresh_token_secret.trim().is_empty()
+    // A member's own sign-in carries its refresh token in the account row; the
+    // config marker only matters for the operator's imported credential.
+    let refreshable =
+        !profile.refresh_token_secret.trim().is_empty() || owner.account_id != DEFAULT_ACCOUNT;
+    let oauth_target = match plan {
+        AuthPlan::OAuth {
+            style,
+            token_url,
+            client_id_fallback,
+        } => Some((style, token_url, client_id_fallback)),
+        AuthPlan::ApiKey if claude_plan => Some((
+            OAuthStyle::ClaudeRefresh,
+            crate::auth_flows::claude::TOKEN_URL,
+            None,
+        )),
+        AuthPlan::ApiKey => None,
+    };
+    if let Some((style, token_url, client_id_fallback)) = oauth_target
+        && refreshable
         && !credential.refresh_token.trim().is_empty()
     {
         let client_id = if profile.oauth_client_id_secret.trim().is_empty() {
@@ -1103,6 +1419,11 @@ pub fn open_provider_client(
                 "oauth client secret is required to refresh this provider".into(),
             ));
         }
+        if style == OAuthStyle::ClaudeRefresh && client_id.is_empty() {
+            return Err(SeraError::Config(
+                "the Claude sign-in client id is not configured".into(),
+            ));
+        }
         client = client.with_oauth(OAuthMaterial {
             style,
             refresh_token: credential.refresh_token.clone(),
@@ -1113,18 +1434,139 @@ pub fn open_provider_client(
         oauth_installed = true;
     }
     if oauth_installed {
-        // Rotation writes back into the credential's owner row (the acting
-        // user, or the grantor for a granted provider).
-        client = client.with_credential_writer(Arc::new(UserCredentialWriter::provider(
-            owner.users.clone(),
-            owner.user_id,
-            owner.provider,
-        )))?;
+        match owner.refresher {
+            // Every refresh goes through the account's single-flight lock and
+            // is written back to the owner's account row.
+            Some(refresher) => {
+                client = client.with_account_refresh(
+                    AccountRefreshTarget {
+                        refresher: refresher.clone(),
+                        user_id: owner.user_id.to_owned(),
+                        provider: owner.provider.to_owned(),
+                        account_id: owner.account_id.to_owned(),
+                    },
+                    credential.generation.clone(),
+                    credential.expires_at,
+                )?;
+            }
+            // Rotation writes back into the credential's owner row (the acting
+            // user, or the grantor for a granted provider).
+            None => {
+                client =
+                    client.with_credential_writer(Arc::new(UserCredentialWriter::provider(
+                        owner.users.clone(),
+                        owner.user_id,
+                        owner.provider,
+                    )))?;
+            }
+        }
     }
-    if canonical_kind(&profile.kind)? == "google-antigravity" {
-        client = client.with_cloud_code(&profile.project_id)?;
+    match kind.as_str() {
+        "muse-code" => {
+            client = client
+                .with_header("x-api-version", MUSE_API_VERSION)
+                .with_wire(Wire::Responses);
+        }
+        "anthropic" => {
+            client = client.with_wire(if claude_plan {
+                Wire::AnthropicPlan
+            } else {
+                Wire::AnthropicKey
+            });
+        }
+        "opencode-go" => client = client.with_opencode_session(),
+        _ => {}
+    }
+    // The operator's own credential uses the provider's project; a member's
+    // account never does, it has its own.
+    let member_account = owner.account_id != DEFAULT_ACCOUNT;
+    if kind == "google-antigravity" {
+        let project = if member_account {
+            ""
+        } else {
+            profile.project_id.as_str()
+        };
+        client = client.with_cloud_code(project)?;
+        if !profile.client_version.trim().is_empty() {
+            client = client.with_cloud_version(&profile.client_version);
+        }
+    }
+    if member_account && let Some(refresher) = owner.refresher {
+        let accounts = refresher.accounts();
+        let row =
+            accounts
+                .store()
+                .provider_account(owner.user_id, owner.provider, owner.account_id)?;
+        let generation = row.as_ref().map_or(0, |row| row.session_generation);
+        client = client.with_account(
+            AccountRefreshTarget {
+                refresher: refresher.clone(),
+                user_id: owner.user_id.to_owned(),
+                provider: owner.provider.to_owned(),
+                account_id: owner.account_id.to_owned(),
+            },
+            generation,
+            matches!(kind.as_str(), "muse-code" | "anthropic"),
+        );
+        if kind == "google-antigravity"
+            && let Some(row) = row
+        {
+            let known = row
+                .identity
+                .get("project_id")
+                .and_then(Value::as_str)
+                .filter(|project| {
+                    crate::cloud_code::validate_project_id("google-antigravity", project).is_ok()
+                })
+                .map(str::to_owned);
+            let checked = row
+                .identity
+                .get("project_checked_at")
+                .and_then(Value::as_i64);
+            client = client.with_project_discovery(
+                known,
+                checked,
+                Arc::new(AccountProjectMemo {
+                    accounts: accounts.clone(),
+                    user_id: owner.user_id.to_owned(),
+                    provider: owner.provider.to_owned(),
+                    account_id: owner.account_id.to_owned(),
+                }),
+            );
+        }
     }
     Ok(client)
+}
+
+/// Writes a discovered Cloud Code project (and the fact that discovery ran)
+/// into the member account's own identity.
+struct AccountProjectMemo {
+    accounts: Arc<Accounts>,
+    user_id: String,
+    provider: String,
+    account_id: String,
+}
+
+impl crate::llm::ProjectMemo for AccountProjectMemo {
+    fn record(&self, discovery: &crate::cloud_code::Discovery) {
+        let mut patch = serde_json::json!({
+            "project_checked_at": chrono::Utc::now().timestamp(),
+        });
+        if let Some(project) = &discovery.project {
+            patch["project_id"] = serde_json::json!(project);
+        }
+        if let Some(tier) = &discovery.tier {
+            patch["tier"] = serde_json::json!(tier);
+        }
+        if let Err(error) = self.accounts.store().merge_provider_account_identity(
+            &self.user_id,
+            &self.provider,
+            &self.account_id,
+            &patch,
+        ) {
+            tracing::warn!(%error, "could not remember a discovered Cloud Code project");
+        }
+    }
 }
 
 /// Copy the operator's existing age-store provider credentials into the
@@ -1194,6 +1636,90 @@ pub fn import_age_provider_credentials(
     }
     Ok(imported)
 }
+
+/// Bring an operator's *new* age-store sign-in (after `serabot providers login`
+/// or `serabot secrets set`) into the admin's accounts.
+///
+/// [`import_age_provider_credentials`] runs once per provider, so a later
+/// sign-in used to be ignored. Here the age store's refresh token is
+/// fingerprinted (a keyed hash, never the token) and remembered per provider:
+/// the first run only records it, because the once-only import already copied
+/// that sign-in; when it later differs, the new sign-in is added as another
+/// admin account beside the old ones, with the provider's configured project in
+/// its identity. Nothing is overwritten or removed. Returns the accounts added.
+pub fn import_age_oauth_sign_ins(
+    config: &Config,
+    secrets: &SharedSecrets,
+    accounts: &Accounts,
+    store: &Store,
+    admin_id: &str,
+) -> Result<usize> {
+    let default = config.llm.default_provider();
+    let mut added = 0;
+    for (id, profile) in std::iter::once(("default", &default)).chain(
+        config
+            .llm
+            .providers
+            .iter()
+            .map(|(id, profile)| (id.as_str(), profile)),
+    ) {
+        if profile.refresh_token_secret.trim().is_empty()
+            || canonical_kind(&profile.kind).is_ok_and(|kind| kind != "google-antigravity")
+        {
+            continue;
+        }
+        let (Some(refresh), Some(access)) = (
+            secrets.get(profile.refresh_token_secret.trim()),
+            secrets.get(profile.api_key_secret.trim()),
+        ) else {
+            continue;
+        };
+        if refresh.is_empty() || access.is_empty() {
+            continue;
+        }
+        let fingerprint = accounts.key_fingerprint(admin_id, id, &refresh);
+        let marker = format!("provider_signin_seen:{admin_id}:{id}");
+        match store.kv_get(&marker)? {
+            Some(seen) if seen == fingerprint => continue,
+            // First sight: the once-only import already holds this sign-in.
+            None => {
+                store.kv_set(&marker, &fingerprint)?;
+                continue;
+            }
+            Some(_) => {}
+        }
+        let identity = if profile.project_id.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::json!({"project_id": profile.project_id.trim()})
+        };
+        accounts.add(
+            admin_id,
+            crate::accounts::AddAccount {
+                provider: id.to_owned(),
+                label: "Imported sign-in".into(),
+                auth_kind: crate::accounts::AuthKind::Oauth,
+                fingerprint: fingerprint.clone(),
+                identity,
+                credential: ProviderCredential {
+                    api_key: access,
+                    refresh_token: refresh,
+                    ..Default::default()
+                },
+                priority: 0,
+            },
+        )?;
+        store.kv_set(&marker, &fingerprint)?;
+        added += 1;
+    }
+    Ok(added)
+}
+
+#[cfg(test)]
+mod account_clients_tests;
+
+#[cfg(test)]
+mod wire_clients_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1700,6 +2226,175 @@ mod tests {
         users.grant(&admin, &member, "default").unwrap();
         assert!(credentials.available(&member, "default"));
         assert!(credentials.client(&member, "default", &profile).is_ok());
+    }
+
+    /// A chat endpoint that answers `text` to exactly one bearer key.
+    async fn answer_for_key(server: &wiremock::MockServer, key: &str, text: &str) {
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("authorization", format!("Bearer {key}").as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn who_answers(client: &LlmClient) -> String {
+        client
+            .clone()
+            .with_model("synthetic")
+            .complete(&[crate::domain::LlmMessage::user("hi")], &[], None, None)
+            .await
+            .unwrap()
+            .message
+            .content
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn accounts_make_a_provider_usable_and_pick_the_best_healthy_one() {
+        let store = Store::open_in_memory(384).unwrap();
+        let users = Arc::new(UserSecrets::with_master_key(store.clone(), [3u8; 32]).unwrap());
+        let credentials = UserProviderCredentials::new(
+            users.clone(),
+            SharedSecrets::new(crate::secrets::SecretStore::from_map(Default::default())),
+            5,
+            64,
+        );
+        let accounts = credentials.refresher().accounts().clone();
+        let alice = store
+            .create_user("microsoft:pick-a", "a@example.example", "Alice")
+            .unwrap()
+            .id;
+        let bob = store
+            .create_user("microsoft:pick-b", "b@example.example", "Bob")
+            .unwrap()
+            .id;
+        let server = wiremock::MockServer::start().await;
+        for (key, text) in [
+            ("key-low", "low"),
+            ("key-high", "high"),
+            ("key-broken", "broken"),
+            ("key-default", "default"),
+        ] {
+            answer_for_key(&server, key, text).await;
+        }
+        let profile = ProviderConfig {
+            base_url: server.uri(),
+            api_key_secret: "acme".into(),
+            models: vec!["synthetic".into()],
+            ..Default::default()
+        };
+
+        // Nothing yet: not usable, and no client.
+        assert!(!credentials.available(&alice, "acme"));
+        assert!(credentials.client(&alice, "acme", &profile).is_err());
+
+        let low = accounts
+            .add_api_key(&alice, "acme", "Low", "key-low")
+            .unwrap();
+        let high = accounts
+            .add_api_key(&alice, "acme", "High", "key-high")
+            .unwrap();
+        let broken = accounts
+            .add_api_key(&alice, "acme", "Broken", "key-broken")
+            .unwrap();
+        use crate::accounts::AccountPatch;
+        accounts
+            .update(
+                &alice,
+                "acme",
+                &high.account_id,
+                &AccountPatch {
+                    priority: Some(5),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        accounts
+            .update(
+                &alice,
+                "acme",
+                &broken.account_id,
+                &AccountPatch {
+                    priority: Some(99),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        accounts
+            .set_status(
+                &alice,
+                "acme",
+                &broken.account_id,
+                crate::accounts::AccountStatus::NeedsReauth,
+                Some("rejected"),
+                None,
+            )
+            .unwrap();
+        // Accounts alone make the provider available, for this user only.
+        assert!(credentials.available(&alice, "acme"));
+        assert!(!credentials.available(&bob, "acme"));
+        // The best healthy account answers, whatever its row order.
+        let client = credentials.client(&alice, "acme", &profile).unwrap();
+        assert_eq!(who_answers(&client).await, "high");
+        // A named account is used even when it is not the best.
+        let client = credentials
+            .client_for_account(&alice, "acme", &profile, &low.account_id)
+            .unwrap();
+        assert_eq!(who_answers(&client).await, "low");
+        // Another member cannot name Alice's account.
+        assert!(
+            credentials
+                .client_for_account(&bob, "acme", &profile, &low.account_id)
+                .is_err()
+        );
+        // When the best one fails over to needs_reauth the next one is used.
+        accounts
+            .set_status(
+                &alice,
+                "acme",
+                &high.account_id,
+                crate::accounts::AccountStatus::NeedsReauth,
+                None,
+                None,
+            )
+            .unwrap();
+        let client = credentials.client(&alice, "acme", &profile).unwrap();
+        assert_eq!(who_answers(&client).await, "low");
+        // A disabled account is never picked, even when it is all that is left.
+        accounts
+            .update(
+                &alice,
+                "acme",
+                &low.account_id,
+                &AccountPatch {
+                    disabled: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let client = credentials.client(&alice, "acme", &profile).unwrap();
+        assert_ne!(who_answers(&client).await, "low");
+
+        // The pre-accounts credential competes at priority 0.
+        users
+            .set(
+                &bob,
+                "acme",
+                &ProviderCredential {
+                    api_key: "key-default".into(),
+                    ..Default::default()
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(credentials.available(&bob, "acme"));
+        let client = credentials.client(&bob, "acme", &profile).unwrap();
+        assert_eq!(who_answers(&client).await, "default");
     }
 
     fn catalog_of(value: serde_json::Value, strict: bool) -> ModelCatalog {

@@ -39,6 +39,9 @@ pub struct ProviderPreset {
     /// authorization code), device (device code) or pkce_google (Google
     /// Cloud Code). Empty for providers that only take an API key.
     pub sign_in: &'static str,
+    /// A plain-words risk shown beside a sign-in that rides on a vendor's
+    /// consumer plan rather than an API contract. Empty when there is none.
+    pub risk: &'static str,
 }
 
 /// Filter tabs for the Provider Directory.
@@ -111,6 +114,14 @@ pub fn filter_presets(
         .collect()
 }
 
+/// Shown beside the Antigravity sign-in: it uses Google's own desktop client,
+/// so the account can be suspended.
+pub const PLAN_RISK_GOOGLE: &str = "This signs in through Google's Antigravity client, not an API contract. Google may suspend an account used this way. It is your own account and is never shared.";
+
+/// Shown beside a Claude plan sign-in when the server does not send its own
+/// text. API keys are the supported path.
+pub const PLAN_RISK_CLAUDE: &str = "Anthropic's terms do not allow a third-party product to offer Claude plan sign-in. This account is yours alone, is never shared, and may be suspended. API keys are the supported path.";
+
 const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "antigravity",
@@ -132,6 +143,7 @@ const PRESETS: &[ProviderPreset] = &[
         note: "Google Cloud Code OAuth (PKCE) — Gemini & Claude models",
         key_url: "",
         sign_in: "pkce_google",
+        risk: PLAN_RISK_GOOGLE,
     },
     ProviderPreset {
         id: "deepseek",
@@ -148,6 +160,7 @@ const PRESETS: &[ProviderPreset] = &[
         note: "DeepSeek V3, R1 & Reasoner API",
         key_url: "https://platform.deepseek.com/api_keys",
         sign_in: "",
+        risk: "",
     },
     ProviderPreset {
         id: "minimax",
@@ -164,6 +177,7 @@ const PRESETS: &[ProviderPreset] = &[
         note: "MiniMax M3.1 Flash, M3 & M-Plan API",
         key_url: "https://platform.minimax.io/user-center/basic-information/interface-key",
         sign_in: "",
+        risk: "",
     },
     ProviderPreset {
         id: "minimax-cn",
@@ -180,6 +194,7 @@ const PRESETS: &[ProviderPreset] = &[
         note: "MiniMax China domestic endpoint",
         key_url: "https://platform.minimaxi.com/user-center/basic-information/interface-key",
         sign_in: "",
+        risk: "",
     },
     ProviderPreset {
         id: "mistral",
@@ -221,6 +236,7 @@ const PRESETS: &[ProviderPreset] = &[
         note: "Mistral Large, Magistral, Codestral, Ministral, Pixtral & open models",
         key_url: "https://console.mistral.ai/api-keys",
         sign_in: "",
+        risk: "",
     },
     ProviderPreset {
         id: "openai",
@@ -248,6 +264,7 @@ const PRESETS: &[ProviderPreset] = &[
         note: "GPT-5, GPT-4.1, GPT-4o & o-series reasoning",
         key_url: "https://platform.openai.com/api-keys",
         sign_in: "",
+        risk: "",
     },
     ProviderPreset {
         id: "openrouter",
@@ -268,6 +285,7 @@ const PRESETS: &[ProviderPreset] = &[
         note: "Unified router for Claude, Gemini, Llama & DeepSeek",
         key_url: "https://openrouter.ai/settings/keys",
         sign_in: "pkce",
+        risk: "",
     },
     ProviderPreset {
         id: "groq",
@@ -288,6 +306,7 @@ const PRESETS: &[ProviderPreset] = &[
         note: "Ultra-fast LPU inference for Llama & Qwen",
         key_url: "https://console.groq.com/keys",
         sign_in: "",
+        risk: "",
     },
     ProviderPreset {
         id: "xai",
@@ -304,6 +323,7 @@ const PRESETS: &[ProviderPreset] = &[
         note: "Grok 3 & Grok 3 Mini API",
         key_url: "https://console.x.ai",
         sign_in: "",
+        risk: "",
     },
     ProviderPreset {
         id: "moonshot",
@@ -320,6 +340,7 @@ const PRESETS: &[ProviderPreset] = &[
         note: "Kimi K2 & Moonshot v1 long-context API",
         key_url: "https://platform.moonshot.ai/console/api-keys",
         sign_in: "",
+        risk: "",
     },
     ProviderPreset {
         id: "cerebras",
@@ -336,6 +357,7 @@ const PRESETS: &[ProviderPreset] = &[
         note: "Wafer-scale high-speed inference",
         key_url: "https://cloud.cerebras.ai/platform",
         sign_in: "",
+        risk: "",
     },
     ProviderPreset {
         id: "together",
@@ -355,6 +377,7 @@ const PRESETS: &[ProviderPreset] = &[
         note: "Open-weights cloud inference",
         key_url: "https://api.together.ai/settings/api-keys",
         sign_in: "",
+        risk: "",
     },
     ProviderPreset {
         id: "fireworks",
@@ -374,6 +397,7 @@ const PRESETS: &[ProviderPreset] = &[
         note: "Fast production open-model inference",
         key_url: "https://app.fireworks.ai/settings/users/api-keys",
         sign_in: "",
+        risk: "",
     },
     ProviderPreset {
         id: "gemini",
@@ -390,6 +414,7 @@ const PRESETS: &[ProviderPreset] = &[
         note: "Gemini API key from Google AI Studio",
         key_url: "https://aistudio.google.com/apikey",
         sign_in: "",
+        risk: "",
     },
     ProviderPreset {
         id: "perplexity",
@@ -406,6 +431,7 @@ const PRESETS: &[ProviderPreset] = &[
         note: "Sonar models with web search",
         key_url: "https://www.perplexity.ai/account/api/keys",
         sign_in: "",
+        risk: "",
     },
     ProviderPreset {
         id: "huggingface",
@@ -425,6 +451,7 @@ const PRESETS: &[ProviderPreset] = &[
         note: "Hugging Face access token with inference permission",
         key_url: "https://huggingface.co/settings/tokens",
         sign_in: "",
+        risk: "",
     },
     ProviderPreset {
         id: "nebius",
@@ -441,6 +468,7 @@ const PRESETS: &[ProviderPreset] = &[
         note: "Open models on Nebius infrastructure",
         key_url: "https://tokenfactory.nebius.com",
         sign_in: "",
+        risk: "",
     },
     ProviderPreset {
         id: "sambanova",
@@ -457,12 +485,81 @@ const PRESETS: &[ProviderPreset] = &[
         note: "Fast open-model inference on SambaNova chips",
         key_url: "https://cloud.sambanova.ai/apis",
         sign_in: "",
+        risk: "",
+    },
+    ProviderPreset {
+        id: "anthropic",
+        label: "Anthropic (Claude)",
+        subtitle: "Claude models on the native Messages API. Add several API keys; each member's keys are their own.",
+        base_url: "https://api.anthropic.com/v1",
+        kind: "anthropic",
+        default_id: "anthropic",
+        models: &["claude-sonnet-5-5", "claude-opus-5-5"],
+        secret_name: "anthropic_api_key",
+        catalog_fetch: true,
+        auth: "api_key",
+        badge: "API Key",
+        note: "Anthropic API key. Claude plan sign-in is off by default and admin-only",
+        key_url: "https://console.anthropic.com/settings/keys",
+        sign_in: "",
+        risk: PLAN_RISK_CLAUDE,
+    },
+    ProviderPreset {
+        id: "opencode-go",
+        label: "OpenCode Go",
+        subtitle: "OpenCode Go subscription: open coding models behind one key",
+        base_url: "https://opencode.ai/zen/go/v1",
+        kind: "opencode-go",
+        default_id: "opencode-go",
+        models: &["glm-5.3-flash", "glm-5.3", "kimi-k2.7-code"],
+        secret_name: "opencode_go_api_key",
+        catalog_fetch: true,
+        auth: "api_key",
+        badge: "API Key",
+        note: "OpenCode Go key; every request carries a session id",
+        key_url: "https://opencode.ai/auth",
+        sign_in: "",
+        risk: "",
+    },
+    ProviderPreset {
+        id: "opencode-zen",
+        label: "OpenCode Zen",
+        subtitle: "OpenCode Zen pay-as-you-go models behind one key",
+        base_url: "https://opencode.ai/zen/v1",
+        kind: "opencode-zen",
+        default_id: "opencode-zen",
+        models: &["claude-fable-5-1"],
+        secret_name: "opencode_zen_api_key",
+        catalog_fetch: true,
+        auth: "api_key",
+        badge: "API Key",
+        note: "OpenCode Zen key (pay as you go)",
+        key_url: "https://opencode.ai/auth",
+        sign_in: "",
+        risk: "",
+    },
+    ProviderPreset {
+        id: "nous",
+        label: "Nous Portal (Hermes)",
+        subtitle: "Nous Research's Hermes models, OpenAI-compatible, with an API key",
+        base_url: "https://inference-api.nousresearch.com/v1",
+        kind: "openai-compatible",
+        default_id: "nous",
+        models: &[],
+        secret_name: "nous_api_key",
+        catalog_fetch: true,
+        auth: "api_key",
+        badge: "API Key",
+        note: "Base URL not verified against Nous docs: confirm it before approving egress",
+        key_url: "https://portal.nousresearch.com",
+        sign_in: "",
+        risk: "",
     },
     ProviderPreset {
         id: "muse-code",
         label: "Muse Code",
         subtitle: "Muse Spark OAuth device sign-in",
-        base_url: "https://api.musecode.ai/v1",
+        base_url: "https://api.meta.ai/v1",
         kind: "muse-code",
         default_id: "muse",
         models: &["muse-spark-1.3"],
@@ -473,6 +570,7 @@ const PRESETS: &[ProviderPreset] = &[
         note: "Muse Spark OAuth device sign-in",
         key_url: "",
         sign_in: "device",
+        risk: "",
     },
     ProviderPreset {
         id: "ollama",
@@ -489,6 +587,7 @@ const PRESETS: &[ProviderPreset] = &[
         note: "Local model server on 127.0.0.1:11434",
         key_url: "",
         sign_in: "",
+        risk: "",
     },
     ProviderPreset {
         id: "custom",
@@ -505,8 +604,19 @@ const PRESETS: &[ProviderPreset] = &[
         note: "Any /v1/chat/completions gateway or proxy",
         key_url: "",
         sign_in: "",
+        risk: "",
     },
 ];
+
+/// Presets whose base URL or key page no research note confirms. The sheet
+/// shows their note, and the owner checks the vendor's docs before approving
+/// egress.
+pub const UNVERIFIED_PRESETS: &[&str] = &["nous"];
+
+/// Whether a preset's endpoint is unconfirmed (see [`UNVERIFIED_PRESETS`]).
+pub fn is_unverified(id: &str) -> bool {
+    UNVERIFIED_PRESETS.contains(&id)
+}
 
 /// The preset catalog, in picker order.
 pub fn presets() -> &'static [ProviderPreset] {
@@ -596,6 +706,9 @@ mod tests {
                         | "together"
                         | "fireworks"
                         | "muse-code"
+                        | "anthropic"
+                        | "opencode-go"
+                        | "opencode-zen"
                         | "gemini"
                         | "perplexity"
                         | "huggingface"
@@ -639,6 +752,39 @@ mod tests {
             "http://127.0.0.1:11434/v1"
         );
         assert!(preset_for("nope").is_none());
+    }
+
+    #[test]
+    fn the_v049_provider_presets_match_the_server() {
+        let anthropic = preset_for("anthropic").unwrap();
+        assert_eq!(anthropic.kind, "anthropic");
+        assert_eq!(anthropic.base_url, "https://api.anthropic.com/v1");
+        // API keys only: the plan sign-in is an admin flag, not a preset.
+        assert_eq!((anthropic.auth, anthropic.sign_in), ("api_key", ""));
+        let go = preset_for("opencode-go").unwrap();
+        assert_eq!(go.kind, "opencode-go");
+        assert_eq!(go.base_url, "https://opencode.ai/zen/go/v1");
+        let zen = preset_for("opencode-zen").unwrap();
+        assert_eq!(zen.kind, "opencode-zen");
+        assert_eq!(zen.base_url, "https://opencode.ai/zen/v1");
+        // Nous is a plain OpenAI-compatible provider; its URL is flagged.
+        let nous = preset_for("nous").unwrap();
+        assert_eq!(nous.kind, "openai-compatible");
+        assert!(is_unverified("nous"));
+        assert!(nous.note.contains("not verified"));
+        for verified in ["anthropic", "opencode-go", "opencode-zen", "muse-code"] {
+            assert!(!is_unverified(verified), "{verified}");
+        }
+        // Muse's catalog is pinned to the documented host.
+        assert_eq!(
+            preset_for("muse-code").unwrap().base_url,
+            "https://api.meta.ai/v1"
+        );
+        // Matching a configured provider to a preset works by kind for the
+        // native kinds and by id for the shared OpenAI-compatible kind.
+        assert!(provider_matches_preset("mine", "anthropic", anthropic));
+        assert!(provider_matches_preset("nous", "openai-compatible", nous));
+        assert!(!provider_matches_preset("other", "openai-compatible", nous));
     }
 
     #[test]
@@ -701,6 +847,22 @@ mod tests {
             assert_eq!((preset.auth, preset.sign_in), ("api_key", ""), "{id}");
         }
         assert_eq!(preset_for("ollama").unwrap().auth, "none");
+    }
+
+    #[test]
+    fn only_plan_sign_ins_carry_a_risk_line() {
+        let risky: Vec<&str> = presets()
+            .iter()
+            .filter(|preset| !preset.risk.is_empty())
+            .map(|preset| preset.id)
+            .collect();
+        assert_eq!(risky, ["antigravity", "anthropic"]);
+        assert!(PLAN_RISK_GOOGLE.contains("suspend"));
+        assert!(PLAN_RISK_CLAUDE.contains("API keys are the supported path"));
+        // A risk never hides on a plain key provider.
+        for id in ["openai", "mistral", "opencode-go", "nous", "muse-code"] {
+            assert!(preset_for(id).unwrap().risk.is_empty(), "{id}");
+        }
     }
 
     #[test]

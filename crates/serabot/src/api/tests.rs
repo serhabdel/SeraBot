@@ -9,6 +9,7 @@ use axum::http::Request;
 use tower::ServiceExt;
 
 mod a8_smoke_api;
+mod anthropic_claude_api;
 mod big_wave_b3_b4;
 mod bot_chats_api;
 mod browser_api;
@@ -25,6 +26,8 @@ mod memory_settings_api;
 mod personal_api;
 mod preview_api;
 mod profiles_api;
+mod provider_accounts_api;
+mod signin_agy_muse_api;
 mod standing_grants_api;
 mod status_api;
 mod task_contract_api;
@@ -97,6 +100,9 @@ fn test_bot(name: &str, role: crate::orchestration::BotRole) -> LoadedBot {
             thinking: None,
             role,
             delegates: vec![],
+            route: None,
+            fallbacks: Vec::new(),
+            failover: Default::default(),
         },
         prompt: "test prompt".into(),
     }
@@ -2827,6 +2833,89 @@ async fn usage_endpoint_rolls_up_model_used_rows_clamps_days_and_filters() {
         .await
         .unwrap();
     assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn bot_route_endpoint_validates_and_persists_the_chain() {
+    let root = temp_base();
+    let mut notes = test_bot("notes", crate::orchestration::BotRole::Specialist);
+    notes.config.enabled = true;
+    let (app, _, _) = app_with_fleet(
+        true,
+        Policy::empty(),
+        root.clone(),
+        vec![
+            test_bot("main", crate::orchestration::BotRole::Orchestrator),
+            notes,
+        ],
+    );
+    let put = |body: Value| request(&app, "PUT", "/v1/bots/notes/route", true, Some(body));
+    let status = |body: Value| {
+        let app = app.clone();
+        let req = put(body);
+        async move { app.oneshot(req).await.unwrap().status() }
+    };
+
+    // Too many fallbacks, duplicates, an unsupported thinking level, an
+    // unknown provider and an empty body are all refused before any write.
+    let entry = |model: &str| json!({"provider": "default", "model": model});
+    assert!(
+        !status(json!({
+            "route": entry("test"),
+            "fallbacks": [entry("a"), entry("b"), entry("c")]
+        }))
+        .await
+        .is_success()
+    );
+    assert!(
+        !status(json!({"route": entry("test"), "fallbacks": [entry("test")]}))
+            .await
+            .is_success()
+    );
+    assert!(
+        !status(json!({
+            "route": {"provider": "default", "model": "test", "thinking": "high"}
+        }))
+        .await
+        .is_success()
+    );
+    assert!(
+        !status(json!({
+            "route": {"provider": "nowhere", "model": "test"}
+        }))
+        .await
+        .is_success()
+    );
+    assert!(!status(json!({})).await.is_success());
+    let unchanged = read_json(
+        app.clone()
+            .oneshot(request(&app, "GET", "/v1/bots/notes", true, None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(unchanged["route"]["route"], Value::Null);
+
+    let saved = app
+        .clone()
+        .oneshot(put(json!({
+            "route": entry("test"),
+            "failover": {"max_switches": 2}
+        })))
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), StatusCode::OK);
+    let body = read_json(
+        app.clone()
+            .oneshot(request(&app, "GET", "/v1/bots/notes", true, None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["route"]["route"]["model"], "test");
+    assert_eq!(body["route"]["failover"]["max_switches"], 2);
+    assert_eq!(body["route"]["effective"]["provider"], "default");
+    assert_eq!(body["route"]["last_switch"], Value::Null);
 }
 
 #[tokio::test]
