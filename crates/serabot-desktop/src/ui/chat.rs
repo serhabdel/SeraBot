@@ -1,6 +1,11 @@
 use super::chat_feed_view::{self as feed_view, RowView};
 use super::*;
 
+/// Whether the in-conversation search bar is open. Provided by `Shell` so the
+/// topbar's search button and the chat view's bar share one flag.
+#[derive(Clone, Copy)]
+pub(crate) struct ChatFindOpen(pub Signal<bool>);
+
 #[component]
 pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
     let conversation_kind = session.read().conversation_kind().map(str::to_owned);
@@ -391,7 +396,10 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let copied = use_signal(|| Option::<String>::None);
     let mut confirm_regen = use_signal(|| Option::<String>::None);
     let task_added_ids = use_signal(HashSet::<String>::new);
-    let mut search_open = use_signal(|| false);
+    // The topbar owns the search button, so the open flag is shared; it closes
+    // with the conversation (the view is keyed by it).
+    let ChatFindOpen(mut search_open) = use_context::<ChatFindOpen>();
+    use_drop(move || search_open.set(false));
     let mut search_query = use_signal(String::new);
     // Keyed by (message, attempt): the same sentence after another failed
     // send is a new failure and shows again.
@@ -886,9 +894,8 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                 }
             }
             div { class: "chat-column",
-                if message_count >= 4 || search_open() {
-                    if search_open() {
-                        div { class: "chat-find-bar", role: "search", "aria-label": "Search in conversation",
+                if search_open() {
+                    div { class: "chat-find-bar", role: "search", "aria-label": "Search in conversation",
                             Icon { name: "search", size: 14 }
                             input {
                                 id: "chat-find-input",
@@ -925,24 +932,6 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                 },
                                 Icon { name: "x", size: 13 }
                             }
-                        }
-                    } else {
-                        div { class: "chat-find-toggle-row",
-                            button {
-                                class: "btn ghost sm chat-find-toggle",
-                                r#type: "button",
-                                title: "Search in conversation (Ctrl+F)",
-                                "aria-label": "Search in conversation",
-                                onclick: move |_| {
-                                    search_open.set(true);
-                                    let _ = dioxus::document::eval(
-                                        "requestAnimationFrame(() => { const el = document.getElementById('chat-find-input'); if (el) el.focus(); })",
-                                    );
-                                },
-                                Icon { name: "search", size: 13 }
-                                " Search"
-                            }
-                        }
                     }
                 }
                 if let Some(plan) = chat_plan.clone() {

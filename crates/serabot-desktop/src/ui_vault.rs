@@ -392,6 +392,7 @@ fn VaultEntryCard(session: Signal<Session>, entry: VaultEntry) -> Element {
                             r#type: "button",
                             title: "Copy reference path",
                             onclick: move |_| {
+                                #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
                                 let text = ref_copy.clone();
                                 copied_ref.set(true);
                                 #[cfg(target_os = "windows")]

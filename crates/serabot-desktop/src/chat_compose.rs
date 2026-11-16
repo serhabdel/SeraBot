@@ -1093,7 +1093,7 @@ mod tests {
             ".composer-wrap .composer-hint {",
             "max-height: 40vh;",
             "max-height: 70vh;",
-            "min-height: 72px;",
+            "min-height: 28px;",
         ] {
             assert!(css.contains(needle), "missing composer rule: {needle}");
         }

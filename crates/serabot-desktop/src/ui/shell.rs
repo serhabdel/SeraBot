@@ -10,6 +10,8 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
     let mut drawer_open = use_signal(|| false);
     let mut toast = use_signal(|| Option::<(String, bool)>::None);
     let undo = use_signal(|| Option::<String>::None);
+    // The topbar's search button and the chat view's find bar share this flag.
+    use_context_provider(|| ChatFindOpen(Signal::new(false)));
     // A sign-in the session starts by itself (right after a save, or when an
     // error asks for one) opens its sheet here.
     let mut overlay_for_signin = overlay;
@@ -434,18 +436,35 @@ pub(super) fn Sidebar(
                     let unread = chat_feed::rolled_up_unread(main_unread, &other_unread);
                     let extra = chats.iter().filter(|chat| !chat.primary).count();
                     let has_active = chats.iter().any(|chat| chat.id == current);
+                    // The latest message of the bot's main chat reads better
+                    // than repeating its role on every row.
+                    let subtitle = conversations
+                        .iter()
+                        .find(|conversation| conversation.id == id)
+                        .filter(|conversation| {
+                            conversation
+                                .last_message
+                                .as_ref()
+                                .is_some_and(|last| !last.text.trim().is_empty())
+                        })
+                        .map(|conversation| state.conversation_list_subtitle(conversation))
+                        .unwrap_or_else(|| capitalise_role(&bot.role));
                     items.push(RailItem::Bot {
                         active: id == current || has_active,
                         pinned: pins.contains(&bot.id),
                         id,
                         label: state.bot_display_name(&bot.id),
                         role: bot.role.clone(),
+                        subtitle,
                         avatar: state.bot_avatar(&bot.id),
                         enabled: bot.enabled,
                         live: bot.live,
                         unread,
                         extra_chats: extra,
                     });
+                }
+                if needle.is_empty() && state.state.shipped_bots.len() > bots.len() {
+                    items.push(RailItem::AddBots);
                 }
             }
         }
@@ -679,6 +698,8 @@ pub(super) fn Sidebar(
                                 button {
                                     key: "{key}",
                                     class: "thread-group",
+                                    r#type: "button",
+                                    "aria-expanded": if closed { "false" } else { "true" },
                                     onclick: move |_| {
                                         let mut set = collapsed.write();
                                         let opening = set.contains(&toggle);
@@ -692,30 +713,34 @@ pub(super) fn Sidebar(
                                             session.write().load_archived();
                                         }
                                     },
-                                    Icon { name: if closed { "chevron-right" } else { "chevron-down" }, size: 14 }
+                                    Icon { name: if closed { "chevron-right" } else { "chevron-down" }, size: 12 }
                                     span { class: "thread-title", "{title}" }
                                     if let Some(total) = total {
-                                        span { class: "thread-meta", "{count} of {total}" }
+                                        span {
+                                            class: "thread-count",
+                                            title: "{count} of {total} built-in bots",
+                                            "{count}"
+                                        }
                                     } else {
-                                        span { class: "thread-meta", "{count}" }
-                                    }
-                                }
-                                if total.is_some() {
-                                    button {
-                                        key: "{key}-more",
-                                        class: "btn ghost sm",
-                                        r#type: "button",
-                                        title: "See every built-in bot and add the ones you do not have",
-                                        onclick: move |_| {
-                                            drawer_open.set(false);
-                                            session.write().open_bots_tab();
-                                        },
-                                        "Add more bots"
+                                        span { class: "thread-count", "{count}" }
                                     }
                                 }
                             }
                         },
-                        RailItem::Bot { id, label, role, avatar, active, enabled, live, unread, pinned, extra_chats } => {
+                        RailItem::AddBots => rsx! {
+                            button {
+                                class: "thread-add",
+                                r#type: "button",
+                                title: "See every built-in bot and add the ones you do not have",
+                                onclick: move |_| {
+                                    drawer_open.set(false);
+                                    session.write().open_bots_tab();
+                                },
+                                span { class: "thread-add-icon", Icon { name: "plus", size: 14 } }
+                                "Add more bots"
+                            }
+                        },
+                        RailItem::Bot { id, label, role, subtitle, avatar, active, enabled, live, unread, pinned, extra_chats } => {
                             let pin_id = id.strip_prefix("dir:").unwrap_or(&id).to_owned();
                             let removable = serabot_desktop::can_remove_bot(&pin_id, &role);
                             let act = session.read().state.working.activity_of(&pin_id, Instant::now());
@@ -752,7 +777,7 @@ pub(super) fn Sidebar(
                                                 span { class: "thread-meta working-label", role: "status", "{act_label}" }
                                             }
                                             span { class: "thread-meta",
-                                                if enabled { "{role}" } else { "{role} · disabled" }
+                                                if enabled { "{subtitle}" } else { "{subtitle} · disabled" }
                                             }
                                         }
                                         if extra_chats > 0 {
@@ -1416,6 +1441,16 @@ pub(super) fn initial_of(label: &str) -> String {
         .unwrap_or_else(|| "C".to_owned())
 }
 
+/// "specialist" becomes "Specialist" for the one-line row subtitle.
+pub(super) fn capitalise_role(role: &str) -> String {
+    let role = role.trim();
+    let mut chars = role.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => "Bot".to_owned(),
+    }
+}
+
 pub(super) enum RailItem {
     Header {
         key: String,
@@ -1429,6 +1464,8 @@ pub(super) enum RailItem {
         id: String,
         label: String,
         role: String,
+        /// One line under the name: the latest chat preview, else the role.
+        subtitle: String,
         avatar: String,
         active: bool,
         enabled: bool,
@@ -1438,6 +1475,8 @@ pub(super) enum RailItem {
         /// Chats beyond the primary one.
         extra_chats: usize,
     },
+    /// "Add more bots", the quiet last row of the Bots group.
+    AddBots,
     Thread {
         id: String,
         label: String,
@@ -1639,15 +1678,17 @@ pub(super) fn Topbar(
         };
         (subtitle, avatar)
     };
-    let (pill_class, pill_label) = if !connected {
-        ("pill danger", "offline")
+    // A chip only for what needs attention. "Working" shows as the live
+    // status under the name; an idle bot says nothing.
+    let status_pill = if !connected {
+        Some(("pill danger", "offline"))
+    } else if matches!(task_status, Some(TaskStatus::AwaitingApproval)) {
+        Some(("pill warn", "awaiting approval"))
     } else {
-        match task_status {
-            Some(TaskStatus::Running | TaskStatus::Queued) => ("pill ok", "working"),
-            Some(TaskStatus::AwaitingApproval) => ("pill warn", "awaiting approval"),
-            _ => ("pill", "idle"),
-        }
+        None
     };
+    let mut find_open = use_context::<ChatFindOpen>().0;
+    let can_search = session.read().state.messages.len() >= 2 || find_open();
     let team = {
         let state = session.read();
         let team_members = state
@@ -1724,16 +1765,16 @@ pub(super) fn Topbar(
                     strong { "{title}" }
                 }
                 if let Some(text) = header_label {
-                    span { class: "working-label", role: "status", "{text}" }
+                    span { class: "topbar-sub topbar-status", role: "status",
+                        span { class: "status-dot", "aria-hidden": "true" }
+                        "{text}"
+                    }
                 } else {
-                    span { "{subtitle}" }
+                    span { class: "topbar-sub", "{subtitle}" }
                 }
             }
-            span { class: "{pill_class}", role: "status",
-                if pill_label == "working" {
-                    span { class: "pill-dot live" }
-                }
-                "{pill_label}"
+            if let Some((pill_class, pill_label)) = status_pill {
+                span { class: "{pill_class}", role: "status", "{pill_label}" }
             }
             div { class: "chat-header-actions",
                 // The member stack belongs to groups and rooms; in a one-to-one
@@ -1757,6 +1798,27 @@ pub(super) fn Topbar(
                         }
                     }
                 }
+                }
+                if can_search {
+                    button {
+                        class: "icon-btn topbar-search",
+                        r#type: "button",
+                        title: "Search in conversation (Ctrl+F)",
+                        "aria-label": "Search in conversation",
+                        "aria-keyshortcuts": "Control+F",
+                        "aria-pressed": if find_open() { "true" } else { "false" },
+                        onclick: move |_| {
+                            if find_open() {
+                                find_open.set(false);
+                            } else {
+                                find_open.set(true);
+                                let _ = dioxus::document::eval(
+                                    "requestAnimationFrame(() => { const el = document.getElementById('chat-find-input'); if (el) el.focus(); })",
+                                );
+                            }
+                        },
+                        Icon { name: "search", size: 16 }
+                    }
                 }
                 button {
                     class: "icon-btn",
@@ -2078,4 +2140,17 @@ pub(super) fn UpdateBanner(session: Signal<Session>) -> Element {
 /// Moves the caret to the composer (after a suggestion fills it).
 pub(super) fn focus_composer() {
     let _ = dioxus::document::eval("document.getElementById('composer-input')?.focus();");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::capitalise_role;
+
+    #[test]
+    fn row_subtitles_capitalise_the_role_and_never_come_back_empty() {
+        assert_eq!(capitalise_role("specialist"), "Specialist");
+        assert_eq!(capitalise_role(" orchestrator "), "Orchestrator");
+        assert_eq!(capitalise_role("élite"), "Élite");
+        assert_eq!(capitalise_role(""), "Bot");
+    }
 }
