@@ -1325,3 +1325,417 @@ fn opencode_kinds_are_builtins_pinned_to_their_host() {
     );
     assert!(canonical_kind("nous").is_err());
 }
+
+// ---- Codex (ChatGPT plan) on the Responses transport ----
+
+const CODEX: &str = "codex";
+
+fn codex_profile(server: &MockServer, plan_oauth: bool) -> ProviderConfig {
+    ProviderConfig {
+        kind: "openai-codex".into(),
+        base_url: format!("{}/backend-api/codex", server.uri()),
+        models: crate::auth_flows::codex::MODELS
+            .iter()
+            .map(|model| (*model).to_owned())
+            .collect(),
+        data_egress_approved: true,
+        plan_oauth,
+        ..Default::default()
+    }
+}
+
+fn add_codex(
+    env: &Env,
+    user: &str,
+    workspace: Option<&str>,
+    access: &str,
+    refresh: &str,
+) -> String {
+    let mut identity = json!({"email": "codex@example.example"});
+    if let Some(workspace) = workspace {
+        identity["chatgpt_account_id"] = json!(workspace);
+    }
+    env.accounts
+        .add(
+            user,
+            AddAccount {
+                provider: CODEX.into(),
+                label: "codex@example.example".into(),
+                auth_kind: AuthKind::Oauth,
+                fingerprint: identity_fingerprint("openai-codex", "account:acct-1"),
+                identity,
+                credential: ProviderCredential {
+                    api_key: access.into(),
+                    refresh_token: refresh.into(),
+                    expires_at: None,
+                    generation: None,
+                },
+                priority: 0,
+            },
+        )
+        .unwrap()
+        .account_id
+}
+
+#[test]
+fn codex_is_a_builtin_oauth_kind_on_the_chatgpt_backend() {
+    assert_eq!(canonical_kind("openai-codex").unwrap(), "openai-codex");
+    assert_eq!(
+        resolve_base_url("openai-codex", "").unwrap(),
+        "https://chatgpt.com/backend-api/codex"
+    );
+    // Sign-in is its default, and its refresh is pinned to OpenAI's token endpoint.
+    match auth_plan("openai-codex", "").unwrap() {
+        AuthPlan::OAuth {
+            style,
+            token_url,
+            client_id_fallback,
+        } => {
+            assert_eq!(style, OAuthStyle::CodexRefresh);
+            assert_eq!(token_url, "https://auth.openai.com/oauth/token");
+            assert_eq!(client_id_fallback, Some("app_EMoamEEZ73f0CkXaXp7hrann"));
+        }
+        AuthPlan::ApiKey => panic!("codex signs in"),
+    }
+    assert!(
+        enforce_oauth_target(
+            OAuthStyle::CodexRefresh,
+            "https://auth.openai.com/oauth/token"
+        )
+        .is_ok()
+    );
+    assert!(
+        enforce_oauth_target(OAuthStyle::CodexRefresh, "https://evil.example/oauth/token").is_err()
+    );
+    assert!(
+        enforce_oauth_target(
+            OAuthStyle::CodexRefresh,
+            "https://auth.openai.com/oauth/other"
+        )
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn a_codex_account_chats_with_the_workspace_and_cli_headers() {
+    let env = env();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/responses"))
+        .and(header("authorization", "Bearer codex-access-1"))
+        .and(header("chatgpt-account-id", "acct-1"))
+        .and(header("openai-beta", "responses=v1"))
+        .and(header("originator", "serabot"))
+        .and(header("session_id", "conv-A"))
+        .respond_with(responses_text("from the plan"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Bob's account names no workspace, so the strict mock above never matches.
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/responses"))
+        .respond_with(responses_text("bare"))
+        .mount(&server)
+        .await;
+    let profile = codex_profile(&server, true);
+    let account = add_codex(
+        &env,
+        &env.alice,
+        Some("acct-1"),
+        "codex-access-1",
+        "codex-refresh-1",
+    );
+    let client = env
+        .credentials
+        .client_for_account(&env.alice, CODEX, &profile, &account)
+        .unwrap()
+        .with_model("gpt-6.1-sol");
+    let fields = crate::thinking::wire_fields("openai-codex", "gpt-6.1-sol", &[], "high").unwrap();
+    let reply = crate::llm::with_conversation("conv-A", async {
+        client
+            .complete_with(
+                &[LlmMessage::system("sys"), LlmMessage::user("hi")],
+                &[lookup_tool()],
+                None,
+                Some(0.7),
+                Some(&fields),
+            )
+            .await
+            .unwrap()
+    })
+    .await;
+    assert_eq!(reply.message.content.as_deref(), Some("from the plan"));
+    let body = body_of(&server.received_requests().await.unwrap()[0]);
+    assert_eq!(body["store"], false);
+    assert_eq!(body["stream"], true);
+    assert_eq!(body["instructions"], "sys");
+    assert_eq!(body["prompt_cache_key"], "conv-A");
+    assert_eq!(body["model"], "gpt-6.1-sol");
+    assert_eq!(
+        body["reasoning"],
+        json!({"effort": "high", "summary": "auto"})
+    );
+    assert!(body.get("temperature").is_none());
+    // No workspace named: the header is simply left off, and a request outside
+    // a conversation still carries one stable session id.
+    let bare = add_codex(&env, &env.bob, None, "codex-access-2", "codex-refresh-2");
+    let client = env
+        .credentials
+        .client_for_account(&env.bob, CODEX, &profile, &bare)
+        .unwrap()
+        .with_model("gpt-6-luna");
+    for _ in 0..2 {
+        client
+            .complete(&[LlmMessage::user("hi")], &[], None, None)
+            .await
+            .unwrap();
+    }
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests[1].headers.get("chatgpt-account-id").is_none());
+    let sessions: Vec<_> = requests[1..]
+        .iter()
+        .map(|request| request.headers.get("session_id").unwrap().clone())
+        .collect();
+    assert_eq!(sessions[0], sessions[1]);
+    assert_ne!(sessions[0], "conv-A");
+    // Even with no system message the backend gets the `instructions` it needs.
+    assert!(body_of(&requests[1]).get("instructions").is_some());
+}
+
+#[tokio::test]
+async fn a_codex_account_is_refused_while_the_flag_is_off_or_as_a_default_or_without_a_refresh_token()
+ {
+    let env = env();
+    let server = MockServer::start().await;
+    let account = add_codex(
+        &env,
+        &env.alice,
+        Some("acct-1"),
+        "codex-access-1",
+        "codex-refresh-1",
+    );
+    let off = codex_profile(&server, false);
+    assert!(matches!(
+        env.credentials
+            .client_for_account(&env.alice, CODEX, &off, &account),
+        Err(SeraError::Forbidden(_))
+    ));
+    let on = codex_profile(&server, true);
+    let build = |account_id: &str, refresh: &str| {
+        open_provider_client(
+            &on,
+            &ProviderCredential {
+                api_key: "codex-access-3".into(),
+                refresh_token: refresh.into(),
+                ..Default::default()
+            },
+            &env.credentials.server_secrets,
+            10,
+            4096,
+            CredentialOwner {
+                users: &env.credentials.users,
+                user_id: &env.alice,
+                provider: CODEX,
+                account_id,
+                refresher: None,
+            },
+        )
+    };
+    // The legacy default row is what a grant shares: never usable.
+    assert!(matches!(
+        build(DEFAULT_ACCOUNT, "codex-refresh-3"),
+        Err(SeraError::Forbidden(_))
+    ));
+    // An API key (no refresh token) is not a plan sign-in.
+    assert!(matches!(build(&account, ""), Err(SeraError::Forbidden(_))));
+    assert!(build(&account, "codex-refresh-3").is_ok());
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_codex_refresh_rotates_the_token_once_for_eight_turns() {
+    let env = env();
+    let server = MockServer::start().await;
+    // The old refresh token is good once; a second spend is the failure.
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .and(wiremock::matchers::body_string_contains(
+            "grant_type=refresh_token",
+        ))
+        .and(wiremock::matchers::body_string_contains(
+            "refresh_token=codex-refresh-old",
+        ))
+        .and(wiremock::matchers::body_string_contains(
+            "client_id=synthetic-codex-client",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(150))
+                .set_body_json(json!({
+                    "access_token": "codex-access-new",
+                    "refresh_token": "codex-refresh-new",
+                    "expires_in": 3600
+                })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": "invalid_grant"})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/responses"))
+        .and(header("authorization", "Bearer codex-access-old"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/responses"))
+        .and(header("authorization", "Bearer codex-access-new"))
+        .respond_with(responses_text("renewed"))
+        .mount(&server)
+        .await;
+    let account = add_codex(
+        &env,
+        &env.alice,
+        Some("acct-1"),
+        "codex-access-old",
+        "codex-refresh-old",
+    );
+    let mut turns = Vec::new();
+    for _ in 0..8 {
+        let client = LlmClient::new(
+            format!("{}/backend-api/codex", server.uri()),
+            "codex-access-old",
+            10,
+            4096,
+        )
+        .unwrap()
+        .with_model("gpt-6.1-sol")
+        .with_oauth_unpinned(OAuthMaterial {
+            style: OAuthStyle::CodexRefresh,
+            refresh_token: "codex-refresh-old".into(),
+            token_url: format!("{}/oauth/token", server.uri()),
+            client_id: "synthetic-codex-client".into(),
+            client_secret: String::new(),
+        })
+        .unwrap()
+        .with_account_refresh(
+            AccountRefreshTarget {
+                refresher: env.credentials.refresher().clone(),
+                user_id: env.alice.clone(),
+                provider: CODEX.into(),
+                account_id: account.clone(),
+            },
+            None,
+            None,
+        )
+        .unwrap()
+        .with_wire(Wire::Responses)
+        .with_codex(Some("acct-1".into()));
+        turns.push(tokio::spawn(async move {
+            client
+                .complete(&[LlmMessage::user("hi")], &[], None, None)
+                .await
+        }));
+    }
+    for turn in turns {
+        assert_eq!(
+            turn.await.unwrap().unwrap().message.content.as_deref(),
+            Some("renewed")
+        );
+    }
+    let token_calls = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path() == "/oauth/token")
+        .count();
+    assert_eq!(token_calls, 1);
+    // The rotated pair is what the account holds now.
+    let stored = env
+        .accounts
+        .credential(&env.alice, CODEX, &account)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.api_key, "codex-access-new");
+    assert_eq!(stored.refresh_token, "codex-refresh-new");
+    assert!(stored.expires_at.is_some());
+}
+
+#[tokio::test]
+async fn a_refused_codex_refresh_parks_the_account_and_keeps_the_row() {
+    let env = env();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": "invalid_grant"})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/responses"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let account = add_codex(
+        &env,
+        &env.alice,
+        Some("acct-1"),
+        "codex-access-x",
+        "codex-refresh-x",
+    );
+    let client = LlmClient::new(
+        format!("{}/backend-api/codex", server.uri()),
+        "codex-access-x",
+        10,
+        4096,
+    )
+    .unwrap()
+    .with_model("gpt-6.1-sol")
+    .with_oauth_unpinned(OAuthMaterial {
+        style: OAuthStyle::CodexRefresh,
+        refresh_token: "codex-refresh-x".into(),
+        token_url: format!("{}/oauth/token", server.uri()),
+        client_id: "synthetic-codex-client".into(),
+        client_secret: String::new(),
+    })
+    .unwrap()
+    .with_account_refresh(
+        AccountRefreshTarget {
+            refresher: env.credentials.refresher().clone(),
+            user_id: env.alice.clone(),
+            provider: CODEX.into(),
+            account_id: account.clone(),
+        },
+        None,
+        None,
+    )
+    .unwrap()
+    .with_wire(Wire::Responses);
+    let error = client
+        .complete(&[LlmMessage::user("hi")], &[], None, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        SeraError::Rejected {
+            code: "needs_reauth",
+            ..
+        }
+    ));
+    let row = env
+        .accounts
+        .get(&env.alice, CODEX, &account)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, AccountStatus::NeedsReauth);
+    assert!(
+        env.accounts
+            .credential(&env.alice, CODEX, &account)
+            .unwrap()
+            .is_some()
+    );
+    assert!(env.accounts.list(&env.bob, CODEX).unwrap().is_empty());
+}

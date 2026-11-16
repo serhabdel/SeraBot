@@ -201,7 +201,7 @@ static BRANDS: &[Brand] = &[
         mark: png!("mistral"),
     },
     Brand {
-        keys: &["openai"],
+        keys: &["openai", "openai-codex", "chatgpt-codex"],
         label: "OpenAI",
         mark: png!("openai"),
     },
@@ -395,6 +395,8 @@ mod tests {
         "stripe-read",
         "mistral",
         "openai",
+        "openai-codex",
+        "chatgpt-codex",
         "xai",
         "deepseek",
         "groq",

@@ -40,16 +40,16 @@ pub(super) fn mask_email(email: &str) -> String {
     }
 }
 
-/// The sign-in flows a member's page may offer for a provider. A Claude plan
-/// sign-in shows only to the admin, and only on a provider that has not turned
-/// `plan_oauth` off.
+/// The sign-in flows a member's page may offer for a provider. A plan sign-in
+/// (Claude, Codex) shows only on a provider that has not turned `plan_oauth`
+/// off, and Claude's only to the admin.
 pub(super) fn signin_flows(
     state: &ApiState,
     is_admin: bool,
     provider_id: &str,
     kind: &str,
 ) -> Vec<&'static str> {
-    if kind == "anthropic" {
+    if matches!(kind, "anthropic" | "openai-codex") {
         let enabled = state
             .config
             .llm
@@ -57,7 +57,7 @@ pub(super) fn signin_flows(
             .get(provider_id)
             // Not saved yet: the directory offers the sign-in (it is on by default).
             .is_none_or(ProviderConfig::plan_oauth_enabled);
-        if !(enabled && is_admin) {
+        if !enabled || (kind == "anthropic" && !is_admin) {
             return Vec::new();
         }
     }
@@ -67,19 +67,29 @@ pub(super) fn signin_flows(
 /// The risk a plan sign-in carries, for the banner the page shows beside it.
 /// `None` for every sign-in that is the vendor's supported path.
 pub(super) fn signin_risk(kind: &str, flows: &[&'static str]) -> Option<&'static str> {
-    (kind == "anthropic" && !flows.is_empty()).then_some(
-        "This signs in through Claude's own client, not an API contract. Anthropic may restrict or suspend an account used this way. It is your own account and is never shared. API keys are the supported path.",
-    )
+    if flows.is_empty() {
+        return None;
+    }
+    match kind {
+        "anthropic" => Some(
+            "This signs in through Claude's own client, not an API contract. Anthropic may restrict or suspend an account used this way. It is your own account and is never shared. API keys are the supported path.",
+        ),
+        "openai-codex" => Some(
+            "This signs in through ChatGPT's own Codex client, not an API contract. OpenAI may restrict or suspend an account used this way. It is your own account and is never shared. API keys on the OpenAI provider are the supported path.",
+        ),
+        _ => None,
+    }
 }
 
-/// Claude plan sign-in is for the admin, on a provider that has not turned
-/// `plan_oauth` off. Every other provider's sign-in is open to members.
+/// A plan sign-in needs a provider that has not turned `plan_oauth` off.
+/// Claude's is for the admin; Codex's is open to members (each account is its
+/// owner's own). Every other provider's sign-in is open to members.
 pub(super) fn plan_signin_gate(
     user: &ActingUser,
     profile: &ProviderConfig,
     kind: &str,
 ) -> Result<()> {
-    if kind != "anthropic" {
+    if !matches!(kind, "anthropic" | "openai-codex") {
         return Ok(());
     }
     if !profile.plan_oauth_enabled() {
@@ -88,7 +98,7 @@ pub(super) fn plan_signin_gate(
             message: "This provider has no sign-in; add its API key".into(),
         });
     }
-    if !user.is_admin() {
+    if kind == "anthropic" && !user.is_admin() {
         return Err(SeraError::Forbidden(
             "Claude plan sign-in is only available to the server admin".into(),
         ));

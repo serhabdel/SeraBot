@@ -304,6 +304,12 @@ impl AddMethod {
     }
 }
 
+/// The provider kinds whose sign-in is a vendor plan, which the operator can
+/// turn off (`plan_oauth = false`).
+fn is_plan_kind(kind: &str) -> bool {
+    matches!(kind, "anthropic" | "openai-codex")
+}
+
 /// The ways to add an account to `provider`. The server's own list of
 /// sign-in flows wins; an older server that sends none falls back to what
 /// the preset documents. A sign-in-only provider offers no key.
@@ -314,10 +320,11 @@ pub fn add_methods(provider: &ProviderStatus, preset: Option<&ProviderPreset>) -
     if takes_key {
         methods.push(AddMethod::Key);
     }
-    // The server's list is authoritative for Claude: an empty list means the
-    // operator turned plan sign-in off, not that the server is old.
-    let is_claude = provider.kind == "anthropic" || preset.is_some_and(|p| p.kind == "anthropic");
-    let flows: Vec<&str> = if provider.signin.is_empty() && !is_claude {
+    // The server's list is authoritative for the plan sign-ins (Claude, Codex):
+    // an empty list means the operator turned them off, not that the server is
+    // old.
+    let is_plan = is_plan_kind(&provider.kind) || preset.is_some_and(|p| is_plan_kind(p.kind));
+    let flows: Vec<&str> = if provider.signin.is_empty() && !is_plan {
         match preset.map(|p| p.sign_in) {
             Some("pkce" | "pkce_google") => vec!["pkce"],
             Some("device") => vec!["device"],
@@ -386,9 +393,10 @@ pub fn first_sign_in_method(methods: &[AddMethod]) -> Option<AddMethod> {
 }
 
 /// Whether the directory card offers a sign-in button. Providers that are not
-/// saved yet offer it when the preset documents one (Antigravity and Claude
-/// sign in with no setup step). A saved Claude provider whose server lists no
-/// flow has plan sign-in turned off, so the button is not offered.
+/// saved yet offer it when the preset documents one (Antigravity, Claude and
+/// Codex sign in with no setup step). A saved plan provider whose server lists
+/// no flow has plan sign-in turned off (or is not open to this member), so the
+/// button is not offered.
 pub fn directory_offers_sign_in(
     existing: Option<&ProviderStatus>,
     preset: &ProviderPreset,
@@ -397,7 +405,7 @@ pub fn directory_offers_sign_in(
         return false;
     }
     match existing {
-        Some(provider) if preset.kind == "anthropic" => !provider.signin.is_empty(),
+        Some(provider) if is_plan_kind(preset.kind) => !provider.signin.is_empty(),
         _ => true,
     }
 }
@@ -823,6 +831,32 @@ mod tests {
             sign_in_needed_for("secret WORK_API_KEY is empty; provide an API key"),
             None
         );
+    }
+
+    /// The ChatGPT/Codex card: sign-in only (browser, and a code when the
+    /// server offers it), a risk banner, and no key box (a key is the OpenAI card).
+    #[test]
+    fn the_codex_card_signs_in_and_never_takes_a_key() {
+        use crate::provider_presets::PLAN_RISK_CODEX;
+        let codex = kinded("openai-codex", "oauth", &["pkce", "device"]);
+        let (methods, empty, filled, first, text) = card(&codex, "chatgpt-codex");
+        assert_eq!(methods, vec![AddMethod::Browser, AddMethod::Device]);
+        assert_eq!((empty, filled), ("Sign in", "Add account"));
+        assert_eq!(first, Some(AddMethod::Browser));
+        assert_eq!(text, "Not signed in yet. Sign in to use this provider.");
+        assert_eq!(
+            risk_text(&codex, preset_for("chatgpt-codex")).as_deref(),
+            Some(PLAN_RISK_CODEX)
+        );
+        // The server's list is authoritative: empty means the operator turned
+        // Codex sign-in off, so there is no button and no banner.
+        let off = kinded("openai-codex", "oauth", &[]);
+        assert!(add_methods(&off, preset_for("chatgpt-codex")).is_empty());
+        assert_eq!(risk_text(&off, preset_for("chatgpt-codex")), None);
+        let card_preset = preset_for("chatgpt-codex").unwrap();
+        assert!(directory_offers_sign_in(None, card_preset));
+        assert!(directory_offers_sign_in(Some(&codex), card_preset));
+        assert!(!directory_offers_sign_in(Some(&off), card_preset));
     }
 
     #[test]

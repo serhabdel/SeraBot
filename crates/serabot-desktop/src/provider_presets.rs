@@ -122,6 +122,10 @@ pub const PLAN_RISK_GOOGLE: &str = "This signs in through Google's Antigravity c
 /// text.
 pub const PLAN_RISK_CLAUDE: &str = "This signs in through Claude's own client, not an API contract. Anthropic may restrict or suspend an account used this way. It is your own account and is never shared. API keys are the supported path.";
 
+/// Shown beside a Codex (ChatGPT plan) sign-in when the server does not send
+/// its own text.
+pub const PLAN_RISK_CODEX: &str = "This signs in through ChatGPT's own Codex client, not an API contract. OpenAI may restrict or suspend an account used this way. It is your own account and is never shared. API keys on the OpenAI provider are the supported path.";
+
 const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "antigravity",
@@ -259,6 +263,34 @@ const PRESETS: &[ProviderPreset] = &[
         key_url: "https://platform.openai.com/api-keys",
         sign_in: "",
         risk: "",
+    },
+    ProviderPreset {
+        id: "chatgpt-codex",
+        label: "ChatGPT (Codex)",
+        subtitle: "Use your ChatGPT plan through Codex. Sign in with the browser or a code; add several accounts. For an API key, use the OpenAI provider.",
+        base_url: "https://chatgpt.com/backend-api/codex",
+        kind: "openai-codex",
+        default_id: "codex",
+        // The ChatGPT Codex lineup, as the owner's HielCowork client lists it
+        // (the endpoint has no public model list); the default comes first.
+        models: &[
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        ],
+        secret_name: "codex_access_token",
+        catalog_fetch: false,
+        auth: "oauth",
+        badge: "OAuth",
+        note: "Sign in with ChatGPT (browser or code, several accounts)",
+        key_url: "",
+        sign_in: "pkce",
+        risk: PLAN_RISK_CODEX,
     },
     ProviderPreset {
         id: "openrouter",
@@ -814,6 +846,7 @@ mod tests {
                         | "fireworks"
                         | "muse-code"
                         | "anthropic"
+                        | "openai-codex"
                         | "opencode-go"
                         | "opencode-zen"
                         | "gemini"
@@ -892,6 +925,41 @@ mod tests {
         assert!(provider_matches_preset("mine", "anthropic", anthropic));
         assert!(provider_matches_preset("nous", "openai-compatible", nous));
         assert!(!provider_matches_preset("other", "openai-compatible", nous));
+    }
+
+    /// The Codex card follows the owner's HielCowork client: the same
+    /// endpoint, the same models in the same order, sign-in only (an API key
+    /// is not valid on the ChatGPT backend; that is the OpenAI card).
+    #[test]
+    fn the_codex_preset_matches_hielcowork() {
+        let codex = preset_for("chatgpt-codex").unwrap();
+        assert_eq!(codex.kind, "openai-codex");
+        assert_eq!(codex.base_url, "https://chatgpt.com/backend-api/codex");
+        assert_eq!((codex.auth, codex.sign_in), ("oauth", "pkce"));
+        assert!(codex.key_url.is_empty() && !codex.catalog_fetch);
+        assert_eq!(
+            codex.models,
+            [
+                "gpt-6.1-sol",
+                "gpt-6.1-terra",
+                "gpt-6-astra",
+                "gpt-6-sol",
+                "gpt-6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+            ]
+        );
+        assert!(codex.subtitle.contains("OpenAI provider"));
+        assert!(!is_unverified("chatgpt-codex"));
+        assert!(provider_matches_preset("mine", "openai-codex", codex));
+        // The card is found by its name, its model or its kind.
+        for query in ["chatgpt", "gpt-6.1-terra", "codex"] {
+            let found = filter_presets(query, DirectoryFilter::OAuth, |_| false);
+            assert!(found.iter().any(|p| p.id == "chatgpt-codex"), "{query}");
+        }
+        // The API-key OpenAI card stays a plain key provider.
+        assert_eq!(preset_for("openai").unwrap().risk, "");
     }
 
     #[test]
@@ -981,6 +1049,8 @@ mod tests {
                 "muse-code" => "device",
                 // Claude: a key or a browser sign-in (PKCE) on the same card.
                 "anthropic" => "pkce",
+                // Codex: a ChatGPT browser sign-in (the server adds the device code).
+                "chatgpt-codex" => "pkce",
                 _ => "",
             };
             assert_eq!(preset.sign_in, expected_sign_in, "{:?}", preset.id);
@@ -1013,8 +1083,9 @@ mod tests {
             .filter(|preset| !preset.risk.is_empty())
             .map(|preset| preset.id)
             .collect();
-        assert_eq!(risky, ["antigravity", "anthropic"]);
+        assert_eq!(risky, ["antigravity", "chatgpt-codex", "anthropic"]);
         assert!(PLAN_RISK_GOOGLE.contains("suspend"));
+        assert!(PLAN_RISK_CODEX.contains("API keys on the OpenAI provider"));
         assert!(PLAN_RISK_CLAUDE.contains("API keys are the supported path"));
         // A risk never hides on a plain key provider.
         for id in ["openai", "mistral", "opencode-go", "nous", "muse-code"] {

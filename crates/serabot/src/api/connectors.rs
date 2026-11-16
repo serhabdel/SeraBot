@@ -44,8 +44,14 @@ pub(super) async fn list_providers(
             let is_oauth =
                 config.is_some_and(|c| {
                     c.auth.eq_ignore_ascii_case("oauth")
-                        || matches!(c.kind.as_str(), "google-antigravity" | "muse-code")
-                }) || matches!(provider.kind.as_str(), "google-antigravity" | "muse-code");
+                        || matches!(
+                            c.kind.as_str(),
+                            "google-antigravity" | "muse-code" | "openai-codex"
+                        )
+                }) || matches!(
+                    provider.kind.as_str(),
+                    "google-antigravity" | "muse-code" | "openai-codex"
+                );
             let mut secrets = json!({
                 "api_key": visible_secret_status(&state.secrets, config.map(|c| c.api_key_secret.as_str()), is_admin),
             });
@@ -116,7 +122,10 @@ pub(super) async fn list_providers(
                 .any(|p| p.get("id").and_then(Value::as_str) == Some(&id))
             {
                 let is_oauth = profile.auth.eq_ignore_ascii_case("oauth")
-                    || matches!(profile.kind.as_str(), "google-antigravity" | "muse-code");
+                    || matches!(
+                        profile.kind.as_str(),
+                        "google-antigravity" | "muse-code" | "openai-codex"
+                    );
                 let mut secrets = json!({
                     "api_key": visible_secret_status(&state.secrets, Some(profile.api_key_secret.as_str()), is_admin),
                 });

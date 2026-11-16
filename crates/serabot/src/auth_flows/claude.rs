@@ -134,7 +134,7 @@ impl ClaudeSignIn {
             .llm
             .providers
             .values()
-            .find(|profile| profile.plan_oauth_enabled())
+            .find(|profile| profile.plan_oauth_enabled() && profile.is_anthropic())
             .map(|profile| profile.oauth_client_id_secret.as_str())
             .unwrap_or("");
         Self::new(secrets, name)

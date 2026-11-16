@@ -255,6 +255,12 @@ const BUILTINS: &[BuiltinProvider] = &[
         summary: "Muse Code device login, minted key, Responses chat, catalog GET https://api.meta.ai/v1/models",
     },
     BuiltinProvider {
+        kind: "openai-codex",
+        base_url: Some(crate::auth_flows::codex::BASE_URL),
+        auth: "oauth",
+        summary: "ChatGPT plan (Codex) sign-in; Responses chat at chatgpt.com/backend-api/codex, static model list",
+    },
+    BuiltinProvider {
         kind: "google-antigravity",
         base_url: Some("https://daily-cloudcode-pa.googleapis.com"),
         auth: "oauth",
@@ -272,6 +278,8 @@ pub enum OAuthStyle {
     RefreshToken,
     /// A Claude plan sign-in: a JSON refresh grant that rotates the token.
     ClaudeRefresh,
+    /// A Codex (ChatGPT plan) sign-in: a form refresh grant that rotates the token.
+    CodexRefresh,
 }
 
 pub enum AuthPlan {
@@ -358,7 +366,10 @@ pub fn auth_plan(kind: &str, auth: &str) -> Result<AuthPlan> {
     let kind = canonical_kind(kind)?;
     let requested = auth.trim();
     let mode = if requested.is_empty() {
-        if matches!(kind.as_str(), "muse-code" | "google-antigravity") {
+        if matches!(
+            kind.as_str(),
+            "muse-code" | "google-antigravity" | "openai-codex"
+        ) {
             "oauth"
         } else {
             "api_key"
@@ -379,8 +390,14 @@ pub fn auth_plan(kind: &str, auth: &str) -> Result<AuthPlan> {
                 token_url: "https://oauth2.googleapis.com/token",
                 client_id_fallback: Some(ANTIGRAVITY_CLIENT_ID),
             }),
+            "openai-codex" => Ok(AuthPlan::OAuth {
+                style: OAuthStyle::CodexRefresh,
+                token_url: crate::auth_flows::codex::TOKEN_URL,
+                client_id_fallback: Some(crate::auth_flows::codex::CLIENT_ID),
+            }),
             _ => Err(SeraError::Config(
-                "oauth auth is only supported for muse-code and google-antigravity".into(),
+                "oauth auth is only supported for muse-code, google-antigravity and openai-codex"
+                    .into(),
             )),
         },
         _ => Err(SeraError::Config("auth must be api_key or oauth".into())),
@@ -478,6 +495,10 @@ pub fn enforce_oauth_target(style: OAuthStyle, token_url: &str) -> Result<String
         OAuthStyle::ClaudeRefresh => {
             host.eq_ignore_ascii_case(crate::auth_flows::claude::TOKEN_HOST)
                 && parsed.path() == crate::auth_flows::claude::TOKEN_PATH
+        }
+        OAuthStyle::CodexRefresh => {
+            host.eq_ignore_ascii_case(crate::auth_flows::codex::AUTH_HOST)
+                && parsed.path() == crate::auth_flows::codex::TOKEN_PATH
         }
     };
     if !ok {
@@ -1369,6 +1390,19 @@ pub fn open_provider_client(
             "Claude plan sign-in is turned off on this server".into(),
         ));
     }
+    // A Codex (ChatGPT plan) account exists only as a member's own sign-in with
+    // a refresh token, only while the operator has not turned `plan_oauth`
+    // off, and is never reachable through a grant (a grant carries only the
+    // grantor's default credential).
+    if kind == "openai-codex"
+        && !(profile.plan_oauth_enabled()
+            && owner.account_id != DEFAULT_ACCOUNT
+            && !credential.refresh_token.trim().is_empty())
+    {
+        return Err(SeraError::Forbidden(
+            "Codex plan sign-in is turned off on this server".into(),
+        ));
+    }
     let mut client = LlmClient::new(
         &endpoint,
         credential.api_key.clone(),
@@ -1471,6 +1505,7 @@ pub fn open_provider_client(
                 Wire::AnthropicKey
             });
         }
+        "openai-codex" => client = client.with_wire(Wire::Responses),
         "opencode-go" => client = client.with_opencode_session(),
         _ => {}
     }
@@ -1503,8 +1538,23 @@ pub fn open_provider_client(
                 account_id: owner.account_id.to_owned(),
             },
             generation,
-            matches!(kind.as_str(), "muse-code" | "anthropic"),
+            matches!(kind.as_str(), "muse-code" | "anthropic" | "openai-codex"),
         );
+        if kind == "openai-codex" {
+            // The ChatGPT workspace the sign-in named goes on every request.
+            let chatgpt_account = row
+                .as_ref()
+                .and_then(|row| row.identity.get("chatgpt_account_id"))
+                .and_then(Value::as_str)
+                .filter(|id| {
+                    (1..=64).contains(&id.len())
+                        && id
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+                })
+                .map(str::to_owned);
+            client = client.with_codex(chatgpt_account);
+        }
         if kind == "google-antigravity"
             && let Some(row) = row
         {

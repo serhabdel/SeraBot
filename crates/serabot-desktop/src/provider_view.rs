@@ -57,6 +57,7 @@ impl Connection {
 pub fn human_kind(kind: &str) -> &str {
     match kind {
         "openai" => "OpenAI",
+        "openai-codex" => "ChatGPT (Codex)",
         "openai-compatible" => "OpenAI-compatible",
         "anthropic" => "Anthropic",
         "google" | "gemini" => "Google Gemini",

@@ -233,14 +233,19 @@ pub struct RedirectPlan {
 }
 
 /// The loopback redirect for a provider kind. Antigravity prefers 51121;
-/// Claude's registration allows only `localhost:54545/callback`; OpenRouter
-/// documents `localhost`.
+/// Claude's registration allows only `localhost:54545/callback` and Codex's
+/// only `localhost:1455/auth/callback`; OpenRouter documents `localhost`.
 pub fn redirect_plan(kind: &str) -> RedirectPlan {
     match kind {
         "anthropic" => RedirectPlan {
             fixed_port: Some(oauth::CLAUDE_PORT),
             host: "localhost",
             path: oauth::CLAUDE_CALLBACK_PATH,
+        },
+        "openai-codex" => RedirectPlan {
+            fixed_port: Some(oauth::CODEX_PORT),
+            host: "localhost",
+            path: oauth::CODEX_CALLBACK_PATH,
         },
         "openrouter" => RedirectPlan {
             fixed_port: None,
@@ -555,6 +560,9 @@ mod tests {
         let claude = redirect_plan("anthropic");
         assert_eq!(claude.fixed_port, Some(54545));
         assert_eq!(claude.uri(54545), "http://localhost:54545/callback");
+        let codex = redirect_plan("openai-codex");
+        assert_eq!(codex.fixed_port, Some(1455));
+        assert_eq!(codex.uri(1455), "http://localhost:1455/auth/callback");
         assert_eq!(
             redirect_plan("openrouter").uri(40000),
             "http://localhost:40000/oauth-callback"

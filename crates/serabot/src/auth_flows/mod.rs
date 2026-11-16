@@ -21,9 +21,11 @@
 //! provider kind to its implementation. This module ships OpenRouter's PKCE
 //! sign-in and Muse's device sign-in (`muse`); Antigravity's (`google`) needs
 //! the server's age store for its OAuth client secret and is registered by the
-//! API; the Claude sign-in registers the same way.
+//! API; the Claude sign-in registers the same way. Codex's (`codex`) is
+//! standard: its client id is public.
 
 pub mod claude;
+pub mod codex;
 pub mod device;
 pub mod google;
 pub mod muse;
@@ -340,6 +342,9 @@ impl SignInRegistry {
         let mut registry = Self::default();
         registry.register("openrouter", Arc::new(OpenRouterSignIn));
         registry.register("muse-code", Arc::new(muse::MuseSignIn::new()));
+        // Codex's client id is public and compiled in, so it needs no secret.
+        // Each provider's `plan_oauth` flag (checked per request) turns it off.
+        registry.register("openai-codex", Arc::new(codex::CodexSignIn::new()));
         registry
     }
 

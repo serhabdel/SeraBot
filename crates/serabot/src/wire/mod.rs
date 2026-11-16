@@ -1,7 +1,7 @@
 //! Provider wire formats beyond OpenAI chat completions.
 //!
 //! - [`responses`]: the OpenAI Responses transport (`POST {base}/responses`
-//!   over SSE). Meta Muse Code uses it; Codex reuses it in v0.52.
+//!   over SSE). Meta Muse Code and the Codex (ChatGPT plan) endpoint use it.
 //! - [`anthropic`]: the native Anthropic Messages transport, for API-key
 //!   accounts and (behind the admin flag) Claude plan sign-ins.
 //! - [`schema`]: the tool-schema flattener both of them share.
