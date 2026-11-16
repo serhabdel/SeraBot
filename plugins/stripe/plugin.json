@@ -1,0 +1,81 @@
+{
+  "schemaVersion": 2,
+  "slug": "stripe",
+  "name": "Stripe (read only)",
+  "tagline": "Look up Stripe customers, invoices and balance.",
+  "description": "Read-only Stripe lookups: customers, products, prices, invoices, subscriptions, payment intents, disputes and balance. Only read tools are offered; Stripe's write tools are not listed. Sign in with your own Stripe account in the browser; the tokens are sealed for you alone.",
+  "category": "finance",
+  "iconUrl": "https://stripe.com/favicon.ico",
+  "version": "1.1.0",
+  "minServerVersion": "0.51.0",
+  "prompts": [
+    {
+      "id": "stripe-0",
+      "text": "Show this week's unpaid invoices."
+    }
+  ],
+  "apps": [
+    {
+      "id": "payments",
+      "name": "Payments",
+      "server": {
+        "transport": "http",
+        "url": "https://mcp.stripe.com"
+      },
+      "auth": [
+        {
+          "id": "signin",
+          "kind": "oauth",
+          "fields": [],
+          "oauth": {
+            "scopes": [],
+            "usesCimd": false
+          }
+        }
+      ],
+      "tools": {
+        "readOnly": [
+          "retrieve_balance",
+          "get_stripe_account_info",
+          "list_customers",
+          "list_products",
+          "list_prices",
+          "list_invoices",
+          "list_payment_intents",
+          "list_subscriptions",
+          "list_coupons",
+          "list_disputes",
+          "search_stripe_resources",
+          "fetch_stripe_resources",
+          "search_stripe_documentation"
+        ],
+        "allow": [
+          "retrieve_balance",
+          "get_stripe_account_info",
+          "list_customers",
+          "list_products",
+          "list_prices",
+          "list_invoices",
+          "list_payment_intents",
+          "list_subscriptions",
+          "list_coupons",
+          "list_disputes",
+          "search_stripe_resources",
+          "fetch_stripe_resources",
+          "search_stripe_documentation"
+        ]
+      },
+      "accounts": {
+        "multiple": false
+      }
+    }
+  ],
+  "permissions": {
+    "egress": [
+      "mcp.stripe.com"
+    ]
+  },
+  "websiteUrl": "https://stripe.com",
+  "privacyPolicyUrl": "https://stripe.com/privacy",
+  "termsUrl": "https://stripe.com/legal"
+}

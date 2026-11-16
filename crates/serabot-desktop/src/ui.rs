@@ -88,7 +88,8 @@ const CSS_PAGES: &str = concat!(
     include_str!("../assets/jobs.css"),
     include_str!("../assets/foundation.css"),
     include_str!("../assets/accounts.css"),
-    include_str!("../assets/runs.css")
+    include_str!("../assets/runs.css"),
+    include_str!("../assets/marketplace.css")
 );
 
 /// The `data-activity` value the stylesheet keys the avatar ring and the
@@ -155,7 +156,7 @@ type PickerItem = (
 );
 
 /// The provider kinds the server understands.
-const PROVIDER_KINDS: [&str; 23] = [
+const PROVIDER_KINDS: [&str; 25] = [
     "openai-compatible",
     "google-antigravity",
     "mistral",
@@ -179,6 +180,8 @@ const PROVIDER_KINDS: [&str; 23] = [
     "anthropic",
     "opencode-go",
     "opencode-zen",
+    "openai-codex",
+    "github-copilot",
 ];
 
 /// Global key bindings, installed once in the WebView.

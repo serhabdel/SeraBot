@@ -347,8 +347,10 @@ impl AdminStore {
             )));
         }
         let kind = canonical_kind(&profile.kind)?;
-        let is_oauth = matches!(kind.as_str(), "google-antigravity" | "muse-code")
-            || profile.auth.trim().eq_ignore_ascii_case("oauth");
+        let is_oauth = matches!(
+            kind.as_str(),
+            "google-antigravity" | "muse-code" | "openai-codex" | "github-copilot"
+        ) || profile.auth.trim().eq_ignore_ascii_case("oauth");
         if is_oauth {
             if profile.auth.trim().is_empty() {
                 profile.auth = "oauth".to_owned();
@@ -371,9 +373,27 @@ impl AdminStore {
                 if profile.refresh_token_secret.trim().is_empty() {
                     profile.refresh_token_secret = "muse_code_identity".to_owned();
                 }
+            } else if kind == "openai-codex" {
+                // Only members' own sign-ins use this provider; these names are
+                // placeholders for an operator credential that never exists.
+                if profile.api_key_secret.trim().is_empty() {
+                    profile.api_key_secret = "codex_access_token".to_owned();
+                }
+                if profile.refresh_token_secret.trim().is_empty() {
+                    profile.refresh_token_secret = "codex_refresh_token".to_owned();
+                }
+            } else if kind == "github-copilot" {
+                // As Codex: placeholders for an operator credential that never exists.
+                if profile.api_key_secret.trim().is_empty() {
+                    profile.api_key_secret = "copilot_access_token".to_owned();
+                }
+                if profile.refresh_token_secret.trim().is_empty() {
+                    profile.refresh_token_secret = "copilot_github_token".to_owned();
+                }
             } else {
                 return Err(SeraError::Config(
-                    "oauth auth is only supported for muse-code and google-antigravity".into(),
+                    "oauth auth is only supported for muse-code, google-antigravity, openai-codex and github-copilot"
+                        .into(),
                 ));
             }
         } else {

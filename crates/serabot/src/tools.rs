@@ -977,6 +977,7 @@ pub fn known_tool_names() -> Vec<&'static str> {
         "composio_execute",
         "agentmail_inboxes_list",
         "agentmail_send",
+        "suggest_marketplace_app",
         "github_search_repos",
         "github_list_issues",
         "github_get_issue",

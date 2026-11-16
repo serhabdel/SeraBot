@@ -6,6 +6,11 @@
 //! names the secrets it needs (`secretKey`) and the hosts it may reach
 //! (`permissions.egress`); secrets are stored per user, never as environment
 //! variables on the shared server.
+//!
+//! Schema version 2 (v0.51) is additive: `schemaVersion: 2` manifests may use
+//! `auth.kind` `oauth` or `none`, an `oauth` block, a per-field request
+//! `header`, `tools` filters and `accounts`. A version 1 manifest loads exactly
+//! as before and may not use any of those.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -15,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Result, SeraError};
 
 pub const SCHEMA_VERSION: u32 = 1;
+/// The additive v0.51 schema (OAuth, header rules, tool filters, accounts).
+pub const SCHEMA_VERSION_V2: u32 = 2;
 const MAX_FILE_BYTES: u64 = 64 * 1024;
 const MAX_SLUG_CHARS: usize = 48;
 const MAX_TEXT_CHARS: usize = 2_000;
@@ -58,6 +65,34 @@ pub struct App {
     pub server: Server,
     #[serde(default)]
     pub auth: Vec<Auth>,
+    /// v2: which of the server's tools may be offered, and which are read only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<ToolFilter>,
+    /// v2: whether a member may hold several accounts for this app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounts: Option<AccountRules>,
+}
+
+/// v2 tool filters, by tool name. `deny` wins over `allow`; an empty `allow`
+/// means every tool not denied. `read_only` names tools the manifest vouches
+/// for as read only, which the runtime may treat as such.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolFilter {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+    #[serde(default)]
+    pub read_only: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AccountRules {
+    #[serde(default)]
+    pub multiple: bool,
 }
 
 /// How the plugin's tool server is reached. Only `http` runs in this build;
@@ -77,13 +112,58 @@ pub struct Auth {
     pub kind: AuthKind,
     #[serde(default)]
     pub fields: Vec<Field>,
+    /// v2, `kind: oauth` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<OauthSpec>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuthKind {
+    /// v1: the owner links the account in a browser; no secret is stored here.
     OauthLink,
     ApiKey,
+    /// v2: MCP OAuth (RFC 9728 discovery, PKCE, resource indicators).
+    Oauth,
+    /// v2: the server needs no credential.
+    None,
+}
+
+/// v2 OAuth settings for an MCP server. Discovery finds the endpoints; these
+/// only steer it.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+pub struct OauthSpec {
+    /// Where the protected-resource metadata lives, when it is not at the
+    /// well-known path for the server URL.
+    #[serde(default)]
+    pub resource_metadata_url: Option<String>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// A pre-registered public client id, used when neither a client metadata
+    /// document nor dynamic registration is available.
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// Offer SeraBot's client metadata document as the client id.
+    #[serde(default)]
+    pub uses_cimd: bool,
+}
+
+/// How an API-key field is sent: `bearer` puts `Bearer ` before the value, `raw`
+/// sends the value alone.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HeaderScheme {
+    Bearer,
+    Raw,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderSpec {
+    pub name: String,
+    pub scheme: HeaderScheme,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -97,6 +177,9 @@ pub struct Field {
     pub hint: String,
     #[serde(default)]
     pub docs_url: Option<String>,
+    /// v2: the request header this field's value is sent in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<HeaderSpec>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -108,9 +191,10 @@ pub struct Permissions {
 
 /// Validate one manifest. The error names the first field that fails.
 pub fn validate(manifest: &PluginManifest, expected_slug: &str) -> Result<()> {
-    if manifest.schema_version != SCHEMA_VERSION {
-        return Err(invalid("schemaVersion", "must be 1"));
+    if manifest.schema_version != SCHEMA_VERSION && manifest.schema_version != SCHEMA_VERSION_V2 {
+        return Err(invalid("schemaVersion", "must be 1 or 2"));
     }
+    let v2 = manifest.schema_version == SCHEMA_VERSION_V2;
     check_slug(&manifest.slug)
         .map_err(|_| invalid("slug", "must be lowercase letters, digits and dashes"))?;
     if manifest.slug != expected_slug {
@@ -149,9 +233,12 @@ pub fn validate(manifest: &PluginManifest, expected_slug: &str) -> Result<()> {
                 }
             }
         }
+        check_app_v2(app, v2, &manifest.permissions.egress)?;
         for auth in &app.auth {
             check_slug(&auth.id).map_err(|_| invalid("apps.auth.id", "must be a short id"))?;
+            check_auth_kind(auth, v2)?;
             for field in &auth.fields {
+                check_field_header(field, auth.kind, v2)?;
                 check_id(&field.id)
                     .map_err(|_| invalid("apps.auth.fields.id", "must be a short id"))?;
                 check_text("apps.auth.fields.label", &field.label, 80)?;
@@ -178,7 +265,203 @@ pub fn validate(manifest: &PluginManifest, expected_slug: &str) -> Result<()> {
     Ok(())
 }
 
+/// Request headers a manifest may never set: they frame the request or carry
+/// identity the client owns.
+const DENIED_HEADERS: &[&str] = &[
+    "host",
+    "content-length",
+    "cookie",
+    "set-cookie",
+    "transfer-encoding",
+    "connection",
+    "upgrade",
+    "te",
+    "trailer",
+    "proxy-authorization",
+    "content-type",
+    "accept",
+    "mcp-session-id",
+    "mcp-protocol-version",
+];
+const MAX_TOOL_NAMES: usize = 64;
+const MAX_SCOPES: usize = 16;
+
+fn check_auth_kind(auth: &Auth, v2: bool) -> Result<()> {
+    match auth.kind {
+        AuthKind::OauthLink | AuthKind::ApiKey => {
+            if auth.oauth.is_some() {
+                return Err(invalid("apps.auth.oauth", "is only for kind oauth"));
+            }
+            if v2 && auth.kind == AuthKind::OauthLink {
+                return Err(invalid(
+                    "apps.auth.kind",
+                    "oauth-link is a v1 kind; use oauth",
+                ));
+            }
+            if v2 && auth.kind == AuthKind::ApiKey && auth.fields.is_empty() {
+                return Err(invalid("apps.auth.fields", "an api-key needs a field"));
+            }
+        }
+        AuthKind::Oauth | AuthKind::None if !v2 => {
+            return Err(invalid(
+                "apps.auth.kind",
+                "oauth and none need schemaVersion 2",
+            ));
+        }
+        AuthKind::Oauth => {
+            if !auth.fields.is_empty() {
+                return Err(invalid("apps.auth.fields", "an oauth auth has no fields"));
+            }
+            let spec = auth
+                .oauth
+                .as_ref()
+                .ok_or_else(|| invalid("apps.auth.oauth", "is required for kind oauth"))?;
+            check_oauth(spec)?;
+        }
+        AuthKind::None => {
+            if !auth.fields.is_empty() || auth.oauth.is_some() {
+                return Err(invalid("apps.auth", "kind none has no fields or oauth"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_oauth(spec: &OauthSpec) -> Result<()> {
+    if let Some(url) = &spec.resource_metadata_url {
+        check_https("apps.auth.oauth.resourceMetadataUrl", url)?;
+    }
+    if spec.scopes.len() > MAX_SCOPES {
+        return Err(invalid("apps.auth.oauth.scopes", "has too many entries"));
+    }
+    for scope in &spec.scopes {
+        let ok = !scope.is_empty()
+            && scope.len() <= 100
+            && scope
+                .bytes()
+                .all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\');
+        if !ok {
+            return Err(invalid("apps.auth.oauth.scopes", "has an invalid scope"));
+        }
+    }
+    if let Some(id) = &spec.client_id {
+        let ok = !id.is_empty() && id.len() <= 200 && id.bytes().all(|b| b.is_ascii_graphic());
+        if !ok {
+            return Err(invalid("apps.auth.oauth.clientId", "is not a client id"));
+        }
+    }
+    Ok(())
+}
+
+fn check_field_header(field: &Field, kind: AuthKind, v2: bool) -> Result<()> {
+    let Some(header) = &field.header else {
+        return Ok(());
+    };
+    if !v2 || kind != AuthKind::ApiKey {
+        return Err(invalid(
+            "apps.auth.fields.header",
+            "needs schemaVersion 2 and kind api-key",
+        ));
+    }
+    let name = header.name.to_ascii_lowercase();
+    let token = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if !token {
+        return Err(invalid(
+            "apps.auth.fields.header.name",
+            "is not a header name",
+        ));
+    }
+    if DENIED_HEADERS.contains(&name.as_str()) {
+        return Err(invalid(
+            "apps.auth.fields.header.name",
+            "names a header a manifest may not set",
+        ));
+    }
+    Ok(())
+}
+
+fn check_app_v2(app: &App, v2: bool, egress: &[String]) -> Result<()> {
+    if (app.tools.is_some() || app.accounts.is_some()) && !v2 {
+        return Err(invalid("apps", "tools and accounts need schemaVersion 2"));
+    }
+    if let Some(tools) = &app.tools {
+        for (field, names) in [
+            ("apps.tools.allow", &tools.allow),
+            ("apps.tools.deny", &tools.deny),
+            ("apps.tools.readOnly", &tools.read_only),
+        ] {
+            if names.len() > MAX_TOOL_NAMES {
+                return Err(invalid(field, "has too many entries"));
+            }
+            for name in names {
+                let ok = !name.is_empty()
+                    && name.len() <= 64
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
+                if !ok {
+                    return Err(invalid(field, "has an invalid tool name"));
+                }
+            }
+        }
+        if tools.allow.iter().any(|name| tools.deny.contains(name)) {
+            return Err(invalid(
+                "apps.tools",
+                "lists a tool as both allowed and denied",
+            ));
+        }
+    }
+    // The resource metadata document is fetched with the plugin's reach: its
+    // host must be one the manifest declares.
+    for auth in &app.auth {
+        if let Some(url) = auth
+            .oauth
+            .as_ref()
+            .and_then(|spec| spec.resource_metadata_url.as_deref())
+        {
+            let host = url::Url::parse(url)
+                .ok()
+                .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase));
+            if !host.is_some_and(|host| egress.iter().any(|e| e.eq_ignore_ascii_case(&host))) {
+                return Err(invalid(
+                    "apps.auth.oauth.resourceMetadataUrl",
+                    "must use a host on permissions.egress",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 const BUILTIN_MANIFESTS: &[(&str, &str)] = &[
+    (
+        "atlassian",
+        include_str!("../../../plugins/atlassian/plugin.json"),
+    ),
+    (
+        "context7",
+        include_str!("../../../plugins/context7/plugin.json"),
+    ),
+    (
+        "posthog",
+        include_str!("../../../plugins/posthog/plugin.json"),
+    ),
+    (
+        "sentry",
+        include_str!("../../../plugins/sentry/plugin.json"),
+    ),
+    (
+        "stripe",
+        include_str!("../../../plugins/stripe/plugin.json"),
+    ),
+    (
+        "vercel",
+        include_str!("../../../plugins/vercel/plugin.json"),
+    ),
     (
         "brave-search",
         include_str!("../../../plugins/brave-search/plugin.json"),
@@ -378,7 +661,10 @@ fn check_host(value: &str) -> Result<()> {
 }
 
 fn check_secret_key(value: &str) -> Result<()> {
+    // `marketplace.<slug>.<account>.oauth` is where OAuth records are sealed.
     let ok = !value.is_empty()
+        && !value.eq_ignore_ascii_case("oauth")
+        && !value.to_ascii_lowercase().ends_with(".oauth")
         && value.len() <= 96
         && value
             .bytes()
@@ -427,8 +713,12 @@ mod tests {
                         secret_key: "sample.api_key".into(),
                         hint: String::new(),
                         docs_url: None,
+                        header: None,
                     }],
+                    oauth: None,
                 }],
+                tools: None,
+                accounts: None,
             }],
             permissions: Permissions {
                 egress: vec!["mcp.sample.example.invalid".into()],
@@ -448,7 +738,7 @@ mod tests {
     fn a_manifest_must_match_its_folder_and_version() {
         let mut manifest = sample();
         assert!(validate(&manifest, "other-plugin").is_err());
-        manifest.schema_version = 2;
+        manifest.schema_version = 3;
         assert!(validate(&manifest, "sample-plugin").is_err());
     }
 
@@ -476,6 +766,9 @@ mod tests {
         manifest.apps[0].auth[0].fields[0].secret_key = "bad key with spaces".into();
         assert!(validate(&manifest, "sample-plugin").is_err());
         let mut manifest = sample();
+        manifest.apps[0].auth[0].fields[0].secret_key = "acct.oauth".into();
+        assert!(validate(&manifest, "sample-plugin").is_err());
+        let mut manifest = sample();
         let duplicate = manifest.apps[0].auth[0].fields[0].clone();
         manifest.apps[0].auth[0].fields.push(duplicate);
         assert!(validate(&manifest, "sample-plugin").is_err());
@@ -489,13 +782,13 @@ mod tests {
     }
 
     #[test]
-    fn the_repository_catalog_loads_with_ten_valid_plugins() {
+    fn the_repository_catalog_loads_with_sixteen_valid_plugins() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
         let (plugins, problems) = load_catalog(&root);
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(
             plugins.len(),
-            10,
+            16,
             "{:?}",
             plugins.iter().map(|p| &p.slug).collect::<Vec<_>>()
         );
@@ -521,20 +814,26 @@ mod tests {
     }
 
     #[test]
-    fn builtin_catalog_parses_all_ten_shipped_manifests() {
+    fn builtin_catalog_parses_all_sixteen_shipped_manifests() {
         let builtin = builtin_catalog();
-        assert_eq!(builtin.len(), 10);
+        assert_eq!(builtin.len(), 16);
         let slugs: Vec<&str> = builtin.iter().map(|p| p.slug.as_str()).collect();
         for expected in [
+            "atlassian",
             "brave-search",
+            "context7",
             "elevenlabs",
             "exa",
             "firecrawl",
             "github",
             "linear",
             "notion",
+            "posthog",
             "resend",
+            "sentry",
+            "stripe",
             "tavily",
+            "vercel",
             "workspace-files",
         ] {
             assert!(slugs.contains(&expected), "missing built-in {expected}");
@@ -545,17 +844,82 @@ mod tests {
         assert_eq!(builtin, sorted);
     }
 
+    /// Real remote MCP hosts shipped from v0.51: slug, MCP URL host.
+    const REAL_HOSTS: &[(&str, &str)] = &[
+        ("atlassian", "mcp.atlassian.com"),
+        ("context7", "mcp.context7.com"),
+        ("linear", "mcp.linear.app"),
+        ("notion", "mcp.notion.com"),
+        ("posthog", "mcp.posthog.com"),
+        ("sentry", "mcp.sentry.dev"),
+        ("stripe", "mcp.stripe.com"),
+        ("vercel", "mcp.vercel.com"),
+    ];
+
     #[test]
-    fn load_catalog_with_builtin_returns_all_ten_when_dir_is_missing_or_empty() {
+    fn real_host_manifests_are_oauth_https_and_egress_listed() {
+        let builtin = builtin_catalog();
+        for (slug, host) in REAL_HOSTS {
+            let manifest = builtin.iter().find(|p| p.slug == *slug).expect(slug);
+            assert_eq!(manifest.schema_version, 2, "{slug}");
+            assert_eq!(
+                manifest.permissions.egress,
+                vec![host.to_string()],
+                "{slug}"
+            );
+            let raw = serde_json::to_string(manifest).unwrap();
+            assert!(!raw.contains("example.invalid"), "{slug}");
+            let [app] = manifest.apps.as_slice() else {
+                panic!("{slug}: one app");
+            };
+            let Server::Http { url } = &app.server else {
+                panic!("{slug}: http transport");
+            };
+            let parsed = url::Url::parse(url).unwrap();
+            assert_eq!(parsed.scheme(), "https", "{slug}");
+            assert_eq!(parsed.host_str(), Some(*host), "{slug}");
+            // Sign-in only: no pasted secret, no link-out.
+            assert_eq!(app.auth.len(), 1, "{slug}");
+            assert_eq!(app.auth[0].kind, AuthKind::Oauth, "{slug}");
+            assert!(app.auth[0].fields.is_empty(), "{slug}");
+        }
+    }
+
+    #[test]
+    fn vouched_read_only_tools_are_reads_and_stripe_offers_only_reads() {
+        let builtin = builtin_catalog();
+        for (slug, _) in REAL_HOSTS {
+            let manifest = builtin.iter().find(|p| p.slug == *slug).unwrap();
+            let Some(tools) = &manifest.apps[0].tools else {
+                continue;
+            };
+            for name in &tools.read_only {
+                for verb in [
+                    "create", "update", "delete", "remove", "deploy", "add", "edit", "write",
+                    "send", "refund", "cancel",
+                ] {
+                    let words: Vec<&str> = name.split(['_', '-']).collect();
+                    assert!(!words.contains(&verb), "{slug}: {name} looks like a write");
+                }
+            }
+            if *slug == "stripe" {
+                assert!(!tools.allow.is_empty());
+                assert_eq!(tools.allow, tools.read_only);
+            }
+        }
+    }
+
+    #[test]
+    fn load_catalog_with_builtin_returns_all_sixteen_when_dir_is_missing_or_empty() {
         let missing = std::path::Path::new("/nonexistent/serabot-plugins-dir-xyz");
         let (plugins, problems) = load_catalog_with_builtin(missing);
         assert!(problems.is_empty(), "{problems:?}");
-        assert_eq!(plugins.len(), 10);
+        assert_eq!(plugins.len(), 16);
 
         let empty = tempfile::tempdir().unwrap();
         let (plugins, problems) = load_catalog_with_builtin(empty.path());
         assert!(problems.is_empty(), "{problems:?}");
-        assert_eq!(plugins.len(), 10);
+        assert_eq!(plugins.len(), 16);
     }
 
     #[test]
@@ -574,8 +938,123 @@ mod tests {
 
         let (plugins, problems) = load_catalog_with_builtin(dir.path());
         assert!(problems.is_empty(), "{problems:?}");
-        assert_eq!(plugins.len(), 10);
+        assert_eq!(plugins.len(), 16);
         let tavily = plugins.iter().find(|p| p.slug == "tavily").unwrap();
         assert_eq!(tavily.name, "Custom Tavily Override");
+    }
+
+    fn sample_v2_oauth() -> PluginManifest {
+        let mut manifest = sample();
+        manifest.schema_version = 2;
+        manifest.apps[0].auth = vec![Auth {
+            id: "signin".into(),
+            kind: AuthKind::Oauth,
+            fields: vec![],
+            oauth: Some(OauthSpec {
+                resource_metadata_url: Some(
+                    "https://mcp.sample.example.invalid/.well-known/oauth-protected-resource"
+                        .into(),
+                ),
+                scopes: vec!["read".into(), "write".into()],
+                client_id: None,
+                uses_cimd: true,
+            }),
+        }];
+        manifest.apps[0].tools = Some(ToolFilter {
+            allow: vec![],
+            deny: vec!["delete_everything".into()],
+            read_only: vec!["search".into()],
+        });
+        manifest.apps[0].accounts = Some(AccountRules { multiple: true });
+        manifest
+    }
+
+    #[test]
+    fn a_v1_manifest_still_loads_and_round_trips_without_v2_fields() {
+        let text = serde_json::to_string(&sample()).unwrap();
+        assert!(!text.contains("oauth"));
+        assert!(!text.contains("header"));
+        let back: PluginManifest = serde_json::from_str(&text).unwrap();
+        assert!(validate(&back, "sample-plugin").is_ok());
+        // A v1 file written before v2 existed has none of the new keys.
+        let legacy = r#"{"schemaVersion":1,"slug":"sample-plugin","name":"S","tagline":"t",
+            "description":"d","category":"c","iconUrl":"https://a.example.invalid/i.png",
+            "version":"1.0.0","minServerVersion":"0.36.0",
+            "apps":[{"id":"m","name":"M","server":{"transport":"http","url":"https://a.example.invalid/mcp"},
+              "auth":[{"id":"link","kind":"oauth-link","fields":[]}]}],
+            "permissions":{"egress":["a.example.invalid"]},
+            "websiteUrl":"https://a.example.invalid","privacyPolicyUrl":"https://a.example.invalid/p",
+            "termsUrl":"https://a.example.invalid/t"}"#;
+        let manifest: PluginManifest = serde_json::from_str(legacy).unwrap();
+        assert!(validate(&manifest, "sample-plugin").is_ok());
+    }
+
+    #[test]
+    fn a_v2_oauth_manifest_validates_and_round_trips() {
+        let manifest = sample_v2_oauth();
+        assert!(validate(&manifest, "sample-plugin").is_ok());
+        let text = serde_json::to_string(&manifest).unwrap();
+        let back: PluginManifest = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, manifest);
+    }
+
+    #[test]
+    fn v2_features_are_refused_in_a_v1_manifest() {
+        let mut manifest = sample_v2_oauth();
+        manifest.schema_version = 1;
+        assert!(validate(&manifest, "sample-plugin").is_err());
+        let mut manifest = sample();
+        manifest.apps[0].accounts = Some(AccountRules { multiple: true });
+        assert!(validate(&manifest, "sample-plugin").is_err());
+        let mut manifest = sample();
+        manifest.apps[0].auth[0].fields[0].header = Some(HeaderSpec {
+            name: "x-api-key".into(),
+            scheme: HeaderScheme::Raw,
+        });
+        assert!(validate(&manifest, "sample-plugin").is_err());
+    }
+
+    #[test]
+    fn a_denied_or_malformed_header_is_rejected() {
+        for name in ["Host", "content-length", "Cookie", "bad header", "x:y", ""] {
+            let mut manifest = sample();
+            manifest.schema_version = 2;
+            manifest.apps[0].auth[0].fields[0].header = Some(HeaderSpec {
+                name: name.into(),
+                scheme: HeaderScheme::Raw,
+            });
+            assert!(validate(&manifest, "sample-plugin").is_err(), "{name}");
+        }
+        let mut manifest = sample();
+        manifest.schema_version = 2;
+        manifest.apps[0].auth[0].fields[0].header = Some(HeaderSpec {
+            name: "X-Api-Key".into(),
+            scheme: HeaderScheme::Raw,
+        });
+        assert!(validate(&manifest, "sample-plugin").is_ok());
+    }
+
+    #[test]
+    fn oauth_settings_are_checked() {
+        let mut manifest = sample_v2_oauth();
+        manifest.apps[0].auth[0].oauth = None;
+        assert!(validate(&manifest, "sample-plugin").is_err());
+        let mut manifest = sample_v2_oauth();
+        manifest.apps[0].auth[0]
+            .oauth
+            .as_mut()
+            .unwrap()
+            .resource_metadata_url = Some("https://other.example.invalid/meta".into());
+        assert!(validate(&manifest, "sample-plugin").is_err());
+        let mut manifest = sample_v2_oauth();
+        manifest.apps[0].auth[0].oauth.as_mut().unwrap().scopes = vec!["has space".into()];
+        assert!(validate(&manifest, "sample-plugin").is_err());
+        let mut manifest = sample_v2_oauth();
+        manifest.apps[0].tools = Some(ToolFilter {
+            allow: vec!["a".into()],
+            deny: vec!["a".into()],
+            read_only: vec![],
+        });
+        assert!(validate(&manifest, "sample-plugin").is_err());
     }
 }

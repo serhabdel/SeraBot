@@ -1,0 +1,199 @@
+/* Plugin accounts, per-tool switches and the GitHub card (v0.51). Colours,
+   radii and timing come from the shared tokens. A press answers at once and
+   every transition can be interrupted by the next one. Motion is off when the
+   system asks for reduced motion or the console's own motion switch is set to
+   reduce, and every control keeps a visible focus ring. */
+
+.mp-accounts-section,
+.mp-tools-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.mp-accounts,
+.mp-tool-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.mp-account {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  transition: border-color var(--dur-2) var(--ease), background var(--dur-2) var(--ease),
+    opacity var(--dur-2) var(--ease);
+}
+
+.mp-account:focus-within {
+  border-color: var(--accent);
+  box-shadow: var(--ring);
+}
+
+.mp-account.needs-attention {
+  border-color: var(--warn);
+}
+
+.mp-account.is-busy {
+  border-color: var(--accent);
+  opacity: 0.7;
+}
+
+.mp-account-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.mp-account-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mp-account-title {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  color: var(--label-1);
+}
+
+.mp-account-actions,
+.mp-add-account {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mp-add-account .input {
+  flex: 1 1 200px;
+  min-width: 0;
+}
+
+.mp-notice {
+  color: var(--ok);
+}
+
+.mp-tool {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 4px 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  transition: border-color var(--dur-2) var(--ease), background var(--dur-2) var(--ease);
+}
+
+.mp-tool:focus-within {
+  border-color: var(--accent);
+  box-shadow: var(--ring);
+}
+
+.mp-tool.is-locked {
+  background: transparent;
+}
+
+.mp-tool.skeleton {
+  min-height: 52px;
+}
+
+.mp-tool-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mp-tool-name {
+  font-weight: 600;
+  color: var(--label-1);
+  overflow-wrap: anywhere;
+}
+
+.mp-tool-note,
+.mp-tool-desc {
+  font-size: var(--fs-caption);
+  color: var(--label-3);
+}
+
+.mp-tool-desc {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.mp-tool-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.mp-tool.is-locked .mp-tool-switch {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.github-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  transition: border-color var(--dur-2) var(--ease);
+}
+
+.github-card:focus-within {
+  border-color: var(--accent);
+}
+
+.github-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.github-login {
+  margin: 0;
+  color: var(--label-1);
+}
+
+.github-or {
+  margin: 12px 0 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mp-account,
+  .mp-tool,
+  .github-card {
+    transition: none;
+  }
+}
+
+.root[data-motion="reduce"] .mp-account,
+.root[data-motion="reduce"] .mp-tool,
+.root[data-motion="reduce"] .github-card {
+  transition: none;
+}

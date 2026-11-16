@@ -448,6 +448,7 @@ pub(crate) fn estimate_prompt_chars(messages: &[LlmMessage]) -> usize {
 }
 
 const TOOL_NOTICE_PREFIX: &str = "AVAILABLE TOOLS THIS TURN:";
+const APP_NOTICE_PREFIX: &str = "MARKETPLACE APPS NEEDING ATTENTION:";
 
 /// One-line description: the first sentence, capped in length.
 fn one_line(description: &str) -> String {
@@ -499,6 +500,36 @@ fn render_tool_list(tools: &[ToolSpec]) -> String {
 /// An existing notice is refreshed in place so stale lists from earlier
 /// turns never survive; otherwise the notice is inserted after the first
 /// system message.
+/// Keep one system line naming the marketplace apps the owner enabled that could
+/// not be used this turn (for example "Canva needs sign-in"), or remove it when
+/// every app works. The wording is fixed, so no server text reaches the prompt.
+fn upsert_app_notice(messages: &mut Vec<LlmMessage>, notes: &[String]) {
+    let existing = messages.iter().position(|message| {
+        message.role == Role::System
+            && message
+                .content
+                .as_deref()
+                .is_some_and(|text| text.starts_with(APP_NOTICE_PREFIX))
+    });
+    if notes.is_empty() {
+        if let Some(index) = existing {
+            messages.remove(index);
+        }
+        return;
+    }
+    let content = format!(
+        "{APP_NOTICE_PREFIX} {}. Tell the owner if they ask for it; they fix it in Integrations.",
+        notes.join("; ")
+    );
+    match existing {
+        Some(index) => messages[index].content = Some(content),
+        None => {
+            let at = 2.min(messages.len());
+            messages.insert(at, LlmMessage::system(content));
+        }
+    }
+}
+
 fn upsert_tool_notice(messages: &mut Vec<LlmMessage>, tools: &[ToolSpec]) {
     let tool_list = render_tool_list(tools);
     let content = format!(

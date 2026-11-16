@@ -18,8 +18,11 @@ in passing:
 
 - Local-program (`stdio`) plugins are not runnable; do not add a local-process
   plugin runner without a new security design.
-- The shipped manifests under `plugins/` use placeholder hosts
-  (`*.example.invalid`). They are not real services.
+- Shipped manifests under `plugins/` on real hosts (v0.51: linear, notion,
+  sentry, vercel, stripe (read-only tools), posthog, context7, atlassian) are
+  schema v2 `oauth` and run through the approval-gated runtime. They are not
+  verified until the owner signs in and runs them. The rest of the shipped
+  manifests (`*.example.invalid`) are still placeholders, not real services.
 - `RUNTIME_CALLS_PLUGINS` in `crates/serabot-desktop/src/marketplace.rs` is
   `true` for live `http` MCP plugins. Placeholder hosts (`*.example.invalid`)
   and local-program (`stdio`) plugins stay off. Do not offer those actions, and
@@ -81,16 +84,18 @@ OVH is read-only unless the owner explicitly authorizes an additive installation
 - `crates/serabot/src/analyst.rs`, `spreadsheets.rs` — document and finance analysis.
 - `crates/serabot/src/deck.rs`, `render.rs`, `maker.rs`, `onedrive.rs` — deterministic deliverables; OneDrive is per user.
 - `crates/serabot/src/marketplace.rs`, `plugin_runtime.rs`, `mcp_client.rs`, `api/marketplace.rs` — plugin catalog, per-user install state (v0.36), and per-user `http` MCP plugin tools (v0.38.0).
-- `crates/serabot-desktop/src/marketplace.rs`, `ui_marketplace.rs`, `ui_integrations.rs` — Integrations & Marketplace screen (v0.37–v0.38). Desktop Install/Enable stay off while `RUNTIME_CALLS_PLUGINS` is `false`.
-- `plugins/` — synthetic catalog manifests. Hosts are placeholders (`*.example.invalid`).
+- `crates/serabot-desktop/src/marketplace.rs`, `marketplace_flow.rs`, `session/marketplace_accounts.rs`, `ui_marketplace.rs`, `ui_mcp_accounts.rs`, `ui_integrations.rs` — Integrations & Marketplace screen (v0.37–v0.38); plugin accounts, sign-in, per-tool switches and the GitHub card (v0.51). Desktop Install/Enable stay off while `RUNTIME_CALLS_PLUGINS` is `false`.
+- `crates/serabot/src/mcp_oauth.rs`, `marketplace_auth.rs`, `marketplace_suggest.rs`, `github_connector.rs` — MCP OAuth (discovery, CIMD/DCR, PKCE, revoke), per-member plugin accounts, the `suggest_marketplace_app` card, and the native GitHub device-flow connector (0.51).
+- `crates/serabot/src/auth_flows/codex.rs`, `copilot.rs` — ChatGPT (Codex) and GitHub Copilot plan sign-in, on by default with a risk banner, `plan_oauth = false` turns them off (0.51).
+- `plugins/` — catalog manifests: eight real remote hosts (schema v2, unverified until the owner runs them) and placeholder hosts (`*.example.invalid`) for the rest.
 - `bots/` + `prompts/` — default fleet templates, seeded per user.
 - `crates/serabot/src/logging.rs` — daily files (`[logging] dir`, default `data/logs`, owner-only), redacting ring buffer, shared `DEFAULT_FILTER`; noisy transport crates stay at `warn`.
 - `crates/serabot/src/vault.rs`, `vault_providers.rs`, `api/vault.rs`, `api/browser.rs` — per-user vault, password-manager CLIs (cleared child env, `Zeroizing`), and browser autofill (host-bound).
 - `crates/serabot/src/job_tools.rs`, `bots/jobfinder.toml` — `jobfinder` tools; task/calendar tools use the acting user's id.
 - `crates/serabot/src/api/preview.rs`, `api/workflows.rs`, `api/routines.rs` — artifact preview (owner-only, hash-addressed), per-user workflow plans and routines.
-- `crates/serabot/src/accounts.rs`, `api/accounts.rs`, `auth_flows/`, `llm_failure.rs` — per-user provider accounts (sealed, write-only), sign-in flows (PKCE/device; Antigravity, Muse, Claude plan OAuth flag-gated off), single-flight refresh, typed failure classifier (0.49).
+- `crates/serabot/src/accounts.rs`, `api/accounts.rs`, `auth_flows/`, `llm_failure.rs` — per-user provider accounts (sealed, write-only), sign-in flows (PKCE/device; Antigravity, Muse, Claude, Codex and Copilot plan sign-in, on by default with a risk banner, `plan_oauth = false` turns off), single-flight refresh, typed failure classifier (0.49).
 - `crates/serabot/src/wire/`, `route_chain.rs`, `thinking.rs` — Anthropic and Responses transports, bot route chain with failover and holds, thinking levels (0.49).
 - `crates/serabot/src/fleet_mutation.rs`, `tools_bots.rs` — the one path that changes a bot row, and `main`'s management tools (owner turns only; setters approval-gated, never widening) (0.50).
 - `crates/serabot/src/delegate.rs`, `runtime/auto_resume.rs`, `runtime/compaction.rs`, `runtime/activity.rs` — handoff ledger and resume, `waiting_model` parking, context compaction, orchestration event payloads (0.50).
 - `crates/serabot-desktop/src/runs.rs`, `chat_compose.rs`, `chat_failure.rs`, `chat_cards.rs`, `ui/chat_feed_view.rs`, `assets/runs.css` — runs sidebar, composer queue, failed and wait cards, virtualized feed (0.50).
-- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.50.0.
+- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.51.0.

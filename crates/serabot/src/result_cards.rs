@@ -84,6 +84,19 @@ pub enum ResultCard {
         columns: Vec<String>,
         rows: Vec<Vec<String>>,
     },
+    /// A marketplace app the bot suggests (`suggest_marketplace_app`). It
+    /// installs nothing: the client shows the app and sends the member to the
+    /// Integrations screen, where install and sign-in happen. `needs` is
+    /// `sign_in`, `api_key` or `none`.
+    Install {
+        slug: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tagline: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        category: Option<String>,
+        needs: String,
+    },
 }
 
 /// A saved media file, borrowed so ElevenLabs can build cards without this
@@ -200,6 +213,23 @@ fn link_of(card: &ResultCard) -> Option<&str> {
     match card {
         ResultCard::Link { url, .. } => Some(url.as_str()),
         _ => None,
+    }
+}
+
+/// An install card for a catalog app. Text is cleaned and bounded.
+pub fn install_card(
+    slug: &str,
+    name: &str,
+    tagline: &str,
+    category: &str,
+    needs: &str,
+) -> ResultCard {
+    ResultCard::Install {
+        slug: slug.to_owned(),
+        name: clip(name).unwrap_or_else(|| slug.to_owned()),
+        tagline: clip(tagline),
+        category: clip(category),
+        needs: needs.to_owned(),
     }
 }
 

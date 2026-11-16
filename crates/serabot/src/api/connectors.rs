@@ -44,8 +44,14 @@ pub(super) async fn list_providers(
             let is_oauth =
                 config.is_some_and(|c| {
                     c.auth.eq_ignore_ascii_case("oauth")
-                        || matches!(c.kind.as_str(), "google-antigravity" | "muse-code")
-                }) || matches!(provider.kind.as_str(), "google-antigravity" | "muse-code");
+                        || matches!(
+                            c.kind.as_str(),
+                            "google-antigravity" | "muse-code" | "openai-codex" | "github-copilot"
+                        )
+                }) || matches!(
+                    provider.kind.as_str(),
+                    "google-antigravity" | "muse-code" | "openai-codex" | "github-copilot"
+                );
             let mut secrets = json!({
                 "api_key": visible_secret_status(&state.secrets, config.map(|c| c.api_key_secret.as_str()), is_admin),
             });
@@ -116,7 +122,10 @@ pub(super) async fn list_providers(
                 .any(|p| p.get("id").and_then(Value::as_str) == Some(&id))
             {
                 let is_oauth = profile.auth.eq_ignore_ascii_case("oauth")
-                    || matches!(profile.kind.as_str(), "google-antigravity" | "muse-code");
+                    || matches!(
+                        profile.kind.as_str(),
+                        "google-antigravity" | "muse-code" | "openai-codex" | "github-copilot"
+                    );
                 let mut secrets = json!({
                     "api_key": visible_secret_status(&state.secrets, Some(profile.api_key_secret.as_str()), is_admin),
                 });
@@ -301,14 +310,20 @@ pub(super) async fn list_connectors(
     // own state only. The token itself never appears.
     for id in crate::token_connectors::TokenConnectors::ids() {
         let personal = state.token_connectors.view(&user.id, id)?;
-        views.push(json!({
+        let mut view = json!({
             "id": id,
             "kind": "token",
             "enabled": true,
             "redirect_uri": Value::Null,
             "connected": personal.state == "connected",
             "personal": personal.to_json(),
-        }));
+        });
+        // GitHub also signs in natively (device flow); the pasted token stays
+        // as the fallback. Same card, one extra block.
+        if id == "github" {
+            view["native"] = state.github.view(&user.id)?;
+        }
+        views.push(view);
     }
     let checks = state.store.connector_checks(&user.id)?;
     for view in &mut views {
@@ -694,6 +709,71 @@ pub(super) async fn disconnect_onedrive(
         "id": "onedrive",
         "connected": false,
         "was_connected": deleted,
+    })))
+}
+
+/// The member's native GitHub sign-in state. No token ever appears.
+pub(super) async fn github_native_status(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    Ok(Json(state.github.view(&user.id)?))
+}
+
+/// Start GitHub's device flow: the answer carries the code the member types on
+/// `github.com/login/device`. Approval is picked up by a background poller.
+pub(super) async fn github_device_start(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    let started = state.github.start_device(&user.id).await?;
+    audit_auth(
+        &state,
+        &user.id,
+        "connector.github_signin_started",
+        json!({"connector": "github"}),
+    )?;
+    Ok(Json(serde_json::to_value(started)?))
+}
+
+/// Where the member's newest GitHub sign-in stands.
+pub(super) async fn github_device_status(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    let status = state
+        .github
+        .device_status(&user.id)
+        .ok_or_else(|| SeraError::NotFound("GitHub sign-in".into()))?;
+    let mut body = json!({"status": status.word()});
+    match &status {
+        crate::github_connector::DeviceStatus::Connected { login } => body["login"] = json!(login),
+        crate::github_connector::DeviceStatus::Denied { reason } => body["reason"] = json!(reason),
+        _ => {}
+    }
+    Ok(Json(body))
+}
+
+/// Disconnect GitHub: the sealed tokens and the login row are deleted. The
+/// answer carries the app's connections page on GitHub, where the member can
+/// also revoke the authorization; the console opens it.
+pub(super) async fn github_native_disconnect(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    let manage_url = state.github.manage_url();
+    let was_connected = state.github.disconnect(&user.id)?;
+    audit_auth(
+        &state,
+        &user.id,
+        "connector.disconnected",
+        json!({"connector": "github", "was_connected": was_connected, "native": true}),
+    )?;
+    Ok(Json(json!({
+        "id": "github",
+        "connected": false,
+        "was_connected": was_connected,
+        "manage_url": manage_url,
     })))
 }
 

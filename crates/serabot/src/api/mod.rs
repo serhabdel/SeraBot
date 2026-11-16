@@ -184,8 +184,12 @@ pub struct ApiState {
     composio: Arc<crate::composio::ComposioService>,
     /// The plugin catalog, loaded and validated at boot.
     marketplace: Vec<crate::marketplace::PluginManifest>,
+    /// OAuth sign-in for marketplace plugins (pending sign-ins live in memory).
+    mcp_signin: Arc<crate::marketplace_auth::McpSignIn>,
     /// Per-user GitHub, Todoist, Slack and Exa tokens.
     token_connectors: Arc<crate::token_connectors::TokenConnectors>,
+    /// The native GitHub sign-in (device flow, per member).
+    github: crate::github_connector::GithubConnector,
     /// The ElevenLabs MCP service, shared with the tools; `None` while the
     /// "ElevenLabs" connector is off. Sign-in and sign-out drop its session.
     elevenlabs: Option<Arc<crate::elevenlabs_mcp::ElevenLabsMcp>>,
@@ -259,6 +263,11 @@ impl ApiState {
             &config,
             users.clone(),
         )?);
+        let github = crate::github_connector::GithubConnector::new(
+            store.clone(),
+            users.clone(),
+            &config.connectors.github.app_client_id,
+        )?;
         let accounts = Arc::new(crate::accounts::Accounts::new(store.clone(), users.clone()));
         let refresher = Arc::new(crate::accounts::AccountRefresher::new(accounts.clone()));
         let mut sign_ins = crate::auth_flows::SignInRegistry::standard();
@@ -281,6 +290,11 @@ impl ApiState {
         let signin = Arc::new(
             crate::auth_flows::SignInService::new(accounts.clone())?.with_registry(sign_ins),
         );
+        let mcp_signin = Arc::new(crate::marketplace_auth::McpSignIn::new(
+            store.clone(),
+            users.clone(),
+            crate::mcp_oauth::OauthNet::system(),
+        ));
         let (marketplace, plugin_problems) = marketplace::load(&config);
         for problem in &plugin_problems {
             tracing::warn!(%problem, "plugin skipped");
@@ -296,7 +310,9 @@ impl ApiState {
             personal,
             composio,
             marketplace,
+            mcp_signin,
             token_connectors,
+            github,
             elevenlabs: None,
             token_hash: config.api.token_hash.to_ascii_lowercase(),
             rate: Arc::new(Mutex::new(HashMap::new())),
@@ -449,6 +465,27 @@ pub fn router(state: ApiState) -> Router {
             put(put_plugin_config),
         )
         .route(
+            "/v1/marketplace/plugins/{slug}/oauth/start",
+            post(oauth_start),
+        )
+        .route(
+            "/v1/marketplace/plugins/{slug}/oauth/complete",
+            post(oauth_complete),
+        )
+        .route(
+            "/v1/marketplace/plugins/{slug}/accounts",
+            get(list_accounts),
+        )
+        .route(
+            "/v1/marketplace/plugins/{slug}/accounts/{account_id}",
+            delete(delete_account),
+        )
+        .route("/v1/marketplace/plugins/{slug}/tools", get(list_tools))
+        .route(
+            "/v1/marketplace/plugins/{slug}/tools/{tool}",
+            put(put_tool_mode),
+        )
+        .route(
             "/v1/bots/{bot}/chats",
             get(list_bot_chats).post(create_bot_chat),
         )
@@ -576,6 +613,18 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/v1/connectors/composio/toolkits", get(composio_toolkits))
         .route("/v1/connectors/composio/connect", post(composio_connect))
+        .route(
+            "/v1/connectors/github/device/start",
+            post(github_device_start),
+        )
+        .route(
+            "/v1/connectors/github/device/status",
+            get(github_device_status),
+        )
+        .route(
+            "/v1/connectors/github/native",
+            get(github_native_status).delete(github_native_disconnect),
+        )
         .route("/v1/connectors/{id}", delete(disconnect_personal))
         .route("/v1/connectors/{id}/start", post(start_personal_consent))
         .route("/v1/connectors/{id}/token", put(set_personal_token))

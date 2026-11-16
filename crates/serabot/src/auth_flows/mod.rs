@@ -21,9 +21,12 @@
 //! provider kind to its implementation. This module ships OpenRouter's PKCE
 //! sign-in and Muse's device sign-in (`muse`); Antigravity's (`google`) needs
 //! the server's age store for its OAuth client secret and is registered by the
-//! API; the Claude sign-in registers the same way.
+//! API; the Claude sign-in registers the same way. Codex's (`codex`) and GitHub
+//! Copilot's (`copilot`) are standard: their client ids are public.
 
 pub mod claude;
+pub mod codex;
+pub mod copilot;
 pub mod device;
 pub mod google;
 pub mod muse;
@@ -47,6 +50,27 @@ use crate::user_secrets::ProviderCredential;
 
 use device::{DevicePoll, DeviceStart, PollEnd};
 use pkce::RedirectSpec;
+
+/// One async lock per key (a user and account), so a slow token endpoint
+/// stalls only that account's refresh and a rotating refresh token is still
+/// never spent twice.
+#[derive(Clone, Default)]
+pub struct KeyedLocks {
+    locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+impl KeyedLocks {
+    /// The lock for `key`; callers `.lock().await` it. Idle entries are
+    /// dropped when the map grows, which cannot break a lock in use because
+    /// holders keep their own `Arc`.
+    pub fn get(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        if locks.len() > 256 {
+            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        }
+        locks.entry(key.to_owned()).or_default().clone()
+    }
+}
 
 /// How long a started flow is remembered.
 pub const FLOW_TTL: Duration = Duration::from_secs(600);
@@ -161,6 +185,8 @@ pub struct TokenSet {
     pub expires_in: Option<u64>,
     /// An OpenID Connect identity token, when the provider sent one.
     pub id_token: Option<String>,
+    /// Seconds the refresh token lives, when the provider says (GitHub does).
+    pub refresh_expires_in: Option<u64>,
 }
 
 impl std::fmt::Debug for TokenSet {
@@ -192,6 +218,10 @@ impl TokenSet {
                 .and_then(Value::as_u64)
                 .filter(|seconds| *seconds > 0),
             id_token: text("id_token"),
+            refresh_expires_in: value
+                .get("refresh_token_expires_in")
+                .and_then(Value::as_u64)
+                .filter(|seconds| *seconds > 0),
         })
     }
 
@@ -334,6 +364,10 @@ impl SignInRegistry {
         let mut registry = Self::default();
         registry.register("openrouter", Arc::new(OpenRouterSignIn));
         registry.register("muse-code", Arc::new(muse::MuseSignIn::new()));
+        // Codex's client id is public and compiled in, so it needs no secret.
+        // Each provider's `plan_oauth` flag (checked per request) turns it off.
+        registry.register("openai-codex", Arc::new(codex::CodexSignIn::new()));
+        registry.register("github-copilot", Arc::new(copilot::CopilotSignIn::new()));
         registry
     }
 

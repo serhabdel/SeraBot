@@ -1,19 +1,39 @@
-//! Plugin tools for a user's bots (v0.37).
+//! Plugin tools for a user's bots (v0.37, auth and annotations in v0.51).
 //!
-//! An installed and enabled `http` plugin exposes the tools its MCP server
-//! offers. Each tool is named `plugin.<slug>.<tool>`, so a name never collides
-//! with a built-in tool or with another plugin. Everything here is per user:
-//! the install, the sealed key and the audit row all belong to the caller.
-//! Nothing is added to the global tool registry; the set is read per turn, so a
-//! plugin disabled or uninstalled drops out on the next turn.
+//! An installed and enabled `http` plugin exposes the tools its MCP servers
+//! offer; every `http` app of a plugin is used. Each tool is named
+//! `plugin.<slug>.<tool>` (`plugin.<slug>.<app>.<tool>` when a plugin has more
+//! than one http app), so a name never collides with a built-in tool or with
+//! another plugin. Everything here is per user: the install, the sealed
+//! credential and the audit row all belong to the caller. Nothing is added to
+//! the global tool registry; the set is read per turn, so a plugin disabled or
+//! uninstalled drops out on the next turn.
+//!
+//! Credentials come from the manifest's auth entry for the app: an API key
+//! sealed in the caller's store (sent in the header the manifest names), an
+//! OAuth access token from the caller's marketplace account, or none. The
+//! credential is read at call time and handed to the HTTP client only; it never
+//! reaches a prompt, a tool description or an error. A `401` on an OAuth app
+//! refreshes the token once and retries once.
 //!
 //! Each request is checked first: https only, no credentials, the host on the
 //! manifest's egress list, and every resolved address public. Calls are audited
 //! by plugin and tool name only; arguments and results are never written.
+//!
+//! Approval follows the tool's MCP annotations. A tool the server marks
+//! `readOnlyHint` (or the manifest vouches for) runs without approval, still
+//! through the gateway, so it is audited and its output is scanned. Every other
+//! tool needs approval for each call. A tool marked `destructiveHint` can never
+//! be relaxed, and no plugin tool gets a standing grant. The owner can set a
+//! per-tool override: `ask` makes a read-only tool ask, `allow` lets a tool that
+//! is not marked destructive run without asking. A server's own hints are
+//! untrusted claims; the manifest's egress list and the owner's override bound
+//! what they can do.
 
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -23,24 +43,147 @@ use serde_json::{Value, json};
 
 use crate::error::{Result, SeraError};
 use crate::gateway::{ApprovalDetails, Tool, ToolContext, ToolOutput, ToolSpec};
-use crate::marketplace::{PluginManifest, Server};
+use crate::marketplace::{App, AuthKind, HeaderScheme, PluginManifest, Server};
 use crate::mcp_client::{CatalogCache, McpAuth, McpClient, McpError};
+use crate::mcp_oauth::{OauthAccounts, OauthNet, RefreshOutcome};
 use crate::store::Store;
 use crate::user_secrets::UserSecrets;
 
 /// Prefix shared by every plugin tool name.
 pub const PREFIX: &str = "plugin.";
 /// Longest time one plugin request may take.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Largest response read from a plugin server.
-const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 /// Largest text returned to the model from one call.
-const MAX_OUTPUT_CHARS: usize = 8_000;
+pub(crate) const MAX_OUTPUT_CHARS: usize = 8_000;
 /// Longest description kept from a plugin's tool list.
-const MAX_DESCRIPTION_CHARS: usize = 400;
+pub(crate) const MAX_DESCRIPTION_CHARS: usize = 400;
 /// Largest input schema passed to the model. A bigger one is skipped, not truncated,
 /// since a cut-off schema would describe arguments wrongly.
 const MAX_SCHEMA_BYTES: usize = 8 * 1024;
+
+/// Why a plugin could not be used this turn. Shown to the owner (and in a
+/// one-line note to the main bot) in fixed words; nothing from the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Problem {
+    NeedsSetup,
+    NeedsSignIn,
+    Unreachable,
+}
+
+impl Problem {
+    pub fn phrase(self) -> &'static str {
+        match self {
+            Problem::NeedsSetup => "needs setup",
+            Problem::NeedsSignIn => "needs sign-in",
+            Problem::Unreachable => "is not responding",
+        }
+    }
+}
+
+/// A failed attempt to use one app: the class, and the error to return.
+#[derive(Debug)]
+struct Failure {
+    problem: Problem,
+    error: SeraError,
+}
+
+impl Failure {
+    fn new(problem: Problem, error: SeraError) -> Self {
+        Self { problem, error }
+    }
+
+    fn of_mcp(slug: &str, error: &McpError, signed_in: bool) -> Self {
+        let problem = if error.is_unauthorized() {
+            if signed_in {
+                Problem::NeedsSignIn
+            } else {
+                Problem::NeedsSetup
+            }
+        } else {
+            Problem::Unreachable
+        };
+        Self::new(problem, external(slug, error))
+    }
+
+    fn needs(slug: &str, problem: Problem) -> Self {
+        Self::new(
+            problem,
+            SeraError::Validation(format!("plugin {slug} {}", problem.phrase())),
+        )
+    }
+}
+
+/// What a call presents to the server and where it came from.
+struct Credential {
+    auth: McpAuth,
+    secret: SecretString,
+    /// The marketplace account behind an OAuth token.
+    account: Option<String>,
+}
+
+/// The caller's override for one tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolMode {
+    Ask,
+    Allow,
+}
+
+impl ToolMode {
+    pub fn parse(word: &str) -> Option<Self> {
+        match word {
+            "ask" => Some(Self::Ask),
+            "allow" => Some(Self::Allow),
+            _ => None,
+        }
+    }
+}
+
+/// What a tool's MCP annotations say about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hints {
+    pub read_only: bool,
+    pub destructive: bool,
+}
+
+/// Read the hints from a tool entry. `destructiveHint: true` wins over a
+/// read-only claim, so a contradictory server is treated as destructive.
+pub fn hints_of(tool: &Value) -> Hints {
+    let annotations = tool.get("annotations");
+    let flag = |key: &str| {
+        annotations
+            .and_then(|found| found.get(key))
+            .and_then(Value::as_bool)
+    };
+    let destructive = flag("destructiveHint") == Some(true);
+    Hints {
+        read_only: flag("readOnlyHint") == Some(true) && !destructive,
+        destructive,
+    }
+}
+
+/// One tool as the console lists it: the server's hints and the caller's
+/// override (`"ask"`, `"allow"` or none).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ToolRow {
+    /// The app the tool belongs to; sent back when setting an override.
+    pub app: String,
+    pub name: String,
+    pub description: String,
+    pub read_only: bool,
+    pub destructive: bool,
+    pub mode: Option<String>,
+}
+
+/// Whether a call to a tool with these hints needs approval.
+pub(crate) fn approval_needed(hints: Hints, mode: Option<ToolMode>) -> bool {
+    match mode {
+        Some(ToolMode::Ask) => true,
+        Some(ToolMode::Allow) if !hints.destructive => false,
+        _ => !hints.read_only,
+    }
+}
 
 /// The plugins a user can call: installed and enabled, with an http server.
 #[derive(Clone)]
@@ -49,20 +192,40 @@ pub struct PluginTools {
     users: Arc<UserSecrets>,
     catalog: Arc<Vec<PluginManifest>>,
     cache: Arc<CatalogCache>,
+    oauth: OauthAccounts,
+    net: OauthNet,
+    /// One token refresh at a time per user and account, so a rotating refresh
+    /// token is not spent twice and one slow server stalls no other user.
+    refresh_locks: crate::auth_flows::KeyedLocks,
+    /// Per user, the plugins that could not be used on the last turn.
+    problems: Arc<Mutex<HashMap<String, BTreeMap<String, Problem>>>>,
 }
 
 impl PluginTools {
     pub fn new(store: Store, users: Arc<UserSecrets>, catalog: Vec<PluginManifest>) -> Self {
+        let net = OauthNet::system();
         Self {
+            oauth: OauthAccounts::new(store.clone(), users.clone(), net.clone()),
+            net,
             store,
             users,
             catalog: Arc::new(catalog),
             cache: Arc::new(CatalogCache::default()),
+            refresh_locks: Default::default(),
+            problems: Arc::default(),
         }
     }
 
-    /// The caller's enabled plugins with a usable http server. A plugin with a
-    /// stdio server is skipped; install already refuses those.
+    /// Tests only: use a net that accepts a plain-http loopback mock server.
+    #[cfg(test)]
+    pub(crate) fn with_net(mut self, net: OauthNet) -> Self {
+        self.oauth = OauthAccounts::new(self.store.clone(), self.users.clone(), net.clone());
+        self.net = net;
+        self
+    }
+
+    /// The caller's enabled plugins with at least one usable http app. A plugin
+    /// with only stdio apps is skipped; install already refuses those.
     fn enabled_for(&self, user_id: &str) -> Result<Vec<&PluginManifest>> {
         let mut plugins = Vec::new();
         for (slug, enabled, _version) in self.store.marketplace_installs(user_id)? {
@@ -72,7 +235,7 @@ impl PluginTools {
             let Some(manifest) = self.catalog.iter().find(|plugin| plugin.slug == slug) else {
                 continue;
             };
-            if http_url(manifest).is_some() {
+            if http_apps(manifest).next().is_some() {
                 plugins.push(manifest);
             }
         }
@@ -80,107 +243,451 @@ impl PluginTools {
     }
 
     /// Specs for every tool the caller's enabled plugins currently offer. A plugin
-    /// that cannot be reached contributes nothing this turn, and no error is raised.
+    /// that cannot be used contributes nothing this turn; the reason is kept (see
+    /// [`PluginTools::notes_for`]) and audited when it changes, not raised.
     pub async fn specs_for(&self, user_id: &str) -> Vec<ToolSpec> {
         let Ok(plugins) = self.enabled_for(user_id) else {
             return Vec::new();
         };
         let mut specs = Vec::new();
+        let mut found: BTreeMap<String, Problem> = BTreeMap::new();
         for manifest in plugins {
-            let Ok(tools) = self.list(user_id, manifest).await else {
-                continue;
-            };
-            for tool in &tools {
-                if let Some(spec) = spec_of(&manifest.slug, tool) {
-                    specs.push(spec);
+            for app in http_apps(manifest) {
+                match self.list_app(user_id, manifest, app).await {
+                    Ok(tools) => {
+                        let space = namespace(manifest, app);
+                        specs.extend(tools.iter().filter_map(|tool| spec_of(&space, tool)));
+                    }
+                    Err(failure) => {
+                        tracing::warn!(
+                            plugin = %manifest.slug,
+                            app = %app.id,
+                            problem = failure.problem.phrase(),
+                            "plugin tools unavailable"
+                        );
+                        found
+                            .entry(manifest.slug.clone())
+                            .or_insert(failure.problem);
+                    }
                 }
             }
         }
+        self.record_problems(user_id, found);
         specs
+    }
+
+    /// Replace the caller's remembered problems; audit each one that is new or changed.
+    fn record_problems(&self, user_id: &str, found: BTreeMap<String, Problem>) {
+        let previous = {
+            let mut problems = self.problems.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = problems.get(user_id).cloned().unwrap_or_default();
+            if found.is_empty() {
+                problems.remove(user_id);
+            } else {
+                problems.insert(user_id.to_owned(), found.clone());
+            }
+            previous
+        };
+        for (slug, problem) in &found {
+            if previous.get(slug) == Some(problem) {
+                continue;
+            }
+            if let Err(error) = self.store.record_audit(
+                user_id,
+                "plugin.unavailable",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&json!({"plugin": slug, "problem": problem.phrase()})),
+            ) {
+                tracing::warn!(error = %error, "plugin audit write failed");
+            }
+        }
+    }
+
+    /// One short line per plugin that could not be used on the caller's last
+    /// turn, such as "Canva needs sign-in". Names come from the catalog and the
+    /// wording is fixed: nothing here is server text.
+    pub fn notes_for(&self, user_id: &str) -> Vec<String> {
+        let problems = self.problems.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(found) = problems.get(user_id) else {
+            return Vec::new();
+        };
+        found
+            .iter()
+            .filter_map(|(slug, problem)| {
+                let manifest = self.catalog.iter().find(|plugin| &plugin.slug == slug)?;
+                Some(format!("{} {}", manifest.name, problem.phrase()))
+            })
+            .collect()
+    }
+
+    /// Drop the caller's cached tool lists for one plugin, for example after a
+    /// sign-in or sign-out.
+    pub fn forget_cache(&self, user_id: &str, slug: &str) {
+        if let Some(manifest) = self.catalog.iter().find(|plugin| plugin.slug == slug) {
+            for app in &manifest.apps {
+                self.cache.forget(&cache_owner(user_id, slug, &app.id));
+            }
+        }
+    }
+
+    /// The tools one installed plugin offers the caller, with what the server's
+    /// hints say and the caller's own override, for the console's per-tool
+    /// switches. Plugin text is cut to the same length the model sees. Nothing
+    /// here is a secret.
+    pub async fn tool_rows(&self, user_id: &str, slug: &str) -> Result<Vec<ToolRow>> {
+        let manifest = self
+            .catalog
+            .iter()
+            .find(|plugin| plugin.slug == slug)
+            .ok_or_else(|| SeraError::NotFound(format!("plugin {slug}")))?;
+        if self.store.marketplace_install(user_id, slug)?.is_none() {
+            return Err(SeraError::NotFound(format!(
+                "plugin {slug} is not installed"
+            )));
+        }
+        let mut rows = Vec::new();
+        for app in http_apps(manifest) {
+            let listed = self
+                .list_app(user_id, manifest, app)
+                .await
+                .map_err(|failure| failure.error)?;
+            for tool in &listed {
+                let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let hints = hints_of(tool);
+                let mode = self
+                    .store
+                    .marketplace_tool_mode(user_id, slug, &mode_key(manifest, app, name))?
+                    .filter(|word| ToolMode::parse(word).is_some());
+                rows.push(ToolRow {
+                    app: app.id.clone(),
+                    name: name.to_owned(),
+                    description: truncate(
+                        tool.get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or(""),
+                        MAX_DESCRIPTION_CHARS,
+                    ),
+                    read_only: hints.read_only,
+                    destructive: hints.destructive,
+                    mode,
+                });
+            }
+        }
+        Ok(rows)
     }
 
     /// The tool behind one `plugin.<slug>.<tool>` name, when the caller may use it.
     pub async fn tool_for(&self, user_id: &str, name: &str) -> Option<PluginTool> {
-        let (slug, tool_name) = name.strip_prefix(PREFIX)?.split_once('.')?;
+        let rest = name.strip_prefix(PREFIX)?;
         let plugins = self.enabled_for(user_id).ok()?;
-        let manifest = plugins.into_iter().find(|plugin| plugin.slug == slug)?;
-        let listed = self.list(user_id, manifest).await.ok()?;
-        let description = listed
-            .into_iter()
-            .find(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name))?;
-        Some(PluginTool {
-            tools: self.clone(),
-            user_id: user_id.to_owned(),
-            slug: slug.to_owned(),
-            tool_name: tool_name.to_owned(),
-            description,
-        })
+        for manifest in plugins {
+            for app in http_apps(manifest) {
+                let space = format!("{}.", namespace(manifest, app));
+                let Some(tool_name) = rest.strip_prefix(&space) else {
+                    continue;
+                };
+                let listed = self.list_app(user_id, manifest, app).await.ok()?;
+                let description = listed
+                    .into_iter()
+                    .find(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name))?;
+                let mode = self
+                    .store
+                    .marketplace_tool_mode(
+                        user_id,
+                        &manifest.slug,
+                        &mode_key(manifest, app, tool_name),
+                    )
+                    .ok()
+                    .flatten()
+                    .and_then(|word| ToolMode::parse(&word));
+                return Some(PluginTool {
+                    tools: self.clone(),
+                    user_id: user_id.to_owned(),
+                    slug: manifest.slug.clone(),
+                    app_id: app.id.clone(),
+                    tool_name: tool_name.to_owned(),
+                    description,
+                    mode,
+                });
+            }
+        }
+        None
     }
 
-    /// The tool list of one plugin's server for this caller, cached briefly.
-    async fn list(&self, user_id: &str, manifest: &PluginManifest) -> Result<Vec<Value>> {
-        let owner = format!("{user_id}/{}", manifest.slug);
+    /// The tool list of one app's server for this caller, cached briefly. The
+    /// manifest's tool filters are applied here, and a tool the manifest vouches
+    /// for as read only carries `readOnlyHint` from then on.
+    async fn list_app(
+        &self,
+        user_id: &str,
+        manifest: &PluginManifest,
+        app: &App,
+    ) -> std::result::Result<Vec<Value>, Failure> {
+        let owner = cache_owner(user_id, &manifest.slug, &app.id);
         if let Some(cached) = self.cache.get(&owner) {
             return Ok(cached.as_ref().clone());
         }
-        let (client, secret) = self.client_for(user_id, manifest).await?;
-        let listed = client
-            .list_tools(secret.expose_secret(), REQUEST_TIMEOUT)
-            .await
-            .map_err(|error| external(&manifest.slug, &error))?;
+        let listed = self
+            .run(user_id, manifest, app, |client, secret| async move {
+                client
+                    .list_tools(secret.expose_secret(), REQUEST_TIMEOUT)
+                    .await
+            })
+            .await?;
         let total = listed.len();
-        let tools: Vec<Value> = listed.into_iter().filter(schema_within_limit).collect();
+        let filter = app.tools.clone().unwrap_or_default();
+        let mut tools: Vec<Value> = listed
+            .into_iter()
+            .filter(schema_within_limit)
+            .filter(|tool| {
+                let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                    return false;
+                };
+                !filter.deny.iter().any(|denied| denied == name)
+                    && (filter.allow.is_empty() || filter.allow.iter().any(|ok| ok == name))
+            })
+            .collect();
+        for tool in &mut tools {
+            let name = tool.get("name").and_then(Value::as_str).unwrap_or_default();
+            if filter.read_only.iter().any(|vouched| vouched == name) {
+                vouch_read_only(tool);
+            }
+        }
         if tools.len() < total {
-            tracing::warn!(
+            tracing::debug!(
                 plugin = %manifest.slug,
                 skipped = total - tools.len(),
-                "plugin tools with an oversized input schema were skipped"
+                "plugin tools were skipped (oversized schema or manifest filter)"
             );
         }
         self.cache.put(&owner, Arc::new(tools.clone()));
         Ok(tools)
     }
 
-    /// The plugin's MCP client and the caller's sealed key, after the egress
-    /// checks pass. The key is read from the caller's own store and is never
-    /// logged or returned to the model.
-    async fn client_for(
+    /// Run one MCP operation against an app with the caller's credential. On a
+    /// `401` for an OAuth account the token is refreshed once and the operation
+    /// is tried once more: the server rejected the request before acting, so
+    /// the retry cannot repeat an effect.
+    async fn run<T, F, Fut>(
         &self,
         user_id: &str,
         manifest: &PluginManifest,
-    ) -> Result<(McpClient, SecretString)> {
-        let url = http_url(manifest)
-            .ok_or_else(|| SeraError::Validation("plugin has no http server".into()))?;
-        check_egress(url, &manifest.permissions.egress)?;
-        let field = manifest
-            .apps
-            .iter()
-            .flat_map(|app| app.auth.iter())
-            .flat_map(|auth| auth.fields.iter())
-            .next()
-            .ok_or_else(|| SeraError::Validation("plugin declares no key field".into()))?;
-        let key_name = format!("marketplace.{}.{}", manifest.slug, field.secret_key);
-        let secret = self.users.get(user_id, &key_name)?.ok_or_else(|| {
-            SeraError::Validation(format!("plugin {} is not set up yet", manifest.slug))
-        })?;
-        // Resolve last: a plugin the caller has not set up never reaches DNS.
-        // The client is pinned to the addresses checked here, so the key is
-        // sent only to them, whatever DNS says later.
-        let pinned = resolve_checked(url, system_lookup).await?;
-        let client = McpClient::new_pinned(
+        app: &App,
+        op: F,
+    ) -> std::result::Result<T, Failure>
+    where
+        F: Fn(McpClient, SecretString) -> Fut,
+        Fut: Future<Output = std::result::Result<T, McpError>>,
+    {
+        let url = self.checked_url(manifest, app)?;
+        let mut rejected: Option<String> = None;
+        loop {
+            let credential = self
+                .credential(user_id, manifest, app, rejected.as_deref())
+                .await?;
+            // Resolve last: a plugin the caller has not set up never reaches DNS.
+            let client = self.connect(url, manifest, credential.auth.clone()).await?;
+            let signed_in = credential.account.is_some();
+            let used = credential.secret.expose_secret().to_owned();
+            match op(client, credential.secret).await {
+                Ok(value) => return Ok(value),
+                Err(error) if error.is_unauthorized() && signed_in && rejected.is_none() => {
+                    rejected = Some(used);
+                }
+                Err(error) => return Err(Failure::of_mcp(&manifest.slug, &error, signed_in)),
+            }
+        }
+    }
+
+    /// An MCP client for `url`, pinned to the addresses that passed the public-IP
+    /// check, so the credential is sent only to them whatever DNS says later.
+    async fn connect(
+        &self,
+        url: &str,
+        manifest: &PluginManifest,
+        auth: McpAuth,
+    ) -> std::result::Result<McpClient, Failure> {
+        let unreachable =
+            |error: &McpError| Failure::new(Problem::Unreachable, external(&manifest.slug, error));
+        if self.net.is_loopback_test_url(url) {
+            return McpClient::new(
+                "plugin",
+                url.to_owned(),
+                auth,
+                REQUEST_TIMEOUT,
+                MAX_RESPONSE_BYTES,
+            )
+            .map_err(|error| unreachable(&error));
+        }
+        let pinned = resolve_checked(url, system_lookup)
+            .await
+            .map_err(|error| Failure::new(Problem::Unreachable, error))?;
+        McpClient::new_pinned(
             "plugin",
             url.to_owned(),
-            McpAuth::Bearer,
+            auth,
             REQUEST_TIMEOUT,
             MAX_RESPONSE_BYTES,
             &pinned.host,
             &pinned.addrs,
         )
-        .map_err(|error| external(&manifest.slug, &error))?;
-        Ok((client, secret))
+        .map_err(|error| unreachable(&error))
     }
 
-    fn record(&self, user_id: &str, event: &str, tool: &str, task_id: Option<&str>, ok: bool) {
+    /// The credential for one app, read from the caller's own store at call
+    /// time. `rejected` is an access token the server just refused: it forces a
+    /// refresh unless another call already replaced it.
+    async fn credential(
+        &self,
+        user_id: &str,
+        manifest: &PluginManifest,
+        app: &App,
+        rejected: Option<&str>,
+    ) -> std::result::Result<Credential, Failure> {
+        let slug = &manifest.slug;
+        let Some(entry) = app.auth.first() else {
+            return Ok(Credential::none());
+        };
+        match entry.kind {
+            AuthKind::None => Ok(Credential::none()),
+            AuthKind::OauthLink => Err(Failure::needs(slug, Problem::NeedsSetup)),
+            AuthKind::ApiKey => {
+                let field = entry
+                    .fields
+                    .first()
+                    .ok_or_else(|| Failure::needs(slug, Problem::NeedsSetup))?;
+                let key_name = format!("marketplace.{slug}.{}", field.secret_key);
+                let secret = self
+                    .users
+                    .get(user_id, &key_name)
+                    .map_err(|error| Failure::new(Problem::NeedsSetup, error))?
+                    .ok_or_else(|| {
+                        Failure::new(
+                            Problem::NeedsSetup,
+                            SeraError::Validation(format!("plugin {slug} is not set up yet")),
+                        )
+                    })?;
+                let auth = match &field.header {
+                    Some(header) => McpAuth::Named {
+                        name: header.name.clone(),
+                        bearer: header.scheme == HeaderScheme::Bearer,
+                    },
+                    None => McpAuth::Bearer,
+                };
+                Ok(Credential {
+                    auth,
+                    secret,
+                    account: None,
+                })
+            }
+            AuthKind::Oauth => self.oauth_credential(user_id, slug, rejected).await,
+        }
+    }
+
+    /// The access token of the caller's first usable account, refreshed when it
+    /// is stale. The outcome table of [`OauthAccounts::refresh_account`] decides
+    /// the account's state.
+    async fn oauth_credential(
+        &self,
+        user_id: &str,
+        slug: &str,
+        rejected: Option<&str>,
+    ) -> std::result::Result<Credential, Failure> {
+        let sign_in = || Failure::needs(slug, Problem::NeedsSignIn);
+        let stored = |error: SeraError| Failure::new(Problem::Unreachable, error);
+        let account = self
+            .store
+            .marketplace_accounts(user_id, slug)
+            .map_err(stored)?
+            .into_iter()
+            .find(|account| account.state != "needs_sign_in")
+            .ok_or_else(sign_in)?
+            .account_id;
+        let now = chrono::Utc::now().timestamp();
+        let mut record = self
+            .oauth
+            .load(user_id, slug, &account)
+            .map_err(stored)?
+            .ok_or_else(sign_in)?;
+        let stale = |record: &crate::mcp_oauth::OauthRecord| {
+            record.needs_refresh(now) || rejected == Some(record.access_token.as_str())
+        };
+        if stale(&record) {
+            let lock = self
+                .refresh_locks
+                .get(&format!("{user_id}\n{slug}\n{account}"));
+            let _guard = lock.lock().await;
+            // Another call may have refreshed while this one waited.
+            record = self
+                .oauth
+                .load(user_id, slug, &account)
+                .map_err(stored)?
+                .ok_or_else(sign_in)?;
+            if stale(&record) {
+                match self
+                    .oauth
+                    .refresh_account(user_id, slug, &account)
+                    .await
+                    .map_err(stored)?
+                {
+                    RefreshOutcome::Ready => {}
+                    RefreshOutcome::NeedsSignIn | RefreshOutcome::ClientDropped => {
+                        return Err(sign_in());
+                    }
+                    RefreshOutcome::Unreachable => {
+                        return Err(Failure::needs(slug, Problem::Unreachable));
+                    }
+                }
+                record = self
+                    .oauth
+                    .load(user_id, slug, &account)
+                    .map_err(stored)?
+                    .ok_or_else(sign_in)?;
+            }
+        }
+        if record.access_token.is_empty() {
+            return Err(sign_in());
+        }
+        Ok(Credential {
+            auth: McpAuth::Bearer,
+            secret: SecretString::from(record.access_token.clone()),
+            account: Some(account),
+        })
+    }
+
+    /// The app's URL after the egress check. Nothing is resolved or sent yet.
+    fn checked_url<'a>(
+        &self,
+        manifest: &PluginManifest,
+        app: &'a App,
+    ) -> std::result::Result<&'a str, Failure> {
+        let Server::Http { url } = &app.server else {
+            return Err(Failure::new(
+                Problem::NeedsSetup,
+                SeraError::Validation("plugin app has no http server".into()),
+            ));
+        };
+        self.net
+            .check_mcp_egress(url, &manifest.permissions.egress)
+            .map_err(|error| Failure::new(Problem::NeedsSetup, error))?;
+        Ok(url)
+    }
+
+    fn record(
+        &self,
+        user_id: &str,
+        event: &str,
+        tool: &str,
+        task_id: Option<&str>,
+        ok: bool,
+        read_only: bool,
+    ) {
         // An audit write failing must not hide the tool result, so it is logged only.
         if let Err(error) = self.store.record_audit(
             user_id,
@@ -190,24 +697,88 @@ impl PluginTools {
             None,
             None,
             None,
-            Some(&json!({"ok": ok})),
+            Some(&json!({"ok": ok, "read_only": read_only})),
         ) {
             tracing::warn!(error = %error, "plugin audit write failed");
         }
     }
 }
 
-/// The http URL of a plugin's first http app, if it has one.
-fn http_url(manifest: &PluginManifest) -> Option<&str> {
-    manifest.apps.iter().find_map(|app| match &app.server {
-        Server::Http { url } => Some(url.as_str()),
-        Server::Stdio { .. } => None,
-    })
+impl Credential {
+    fn none() -> Self {
+        Self {
+            auth: McpAuth::None,
+            secret: SecretString::from(String::new()),
+            account: None,
+        }
+    }
+}
+
+fn cache_owner(user_id: &str, slug: &str, app_id: &str) -> String {
+    format!("{user_id}/{slug}/{app_id}")
+}
+
+/// The plugin's http apps, in manifest order.
+fn http_apps(manifest: &PluginManifest) -> impl Iterator<Item = &App> {
+    manifest
+        .apps
+        .iter()
+        .filter(|app| matches!(app.server, Server::Http { .. }))
+}
+
+/// The key an approval override is stored under. A plugin with one http app
+/// keys by the tool name alone; with several, by `app/tool`, so a switch set
+/// for one app's tool never reaches a same-named tool on another app.
+fn mode_key(manifest: &PluginManifest, app: &App, tool: &str) -> String {
+    if http_apps(manifest).count() > 1 {
+        format!("{}/{tool}", app.id)
+    } else {
+        tool.to_owned()
+    }
+}
+
+/// The override key for a console request. `app` is required when the plugin
+/// has several http apps and must name one of them.
+pub fn tool_mode_key(manifest: &PluginManifest, app: Option<&str>, tool: &str) -> Result<String> {
+    let apps: Vec<&App> = http_apps(manifest).collect();
+    let chosen = match (apps.as_slice(), app) {
+        ([only], None) => *only,
+        (apps, Some(id)) => *apps
+            .iter()
+            .find(|candidate| candidate.id == id)
+            .ok_or_else(|| SeraError::Validation("app is not part of this plugin".into()))?,
+        _ => {
+            return Err(SeraError::Validation(
+                "this plugin has several apps: name one".into(),
+            ));
+        }
+    };
+    Ok(mode_key(manifest, chosen, tool))
+}
+
+/// The name space of an app's tools: the slug, plus the app id when the plugin
+/// has more than one http app.
+fn namespace(manifest: &PluginManifest, app: &App) -> String {
+    if http_apps(manifest).count() > 1 {
+        format!("{}.{}", manifest.slug, app.id)
+    } else {
+        manifest.slug.clone()
+    }
+}
+
+/// Mark a tool entry read only (the manifest vouches for it).
+fn vouch_read_only(tool: &mut Value) {
+    if let Some(object) = tool.as_object_mut() {
+        let annotations = object.entry("annotations").or_insert_with(|| json!({}));
+        if let Some(annotations) = annotations.as_object_mut() {
+            annotations.insert("readOnlyHint".into(), json!(true));
+        }
+    }
 }
 
 /// Whether a tool's input schema is small enough to offer the model. A tool
 /// without a schema is fine: the default one is used.
-fn schema_within_limit(tool: &Value) -> bool {
+pub(crate) fn schema_within_limit(tool: &Value) -> bool {
     match tool.get("inputSchema") {
         None => true,
         Some(schema) => {
@@ -216,8 +787,9 @@ fn schema_within_limit(tool: &Value) -> bool {
     }
 }
 
-/// The spec for one MCP tool entry, namespaced to its plugin.
-fn spec_of(slug: &str, tool: &Value) -> Option<ToolSpec> {
+/// The spec for one MCP tool entry, namespaced to its plugin (and app). A read
+/// only tool is not an external effect.
+fn spec_of(space: &str, tool: &Value) -> Option<ToolSpec> {
     if !schema_within_limit(tool) {
         return None;
     }
@@ -227,13 +799,13 @@ fn spec_of(slug: &str, tool: &Value) -> Option<ToolSpec> {
         .and_then(Value::as_str)
         .unwrap_or("A tool from an installed plugin.");
     Some(ToolSpec {
-        name: format!("{PREFIX}{slug}.{name}"),
+        name: format!("{PREFIX}{space}.{name}"),
         description: truncate(description, MAX_DESCRIPTION_CHARS),
         parameters: tool
             .get("inputSchema")
             .cloned()
             .unwrap_or_else(|| json!({"type": "object"})),
-        external_effect: true,
+        external_effect: !hints_of(tool).read_only,
     })
 }
 
@@ -294,7 +866,7 @@ pub struct PinnedAddresses {
 }
 
 /// The system resolver, as the lookup [`resolve_checked`] uses in production.
-async fn system_lookup(host: String, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+pub(crate) async fn system_lookup(host: String, port: u16) -> std::io::Result<Vec<SocketAddr>> {
     Ok(tokio::net::lookup_host((host.as_str(), port))
         .await?
         .collect())
@@ -338,26 +910,47 @@ where
     Ok(PinnedAddresses { host: bare, addrs })
 }
 
-fn truncate(text: &str, max: usize) -> String {
+pub(crate) fn truncate(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
-/// One plugin tool bound to one caller. It always needs owner approval, never
-/// gets a standing grant, and is never auto-approved: a third-party tool is
-/// external, so the owner decides each use.
+/// One plugin tool bound to one caller. A call needs owner approval unless the
+/// tool is read only (or the owner allowed it); it never gets a standing grant
+/// and is never auto-approved, so the owner decides each use of a tool that acts.
 pub struct PluginTool {
     tools: PluginTools,
     user_id: String,
     slug: String,
+    app_id: String,
     tool_name: String,
     description: Value,
+    mode: Option<ToolMode>,
+}
+
+impl PluginTool {
+    fn space(&self) -> String {
+        // The name space the model saw: recomputed from the catalog so it
+        // matches `specs_for` exactly.
+        self.tools
+            .catalog
+            .iter()
+            .find(|plugin| plugin.slug == self.slug)
+            .and_then(|manifest| {
+                manifest
+                    .apps
+                    .iter()
+                    .find(|app| app.id == self.app_id)
+                    .map(|app| namespace(manifest, app))
+            })
+            .unwrap_or_else(|| self.slug.clone())
+    }
 }
 
 #[async_trait]
 impl Tool for PluginTool {
     fn spec(&self) -> ToolSpec {
-        spec_of(&self.slug, &self.description).unwrap_or_else(|| ToolSpec {
-            name: format!("{PREFIX}{}.{}", self.slug, self.tool_name),
+        spec_of(&self.space(), &self.description).unwrap_or_else(|| ToolSpec {
+            name: format!("{PREFIX}{}.{}", self.space(), self.tool_name),
             description: "A tool from an installed plugin.".into(),
             parameters: json!({"type": "object"}),
             external_effect: true,
@@ -374,7 +967,7 @@ impl Tool for PluginTool {
     }
 
     fn requires_approval(&self, _args: &Value) -> bool {
-        true
+        approval_needed(hints_of(&self.description), self.mode)
     }
 
     async fn auto_approve_allowed(&self, _args: &Value, _context: &ToolContext) -> bool {
@@ -399,14 +992,14 @@ impl Tool for PluginTool {
             .cloned()
             .ok_or_else(|| SeraError::NotFound(format!("plugin {} is not enabled", self.slug)))?;
         let outcome = self.call(&manifest, &args).await;
-        let event = "plugin.call";
-        let tool = format!("{PREFIX}{}.{}", self.slug, self.tool_name);
+        let tool = format!("{PREFIX}{}.{}", self.space(), self.tool_name);
         self.tools.record(
             &self.user_id,
-            event,
+            "plugin.call",
             &tool,
             context.task_id.as_deref(),
             outcome.is_ok(),
+            hints_of(&self.description).read_only,
         );
         outcome
     }
@@ -414,16 +1007,24 @@ impl Tool for PluginTool {
 
 impl PluginTool {
     async fn call(&self, manifest: &PluginManifest, args: &Value) -> Result<ToolOutput> {
-        let (client, secret) = self.tools.client_for(&self.user_id, manifest).await?;
-        let result = client
-            .call_tool(
-                secret.expose_secret(),
-                &self.tool_name,
-                args,
-                REQUEST_TIMEOUT,
-            )
+        let app = manifest
+            .apps
+            .iter()
+            .find(|app| app.id == self.app_id)
+            .ok_or_else(|| SeraError::NotFound(format!("plugin {} app", self.slug)))?;
+        let result = self
+            .tools
+            .run(&self.user_id, manifest, app, |client, secret| {
+                let name = self.tool_name.clone();
+                let args = args.clone();
+                async move {
+                    client
+                        .call_tool(secret.expose_secret(), &name, &args, REQUEST_TIMEOUT)
+                        .await
+                }
+            })
             .await
-            .map_err(|error| external(&self.slug, &error))?;
+            .map_err(|failure| failure.error)?;
         Ok(ToolOutput {
             content: truncate(&result_text(&result), MAX_OUTPUT_CHARS),
             ..Default::default()
@@ -432,7 +1033,7 @@ impl PluginTool {
 }
 
 /// The text blocks of an MCP tool result, joined in order.
-fn result_text(result: &Value) -> String {
+pub(crate) fn result_text(result: &Value) -> String {
     result
         .get("content")
         .and_then(Value::as_array)
@@ -442,10 +1043,16 @@ fn result_text(result: &Value) -> String {
                 .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
                 .filter_map(|item| item.get("text").and_then(Value::as_str))
                 .collect::<Vec<_>>()
-                .join("\n")
+                .join(
+                    "
+",
+                )
         })
         .unwrap_or_default()
 }
+
+#[cfg(test)]
+pub(crate) mod oauth_tests;
 
 #[cfg(test)]
 mod tests {
@@ -458,6 +1065,13 @@ mod tests {
         let (plugins, problems) = crate::marketplace::load_catalog(&root);
         assert!(problems.is_empty(), "catalog problems: {problems:?}");
         plugins
+    }
+
+    fn http_url(manifest: &PluginManifest) -> Option<&str> {
+        http_apps(manifest).find_map(|app| match &app.server {
+            Server::Http { url } => Some(url.as_str()),
+            Server::Stdio { .. } => None,
+        })
     }
 
     fn firecrawl() -> PluginManifest {
@@ -585,7 +1199,12 @@ mod tests {
             .unwrap();
         // No key is stored, so the call fails before any request or DNS lookup.
         let manifest = firecrawl();
-        let error = tools.client_for(&user, &manifest).await.err().unwrap();
+        let error = tools
+            .credential(&user, &manifest, &manifest.apps[0], None)
+            .await
+            .err()
+            .unwrap()
+            .error;
         assert!(error.to_string().contains("not set up"), "{error}");
         assert!(tools.specs_for(&user).await.is_empty());
     }

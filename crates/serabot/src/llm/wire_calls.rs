@@ -207,7 +207,46 @@ impl LlmClient {
         Err(last_error.unwrap_or_else(|| llm_failure::transport_error("LLM request failed".into())))
     }
 
-    /// One completion on the Responses transport (Meta Muse Code).
+    /// The Codex session id: the running conversation's (so every request of
+    /// one conversation hits one cache), else this client's seed. Only header-
+    /// and key-safe characters are kept.
+    fn codex_session(&self) -> Option<String> {
+        let codex = self.codex.as_ref()?;
+        let conversation: String = current_conversation()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+            .take(64)
+            .collect();
+        Some(if conversation.is_empty() {
+            codex.seed.clone()
+        } else {
+            conversation
+        })
+    }
+
+    /// The headers a Codex request adds to the bearer.
+    fn codex_headers(&self, session: &str) -> Vec<(&'static str, String)> {
+        let Some(codex) = self.codex.as_ref() else {
+            return Vec::new();
+        };
+        let mut headers = vec![
+            (
+                "OpenAI-Beta",
+                crate::auth_flows::codex::OPENAI_BETA.to_owned(),
+            ),
+            (
+                "originator",
+                crate::auth_flows::codex::ORIGINATOR.to_owned(),
+            ),
+            ("session_id", session.to_owned()),
+        ];
+        if let Some(account) = &codex.account_id {
+            headers.push(("ChatGPT-Account-Id", account.clone()));
+        }
+        headers
+    }
+
+    /// One completion on the Responses transport (Meta Muse Code, Codex).
     pub(super) async fn complete_responses(
         &self,
         messages: &[LlmMessage],
@@ -215,7 +254,8 @@ impl LlmClient {
         model: &str,
         extra: Option<&Map<String, Value>>,
     ) -> Result<LlmResponse> {
-        let body = responses::build_request(
+        let session = self.codex_session();
+        let mut body = responses::build_request(
             messages,
             tools,
             &responses::RequestOptions {
@@ -223,8 +263,13 @@ impl LlmClient {
                 max_output_tokens: self.max_output_tokens,
                 extra,
                 web_search: false,
+                prompt_cache_key: session.as_deref(),
             },
         );
+        // The ChatGPT backend refuses a request with no `instructions`.
+        if session.is_some() && body.get("instructions").is_none() {
+            body["instructions"] = Value::String("You are a helpful assistant.".into());
+        }
         let fix = |body: &mut Value, text: &str| responses::strip_for_bad_request(body, text);
         let bytes = self
             .send_wire(WireCall {
@@ -232,7 +277,10 @@ impl LlmClient {
                 url: format!("{}/responses", self.base_url),
                 query: Vec::new(),
                 auth: WireAuth::Bearer,
-                headers: Vec::new(),
+                headers: session
+                    .as_deref()
+                    .map(|session| self.codex_headers(session))
+                    .unwrap_or_default(),
                 body: Some(body),
                 fix_bad_request: Some(&fix),
                 echo_error: true,

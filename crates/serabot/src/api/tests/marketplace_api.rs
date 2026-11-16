@@ -25,7 +25,7 @@ async fn the_catalog_lists_the_repository_plugins_without_secrets() {
     let (_, token) = member(&store, "v036-catalog").await;
     let listed = read_json(call(&app, &token, "GET", "/v1/marketplace/plugins", None).await).await;
     let plugins = listed["plugins"].as_array().unwrap();
-    assert_eq!(plugins.len(), 10, "{listed}");
+    assert_eq!(plugins.len(), 16, "{listed}");
     assert!(
         plugins.iter().all(|plugin| plugin["status"] == "available"),
         "{listed}"

@@ -15,14 +15,18 @@ mod bot_chats_api;
 mod browser_api;
 mod cards_api;
 mod chat_api;
+mod codex_api;
 mod composio_api;
+mod copilot_api;
 mod desktop_tabs_api;
 mod digest_api;
 mod files_api;
+mod github_connector_api;
 mod handoffs_api;
 mod jobs_api;
 mod logs_api;
 mod marketplace_api;
+mod marketplace_oauth_api;
 mod memory_settings_api;
 mod personal_api;
 mod preview_api;
@@ -225,6 +229,7 @@ fn app_with_stack(
         crate::user_secrets::UserSecrets::with_master_key(store.clone(), [9u8; 32]).unwrap(),
     );
     let composio_users = users.clone();
+    let signin_users = users.clone();
     let fleet = runtime.fleet();
     let auth = match auth_issuer {
         Some(issuer) => {
@@ -258,7 +263,23 @@ fn app_with_stack(
     if let Some(service) = auth {
         state.auth = Some(Arc::new(service));
     }
+    // A test may swap in its own catalog and a net that reaches a loopback mock.
+    if let Some((plugins, net)) = MARKETPLACE_OVERRIDE.with(|slot| slot.borrow_mut().take()) {
+        state.marketplace = plugins;
+        state.mcp_signin = Arc::new(crate::marketplace_auth::McpSignIn::new(
+            store.clone(),
+            signin_users,
+            net,
+        ));
+    }
     (router(state), config, store)
+}
+
+thread_local! {
+    /// Set by a test just before it builds the app; taken by the builder.
+    static MARKETPLACE_OVERRIDE: std::cell::RefCell<
+        Option<(Vec<crate::marketplace::PluginManifest>, crate::mcp_oauth::OauthNet)>,
+    > = const { std::cell::RefCell::new(None) };
 }
 
 /// Same stack, also returning the artifact store so a test can save

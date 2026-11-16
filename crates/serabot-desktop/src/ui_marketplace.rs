@@ -10,6 +10,7 @@
 
 use crate::ui::{BrandLogo, Icon};
 use crate::ui_integrations::IntegrationCard;
+use crate::ui_mcp_accounts::{AccountsSection, ToolsSection};
 use crate::ui_widgets::{SecretField, StatusChip};
 use dioxus::prelude::*;
 use serabot_desktop::integrations::{plugin_entry, plugin_tone};
@@ -231,7 +232,7 @@ fn PluginPage(session: Signal<Session>, detail: PluginDetail) -> Element {
                 }
                 if !detail.plugin.prompts.is_empty() {
                     h3 { class: "mp-section-title", "Example prompts" }
-                    p { class: "tiny", "Examples only. The bot cannot run these yet." }
+                    p { class: "tiny", "Ideas for what to ask once the plugin is installed and signed in." }
                     ul { class: "mp-prompts",
                         for prompt in detail.plugin.prompts.iter().cloned() {
                             li { key: "{prompt.id}{prompt.text}", "{prompt.text}" }
@@ -262,6 +263,12 @@ fn PluginPage(session: Signal<Session>, detail: PluginDetail) -> Element {
                 }
                 if block.is_none() && detail.installed() && !fields.is_empty() {
                     ConfigForm { key: "{slug}", session, slug: slug.clone(), fields }
+                }
+                if block.is_none() && detail.installed() && detail.uses_oauth() {
+                    AccountsSection { key: "accounts-{slug}", session, detail: detail.clone() }
+                }
+                if block.is_none() && detail.installed() && detail.fully_configured() && detail.signed_in() {
+                    ToolsSection { key: "tools-{slug}", session, slug: slug.clone() }
                 }
                 if confirming() {
                     div { class: "mp-confirm", role: "alertdialog", "aria-label": "Confirm uninstall",

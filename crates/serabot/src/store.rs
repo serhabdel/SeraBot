@@ -77,6 +77,32 @@ const MIGRATION_35: &str = include_str!("../migrations/0035_marketplace_installs
 const MIGRATION_36: &str = include_str!("../migrations/0036_console_pages.sql");
 const MIGRATION_37: &str = include_str!("../migrations/0037_provider_accounts.sql");
 const MIGRATION_38: &str = include_str!("../migrations/0038_handoffs.sql");
+const MIGRATION_39: &str = include_str!("../migrations/0039_marketplace_accounts.sql");
+const MIGRATION_40: &str = include_str!("../migrations/0040_marketplace_tool_policy.sql");
+
+/// One member's account for a marketplace plugin (no secret).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MarketplaceAccount {
+    pub slug: String,
+    pub account_id: String,
+    pub label: String,
+    pub state: String,
+    pub last_error: Option<String>,
+    pub last_ok_at: Option<String>,
+    pub created_at: String,
+}
+
+/// One member's native GitHub connection (no token; tokens are sealed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GithubConnection {
+    pub login: String,
+    pub gh_user_id: i64,
+    /// `connected`, `expired` or `needs_sign_in`.
+    pub state: String,
+    pub access_expires_at: Option<String>,
+    pub refresh_expires_at: Option<String>,
+    pub updated_at: String,
+}
 
 /// Fixed admin id written by migration 0008 and mirrored in
 /// `kv['admin_user_id']`. Code resolves the admin through the kv entry (the
@@ -729,6 +755,16 @@ impl Store {
         if version < 38 {
             connection.execute_batch(MIGRATION_38)?;
             connection.pragma_update(None, "user_version", 38)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 39 {
+            connection.execute_batch(MIGRATION_39)?;
+            connection.pragma_update(None, "user_version", 39)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 40 {
+            connection.execute_batch(MIGRATION_40)?;
+            connection.pragma_update(None, "user_version", 40)?;
         }
         // VACUUM INTO (backups) may renumber rowids; rebuild the external-content
         // FTS index only when its row count no longer matches `memories`.
@@ -4773,12 +4809,231 @@ impl Store {
         Ok(changed == 1)
     }
 
+    /// Add or relabel one marketplace account for the caller. A new account
+    /// starts as `needs_sign_in`; an existing one keeps its state.
+    pub fn marketplace_account_upsert(
+        &self,
+        user_id: &str,
+        slug: &str,
+        account_id: &str,
+        label: &str,
+    ) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO marketplace_accounts(user_id, slug, account_id, label, state, created_at)
+             VALUES (?1, ?2, ?3, ?4, 'needs_sign_in', ?5)
+             ON CONFLICT(user_id, slug, account_id) DO UPDATE SET label = excluded.label",
+            params![user_id, slug, account_id, label, now_string()],
+        )?;
+        Ok(())
+    }
+
+    /// The caller's accounts for one plugin, oldest first.
+    pub fn marketplace_accounts(
+        &self,
+        user_id: &str,
+        slug: &str,
+    ) -> Result<Vec<MarketplaceAccount>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT slug, account_id, label, state, last_error, last_ok_at, created_at
+             FROM marketplace_accounts WHERE user_id = ?1 AND slug = ?2
+             ORDER BY created_at ASC, account_id ASC",
+        )?;
+        let rows = statement.query_map(params![user_id, slug], |row| {
+            Ok(MarketplaceAccount {
+                slug: row.get(0)?,
+                account_id: row.get(1)?,
+                label: row.get(2)?,
+                state: row.get(3)?,
+                last_error: row.get(4)?,
+                last_ok_at: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Record an account's state. `error` is kept for the owner to read, and
+    /// `ready` stamps `last_ok_at` and clears it. `false` when the caller has
+    /// no such account.
+    pub fn marketplace_account_set_state(
+        &self,
+        user_id: &str,
+        slug: &str,
+        account_id: &str,
+        state: &str,
+        error: Option<&str>,
+    ) -> Result<bool> {
+        let connection = self.connection()?;
+        let now = now_string();
+        let changed = connection.execute(
+            "UPDATE marketplace_accounts
+             SET state = ?1,
+                 last_error = ?2,
+                 last_ok_at = CASE WHEN ?1 = 'ready' THEN ?3 ELSE last_ok_at END
+             WHERE user_id = ?4 AND slug = ?5 AND account_id = ?6",
+            params![state, error, now, user_id, slug, account_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Remove one of the caller's marketplace accounts. `false` when absent.
+    pub fn marketplace_account_delete(
+        &self,
+        user_id: &str,
+        slug: &str,
+        account_id: &str,
+    ) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "DELETE FROM marketplace_accounts
+             WHERE user_id = ?1 AND slug = ?2 AND account_id = ?3",
+            params![user_id, slug, account_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// The caller's override for one plugin tool: `"ask"`, `"allow"` or none.
+    pub fn marketplace_tool_mode(
+        &self,
+        user_id: &str,
+        slug: &str,
+        tool: &str,
+    ) -> Result<Option<String>> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT mode FROM marketplace_tool_policy
+                 WHERE user_id = ?1 AND slug = ?2 AND tool = ?3",
+                params![user_id, slug, tool],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Set (`Some("ask" | "allow")`) or clear (`None`) the caller's override.
+    pub fn marketplace_tool_mode_set(
+        &self,
+        user_id: &str,
+        slug: &str,
+        tool: &str,
+        mode: Option<&str>,
+    ) -> Result<()> {
+        let connection = self.connection()?;
+        match mode {
+            Some(mode) => connection.execute(
+                "INSERT INTO marketplace_tool_policy(user_id, slug, tool, mode, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(user_id, slug, tool)
+                 DO UPDATE SET mode = excluded.mode, updated_at = excluded.updated_at",
+                params![user_id, slug, tool, mode, now_string()],
+            )?,
+            None => connection.execute(
+                "DELETE FROM marketplace_tool_policy
+                 WHERE user_id = ?1 AND slug = ?2 AND tool = ?3",
+                params![user_id, slug, tool],
+            )?,
+        };
+        Ok(())
+    }
+
     /// Remove the caller's install. `false` when there was none.
     pub fn marketplace_install_delete(&self, user_id: &str, slug: &str) -> Result<bool> {
         let connection = self.connection()?;
         let changed = connection.execute(
             "DELETE FROM marketplace_installs WHERE user_id = ?1 AND slug = ?2",
             params![user_id, slug],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// The caller's native GitHub connection (no token), if any.
+    pub fn github_connector(&self, user_id: &str) -> Result<Option<GithubConnection>> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT login, gh_user_id, state, access_expires_at, refresh_expires_at, updated_at
+                 FROM github_connector WHERE user_id = ?1",
+                params![user_id],
+                |row| {
+                    Ok(GithubConnection {
+                        login: row.get(0)?,
+                        gh_user_id: row.get(1)?,
+                        state: row.get(2)?,
+                        access_expires_at: row.get(3)?,
+                        refresh_expires_at: row.get(4)?,
+                        updated_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Record a finished GitHub sign-in for the caller, replacing any earlier one.
+    pub fn github_connector_put(
+        &self,
+        user_id: &str,
+        login: &str,
+        gh_user_id: i64,
+        access_expires_at: Option<&str>,
+        refresh_expires_at: Option<&str>,
+    ) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO github_connector(user_id, login, gh_user_id, state,
+                 access_expires_at, refresh_expires_at, updated_at)
+             VALUES (?1, ?2, ?3, 'connected', ?4, ?5, ?6)
+             ON CONFLICT(user_id) DO UPDATE SET
+                 login = excluded.login, gh_user_id = excluded.gh_user_id,
+                 state = 'connected', access_expires_at = excluded.access_expires_at,
+                 refresh_expires_at = excluded.refresh_expires_at,
+                 updated_at = excluded.updated_at",
+            params![
+                user_id,
+                login,
+                gh_user_id,
+                access_expires_at,
+                refresh_expires_at,
+                now_string()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record new token lifetimes after a refresh and mark the login connected.
+    pub fn github_connector_refreshed(
+        &self,
+        user_id: &str,
+        access_expires_at: Option<&str>,
+        refresh_expires_at: Option<&str>,
+    ) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE github_connector SET state = 'connected', access_expires_at = ?1,
+                 refresh_expires_at = ?2, updated_at = ?3 WHERE user_id = ?4",
+            params![access_expires_at, refresh_expires_at, now_string(), user_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Set the caller's GitHub state (`connected`, `expired`, `needs_sign_in`).
+    /// The login stays, so the member sees who they were signed in as.
+    pub fn github_connector_set_state(&self, user_id: &str, state: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE github_connector SET state = ?1, updated_at = ?2 WHERE user_id = ?3",
+            params![state, now_string(), user_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Remove the caller's GitHub connection row. `false` when there was none.
+    pub fn github_connector_delete(&self, user_id: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "DELETE FROM github_connector WHERE user_id = ?1",
+            params![user_id],
         )?;
         Ok(changed == 1)
     }
@@ -6120,7 +6375,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 38);
+        assert_eq!(version, 40);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
@@ -6185,7 +6440,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 38);
+        assert_eq!(version, 40);
         assert!(store.list_device_tokens().unwrap().is_empty());
         // The team table arrives with the same migration batch.
         assert!(
@@ -6259,7 +6514,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 38);
+        assert_eq!(version, 40);
         let admin = admin(&store);
         let memory = crate::memory::get(&store, &admin, "mem-legacy").unwrap();
         assert_eq!(memory.origin, "explicit");
@@ -6348,7 +6603,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 38);
+        assert_eq!(version, 40);
 
         let admin = store.admin_user().unwrap().unwrap();
         assert_eq!(admin.id, ADMIN_USER_ID);
@@ -6479,7 +6734,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 38);
+        assert_eq!(version, 40);
 
         // Every scoped table carries user_id = the admin, and the column is
         // NOT NULL with a real foreign key.
@@ -6634,7 +6889,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 38);
+        assert_eq!(version, 40);
 
         // The old row is now the admin's, with the empty prompt the migration
         // header documents; startup seeding fills it from the template.

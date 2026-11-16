@@ -1,8 +1,8 @@
 //! The OpenAI Responses transport: `POST {base}/responses` over SSE.
 //!
 //! Meta Muse Code is served this way (reasoning only round-trips on Responses),
-//! and Codex reuses it in v0.52. The rules follow the owner's HielCowork
-//! client:
+//! and so is the Codex (ChatGPT plan) endpoint, which also takes a
+//! `prompt_cache_key`. The rules follow the owner's HielCowork client:
 //!
 //! - `store: false`; the system messages go in `instructions`; `stream: true`.
 //! - Tool calls are `function_call` items and tool results `function_call_output`
@@ -40,6 +40,10 @@ pub struct RequestOptions<'a> {
     pub extra: Option<&'a Map<String, Value>>,
     /// Offer the hosted `web_search` tool.
     pub web_search: bool,
+    /// The conversation's cache key, sent as `prompt_cache_key`. Codex takes it
+    /// (the Codex CLI names its conversation there); Muse rejects it, so it is
+    /// `None` there.
+    pub prompt_cache_key: Option<&'a str>,
 }
 
 fn clean_call_id(id: &str, fallback: usize) -> String {
@@ -133,6 +137,9 @@ pub fn build_request(
     });
     if !instructions.is_empty() {
         body["instructions"] = json!(instructions);
+    }
+    if let Some(key) = options.prompt_cache_key.filter(|key| !key.is_empty()) {
+        body["prompt_cache_key"] = json!(key);
     }
     let mut wire_tools: Vec<Value> = tools
         .iter()
@@ -521,7 +528,23 @@ mod tests {
             max_output_tokens: 4096,
             extra,
             web_search: false,
+            prompt_cache_key: None,
         }
+    }
+
+    #[test]
+    fn a_cache_key_is_sent_only_when_asked_for() {
+        let messages = [LlmMessage::user("hi")];
+        let body = build_request(&messages, &[], &options(None));
+        assert!(body.get("prompt_cache_key").is_none());
+        let keyed = RequestOptions {
+            prompt_cache_key: Some("conv-1"),
+            ..options(None)
+        };
+        assert_eq!(
+            build_request(&messages, &[], &keyed)["prompt_cache_key"],
+            "conv-1"
+        );
     }
 
     fn call(id: &str) -> ToolCall {

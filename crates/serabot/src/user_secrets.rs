@@ -408,6 +408,7 @@ impl UserSecrets {
             !name.starts_with(VAULT_PROVIDER_PREFIX)
                 && !name.starts_with(VAULT_PROVIDER_TOKEN_PREFIX)
                 && !name.starts_with(ACCOUNT_PROVIDER_PREFIX)
+                && !is_marketplace_oauth_id(name)
         });
         for grant in self.store.list_active_grants_for(user_id)? {
             names.push(grant.provider);
@@ -733,6 +734,77 @@ pub(crate) fn account_provider_id(provider: &str, account_id: &str) -> Result<St
     Ok(format!("{ACCOUNT_PROVIDER_PREFIX}{provider}:{account_id}"))
 }
 
+/// Provider-id prefix under which a marketplace plugin's OAuth record is
+/// sealed: `marketplace.<slug>.<account>.oauth`.
+pub(crate) const MARKETPLACE_PROVIDER_PREFIX: &str = "marketplace.";
+
+/// Whether `provider` has the reserved shape of a marketplace OAuth record.
+/// Plugin API-key secrets (`marketplace.<slug>.<key>`) share the prefix, so a
+/// manifest secret key may not end in `.oauth` (see `marketplace.rs`).
+fn is_marketplace_oauth_id(provider: &str) -> bool {
+    provider.starts_with(MARKETPLACE_PROVIDER_PREFIX) && provider.ends_with(".oauth")
+}
+
+/// The sealed-credential id for one marketplace account's OAuth record. The
+/// slug is a manifest slug and the account id a short lowercase id, neither
+/// containing a dot, so the id cannot be forged from another pair.
+pub(crate) fn marketplace_oauth_id(slug: &str, account_id: &str) -> Result<String> {
+    let slug_ok = !slug.is_empty()
+        && slug.len() <= 48
+        && slug
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    let account_ok = !account_id.is_empty()
+        && account_id.len() <= 32
+        && account_id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if !slug_ok || !account_ok {
+        return Err(SeraError::Validation("invalid marketplace account".into()));
+    }
+    Ok(format!(
+        "{MARKETPLACE_PROVIDER_PREFIX}{slug}.{account_id}.oauth"
+    ))
+}
+
+impl UserSecrets {
+    /// Seal one marketplace account's OAuth record for the acting user.
+    pub(crate) fn set_marketplace_oauth(
+        &self,
+        user_id: &str,
+        slug: &str,
+        account_id: &str,
+        value: &str,
+    ) -> Result<()> {
+        let id = marketplace_oauth_id(slug, account_id)?;
+        validate_value(value)?;
+        let _write = self.lock_writes();
+        self.seal_and_store(user_id, &id, value)
+    }
+
+    /// The acting user's OAuth record for one marketplace account, if any.
+    pub(crate) fn get_marketplace_oauth(
+        &self,
+        user_id: &str,
+        slug: &str,
+        account_id: &str,
+    ) -> Result<Option<SecretString>> {
+        let id = marketplace_oauth_id(slug, account_id)?;
+        self.get_unchecked(user_id, &id)
+    }
+
+    /// Delete the acting user's OAuth record for one marketplace account.
+    pub(crate) fn delete_marketplace_oauth(
+        &self,
+        user_id: &str,
+        slug: &str,
+        account_id: &str,
+    ) -> Result<bool> {
+        let id = marketplace_oauth_id(slug, account_id)?;
+        self.store.delete_user_credential(user_id, &id)
+    }
+}
+
 /// Provider ids are config keys: letters, digits, `-`, `_`, and `.`.
 pub fn validate_provider(provider: &str) -> Result<()> {
     let valid = !provider.is_empty()
@@ -740,7 +812,7 @@ pub fn validate_provider(provider: &str) -> Result<()> {
         && provider
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
-    if !valid {
+    if !valid || is_marketplace_oauth_id(provider) {
         return Err(SeraError::Validation(
             "provider id must be 1-64 letters, digits, '-', '_', or '.'".into(),
         ));

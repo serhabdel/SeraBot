@@ -28,12 +28,14 @@ use crate::{
 };
 mod bot_settings;
 mod flows;
+mod marketplace_accounts;
 mod orchestration;
 mod provider_accounts;
 
 pub use bot_settings::{BotDraft, BotSettings, SettingsTab, model_pick, model_value};
 use flows::AvatarOp;
 pub use flows::{ImageSlot, NewBotDraft, NewGroupDraft, OnboardingUi, PickedImage};
+pub use marketplace_accounts::{McpUi, SignInTarget, ToolsState, ToolsView};
 pub use provider_accounts::{AccountOp, AccountsUi, RouteChange, RouteEditorUi};
 use secrecy::ExposeSecret;
 use std::{
@@ -680,6 +682,8 @@ pub struct Session {
     pub bot_settings: BotSettings,
     /// The Providers page's accounts, their sheet and sign-in (v0.49).
     pub accounts_ui: AccountsUi,
+    /// Plugin accounts, tool switches and the GitHub card (v0.51).
+    pub mcp_ui: McpUi,
     /// The bot "Model route" editor (v0.49).
     pub route_editor: RouteEditorUi,
     /// The last message, waiting for "Retry on <fallback>" to land its pick.
@@ -908,6 +912,7 @@ impl Session {
             voice: VoiceDraft::default(),
             bot_settings: BotSettings::default(),
             accounts_ui: AccountsUi::default(),
+            mcp_ui: McpUi::default(),
             route_editor: RouteEditorUi::default(),
             pending_retry: None,
             admin_notice: None,
@@ -1517,6 +1522,7 @@ impl Session {
         if !self.state.connected || !crate::valid_id(&slug) {
             return;
         }
+        self.drop_plugin_signin_unless(Some(&slug));
         self.state.marketplace_detail = None;
         self.marketplace_open = Some(slug.clone());
         self.state.marketplace_error = None;
@@ -1524,6 +1530,7 @@ impl Session {
     }
 
     pub fn close_plugin(&mut self) {
+        self.drop_plugin_signin_unless(None);
         self.marketplace_open = None;
         self.state.marketplace_detail = None;
         self.state.marketplace_error = None;
@@ -1983,6 +1990,7 @@ impl Session {
         self.reset_panel();
         self.sign_in.reset_transient();
         self.accounts_ui = AccountsUi::default();
+        self.mcp_ui = McpUi::default();
         self.route_editor = RouteEditorUi::default();
         self.credentials = None;
         self.token.zeroize();
@@ -3438,6 +3446,37 @@ impl Session {
             flow.remaining_secs(self.accounts_ui.flow_elapsed())
                 .hash(&mut h);
         }
+        if let Some(flow) = &self.mcp_ui.flow {
+            format!("{:?}", flow.phase).hash(&mut h);
+            flow.url.hash(&mut h);
+            flow.remaining_secs(self.mcp_ui.flow_elapsed()).hash(&mut h);
+        }
+        self.mcp_ui.target.hash(&mut h);
+        self.mcp_ui.notice.hash(&mut h);
+        self.mcp_ui.error.hash(&mut h);
+        self.mcp_ui.removing.hash(&mut h);
+        self.mcp_ui.confirm_remove.hash(&mut h);
+        self.mcp_ui.confirm_disconnect.hash(&mut h);
+        self.mcp_ui.github_busy.hash(&mut h);
+        self.mcp_ui.github_error.hash(&mut h);
+        self.mcp_ui
+            .github
+            .as_ref()
+            .map(|view| view.state.clone())
+            .hash(&mut h);
+        self.mcp_ui
+            .github
+            .as_ref()
+            .map(|view| view.login.clone())
+            .hash(&mut h);
+        if let Some(tools) = &self.mcp_ui.tools {
+            format!("{:?}", tools.state).hash(&mut h);
+            tools.error.hash(&mut h);
+            for row in &tools.rows {
+                row.name.hash(&mut h);
+                row.mode.hash(&mut h);
+            }
+        }
         self.accounts_ui.busy.hash(&mut h);
         self.accounts_ui.sheet_error.hash(&mut h);
         self.accounts_ui.force_prompt.is_some().hash(&mut h);
@@ -3481,6 +3520,7 @@ impl Session {
         self.poll_status();
         self.poll_sign_in();
         self.poll_provider_flow();
+        self.poll_mcp();
         self.poll_pending_signin();
         self.poll_telegram();
         self.poll_download();

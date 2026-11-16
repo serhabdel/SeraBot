@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 2,
+  "slug": "atlassian",
+  "name": "Atlassian",
+  "tagline": "Read and update Jira and Confluence.",
+  "description": "Search and read Jira issues and Confluence pages through Atlassian's Rovo server. Sign in with your own account in the browser; the tokens are sealed for you alone. Writes ask for approval.",
+  "category": "productivity",
+  "iconUrl": "https://www.atlassian.com/favicon.ico",
+  "version": "1.1.0",
+  "minServerVersion": "0.51.0",
+  "prompts": [
+    {
+      "id": "atlassian-0",
+      "text": "Summarise the Jira issues assigned to me."
+    }
+  ],
+  "apps": [
+    {
+      "id": "workspace",
+      "name": "Jira and Confluence",
+      "server": {
+        "transport": "http",
+        "url": "https://mcp.atlassian.com/v2/mcp"
+      },
+      "auth": [
+        {
+          "id": "signin",
+          "kind": "oauth",
+          "fields": [],
+          "oauth": {
+            "scopes": [],
+            "usesCimd": false
+          }
+        }
+      ],
+      "accounts": {
+        "multiple": false
+      }
+    }
+  ],
+  "permissions": {
+    "egress": [
+      "mcp.atlassian.com"
+    ]
+  },
+  "websiteUrl": "https://www.atlassian.com",
+  "privacyPolicyUrl": "https://www.atlassian.com/legal/privacy-policy",
+  "termsUrl": "https://www.atlassian.com/legal/cloud-terms-of-service"
+}

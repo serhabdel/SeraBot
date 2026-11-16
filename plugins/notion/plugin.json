@@ -1,13 +1,13 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "slug": "notion",
-  "name": "Notes and Docs",
+  "name": "Notion",
   "tagline": "Read and update pages in Notion.",
-  "description": "Search your workspace, read pages and add content. Connect the owner's account with the browser sign-in.",
+  "description": "Search your workspace, read pages and add content in Notion. Sign in with your own account in the browser; the tokens are sealed for you alone. Writes ask for approval.",
   "category": "productivity",
-  "iconUrl": "https://notion.example.invalid/icon.png",
-  "version": "1.0.0",
-  "minServerVersion": "0.36.0",
+  "iconUrl": "https://www.notion.com/favicon.ico",
+  "version": "1.1.0",
+  "minServerVersion": "0.51.0",
   "prompts": [
     {
       "id": "notion-0",
@@ -20,23 +20,39 @@
       "name": "Workspace",
       "server": {
         "transport": "http",
-        "url": "https://mcp.notion.example.invalid/mcp"
+        "url": "https://mcp.notion.com/mcp"
       },
       "auth": [
         {
-          "id": "link",
-          "kind": "oauth-link",
-          "fields": []
+          "id": "signin",
+          "kind": "oauth",
+          "fields": [],
+          "oauth": {
+            "scopes": [],
+            "usesCimd": true
+          }
         }
-      ]
+      ],
+      "tools": {
+        "readOnly": [
+          "notion-search",
+          "notion-fetch",
+          "notion-get-comments",
+          "notion-get-users",
+          "notion-get-teams"
+        ]
+      },
+      "accounts": {
+        "multiple": false
+      }
     }
   ],
   "permissions": {
     "egress": [
-      "mcp.notion.example.invalid"
+      "mcp.notion.com"
     ]
   },
-  "websiteUrl": "https://notion.example.invalid",
-  "privacyPolicyUrl": "https://notion.example.invalid/privacy",
-  "termsUrl": "https://notion.example.invalid/terms"
+  "websiteUrl": "https://www.notion.com",
+  "privacyPolicyUrl": "https://www.notion.com/privacy",
+  "termsUrl": "https://www.notion.com/terms"
 }

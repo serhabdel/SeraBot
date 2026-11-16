@@ -144,3 +144,18 @@ never merge without the owner's OK.
 - [ ] Visual screenshot review (light and dark) of chat, runs sidebar and composer on a device.
 - [ ] Load fixture on the target host before raising workers above 2.
 - [ ] Live verification against owner-approved accounts (none claimed).
+
+## Release 0.51.0 — marketplace, GitHub, Codex, Copilot
+
+- [x] M1 manifest schema v2; M2 MCP OAuth; M3 API and health; M4 runtime auth and annotations.
+- [x] M5 native GitHub connector (device flow, hosted MCP) and M8 `suggest_marketplace_app`.
+- [x] M6 real hosts: Linear, Notion, Sentry, Vercel, Stripe (read only), PostHog, Context7, Atlassian.
+- [x] M7 desktop marketplace accounts, sign-in, tool switches, GitHub card.
+- [x] Codex (ChatGPT plan) sign-in: browser PKCE and device code.
+- [x] GitHub Copilot sign-in: device code, token exchange, several accounts.
+- [x] M9 docs, release notes, version 0.51.0.
+- [ ] Canva manifest (`mcp.canva.com/mcp`; not shipped).
+- [ ] Live owner verification: each MCP host, GitHub App device flow and hosted MCP terms, Codex, Copilot (none claimed).
+- [ ] Copilot `auto` model, Responses-only models, reasoning effort, quota meter; Codex reasoning-item replay and usage meter.
+- [ ] Visual review of the desktop marketplace screens on a device.
+- [ ] Mistral sign-in: not wanted (owner decision).

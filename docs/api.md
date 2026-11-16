@@ -594,6 +594,22 @@ returned; no restart is needed.
   the code as `code`, `code#state` or the whole callback URL. The account is the
   admin's own and is never shared. See `docs/providers.md`, "Claude plan sign-in".
 
+- `openai-codex` (ChatGPT plan sign-in, PKCE or device code): on by default and
+  open to every member (each account is its member's own, never shared). A
+  provider with `plan_oauth = false` answers `422 signin_unsupported`; an API key
+  is refused with `422 signin_required`. For `pkce`, `redirect_uri` must be
+  `http://localhost:1455/auth/callback` (or the `127.0.0.1` spelling); for
+  `device`, `signin/start` returns the code and `https://auth.openai.com/codex/device`.
+  See `docs/providers.md`, "Codex plan sign-in".
+
+- `github-copilot` (GitHub Copilot, device code only): on by default and open to
+  every member (each account is its member's own, never shared). A provider with
+  `plan_oauth = false` answers `422 signin_unsupported`; an API key is refused
+  with `422 signin_required`; a `pkce` flow is `422 flow_unsupported`.
+  `signin/start` returns the user code and `https://github.com/login/device`; a
+  GitHub account with no Copilot plan ends the flow `denied` with reason
+  `copilot_not_subscribed`. See `docs/providers.md`, "GitHub Copilot sign-in".
+
 A provider with no sign-in answers `422`; an unknown id `404`. Audit entries
 (`config.provider_oauth_signed_in` / `config.provider_oauth_failed`) carry the
 provider id, kind and account id only.
@@ -602,7 +618,8 @@ provider id, kind and account id only.
 flows a caller may use in `signin`. For a Claude plan sign-in, `signin` is empty
 for members and `signin_risk` (a short text for a banner) is `null`; for the
 admin on an enabled provider `signin` is `["pkce"]` and `signin_risk` carries the
-risk text. An `anthropic` provider otherwise takes API keys:
+risk text. A Codex provider lists `["pkce","device"]` and its risk text to every
+member while the flag is on; a Copilot provider lists `["device"]` the same way. An `anthropic` provider otherwise takes API keys:
 `POST /v1/providers/{id}/accounts` with `{"label","api_key"}`, several per
 member, checked with one model-list call.
 

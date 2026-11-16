@@ -1,13 +1,13 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "slug": "linear",
-  "name": "Issues and Projects",
+  "name": "Linear",
   "tagline": "Track issues and projects in Linear.",
-  "description": "List, search and update issues and projects. Connect the owner's account with the browser sign-in.",
+  "description": "List, search and update Linear issues, projects and comments. Sign in with your own account in the browser; the tokens are sealed for you alone. Writes ask for approval.",
   "category": "productivity",
-  "iconUrl": "https://linear.example.invalid/icon.png",
-  "version": "1.0.0",
-  "minServerVersion": "0.36.0",
+  "iconUrl": "https://linear.app/favicon.ico",
+  "version": "1.1.0",
+  "minServerVersion": "0.51.0",
   "prompts": [
     {
       "id": "linear-0",
@@ -20,23 +20,46 @@
       "name": "Issues",
       "server": {
         "transport": "http",
-        "url": "https://mcp.linear.example.invalid/mcp"
+        "url": "https://mcp.linear.app/mcp"
       },
       "auth": [
         {
-          "id": "link",
-          "kind": "oauth-link",
-          "fields": []
+          "id": "signin",
+          "kind": "oauth",
+          "fields": [],
+          "oauth": {
+            "scopes": [],
+            "usesCimd": false
+          }
         }
-      ]
+      ],
+      "tools": {
+        "readOnly": [
+          "list_issues",
+          "get_issue",
+          "list_projects",
+          "get_project",
+          "list_teams",
+          "list_users",
+          "list_comments",
+          "list_issue_statuses",
+          "list_issue_labels",
+          "list_cycles",
+          "list_documents",
+          "get_document"
+        ]
+      },
+      "accounts": {
+        "multiple": false
+      }
     }
   ],
   "permissions": {
     "egress": [
-      "mcp.linear.example.invalid"
+      "mcp.linear.app"
     ]
   },
-  "websiteUrl": "https://linear.example.invalid",
-  "privacyPolicyUrl": "https://linear.example.invalid/privacy",
-  "termsUrl": "https://linear.example.invalid/terms"
+  "websiteUrl": "https://linear.app",
+  "privacyPolicyUrl": "https://linear.app/privacy",
+  "termsUrl": "https://linear.app/terms"
 }

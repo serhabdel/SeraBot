@@ -151,7 +151,8 @@ pub fn levels_for(kind: &str, model: &str, tags: &[String]) -> Vec<&'static str>
                 &[]
             }
         }
-        "muse-code" => &["off", "low", "medium", "high"],
+        // Both take the Responses `reasoning.effort`; `max` clamps to high.
+        "muse-code" | "openai-codex" => &["off", "low", "medium", "high"],
         kind if kind.starts_with("opencode-") => {
             // Only what the catalog tags as reasoning; OpenCode serves many
             // vendors' models behind one endpoint.
@@ -261,7 +262,7 @@ pub fn wire_fields(
             // into `thinkingConfig` for the model. It is never sent as is.
             fields.insert("thinking_level".into(), json!(level));
         }
-        "muse-code" => {
+        "muse-code" | "openai-codex" => {
             // Responses-style effort. Off omits it; `max` is not offered.
             if level != "off" {
                 fields.insert(
@@ -593,6 +594,16 @@ mod tests {
         // Muse `off` omits reasoning; `max` is never offered.
         assert_eq!(shape("muse-code", "muse-spark", "off"), Some(json!({})));
         assert_eq!(shape("muse-code", "muse-spark", "max"), None);
+        // Codex takes the same Responses effort for every model.
+        assert_eq!(
+            levels_for("openai-codex", "gpt-6.1-sol", &none()),
+            ["off", "low", "medium", "high"]
+        );
+        assert_eq!(
+            shape("openai-codex", "gpt-6.1-sol", "medium"),
+            Some(json!({"reasoning": {"effort": "medium", "summary": "auto"}}))
+        );
+        assert_eq!(shape("openai-codex", "gpt-6.1-sol", "off"), Some(json!({})));
         assert_eq!(
             shape("opencode-go", "glm-5", "medium"),
             Some(json!({"reasoning_effort": "medium"}))
