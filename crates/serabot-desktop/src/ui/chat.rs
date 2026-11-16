@@ -1,3 +1,4 @@
+use super::chat_feed_view::{self as feed_view, RowView};
 use super::*;
 
 #[component]
@@ -329,6 +330,13 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     // Message list and composer state (0.19).
     let mut at_bottom = use_signal(|| true);
     let mut unseen = use_signal(|| 0usize);
+    // The message the reader is looking at while scrolled up (C1), kept as an
+    // id so rows loading in front never move the drawn window, and the ids of
+    // the rows as last drawn for the page's reports to resolve against.
+    let mut feed_anchor = use_signal(|| Option::<String>::None);
+    let feed_ids = use_hook(|| Rc::new(RefCell::new(Vec::<String>::new())));
+    let feed_ids_sink = Rc::clone(&feed_ids);
+    let mut feed_reported = use_signal(|| Option::<usize>::None);
     let mut last_count = use_signal(|| 0usize);
     // The conversation the scroll state was last reset for, and the last
     // transcript fingerprint. `use_effect` closures that read `session` re-run
@@ -424,6 +432,25 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             }
             if following && *unseen.peek() != 0 {
                 unseen.set(0);
+            }
+        }
+    });
+    // The first visible row, reported by the page after it moved a few rows.
+    use_future(move || {
+        let ids = Rc::clone(&feed_ids_sink);
+        async move {
+            let _ = dioxus::document::eval(&feed_view::feed_window_js());
+            let mut sink = dioxus::document::eval(feed_view::FEED_SINK_JS);
+            while let Ok(index) = sink.recv::<i64>().await {
+                let index = usize::try_from(index).unwrap_or(0);
+                if !feed_view::moved_enough(*feed_reported.peek(), index) {
+                    continue;
+                }
+                feed_reported.set(Some(index));
+                let id = ids.borrow().get(index).cloned();
+                if *feed_anchor.peek() != id {
+                    feed_anchor.set(id);
+                }
             }
         }
     });
@@ -737,6 +764,14 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             })
             .collect()
     };
+    // Draw the rows near the viewport only; spacers stand in for the rest.
+    let feed = {
+        *feed_ids.borrow_mut() = row_views.iter().map(|view| view.row.id.clone()).collect();
+        let anchor = feed_anchor.read().as_deref().and_then(|id| {
+            feed_view::anchor_index(row_views.iter().map(|view| view.row.id.as_str()), id)
+        });
+        feed_view::feed_window(row_views.len(), anchor, at_bottom())
+    };
     let run_active = live_task.is_some();
     rsx! {
         div { class: "pane-body chat-body",
@@ -1049,7 +1084,16 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                             }
                         }
                     }
-                    for (index, view) in row_views.into_iter().enumerate() {
+                    if feed.top_spacer_px() > 0 {
+                        div {
+                            id: "feed-spacer-top",
+                            class: "feed-spacer",
+                            "aria-hidden": "true",
+                            "data-start": "{feed.start}",
+                            style: "height: {feed.top_spacer_px()}px",
+                        }
+                    }
+                    for (index, view) in row_views.into_iter().enumerate().skip(feed.start).take(feed.end - feed.start) {
                         Fragment { key: "{view.row.id}",
                             for card in placed[index].clone() {
                                 ChatCardRow { session, key: "{card.id}", card }
@@ -1074,6 +1118,13 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                 task_added_ids,
                                 composer_draft,
                             }
+                        }
+                    }
+                    if feed.bottom_spacer_px() > 0 {
+                        div {
+                            class: "feed-spacer",
+                            "aria-hidden": "true",
+                            style: "height: {feed.bottom_spacer_px()}px",
                         }
                     }
                     // Resolved cards that come after the newest message.
@@ -1845,14 +1896,6 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             }
         }
     }
-}
-
-/// One prepared transcript row, with what it is drawn with this time.
-struct RowView {
-    row: Rc<MsgView>,
-    class: String,
-    bot_meta: Option<(String, bool)>,
-    media: Vec<serabot_desktop::LibraryEntry>,
 }
 
 /// One message of the transcript. A component of its own so that a row whose

@@ -49,6 +49,7 @@ use crate::ui_vault::VaultPage;
 
 mod account_views;
 mod chat;
+mod chat_feed_view;
 mod connect;
 mod conversations;
 mod markdown;
