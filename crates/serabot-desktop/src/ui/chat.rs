@@ -181,6 +181,9 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             route_chip::switch_rows(&options, &state.state.route_events),
         )
     };
+    // "Earlier messages were summarized" rows, placed like the switch rows.
+    let compaction_placed: Vec<Vec<serabot_desktop::runs::CompactionRow>> =
+        chat_cards::place_compactions(&message_times, &session.read().state.runs.compactions);
     // A failed turn offers the next route of the bot's chain.
     let (fallback_offer, failed_task) = {
         let state = session.read();
@@ -199,15 +202,47 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         )
     };
     let mut dismissed_fallback = use_signal(|| Option::<String>::None);
-    let show_fallback = fallback_offer
-        .clone()
-        .filter(|_| failed_task.is_some() && dismissed_fallback() != failed_task);
+    // The failed-turn card: reason chips, Retry on the next route, Retry on
+    // another route and Ask main. It shows for a failed turn that has any way
+    // forward, until dismissed.
+    let show_failed_card = if failed_task.is_some() && dismissed_fallback() != failed_task {
+        let state = session.read();
+        let options = state.route_options();
+        let ask_main = state
+            .state
+            .listed_bots
+            .iter()
+            .any(|bot| bot.role == "orchestrator" && bot.enabled);
+        let card = chat_failure::failed_card(
+            &options,
+            state.state.route_chain.as_deref(),
+            &state.state.draft,
+            &state.state.route_events,
+            fallback_offer.clone(),
+            ask_main,
+        );
+        (card.fallback.is_some() || !card.alternatives.is_empty() || card.ask_main).then_some(card)
+    } else {
+        None
+    };
     let live_task: Option<TaskStatus> = session
         .read()
         .state
         .task
         .as_ref()
         .and_then(|task| (!task.status.terminal()).then_some(task.status));
+    // The waiting-for-a-model line, with its countdown, while the turn is parked.
+    let wait_line = {
+        let state = session.read();
+        chat_cards::wait_banner(
+            state.state.task.as_ref().map(|task| task.status),
+            state.state.runs.waiting.as_ref(),
+            serabot_desktop::workflows::now_secs(),
+        )
+    };
+    // Stop stays on screen while the reply or any subagent runs.
+    let any_run_active = session.read().any_run_active();
+    let queued_count = session.read().queue.len();
     let (steps, steps_summary, steps_dropped, steps_attention, sending, history_ready) = {
         let state = session.read();
         let sending =
@@ -772,7 +807,6 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         });
         feed_view::feed_window(row_views.len(), anchor, at_bottom())
     };
-    let run_active = live_task.is_some();
     rsx! {
         div { class: "pane-body chat-body",
             onkeydown: move |event: KeyboardEvent| {
@@ -804,16 +838,19 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     // Ctrl+/: back to the composer from anywhere in the chat.
                     event.prevent_default();
                     focus_composer();
+                } else if event.key() == Key::F1 {
+                    event.prevent_default();
+                    overlay.set(Overlay::Shortcuts);
                 } else if event.key() == Key::Escape
                     && !command
-                    && run_active
+                    && any_run_active
                     && !search_open()
                     && !show_mention
                     && !show_slash
                 {
                     // Esc stops the reply that is being written.
                     event.prevent_default();
-                    session.write().stop_turn();
+                    session.write().stop_turn_or_runs();
                 }
             },
             ondragover: move |event: DragEvent| {
@@ -1101,6 +1138,9 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                             for row in switch_placed[index].clone() {
                                 RouteSwitchRow { key: "{row.id}", text: row.text }
                             }
+                            for (n, row) in compaction_placed[index].clone().into_iter().enumerate() {
+                                CompactionNote { key: "c{index}-{n}", text: row.text }
+                            }
                             if let Some(heading) = view.row.day.clone() {
                                 div { class: "day-sep", role: "separator",
                                     span { "{heading}" }
@@ -1133,6 +1173,9 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     }
                     for row in switch_placed.last().cloned().unwrap_or_default() {
                         RouteSwitchRow { key: "{row.id}", text: row.text }
+                    }
+                    for (n, row) in compaction_placed.last().cloned().unwrap_or_default().into_iter().enumerate() {
+                        CompactionNote { key: "c-last-{n}", text: row.text }
                     }
                     // Files produced in an active turn that has no reply yet,
                     // plus any in-flight media jobs.
@@ -1259,28 +1302,19 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                         }
                     }
                     crate::ui_cards::InlineApprovals { session }
-                    if let Some(offer) = show_fallback.clone() {
-                        div { class: "banner err fallback-card", role: "alert",
-                            span { class: "grow", "{chat_failure::FAILED_TURN_WITH_FALLBACK}" }
-                            button {
-                                class: "btn primary sm",
-                                r#type: "button",
-                                disabled: !can_send_again,
-                                onclick: {
-                                    let offer = offer.clone();
-                                    move |_| session.write().retry_on_fallback(offer.clone())
-                                },
-                                "{offer.label}"
-                            }
-                            button {
-                                class: "btn ghost sm chat-banner-close",
-                                r#type: "button",
-                                title: "Dismiss",
-                                "aria-label": "Dismiss",
-                                onclick: move |_| dismissed_fallback.set(failed_task.clone()),
-                                Icon { name: "x", size: 13 }
-                            }
+                    if let Some(card) = show_failed_card.clone() {
+                        FailedTurnCard {
+                            session,
+                            card,
+                            can_act: can_send_again,
+                            ondismiss: {
+                                let failed = failed_task.clone();
+                                move |_| dismissed_fallback.set(failed.clone())
+                            },
                         }
+                    }
+                    if let Some(line) = wait_line.clone() {
+                        WaitBanner { line }
                     }
                     if let Some(failure) = show_failure.clone() {
                         div { class: "banner err", role: "alert",
@@ -1399,6 +1433,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                             }
                         }
                     }
+                    QueuePanel { session }
                     div { class: if composer_expanded() { "composer expanded" } else { "composer" },
                         ComposerFiles { session }
                         textarea {
@@ -1558,10 +1593,10 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                 }
                                 // Esc stops a running reply, like the Stop button.
                                 if event.key() == Key::Escape
-                                    && chat_compose::escape_stops_run(run_active, awaiting_approval)
+                                    && chat_compose::escape_stops_run(any_run_active, awaiting_approval)
                                 {
                                     event.prevent_default();
-                                    session.write().stop_turn();
+                                    session.write().stop_turn_or_runs();
                                     return;
                                 }
                                 // Up in an empty composer recalls the last message.
@@ -1593,7 +1628,8 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                         event.is_composing(),
                                     ) {
                                         event.prevent_default();
-                                        session.write().submit();
+                                        // While a reply runs, Enter queues the message.
+                                        session.write().send_or_queue();
                                     }
                                 }
                             },
@@ -1708,12 +1744,26 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     span { class: "composer-waiting", role: "status",
                                         "Waiting for your approval. Decline it to stop."
                                     }
-                                } else if live_task.is_some() {
+                                } else if any_run_active {
+                                    // Typing while a reply runs queues the message; Stop is
+                                    // always within reach while anything runs.
+                                    if send_ready && live_task.is_some() {
+                                        button {
+                                            class: "btn ghost queue-btn",
+                                            r#type: "button",
+                                            title: "Add to the queue; it is sent when the reply is done",
+                                            "aria-label": "Add the message to the queue",
+                                            disabled: !accepts || queued_count >= chat_compose::MAX_QUEUED,
+                                            onclick: move |_| session.write().queue_composer(),
+                                            Icon { name: "list", size: 14 }
+                                            "Queue"
+                                        }
+                                    }
                                     button {
                                         class: "btn stop-btn composer-stop",
-                                        title: "Stop generating",
+                                        title: "Stop (Esc)",
                                         "aria-label": "Stop generating",
-                                        onclick: move |_| session.write().stop_turn(),
+                                        onclick: move |_| session.write().stop_turn_or_runs(),
                                         Icon { name: "stop", size: 14 }
                                     }
                                 } else {
@@ -1731,7 +1781,16 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     }
                     // The key hint sits under the container, always, so it never
                     // overlaps the text and the box never jumps when focus moves.
-                    div { class: "composer-hint", "{chat_compose::composer_hint(enter_sends_pref)}" }
+                    div { class: "composer-hint",
+                        "{chat_compose::composer_hint(enter_sends_pref)}"
+                        button {
+                            class: "link-btn shortcuts-link",
+                            r#type: "button",
+                            title: "Keyboard shortcuts (F1)",
+                            onclick: move |_| overlay.set(Overlay::Shortcuts),
+                            "Shortcuts"
+                        }
+                    }
                     if show_mention {
                         div { class: "mention-pop pop above open",
                             // Hidden closer: GLOBAL_KEYS_JS clicks it on Esc /

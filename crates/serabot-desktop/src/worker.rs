@@ -96,6 +96,10 @@ pub enum OperationKind {
     RouteWrite,
     /// Read the open conversation's route switches and the bot's chain.
     RouteEvents,
+    /// Read the open conversation's subagent runs.
+    Runs,
+    /// Stop or retry one subagent run.
+    RunAction,
     ConnectorTest,
     OAuthSignIn,
     ConnectorSignOut,
@@ -158,6 +162,11 @@ pub enum Operation {
     HistoryBefore(String),
     Apply(Selection),
     Submit(Zeroizing<String>),
+    /// A message the named bot answers (`@bot` routed to a delegate).
+    SubmitTo {
+        text: Zeroizing<String>,
+        bot: String,
+    },
     /// A message with uploaded attachment ids (text may be empty).
     SubmitWith {
         text: Zeroizing<String>,
@@ -447,6 +456,17 @@ pub enum Operation {
     RouteEvents {
         bot: Option<String>,
     },
+    /// GET /v1/handoffs for the open conversation.
+    Handoffs,
+    /// POST /v1/handoffs/{id}/cancel: stop one subagent run.
+    StopRun {
+        id: String,
+    },
+    /// POST /v1/handoffs/{id}/retry, on the run's own chain or on `route`.
+    RetryRun {
+        id: String,
+        route: Option<crate::api::RouteEntry>,
+    },
     AdminRemoveProvider(String),
     AdminSetConnector {
         id: String,
@@ -569,7 +589,9 @@ impl Operation {
             Self::History => OperationKind::History,
             Self::HistoryBefore(_) => OperationKind::HistoryOlder,
             Self::Apply(_) => OperationKind::Apply,
-            Self::Submit(_) | Self::SubmitWith { .. } => OperationKind::Submit,
+            Self::Submit(_) | Self::SubmitWith { .. } | Self::SubmitTo { .. } => {
+                OperationKind::Submit
+            }
             Self::UploadAttachment { .. } => OperationKind::Attach,
             Self::Task(_) => OperationKind::Task,
             Self::Approvals => OperationKind::Approvals,
@@ -652,6 +674,8 @@ impl Operation {
             | Self::RefreshAccountQuota { .. } => OperationKind::ProviderAccount,
             Self::SaveBotRoute { .. } => OperationKind::RouteWrite,
             Self::RouteEvents { .. } => OperationKind::RouteEvents,
+            Self::Handoffs => OperationKind::Runs,
+            Self::StopRun { .. } | Self::RetryRun { .. } => OperationKind::RunAction,
             Self::VoiceSettings => OperationKind::VoiceSettings,
             Self::AdminSetVoice(_) => OperationKind::AdminWrite,
             Self::TestConnector { .. } => OperationKind::ConnectorTest,
@@ -789,6 +813,10 @@ pub enum Reply {
     RouteSaved,
     /// The open conversation's route switches and the bot's chain.
     RouteEvents(crate::api::RouteEvents),
+    /// The open conversation's subagent runs.
+    Runs(Vec<crate::runs::Handoff>),
+    /// A run was stopped or retried; the list is read again.
+    RunActed,
     ProviderTested {
         id: String,
         result: crate::api::ProviderTest,
@@ -1002,6 +1030,9 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
             .map(Reply::HistoryOlder),
         Operation::Apply(selection) => client.select(conversation, selection).map(Reply::Selection),
         Operation::Submit(text) => client.submit(conversation, text).map(Reply::Task),
+        Operation::SubmitTo { text, bot } => {
+            client.submit_to(conversation, text, bot).map(Reply::Task)
+        }
         Operation::SubmitWith { text, attachments } => client
             .submit_with(conversation, text, attachments)
             .map(Reply::Task),
@@ -1327,6 +1358,11 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         Operation::RouteEvents { bot } => client
             .route_events(conversation, bot.as_deref())
             .map(Reply::RouteEvents),
+        Operation::Handoffs => client.list_handoffs(conversation).map(Reply::Runs),
+        Operation::StopRun { id } => client.cancel_handoff(id).map(|()| Reply::RunActed),
+        Operation::RetryRun { id, route } => client
+            .retry_handoff(id, route.as_ref())
+            .map(|()| Reply::RunActed),
         Operation::TestProvider { id } => {
             client
                 .test_provider(id)

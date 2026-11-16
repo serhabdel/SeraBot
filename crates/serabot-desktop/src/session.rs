@@ -28,6 +28,7 @@ use crate::{
 };
 mod bot_settings;
 mod flows;
+mod orchestration;
 mod provider_accounts;
 
 pub use bot_settings::{BotDraft, BotSettings, SettingsTab, model_pick, model_value};
@@ -734,6 +735,13 @@ pub struct Session {
     pub composer_files: Vec<crate::AttachmentInfo>,
     /// Text drafts per conversation, kept while the app runs (0.19).
     pub drafts: crate::chat_compose::Drafts,
+    /// Messages typed while a reply runs, for the open chat (v0.50).
+    pub queue: crate::chat_compose::SendQueue,
+    /// Queues of the chats that are not open.
+    queues: crate::chat_compose::Queues,
+    /// Collapsed run groups the owner opened.
+    pub runs_open: std::collections::HashSet<String>,
+    runs_last_read: Option<Instant>,
     /// Why some files were refused, shown under the composer.
     pub attach_notice: Option<String>,
     /// Picture previews by attachment id (small images only).
@@ -933,6 +941,10 @@ impl Session {
             folder_stats_chan: None,
             composer_files: Vec::new(),
             drafts: crate::chat_compose::Drafts::default(),
+            queue: crate::chat_compose::SendQueue::default(),
+            queues: crate::chat_compose::Queues::default(),
+            runs_open: std::collections::HashSet::new(),
+            runs_last_read: None,
             attach_notice: None,
             attachment_thumbs: std::collections::HashMap::new(),
             upload_thumb: None,
@@ -2323,7 +2335,12 @@ impl Session {
         }
         // The draft of the conversation being left waits for its return.
         self.drafts.store(&self.conversation, &self.composer);
+        let left = std::mem::take(&mut self.queue);
+        self.queues.stash(&self.conversation, left);
+        self.runs_open.clear();
+        self.runs_last_read = None;
         self.conversation = id;
+        self.queue = self.queues.restore(&self.conversation);
         self.state.chat_failure = None;
         self.state.held_draft = None;
         self.section = Section::Chat;
@@ -2748,7 +2765,15 @@ impl Session {
             limit_reached: false,
         });
         if files.is_empty() {
-            self.start_request(Operation::Submit(zeroize::Zeroizing::new(text)));
+            // A leading `@bot` sends the message to that bot (a delegate).
+            let routed = self.route_for(&text);
+            match routed.target {
+                Some(bot) => self.start_request(Operation::SubmitTo {
+                    text: zeroize::Zeroizing::new(routed.text),
+                    bot,
+                }),
+                None => self.start_request(Operation::Submit(zeroize::Zeroizing::new(text))),
+            }
         } else {
             self.start_request(Operation::SubmitWith {
                 text: zeroize::Zeroizing::new(text),
@@ -3414,6 +3439,25 @@ impl Session {
         self.state.account_tests.len().hash(&mut h);
         self.state.route_events.len().hash(&mut h);
         self.state.route_chain.is_some().hash(&mut h);
+        // Runs, queue and wait rows (v0.50). A countdown moves each second.
+        for row in &self.state.runs.rows {
+            row.id.hash(&mut h);
+            row.chip.label().hash(&mut h);
+        }
+        self.state.runs.compactions.len().hash(&mut h);
+        self.state.runs.holds.len().hash(&mut h);
+        self.state.runs.waiting.is_some().hash(&mut h);
+        if self.state.runs.waiting.is_some() || !self.state.runs.holds.is_empty() {
+            crate::workflows::now_secs().hash(&mut h);
+        }
+        self.queue.len().hash(&mut h);
+        self.queue.editing().hash(&mut h);
+        for item in self.queue.items() {
+            item.id.hash(&mut h);
+            item.steer.hash(&mut h);
+            item.text.len().hash(&mut h);
+        }
+        self.runs_open.len().hash(&mut h);
         self.route_editor.saving.hash(&mut h);
         self.route_editor.error.hash(&mut h);
         self.route_editor.notice.hash(&mut h);
@@ -3443,6 +3487,8 @@ impl Session {
         self.hydrate_bot_settings();
         self.hydrate_route_editor();
         self.poll_route_events();
+        self.poll_runs();
+        self.pump_queue();
         self.pump_panel();
         if self.link_down
             && self.pending.is_none()
@@ -3592,6 +3638,10 @@ impl Session {
         // This never consumes the event: turn.completed and
         // task.failed still refresh the transcript below.
         self.state.working.apply(&kind, &payload, Instant::now());
+        // Subagent runs, holds, waits and compactions of the open chat.
+        self.state
+            .runs
+            .apply_event(&kind, &payload, self.conversation.as_str());
         // Step events only feed the live view; the transcript
         // is not re-read for each one.
         let stepped = self.state.activity.apply(&kind, &payload);
@@ -3977,6 +4027,13 @@ impl Session {
                 Err(_) if completion.kind == OperationKind::RouteEvents => {
                     self.state.route_events_loaded = true;
                 }
+                // An older server has no runs list: the sidebar stays empty.
+                Err(_) if completion.kind == OperationKind::Runs => {
+                    self.state.runs.loaded = true;
+                }
+                Err(error) if completion.kind == OperationKind::RunAction => {
+                    self.run_action_failed(&error);
+                }
 
                 Err(error)
                     if matches!(
@@ -4288,6 +4345,9 @@ impl Session {
                     // Nothing marked means no turn was running when Stop was pressed.
                     if matches!(reply, Reply::Stopping(0)) {
                         self.toast = Some("Nothing is running to stop.".into());
+                    }
+                    if matches!(reply, Reply::RunActed) {
+                        self.run_action_done();
                     }
                     let bot_config_saved = match &reply {
                         Reply::BotConfigSaved { restart_required } => Some(*restart_required),

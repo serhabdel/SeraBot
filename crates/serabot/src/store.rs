@@ -2961,6 +2961,19 @@ impl Store {
         Ok(ids)
     }
 
+    /// Ids of the acting user's active turns of one task. Another user's
+    /// task never matches.
+    pub fn running_turn_ids_for_task(&self, user_id: &str, task_id: &str) -> Result<Vec<String>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id FROM turns WHERE user_id = ?1 AND task_id = ?2 AND status = 'active'",
+        )?;
+        let ids = statement
+            .query_map(params![user_id, task_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(ids)
+    }
+
     pub fn update_turn(&self, user_id: &str, id: &str, status: &str, state: &Value) -> Result<()> {
         let connection = self.connection()?;
         connection.execute(

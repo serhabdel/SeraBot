@@ -550,6 +550,10 @@ accepts `category` and `pinned`. `PATCH /v1/memories/{id}` accepts `pinned`.
   catalog and the provider's egress approval. A handoff whose earlier attempt
   may have had an effect with an unknown outcome is refused unless the owner
   sets `confirm_effects_unknown`. Another user's id is a 404.
+- `POST /v1/handoffs/{id}/cancel` is the per-run Stop: a queued child is
+  cancelled, a running one ends at its next checkpoint. The reply is
+  `{handoff_id, cancelled, stopping}`. A finished handoff is refused; another
+  user's id is a 404.
 
 Handoff and resume turns count against `[users] child_daily_limit` (default
 500 per user per UTC day), separately from `tasks_per_user_per_day`.

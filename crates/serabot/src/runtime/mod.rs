@@ -304,6 +304,19 @@ impl Runtime {
         Ok(turn_ids.len())
     }
 
+    /// Ask the acting user's running turn of one task (a subagent's child)
+    /// to stop, with the same checkpoint rules as `request_stop`. Returns how
+    /// many turns were marked.
+    pub fn request_stop_task(&self, user_id: &str, task_id: &str) -> Result<usize> {
+        let turn_ids = self.store.running_turn_ids_for_task(user_id, task_id)?;
+        let mut marks = self
+            .stop_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        marks.extend(turn_ids.iter().cloned());
+        Ok(turn_ids.len())
+    }
+
     fn stop_requested(&self, turn_id: &str) -> bool {
         self.stop_requests
             .lock()

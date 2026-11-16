@@ -26,6 +26,39 @@ pub(super) async fn list_handoffs(
     Ok(Json(json!({ "handoffs": handoffs })))
 }
 
+/// `POST /v1/handoffs/{id}/cancel`: the owner's per-run Stop. A queued child
+/// is cancelled at once; a running one is marked and ends at its next
+/// checkpoint. A finished handoff, or another user's, is refused.
+pub(super) async fn cancel_handoff(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    let view = state.store.handoff_view(&user.id, &id)?;
+    let (cancelled, stopping) = match view.status {
+        "queued" | "resumed" | "running" => {
+            let cancelled =
+                state
+                    .store
+                    .cancel_task(&user.id, &view.child_task_id, "stopped by owner")?;
+            let stopping = state
+                .runtime
+                .request_stop_task(&user.id, &view.child_task_id)?;
+            (cancelled, stopping)
+        }
+        other => {
+            return Err(SeraError::InvalidState(format!(
+                "handoff is {other}; only a queued or running subagent can be stopped"
+            )));
+        }
+    };
+    Ok(Json(json!({
+        "handoff_id": id,
+        "cancelled": cancelled,
+        "stopping": stopping,
+    })))
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RetryHandoffRequest {

@@ -2322,6 +2322,8 @@ pub enum TaskStatus {
     Queued,
     Running,
     AwaitingApproval,
+    /// Parked until a model route is available again (v0.50).
+    WaitingModel,
     Done,
     Failed,
     Cancelled,
@@ -2336,6 +2338,7 @@ impl TaskStatus {
             Self::Queued => "Queued",
             Self::Running => "Working",
             Self::AwaitingApproval => "Awaiting approval",
+            Self::WaitingModel => "Waiting for a model",
             Self::Done => "Done",
             Self::Failed => "Failed",
             Self::Cancelled => "Cancelled",
@@ -3310,9 +3313,29 @@ impl ApiClient {
         text: &str,
         attachments: &[String],
     ) -> Result<Task, ApiError> {
+        self.submit_inner(conversation, text, attachments, None)
+    }
+
+    /// Send a message that the named bot answers (an `@bot` mention that
+    /// routes to a delegate). The server checks the bot against the owner's
+    /// own fleet.
+    pub fn submit_to(&self, conversation: &str, text: &str, bot: &str) -> Result<Task, ApiError> {
+        self.submit_inner(conversation, text, &[], Some(bot))
+    }
+
+    fn submit_inner(
+        &self,
+        conversation: &str,
+        text: &str,
+        attachments: &[String],
+        bot: Option<&str>,
+    ) -> Result<Task, ApiError> {
         check_id(conversation)?;
         if attachments.len() > MAX_ATTACHMENTS || !attachments.iter().all(|id| valid_id(id)) {
             return Err(ApiError::Validation("Attach at most 6 files."));
+        }
+        if bot.is_some_and(|bot| !valid_speaker(bot)) {
+            return Err(ApiError::Validation("Choose a bot from the list."));
         }
         let text_ok = valid_text(text) || (!attachments.is_empty() && text.trim().is_empty());
         if !text_ok {
@@ -3326,6 +3349,8 @@ impl ApiClient {
             text: &'a str,
             #[serde(skip_serializing_if = "<[String]>::is_empty")]
             attachments: &'a [String],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            bot: Option<&'a str>,
         }
         let response: TaskEnvelope = self.request(
             Method::POST,
@@ -3335,10 +3360,58 @@ impl ApiClient {
                 conversation_id: conversation,
                 text,
                 attachments,
+                bot,
             }),
         )?;
         check_task(response.task)
     }
+
+    /// `GET /v1/handoffs?conversation_id=`: the subagent runs of one chat.
+    pub fn list_handoffs(&self, conversation: &str) -> Result<Vec<crate::runs::Handoff>, ApiError> {
+        check_id(conversation)?;
+        let list: crate::runs::HandoffList =
+            self.get(&["v1", "handoffs"], &[("conversation_id", conversation)])?;
+        if list.handoffs.len() > crate::runs::MAX_RUNS * 2
+            || !list.handoffs.iter().all(|h| valid_id(&h.id))
+        {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(list.handoffs)
+    }
+
+    /// `POST /v1/handoffs/{id}/retry`: run a failed subagent again, on its
+    /// own chain or on `route`. An unknown effect is never confirmed from
+    /// here: the server refuses it and the owner checks the result first.
+    pub fn retry_handoff(&self, id: &str, route: Option<&RouteEntry>) -> Result<(), ApiError> {
+        check_id(id)?;
+        #[derive(Serialize)]
+        struct Body<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            route_override: Option<&'a RouteEntry>,
+        }
+        let _: serde_json::Value = self.request(
+            Method::POST,
+            &["v1", "handoffs", id, "retry"],
+            &[],
+            Some(&Body {
+                route_override: route,
+            }),
+        )?;
+        Ok(())
+    }
+
+    /// `POST /v1/handoffs/{id}/cancel`: the per-run Stop.
+    pub fn cancel_handoff(&self, id: &str) -> Result<(), ApiError> {
+        check_id(id)?;
+        let _: serde_json::Value = self.request::<serde_json::Value, ()>(
+            Method::POST,
+            &["v1", "handoffs", id, "cancel"],
+            &[],
+            None,
+        )?;
+        Ok(())
+    }
+
     pub fn task(&self, id: &str) -> Result<Task, ApiError> {
         check_id(id)?;
         let response: TaskEnvelope = self.get(&["v1", "tasks", id], &[])?;

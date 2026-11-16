@@ -460,6 +460,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/route-events", get(list_route_events))
         .route("/v1/handoffs", get(list_handoffs))
         .route("/v1/handoffs/{id}/retry", post(retry_handoff))
+        .route("/v1/handoffs/{id}/cancel", post(cancel_handoff))
         .route("/v1/skills", get(list_skills).post(create_skill_pack))
         .route(
             "/v1/conversations",

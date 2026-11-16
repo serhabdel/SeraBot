@@ -231,3 +231,39 @@ async fn an_unknown_effect_needs_the_owners_confirmation_to_retry() {
     .await;
     assert_eq!(accepted.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn the_owner_stops_one_run_and_only_their_own() {
+    let (app, _, store) = app_with_root(true, Policy::empty(), temp_base());
+    let (alice_id, alice, handoff, child) =
+        member_with_handoff(&app, &store, "v050-stop-a", "queued").await;
+    let (_, bob, bobs_handoff, _) =
+        member_with_handoff(&app, &store, "v050-stop-b", "queued").await;
+    let uri = format!("/v1/handoffs/{handoff}/cancel");
+
+    // Another user's handoff reads as unknown, both ways round.
+    let response = call(&app, &bob, "POST", &uri, None).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = call(
+        &app,
+        &alice,
+        "POST",
+        &format!("/v1/handoffs/{bobs_handoff}/cancel"),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = call(&app, &alice, "POST", &uri, None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    assert_eq!(body["cancelled"], true, "{body}");
+    assert_eq!(
+        store.get_task(&alice_id, &child).unwrap().status,
+        "cancelled"
+    );
+
+    // A finished run cannot be stopped again.
+    let again = call(&app, &alice, "POST", &uri, None).await;
+    assert!(!again.status().is_success());
+}

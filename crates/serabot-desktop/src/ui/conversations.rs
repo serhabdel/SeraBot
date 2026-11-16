@@ -41,6 +41,9 @@ struct ConvCardRow {
     parent_label: Option<String>,
     unread: i64,
     active: bool,
+    /// Subagent runs going and failed runs waiting for the owner. Known for
+    /// the open chat only: the runs list is read per conversation.
+    runs: (usize, usize),
 }
 
 #[component]
@@ -88,6 +91,14 @@ pub(super) fn ConversationsView(session: Signal<Session>) -> Element {
                     parent_label,
                     unread: conversation.unread_count,
                     active: conversation.id == current,
+                    runs: if conversation.id == current {
+                        (
+                            serabot_desktop::runs::active_count(&state.state.runs.rows),
+                            serabot_desktop::runs::needs_attention(&state.state.runs.rows),
+                        )
+                    } else {
+                        (0, 0)
+                    },
                 }
             })
             .collect::<Vec<_>>();
@@ -381,6 +392,7 @@ pub(super) fn ConversationsView(session: Signal<Session>) -> Element {
                                                 if row.unread > 0 {
                                                     span { class: "chip accent", "{row.unread} unread" }
                                                 }
+                                                RunCountChips { running: row.runs.0, failed: row.runs.1 }
                                             }
                                             span { class: "card-sub", title: "{updated_raw}",
                                                 if let Some(parent_name) = row.parent_label.as_deref() {

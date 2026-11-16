@@ -50,26 +50,32 @@ use crate::ui_vault::VaultPage;
 mod account_views;
 mod chat;
 mod chat_feed_view;
+mod compose_queue;
 mod connect;
 mod conversations;
 mod markdown;
 mod memory;
 mod providers;
 mod row_menu;
+mod runs;
 mod settings_view;
 mod sheets;
 mod shell;
+mod wait_cards;
 pub(crate) use account_views::*;
 pub(crate) use chat::*;
+pub(crate) use compose_queue::*;
 pub(crate) use connect::*;
 pub(crate) use conversations::*;
 pub(crate) use markdown::*;
 pub(crate) use memory::*;
 pub(crate) use providers::*;
 pub(crate) use row_menu::*;
+pub(crate) use runs::*;
 pub(crate) use settings_view::*;
 pub(crate) use sheets::*;
 pub(crate) use shell::*;
+pub(crate) use wait_cards::*;
 
 const CSS: &str = include_str!("../assets/app.css");
 /// Reports whether the system prefers a dark theme, now and on every change.
@@ -81,7 +87,8 @@ const CSS_PAGES: &str = concat!(
     include_str!("../assets/files.css"),
     include_str!("../assets/jobs.css"),
     include_str!("../assets/foundation.css"),
-    include_str!("../assets/accounts.css")
+    include_str!("../assets/accounts.css"),
+    include_str!("../assets/runs.css")
 );
 
 /// The `data-activity` value the stylesheet keys the avatar ring and the
@@ -326,6 +333,8 @@ pub(crate) enum Overlay {
     Team,
     /// "Meet your team": the shipped bots the owner can add.
     MeetTeam,
+    /// The keyboard shortcuts sheet (F1).
+    Shortcuts,
 }
 
 fn avatar_hue(id: &str) -> u16 {
