@@ -52,13 +52,13 @@ use crate::user_secrets::UserSecrets;
 /// Prefix shared by every plugin tool name.
 pub const PREFIX: &str = "plugin.";
 /// Longest time one plugin request may take.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Largest response read from a plugin server.
-const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 /// Largest text returned to the model from one call.
-const MAX_OUTPUT_CHARS: usize = 8_000;
+pub(crate) const MAX_OUTPUT_CHARS: usize = 8_000;
 /// Longest description kept from a plugin's tool list.
-const MAX_DESCRIPTION_CHARS: usize = 400;
+pub(crate) const MAX_DESCRIPTION_CHARS: usize = 400;
 /// Largest input schema passed to the model. A bigger one is skipped, not truncated,
 /// since a cut-off schema would describe arguments wrongly.
 const MAX_SCHEMA_BYTES: usize = 8 * 1024;
@@ -164,7 +164,7 @@ pub fn hints_of(tool: &Value) -> Hints {
 }
 
 /// Whether a call to a tool with these hints needs approval.
-fn approval_needed(hints: Hints, mode: Option<ToolMode>) -> bool {
+pub(crate) fn approval_needed(hints: Hints, mode: Option<ToolMode>) -> bool {
     match mode {
         Some(ToolMode::Ask) => true,
         Some(ToolMode::Allow) if !hints.destructive => false,
@@ -679,7 +679,7 @@ fn vouch_read_only(tool: &mut Value) {
 
 /// Whether a tool's input schema is small enough to offer the model. A tool
 /// without a schema is fine: the default one is used.
-fn schema_within_limit(tool: &Value) -> bool {
+pub(crate) fn schema_within_limit(tool: &Value) -> bool {
     match tool.get("inputSchema") {
         None => true,
         Some(schema) => {
@@ -767,7 +767,7 @@ pub struct PinnedAddresses {
 }
 
 /// The system resolver, as the lookup [`resolve_checked`] uses in production.
-async fn system_lookup(host: String, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+pub(crate) async fn system_lookup(host: String, port: u16) -> std::io::Result<Vec<SocketAddr>> {
     Ok(tokio::net::lookup_host((host.as_str(), port))
         .await?
         .collect())
@@ -811,7 +811,7 @@ where
     Ok(PinnedAddresses { host: bare, addrs })
 }
 
-fn truncate(text: &str, max: usize) -> String {
+pub(crate) fn truncate(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
@@ -934,7 +934,7 @@ impl PluginTool {
 }
 
 /// The text blocks of an MCP tool result, joined in order.
-fn result_text(result: &Value) -> String {
+pub(crate) fn result_text(result: &Value) -> String {
     result
         .get("content")
         .and_then(Value::as_array)

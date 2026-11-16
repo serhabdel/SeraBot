@@ -21,6 +21,7 @@ use tracing::{info, warn};
 
 use crate::domain::{Action, Approval, ApprovalState, Id, LlmMessage};
 use crate::error::{Result, SeraError};
+use crate::github_connector::{GithubConnector, TOOL_PREFIX as GITHUB_PREFIX};
 use crate::plugin_runtime::{PREFIX as PLUGIN_PREFIX, PluginTools};
 use crate::policy::Policy;
 use crate::store::Store;
@@ -307,6 +308,8 @@ pub struct Gateway {
     /// Per-user plugin tools (`plugin.<slug>.<tool>`). They are not in the
     /// registry: each user sees only the plugins they have enabled.
     plugins: Option<PluginTools>,
+    /// The native GitHub connector's tools (`github.<tool>`), per user.
+    github: Option<GithubConnector>,
 }
 
 impl Gateway {
@@ -327,6 +330,7 @@ impl Gateway {
             vault: None,
             resolved: Arc::default(),
             plugins: None,
+            github: None,
         }
     }
 
@@ -336,14 +340,23 @@ impl Gateway {
         self
     }
 
-    /// Specs for the user's enabled plugin tools. Each one is also added to
-    /// `context.allowed_tools`, so the turn and any approval resume can run it.
-    /// Empty when no plugin runtime is wired.
+    /// Serve the native GitHub connector's tools to the members signed in to it.
+    pub fn with_github(mut self, github: GithubConnector) -> Self {
+        self.github = Some(github);
+        self
+    }
+
+    /// Specs for the user's enabled plugin tools and native GitHub tools. Each
+    /// one is also added to `context.allowed_tools`, so the turn and any
+    /// approval resume can run it. Empty when no runtime is wired.
     pub async fn enable_plugin_tools(&self, context: &mut ToolContext) -> Vec<ToolSpec> {
-        let Some(plugins) = &self.plugins else {
-            return Vec::new();
+        let mut specs = match &self.plugins {
+            Some(plugins) => plugins.specs_for(&context.user_id).await,
+            None => Vec::new(),
         };
-        let specs = plugins.specs_for(&context.user_id).await;
+        if let Some(github) = &self.github {
+            specs.extend(github.specs_for(&context.user_id).await);
+        }
         context
             .allowed_tools
             .extend(specs.iter().map(|spec| spec.name.clone()));
@@ -359,10 +372,15 @@ impl Gateway {
     /// One line per marketplace app the user enabled that could not be used on
     /// their last turn, such as "Canva needs sign-in".
     pub fn plugin_notes(&self, user_id: &str) -> Vec<String> {
-        self.plugins
+        let mut notes = self
+            .plugins
             .as_ref()
             .map(|plugins| plugins.notes_for(user_id))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if let Some(github) = &self.github {
+            notes.extend(github.notes_for(user_id));
+        }
+        notes
     }
 
     /// The tool for `name`: a registered tool, or for a `plugin.` name, the
@@ -370,6 +388,12 @@ impl Gateway {
     async fn resolve_tool(&self, name: &str, user_id: &str) -> Option<Arc<dyn Tool>> {
         if let Some(tool) = self.registry.get(name) {
             return Some(tool);
+        }
+        if let Some(github) = &self.github
+            && name.starts_with(GITHUB_PREFIX)
+        {
+            let tool = github.tool_for(user_id, name).await?;
+            return Some(Arc::new(tool));
         }
         if !name.starts_with(PLUGIN_PREFIX) {
             return None;

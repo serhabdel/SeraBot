@@ -19,6 +19,7 @@ mod composio_api;
 mod desktop_tabs_api;
 mod digest_api;
 mod files_api;
+mod github_connector_api;
 mod handoffs_api;
 mod jobs_api;
 mod logs_api;

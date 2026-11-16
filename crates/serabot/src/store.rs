@@ -92,6 +92,18 @@ pub struct MarketplaceAccount {
     pub created_at: String,
 }
 
+/// One member's native GitHub connection (no token; tokens are sealed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GithubConnection {
+    pub login: String,
+    pub gh_user_id: i64,
+    /// `connected`, `expired` or `needs_sign_in`.
+    pub state: String,
+    pub access_expires_at: Option<String>,
+    pub refresh_expires_at: Option<String>,
+    pub updated_at: String,
+}
+
 /// Fixed admin id written by migration 0008 and mirrored in
 /// `kv['admin_user_id']`. Code resolves the admin through the kv entry (the
 /// database is the source of truth); this constant documents the value and
@@ -4932,6 +4944,96 @@ impl Store {
         let changed = connection.execute(
             "DELETE FROM marketplace_installs WHERE user_id = ?1 AND slug = ?2",
             params![user_id, slug],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// The caller's native GitHub connection (no token), if any.
+    pub fn github_connector(&self, user_id: &str) -> Result<Option<GithubConnection>> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT login, gh_user_id, state, access_expires_at, refresh_expires_at, updated_at
+                 FROM github_connector WHERE user_id = ?1",
+                params![user_id],
+                |row| {
+                    Ok(GithubConnection {
+                        login: row.get(0)?,
+                        gh_user_id: row.get(1)?,
+                        state: row.get(2)?,
+                        access_expires_at: row.get(3)?,
+                        refresh_expires_at: row.get(4)?,
+                        updated_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Record a finished GitHub sign-in for the caller, replacing any earlier one.
+    pub fn github_connector_put(
+        &self,
+        user_id: &str,
+        login: &str,
+        gh_user_id: i64,
+        access_expires_at: Option<&str>,
+        refresh_expires_at: Option<&str>,
+    ) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO github_connector(user_id, login, gh_user_id, state,
+                 access_expires_at, refresh_expires_at, updated_at)
+             VALUES (?1, ?2, ?3, 'connected', ?4, ?5, ?6)
+             ON CONFLICT(user_id) DO UPDATE SET
+                 login = excluded.login, gh_user_id = excluded.gh_user_id,
+                 state = 'connected', access_expires_at = excluded.access_expires_at,
+                 refresh_expires_at = excluded.refresh_expires_at,
+                 updated_at = excluded.updated_at",
+            params![
+                user_id,
+                login,
+                gh_user_id,
+                access_expires_at,
+                refresh_expires_at,
+                now_string()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record new token lifetimes after a refresh and mark the login connected.
+    pub fn github_connector_refreshed(
+        &self,
+        user_id: &str,
+        access_expires_at: Option<&str>,
+        refresh_expires_at: Option<&str>,
+    ) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE github_connector SET state = 'connected', access_expires_at = ?1,
+                 refresh_expires_at = ?2, updated_at = ?3 WHERE user_id = ?4",
+            params![access_expires_at, refresh_expires_at, now_string(), user_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Set the caller's GitHub state (`connected`, `expired`, `needs_sign_in`).
+    /// The login stays, so the member sees who they were signed in as.
+    pub fn github_connector_set_state(&self, user_id: &str, state: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE github_connector SET state = ?1, updated_at = ?2 WHERE user_id = ?3",
+            params![state, now_string(), user_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Remove the caller's GitHub connection row. `false` when there was none.
+    pub fn github_connector_delete(&self, user_id: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "DELETE FROM github_connector WHERE user_id = ?1",
+            params![user_id],
         )?;
         Ok(changed == 1)
     }

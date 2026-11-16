@@ -89,6 +89,38 @@ pub struct ConnectorsConfig {
     pub notion: NotionConnectorConfig,
     #[serde(default)]
     pub agentmail: AgentMailConnectorConfig,
+    #[serde(default)]
+    pub github: GithubConnectorConfig,
+}
+
+/// The native GitHub connector (v0.51): a GitHub App signed in with the device
+/// flow. The client id is public, so it lives here; no client secret is used.
+/// Without an id the connector reports "not configured".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GithubConnectorConfig {
+    #[serde(default)]
+    pub app_client_id: String,
+}
+
+impl GithubConnectorConfig {
+    pub fn configured(&self) -> bool {
+        !self.app_client_id.trim().is_empty()
+    }
+
+    fn validate(&self) -> Result<()> {
+        let id = self.app_client_id.trim();
+        let ok = id.len() <= 64
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+        if !ok {
+            return Err(SeraError::Config(
+                "connectors.github.app_client_id must be 64 or fewer letters, digits, '.', '_' or '-'"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl ConnectorsConfig {
@@ -118,6 +150,7 @@ impl ConnectorsConfig {
         self.outlook_calendar.validate_enabled()?;
         self.notion.validate_enabled()?;
         self.agentmail.validate_enabled()?;
+        self.github.validate()?;
         Ok(())
     }
 

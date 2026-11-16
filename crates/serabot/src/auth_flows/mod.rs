@@ -161,6 +161,8 @@ pub struct TokenSet {
     pub expires_in: Option<u64>,
     /// An OpenID Connect identity token, when the provider sent one.
     pub id_token: Option<String>,
+    /// Seconds the refresh token lives, when the provider says (GitHub does).
+    pub refresh_expires_in: Option<u64>,
 }
 
 impl std::fmt::Debug for TokenSet {
@@ -192,6 +194,10 @@ impl TokenSet {
                 .and_then(Value::as_u64)
                 .filter(|seconds| *seconds > 0),
             id_token: text("id_token"),
+            refresh_expires_in: value
+                .get("refresh_token_expires_in")
+                .and_then(Value::as_u64)
+                .filter(|seconds| *seconds > 0),
         })
     }
 

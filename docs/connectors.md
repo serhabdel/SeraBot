@@ -95,6 +95,22 @@ Tools: `github_search_repos`, `github_list_issues`, `github_get_issue`,
 `github_get_file` (read) and `github_create_issue`, `github_comment_issue`
 (write, approval).
 
+**Sign in with GitHub (v0.51, native).** When the owner sets
+`[connectors.github] app_client_id` (the client id of a GitHub App with the
+device flow enabled; it is public and no client secret is used), the GitHub
+card offers "Sign in with GitHub": `POST /v1/connectors/github/device/start`
+returns a code to type at `github.com/login/device`, and
+`GET /v1/connectors/github/device/status` reports the result. Tokens are sealed
+per member (`connector.github`) and refreshed ten minutes before they expire,
+one refresh at a time; if GitHub rejects the refresh the card shows "expired"
+and keeps the login. Tools come from GitHub's hosted MCP server and are named
+`github.<tool>`: read-only tools run without approval, every other tool asks,
+bound to the repository and arguments, and results are untrusted data.
+`DELETE /v1/connectors/github/native` removes the tokens and returns the app's
+connections page (`manage_url`) to revoke the authorization on GitHub. Without
+a client id the card says "not configured". The pasted token below stays as the
+fallback and keeps the `github_*` tool names.
+
 1. Open <https://github.com/settings/personal-access-tokens/new> and create a
    **fine-grained personal access token**.
 2. Under **Repository access**, choose only the repositories your bots need.

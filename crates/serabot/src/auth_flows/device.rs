@@ -194,6 +194,17 @@ impl DeviceSpec {
 
 /// Map one token-endpoint answer to a poll result.
 fn classify_poll(status: u16, value: &Value, body: &[u8]) -> DevicePoll {
+    // GitHub answers a pending or finished-with-error poll with HTTP 200 and
+    // an `error` field. A 2xx body with an error and no token is read as the
+    // 400 it stands for.
+    let status = if (200..300).contains(&status)
+        && value.get("error").is_some()
+        && value.get("access_token").is_none()
+    {
+        400
+    } else {
+        status
+    };
     if (200..300).contains(&status) {
         return match TokenSet::from_body(body) {
             Ok(tokens) => DevicePoll::Done(tokens),
@@ -414,6 +425,23 @@ mod tests {
         assert!(matches!(
             answer(200, r#"{"nope":1}"#),
             DevicePoll::Failed("bad_token_reply")
+        ));
+        // GitHub reports these with HTTP 200.
+        assert!(matches!(
+            answer(200, r#"{"error":"authorization_pending"}"#),
+            DevicePoll::Pending
+        ));
+        assert!(matches!(
+            answer(200, r#"{"error":"slow_down"}"#),
+            DevicePoll::SlowDown
+        ));
+        assert!(matches!(
+            answer(200, r#"{"error":"expired_token"}"#),
+            DevicePoll::Expired
+        ));
+        assert!(matches!(
+            answer(200, r#"{"error":"access_denied"}"#),
+            DevicePoll::Denied
         ));
     }
 }

@@ -703,6 +703,8 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     )?;
     serabot::vault::register_vault_tools(&mut registry, users.clone(), policy.clone())?;
     serabot::cards::register_card_tools(&mut registry, store.clone(), policy.clone())?;
+    let plugin_catalog = serabot::marketplace::load_catalog_with_builtin(&config.path("plugins")).0;
+    serabot::marketplace_suggest::register(&mut registry, store.clone(), plugin_catalog.clone())?;
     serabot::tools::register_pdf_tools(
         &mut registry,
         artifacts.clone(),
@@ -1016,8 +1018,13 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     .with_plugin_tools(serabot::plugin_runtime::PluginTools::new(
         store.clone(),
         users.clone(),
-        serabot::marketplace::load_catalog_with_builtin(&config.path("plugins")).0,
-    ));
+        plugin_catalog,
+    ))
+    .with_github(serabot::github_connector::GithubConnector::new(
+        store.clone(),
+        users.clone(),
+        &config.connectors.github.app_client_id,
+    )?);
 
     let runtime = Runtime::with_fleet(
         config.clone(),
