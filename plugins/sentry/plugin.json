@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 2,
+  "slug": "sentry",
+  "name": "Sentry",
+  "tagline": "Look into errors and releases in Sentry.",
+  "description": "Search issues and events, read issue details and releases in Sentry. Sign in with your own account in the browser; the tokens are sealed for you alone. Writes ask for approval.",
+  "category": "developer",
+  "iconUrl": "https://sentry.io/favicon.ico",
+  "version": "1.1.0",
+  "minServerVersion": "0.51.0",
+  "prompts": [
+    {
+      "id": "sentry-0",
+      "text": "What are the most frequent unresolved errors this week?"
+    }
+  ],
+  "apps": [
+    {
+      "id": "errors",
+      "name": "Errors",
+      "server": {
+        "transport": "http",
+        "url": "https://mcp.sentry.dev/mcp"
+      },
+      "auth": [
+        {
+          "id": "signin",
+          "kind": "oauth",
+          "fields": [],
+          "oauth": {
+            "scopes": [],
+            "usesCimd": false
+          }
+        }
+      ],
+      "tools": {
+        "readOnly": [
+          "whoami",
+          "find_organizations",
+          "find_projects",
+          "find_teams",
+          "find_releases",
+          "get_issue_details",
+          "get_trace_details",
+          "search_events",
+          "search_issues"
+        ]
+      },
+      "accounts": {
+        "multiple": false
+      }
+    }
+  ],
+  "permissions": {
+    "egress": [
+      "mcp.sentry.dev"
+    ]
+  },
+  "websiteUrl": "https://sentry.io",
+  "privacyPolicyUrl": "https://sentry.io/privacy/",
+  "termsUrl": "https://sentry.io/terms/"
+}

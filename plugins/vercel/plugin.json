@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 2,
+  "slug": "vercel",
+  "name": "Vercel",
+  "tagline": "Inspect Vercel projects and deployments.",
+  "description": "Read projects, deployments, build and runtime logs and Vercel documentation. Sign in with your own account in the browser; the tokens are sealed for you alone. Writes ask for approval.",
+  "category": "developer",
+  "iconUrl": "https://vercel.com/favicon.ico",
+  "version": "1.1.0",
+  "minServerVersion": "0.51.0",
+  "prompts": [
+    {
+      "id": "vercel-0",
+      "text": "Why did the latest deployment fail?"
+    }
+  ],
+  "apps": [
+    {
+      "id": "deployments",
+      "name": "Deployments",
+      "server": {
+        "transport": "http",
+        "url": "https://mcp.vercel.com"
+      },
+      "auth": [
+        {
+          "id": "signin",
+          "kind": "oauth",
+          "fields": [],
+          "oauth": {
+            "scopes": [],
+            "usesCimd": true
+          }
+        }
+      ],
+      "tools": {
+        "readOnly": [
+          "search_vercel_documentation",
+          "list_teams",
+          "list_projects",
+          "get_project",
+          "list_deployments",
+          "get_deployment",
+          "get_deployment_build_logs",
+          "get_runtime_logs",
+          "check_domain_availability_and_price"
+        ]
+      },
+      "accounts": {
+        "multiple": false
+      }
+    }
+  ],
+  "permissions": {
+    "egress": [
+      "mcp.vercel.com"
+    ]
+  },
+  "websiteUrl": "https://vercel.com",
+  "privacyPolicyUrl": "https://vercel.com/legal/privacy-policy",
+  "termsUrl": "https://vercel.com/legal/terms"
+}

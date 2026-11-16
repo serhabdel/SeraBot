@@ -7,10 +7,10 @@
 //! only secret text on the client is what the user types into a form, and it
 //! is cleared as soon as it is sent.
 //!
-//! Plugins cannot be called yet, and the shipped catalog uses placeholder
-//! hosts (`*.example.invalid`). Install and Enable stay off until both are
-//! true for that plugin, so a click cannot end at a plugin that looks on and
-//! does nothing. Disable and Uninstall stay available so an install made
+//! Plugins on real `http` hosts can be called through the approval-gated
+//! runtime; some shipped manifests still use placeholder hosts
+//! (`*.example.invalid`). Install and Enable stay off for those, so a click
+//! cannot end at a plugin that looks on and does nothing. Disable and Uninstall stay available so an install made
 //! through the API can still be turned off and removed.
 
 use serde::Deserialize;

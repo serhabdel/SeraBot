@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 2,
+  "slug": "context7",
+  "name": "Context7",
+  "tagline": "Current library documentation for coding questions.",
+  "description": "Look up up-to-date documentation and code examples for libraries and frameworks. Sign in with your own account in the browser; the tokens are sealed for you alone.",
+  "category": "developer",
+  "iconUrl": "https://context7.com/favicon.ico",
+  "version": "1.1.0",
+  "minServerVersion": "0.51.0",
+  "prompts": [
+    {
+      "id": "context7-0",
+      "text": "Show the current docs for this library's routing API."
+    }
+  ],
+  "apps": [
+    {
+      "id": "docs",
+      "name": "Documentation",
+      "server": {
+        "transport": "http",
+        "url": "https://mcp.context7.com/mcp"
+      },
+      "auth": [
+        {
+          "id": "signin",
+          "kind": "oauth",
+          "fields": [],
+          "oauth": {
+            "scopes": [],
+            "usesCimd": false
+          }
+        }
+      ],
+      "tools": {
+        "readOnly": [
+          "resolve-library-id",
+          "get-library-docs",
+          "query-docs"
+        ]
+      },
+      "accounts": {
+        "multiple": false
+      }
+    }
+  ],
+  "permissions": {
+    "egress": [
+      "mcp.context7.com"
+    ]
+  },
+  "websiteUrl": "https://context7.com",
+  "privacyPolicyUrl": "https://context7.com/privacy",
+  "termsUrl": "https://context7.com/terms"
+}

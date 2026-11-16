@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 2,
+  "slug": "posthog",
+  "name": "PostHog",
+  "tagline": "Query product analytics in PostHog.",
+  "description": "Ask about insights, dashboards, feature flags and events in PostHog. Sign in with your own account in the browser; the tokens are sealed for you alone. Writes ask for approval.",
+  "category": "analytics",
+  "iconUrl": "https://posthog.com/favicon.ico",
+  "version": "1.1.0",
+  "minServerVersion": "0.51.0",
+  "prompts": [
+    {
+      "id": "posthog-0",
+      "text": "How did signups change over the last 30 days?"
+    }
+  ],
+  "apps": [
+    {
+      "id": "analytics",
+      "name": "Analytics",
+      "server": {
+        "transport": "http",
+        "url": "https://mcp.posthog.com/mcp"
+      },
+      "auth": [
+        {
+          "id": "signin",
+          "kind": "oauth",
+          "fields": [],
+          "oauth": {
+            "scopes": [],
+            "usesCimd": false
+          }
+        }
+      ],
+      "accounts": {
+        "multiple": false
+      }
+    }
+  ],
+  "permissions": {
+    "egress": [
+      "mcp.posthog.com"
+    ]
+  },
+  "websiteUrl": "https://posthog.com",
+  "privacyPolicyUrl": "https://posthog.com/privacy",
+  "termsUrl": "https://posthog.com/terms"
+}

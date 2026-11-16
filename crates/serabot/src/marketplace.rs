@@ -439,6 +439,30 @@ fn check_app_v2(app: &App, v2: bool, egress: &[String]) -> Result<()> {
 
 const BUILTIN_MANIFESTS: &[(&str, &str)] = &[
     (
+        "atlassian",
+        include_str!("../../../plugins/atlassian/plugin.json"),
+    ),
+    (
+        "context7",
+        include_str!("../../../plugins/context7/plugin.json"),
+    ),
+    (
+        "posthog",
+        include_str!("../../../plugins/posthog/plugin.json"),
+    ),
+    (
+        "sentry",
+        include_str!("../../../plugins/sentry/plugin.json"),
+    ),
+    (
+        "stripe",
+        include_str!("../../../plugins/stripe/plugin.json"),
+    ),
+    (
+        "vercel",
+        include_str!("../../../plugins/vercel/plugin.json"),
+    ),
+    (
         "brave-search",
         include_str!("../../../plugins/brave-search/plugin.json"),
     ),
@@ -758,13 +782,13 @@ mod tests {
     }
 
     #[test]
-    fn the_repository_catalog_loads_with_ten_valid_plugins() {
+    fn the_repository_catalog_loads_with_sixteen_valid_plugins() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
         let (plugins, problems) = load_catalog(&root);
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(
             plugins.len(),
-            10,
+            16,
             "{:?}",
             plugins.iter().map(|p| &p.slug).collect::<Vec<_>>()
         );
@@ -790,20 +814,26 @@ mod tests {
     }
 
     #[test]
-    fn builtin_catalog_parses_all_ten_shipped_manifests() {
+    fn builtin_catalog_parses_all_sixteen_shipped_manifests() {
         let builtin = builtin_catalog();
-        assert_eq!(builtin.len(), 10);
+        assert_eq!(builtin.len(), 16);
         let slugs: Vec<&str> = builtin.iter().map(|p| p.slug.as_str()).collect();
         for expected in [
+            "atlassian",
             "brave-search",
+            "context7",
             "elevenlabs",
             "exa",
             "firecrawl",
             "github",
             "linear",
             "notion",
+            "posthog",
             "resend",
+            "sentry",
+            "stripe",
             "tavily",
+            "vercel",
             "workspace-files",
         ] {
             assert!(slugs.contains(&expected), "missing built-in {expected}");
@@ -814,17 +844,82 @@ mod tests {
         assert_eq!(builtin, sorted);
     }
 
+    /// Real remote MCP hosts shipped from v0.51: slug, MCP URL host.
+    const REAL_HOSTS: &[(&str, &str)] = &[
+        ("atlassian", "mcp.atlassian.com"),
+        ("context7", "mcp.context7.com"),
+        ("linear", "mcp.linear.app"),
+        ("notion", "mcp.notion.com"),
+        ("posthog", "mcp.posthog.com"),
+        ("sentry", "mcp.sentry.dev"),
+        ("stripe", "mcp.stripe.com"),
+        ("vercel", "mcp.vercel.com"),
+    ];
+
     #[test]
-    fn load_catalog_with_builtin_returns_all_ten_when_dir_is_missing_or_empty() {
+    fn real_host_manifests_are_oauth_https_and_egress_listed() {
+        let builtin = builtin_catalog();
+        for (slug, host) in REAL_HOSTS {
+            let manifest = builtin.iter().find(|p| p.slug == *slug).expect(slug);
+            assert_eq!(manifest.schema_version, 2, "{slug}");
+            assert_eq!(
+                manifest.permissions.egress,
+                vec![host.to_string()],
+                "{slug}"
+            );
+            let raw = serde_json::to_string(manifest).unwrap();
+            assert!(!raw.contains("example.invalid"), "{slug}");
+            let [app] = manifest.apps.as_slice() else {
+                panic!("{slug}: one app");
+            };
+            let Server::Http { url } = &app.server else {
+                panic!("{slug}: http transport");
+            };
+            let parsed = url::Url::parse(url).unwrap();
+            assert_eq!(parsed.scheme(), "https", "{slug}");
+            assert_eq!(parsed.host_str(), Some(*host), "{slug}");
+            // Sign-in only: no pasted secret, no link-out.
+            assert_eq!(app.auth.len(), 1, "{slug}");
+            assert_eq!(app.auth[0].kind, AuthKind::Oauth, "{slug}");
+            assert!(app.auth[0].fields.is_empty(), "{slug}");
+        }
+    }
+
+    #[test]
+    fn vouched_read_only_tools_are_reads_and_stripe_offers_only_reads() {
+        let builtin = builtin_catalog();
+        for (slug, _) in REAL_HOSTS {
+            let manifest = builtin.iter().find(|p| p.slug == *slug).unwrap();
+            let Some(tools) = &manifest.apps[0].tools else {
+                continue;
+            };
+            for name in &tools.read_only {
+                for verb in [
+                    "create", "update", "delete", "remove", "deploy", "add", "edit", "write",
+                    "send", "refund", "cancel",
+                ] {
+                    let words: Vec<&str> = name.split(['_', '-']).collect();
+                    assert!(!words.contains(&verb), "{slug}: {name} looks like a write");
+                }
+            }
+            if *slug == "stripe" {
+                assert!(!tools.allow.is_empty());
+                assert_eq!(tools.allow, tools.read_only);
+            }
+        }
+    }
+
+    #[test]
+    fn load_catalog_with_builtin_returns_all_sixteen_when_dir_is_missing_or_empty() {
         let missing = std::path::Path::new("/nonexistent/serabot-plugins-dir-xyz");
         let (plugins, problems) = load_catalog_with_builtin(missing);
         assert!(problems.is_empty(), "{problems:?}");
-        assert_eq!(plugins.len(), 10);
+        assert_eq!(plugins.len(), 16);
 
         let empty = tempfile::tempdir().unwrap();
         let (plugins, problems) = load_catalog_with_builtin(empty.path());
         assert!(problems.is_empty(), "{problems:?}");
-        assert_eq!(plugins.len(), 10);
+        assert_eq!(plugins.len(), 16);
     }
 
     #[test]
@@ -843,7 +938,7 @@ mod tests {
 
         let (plugins, problems) = load_catalog_with_builtin(dir.path());
         assert!(problems.is_empty(), "{problems:?}");
-        assert_eq!(plugins.len(), 10);
+        assert_eq!(plugins.len(), 16);
         let tavily = plugins.iter().find(|p| p.slug == "tavily").unwrap();
         assert_eq!(tavily.name, "Custom Tavily Override");
     }

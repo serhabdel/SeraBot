@@ -602,7 +602,7 @@ mod tests {
         };
         let (plugins, problems) = load(&config);
         assert!(problems.is_empty(), "{problems:?}");
-        assert_eq!(plugins.len(), 10);
+        assert_eq!(plugins.len(), 16);
     }
 
     #[tokio::test]
@@ -703,6 +703,6 @@ mod tests {
             .unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         let plugins = body["plugins"].as_array().unwrap();
-        assert_eq!(plugins.len(), 10);
+        assert_eq!(plugins.len(), 16);
     }
 }

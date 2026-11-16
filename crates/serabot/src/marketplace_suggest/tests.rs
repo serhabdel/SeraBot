@@ -237,7 +237,15 @@ fn only_runnable_apps_count() {
     assert_eq!(runnable(by_slug("poster-studio")), Some("sign_in"));
     assert_eq!(runnable(by_slug("poster-placeholder")), None);
     assert_eq!(runnable(by_slug("poster-link")), None);
-    // The shipped manifests are all placeholders today, so none is suggested.
+    // Only the shipped manifests on real hosts (v0.51) are suggested; the rest
+    // are placeholders.
     let (shipped, _) = crate::marketplace::load_catalog_with_builtin(std::path::Path::new("none"));
-    assert!(shipped.iter().all(|manifest| runnable(manifest).is_none()));
+    for manifest in &shipped {
+        let real = manifest
+            .permissions
+            .egress
+            .iter()
+            .all(|h| !h.ends_with(".invalid"));
+        assert_eq!(runnable(manifest).is_some(), real, "{}", manifest.slug);
+    }
 }

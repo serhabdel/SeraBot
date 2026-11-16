@@ -18,8 +18,11 @@ in passing:
 
 - Local-program (`stdio`) plugins are not runnable; do not add a local-process
   plugin runner without a new security design.
-- The shipped manifests under `plugins/` use placeholder hosts
-  (`*.example.invalid`). They are not real services.
+- Shipped manifests under `plugins/` on real hosts (v0.51: linear, notion,
+  sentry, vercel, stripe (read-only tools), posthog, context7, atlassian) are
+  schema v2 `oauth` and run through the approval-gated runtime. They are not
+  verified until the owner signs in and runs them. The rest of the shipped
+  manifests (`*.example.invalid`) are still placeholders, not real services.
 - `RUNTIME_CALLS_PLUGINS` in `crates/serabot-desktop/src/marketplace.rs` is
   `true` for live `http` MCP plugins. Placeholder hosts (`*.example.invalid`)
   and local-program (`stdio`) plugins stay off. Do not offer those actions, and
