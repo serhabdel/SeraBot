@@ -174,7 +174,7 @@ const PRESETS: &[ProviderPreset] = &[
         base_url: "https://api.minimax.io/v1",
         kind: "minimax",
         default_id: "minimax",
-        models: &["MiniMax-M3.1-Flash", "MiniMax-M3", "MiniMax-Text-01"],
+        models: &["MiniMax-M3", "MiniMax-M3.1-Flash"],
         secret_name: "minimax_m_plan_key",
         catalog_fetch: true,
         auth: "api_key",
@@ -191,7 +191,7 @@ const PRESETS: &[ProviderPreset] = &[
         base_url: "https://api.minimaxi.com/v1",
         kind: "minimax-cn",
         default_id: "minimax-cn",
-        models: &["MiniMax-M3.1-Flash", "MiniMax-M3"],
+        models: &["MiniMax-M3", "MiniMax-M3.1-Flash"],
         secret_name: "minimax_cn_api_key",
         catalog_fetch: true,
         auth: "api_key",
@@ -204,41 +204,24 @@ const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "mistral",
         label: "Mistral AI",
-        subtitle: "Mistral Large, Magistral, Codestral, Ministral, Pixtral & open models",
+        subtitle: "Mistral Large 4 and Mistral Small",
         base_url: "https://api.mistral.ai/v1",
         kind: "mistral",
         default_id: "mistral",
-        // Static fallback list of well-known stable model ids. The live
-        // /models fetch (catalog_fetch) is authoritative; this list only
-        // prefills the form when the catalog is not fetched.
+        // Static fallback list of ids confirmed on Mistral's model pages
+        // (2026-11). Ministral 3 ids are not confirmed, so they are left out.
+        // The live /models fetch (catalog_fetch) is authoritative; this list
+        // only prefills the form when the catalog is not fetched.
         models: &[
-            "mistral-large-latest",
-            "mistral-large-2411",
-            "magistral-medium-latest",
-            "magistral-small-latest",
-            "codestral-latest",
-            "codestral-2501",
-            "ministral-8b-latest",
-            "ministral-3b-latest",
-            "ministral-14b-latest",
-            "devstral-small-latest",
-            "devstral-medium-latest",
-            "mistral-medium-latest",
+            "mistral-large-4",
+            "mistral-small-2603",
             "mistral-small-latest",
-            "pixtral-large-latest",
-            "pixtral-12b-latest",
-            "open-mistral-nemo",
-            "open-mistral-7b",
-            "open-mixtral-8x7b",
-            "open-mixtral-8x22b",
-            "mistral-embed",
-            "mistral-moderation-latest",
         ],
         secret_name: "mistral_api_key",
         catalog_fetch: true,
         auth: "api_key",
         badge: "API Key",
-        note: "Mistral Large, Magistral, Codestral, Ministral, Pixtral & open models",
+        note: "Mistral Large 4 and Mistral Small",
         key_url: "https://console.mistral.ai/api-keys",
         sign_in: "",
         risk: "",
@@ -246,32 +229,33 @@ const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "openai",
         label: "OpenAI",
-        subtitle: "GPT-6, GPT-5.6, GPT-4o & o-series reasoning",
+        subtitle: "GPT-6, GPT-5.6, GPT-5 and gpt-oss",
         base_url: "https://api.openai.com/v1",
         kind: "openai",
         default_id: "openai",
-        // Static fallback list; the live /models fetch is authoritative.
+        // Static fallback list (OpenAI's current models page); the default,
+        // gpt-6.1-sol, comes first. The live /models fetch is authoritative.
         models: &[
-            "gpt-6-astra",
             "gpt-6.1-sol",
+            "gpt-6-astra",
             "gpt-6.1-terra",
             "gpt-6-luna",
             "gpt-6-sol",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
             "gpt-5.6-luna",
+            "gpt-5.5",
             "gpt-5.4",
-            "gpt-4o",
-            "gpt-4o-mini",
-            "o3",
-            "o3-mini",
-            "o4-mini",
+            "gpt-5.4-mini",
+            "gpt-5.2",
+            "gpt-oss-120b",
+            "gpt-oss-20b",
         ],
         secret_name: "openai_api_key",
         catalog_fetch: true,
         auth: "api_key",
         badge: "API Key",
-        note: "GPT-6, GPT-5.6, GPT-4o & o-series reasoning",
+        note: "GPT-6, GPT-5.6, GPT-5 and gpt-oss",
         key_url: "https://platform.openai.com/api-keys",
         sign_in: "",
         risk: "",
@@ -283,12 +267,9 @@ const PRESETS: &[ProviderPreset] = &[
         base_url: "https://openrouter.ai/api/v1",
         kind: "openrouter",
         default_id: "openrouter",
-        models: &[
-            "anthropic/claude-sonnet-5.5",
-            "openai/gpt-6.1-sol",
-            "google/gemini-3.8-flash",
-            "deepseek/deepseek-v4-pro",
-        ],
+        // Only the auto router is confirmed; the live /models fetch lists
+        // the rest.
+        models: &["openrouter/auto"],
         secret_name: "openrouter_api_key",
         catalog_fetch: true,
         auth: "api_key",
@@ -301,20 +282,23 @@ const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "groq",
         label: "Groq",
-        subtitle: "Ultra-fast LPU inference for Llama & Qwen",
+        subtitle: "Ultra-fast LPU inference for gpt-oss & Llama",
         base_url: "https://api.groq.com/openai/v1",
         kind: "groq",
         default_id: "groq",
+        // Production models only; Groq's preview models come from the live
+        // /models fetch.
         models: &[
+            "openai/gpt-oss-120b",
+            "openai/gpt-oss-20b",
             "llama-3.3-70b-versatile",
             "llama-3.1-8b-instant",
-            "qwen-qwq-32b",
         ],
         secret_name: "groq_api_key",
         catalog_fetch: true,
         auth: "api_key",
         badge: "API Key",
-        note: "Ultra-fast LPU inference for Llama & Qwen",
+        note: "Ultra-fast LPU inference for gpt-oss & Llama",
         key_url: "https://console.groq.com/keys",
         sign_in: "",
         risk: "",
@@ -322,16 +306,25 @@ const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "xai",
         label: "xAI (Grok)",
-        subtitle: "Grok 3 & Grok 3 Mini API",
+        subtitle: "Grok 4.x API",
         base_url: "https://api.x.ai/v1",
         kind: "xai",
         default_id: "xai",
-        models: &["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"],
+        models: &[
+            "grok-4.7",
+            "grok-4.6",
+            "grok-4.5",
+            "grok-4.3",
+            "grok-4.20-0309-reasoning",
+            "grok-4.20-0309-non-reasoning",
+            "grok-4.20-multi-agent-0309",
+            "grok-build-0.1",
+        ],
         secret_name: "xai_api_key",
         catalog_fetch: true,
         auth: "api_key",
         badge: "API Key",
-        note: "Grok 3 & Grok 3 Mini API",
+        note: "Grok 4.x API",
         key_url: "https://console.x.ai",
         sign_in: "",
         risk: "",
@@ -339,16 +332,16 @@ const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "moonshot",
         label: "Moonshot (Kimi)",
-        subtitle: "Kimi K2 & Moonshot v1 long-context API",
+        subtitle: "Kimi K3 and K3.1 Pro API",
         base_url: "https://api.moonshot.ai/v1",
         kind: "moonshot",
         default_id: "moonshot",
-        models: &["kimi-k3", "kimi-k2.7-code"],
+        models: &["kimi-k3.1-pro", "kimi-k3"],
         secret_name: "moonshot_api_key",
         catalog_fetch: true,
         auth: "api_key",
         badge: "API Key",
-        note: "Kimi K2 & Moonshot v1 long-context API",
+        note: "Kimi K3 and K3.1 Pro API",
         key_url: "https://platform.moonshot.ai/console/api-keys",
         sign_in: "",
         risk: "",
@@ -360,7 +353,7 @@ const PRESETS: &[ProviderPreset] = &[
         base_url: "https://api.cerebras.ai/v1",
         kind: "cerebras",
         default_id: "cerebras",
-        models: &["llama-3.3-70b", "llama3.1-8b"],
+        models: &["gpt-oss-120b", "qwen-3.8-27b"],
         secret_name: "cerebras_api_key",
         catalog_fetch: true,
         auth: "api_key",
@@ -378,8 +371,19 @@ const PRESETS: &[ProviderPreset] = &[
         kind: "together",
         default_id: "together",
         models: &[
-            "meta-llama/Llama-3.3-70B-Instruct-Turbo",
-            "deepseek-ai/DeepSeek-R1",
+            "openai/gpt-oss-120b",
+            "moonshotai/Kimi-K3.1-Pro",
+            "moonshotai/Kimi-K3",
+            "zai-org/GLM-5.3",
+            "zai-org/GLM-5.3-Flash",
+            "zai-org/GLM-5.2",
+            "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+            "deepseek-ai/DeepSeek-V4-Pro-0813",
+            "MiniMaxAI/MiniMax-M3.1-Flash",
+            "Qwen/Qwen3.7-Max",
+            "Qwen/Qwen3.7-Plus",
+            "Qwen/Qwen3.8-Flash",
+            "Qwen/Qwen3.6-Plus",
         ],
         secret_name: "together_api_key",
         catalog_fetch: true,
@@ -397,10 +401,8 @@ const PRESETS: &[ProviderPreset] = &[
         base_url: "https://api.fireworks.ai/inference/v1",
         kind: "fireworks",
         default_id: "fireworks",
-        models: &[
-            "accounts/fireworks/models/deepseek-v3",
-            "accounts/fireworks/models/llama-v3p3-70b-instruct",
-        ],
+        // No current serverless list is confirmed; "Fetch models" fills it.
+        models: &[],
         secret_name: "fireworks_api_key",
         catalog_fetch: true,
         auth: "api_key",
@@ -417,7 +419,17 @@ const PRESETS: &[ProviderPreset] = &[
         base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
         kind: "gemini",
         default_id: "gemini",
-        models: &["gemini-3.8-flash", "gemini-3.7-flash"],
+        models: &[
+            "gemini-3.8-flash",
+            "gemini-4-argon",
+            "gemini-4-carbon",
+            "gemini-4-hydrogen",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+            "gemini-3.1-pro-preview",
+            "gemini-3-flash-preview",
+        ],
         secret_name: "gemini_api_key",
         catalog_fetch: true,
         auth: "api_key",
@@ -434,7 +446,8 @@ const PRESETS: &[ProviderPreset] = &[
         base_url: "https://api.perplexity.ai",
         kind: "perplexity",
         default_id: "perplexity",
-        models: &["sonar", "sonar-pro", "sonar-reasoning-pro"],
+        // Only sonar is confirmed; other Sonar ids come from the live fetch.
+        models: &["sonar"],
         secret_name: "perplexity_api_key",
         catalog_fetch: true,
         auth: "api_key",
@@ -451,10 +464,8 @@ const PRESETS: &[ProviderPreset] = &[
         base_url: "https://router.huggingface.co/v1",
         kind: "huggingface",
         default_id: "huggingface",
-        models: &[
-            "meta-llama/Llama-3.3-70B-Instruct",
-            "Qwen/Qwen2.5-72B-Instruct",
-        ],
+        // No current list is confirmed; "Fetch models" fills it.
+        models: &[],
         secret_name: "huggingface_api_key",
         catalog_fetch: true,
         auth: "api_key",
@@ -471,7 +482,8 @@ const PRESETS: &[ProviderPreset] = &[
         base_url: "https://api.tokenfactory.nebius.com/v1",
         kind: "nebius",
         default_id: "nebius",
-        models: &["meta-llama/Llama-3.3-70B-Instruct"],
+        // No current list is confirmed; "Fetch models" fills it.
+        models: &[],
         secret_name: "nebius_api_key",
         catalog_fetch: true,
         auth: "api_key",
@@ -488,7 +500,8 @@ const PRESETS: &[ProviderPreset] = &[
         base_url: "https://api.sambanova.ai/v1",
         kind: "sambanova",
         default_id: "sambanova",
-        models: &["Meta-Llama-3.3-70B-Instruct"],
+        // No current list is confirmed; "Fetch models" fills it.
+        models: &[],
         secret_name: "sambanova_api_key",
         catalog_fetch: true,
         auth: "api_key",
@@ -505,16 +518,22 @@ const PRESETS: &[ProviderPreset] = &[
         base_url: "https://api.anthropic.com/v1",
         kind: "anthropic",
         default_id: "anthropic",
+        // Anthropic's models overview (2026-11); the default comes first.
         models: &[
             "claude-opus-5-5",
-            "claude-fable-5-1",
+            "claude-fable-5-2",
             "claude-sonnet-5-5",
             "claude-haiku-5-5",
-            "claude-haiku-4-5",
+            "claude-fable-5-1",
+            "claude-fable-5",
             "claude-opus-5",
             "claude-sonnet-5",
             "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
             "claude-sonnet-4-6",
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5",
         ],
         secret_name: "anthropic_api_key",
         catalog_fetch: true,
@@ -546,6 +565,7 @@ const PRESETS: &[ProviderPreset] = &[
             "minimax-m3",
             "grok-4.7",
             "muse-spark-1.3-contributor",
+            "space-bunny-free",
         ],
         secret_name: "opencode_go_api_key",
         catalog_fetch: true,
@@ -578,6 +598,10 @@ const PRESETS: &[ProviderPreset] = &[
             "glm-5.3",
             "deepseek-v4-flash-free",
             "mimo-v2.6-flash-free",
+            "mimo-v2.5-free",
+            "ling-3.0-flash-fin-free",
+            "nemotron-3-ultra-free",
+            "nemotron-3.5-lightning-free",
             "muse-spark-1.3-contributor-free",
             "union-alpha",
             "jev-1.13-free",
@@ -869,19 +893,23 @@ mod tests {
             }
         }
         let mistral = preset_for("mistral").unwrap();
-        assert!(mistral.models.len() >= 20, "the fallback list grew");
-        for expected in [
-            "mistral-large-latest",
-            "ministral-14b-latest",
-            "mistral-embed",
-            "mistral-moderation-latest",
-        ] {
+        for expected in ["mistral-large-4", "mistral-small-2603"] {
             assert!(mistral.models.contains(&expected), "{expected}");
         }
         let openai = preset_for("openai").unwrap();
-        for expected in ["gpt-6.1-sol", "gpt-6-astra", "gpt-5.6-luna", "gpt-4o-mini"] {
+        assert_eq!(openai.models.first(), Some(&"gpt-6.1-sol"));
+        for expected in ["gpt-6-astra", "gpt-5.6-luna", "gpt-5.5", "gpt-oss-120b"] {
             assert!(openai.models.contains(&expected), "{expected}");
         }
+        let anthropic = preset_for("anthropic").unwrap();
+        for expected in ["claude-fable-5-2", "claude-opus-5-5", "claude-haiku-4-5"] {
+            assert!(anthropic.models.contains(&expected), "{expected}");
+        }
+        let gemini = preset_for("gemini").unwrap();
+        assert_eq!(gemini.models.first(), Some(&"gemini-3.8-flash"));
+        assert!(gemini.models.contains(&"gemini-4-argon"));
+        assert_eq!(preset_for("moonshot").unwrap().models[0], "kimi-k3.1-pro");
+        assert_eq!(preset_for("cerebras").unwrap().models.len(), 2);
     }
 
     /// The lists follow the owner's HielCowork reference (dated 2026-11-02).
@@ -891,14 +919,19 @@ mod tests {
         const RETIRED: &[&str] = &[
             "gemini-2.5-pro",
             "gemini-2.5-flash",
-            "claude-sonnet-4-5",
             "claude-opus-4",
             "gpt-5",
             "gpt-5-mini",
             "gpt-5-nano",
+            "gpt-4o",
+            "gpt-4o-mini",
+            "o3",
+            "o4-mini",
             "deepseek-chat",
             "deepseek-reasoner",
-            "gpt-oss-120b",
+            "MiniMax-Text-01",
+            "qwen-qwq-32b",
+            "mistral-large-2411",
         ];
         for preset in presets() {
             for model in preset.models {
