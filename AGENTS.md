@@ -84,7 +84,7 @@ OVH is read-only unless the owner explicitly authorizes an additive installation
 - `crates/serabot/src/analyst.rs`, `spreadsheets.rs` — document and finance analysis.
 - `crates/serabot/src/deck.rs`, `render.rs`, `maker.rs`, `onedrive.rs` — deterministic deliverables; OneDrive is per user.
 - `crates/serabot/src/marketplace.rs`, `plugin_runtime.rs`, `mcp_client.rs`, `api/marketplace.rs` — plugin catalog, per-user install state (v0.36), and per-user `http` MCP plugin tools (v0.38.0).
-- `crates/serabot-desktop/src/marketplace.rs`, `ui_marketplace.rs`, `ui_integrations.rs` — Integrations & Marketplace screen (v0.37–v0.38). Desktop Install/Enable stay off while `RUNTIME_CALLS_PLUGINS` is `false`.
+- `crates/serabot-desktop/src/marketplace.rs`, `marketplace_flow.rs`, `session/marketplace_accounts.rs`, `ui_marketplace.rs`, `ui_mcp_accounts.rs`, `ui_integrations.rs` — Integrations & Marketplace screen (v0.37–v0.38); plugin accounts, sign-in, per-tool switches and the GitHub card (v0.51). Desktop Install/Enable stay off while `RUNTIME_CALLS_PLUGINS` is `false`.
 - `plugins/` — synthetic catalog manifests. Hosts are placeholders (`*.example.invalid`).
 - `bots/` + `prompts/` — default fleet templates, seeded per user.
 - `crates/serabot/src/logging.rs` — daily files (`[logging] dir`, default `data/logs`, owner-only), redacting ring buffer, shared `DEFAULT_FILTER`; noisy transport crates stay at `warn`.

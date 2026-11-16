@@ -98,6 +98,11 @@ async fn sign_in_accounts_tool_override_sign_out_and_uninstall() {
     let url = started["authorize_url"].as_str().unwrap();
     assert!(url.contains("code_challenge_method=S256"), "{started}");
     assert!(!started.to_string().contains("verifier"), "{started}");
+    assert_eq!(
+        started["redirect_uri"],
+        crate::elevenlabs_oauth::oauth_callback_uri(),
+        "{started}"
+    );
     let state = started["state"].as_str().unwrap().to_owned();
     let stolen = call(
         &app,
@@ -142,6 +147,21 @@ async fn sign_in_accounts_tool_override_sign_out_and_uninstall() {
         detail["plugin"]["accounts"][0]["account_id"], "default",
         "{detail}"
     );
+    assert_eq!(
+        detail["plugin"]["apps"][0]["multiple_accounts"], false,
+        "{detail}"
+    );
+
+    // The tool list needs an install, and is empty without a plugin runtime.
+    let listed_tools =
+        read_json(call(&app, &first, "GET", &format!("{BASE}/tools"), None).await).await;
+    assert!(
+        listed_tools["tools"].as_array().unwrap().is_empty(),
+        "{listed_tools}"
+    );
+    let bare = member(&store, "v051-bare");
+    let refused = call(&app, &bare, "GET", &format!("{BASE}/tools"), None).await;
+    assert_eq!(refused.status(), StatusCode::NOT_FOUND);
 
     // Per-tool override: validated.
     let tool = |name: &str| format!("{BASE}/tools/{name}");

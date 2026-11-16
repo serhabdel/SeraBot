@@ -658,3 +658,39 @@ fn annotations_decide_approval_and_a_destructive_hint_cannot_be_overridden() {
     assert!(approval_needed(hurts, Some(ToolMode::Allow)));
     assert!(approval_needed(both, Some(ToolMode::Allow)));
 }
+
+#[tokio::test]
+async fn tool_rows_carry_hints_and_the_callers_own_override_only() {
+    let server = oauth_server(FIRST_TOKEN, true).await;
+    let world = world(&server);
+    // Not installed: nothing to list.
+    assert!(world.tools.tool_rows(&world.user, "fixture").await.is_err());
+    world.install();
+    // Installed but not signed in: the failure says so instead of listing.
+    assert!(world.tools.tool_rows(&world.user, "fixture").await.is_err());
+    world.sign_in().await;
+    world
+        .store
+        .marketplace_tool_mode_set(&world.user, "fixture", "post_comment", Some("allow"))
+        .unwrap();
+    let rows = world.tools.tool_rows(&world.user, "fixture").await.unwrap();
+    let find = |name: &str| rows.iter().find(|row| row.name == name).unwrap();
+    assert_eq!(rows.len(), 4);
+    assert!(find("lookup").read_only && !find("lookup").destructive);
+    assert_eq!(find("post_comment").mode.as_deref(), Some("allow"));
+    assert!(find("delete_item").destructive);
+    assert!(
+        find("liar").destructive && !find("liar").read_only,
+        "a contradictory claim is destructive"
+    );
+    assert_eq!(find("lookup").mode, None);
+    let shown = serde_json::to_string(&rows).unwrap();
+    assert!(!shown.contains(FIRST_TOKEN) && !shown.contains("synthetic-refresh"));
+    // Another member sees no override of this member's.
+    let other = world
+        .store
+        .create_user("microsoft:oauth-other", "other@example.example", "O")
+        .unwrap()
+        .id;
+    assert!(world.tools.tool_rows(&other, "fixture").await.is_err());
+}

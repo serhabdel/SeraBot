@@ -7,7 +7,7 @@
 
 use crate::ConnectorStatus;
 use crate::connector_card::{CardState, connector_card_state, legacy_connected};
-use crate::marketplace::{PluginStatus, PluginSummary};
+use crate::marketplace::{AccountState, GithubState, GithubView, PluginStatus, PluginSummary};
 use crate::theme::Tone;
 
 /// The connector whose apps the Composio tab lists. It is not an installed
@@ -229,9 +229,70 @@ pub fn connector_entry(connector: &ConnectorStatus, error: Option<&str>) -> Entr
 pub fn plugin_tone(status: PluginStatus) -> Tone {
     match status {
         PluginStatus::ComingSoon | PluginStatus::Available | PluginStatus::Installed => Tone::Muted,
-        PluginStatus::NeedsSetup => Tone::Warn,
+        PluginStatus::NeedsSetup | PluginStatus::NeedsSignIn => Tone::Warn,
         PluginStatus::Enabled => Tone::Ok,
     }
+}
+
+/// The badge tone for one plugin account: ready is green, a sign-in that must
+/// be redone is amber, and an unreachable service is red (it is not the
+/// member's doing, but it is the state that needs a look).
+pub fn account_tone(state: AccountState) -> Tone {
+    match state {
+        AccountState::Ready => Tone::Ok,
+        AccountState::NeedsSetup | AccountState::NeedsSignIn => Tone::Warn,
+        AccountState::Unreachable => Tone::Danger,
+    }
+}
+
+/// The tone of the GitHub card's badge.
+pub fn github_tone(state: GithubState) -> Tone {
+    match state {
+        GithubState::Connected => Tone::Ok,
+        GithubState::Expired => Tone::Warn,
+        GithubState::NotConfigured | GithubState::Ready => Tone::Muted,
+    }
+}
+
+/// Fold the member's native GitHub sign-in into the card list. A connected or
+/// expired sign-in puts the GitHub card in "Set up" with its own badge, even
+/// when no token is pasted; a state with nothing to show leaves the list alone.
+pub fn apply_github(list: &mut Installed, github: &GithubView) {
+    let state = github.state();
+    if !matches!(state, GithubState::Connected | GithubState::Expired) {
+        return;
+    }
+    let pill = github.badge().to_owned();
+    let tone = github_tone(state);
+    let meta = github
+        .login_line()
+        .unwrap_or_else(|| "Your account".to_owned());
+    let take = |entry: &mut Entry| {
+        entry.pill = pill.clone();
+        entry.tone = tone;
+        entry.set_up = true;
+        entry.meta = meta.clone();
+    };
+    if let Some(entry) = list
+        .set_up
+        .iter_mut()
+        .find(|entry| entry.source == Source::Connector("github".into()))
+    {
+        take(entry);
+        return;
+    }
+    for (_, cards) in &mut list.available {
+        if let Some(at) = cards
+            .iter()
+            .position(|entry| entry.source == Source::Connector("github".into()))
+        {
+            let mut entry = cards.remove(at);
+            take(&mut entry);
+            list.set_up.insert(0, entry);
+            break;
+        }
+    }
+    list.available.retain(|(_, cards)| !cards.is_empty());
 }
 
 /// The card for one marketplace plugin. A plugin counts as set up once it is
@@ -371,6 +432,57 @@ mod tests {
 
     fn no_errors(_: &str) -> Option<String> {
         None
+    }
+
+    fn github(state: &str, login: Option<&str>) -> GithubView {
+        GithubView {
+            state: state.into(),
+            configured: true,
+            login: login.map(str::to_owned),
+            pending: false,
+            manage_url: None,
+        }
+    }
+
+    #[test]
+    fn state_badges_have_a_tone_each() {
+        assert_eq!(account_tone(AccountState::Ready), Tone::Ok);
+        assert_eq!(account_tone(AccountState::NeedsSignIn), Tone::Warn);
+        assert_eq!(account_tone(AccountState::NeedsSetup), Tone::Warn);
+        assert_eq!(account_tone(AccountState::Unreachable), Tone::Danger);
+        assert_eq!(plugin_tone(PluginStatus::NeedsSignIn), Tone::Warn);
+        assert_eq!(github_tone(GithubState::Connected), Tone::Ok);
+        assert_eq!(github_tone(GithubState::Expired), Tone::Warn);
+        assert_eq!(github_tone(GithubState::Ready), Tone::Muted);
+        // The card of a plugin that needs a sign-in says so.
+        let entry = plugin_entry(&plugin("canva", true, false, "needs_sign_in"));
+        assert_eq!(
+            (entry.pill.as_str(), entry.tone, entry.set_up),
+            ("Needs sign-in", Tone::Warn, true)
+        );
+    }
+
+    #[test]
+    fn a_native_github_sign_in_moves_its_card_into_set_up() {
+        let mut list = installed(&[connector("github")], &[], &no_errors);
+        assert!(list.set_up.is_empty());
+        // Not connected (or no app): the list is left alone.
+        apply_github(&mut list, &github("ready", None));
+        assert!(list.set_up.is_empty());
+        apply_github(&mut list, &github("connected", Some("octo-cat")));
+        assert_eq!(list.set_up.len(), 1);
+        let card = &list.set_up[0];
+        assert_eq!(card.source, Source::Connector("github".into()));
+        assert_eq!(
+            (card.pill.as_str(), card.tone, card.meta.as_str()),
+            ("Connected", Tone::Ok, "@octo-cat")
+        );
+        assert!(list.available.iter().all(|(_, cards)| cards.is_empty()));
+        // An expired sign-in updates the card where it already is.
+        apply_github(&mut list, &github("expired", Some("octo-cat")));
+        assert_eq!(list.set_up.len(), 1);
+        assert_eq!(list.set_up[0].pill, "Needs sign-in");
+        assert_eq!(list.set_up[0].tone, Tone::Warn);
     }
 
     #[test]

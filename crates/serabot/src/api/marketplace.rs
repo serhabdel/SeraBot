@@ -184,6 +184,7 @@ fn detail(state: &ApiState, user: &ActingUser, manifest: &PluginManifest) -> Res
             "id": app.id,
             "name": app.name,
             "transport": transport_word(&app.server),
+            "multiple_accounts": app.accounts.as_ref().is_some_and(|rules| rules.multiple),
             "auth": auth,
         }));
     }
@@ -412,7 +413,26 @@ pub(super) async fn oauth_start(
         "authorize_url": started.authorize_url,
         "state": started.state,
         "account_id": started.account_id,
+        // The console listens here for the consent redirect.
+        "redirect_uri": crate::elevenlabs_oauth::oauth_callback_uri(),
     })))
+}
+
+/// `GET /v1/marketplace/plugins/{slug}/tools`: the tools the plugin offers this
+/// caller, with the hints and the caller's override, for the per-tool switches.
+/// Empty when this server has no plugin runtime.
+pub(super) async fn list_tools(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(slug): Path<String>,
+) -> Result<Json<Value>> {
+    find(&state, &slug)?;
+    require_install(&state, &user, &slug)?;
+    let rows = match state.runtime.gateway().plugin_tools() {
+        Some(plugins) => plugins.tool_rows(&user.id, &slug).await?,
+        None => Vec::new(),
+    };
+    Ok(Json(json!({"slug": slug, "tools": rows})))
 }
 
 /// `POST /v1/marketplace/plugins/{slug}/oauth/complete`: the code and state the

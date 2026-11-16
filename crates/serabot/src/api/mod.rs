@@ -480,6 +480,7 @@ pub fn router(state: ApiState) -> Router {
             "/v1/marketplace/plugins/{slug}/accounts/{account_id}",
             delete(delete_account),
         )
+        .route("/v1/marketplace/plugins/{slug}/tools", get(list_tools))
         .route(
             "/v1/marketplace/plugins/{slug}/tools/{tool}",
             put(put_tool_mode),

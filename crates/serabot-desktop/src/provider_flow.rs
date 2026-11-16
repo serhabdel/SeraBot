@@ -261,7 +261,7 @@ impl RedirectPlan {
     }
 }
 
-fn oauth_end(error: OAuthError) -> FlowEnd {
+pub(crate) fn oauth_end(error: OAuthError) -> FlowEnd {
     match error {
         OAuthError::Cancelled => FlowEnd::Cancelled,
         OAuthError::TimedOut => FlowEnd::Expired,
@@ -272,7 +272,7 @@ fn oauth_end(error: OAuthError) -> FlowEnd {
 
 /// A sentence for a failed call during sign-in. The server's own message is
 /// shown when it sent one; a raw status never is.
-fn api_end(error: ApiError) -> FlowEnd {
+pub(crate) fn api_end(error: ApiError) -> FlowEnd {
     FlowEnd::Failed(match error {
         ApiError::Rejected(message) => crate::provider_accounts::plain_error(&message),
         ApiError::Http(404) => {

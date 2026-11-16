@@ -163,6 +163,17 @@ pub fn hints_of(tool: &Value) -> Hints {
     }
 }
 
+/// One tool as the console lists it: the server's hints and the caller's
+/// override (`"ask"`, `"allow"` or none).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ToolRow {
+    pub name: String,
+    pub description: String,
+    pub read_only: bool,
+    pub destructive: bool,
+    pub mode: Option<String>,
+}
+
 /// Whether a call to a tool with these hints needs approval.
 pub(crate) fn approval_needed(hints: Hints, mode: Option<ToolMode>) -> bool {
     match mode {
@@ -318,6 +329,53 @@ impl PluginTools {
                 self.cache.forget(&cache_owner(user_id, slug, &app.id));
             }
         }
+    }
+
+    /// The tools one installed plugin offers the caller, with what the server's
+    /// hints say and the caller's own override, for the console's per-tool
+    /// switches. Plugin text is cut to the same length the model sees. Nothing
+    /// here is a secret.
+    pub async fn tool_rows(&self, user_id: &str, slug: &str) -> Result<Vec<ToolRow>> {
+        let manifest = self
+            .catalog
+            .iter()
+            .find(|plugin| plugin.slug == slug)
+            .ok_or_else(|| SeraError::NotFound(format!("plugin {slug}")))?;
+        if self.store.marketplace_install(user_id, slug)?.is_none() {
+            return Err(SeraError::NotFound(format!(
+                "plugin {slug} is not installed"
+            )));
+        }
+        let mut rows = Vec::new();
+        for app in http_apps(manifest) {
+            let listed = self
+                .list_app(user_id, manifest, app)
+                .await
+                .map_err(|failure| failure.error)?;
+            for tool in &listed {
+                let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let hints = hints_of(tool);
+                let mode = self
+                    .store
+                    .marketplace_tool_mode(user_id, slug, name)?
+                    .filter(|word| ToolMode::parse(word).is_some());
+                rows.push(ToolRow {
+                    name: name.to_owned(),
+                    description: truncate(
+                        tool.get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or(""),
+                        MAX_DESCRIPTION_CHARS,
+                    ),
+                    read_only: hints.read_only,
+                    destructive: hints.destructive,
+                    mode,
+                });
+            }
+        }
+        Ok(rows)
     }
 
     /// The tool behind one `plugin.<slug>.<tool>` name, when the caller may use it.

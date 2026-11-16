@@ -4013,6 +4013,157 @@ impl ApiClient {
         Ok(())
     }
 
+    /// `POST /v1/marketplace/plugins/{slug}/oauth/start`: the sign-in page, the
+    /// state its redirect carries and the loopback address to listen on. The
+    /// PKCE verifier stays on the server.
+    pub fn marketplace_oauth_start(
+        &self,
+        slug: &str,
+        account_id: &str,
+        label: Option<&str>,
+    ) -> Result<crate::marketplace::OauthStarted, ApiError> {
+        check_slug(slug)?;
+        if !crate::marketplace::valid_account_id(account_id) {
+            return Err(ApiError::Validation("That account id is not valid."));
+        }
+        let mut body = serde_json::json!({ "account_id": account_id });
+        if let Some(label) = label.map(str::trim).filter(|text| !text.is_empty()) {
+            if !crate::marketplace::valid_account_label(label) {
+                return Err(ApiError::Validation(
+                    "Keep the label to 60 characters on one line.",
+                ));
+            }
+            body["label"] = serde_json::Value::String(label.to_owned());
+        }
+        let started: crate::marketplace::OauthStarted = self.request(
+            Method::POST,
+            &["v1", "marketplace", "plugins", slug, "oauth", "start"],
+            &[],
+            Some(&body),
+        )?;
+        if !crate::marketplace::check_oauth_started(&started) {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(started)
+    }
+
+    /// `POST /v1/marketplace/plugins/{slug}/oauth/complete`: hand the code and
+    /// state the redirect carried to the server, which swaps them for tokens.
+    pub fn marketplace_oauth_complete(
+        &self,
+        slug: &str,
+        code: &str,
+        state: &str,
+    ) -> Result<crate::marketplace::OauthDone, ApiError> {
+        check_slug(slug)?;
+        if code.is_empty() || code.len() > 4_096 || code.chars().any(char::is_control) {
+            return Err(ApiError::InvalidResponse);
+        }
+        let done: crate::marketplace::OauthDone = self.request(
+            Method::POST,
+            &["v1", "marketplace", "plugins", slug, "oauth", "complete"],
+            &[],
+            Some(&serde_json::json!({ "code": code, "state": state })),
+        )?;
+        if !crate::marketplace::valid_account_id(&done.account_id) {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(done)
+    }
+
+    /// `DELETE /v1/marketplace/plugins/{slug}/accounts/{account_id}`: sign out.
+    pub fn marketplace_remove_account(&self, slug: &str, account_id: &str) -> Result<(), ApiError> {
+        check_slug(slug)?;
+        if !crate::marketplace::valid_account_id(account_id) {
+            return Err(ApiError::Validation("That account id is not valid."));
+        }
+        let _: serde_json::Value = self.request::<_, ()>(
+            Method::DELETE,
+            &["v1", "marketplace", "plugins", slug, "accounts", account_id],
+            &[],
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// `GET /v1/marketplace/plugins/{slug}/tools`.
+    pub fn marketplace_tools(
+        &self,
+        slug: &str,
+    ) -> Result<Vec<crate::marketplace::PluginTool>, ApiError> {
+        check_slug(slug)?;
+        let list: crate::marketplace::ToolList =
+            self.get(&["v1", "marketplace", "plugins", slug, "tools"], &[])?;
+        Ok(crate::marketplace::clean_tools(list.tools))
+    }
+
+    /// `PUT /v1/marketplace/plugins/{slug}/tools/{tool}`: the owner's switch.
+    pub fn marketplace_tool_mode(
+        &self,
+        slug: &str,
+        tool: &str,
+        mode: crate::marketplace::ToolMode,
+    ) -> Result<(), ApiError> {
+        check_slug(slug)?;
+        if !crate::marketplace::valid_tool_name(tool) {
+            return Err(ApiError::Validation("That tool name is not valid."));
+        }
+        let _: serde_json::Value = self.request(
+            Method::PUT,
+            &["v1", "marketplace", "plugins", slug, "tools", tool],
+            &[],
+            Some(&serde_json::json!({ "mode": mode.word() })),
+        )?;
+        Ok(())
+    }
+
+    /// `GET /v1/connectors/github/native`: the member's GitHub sign-in.
+    pub fn github_native(&self) -> Result<crate::marketplace::GithubView, ApiError> {
+        self.get(&["v1", "connectors", "github", "native"], &[])
+    }
+
+    /// `POST /v1/connectors/github/device/start`: a one-time code to type on
+    /// GitHub's own page. The server polls GitHub until it is approved.
+    pub fn github_device_start(&self) -> Result<crate::marketplace::GithubDeviceStarted, ApiError> {
+        let started: crate::marketplace::GithubDeviceStarted = self.request(
+            Method::POST,
+            &["v1", "connectors", "github", "device", "start"],
+            &[],
+            Some(&serde_json::json!({})),
+        )?;
+        if !crate::marketplace::check_device_started(&started) {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(started)
+    }
+
+    /// `GET /v1/connectors/github/device/status`.
+    pub fn github_device_status(&self) -> Result<crate::marketplace::GithubDeviceStatus, ApiError> {
+        let status: crate::marketplace::GithubDeviceStatus =
+            self.get(&["v1", "connectors", "github", "device", "status"], &[])?;
+        if !matches!(
+            status.status.as_str(),
+            "pending" | "connected" | "denied" | "expired"
+        ) {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(status)
+    }
+
+    /// `DELETE /v1/connectors/github/native`: forget the sign-in. The reply may
+    /// carry GitHub's own page for revoking the app; only a plain https link is kept.
+    pub fn github_disconnect(&self) -> Result<Option<String>, ApiError> {
+        let done: crate::marketplace::GithubDisconnected = self.request::<_, ()>(
+            Method::DELETE,
+            &["v1", "connectors", "github", "native"],
+            &[],
+            None,
+        )?;
+        Ok(done
+            .manage_url
+            .filter(|url| crate::marketplace::safe_link(url)))
+    }
+
     /// `GET /v1/bots/{bot}/chats`: the bot's chats, primary chat first.
     pub fn list_bot_chats(&self, bot: &str) -> Result<crate::bot_chats::BotChatList, ApiError> {
         check_id(bot)?;

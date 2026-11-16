@@ -88,7 +88,8 @@ const CSS_PAGES: &str = concat!(
     include_str!("../assets/jobs.css"),
     include_str!("../assets/foundation.css"),
     include_str!("../assets/accounts.css"),
-    include_str!("../assets/runs.css")
+    include_str!("../assets/runs.css"),
+    include_str!("../assets/marketplace.css")
 );
 
 /// The `data-activity` value the stylesheet keys the avatar ring and the

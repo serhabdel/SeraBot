@@ -14,18 +14,22 @@ use crate::ui::{BrandLogo, Icon};
 use crate::ui_composio::ComposioCard;
 use crate::ui_connectors::{ConnectorCard, GoogleSetupCard};
 use crate::ui_marketplace::{MarketplaceTab, PluginSheet};
+use crate::ui_mcp_accounts::GithubCard;
 use crate::ui_widgets::StatusChip;
 use dioxus::prelude::*;
 use serabot_desktop::connector_card::{
     GOOGLE_IDS, google_is_set_up, google_redirect_uri, google_setup_offered,
 };
 use serabot_desktop::integrations::{self, COMPOSIO_ID, Entry, Source, Tab, connector_title};
+use serabot_desktop::marketplace::PluginStatus;
 use serabot_desktop::session::Session;
 
 /// The whole screen: header, tabs and search, the active tab, and the sheets.
 #[component]
 pub fn IntegrationsView(session: Signal<Session>) -> Element {
     let mut session = session;
+    // The GitHub card's badge follows the native sign-in, so read it once.
+    use_hook(move || session.write().load_github());
     let mut tab = use_signal(Tab::default);
     let mut query = use_signal(String::new);
     // The sidebar's Bots link asks for its tab; take the request once.
@@ -55,7 +59,11 @@ pub fn IntegrationsView(session: Signal<Session>) -> Element {
                     r#type: "button",
                     title: "Refresh this tab",
                     onclick: move |_| match tab() {
-                        Tab::Installed => session.write().refresh_connectors(),
+                        Tab::Installed => {
+                            let mut s = session.write();
+                            s.refresh_connectors();
+                            s.load_github();
+                        }
                         Tab::Marketplace => session.write().refresh_marketplace(),
                         Tab::Bots => session.write().open_meet_team(),
                         Tab::Composio => {
@@ -134,7 +142,11 @@ pub fn IntegrationCard(session: Signal<Session>, entry: Entry) -> Element {
     let mut session = session;
     let label = format!("{}, {}", entry.name, entry.pill);
     let source = entry.source.clone();
-    let cta = if entry.set_up {
+    let needs_sign_in =
+        matches!(source, Source::Plugin(_)) && entry.pill == PluginStatus::NeedsSignIn.label();
+    let cta = if needs_sign_in {
+        "Sign in \u{2192}"
+    } else if entry.set_up {
         "Manage \u{2192}"
     } else if matches!(source, Source::Connector(_)) {
         "Connect \u{2192}"
@@ -186,6 +198,7 @@ fn InstalledTab(session: Signal<Session>, query: Signal<String>, tab: Signal<Tab
         marketplace_error,
         state_error,
         errors,
+        github,
     ) = {
         let state = session.read();
         (
@@ -197,13 +210,17 @@ fn InstalledTab(session: Signal<Session>, query: Signal<String>, tab: Signal<Tab
             state.state.marketplace_error.clone(),
             state.state.error.clone(),
             state.panel.connectors.errors.clone(),
+            state.mcp_ui.github.clone(),
         )
     };
     let mut tab = tab;
     let mut query = query;
     let needle = query();
     let lookup = |id: &str| errors.get(id).cloned();
-    let view = integrations::installed(&connectors, &plugins, &lookup);
+    let mut view = integrations::installed(&connectors, &plugins, &lookup);
+    if let Some(github) = &github {
+        integrations::apply_github(&mut view, github);
+    }
     let set_up: Vec<Entry> = view
         .set_up
         .into_iter()
@@ -441,6 +458,7 @@ fn ConnectorSheet(session: Signal<Session>, id: String) -> Element {
                         ComposioCard { session, connector }
                     },
                     Some(connector) => {
+                        let is_github = connector.id == "github";
                         let google = GOOGLE_IDS.contains(&connector.id.as_str());
                         let offered = google && google_setup_offered(&connectors, is_admin);
                         let configured = google_is_set_up(&connectors);
@@ -448,6 +466,10 @@ fn ConnectorSheet(session: Signal<Session>, id: String) -> Element {
                         rsx! {
                             if offered {
                                 GoogleSetupCard { session, configured, redirect }
+                            }
+                            if is_github {
+                                GithubCard { session }
+                                p { class: "tiny github-or", "Or connect with a personal access token." }
                             }
                             ConnectorCard { session, connector }
                         }
