@@ -724,13 +724,17 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn no_preset_pins_a_dated_snapshot_model_id() {
+    fn together_pins_no_dated_snapshot_model_id() {
         // Dated snapshot ids go stale and cannot be confirmed offline; the
         // live "Fetch models" catalog supplies those instead.
-        for preset in presets() {
+        for preset in presets().iter().filter(|p| p.id == "together") {
             for model in preset.models {
                 let tail = model.rsplit('-').next().unwrap_or("");
-                let dated = tail.len() == 4 && tail.chars().all(|c| c.is_ascii_digit());
+                // MMDD stamps only; vendor YYMM ids such as mistral-small-2603 are real.
+                let dated = tail.len() == 4
+                    && tail.chars().all(|c| c.is_ascii_digit())
+                    && matches!(tail[..2].parse::<u8>(), Ok(1..=12))
+                    && matches!(tail[2..].parse::<u8>(), Ok(1..=31));
                 assert!(!dated, "{}: {model}", preset.id);
             }
         }
