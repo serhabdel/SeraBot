@@ -197,3 +197,84 @@
 .root[data-motion="reduce"] .github-card {
   transition: none;
 }
+
+/* Bots tab (0.52): the shipped bots as cards, each with its own actions
+   underneath, instead of one long list. The Meet your team sheet keeps the
+   list layout. */
+.mp-bots {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.mp-bots .hint {
+  margin: 0;
+}
+
+.mp-bots .roster {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
+  gap: 12px;
+  align-items: stretch;
+}
+
+.mp-bots .roster-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-rows: 1fr auto;
+  align-items: start;
+  gap: 12px 14px;
+  padding: 16px;
+  border-color: var(--glass-edge);
+  border-radius: var(--r-lg);
+  background: var(--card-bg);
+  box-shadow: var(--shadow-1), inset 0 1px 0 var(--glass-highlight);
+}
+
+.mp-bots .roster-row:hover {
+  background: var(--card-bg);
+  border-color: var(--hairline-strong);
+}
+
+.mp-bots .meet-copy {
+  gap: 4px;
+}
+
+.mp-bots .meet-copy .thread-title {
+  font-size: var(--fs-body);
+  font-weight: 650;
+}
+
+.mp-bots .meet-copy .thread-meta {
+  align-self: flex-start;
+  padding: 1px 8px;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  color: var(--label-2);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  text-transform: capitalize;
+}
+
+.mp-bots .meet-desc {
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+  line-height: 1.45;
+}
+
+.mp-bots .roster-row > .row-actions,
+.mp-bots .roster-row > .btn {
+  grid-column: 1 / -1;
+  justify-self: start;
+  align-self: end;
+}
+
+.mp-bots .roster-row > .row-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  width: 100%;
+  padding-top: 10px;
+  border-top: 1px solid var(--hairline);
+}
