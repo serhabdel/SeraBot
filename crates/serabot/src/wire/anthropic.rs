@@ -1,7 +1,7 @@
 //! The native Anthropic Messages transport: `POST {base}/messages` over SSE.
 //!
 //! Used by the `anthropic` provider kind, for API-key accounts (`x-api-key`)
-//! and, behind the admin `plan_oauth` flag, for Claude plan sign-ins (a bearer
+//! and, for admin `plan_oauth` (on by default), for Claude plan sign-ins (a bearer
 //! token plus the `oauth-2025-04-20` beta).
 //!
 //! - `max_tokens` is required and always sent. `system` is one string.

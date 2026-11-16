@@ -269,12 +269,15 @@ impl ApiState {
                 secrets.clone(),
             )?),
         );
-        // Claude plan sign-in exists only while the operator has turned it on.
-        if let Some(claude) =
-            crate::auth_flows::claude::ClaudeSignIn::from_config(&config, secrets.clone())
-        {
-            sign_ins.register("anthropic", Arc::new(claude));
-        }
+        // Claude plan sign-in is on by default; a provider's `plan_oauth = false`
+        // turns it off (checked per request).
+        sign_ins.register(
+            "anthropic",
+            Arc::new(crate::auth_flows::claude::ClaudeSignIn::from_config(
+                &config,
+                secrets.clone(),
+            )),
+        );
         let signin = Arc::new(
             crate::auth_flows::SignInService::new(accounts.clone())?.with_registry(sign_ins),
         );

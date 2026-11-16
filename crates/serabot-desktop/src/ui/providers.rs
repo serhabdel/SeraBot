@@ -270,30 +270,11 @@ pub(super) fn AddProviderSheet(session: Signal<Session>, overlay: Signal<Overlay
                         }
                     }
                     if chosen.is_some_and(|preset| preset.auth == "oauth") {
-                        if chosen.is_some_and(|preset| preset.kind == "google-antigravity") {
-                            div { class: "field",
-                                label { class: "field-label", r#for: "provider-client-secret-input", "OAuth client secret" }
-                                input {
-                                    id: "provider-client-secret-input",
-                                    class: "input",
-                                    r#type: "password",
-                                    autocomplete: "off",
-                                    spellcheck: false,
-                                    value: "{oauth_client_secret}",
-                                    placeholder: "Paste once (leave empty if already stored)",
-                                    oninput: move |event| session.write().provider.oauth_client_secret = event.value(),
-                                }
-                                span { class: "hint",
-                                    "Google's sign-in needs this secret once. It is stored encrypted on the server and never shown again."
-                                }
-                            }
-                        } else {
-                            div { class: "field",
-                                span { class: "field-label", "Sign-in" }
-                                div { class: "banner info",
-                                    span {
-                                        "Each account's tokens are encrypted for you alone."
-                                    }
+                        div { class: "field",
+                            span { class: "field-label", "Sign-in" }
+                            div { class: "banner info",
+                                span {
+                                    "Each account's tokens are encrypted for you alone."
                                 }
                             }
                         }
@@ -352,6 +333,24 @@ pub(super) fn AddProviderSheet(session: Signal<Session>, overlay: Signal<Overlay
                                 onchange: move |event| session.write().provider.kind = event.value(),
                                 for item in PROVIDER_KINDS {
                                     option { value: "{item}", "{item}" }
+                                }
+                            }
+                        }
+                        if chosen.is_some_and(|preset| preset.kind == "google-antigravity") {
+                            div { class: "field",
+                                label { class: "field-label", r#for: "provider-client-secret-input", "OAuth client secret (optional override)" }
+                                input {
+                                    id: "provider-client-secret-input",
+                                    class: "input",
+                                    r#type: "password",
+                                    autocomplete: "off",
+                                    spellcheck: false,
+                                    value: "{oauth_client_secret}",
+                                    placeholder: "Leave empty to use the built-in Google client",
+                                    oninput: move |event| session.write().provider.oauth_client_secret = event.value(),
+                                }
+                                span { class: "hint",
+                                    "Sign-in works without this. Paste a secret only to replace the built-in Google client; it is stored encrypted on the server and never shown again."
                                 }
                             }
                         }
@@ -846,7 +845,7 @@ pub(super) fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) 
                                             })
                                             || (p.auth == "oauth" && p.secrets.values().any(|s| s.configured))
                                     });
-                                    let offers_sign_in = preset.auth == "oauth" || !preset.sign_in.is_empty();
+                                    let offers_sign_in = accounts::directory_offers_sign_in(existing.as_ref(), preset);
                                     let takes_key = preset.auth == "api_key";
                                     let has_accounts = existing.as_ref().is_some_and(|p| !p.accounts.is_empty());
                                     rsx! {
@@ -891,12 +890,7 @@ pub(super) fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) 
                                                             move |_| {
                                                                 let mut s = session.write();
                                                                 s.admin_error = None;
-                                                                if accounts::directory_needs_setup(existing.as_ref(), preset.kind) {
-                                                                    // Antigravity's client secret is pasted once in the sheet.
-                                                                    fill_provider_draft(&mut s, &preset, existing.as_ref());
-                                                                    drop(s);
-                                                                    overlay.set(Overlay::AddProvider);
-                                                                } else if let Some(cur) = existing.as_ref() {
+                                                                if let Some(cur) = existing.as_ref() {
                                                                     s.sign_in_now(&cur.id);
                                                                 } else {
                                                                     // No card yet: save the profile and sign in, in one press.

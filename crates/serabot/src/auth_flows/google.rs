@@ -8,8 +8,9 @@
 //!   `prompt=consent` are what make Google return a refresh token.
 //! - The redirect is `http://127.0.0.1:<port>/oauth-callback`; Google's desktop
 //!   client accepts any loopback port, so the desktop may fall back from 51121.
-//! - The OAuth client secret is the registration's, not the member's; it lives
-//!   in the server's age store and is read when a flow starts or finishes.
+//! - The OAuth client secret is the registration's, not the member's. It is
+//!   Google's public installed-app credential, compiled in as a default (as in
+//!   HielCowork); an age-store value or `AGY_CLIENT_SECRET` overrides it.
 //! - The email comes from the userinfo endpoint (display and identity only).
 //! - Project discovery runs `loadCodeAssist` and, when the account has no
 //!   project, `onboardUser` up to three times three seconds apart, asking the
@@ -26,7 +27,8 @@ use serde_json::{Value, json};
 
 use crate::accounts::{AuthKind, identity_fingerprint};
 use crate::cloud_code::{
-    ANTIGRAVITY_CLIENT_ID, ANTIGRAVITY_SCOPES, Discovery, discover_project_with, discovery_origins,
+    ANTIGRAVITY_CLIENT_ID, ANTIGRAVITY_SCOPES, Discovery, antigravity_client_secret,
+    discover_project_with, discovery_origins,
 };
 use crate::error::{Result, SeraError};
 use crate::secrets::SharedSecrets;
@@ -138,18 +140,11 @@ impl GoogleSignIn {
             .unwrap_or_else(|| ANTIGRAVITY_CLIENT_ID.to_owned())
     }
 
-    /// The OAuth client. Fails when the server has no client secret: the
-    /// member is told to ask the owner, not shown a vendor error later.
+    /// The OAuth client. The secret is the registration's public installed-app
+    /// credential: a console-saved value wins, then `AGY_CLIENT_SECRET`, then
+    /// the compiled-in default, so sign-in never needs a setup step.
     fn spec(&self) -> Result<PkceSpec> {
-        let secret = self
-            .secrets
-            .get(&self.client_secret_name)
-            .filter(|secret| !secret.trim().is_empty())
-            .ok_or_else(|| SeraError::Rejected {
-                code: "signin_not_configured",
-                message: "Antigravity sign-in is not set up on this server. Ask the owner to store its OAuth client secret."
-                    .into(),
-            })?;
+        let secret = antigravity_client_secret(&self.secrets, &self.client_secret_name);
         Ok(PkceSpec {
             authorize: self.authorize.clone(),
             token: self.token.clone(),
@@ -311,6 +306,7 @@ mod tests {
     use super::*;
     use crate::accounts::Accounts;
     use crate::auth_flows::{CompleteRequest, SignInRegistry, SignInService, StartRequest};
+    use crate::cloud_code::ANTIGRAVITY_DEFAULT_CLIENT_SECRET;
     use crate::secrets::SecretStore;
     use crate::store::Store;
     use crate::user_secrets::UserSecrets;
@@ -539,12 +535,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn without_a_client_secret_nothing_starts() {
+    async fn without_a_stored_client_secret_sign_in_still_starts() {
         let harness = harness();
         let alice = member(&harness, "microsoft:google-nosecret");
         let server = MockServer::start().await;
         let service = service(&harness, &server, false);
-        let error = service
+        let started = service
             .start(
                 &alice,
                 "antigravity",
@@ -552,15 +548,25 @@ mod tests {
                 pkce_request(REDIRECT),
             )
             .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            SeraError::Rejected {
-                code: "signin_not_configured",
-                ..
-            }
-        ));
-        assert!(!error.to_string().contains(CLIENT_SECRET));
+            .unwrap();
+        // The public default client secret is used server-side and never shown.
+        assert!(
+            ANTIGRAVITY_DEFAULT_CLIENT_SECRET.is_empty()
+                || !started.url.contains(ANTIGRAVITY_DEFAULT_CLIENT_SECRET)
+        );
+        assert!(!started.url.contains("client_secret"));
+    }
+
+    #[test]
+    fn the_client_secret_prefers_the_store_then_the_environment_then_the_default() {
+        use crate::cloud_code::pick_antigravity_client_secret as pick;
+        assert_eq!(pick(Some(" stored "), Some("env")), "stored");
+        assert_eq!(pick(None, Some(" env ")), "env");
+        assert_eq!(
+            pick(Some("  "), Some("")),
+            ANTIGRAVITY_DEFAULT_CLIENT_SECRET
+        );
+        assert_eq!(pick(None, None), ANTIGRAVITY_DEFAULT_CLIENT_SECRET);
     }
 
     #[tokio::test]

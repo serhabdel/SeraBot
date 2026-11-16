@@ -119,8 +119,8 @@ pub fn filter_presets(
 pub const PLAN_RISK_GOOGLE: &str = "This signs in through Google's Antigravity client, not an API contract. Google may suspend an account used this way. It is your own account and is never shared.";
 
 /// Shown beside a Claude plan sign-in when the server does not send its own
-/// text. API keys are the supported path.
-pub const PLAN_RISK_CLAUDE: &str = "Anthropic's terms do not allow a third-party product to offer Claude plan sign-in. This account is yours alone, is never shared, and may be suspended. API keys are the supported path.";
+/// text.
+pub const PLAN_RISK_CLAUDE: &str = "This signs in through Claude's own client, not an API contract. Anthropic may restrict or suspend an account used this way. It is your own account and is never shared. API keys are the supported path.";
 
 const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
@@ -512,7 +512,7 @@ const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "anthropic",
         label: "Anthropic (Claude)",
-        subtitle: "Claude models on the native Messages API. Add several API keys; each member's keys are their own.",
+        subtitle: "Claude models on the native Messages API. Sign in with Claude or add several API keys; each account is yours alone.",
         base_url: "https://api.anthropic.com/v1",
         kind: "anthropic",
         default_id: "anthropic",
@@ -537,9 +537,9 @@ const PRESETS: &[ProviderPreset] = &[
         catalog_fetch: true,
         auth: "api_key",
         badge: "API Key",
-        note: "Anthropic API key. Claude plan sign-in is off by default and admin-only",
+        note: "Sign in with Claude (browser, several accounts) or add API keys",
         key_url: "https://console.anthropic.com/settings/keys",
-        sign_in: "",
+        sign_in: "pkce",
         risk: PLAN_RISK_CLAUDE,
     },
     ProviderPreset {
@@ -866,8 +866,8 @@ mod tests {
         let anthropic = preset_for("anthropic").unwrap();
         assert_eq!(anthropic.kind, "anthropic");
         assert_eq!(anthropic.base_url, "https://api.anthropic.com/v1");
-        // API keys only: the plan sign-in is an admin flag, not a preset.
-        assert_eq!((anthropic.auth, anthropic.sign_in), ("api_key", ""));
+        // A key or a Claude browser sign-in (PKCE); the card says both.
+        assert_eq!((anthropic.auth, anthropic.sign_in), ("api_key", "pkce"));
         let go = preset_for("opencode-go").unwrap();
         assert_eq!(go.kind, "opencode-go");
         assert_eq!(go.base_url, "https://opencode.ai/zen/go/v1");
@@ -979,6 +979,8 @@ mod tests {
                 "openrouter" => "pkce",
                 "antigravity" => "pkce_google",
                 "muse-code" => "device",
+                // Claude: a key or a browser sign-in (PKCE) on the same card.
+                "anthropic" => "pkce",
                 _ => "",
             };
             assert_eq!(preset.sign_in, expected_sign_in, "{:?}", preset.id);

@@ -621,6 +621,10 @@ async fn a_plan_account_sends_a_bearer_and_the_oauth_beta() {
         .and(header("authorization", "Bearer plan-access-1"))
         .and(header("anthropic-beta", "oauth-2025-04-20"))
         .and(header("anthropic-version", "2023-06-01"))
+        .and(header(
+            "user-agent",
+            "anthropic-sdk-typescript/0.112.1 userOAuthProvider",
+        ))
         .respond_with(claude_text("from the plan"))
         .expect(1)
         .mount(&server)
@@ -700,6 +704,10 @@ async fn a_plan_refresh_rotates_the_token_once_for_eight_turns() {
     Mock::given(method("POST"))
         .and(path("/oauth/token"))
         .and(header("anthropic-beta", "oauth-2025-04-20"))
+        .and(header(
+            "user-agent",
+            "anthropic-sdk-typescript/0.112.1 userOAuthProvider",
+        ))
         .and(wiremock::matchers::body_json(json!({
             "grant_type": "refresh_token",
             "client_id": "synthetic-claude-client",

@@ -314,7 +314,10 @@ pub fn add_methods(provider: &ProviderStatus, preset: Option<&ProviderPreset>) -
     if takes_key {
         methods.push(AddMethod::Key);
     }
-    let flows: Vec<&str> = if provider.signin.is_empty() {
+    // The server's list is authoritative for Claude: an empty list means the
+    // operator turned plan sign-in off, not that the server is old.
+    let is_claude = provider.kind == "anthropic" || preset.is_some_and(|p| p.kind == "anthropic");
+    let flows: Vec<&str> = if provider.signin.is_empty() && !is_claude {
         match preset.map(|p| p.sign_in) {
             Some("pkce" | "pkce_google") => vec!["pkce"],
             Some("device") => vec!["device"],
@@ -382,21 +385,21 @@ pub fn first_sign_in_method(methods: &[AddMethod]) -> Option<AddMethod> {
         .find(|method| methods.contains(method))
 }
 
-/// What a signed-in provider's card shows the owner when its browser sign-in
-/// cannot start yet. Antigravity's Google client has a secret that lives only
-/// in the server's encrypted store; the owner pastes it once.
-pub fn client_secret_missing(provider: &ProviderStatus) -> bool {
-    provider.kind == "google-antigravity"
-        && provider
-            .secrets
-            .get("oauth_client_secret")
-            .is_some_and(|secret| !secret.configured)
-}
-
-/// Whether the directory must open the Add provider sheet (so the owner can
-/// paste the client secret) instead of signing in at once.
-pub fn directory_needs_setup(existing: Option<&ProviderStatus>, preset_kind: &str) -> bool {
-    preset_kind == "google-antigravity" && existing.is_none_or(client_secret_missing)
+/// Whether the directory card offers a sign-in button. Providers that are not
+/// saved yet offer it when the preset documents one (Antigravity and Claude
+/// sign in with no setup step). A saved Claude provider whose server lists no
+/// flow has plan sign-in turned off, so the button is not offered.
+pub fn directory_offers_sign_in(
+    existing: Option<&ProviderStatus>,
+    preset: &ProviderPreset,
+) -> bool {
+    if preset.auth != "oauth" && preset.sign_in.is_empty() {
+        return false;
+    }
+    match existing {
+        Some(provider) if preset.kind == "anthropic" => !provider.signin.is_empty(),
+        _ => true,
+    }
 }
 
 /// The sign-in a refused server secret asks for: `(provider kind, title)`.
@@ -426,18 +429,10 @@ pub fn sign_in_needed_for(message: &str) -> Option<&'static str> {
 }
 
 /// An API refusal in plain words. A raw "secret ..._refresh_token is empty"
-/// never reaches the member: it becomes "Sign in to <Provider>". The not-set-up
-/// refusal says what the owner does next.
+/// never reaches the member: it becomes "Sign in to <Provider>".
 pub fn plain_error(message: &str) -> String {
     if let Some((_, title)) = sign_in_target(message) {
         return format!("Sign in to {title} to use it. Press Sign in on its card.");
-    }
-    // Claude's plan sign-in is set up in the server config, not pasted here.
-    if message.contains("Antigravity sign-in is not set up on this server") {
-        return format!(
-            "{} In the console, open Add provider, choose Google Antigravity and paste the OAuth client secret under Advanced settings. It is stored encrypted and never shown again.",
-            message.trim_end()
-        );
     }
     message.to_owned()
 }
@@ -761,7 +756,8 @@ mod tests {
         // Claude with the plan sign-in on: a key or a browser sign-in.
         let (methods, ..) = card(&kinded("anthropic", "api_key", &["pkce"]), "anthropic");
         assert_eq!(methods, vec![AddMethod::Key, AddMethod::Browser]);
-        // Claude with it off, and OpenAI: a key only. No sign-in words anywhere.
+        // Claude with it off (the server lists no flow), and OpenAI: a key only.
+        // No sign-in words anywhere.
         for (kind, preset) in [("anthropic", "anthropic"), ("openai", "openai")] {
             let (methods, empty, filled, first, text) = card(&kinded(kind, "api_key", &[]), preset);
             assert_eq!(methods, vec![AddMethod::Key], "{kind}");
@@ -830,49 +826,30 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_client_secret_says_what_the_owner_does_next() {
-        let text = plain_error(
-            "Antigravity sign-in is not set up on this server. Ask the owner to store its OAuth client secret.",
-        );
-        assert!(text.contains("not set up on this server"));
-        assert!(text.contains("Advanced settings"));
-        assert!(text.contains("never shown again"));
-        // Claude's is the operator's to set up in config, so no console hint.
-        let claude = "Claude plan sign-in is not set up on this server. The owner must turn it on and store its OAuth client id.";
-        assert_eq!(plain_error(claude), claude);
-    }
-
-    #[test]
-    fn the_directory_asks_for_the_client_secret_only_when_it_is_missing() {
-        let mut agy = kinded("google-antigravity", "oauth", &["pkce"]);
-        // Never saved: open the sheet so the secret can be pasted.
-        assert!(directory_needs_setup(None, "google-antigravity"));
-        // Saved, secret reported missing: same.
-        agy.secrets.insert(
-            "oauth_client_secret".into(),
-            crate::api::SecretStatus {
-                name: None,
-                configured: false,
-            },
-        );
-        assert!(client_secret_missing(&agy));
-        assert!(directory_needs_setup(Some(&agy), "google-antigravity"));
-        // Stored: sign in at once.
-        agy.secrets.insert(
-            "oauth_client_secret".into(),
-            crate::api::SecretStatus {
-                name: None,
-                configured: true,
-            },
-        );
-        assert!(!client_secret_missing(&agy));
-        assert!(!directory_needs_setup(Some(&agy), "google-antigravity"));
-        // Other providers have no client secret to ask for.
-        assert!(!directory_needs_setup(None, "muse-code"));
-        assert!(!client_secret_missing(&kinded(
-            "muse-code",
-            "oauth",
-            &["device"]
-        )));
+    fn the_directory_offers_sign_in_without_any_setup() {
+        let agy = preset_for("antigravity").unwrap();
+        let claude = preset_for("anthropic").unwrap();
+        // Never saved: Antigravity and Claude both offer Sign in at once.
+        assert!(directory_offers_sign_in(None, agy));
+        assert!(directory_offers_sign_in(None, claude));
+        // A key-only provider never does.
+        assert!(!directory_offers_sign_in(
+            None,
+            preset_for("openai").unwrap()
+        ));
+        // A saved Claude provider follows the server's own flow list.
+        assert!(directory_offers_sign_in(
+            Some(&kinded("anthropic", "api_key", &["pkce"])),
+            claude
+        ));
+        assert!(!directory_offers_sign_in(
+            Some(&kinded("anthropic", "api_key", &[])),
+            claude
+        ));
+        // Antigravity never asks for a client secret first.
+        assert!(directory_offers_sign_in(
+            Some(&kinded("google-antigravity", "oauth", &["pkce"])),
+            agy
+        ));
     }
 }

@@ -146,13 +146,14 @@ models = [
 # # Cloud Code origins are allowed; OpenAI-compatible hosts are not.
 # api_key_secret = "antigravity_access_token"
 # refresh_token_secret = "antigravity_refresh_token"
-# oauth_client_secret_secret = "antigravity_oauth_client_secret"
+# # Optional override of the built-in public client secret (else AGY_CLIENT_SECRET, else the default):
+# # oauth_client_secret_secret = "antigravity_oauth_client_secret"
 # # Leave oauth_client_id_secret empty to use the built-in Antigravity client id.
 # project_id = ""
 # models = ["gemini-4-argon-high", "gemini-3.8-flash-tiered", "claude-opus-5-5-thinking"]
 # catalog_fetch = true
 # data_egress_approved = false
-# One-time sign-in: store the published desktop client secret, then
+# Sign-in needs no stored client secret (a public default is built in):
 # `serabot providers login google-antigravity`. See docs/antigravity.md.
 
 [embeddings]

@@ -1325,7 +1325,13 @@ async fn login_antigravity(config_path: &std::path::Path) -> anyhow::Result<()> 
             anyhow::bail!("oauth client id does not match the Antigravity client");
         }
     }
-    let mut client_secret = store.require(&secret_name)?.to_owned();
+    // A stored value or AGY_CLIENT_SECRET overrides the compiled-in public default.
+    let mut client_secret = serabot::cloud_code::pick_antigravity_client_secret(
+        store.get(&secret_name),
+        std::env::var(serabot::cloud_code::ANTIGRAVITY_CLIENT_SECRET_ENV)
+            .ok()
+            .as_deref(),
+    );
     let login = serabot::cloud_code::login_antigravity(&client_secret, |url| {
         println!("Open {url}");
     })

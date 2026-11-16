@@ -392,7 +392,7 @@ pub fn check_profile(
     base_url: &str,
     auth: &str,
     refresh_token_secret: &str,
-    oauth_client_secret_secret: &str,
+    _oauth_client_secret_secret: &str,
     catalog_fetch: bool,
     catalog_ttl_secs: u64,
 ) -> Result<()> {
@@ -405,16 +405,9 @@ pub fn check_profile(
                 ));
             }
         }
-        AuthPlan::OAuth { style, .. } => {
-            if !refresh_token_secret.trim().is_empty()
-                && style == OAuthStyle::RefreshToken
-                && oauth_client_secret_secret.trim().is_empty()
-            {
-                return Err(SeraError::Config(
-                    "oauth_client_secret_secret is required when refreshing Google tokens".into(),
-                ));
-            }
-        }
+        // The Google client secret has a compiled-in default, so
+        // `oauth_client_secret_secret` is only an optional override.
+        AuthPlan::OAuth { .. } => {}
     }
     if catalog_fetch && !(1..=86_400).contains(&catalog_ttl_secs) {
         return Err(SeraError::Config(
@@ -1368,9 +1361,10 @@ pub fn open_provider_client(
     let kind = canonical_kind(&profile.kind)?;
     // A Claude plan sign-in is an `anthropic` account that carries a refresh
     // token. It exists only for the admin's own account, only while the
-    // operator's flag is on, and is never reachable through a grant.
+    // operator has not turned `plan_oauth` off, and is never reachable through
+    // a grant.
     let claude_plan = kind == "anthropic" && !credential.refresh_token.trim().is_empty();
-    if claude_plan && !(profile.plan_oauth && owner.account_id != DEFAULT_ACCOUNT) {
+    if claude_plan && !(profile.plan_oauth_enabled() && owner.account_id != DEFAULT_ACCOUNT) {
         return Err(SeraError::Forbidden(
             "Claude plan sign-in is turned off on this server".into(),
         ));
@@ -1404,26 +1398,29 @@ pub fn open_provider_client(
         && refreshable
         && !credential.refresh_token.trim().is_empty()
     {
-        let client_id = if profile.oauth_client_id_secret.trim().is_empty() {
+        let client_id = if style == OAuthStyle::ClaudeRefresh {
+            // Claude Code's public client id, unless an age-store value overrides it.
+            crate::auth_flows::claude::client_id_for(
+                server_secrets,
+                &profile.oauth_client_id_secret,
+            )
+        } else if profile.oauth_client_id_secret.trim().is_empty() {
             client_id_fallback.unwrap_or("").to_owned()
         } else {
             server_secrets.require(&profile.oauth_client_id_secret)?
         };
-        let client_secret = if profile.oauth_client_secret_secret.trim().is_empty() {
+        // Antigravity's client secret is a public installed-app credential:
+        // an age-store override, then AGY_CLIENT_SECRET, then the default.
+        let client_secret = if style == OAuthStyle::RefreshToken {
+            crate::cloud_code::antigravity_client_secret(
+                server_secrets,
+                &profile.oauth_client_secret_secret,
+            )
+        } else if profile.oauth_client_secret_secret.trim().is_empty() {
             String::new()
         } else {
             server_secrets.require(&profile.oauth_client_secret_secret)?
         };
-        if style == OAuthStyle::RefreshToken && client_secret.is_empty() {
-            return Err(SeraError::Config(
-                "oauth client secret is required to refresh this provider".into(),
-            ));
-        }
-        if style == OAuthStyle::ClaudeRefresh && client_id.is_empty() {
-            return Err(SeraError::Config(
-                "the Claude sign-in client id is not configured".into(),
-            ));
-        }
         client = client.with_oauth(OAuthMaterial {
             style,
             refresh_token: credential.refresh_token.clone(),

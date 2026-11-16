@@ -36,7 +36,7 @@ async fn env() -> Env {
     config.memory.auto_extract = false;
     config.base_dir = dir.clone();
     let base = format!("{}/v1", server.uri());
-    // `claude` has the plan sign-in turned on; `anthropic` does not.
+    // `claude` has the plan sign-in on (the default); `anthropic` turns it off.
     config.llm.providers.insert(
         "claude".into(),
         ProviderConfig {
@@ -47,7 +47,6 @@ async fn env() -> Env {
             data_egress_approved: true,
             catalog_fetch: true,
             oauth_client_id_secret: CLIENT_NAME.into(),
-            plan_oauth: true,
             ..Default::default()
         },
     );
@@ -60,6 +59,7 @@ async fn env() -> Env {
             models: vec!["claude-sonnet-5-5".into()],
             data_egress_approved: true,
             catalog_fetch: true,
+            plan_oauth: false,
             ..Default::default()
         },
     );
@@ -394,9 +394,9 @@ async fn members_cannot_start_the_plan_sign_in_but_the_admin_can() {
 }
 
 #[tokio::test]
-async fn the_plan_sign_in_is_off_unless_the_operator_turned_it_on() {
+async fn the_plan_sign_in_is_off_when_the_operator_turned_it_off() {
     let env = env().await;
-    // `anthropic` has no `plan_oauth`: not even the admin can start one.
+    // `anthropic` sets `plan_oauth = false`: not even the admin can start one.
     let (status, body) = call(
         &env,
         OWNER,
@@ -444,7 +444,7 @@ async fn listings_show_the_plan_sign_in_and_its_risk_only_to_the_admin() {
     let claude = provider(&admin, "claude");
     assert_eq!(claude["signin"], json!(["pkce"]));
     let risk = claude["signin_risk"].as_str().unwrap();
-    assert!(risk.contains("terms") && risk.contains("never shared"));
+    assert!(risk.contains("Claude's own client") && risk.contains("never shared"));
     assert_eq!(provider(&admin, "anthropic")["signin"], json!([]));
     assert!(provider(&admin, "anthropic")["signin_risk"].is_null());
     let (_, member) = call(&env, &env.alice, "GET", "/v1/providers", None).await;

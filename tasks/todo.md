@@ -128,7 +128,7 @@ never merge without the owner's OK.
 - [x] P8 thinking catalog; P9a/P9b Anthropic Messages and thinking; P10 OpenCode/Nous.
 - [x] P11 single-flight refresh; P12 bot routes; P13 failover engine.
 - [x] P14-P16 desktop Providers page, route editor, composer chip.
-- [x] P17 Claude plan OAuth (flag-gated, default off).
+- [x] P17 Claude plan OAuth (admin-only; default on since 0.50.1, `plan_oauth = false` turns it off).
 - [x] P18 docs, release notes, version 0.49.0.
 - [ ] P19 (optional) Mistral sign-in.
 - [ ] Live verification against owner-approved accounts (none claimed).

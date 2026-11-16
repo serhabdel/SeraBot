@@ -259,6 +259,10 @@ impl LlmClient {
         let mut headers = vec![("anthropic-version", anthropic::API_VERSION.to_owned())];
         if self.wire == Wire::AnthropicPlan {
             headers.push(("anthropic-beta", anthropic::OAUTH_BETA.to_owned()));
+            headers.push((
+                "user-agent",
+                crate::auth_flows::claude::PLAN_USER_AGENT.to_owned(),
+            ));
         }
         headers
     }

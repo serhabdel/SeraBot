@@ -165,7 +165,7 @@ missing-approval and stale-approval tests alongside each new surface.
 0.49.0 adds per-user provider accounts (migration 0037), the sign-in flow
 framework, Antigravity and Muse member sign-in, Anthropic/OpenCode backends,
 single-flight refresh, bot routes with a failover engine, and the matching
-desktop pages. Claude plan OAuth is implemented but off by default (O1).
+desktop pages. Claude plan OAuth is implemented, admin-only, on by default since 0.50.1 (owner decision, supersedes O1; `plan_oauth = false` turns it off).
 Optional P19 (Mistral sign-in) is not done. No live provider was used.
 
 ## Status after 0.49.0 (orchestration, 0.50.0)

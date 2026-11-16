@@ -248,17 +248,13 @@ impl Config {
                     "llm.providers.{id}: client_version must look like 2.25.0"
                 )));
             }
-            if profile.plan_oauth {
-                if crate::providers::canonical_kind(&profile.kind)? != "anthropic" {
-                    return Err(SeraError::Config(format!(
-                        "llm.providers.{id}: plan_oauth is only for kind = \"anthropic\""
-                    )));
-                }
-                if !valid_secret_name(&profile.oauth_client_id_secret) {
-                    return Err(SeraError::Config(format!(
-                        "llm.providers.{id}: plan_oauth needs oauth_client_id_secret (the secret that holds the Claude OAuth client id)"
-                    )));
-                }
+            if profile.plan_oauth_enabled()
+                && !profile.oauth_client_id_secret.is_empty()
+                && !valid_secret_name(&profile.oauth_client_id_secret)
+            {
+                return Err(SeraError::Config(format!(
+                    "llm.providers.{id}: oauth_client_id_secret must be a secret-store key name"
+                )));
             }
         }
         if self.embeddings.dimension == 0 || self.embeddings.dimension > 4096 {
@@ -632,11 +628,31 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub client_version: String,
     /// Allow the admin to sign in with a Claude plan (`anthropic` providers
-    /// only). Off by default: Anthropic's terms do not allow a third-party
-    /// product to offer plan sign-in, so it is opt-in and the account is never
-    /// shared. The OAuth client id comes from `oauth_client_id_secret`.
-    #[serde(default)]
+    /// only; ignored for every other kind). On by default, by the owner's
+    /// decision; set `plan_oauth = false` to turn it off. Anthropic's terms do
+    /// not allow a third-party product to offer plan sign-in, so the page shows
+    /// a risk banner and the account is the admin's own and never shared. The
+    /// OAuth client id is Claude Code's public one unless
+    /// `oauth_client_id_secret` names an age-store override.
+    #[serde(default = "default_plan_oauth")]
     pub plan_oauth: bool,
+}
+
+fn default_plan_oauth() -> bool {
+    true
+}
+
+impl ProviderConfig {
+    /// Whether this provider offers Claude plan sign-in: an `anthropic` kind
+    /// whose `plan_oauth` is on.
+    pub fn plan_oauth_enabled(&self) -> bool {
+        self.plan_oauth && self.is_anthropic()
+    }
+
+    /// Whether this provider's kind is `anthropic`.
+    pub fn is_anthropic(&self) -> bool {
+        crate::providers::canonical_kind(&self.kind).is_ok_and(|kind| kind == "anthropic")
+    }
 }
 
 impl Default for ProviderConfig {
@@ -655,7 +671,7 @@ impl Default for ProviderConfig {
             oauth_client_secret_secret: String::new(),
             project_id: String::new(),
             client_version: String::new(),
-            plan_oauth: false,
+            plan_oauth: default_plan_oauth(),
         }
     }
 }
@@ -3248,37 +3264,55 @@ allow_cross_provider = true
         config
     }
 
-    /// Claude plan sign-in is opt-in per provider, only for `anthropic`, and
-    /// needs the secret that holds its OAuth client id.
+    /// Claude plan sign-in is on by default for `anthropic` providers and can
+    /// be turned off; it means nothing for any other kind.
     #[test]
-    fn plan_oauth_is_off_by_default_and_validated() {
+    fn plan_oauth_is_on_by_default_and_can_be_turned_off() {
         let parsed: ProviderConfig = toml::from_str("kind = \"anthropic\"").unwrap();
-        assert!(!parsed.plan_oauth);
-        assert!(!ProviderConfig::default().plan_oauth);
-        let enabled = |kind: &str, client_id: &str| ProviderConfig {
-            kind: kind.into(),
-            plan_oauth: true,
-            oauth_client_id_secret: client_id.into(),
+        assert!(parsed.plan_oauth && parsed.plan_oauth_enabled());
+        assert!(ProviderConfig::default().plan_oauth);
+        let off: ProviderConfig = toml::from_str(
+            "kind = \"anthropic\"
+plan_oauth = false",
+        )
+        .unwrap();
+        assert!(!off.plan_oauth_enabled());
+        // Other kinds carry the default but never offer it.
+        let openai = ProviderConfig {
+            kind: "openai".into(),
             ..ProviderConfig::default()
         };
-        // On, on the right kind, with a client-id secret: fine.
-        config_with_provider(enabled("anthropic", "claude_client_id"))
-            .validate()
-            .unwrap();
-        // Off, with no secret: fine too.
+        assert!(!openai.plan_oauth_enabled());
+        // The `[llm]` default provider never offers it.
+        assert!(
+            !Config::default()
+                .llm
+                .default_provider()
+                .plan_oauth_enabled()
+        );
+        // On with no client-id secret (the public default is used) validates;
+        // a bad override name does not.
         config_with_provider(ProviderConfig {
             kind: "anthropic".into(),
             ..ProviderConfig::default()
         })
         .validate()
         .unwrap();
-        for (kind, secret) in [("openai", "claude_client_id"), ("anthropic", "")] {
-            let error = config_with_provider(enabled(kind, secret))
-                .validate()
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("plan_oauth"), "{kind}: {error}");
-        }
+        config_with_provider(ProviderConfig {
+            kind: "openai".into(),
+            ..ProviderConfig::default()
+        })
+        .validate()
+        .unwrap();
+        let error = config_with_provider(ProviderConfig {
+            kind: "anthropic".into(),
+            oauth_client_id_secret: "bad name!".into(),
+            ..ProviderConfig::default()
+        })
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("oauth_client_id_secret"), "{error}");
     }
 
     /// A row stored before 0.23 has no title or description and still parses;

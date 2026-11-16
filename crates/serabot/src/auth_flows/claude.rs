@@ -1,22 +1,26 @@
-//! Claude plan sign-in (admin only, behind `plan_oauth`, off by default).
+//! Claude plan sign-in (admin only, on by default, `plan_oauth = false` turns it off).
 //!
 //! This is the claude.ai OAuth flow that Claude Code uses: PKCE through a fixed
 //! loopback port on the signer's own desktop (or a pasted code), a JSON token
-//! exchange, and a rotating refresh token. It follows the owner's aio-proxy
-//! client. Anthropic's terms do not let a third-party product offer plan
-//! sign-in, and both the owner's HielCowork audit and openbot's notes rate a
-//! multi-user server as the risky shape. So, by the owner's decision (O1):
+//! exchange, and a rotating refresh token. It mirrors the owner's aio-proxy
+//! `claude-code` plugin (the Claude client HielCowork's tooling uses): client
+//! id, scopes, endpoints and headers are the same. Anthropic's terms do not let
+//! a third-party product offer plan sign-in, and both the owner's HielCowork
+//! audit and openbot's notes rate a multi-user server as the risky shape. So,
+//! by the owner's decision:
 //!
-//! - it exists only when `[llm.providers.<id>] plan_oauth = true`, and the API
-//!   lets only the admin start it;
-//! - the OAuth client id comes from the server's age store (the provider's
-//!   `oauth_client_id_secret`) and is never committed;
+//! - it is on unless a provider sets `plan_oauth = false`, the API lets only
+//!   the admin start it, and the page shows a risk banner beside it;
+//! - the OAuth client id is Claude Code's public installed-app client id,
+//!   compiled in as a default; an age-store value
+//!   (`oauth_client_id_secret`) overrides it;
 //! - the account lives in the admin's own account list and is never shared
 //!   through a provider grant;
 //! - a login that does not say a stable account id is refused, so signing in
 //!   twice never makes two accounts (the fingerprint is
 //!   `sha256("claude:account:<uuid>")`);
-//! - no `claude-code` user agent is imitated and no CLI credential file is
+//! - no `claude-code` user agent is imitated (the refresh and chat requests
+//!   carry the SDK user agent aio-proxy uses) and no CLI credential file is
 //!   read.
 //!
 //! The refresh token rotates on every refresh, so every refresh goes through the
@@ -45,6 +49,12 @@ const AUTHORIZE_PATH: &str = "/oauth/authorize";
 pub const SCOPE: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 /// The beta header a plan token needs, here only on refresh.
 const OAUTH_BETA: &str = crate::wire::anthropic::OAUTH_BETA;
+/// Claude Code's public installed-app OAuth client id (an identifier, not a
+/// secret: it appears in every authorize URL). The owner's aio-proxy
+/// `claude-code` plugin ships the same value. An age-store value overrides it.
+pub const DEFAULT_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+/// The user agent aio-proxy sends on refresh and on plan chat requests.
+pub const PLAN_USER_AGENT: &str = "anthropic-sdk-typescript/0.112.1 userOAuthProvider";
 /// The fixed loopback port and path Claude's client registration allows.
 pub const CALLBACK_PORT: u16 = 54545;
 pub const CALLBACK_PATH: &str = "/callback";
@@ -58,12 +68,15 @@ fn redirect_spec() -> RedirectSpec {
     }
 }
 
-fn not_configured() -> SeraError {
-    SeraError::Rejected {
-        code: "signin_not_configured",
-        message: "Claude plan sign-in is not set up on this server. The owner must turn it on and store its OAuth client id."
-            .into(),
-    }
+/// The OAuth client id: the age-store override when one is stored, else the
+/// compiled-in public client id.
+pub fn client_id_for(secrets: &SharedSecrets, override_name: &str) -> String {
+    Some(override_name.trim())
+        .filter(|name| !name.is_empty())
+        .and_then(|name| secrets.get(name))
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control))
+        .unwrap_or_else(|| DEFAULT_CLIENT_ID.to_owned())
 }
 
 /// The code a member pasted or the redirect carried: `code`, `code#state`, or
@@ -93,8 +106,7 @@ pub fn split_pasted_code(input: &str) -> (String, Option<String>) {
     }
 }
 
-/// The Claude plan sign-in, registered under the `anthropic` kind only while a
-/// provider has `plan_oauth` on.
+/// The Claude plan sign-in, registered under the `anthropic` kind.
 pub struct ClaudeSignIn {
     secrets: SharedSecrets,
     client_id_name: String,
@@ -112,14 +124,20 @@ impl ClaudeSignIn {
         }
     }
 
-    /// The sign-in for the first provider that has `plan_oauth` on, if any.
-    pub fn from_config(config: &crate::config::Config, secrets: SharedSecrets) -> Option<Self> {
-        config
+    /// The sign-in for this server's configuration. It is always registered so
+    /// the Providers page can offer it before an `anthropic` provider is saved;
+    /// each provider's `plan_oauth` flag (checked per request) is what turns it
+    /// off. The client-id override comes from the first provider that has the
+    /// flag on.
+    pub fn from_config(config: &crate::config::Config, secrets: SharedSecrets) -> Self {
+        let name = config
             .llm
             .providers
             .values()
-            .find(|profile| profile.plan_oauth)
-            .map(|profile| Self::new(secrets, &profile.oauth_client_id_secret))
+            .find(|profile| profile.plan_oauth_enabled())
+            .map(|profile| profile.oauth_client_id_secret.as_str())
+            .unwrap_or("");
+        Self::new(secrets, name)
     }
 
     /// Point every endpoint at a mock server on the exact loopback.
@@ -134,14 +152,7 @@ impl ClaudeSignIn {
     }
 
     fn client_id(&self) -> Result<String> {
-        if self.client_id_name.is_empty() {
-            return Err(not_configured());
-        }
-        self.secrets
-            .get(&self.client_id_name)
-            .map(|id| id.trim().to_owned())
-            .filter(|id| !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control))
-            .ok_or_else(not_configured)
+        Ok(client_id_for(&self.secrets, &self.client_id_name))
     }
 }
 
@@ -347,6 +358,7 @@ pub async fn refresh_exchange(
         .post(token_url)
         .header("accept", "application/json")
         .header("anthropic-beta", OAUTH_BETA)
+        .header("user-agent", PLAN_USER_AGENT)
         .json(&json!({
             "grant_type": "refresh_token",
             "client_id": client_id,
@@ -534,29 +546,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn without_a_client_id_the_sign_in_says_it_is_not_set_up() {
+    async fn without_a_stored_client_id_the_public_default_is_used() {
         let harness = harness();
         let alice = member(&harness, "microsoft:claude-noid");
         let server = MockServer::start().await;
         let service = service(&harness, &server, false);
-        let error = service
+        let started = service
             .start(&alice, "claude", "anthropic", start_request())
             .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            SeraError::Rejected {
-                code: "signin_not_configured",
-                ..
-            }
-        ));
-        // No name configured at all is the same answer.
+            .unwrap();
+        let url = url::Url::parse(&started.url).unwrap();
+        let query: BTreeMap<String, String> = url
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        assert_eq!(query["client_id"], DEFAULT_CLIENT_ID);
+        // No name configured at all is the same answer, and a stored value wins.
         let unnamed = ClaudeSignIn::new(age_store(true), "");
-        assert!(
-            unnamed
-                .authorize_url(REDIRECT, &"c".repeat(43), &"s".repeat(16))
-                .is_err()
-        );
+        let url = unnamed
+            .authorize_url(REDIRECT, &"c".repeat(43), &"s".repeat(16))
+            .unwrap();
+        assert!(url.contains(DEFAULT_CLIENT_ID));
+        assert_eq!(client_id_for(&age_store(true), CLIENT_NAME), CLIENT_ID);
+        assert_eq!(DEFAULT_CLIENT_ID, "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
     }
 
     #[tokio::test]
