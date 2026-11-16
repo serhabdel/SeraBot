@@ -1,5 +1,6 @@
 use super::*;
 use crate::ui_widgets::StatusChip;
+use serabot_desktop::provider_accounts as accounts;
 use serabot_desktop::provider_presets::{DirectoryFilter, filter_presets, provider_matches_preset};
 use serabot_desktop::theme::Tone;
 
@@ -38,6 +39,8 @@ pub(super) fn AddProviderSheet(session: Signal<Session>, overlay: Signal<Overlay
         can_save,
         admin_error,
         existing_ids,
+        will_sign_in,
+        oauth_client_secret,
     ) = {
         let s = session.read();
         (
@@ -55,6 +58,12 @@ pub(super) fn AddProviderSheet(session: Signal<Session>, overlay: Signal<Overlay
                 .iter()
                 .map(|p| p.id.clone())
                 .collect::<Vec<_>>(),
+            s.draft_signs_in(
+                s.provider.id.trim(),
+                s.provider.kind.trim(),
+                s.provider.api_key.trim().is_empty(),
+            ),
+            s.provider.oauth_client_secret.clone(),
         )
     };
     let existing_refs: Vec<&str> = existing_ids.iter().map(String::as_str).collect();
@@ -149,6 +158,7 @@ pub(super) fn AddProviderSheet(session: Signal<Session>, overlay: Signal<Overlay
                             draft.provider.auth = preset.auth.to_owned();
                             // The key belongs to one provider; a new preset starts without one.
                             draft.provider.api_key.clear();
+                            draft.provider.oauth_client_secret.clear();
                             draft.admin_error = None;
                             drop(draft);
                             show_key.set(false);
@@ -176,13 +186,17 @@ pub(super) fn AddProviderSheet(session: Signal<Session>, overlay: Signal<Overlay
                         if preset.auth == "oauth" {
                             div { class: "banner info",
                                 span {
-                                    "Sign-in only. Save the provider first, then press Sign in on its card on the Providers page. You can sign in with more than one account."
+                                    if preset.sign_in == "device" {
+                                        "Sign-in only. Press Save and sign in: a code appears here to type on the provider's page. You can sign in with more than one account."
+                                    } else {
+                                        "Sign-in only. Press Save and sign in: your browser opens the provider's sign-in page and the account appears here once you approve. You can sign in with more than one account."
+                                    }
                                 }
                             }
                         } else if preset.sign_in == "pkce" {
                             div { class: "banner info",
                                 span {
-                                    "Paste an API key below, or save the provider and use Add account on its card to sign in."
+                                    "Paste an API key below, or leave it empty and press Save and sign in to sign in with your browser."
                                 }
                             }
                         } else if preset.auth == "none" {
@@ -256,11 +270,30 @@ pub(super) fn AddProviderSheet(session: Signal<Session>, overlay: Signal<Overlay
                         }
                     }
                     if chosen.is_some_and(|preset| preset.auth == "oauth") {
-                        div { class: "field",
-                            span { class: "field-label", "Sign-in" }
-                            div { class: "banner info",
-                                span {
-                                    "After saving, use the Sign in button on this provider's card. Each account's tokens are encrypted for you alone."
+                        if chosen.is_some_and(|preset| preset.kind == "google-antigravity") {
+                            div { class: "field",
+                                label { class: "field-label", r#for: "provider-client-secret-input", "OAuth client secret" }
+                                input {
+                                    id: "provider-client-secret-input",
+                                    class: "input",
+                                    r#type: "password",
+                                    autocomplete: "off",
+                                    spellcheck: false,
+                                    value: "{oauth_client_secret}",
+                                    placeholder: "Paste once (leave empty if already stored)",
+                                    oninput: move |event| session.write().provider.oauth_client_secret = event.value(),
+                                }
+                                span { class: "hint",
+                                    "Google's sign-in needs this secret once. It is stored encrypted on the server and never shown again."
+                                }
+                            }
+                        } else {
+                            div { class: "field",
+                                span { class: "field-label", "Sign-in" }
+                                div { class: "banner info",
+                                    span {
+                                        "Each account's tokens are encrypted for you alone."
+                                    }
                                 }
                             }
                         }
@@ -372,11 +405,45 @@ pub(super) fn AddProviderSheet(session: Signal<Session>, overlay: Signal<Overlay
                             overlay.set(Overlay::None);
                         }
                     },
-                    "Save provider"
+                    if will_sign_in { "Save and sign in" } else { "Save provider" }
                 }
             }
         }
     }
+}
+
+/// Fill the Add provider draft from a preset, or from the provider already
+/// saved for it.
+fn fill_provider_draft(
+    s: &mut Session,
+    preset: &provider_presets::ProviderPreset,
+    existing: Option<&serabot_desktop::ProviderStatus>,
+) {
+    if let Some(cur) = existing {
+        s.provider.id = cur.id.clone();
+        s.provider.kind = cur.kind.clone();
+        s.provider.base_url = preset.base_url.to_owned();
+        s.provider.secret_name = cur
+            .secrets
+            .values()
+            .find_map(|secret| secret.name.clone())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| preset.secret_name.to_owned());
+        s.provider.models = cur.models.join(", ");
+        s.provider.catalog_fetch = cur.catalog_fetch;
+        s.provider.auth = cur.auth.clone();
+    } else {
+        s.provider.id = preset.default_id.to_owned();
+        s.provider.kind = preset.kind.to_owned();
+        s.provider.base_url = preset.base_url.to_owned();
+        s.provider.secret_name = preset.secret_name.to_owned();
+        s.provider.models = preset.models.join(", ");
+        s.provider.catalog_fetch = preset.catalog_fetch;
+        s.provider.auth = preset.auth.to_owned();
+    }
+    s.provider.api_key.clear();
+    s.provider.oauth_client_secret.clear();
+    s.admin_error = None;
 }
 
 #[component]
@@ -779,6 +846,9 @@ pub(super) fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) 
                                             })
                                             || (p.auth == "oauth" && p.secrets.values().any(|s| s.configured))
                                     });
+                                    let offers_sign_in = preset.auth == "oauth" || !preset.sign_in.is_empty();
+                                    let takes_key = preset.auth == "api_key";
+                                    let has_accounts = existing.as_ref().is_some_and(|p| !p.accounts.is_empty());
                                     rsx! {
                                         div { class: "integration-card", key: "{preset.id}",
                                             div {
@@ -809,47 +879,52 @@ pub(super) fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) 
                                                     tone: if is_connected { Tone::Ok } else { Tone::Muted },
                                                     text: if is_connected { "Connected".to_owned() } else { "Not connected".to_owned() },
                                                 }
-                                                button {
-                                                    class: if is_connected { "btn ghost sm" } else { "btn primary sm" },
-                                                    r#type: "button",
-                                                    onclick: {
-                                                        let preset = *preset;
-                                                        let existing = existing.clone();
-                                                        move |_| {
-                                                            let mut draft = session.write();
-                                                            if let Some(ref cur) = existing {
-                                                                draft.provider.id = cur.id.clone();
-                                                                draft.provider.kind = cur.kind.clone();
-                                                                draft.provider.base_url = preset.base_url.to_owned();
-                                                                draft.provider.secret_name = cur
-                                                                    .secrets
-                                                                    .values()
-                                                                    .find_map(|s| s.name.clone())
-                                                                    .filter(|n| !n.is_empty())
-                                                                    .unwrap_or_else(|| preset.secret_name.to_owned());
-                                                                draft.provider.models = cur.models.join(", ");
-                                                                draft.provider.catalog_fetch = cur.catalog_fetch;
-                                                                draft.provider.auth = cur.auth.clone();
-                                                            } else {
-                                                                draft.provider.id = if preset.default_id.is_empty() {
-                                                                    String::new()
+                                                if offers_sign_in {
+                                                    button {
+                                                        class: if is_connected || takes_key { "btn ghost sm" } else { "btn primary sm" },
+                                                        r#type: "button",
+                                                        title: "Sign in with your browser",
+                                                        disabled: !can_save,
+                                                        onclick: {
+                                                            let preset = *preset;
+                                                            let existing = existing.clone();
+                                                            move |_| {
+                                                                let mut s = session.write();
+                                                                s.admin_error = None;
+                                                                if accounts::directory_needs_setup(existing.as_ref(), preset.kind) {
+                                                                    // Antigravity's client secret is pasted once in the sheet.
+                                                                    fill_provider_draft(&mut s, &preset, existing.as_ref());
+                                                                    drop(s);
+                                                                    overlay.set(Overlay::AddProvider);
+                                                                } else if let Some(cur) = existing.as_ref() {
+                                                                    s.sign_in_now(&cur.id);
                                                                 } else {
-                                                                    preset.default_id.to_owned()
-                                                                };
-                                                                draft.provider.kind = preset.kind.to_owned();
-                                                                draft.provider.base_url = preset.base_url.to_owned();
-                                                                draft.provider.secret_name = preset.secret_name.to_owned();
-                                                                draft.provider.models = preset.models.join(", ");
-                                                                draft.provider.catalog_fetch = preset.catalog_fetch;
-                                                                draft.provider.auth = preset.auth.to_owned();
+                                                                    // No card yet: save the profile and sign in, in one press.
+                                                                    fill_provider_draft(&mut s, &preset, None);
+                                                                    s.save_provider();
+                                                                }
                                                             }
-                                                            draft.provider.api_key.clear();
-                                                            draft.admin_error = None;
-                                                            drop(draft);
-                                                            overlay.set(Overlay::AddProvider);
-                                                        }
-                                                    },
-                                                    if is_connected { "Configure" } else { "Connect" }
+                                                        },
+                                                        Icon { name: "external", size: 14 }
+                                                        if has_accounts { "Add account" } else { "Sign in" }
+                                                    }
+                                                }
+                                                if takes_key || is_connected {
+                                                    button {
+                                                        class: if is_connected { "btn ghost sm" } else { "btn primary sm" },
+                                                        r#type: "button",
+                                                        onclick: {
+                                                            let preset = *preset;
+                                                            let existing = existing.clone();
+                                                            move |_| {
+                                                                let mut s = session.write();
+                                                                fill_provider_draft(&mut s, &preset, existing.as_ref());
+                                                                drop(s);
+                                                                overlay.set(Overlay::AddProvider);
+                                                            }
+                                                        },
+                                                        if is_connected { "Configure" } else { "Connect with a key" }
+                                                    }
                                                 }
                                             }
                                         }

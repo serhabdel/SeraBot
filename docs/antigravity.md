@@ -39,6 +39,8 @@ Full browser UI is out of scope. Login is a loopback PKCE flow, the same shape a
    serabot secrets set antigravity_oauth_client_secret
    ```
 
+   The Windows console can store it too: Providers, Add provider, Google Antigravity, **OAuth client secret** (under the form). It is written to the same encrypted store, never shown again, and the first **Save and sign in** then opens your browser on Google's consent page. Members sign in from the provider's card; no restart is needed.
+
    Paste the secret on stdin. Leave `oauth_client_id_secret` empty so refresh uses the built-in client id. If you set that secret, it must be exactly that client id or login refuses.
 
 2. Point a provider at Cloud Code. `base_url` may be empty (the daily host below) or one of the documented origins. `project_id` may stay empty until login prints one.

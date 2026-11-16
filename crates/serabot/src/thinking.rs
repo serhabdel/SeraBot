@@ -52,6 +52,11 @@ pub fn levels_for(kind: &str, model: &str, tags: &[String]) -> Vec<&'static str>
                 &[]
             } else if id.starts_with("o1") || id.starts_with("o3") || id.starts_with("o4") {
                 &["low", "medium", "high"]
+            } else if matches!(id.as_str(), "gpt-6-astra" | "gpt-6.1-sol") {
+                // OpenAI's models page: no `none`, and `max` on top.
+                &["low", "medium", "high", "xhigh", "max"]
+            } else if matches!(id.as_str(), "gpt-6.1-terra" | "gpt-6-luna") {
+                &["off", "low", "medium", "high", "xhigh", "max"]
             } else if id.starts_with("gpt-5.") || id.starts_with("gpt-6") {
                 &["off", "low", "medium", "high", "xhigh"]
             } else if id.starts_with("gpt-5") {
@@ -120,7 +125,10 @@ pub fn levels_for(kind: &str, model: &str, tags: &[String]) -> Vec<&'static str>
             }
         }
         "anthropic" => {
-            if anthropic_thinks(&id) || (id.starts_with("claude-") && has_reasoning_tag) {
+            if matches!(id.as_str(), "claude-fable-5-2" | "claude-opus-5-5") {
+                // Anthropic marks these two "always on": thinking cannot be off.
+                &["low", "medium", "high", "xhigh"]
+            } else if anthropic_thinks(&id) || (id.starts_with("claude-") && has_reasoning_tag) {
                 &["off", "low", "medium", "high", "xhigh"]
             } else {
                 &[]
@@ -403,6 +411,26 @@ mod tests {
                 "gpt-5.5",
                 &["off", "low", "medium", "high", "xhigh"],
             ),
+            (
+                "openai",
+                "gpt-6.1-sol",
+                &["low", "medium", "high", "xhigh", "max"],
+            ),
+            (
+                "openai",
+                "gpt-6-astra",
+                &["low", "medium", "high", "xhigh", "max"],
+            ),
+            (
+                "openai",
+                "gpt-6.1-terra",
+                &["off", "low", "medium", "high", "xhigh", "max"],
+            ),
+            (
+                "openai",
+                "gpt-6-luna",
+                &["off", "low", "medium", "high", "xhigh", "max"],
+            ),
             ("openai", "gpt-4o", &[]),
             ("openai", "gpt-5-chat-latest", &[]),
             ("mistral", "mistral-small-2603", &["off", "high"]),
@@ -446,9 +474,18 @@ mod tests {
             "claude-sonnet-4-5-20250929",
             "claude-opus-4-1",
             "claude-haiku-4-5",
-            "claude-opus-5-5",
+            "claude-sonnet-5-5",
         ] {
             assert_eq!(levels_for("anthropic", model, &none()), full, "{model}");
+        }
+        // "Always on" models never offer `off`.
+        for model in ["claude-fable-5-2", "claude-opus-5-5"] {
+            assert_eq!(
+                levels_for("anthropic", model, &none()),
+                ["low", "medium", "high", "xhigh"],
+                "{model}"
+            );
+            assert!(wire_fields("anthropic", model, &[], "off").is_none());
         }
         for model in [
             "claude-3-5-sonnet-20241022",

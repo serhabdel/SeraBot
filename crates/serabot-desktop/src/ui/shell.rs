@@ -10,6 +10,15 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
     let mut drawer_open = use_signal(|| false);
     let mut toast = use_signal(|| Option::<(String, bool)>::None);
     let undo = use_signal(|| Option::<String>::None);
+    // A sign-in the session starts by itself (right after a save, or when an
+    // error asks for one) opens its sheet here.
+    let mut overlay_for_signin = overlay;
+    use_effect(move || {
+        let wants = session.read().accounts_ui.sheet_provider.is_some();
+        if wants && overlay_for_signin() == Overlay::None {
+            overlay_for_signin.set(Overlay::AddAccount);
+        }
+    });
     let onboarding_open = chat && session.read().onboarding_ui.open;
     let settings_open = session.read().bot_settings.open;
     let preview_open = session.read().state.preview_dock_hash.is_some();

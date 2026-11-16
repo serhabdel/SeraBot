@@ -274,7 +274,7 @@ fn oauth_end(error: OAuthError) -> FlowEnd {
 /// shown when it sent one; a raw status never is.
 fn api_end(error: ApiError) -> FlowEnd {
     FlowEnd::Failed(match error {
-        ApiError::Rejected(message) => message,
+        ApiError::Rejected(message) => crate::provider_accounts::plain_error(&message),
         ApiError::Http(404) => {
             "This server does not offer that sign-in. Update the server.".to_owned()
         }

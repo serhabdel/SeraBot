@@ -84,13 +84,18 @@ pub(super) fn AccountsBlock(
             s.state.account_tests.clone(),
         )
     };
-    let signs_in = provider.auth == "oauth";
+    let signs_in_methods = accounts::first_sign_in_method(&methods).is_some();
+    let takes_key = methods.contains(&AddMethod::Key);
+    let add_label = accounts::add_button_label(&methods, !ordered.is_empty());
+    let is_admin = session.read().is_admin();
+    let needs_secret = is_admin && accounts::client_secret_missing(&provider);
     let shared_key = ordered.is_empty() && provider.credential.configured;
     if methods.is_empty() && ordered.is_empty() {
         return rsx! {};
     }
     let add_enabled = can_write && accounts::can_add(&provider) && !methods.is_empty();
     let add_provider = provider.id.clone();
+    let key_provider = provider.id.clone();
     let quota_reads = QUOTA_KINDS.contains(&provider.kind.as_str());
     rsx! {
         div { class: "acct-block",
@@ -99,21 +104,45 @@ pub(super) fn AccountsBlock(
                     if ordered.is_empty() { "Accounts" } else { "{accounts::summary_line(&provider.accounts)}" }
                 }
                 if !methods.is_empty() {
-                    button {
-                        class: if ordered.is_empty() { "btn primary sm" } else { "btn ghost sm" },
-                        r#type: "button",
-                        disabled: !add_enabled,
-                        title: if accounts::can_add(&provider) {
-                            "Add another account for this provider"
-                        } else {
-                            "This provider holds the most accounts it can"
-                        },
-                        onclick: move |_| {
-                            session.write().open_add_account(&add_provider);
-                            overlay.set(Overlay::AddAccount);
-                        },
-                        Icon { name: "plus", size: 14 }
-                        if signs_in { "Sign in" } else { "Add account" }
+                    div { class: "row",
+                        if signs_in_methods && takes_key {
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                disabled: !add_enabled,
+                                title: "Paste an API key instead of signing in",
+                                onclick: move |_| {
+                                    let mut s = session.write();
+                                    s.open_add_account(&key_provider);
+                                    s.set_add_method(AddMethod::Key);
+                                    drop(s);
+                                    overlay.set(Overlay::AddAccount);
+                                },
+                                "Use a key"
+                            }
+                        }
+                        button {
+                            class: if ordered.is_empty() { "btn primary sm" } else { "btn ghost sm" },
+                            r#type: "button",
+                            disabled: !add_enabled,
+                            title: if !accounts::can_add(&provider) {
+                                "This provider holds the most accounts it can"
+                            } else if signs_in_methods {
+                                "Open the provider's sign-in page in your browser"
+                            } else {
+                                "Add another account for this provider"
+                            },
+                            onclick: move |_| {
+                                if signs_in_methods {
+                                    session.write().sign_in_now(&add_provider);
+                                } else {
+                                    session.write().open_add_account(&add_provider);
+                                }
+                                overlay.set(Overlay::AddAccount);
+                            },
+                            Icon { name: if signs_in_methods { "external".to_owned() } else { "plus".to_owned() }, size: 14 }
+                            "{add_label}"
+                        }
                     }
                 }
             }
@@ -127,10 +156,13 @@ pub(super) fn AccountsBlock(
                 }
             } else if ordered.is_empty() {
                 div { class: "acct-empty", role: "status",
-                    if signs_in {
-                        "Not signed in yet. Sign in to use this provider."
-                    } else {
-                        "No account yet. Add an API key to use this provider."
+                    "{accounts::empty_card_text(&methods)}"
+                }
+            }
+            if needs_secret {
+                div { class: "banner info", role: "status",
+                    span {
+                        "Google's sign-in needs its OAuth client secret once. Open Add provider, choose Google Antigravity and paste it under Advanced settings."
                     }
                 }
             }
@@ -247,6 +279,23 @@ pub(super) fn AccountsBlock(
                                                     move |_| session.write().refresh_account_quota(&pid, &aid)
                                                 },
                                                 Icon { name: "usage", size: 14 }
+                                            }
+                                        }
+                                        if signs_in_methods && account.auth_kind != "api_key" {
+                                            button {
+                                                class: if state == accounts::AccountState::NeedsReauth { "btn primary sm" } else { "btn ghost sm" },
+                                                r#type: "button",
+                                                title: "Sign in to this provider again",
+                                                "aria-label": "Sign in again as {label}",
+                                                disabled: !can_write,
+                                                onclick: {
+                                                    let pid = pid.clone();
+                                                    move |_| {
+                                                        session.write().sign_in_now(&pid);
+                                                        overlay.set(Overlay::AddAccount);
+                                                    }
+                                                },
+                                                "Sign in again"
                                             }
                                         }
                                         button {

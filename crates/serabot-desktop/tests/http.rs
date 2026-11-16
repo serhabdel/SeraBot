@@ -711,6 +711,7 @@ fn admin_rejections_keep_auth_status_and_surface_safe_messages() {
         api_key_secret: "WORK_API_KEY".into(),
         catalog_fetch: false,
         api_key: None,
+        oauth_client_secret: None,
     };
     let (client, handle) = server(vec![
         (401, r#"{"error":"unauthorized"}"#.into()),
@@ -2182,4 +2183,225 @@ fn a_sign_in_page_must_be_a_plain_https_page_and_bounded() {
         client.add_provider_account("openai", "x", "bad\nkey"),
         Err(ApiError::Validation(_))
     ));
+}
+
+// ---- Browser sign-in, end to end against a local stand-in server ----
+
+/// What the stand-in server saw of a browser sign-in.
+struct SigninMock {
+    url: String,
+    /// `(redirect_uri, state)` of the start call, for the stand-in "browser".
+    started: std::sync::mpsc::Receiver<(String, String)>,
+    handle: thread::JoinHandle<Vec<String>>,
+}
+
+/// Answer the start call (reading the redirect and state the console sent),
+/// then, when `complete` is given, wait for the complete call and answer it.
+/// Returns every request it saw.
+fn signin_mock(start: (u16, String), complete: Option<(u16, String)>) -> SigninMock {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (tx, started) = std::sync::mpsc::channel();
+    let handle = thread::spawn(move || {
+        let mut seen = Vec::new();
+        let reply = |stream: &mut TcpStream, status: u16, body: &str| {
+            write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        };
+        let (mut stream, _) = listener.accept().unwrap();
+        let req = request(&mut stream);
+        let body: serde_json::Value =
+            serde_json::from_str(req.split("\r\n\r\n").nth(1).unwrap_or("{}")).unwrap();
+        let redirect = body["redirect_uri"].as_str().unwrap_or_default().to_owned();
+        let state = body["state"].as_str().unwrap_or_default().to_owned();
+        let start_body = start.1.replace("{state}", &state);
+        let _ = tx.send((redirect, state));
+        reply(&mut stream, start.0, &start_body);
+        seen.push(req);
+        listener.set_nonblocking(true).unwrap();
+        let wait = if complete.is_some() { 15 } else { 2 };
+        let deadline = std::time::Instant::now() + Duration::from_secs(wait);
+        while std::time::Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    let req = request(&mut stream);
+                    let (status, body) = complete.clone().unwrap_or((500, "{}".into()));
+                    reply(&mut stream, status, &body);
+                    seen.push(req);
+                    break;
+                }
+                Err(_) => thread::sleep(Duration::from_millis(25)),
+            }
+        }
+        seen
+    });
+    SigninMock {
+        url,
+        started,
+        handle,
+    }
+}
+
+fn signin_client(url: &str) -> ApiClient {
+    ApiClient::new(
+        validate_endpoint(url).unwrap(),
+        SecretString::new(TOKEN.into()),
+    )
+    .unwrap()
+}
+
+const START_OK: &str = r#"{"flow_id":"flow-1","flow":"pkce","url":"https://accounts.example.invalid/authorize","expires_in":120,"state":"{state}"}"#;
+
+/// The stand-in browser: when "opened", it calls the console's loopback
+/// redirect with `code` and the given state (`None` sends the real one).
+fn browser<'a>(
+    mock: &'a SigninMock,
+    code: &'a str,
+    state: Option<&'a str>,
+) -> impl Fn(&str) -> bool + 'a {
+    move |page: &str| {
+        assert!(page.starts_with("https://"), "only https pages are opened");
+        let (redirect, real_state) = mock.started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let state = state.unwrap_or(&real_state).to_owned();
+        let code = code.to_owned();
+        thread::spawn(move || {
+            let url = url::Url::parse(&redirect).unwrap();
+            let port = url.port().unwrap();
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            write!(
+                stream,
+                "GET {}?code={code}&state={state} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n",
+                url.path()
+            )
+            .unwrap();
+            let mut sink = String::new();
+            let _ = std::io::Read::read_to_string(&mut stream, &mut sink);
+        });
+        true
+    }
+}
+
+#[test]
+fn a_browser_sign_in_posts_the_redirect_code_to_the_server() {
+    use serabot_desktop::provider_flow::{FlowEnd, FlowMsg, run_browser};
+    use std::sync::atomic::AtomicBool;
+    let mock = signin_mock(
+        (200, START_OK.into()),
+        Some((200, r#"{"account_id":"acct-1","created":true}"#.into())),
+    );
+    let client = signin_client(&mock.url);
+    let reports = std::cell::RefCell::new(Vec::new());
+    let end = run_browser(
+        &client,
+        "antigravity",
+        "google-antigravity",
+        &AtomicBool::new(false),
+        &|msg: FlowMsg| reports.borrow_mut().push(msg),
+        &browser(&mock, "synthetic-code", None),
+    );
+    assert_eq!(
+        end,
+        FlowEnd::Done {
+            account_id: "acct-1".into(),
+            created: true
+        }
+    );
+    assert!(matches!(
+        reports.borrow().first(),
+        Some(FlowMsg::Started { opened: true, .. })
+    ));
+    let seen = mock.handle.join().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[0].starts_with("POST /v1/providers/antigravity/signin/start"));
+    // Antigravity's redirect is the loopback path its registration allows.
+    assert!(seen[0].contains("127.0.0.1"));
+    assert!(seen[0].contains("/oauth-callback"));
+    assert!(seen[1].starts_with("POST /v1/providers/antigravity/signin/complete"));
+    assert!(seen[1].contains("\"code\":\"synthetic-code\""));
+    assert!(seen[1].contains("\"flow_id\":\"flow-1\""));
+    assert!(seen[1].contains("\"verifier\":\""));
+}
+
+#[test]
+fn a_redirect_with_the_wrong_state_is_refused_and_nothing_is_posted() {
+    use serabot_desktop::provider_flow::{FlowEnd, run_browser};
+    use std::sync::atomic::AtomicBool;
+    let mock = signin_mock((200, START_OK.into()), None);
+    let client = signin_client(&mock.url);
+    let end = run_browser(
+        &client,
+        "antigravity",
+        "google-antigravity",
+        &AtomicBool::new(false),
+        &|_| {},
+        &browser(&mock, "stolen-code", Some("another-state")),
+    );
+    match end {
+        FlowEnd::Failed(message) => assert!(message.contains("did not match"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+    // Only the start call reached the server; the code was never forwarded.
+    assert_eq!(mock.handle.join().unwrap().len(), 1);
+}
+
+#[test]
+fn cancelling_a_waiting_browser_sign_in_ends_it_without_a_post() {
+    use serabot_desktop::provider_flow::{FlowEnd, run_browser};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let mock = signin_mock((200, START_OK.into()), None);
+    let client = signin_client(&mock.url);
+    let cancel = AtomicBool::new(false);
+    let end = run_browser(
+        &client,
+        "antigravity",
+        "google-antigravity",
+        &cancel,
+        &|_| {},
+        // The page opens, but the member never approves: they press Cancel.
+        &|_| {
+            cancel.store(true, Ordering::SeqCst);
+            true
+        },
+    );
+    assert_eq!(end, FlowEnd::Cancelled);
+    assert_eq!(mock.handle.join().unwrap().len(), 1);
+}
+
+#[test]
+fn a_server_refusal_reaches_the_member_in_plain_words() {
+    use serabot_desktop::provider_flow::{FlowEnd, run_browser};
+    use std::sync::atomic::AtomicBool;
+    for (message, expect, forbid) in [
+        (
+            "Antigravity sign-in is not set up on this server. Ask the owner to store its OAuth client secret.",
+            "OAuth client secret under Advanced settings",
+            "",
+        ),
+        (
+            "secret antigravity_refresh_token is empty; provide credentials",
+            "Sign in to Google Antigravity",
+            "antigravity_refresh_token",
+        ),
+    ] {
+        let body = serde_json::json!({"error": message, "code": "x"}).to_string();
+        let mock = signin_mock((422, body), None);
+        let client = signin_client(&mock.url);
+        let end = run_browser(
+            &client,
+            "antigravity",
+            "google-antigravity",
+            &AtomicBool::new(false),
+            &|_| {},
+            &|_| true,
+        );
+        match end {
+            FlowEnd::Failed(text) => {
+                assert!(text.contains(expect), "{text}");
+                assert!(forbid.is_empty() || !text.contains(forbid), "{text}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let _ = mock.started.recv_timeout(Duration::from_secs(5));
+        mock.handle.join().unwrap();
+    }
 }

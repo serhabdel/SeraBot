@@ -364,16 +364,21 @@ pub(super) async fn list_connectors(
 // ---- Per-user credentials, OneDrive consent, Telegram linking (phase 4) ----
 
 /// The configured profile for a provider id (`default` is `[llm]` itself).
-pub(super) fn provider_profile(config: &Config, id: &str) -> Result<ProviderConfig> {
+///
+/// A provider the owner saved from the console lives in the admin overlay; it
+/// is found here at once, so its sign-in does not wait for a restart.
+pub(super) fn provider_profile(state: &ApiState, id: &str) -> Result<ProviderConfig> {
     validate_provider(id)?;
     if id == "default" {
-        return Ok(config.llm.default_provider());
+        return Ok(state.config.llm.default_provider());
     }
-    config
-        .llm
-        .providers
-        .get(id)
-        .cloned()
+    if let Some(profile) = state.config.llm.providers.get(id) {
+        return Ok(profile.clone());
+    }
+    state
+        .admin
+        .as_ref()
+        .and_then(|admin| admin.snapshot().providers.get(id).cloned())
         .ok_or_else(|| SeraError::NotFound(format!("provider {id}")))
 }
 
@@ -457,7 +462,7 @@ pub(super) async fn set_provider_key(
     Path(id): Path<String>,
     Json(request): Json<SetProviderKeyRequest>,
 ) -> Result<Json<Value>> {
-    provider_profile(&state.config, &id)?;
+    provider_profile(&state, &id)?;
     let credential = ProviderCredential {
         api_key: request.api_key.trim().to_owned(),
         refresh_token: String::new(),
@@ -530,7 +535,7 @@ pub(super) async fn grant_provider(
 ) -> Result<Json<Value>> {
     require_admin(&user)?;
     crate::util::validate_id(&request.grantee)?;
-    provider_profile(&state.config, &request.provider)?;
+    provider_profile(&state, &request.provider)?;
     let grant = state
         .users
         .grant(&user.id, &request.grantee, &request.provider)?;

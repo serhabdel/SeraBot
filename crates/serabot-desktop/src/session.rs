@@ -385,6 +385,9 @@ pub struct ProviderDraft {
     pub catalog_fetch: bool,
     /// How the chosen preset signs in: "api_key", "oauth" or "none".
     pub auth: String,
+    /// The OAuth client secret for Antigravity. Written to the server's
+    /// encrypted store and cleared after the save.
+    pub oauth_client_secret: String,
 }
 
 impl Default for ProviderDraft {
@@ -398,6 +401,7 @@ impl Default for ProviderDraft {
             api_key: String::new(),
             catalog_fetch: true,
             auth: "api_key".into(),
+            oauth_client_secret: String::new(),
         }
     }
 }
@@ -405,6 +409,7 @@ impl Default for ProviderDraft {
 impl Drop for ProviderDraft {
     fn drop(&mut self) {
         self.api_key.zeroize();
+        self.oauth_client_secret.zeroize();
     }
 }
 
@@ -3476,6 +3481,7 @@ impl Session {
         self.poll_status();
         self.poll_sign_in();
         self.poll_provider_flow();
+        self.poll_pending_signin();
         self.poll_telegram();
         self.poll_download();
         self.poll_attachments();
@@ -4055,9 +4061,16 @@ impl Session {
                         ApiError::Rejected(text) if text == "not found" => {
                             "This server has no administration API. Update the server to 0.4.0 or later.".to_owned()
                         }
-                        _ => error.to_string(),
+                        _ => crate::provider_accounts::plain_error(&error.to_string()),
                     };
+                    // A refusal that asks for a sign-in opens that sign-in.
+                    let asks_sign_in =
+                        crate::provider_accounts::sign_in_needed_for(&error.to_string());
+                    self.accounts_ui.save_signin = None;
                     self.admin_error = Some(message);
+                    if asks_sign_in.is_some() {
+                        self.prompt_sign_in_for(&error.to_string());
+                    }
                     self.connector_testing = None;
                     self.oauth_signing_in = None;
                     self.provider_testing = None;
@@ -4791,15 +4804,24 @@ impl Session {
                         }
                         OperationKind::AdminWrite => {
                             self.provider.api_key.zeroize();
+                            self.provider.oauth_client_secret.zeroize();
                             for draft in self.connector_drafts.values_mut() {
                                 for value in draft.values.values_mut() {
                                     value.zeroize();
                                 }
                             }
                             self.admin_error = None;
-                            self.admin_notice =
-                                Some("Saved. Restart the server to apply the change.".into());
-                            self.restart_pending = true;
+                            if let Some(id) = self.accounts_ui.save_signin.take() {
+                                // A sign-in provider needs no restart: its card
+                                // appears and the sign-in page opens.
+                                self.admin_notice =
+                                    Some("Saved. Opening the sign-in page\u{2026}".into());
+                                self.sign_in_after_save(id);
+                            } else {
+                                self.admin_notice =
+                                    Some("Saved. Restart the server to apply the change.".into());
+                                self.restart_pending = true;
+                            }
                             // Re-read the lists so "Connected" reflects what the
                             // server now holds instead of the pre-save snapshot.
                             self.state.connectors_loaded = false;
@@ -5227,6 +5249,10 @@ impl Session {
             Some("Secret name must be 1–128 letters, digits, '_' or '-'.")
         } else if !api_key.is_empty() && !valid_credential(&api_key) {
             Some("The API key contains control characters or is too long.")
+        } else if !self.provider.oauth_client_secret.trim().is_empty()
+            && !valid_credential(self.provider.oauth_client_secret.trim())
+        {
+            Some("The OAuth client secret contains control characters or is too long.")
         } else {
             None
         };
@@ -5238,6 +5264,9 @@ impl Session {
             self.admin_error = Some("Wait for the current request, then retry.".into());
             return;
         }
+        let client_secret = self.provider.oauth_client_secret.trim().to_owned();
+        let signs_in = self.draft_signs_in(&id, &kind, api_key.is_empty());
+        let sign_in_id = id.clone();
         let request = NewProvider {
             id,
             kind,
@@ -5246,7 +5275,9 @@ impl Session {
             api_key_secret: secret,
             catalog_fetch: self.provider.catalog_fetch,
             api_key: (!api_key.is_empty()).then_some(api_key),
+            oauth_client_secret: (!client_secret.is_empty()).then_some(client_secret),
         };
+        self.accounts_ui.save_signin = signs_in.then_some(sign_in_id);
         self.start_request(Operation::AdminSaveProvider(request));
     }
 
