@@ -648,7 +648,8 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     // The API and the model clients refresh account tokens through one
     // single-flight refresher, so a rotated token is never spent twice.
     let account_refresher = credentials.refresher().clone();
-    let router = serabot::model_router::ModelRouter::with_credentials(&config.llm, credentials)?;
+    let router = serabot::model_router::ModelRouter::with_credentials(&config.llm, credentials)?
+        .with_max_inflight_per_account(config.runtime.max_inflight_per_account);
 
     let embedder: Arc<dyn Embedder> = Arc::new(LazyEmbedder::new(
         &config.embeddings,
@@ -970,11 +971,18 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         &mut registry,
         SkillRuntime::new(catalog, fleet.clone(), store.clone()),
     )?;
-    registry.register(serabot::delegate::DelegateTool::new(
-        store.clone(),
-        fleet.clone(),
-        router.clone(),
-    ))?;
+    registry.register(
+        serabot::delegate::DelegateTool::new(store.clone(), fleet.clone(), router.clone())
+            .with_child_daily_limit(config.users.child_daily_limit),
+    )?;
+    serabot::tools_bots::register_bot_tools(
+        &mut registry,
+        &store,
+        &fleet,
+        &router,
+        &policy,
+        config.users.child_daily_limit,
+    )?;
     registry.register(serabot::ask_teammate::AskTeammateTool::new(
         store.clone(),
         fleet.clone(),

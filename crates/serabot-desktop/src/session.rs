@@ -28,6 +28,7 @@ use crate::{
 };
 mod bot_settings;
 mod flows;
+mod orchestration;
 mod provider_accounts;
 
 pub use bot_settings::{BotDraft, BotSettings, SettingsTab, model_pick, model_value};
@@ -117,6 +118,9 @@ enum EventRefresh {
 /// team is read again as well, so an open team sheet shows what the server
 /// saved. Anywhere else there is no team to read and the transcript refresh
 /// is the only thing that happens.
+/// Child counters kept in the session; the one idle longest is dropped.
+const MAX_SUBAGENT_COUNTERS: usize = 64;
+
 fn event_refresh(kind: &str, conversation: &str) -> EventRefresh {
     if kind.starts_with("team.") && teams::is_room(conversation) {
         return EventRefresh::RoomTeam;
@@ -625,6 +629,12 @@ pub struct Session {
     pub panel: PanelState,
     panel_worker: Option<PanelWorker>,
     events_dirty: bool,
+    /// Stream events waiting for the next 16 ms frame (v0.50 C2).
+    event_frames: crate::events::FrameCoalescer,
+    /// Frames applied to the state: one state write each, 60 a second at most.
+    pub event_frame_writes: u64,
+    /// Folded progress of subagents (child tasks), by child task id.
+    pub subagents: std::collections::BTreeMap<String, crate::events::SubagentProgress>,
     pub last_event_id: i64,
     last_event_kind: String,
     pub server: String,
@@ -725,6 +735,13 @@ pub struct Session {
     pub composer_files: Vec<crate::AttachmentInfo>,
     /// Text drafts per conversation, kept while the app runs (0.19).
     pub drafts: crate::chat_compose::Drafts,
+    /// Messages typed while a reply runs, for the open chat (v0.50).
+    pub queue: crate::chat_compose::SendQueue,
+    /// Queues of the chats that are not open.
+    queues: crate::chat_compose::Queues,
+    /// Collapsed run groups the owner opened.
+    pub runs_open: std::collections::HashSet<String>,
+    runs_last_read: Option<Instant>,
     /// Why some files were refused, shown under the composer.
     pub attach_notice: Option<String>,
     /// Picture previews by attachment id (small images only).
@@ -854,6 +871,9 @@ impl Session {
             events_active: false,
             events_seen: false,
             events_dirty: false,
+            event_frames: crate::events::FrameCoalescer::new(),
+            event_frame_writes: 0,
+            subagents: std::collections::BTreeMap::new(),
             last_event_id: 0,
             last_event_kind: String::new(),
             server,
@@ -921,6 +941,10 @@ impl Session {
             folder_stats_chan: None,
             composer_files: Vec::new(),
             drafts: crate::chat_compose::Drafts::default(),
+            queue: crate::chat_compose::SendQueue::default(),
+            queues: crate::chat_compose::Queues::default(),
+            runs_open: std::collections::HashSet::new(),
+            runs_last_read: None,
             attach_notice: None,
             attachment_thumbs: std::collections::HashMap::new(),
             upload_thumb: None,
@@ -1960,6 +1984,8 @@ impl Session {
         self.token.clear();
         self.last_event_id = 0;
         self.last_event_kind.clear();
+        self.event_frames.clear();
+        self.subagents.clear();
         self.usage_loading = false;
         self.server_health_loading = false;
         self.voice = VoiceDraft::default();
@@ -2309,7 +2335,12 @@ impl Session {
         }
         // The draft of the conversation being left waits for its return.
         self.drafts.store(&self.conversation, &self.composer);
+        let left = std::mem::take(&mut self.queue);
+        self.queues.stash(&self.conversation, left);
+        self.runs_open.clear();
+        self.runs_last_read = None;
         self.conversation = id;
+        self.queue = self.queues.restore(&self.conversation);
         self.state.chat_failure = None;
         self.state.held_draft = None;
         self.section = Section::Chat;
@@ -2734,7 +2765,15 @@ impl Session {
             limit_reached: false,
         });
         if files.is_empty() {
-            self.start_request(Operation::Submit(zeroize::Zeroizing::new(text)));
+            // A leading `@bot` sends the message to that bot (a delegate).
+            let routed = self.route_for(&text);
+            match routed.target {
+                Some(bot) => self.start_request(Operation::SubmitTo {
+                    text: zeroize::Zeroizing::new(routed.text),
+                    bot,
+                }),
+                None => self.start_request(Operation::Submit(zeroize::Zeroizing::new(text))),
+            }
         } else {
             self.start_request(Operation::SubmitWith {
                 text: zeroize::Zeroizing::new(text),
@@ -3400,6 +3439,25 @@ impl Session {
         self.state.account_tests.len().hash(&mut h);
         self.state.route_events.len().hash(&mut h);
         self.state.route_chain.is_some().hash(&mut h);
+        // Runs, queue and wait rows (v0.50). A countdown moves each second.
+        for row in &self.state.runs.rows {
+            row.id.hash(&mut h);
+            row.chip.label().hash(&mut h);
+        }
+        self.state.runs.compactions.len().hash(&mut h);
+        self.state.runs.holds.len().hash(&mut h);
+        self.state.runs.waiting.is_some().hash(&mut h);
+        if self.state.runs.waiting.is_some() || !self.state.runs.holds.is_empty() {
+            crate::workflows::now_secs().hash(&mut h);
+        }
+        self.queue.len().hash(&mut h);
+        self.queue.editing().hash(&mut h);
+        for item in self.queue.items() {
+            item.id.hash(&mut h);
+            item.steer.hash(&mut h);
+            item.text.len().hash(&mut h);
+        }
+        self.runs_open.len().hash(&mut h);
         self.route_editor.saving.hash(&mut h);
         self.route_editor.error.hash(&mut h);
         self.route_editor.notice.hash(&mut h);
@@ -3429,6 +3487,8 @@ impl Session {
         self.hydrate_bot_settings();
         self.hydrate_route_editor();
         self.poll_route_events();
+        self.poll_runs();
+        self.pump_queue();
         self.pump_panel();
         if self.link_down
             && self.pending.is_none()
@@ -3532,81 +3592,119 @@ impl Session {
                     EventUpdate::Unauthorized => unauthorized = true,
                     EventUpdate::Event { id, kind, payload } => {
                         self.last_event_id = self.last_event_id.max(id);
-                        // Rings and "Working..." labels follow the same stream.
-                        // This never consumes the event: turn.completed and
-                        // task.failed still refresh the transcript below.
-                        self.state.working.apply(&kind, &payload, Instant::now());
-                        // Step events only feed the live view; the transcript
-                        // is not re-read for each one.
-                        let stepped = self.state.activity.apply(&kind, &payload);
-                        if kind == "turn.step"
-                            && payload
-                                .get("conversation_id")
-                                .and_then(|value| value.as_str())
-                                == Some(self.conversation.as_str())
-                            && let Some(plan) = payload.get("plan")
-                            && let Some(plan) = crate::chat_plan::ChatPlan::from_value(plan)
-                        {
-                            self.state.plan = Some(plan);
-                        }
-                        if stepped {
-                            continue;
-                        }
-                        // Plan updates feed the plan panel only.
-                        if crate::chat_plan::ChatPlan::apply_event(
-                            &mut self.state.plan,
-                            &self.conversation,
-                            &kind,
-                            &payload,
-                        ) {
-                            continue;
-                        }
-                        if kind == "route_switched"
-                            && payload
-                                .get("conversation_id")
-                                .and_then(|value| value.as_str())
-                                == Some(self.conversation.as_str())
-                        {
-                            self.state.route_events_stale = true;
-                        }
-                        if kind == "conversation.renamed"
-                            && let Some(conv_id) = payload
-                                .get("id")
-                                .or_else(|| payload.get("conversation_id"))
-                                .and_then(|value| value.as_str())
-                            && let Some(title) =
-                                payload.get("title").and_then(|value| value.as_str())
-                        {
-                            let clean = title.trim();
-                            if !clean.is_empty() {
-                                for conversation in &mut self.state.conversations {
-                                    if conversation.id == conv_id {
-                                        conversation.title = Some(clean.to_owned());
-                                    }
-                                }
-                                for list in self.state.bot_chats.values_mut() {
-                                    for chat in &mut list.chats {
-                                        if chat.id == conv_id {
-                                            chat.title = Some(clean.to_owned());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        let kind = scope_event_kind(kind, &payload, &self.conversation);
-                        choose_event_kind(
-                            &mut self.last_event_kind,
-                            &mut self.events_dirty,
-                            &self.conversation,
-                            kind,
-                        );
+                        self.event_frames.push(id, kind, payload);
                     }
                 }
             }
         }
+        self.apply_event_frame(Instant::now());
         if unauthorized {
             self.reject_token();
         }
+    }
+
+    /// Applies the events gathered for the current frame, if one is due. The
+    /// whole frame is one state write however many events it holds; child
+    /// progress arrives as counters.
+    fn apply_event_frame(&mut self, now: Instant) {
+        let Some(frame) = self.event_frames.take_frame(now) else {
+            return;
+        };
+        self.event_frame_writes += 1;
+        for (child, counter) in frame.progress {
+            let slot = self.subagents.entry(child).or_default();
+            slot.events = slot.events.saturating_add(counter.events);
+            slot.steps_done = slot.steps_done.saturating_add(counter.steps_done);
+            slot.last_event_id = slot.last_event_id.max(counter.last_event_id);
+        }
+        while self.subagents.len() > MAX_SUBAGENT_COUNTERS {
+            let oldest = self
+                .subagents
+                .iter()
+                .min_by_key(|(_, counter)| counter.last_event_id)
+                .map(|(child, _)| child.clone());
+            match oldest {
+                Some(child) => self.subagents.remove(&child),
+                None => break,
+            };
+        }
+        for (_, kind, payload) in frame.events {
+            self.apply_event(kind, payload);
+        }
+    }
+
+    fn apply_event(&mut self, kind: String, payload: serde_json::Value) {
+        // Rings and "Working..." labels follow the same stream.
+        // This never consumes the event: turn.completed and
+        // task.failed still refresh the transcript below.
+        self.state.working.apply(&kind, &payload, Instant::now());
+        // Subagent runs, holds, waits and compactions of the open chat.
+        self.state
+            .runs
+            .apply_event(&kind, &payload, self.conversation.as_str());
+        // Step events only feed the live view; the transcript
+        // is not re-read for each one.
+        let stepped = self.state.activity.apply(&kind, &payload);
+        if kind == "turn.step"
+            && payload
+                .get("conversation_id")
+                .and_then(|value| value.as_str())
+                == Some(self.conversation.as_str())
+            && let Some(plan) = payload.get("plan")
+            && let Some(plan) = crate::chat_plan::ChatPlan::from_value(plan)
+        {
+            self.state.plan = Some(plan);
+        }
+        if stepped {
+            return;
+        }
+        // Plan updates feed the plan panel only.
+        if crate::chat_plan::ChatPlan::apply_event(
+            &mut self.state.plan,
+            &self.conversation,
+            &kind,
+            &payload,
+        ) {
+            return;
+        }
+        if kind == "route_switched"
+            && payload
+                .get("conversation_id")
+                .and_then(|value| value.as_str())
+                == Some(self.conversation.as_str())
+        {
+            self.state.route_events_stale = true;
+        }
+        if kind == "conversation.renamed"
+            && let Some(conv_id) = payload
+                .get("id")
+                .or_else(|| payload.get("conversation_id"))
+                .and_then(|value| value.as_str())
+            && let Some(title) = payload.get("title").and_then(|value| value.as_str())
+        {
+            let clean = title.trim();
+            if !clean.is_empty() {
+                for conversation in &mut self.state.conversations {
+                    if conversation.id == conv_id {
+                        conversation.title = Some(clean.to_owned());
+                    }
+                }
+                for list in self.state.bot_chats.values_mut() {
+                    for chat in &mut list.chats {
+                        if chat.id == conv_id {
+                            chat.title = Some(clean.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+        let kind = scope_event_kind(kind, &payload, &self.conversation);
+        choose_event_kind(
+            &mut self.last_event_kind,
+            &mut self.events_dirty,
+            &self.conversation,
+            kind,
+        );
     }
 
     fn flush_events(&mut self) {
@@ -3929,6 +4027,13 @@ impl Session {
                 Err(_) if completion.kind == OperationKind::RouteEvents => {
                     self.state.route_events_loaded = true;
                 }
+                // An older server has no runs list: the sidebar stays empty.
+                Err(_) if completion.kind == OperationKind::Runs => {
+                    self.state.runs.loaded = true;
+                }
+                Err(error) if completion.kind == OperationKind::RunAction => {
+                    self.run_action_failed(&error);
+                }
 
                 Err(error)
                     if matches!(
@@ -4240,6 +4345,9 @@ impl Session {
                     // Nothing marked means no turn was running when Stop was pressed.
                     if matches!(reply, Reply::Stopping(0)) {
                         self.toast = Some("Nothing is running to stop.".into());
+                    }
+                    if matches!(reply, Reply::RunActed) {
+                        self.run_action_done();
                     }
                     let bot_config_saved = match &reply {
                         Reply::BotConfigSaved { restart_required } => Some(*restart_required),
@@ -6909,6 +7017,44 @@ mod backlog_tests {
         session.last_event_id = 99;
         let _ = session.clear_session();
         assert_eq!(session.last_event_id, 0);
+    }
+
+    #[test]
+    fn fifty_parallel_children_cost_at_most_sixty_state_writes_a_second() {
+        use serde_json::json;
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        let start = Instant::now();
+        let mut id = 0;
+        // One second of virtual time in 1 ms steps; every child reports each step.
+        for ms in 0..1_000u64 {
+            let now = start + Duration::from_millis(ms);
+            for child in 0..50 {
+                id += 1;
+                let task = format!("child-{child}");
+                session.event_frames.push(
+                    id,
+                    "turn.step".into(),
+                    json!({"task_id": task, "parent_task_id": "parent", "call_id": "c",
+                           "label": "x", "phase": if ms % 2 == 0 { "running" } else { "done" }}),
+                );
+            }
+            session.apply_event_frame(now);
+        }
+        assert!(
+            session.event_frame_writes <= 60,
+            "{} writes",
+            session.event_frame_writes
+        );
+        assert!(session.event_frame_writes >= 50, "frames still flow");
+        // Progress survived as counters, one per child, not as events.
+        assert_eq!(session.subagents.len(), 50);
+        let total: u32 = session.subagents.values().map(|c| c.events).sum();
+        assert!(total >= 49_000, "{total} events folded");
+        assert!(
+            session.state.activity.is_empty(),
+            "child steps stay out of the activity view"
+        );
     }
 
     #[test]

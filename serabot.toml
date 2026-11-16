@@ -248,7 +248,14 @@ artifacts_dir = "data/artifacts"
 max_pages = 30
 
 [runtime]
+# Worker slots, 1..=8. The code default is 4 (scripts/load-fixture.sh passed on the dev
+# host); this file pins 2 until the fixture has been run on the target host.
 max_concurrent_turns = 2
+# Fairness: owner turns and subagent turns one user may run at once, and model
+# calls in flight per (user, provider, account).
+max_turns_per_user = 2
+max_active_children = 4
+max_inflight_per_account = 3
 # Per-turn caps. Owners can override them in Settings (ceiling: 500 calls, 200 rounds).
 max_tool_calls_per_turn = 150
 max_tool_iterations = 60

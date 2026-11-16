@@ -194,6 +194,9 @@ pub struct State {
     pub route_events_asked: bool,
     /// A switch was recorded since: read them again.
     pub route_events_stale: bool,
+    /// The open conversation's subagent runs, holds and wait rows (v0.50).
+    /// Conversation-scoped: a new scope starts with an empty board.
+    pub runs: crate::runs::RunBoard,
     /// Provider id and device code of the last finished sign-in step.
     pub oauth_result: Option<(String, Option<String>)>,
     /// Team of the open room conversation. Conversation-scoped: it is cleared
@@ -363,6 +366,7 @@ impl Default for State {
             route_events_loaded: false,
             route_events_asked: false,
             route_events_stale: false,
+            runs: crate::runs::RunBoard::default(),
             oauth_result: None,
             team: None,
             team_loaded: false,
@@ -1016,6 +1020,9 @@ impl State {
             }
             // The session applies the saved route (it owns the editor).
             Reply::RouteSaved => {}
+            Reply::Runs(handoffs) => self.runs.set_ledger(handoffs),
+            // The session asks for the list again after an action.
+            Reply::RunActed => self.runs.stale = true,
             Reply::RouteEvents(events) => {
                 self.route_events = events.events;
                 self.route_chain = events.chain;
@@ -1078,6 +1085,7 @@ impl State {
                 | OperationKind::OnboardingWrite
                 | OperationKind::ToolsWrite
                 | OperationKind::CardWrite
+                | OperationKind::RunAction
         );
         if mutation && error.unknown_outcome() {
             self.unknown_outcome = true;
@@ -1109,6 +1117,7 @@ impl State {
                 OperationKind::OnboardingWrite => "interview step",
                 OperationKind::ToolsWrite => "capability change",
                 OperationKind::CardWrite => "card reply",
+                OperationKind::RunAction => "subagent change",
                 _ => "model change",
             };
             self.error = Some(format!(

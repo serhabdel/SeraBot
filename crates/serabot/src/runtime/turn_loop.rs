@@ -1,5 +1,6 @@
 //! The durable turn loop: model rounds, tool execution, approvals and replies.
 
+use super::compaction::{CompactReason, MAX_COMPACTIONS, is_context_too_long};
 use super::*;
 use crate::turn_limits::{TurnLimits, config_defaults, resolve_turn_limits};
 
@@ -109,9 +110,26 @@ impl Runtime {
             &payload.conversation_id,
             &json!({}),
         )?;
+        if let Some(handoff) = &payload.handoff {
+            let _ = self.store.append_event(
+                &user,
+                activity::EVENT_HANDOFF_STARTED,
+                &activity::handoff_payload(&activity::HandoffRef {
+                    handoff_id: &handoff.handoff_id,
+                    child_task_id: &task.id,
+                    parent_task_id: &handoff.parent_task_id,
+                    to_bot: &payload.bot,
+                    conversation_id: &payload.conversation_id,
+                }),
+            );
+        }
         // A handoff or team turn reposts an objective the room already holds as
-        // the owner's message; only an owner turn appends it again.
-        if payload.handoff.is_none() && payload.team.is_none() {
+        // the owner's message; only an owner turn appends it again. A resume
+        // follow-up is server-written, so it is not shown as the owner's message.
+        if payload.handoff.is_none()
+            && payload.team.is_none()
+            && payload.source != auto_resume::FOLLOWUP_SOURCE
+        {
             self.store.append_message(
                 &user,
                 &payload.conversation_id,
@@ -136,6 +154,8 @@ impl Runtime {
             help_depth: payload.help_depth,
             help_asked: false,
             history_messages,
+            compactions: 0,
+            waited_secs: 0,
         };
         // Recalled facts answer the owner's message (or the objective of a
         // handoff or team turn). Only owner turns also get the conversation's
@@ -204,6 +224,9 @@ impl Runtime {
     pub(super) async fn resume_turn(&self, task: &Task) -> Result<TurnOutcome> {
         let payload: ResumePayload = serde_json::from_value(task.payload.clone())
             .map_err(|error| SeraError::Validation(format!("invalid resume payload: {error}")))?;
+        if payload.continue_after_limit {
+            return self.resume_after_limit(task, &payload).await;
+        }
         // The resume task is enqueued under the approval owner's user (see
         // `handle_approval`), so the whole resume runs in that scope.
         let user = task.user_id.clone();
@@ -413,6 +436,23 @@ impl Runtime {
                     "specialist": turn.bot,
                 })),
             )?;
+            if let Err(error) =
+                self.store
+                    .mark_handoff_completed(user_id, &handoff.handoff_id, &task.id)
+            {
+                tracing::warn!(%error, "could not mark the handoff completed");
+            }
+            let _ = self.store.append_event(
+                user_id,
+                activity::EVENT_HANDOFF_COMPLETED,
+                &activity::handoff_payload(&activity::HandoffRef {
+                    handoff_id: &handoff.handoff_id,
+                    child_task_id: &task.id,
+                    parent_task_id: &handoff.parent_task_id,
+                    to_bot: &turn.bot,
+                    conversation_id,
+                }),
+            );
         } else {
             self.record_assistant(user_id, conversation_id, turn, text, false)?;
         }
@@ -547,7 +587,7 @@ impl Runtime {
         Ok(TurnOutcome::Completed)
     }
 
-    async fn advance(
+    pub(super) async fn advance(
         &self,
         task: &Task,
         turn: &Turn,
@@ -562,6 +602,11 @@ impl Runtime {
                 .ok_or_else(|| SeraError::NotFound(format!("bot {}", turn.bot)))?
         };
         let user = task.user_id.clone();
+        if turn.status == crate::store::TASK_WAITING_MODEL {
+            // Back from a model wait: the turn is running again.
+            self.store
+                .update_turn(&user, &turn.id, "active", &serde_json::to_value(&state)?)?;
+        }
         let mut context = self.tool_context(task, turn, &bot, &state)?;
         // The user's enabled plugin tools, offered to each of their bots.
         let plugin_specs = self.gateway.enable_plugin_tools(&mut context).await;
@@ -629,31 +674,74 @@ impl Runtime {
                     .finish_stopped(task, turn, &state, conversation_id)
                     .await;
             }
-            let route = self.checked_route(&user, &state.route)?;
-            self.scan_model_messages(&user, &state.messages)?;
-            self.gateway
-                .scan_egress(&user, &serde_json::to_string(&tool_specs)?)?;
-            // Vault values never reach a model: redact a copy of the request.
-            let outgoing = self.gateway.redact_messages(&user, &state.messages)?;
+            let route = self.checked_route(&user, &state.route)?.clone();
             let thinking = self.turn_thinking(&user, conversation_id, &bot);
-            let may_switch = self.turn_may_switch(&user, &state);
-            let routed = self
-                .complete_with_failover(
-                    &failover::RouteCall {
-                        user: &user,
-                        task_id: Some(&task.id),
+            let routed = loop {
+                // Nearing the model's window: compact before the call, not
+                // after a refusal.
+                if state.compactions < MAX_COMPACTIONS
+                    && self.near_window(&user, &route, &state.messages)
+                {
+                    self.compact_turn(
+                        task,
+                        turn,
+                        &mut state,
                         conversation_id,
-                        bot: &turn.bot,
-                    },
-                    route,
-                    thinking.as_deref(),
-                    &state.messages,
-                    &outgoing,
-                    &tool_specs,
-                    temperature,
-                    may_switch,
-                )
-                .await?;
+                        CompactReason::NearWindow,
+                    )
+                    .await?;
+                }
+                self.scan_model_messages(&user, &state.messages)?;
+                self.gateway
+                    .scan_egress(&user, &serde_json::to_string(&tool_specs)?)?;
+                // Vault values never reach a model: redact a copy of the request.
+                let outgoing = self.gateway.redact_messages(&user, &state.messages)?;
+                let may_switch = self.turn_may_switch(&user, &state);
+                let result = self
+                    .complete_with_failover(
+                        &failover::RouteCall {
+                            user: &user,
+                            task_id: Some(&task.id),
+                            conversation_id,
+                            bot: &turn.bot,
+                        },
+                        &route,
+                        thinking.as_deref(),
+                        &state.messages,
+                        &outgoing,
+                        &tool_specs,
+                        temperature,
+                        may_switch,
+                    )
+                    .await;
+                match result {
+                    Ok(routed) => break routed,
+                    Err(SeraError::ModelWaiting { until }) => {
+                        return self
+                            .park_for_model(task, turn, &mut state, conversation_id, until)
+                            .await;
+                    }
+                    // Too long for the model: fold the older messages and
+                    // retry on the same route, at most twice.
+                    Err(error)
+                        if is_context_too_long(&error) && state.compactions < MAX_COMPACTIONS =>
+                    {
+                        let compacted = self
+                            .compact_turn(
+                                task,
+                                turn,
+                                &mut state,
+                                conversation_id,
+                                CompactReason::ContextTooLong,
+                            )
+                            .await?;
+                        if !compacted {
+                            return Err(error);
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
             let used = routed.used;
             let response = routed.response;
             if let Some(reasoning) = response.reasoning.as_deref() {
@@ -733,7 +821,8 @@ impl Runtime {
                     "turn.completed",
                     &json!({"turn_id": turn.id, "task_id": task.id}),
                 )?;
-                if state.handoff.is_none() && state.team.is_none() {
+                let followup = auto_resume::is_followup(&task.payload);
+                if state.handoff.is_none() && state.team.is_none() && !followup {
                     let owner_prompt = extract::owner_text(&state.messages).unwrap_or("");
                     self.maybe_auto_name_conversation(
                         &user,
@@ -747,6 +836,7 @@ impl Runtime {
                 // is stored, in the background, and never fail the turn.
                 if state.handoff.is_none()
                     && state.team.is_none()
+                    && !followup
                     && !state.ask_mode
                     && let Some(owner) = extract::owner_text(&state.messages)
                 {

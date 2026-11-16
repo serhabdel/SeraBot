@@ -1,0 +1,441 @@
+/* Heavy work (v0.50): the runs sidebar, the composer queue, the failed-turn
+   card, the wait banner and the shortcuts sheet.
+   Motion: state changes are CSS transitions (never keyframes), so they can be
+   interrupted mid-way. Movement uses --spring; reduced motion keeps opacity
+   only. Rows have a fixed height, so a chip changing text never shifts the
+   layout. Every control has a focus ring from the shared :focus-visible rule. */
+
+/* ---- Runs sidebar ---- */
+.runs-panel {
+  flex: none;
+  max-height: 40%;
+  overflow-y: auto;
+  margin: 0;
+  padding: 8px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  scrollbar-gutter: stable;
+}
+
+.runs-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 0 4px 6px;
+}
+
+.runs-title {
+  margin: 0;
+  font-size: var(--fs-caption);
+  font-weight: 600;
+  color: var(--label-1);
+}
+
+.runs-summary {
+  font-size: var(--fs-micro);
+  color: var(--label-2);
+}
+
+.runs-summary.bad {
+  color: var(--danger);
+}
+
+.hold-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 6px;
+  padding: 4px 8px;
+  border-radius: var(--r-sm);
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: var(--fs-micro);
+  line-height: 1.4;
+}
+
+.runs-tree {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.run-row {
+  position: relative;
+  padding: 4px 6px;
+  border-radius: var(--r-sm);
+  transition: background-color var(--dur-press) var(--ease);
+}
+
+.run-row:hover {
+  background: var(--hover);
+}
+
+.run-depth-1 { margin-left: 12px; }
+.run-depth-2 { margin-left: 24px; }
+.run-depth-3 { margin-left: 36px; }
+
+.run-main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+}
+
+.run-open {
+  min-width: 0;
+  flex: 0 1 auto;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--label-1);
+  font: inherit;
+  font-size: var(--fs-caption);
+  text-align: left;
+  cursor: pointer;
+}
+
+.run-open:disabled {
+  cursor: default;
+}
+
+.run-name {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-chip {
+  flex: none;
+  padding: 1px 8px;
+  border-radius: var(--r-pill);
+  font-size: var(--fs-micro);
+  line-height: 1.5;
+  white-space: nowrap;
+  background: var(--surface);
+  color: var(--label-2);
+  border: 1px solid var(--hairline);
+  transition:
+    background-color var(--dur-1) var(--ease),
+    color var(--dur-1) var(--ease),
+    opacity var(--dur-fade) var(--ease);
+}
+
+.run-chip[data-tone="live"] { background: var(--accent-2-soft); color: var(--accent-ink); border-color: transparent; }
+.run-chip[data-tone="wait"] { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+.run-chip[data-tone="bad"] { background: var(--danger-soft); color: var(--danger); border-color: transparent; }
+/* --ok alone is 4.2:1 on the light panel; darken the text toward label-1 for AA. */
+.run-chip[data-tone="ok"] { background: var(--ok-soft); color: color-mix(in srgb, var(--ok) 75%, var(--label-1)); border-color: transparent; }
+
+.run-resumes {
+  flex: none;
+  font-size: var(--fs-micro);
+  color: var(--label-3);
+}
+
+.run-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 4px;
+  flex: none;
+}
+
+.run-btn {
+  min-height: 24px;
+  padding: 0 8px;
+  gap: 4px;
+}
+
+.run-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  padding: 2px 0 2px 2px;
+}
+
+.run-note {
+  font-size: var(--fs-micro);
+  color: var(--label-3);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-blocked {
+  margin: 2px 0 0;
+  font-size: var(--fs-micro);
+  color: var(--label-3);
+}
+
+.run-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 28px;
+  padding: 0 2px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.run-chev {
+  display: inline-flex;
+  transition: transform var(--dur-2) var(--spring);
+}
+
+.run-group[aria-expanded="true"] .run-chev {
+  transform: rotate(90deg);
+}
+
+.reason-chip {
+  padding: 1px 8px;
+  border-radius: var(--r-pill);
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: var(--fs-micro);
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.run-count.live { background: var(--accent-2-soft); color: var(--accent-ink); border-color: transparent; }
+.run-count.bad { background: var(--danger-soft); color: var(--danger); border-color: transparent; }
+
+/* ---- Composer queue ---- */
+.queue-panel {
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+}
+
+.queue-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding-bottom: 4px;
+  font-size: var(--fs-caption);
+}
+
+.queue-title { font-weight: 600; color: var(--label-1); }
+.queue-count { color: var(--label-3); }
+.queue-hold { color: var(--warn); font-size: var(--fs-micro); }
+
+.queue-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.queue-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 2px 4px;
+  border-radius: var(--r-sm);
+  transition: background-color var(--dur-press) var(--ease);
+}
+
+.queue-item:hover { background: var(--hover); }
+.queue-item.editing { align-items: flex-start; flex-wrap: wrap; }
+.queue-item[data-steer="true"] { background: var(--accent-soft); }
+
+.queue-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-body-2);
+  color: var(--label-1);
+}
+
+.queue-target { flex: none; }
+
+.queue-actions {
+  display: flex;
+  gap: 2px;
+  flex: none;
+  margin-left: auto;
+}
+
+.queue-edit {
+  flex: 1 1 100%;
+  min-height: 56px;
+  resize: vertical;
+}
+
+.queue-btn { gap: 6px; }
+
+/* ---- Failed card, wait banner, compaction note ---- */
+.failed-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px 12px;
+  align-items: center;
+}
+
+.failed-body { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.reason-chips { display: flex; flex-wrap: wrap; gap: 4px 6px; }
+.failed-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+
+.failed-alt {
+  grid-column: 1 / -1;
+  list-style: none;
+  margin: 0;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  animation: none;
+}
+
+.failed-alt-item {
+  width: 100%;
+  min-height: 32px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: var(--r-xs);
+  background: none;
+  color: var(--label-1);
+  font: inherit;
+  font-size: var(--fs-body-2);
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--dur-press) var(--ease);
+}
+
+.failed-alt-item:hover { background: var(--hover); }
+
+.wait-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--warn-soft);
+  border-color: transparent;
+  color: var(--warn);
+}
+
+.wait-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.9;
+  transition: opacity var(--dur-fade) var(--ease);
+}
+
+.compaction-note {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin: 8px auto;
+  padding: 4px 12px;
+  width: fit-content;
+  max-width: 100%;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  border: 1px solid var(--hairline);
+  color: var(--label-3);
+  font-size: var(--fs-caption);
+}
+
+/* ---- Shortcuts sheet ---- */
+.shortcuts-link {
+  margin-left: 8px;
+  padding: 0 4px;
+  border: 0;
+  background: none;
+  color: var(--label-2);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.shortcut-group + .shortcut-group { margin-top: 16px; }
+.shortcut-heading { margin: 0 0 6px; font-size: var(--fs-caption); color: var(--label-3); font-weight: 600; }
+.shortcut-list { margin: 0; }
+
+.shortcut-row {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+  min-height: 32px;
+}
+
+.shortcut-row dt, .shortcut-row dd { margin: 0; }
+.shortcut-row dd { font-size: var(--fs-body-2); color: var(--label-1); }
+
+.kbd {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: var(--r-xs);
+  border: 1px solid var(--hairline-strong);
+  background: var(--surface-2);
+  color: var(--label-1);
+  font-family: var(--font-mono);
+  font-size: var(--fs-micro);
+}
+
+/* ---- Focus: the shared :focus-visible ring, kept inside clipped panels ---- */
+.run-open:focus-visible,
+.run-group:focus-visible,
+.failed-alt-item:focus-visible,
+.shortcuts-link:focus-visible,
+.queue-edit:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* ---- Forced colors: chips and tones keep a visible edge ---- */
+@media (forced-colors: active) {
+  .run-chip,
+  .reason-chip,
+  .hold-badge,
+  .compaction-note {
+    border: 1px solid CanvasText;
+  }
+}
+
+/* ---- Reduced motion: opacity only, no movement ---- */
+@media (prefers-reduced-motion: reduce) {
+  .run-chev {
+    transition: none;
+    transform: none;
+  }
+
+  .run-row,
+  .queue-item,
+  .failed-alt-item,
+  .run-chip {
+    transition: opacity var(--dur-fade) linear;
+  }
+}
+
+.root[data-motion="reduce"] .run-chev {
+  transition: none;
+  transform: none;
+}
+
+.root[data-motion="reduce"] .run-row,
+.root[data-motion="reduce"] .queue-item,
+.root[data-motion="reduce"] .failed-alt-item,
+.root[data-motion="reduce"] .run-chip {
+  transition: opacity var(--dur-fade) linear;
+}

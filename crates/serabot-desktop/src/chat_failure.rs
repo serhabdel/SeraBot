@@ -2,6 +2,9 @@
 //! they typed. The message is a sentence. Raw JSON is never shown.
 
 use crate::ApiError;
+use crate::api::{RouteSwitch, RouteView, Selection};
+use crate::route_chip::FallbackOffer;
+use crate::route_editor::{Options, route_line};
 
 /// The server's code when no model route in a bot's chain could answer.
 pub const ALL_ROUTES_FAILED: &str = "all_routes_failed";
@@ -9,6 +12,9 @@ pub const ALL_ROUTES_FAILED: &str = "all_routes_failed";
 /// The line on the failed-turn card that offers "Retry on <fallback>".
 pub const FAILED_TURN_WITH_FALLBACK: &str =
     "That turn failed. Your message is still above; send it again on the next route.";
+
+/// The line on the failed-turn card when no fallback route is left.
+pub const FAILED_TURN: &str = "That turn failed. Your message is still above.";
 
 /// The button next to a send failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,6 +133,144 @@ fn looks_like_payload(text: &str) -> bool {
         || lower.starts_with("<html")
 }
 
+// ---- The failed-turn card (v0.50) ----
+
+/// Most other routes "Retry on..." lists.
+pub const MAX_ALTERNATIVES: usize = 6;
+
+/// What the failed-turn card shows: why, and the ways forward.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FailedCard {
+    /// Reason words, newest first, from a fixed vocabulary.
+    pub reasons: Vec<String>,
+    /// "Retry on <fallback>": the next route of the bot's chain.
+    pub fallback: Option<FallbackOffer>,
+    /// "Retry on...": other routes the member may pick.
+    pub alternatives: Vec<FallbackOffer>,
+    /// "Ask main": hand the request to the orchestrator.
+    pub ask_main: bool,
+}
+
+/// Reason words of the conversation's newest route switches. A switch records
+/// why the route before it failed, which is the closest the server comes to
+/// saying why a turn did not finish. Provider text never gets here: only the
+/// fixed reason codes become chips.
+pub fn recent_reasons(events: &[RouteSwitch]) -> Vec<String> {
+    let mut ordered: Vec<&RouteSwitch> = events.iter().collect();
+    ordered.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    let mut out: Vec<String> = Vec::new();
+    for event in ordered {
+        for chip in crate::runs::reason_chips(&event.reason) {
+            if !out.contains(&chip) && out.len() < 4 {
+                out.push(chip);
+            }
+        }
+    }
+    out
+}
+
+fn same(entry: &crate::api::RouteEntry, selection: &Selection) -> bool {
+    entry.provider == selection.provider
+        && entry.model == selection.model
+        && entry.account == selection.account
+}
+
+/// Routes for "Retry on...": the bot's own chain first, then approved models
+/// from the live catalog. The route the conversation is on, and the one the
+/// "Retry on <fallback>" button already offers, are left out.
+pub fn retry_alternatives(
+    options: &Options<'_>,
+    chain: Option<&RouteView>,
+    current: &Selection,
+    skip: Option<&FallbackOffer>,
+) -> Vec<FallbackOffer> {
+    let mut out: Vec<FallbackOffer> = Vec::new();
+    let mut push = |selection: Selection, thinking: Option<String>| {
+        if out.len() >= MAX_ALTERNATIVES
+            || selection.is_auto()
+            || selection == *current
+            || skip.is_some_and(|offer| offer.selection == selection)
+            || out.iter().any(|offer| offer.selection == selection)
+        {
+            return;
+        }
+        let label = route_line(
+            options,
+            &selection.provider,
+            selection.account.as_deref(),
+            &selection.model,
+            None,
+        );
+        out.push(FallbackOffer {
+            selection,
+            thinking,
+            label,
+        });
+    };
+    if let Some(chain) = chain {
+        for entry in chain.route.iter().chain(chain.fallbacks.iter()) {
+            if same(entry, current) {
+                continue;
+            }
+            push(
+                Selection {
+                    provider: entry.provider.clone(),
+                    model: entry.model.clone(),
+                    account: entry.account.clone(),
+                },
+                entry.thinking.clone(),
+            );
+        }
+    }
+    for entry in options.entries.iter().filter(|e| e.data_egress_approved) {
+        push(
+            Selection {
+                provider: entry.provider.clone(),
+                model: entry.model.clone(),
+                account: None,
+            },
+            None,
+        );
+    }
+    out
+}
+
+/// The card for a failed turn.
+pub fn failed_card(
+    options: &Options<'_>,
+    chain: Option<&RouteView>,
+    current: &Selection,
+    events: &[RouteSwitch],
+    fallback: Option<FallbackOffer>,
+    ask_main: bool,
+) -> FailedCard {
+    FailedCard {
+        reasons: recent_reasons(events),
+        alternatives: retry_alternatives(options, chain, current, fallback.as_ref()),
+        fallback,
+        ask_main,
+    }
+}
+
+/// The message "Ask main" sends: fixed words plus the reason chips, so a
+/// provider's text can never ride along into the orchestrator's prompt.
+pub fn ask_main_text(reasons: &[String]) -> String {
+    let mut text = String::from("My last request did not finish because a model route failed.");
+    if !reasons.is_empty() {
+        text.push_str(" Reasons: ");
+        text.push_str(&reasons.join(", "));
+        text.push('.');
+    }
+    text.push_str(
+        " Please take over: try it again on another route or hand it to the right specialist, and tell me what you did.",
+    );
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +351,159 @@ mod tests {
         ));
         assert_eq!(html.action, ChatAction::Retry);
         assert!(!html.message.contains('<'));
+    }
+
+    fn switch(id: &str, at: &str, reason: &str) -> RouteSwitch {
+        RouteSwitch {
+            id: id.into(),
+            created_at: at.into(),
+            reason: reason.into(),
+            to_provider: Some("anthropic".into()),
+            ..RouteSwitch::default()
+        }
+    }
+
+    #[test]
+    fn reason_chips_come_from_the_newest_switches_and_known_words_only() {
+        let events = vec![
+            switch("a", "2026-11-16T10:00:00Z", "quota_exhausted"),
+            switch("b", "2026-11-16T10:05:00Z", "rate_limited"),
+            switch("c", "2026-11-16T10:06:00Z", "<script>alert(1)</script>"),
+            switch("d", "2026-11-16T10:07:00Z", "rate_limited"),
+        ];
+        assert_eq!(
+            recent_reasons(&events),
+            vec!["Rate limited".to_owned(), "Quota used up".to_owned()]
+        );
+        assert!(recent_reasons(&[]).is_empty());
+    }
+
+    fn world() -> (
+        Vec<crate::api::CatalogEntry>,
+        Vec<crate::api::Provider>,
+        Vec<crate::api::ProviderStatus>,
+    ) {
+        let entry = |provider: &str, model: &str, approved: bool| crate::api::CatalogEntry {
+            provider: provider.into(),
+            model: model.into(),
+            data_egress_approved: approved,
+            name: None,
+            context_length: None,
+            tags: Vec::new(),
+            thinking: Vec::new(),
+            account_ids: Vec::new(),
+        };
+        (
+            vec![
+                entry("openai", "gpt-5", true),
+                entry("anthropic", "claude-sonnet", true),
+                entry("unapproved", "x", false),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    fn selection(provider: &str, model: &str) -> Selection {
+        Selection {
+            provider: provider.into(),
+            model: model.into(),
+            account: None,
+        }
+    }
+
+    #[test]
+    fn retry_on_lists_other_approved_routes_without_the_current_or_offered_one() {
+        let data = world();
+        let options = Options {
+            entries: &data.0,
+            catalog_providers: &data.1,
+            providers: &data.2,
+        };
+        let current = selection("openai", "gpt-5");
+        let offered = FallbackOffer {
+            selection: selection("anthropic", "claude-sonnet"),
+            thinking: None,
+            label: "Retry on Anthropic".into(),
+        };
+        let none = retry_alternatives(&options, None, &current, Some(&offered));
+        assert!(none.is_empty(), "{none:?}");
+        let some = retry_alternatives(&options, None, &current, None);
+        assert_eq!(some.len(), 1);
+        assert_eq!(some[0].selection, selection("anthropic", "claude-sonnet"));
+        // A route that is not egress-approved is never offered.
+        assert!(
+            some.iter()
+                .all(|offer| offer.selection.provider != "unapproved"),
+        );
+    }
+
+    #[test]
+    fn retry_alternatives_are_bounded_and_the_chain_comes_first() {
+        let mut entries = Vec::new();
+        for i in 0..20 {
+            entries.push(crate::api::CatalogEntry {
+                provider: format!("p{i}"),
+                model: "m".into(),
+                data_egress_approved: true,
+                name: None,
+                context_length: None,
+                tags: Vec::new(),
+                thinking: Vec::new(),
+                account_ids: Vec::new(),
+            });
+        }
+        let options = Options {
+            entries: &entries,
+            catalog_providers: &[],
+            providers: &[],
+        };
+        let chain = RouteView {
+            route: Some(crate::api::RouteEntry {
+                provider: "p0".into(),
+                model: "m".into(),
+                ..Default::default()
+            }),
+            fallbacks: vec![crate::api::RouteEntry {
+                provider: "p19".into(),
+                model: "m".into(),
+                ..Default::default()
+            }],
+            ..RouteView::default()
+        };
+        let current = selection("p0", "m");
+        let alternatives = retry_alternatives(&options, Some(&chain), &current, None);
+        assert_eq!(alternatives.len(), MAX_ALTERNATIVES);
+        assert_eq!(alternatives[0].selection.provider, "p19");
+    }
+
+    #[test]
+    fn ask_main_carries_only_fixed_words_and_reason_chips() {
+        let text = ask_main_text(&["Rate limited".into(), "Quota used up".into()]);
+        assert!(text.contains("Reasons: Rate limited, Quota used up."));
+        assert!(text.contains("take over"));
+        assert!(!ask_main_text(&[]).contains("Reasons"));
+    }
+
+    #[test]
+    fn the_failed_card_bundles_reasons_and_actions() {
+        let data = world();
+        let options = Options {
+            entries: &data.0,
+            catalog_providers: &data.1,
+            providers: &data.2,
+        };
+        let card = failed_card(
+            &options,
+            None,
+            &selection("openai", "gpt-5"),
+            &[switch("a", "2026-11-16T10:00:00Z", "overloaded")],
+            None,
+            true,
+        );
+        assert_eq!(card.reasons, vec!["Overloaded"]);
+        assert!(card.fallback.is_none());
+        assert_eq!(card.alternatives.len(), 1);
+        assert!(card.ask_main);
     }
 }

@@ -126,7 +126,7 @@ pub fn build(
         let state = match task.status {
             TaskStatus::Queued => JobState::Queued,
             TaskStatus::Running => JobState::Running,
-            TaskStatus::AwaitingApproval => JobState::Waiting,
+            TaskStatus::AwaitingApproval | TaskStatus::WaitingModel => JobState::Waiting,
             TaskStatus::Done => JobState::Done,
             TaskStatus::Failed | TaskStatus::Cancelled => JobState::Failed,
         };

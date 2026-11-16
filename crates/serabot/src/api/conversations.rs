@@ -759,6 +759,26 @@ pub(super) async fn cancel_conversation(
     Ok(Json(json!({"conversation_id": id, "stopping": stopping})))
 }
 
+/// Continue the conversation's latest turn that stopped at a tool limit,
+/// with a fresh tool budget. It reuses the stored transcript and is not a new
+/// request, so it is not counted against the daily quota. Another user's
+/// conversation reads as unknown.
+pub(super) async fn continue_conversation(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    require_own_or_new_conversation(&state, &user.id, &id)?;
+    let turn_id = state
+        .store
+        .latest_limit_turn_id(&user.id, &id)?
+        .ok_or_else(|| {
+            SeraError::InvalidState("nothing to continue in this conversation".into())
+        })?;
+    let task = state.runtime.continue_after_limit(&user.id, &turn_id)?;
+    Ok(Json(json!({"conversation_id": id, "task_id": task.id})))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct AutoApproveRequest {

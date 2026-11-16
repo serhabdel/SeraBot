@@ -848,12 +848,30 @@ impl Gateway {
             action_id = %action_id,
             "gateway approved tool execute"
         );
+        // From here the outbound effect may happen. Flag the task first, so a
+        // crash or a lost lease before the outcome is stored never replays it.
+        // If the flag cannot be written the call does not go out.
+        if let Some(task_id) = context.task_id.as_deref()
+            && let Err(error) = self.store.mark_task_uncertain(&context.user_id, task_id)
+        {
+            self.store.update_action(
+                &context.user_id,
+                action_id,
+                "failed",
+                Some(&serde_json::json!({"error": "task could not be flagged before dispatch"})),
+            )?;
+            return Err(error);
+        }
         let started = std::time::Instant::now();
         let (output, listed) = run_tool_call(tool.as_ref(), args, context).await;
         let output = self.redact_output(context, output);
         let succeeded = output.is_ok();
+        let known_outcome = match &output {
+            Ok(_) => true,
+            Err(error) => !is_ambiguous(error),
+        };
         self.finish_tool_call(tool.as_ref(), &output, &listed, context, started.elapsed())?;
-        match output {
+        let result: Result<ToolOutcome> = match output {
             Ok(value) => {
                 self.store.update_action(
                     &context.user_id,
@@ -892,7 +910,17 @@ impl Gateway {
         }
         .inspect_err(|_| {
             let _ = succeeded;
-        })
+        });
+        // The outcome is stored (the action row says executed or failed), so a
+        // retry can no longer repeat the effect: approvals are single-use. An
+        // ambiguous outcome keeps the flag and the task is never replayed.
+        if known_outcome
+            && let Some(task_id) = context.task_id.as_deref()
+            && let Err(error) = self.store.clear_task_uncertain(&context.user_id, task_id)
+        {
+            warn!(%error, "task uncertainty flag was not cleared");
+        }
+        result
     }
 
     fn finish_tool_call(
@@ -1425,6 +1453,206 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// An external tool that reports whether its task was flagged while it
+    /// ran, then behaves as `mode` says.
+    #[derive(Clone, Copy)]
+    enum ProbeMode {
+        Succeed,
+        Ambiguous,
+        Hang,
+    }
+
+    struct ProbeExternal {
+        store: Store,
+        user: String,
+        task_id: String,
+        flagged_during_dispatch: Arc<std::sync::atomic::AtomicBool>,
+        mode: ProbeMode,
+    }
+
+    #[async_trait]
+    impl Tool for ProbeExternal {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "onedrive_upload".into(),
+                description: "probe upload".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                external_effect: true,
+            }
+        }
+
+        async fn execute(&self, _args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+            let flagged = self.store.get_task(&self.user, &self.task_id)?.uncertain;
+            self.flagged_during_dispatch
+                .store(flagged, Ordering::SeqCst);
+            match self.mode {
+                ProbeMode::Succeed => Ok(ToolOutput {
+                    content: "uploaded".into(),
+                    ..ToolOutput::default()
+                }),
+                ProbeMode::Ambiguous => Err(SeraError::upstream_ambiguous(
+                    "outcome_unknown",
+                    "the upload may or may not have been stored",
+                )),
+                ProbeMode::Hang => {
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                }
+            }
+        }
+    }
+
+    /// A claimed (running) task, an approved action for `mode`'s tool, and
+    /// the flag the tool saw while it ran.
+    async fn approved_probe(
+        mode: ProbeMode,
+    ) -> (
+        Gateway,
+        ToolContext,
+        String,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let task = store
+            .enqueue_task(
+                &admin,
+                "turn",
+                "maker",
+                &serde_json::json!({}),
+                0,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        let claimed = store.claim_task("worker", 60).unwrap().unwrap();
+        assert_eq!(claimed.id, task.id);
+        let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(ProbeExternal {
+                store: store.clone(),
+                user: admin.clone(),
+                task_id: task.id.clone(),
+                flagged_during_dispatch: seen.clone(),
+                mode,
+            })
+            .unwrap();
+        let gateway = Gateway::new(
+            store,
+            Arc::new(Policy::from_text("TopSecret")),
+            registry,
+            1,
+            false,
+        );
+        let context = ToolContext {
+            user_id: admin.clone(),
+            actor: admin,
+            bot: "maker".into(),
+            task_id: Some(task.id),
+            turn_id: None,
+            conversation_id: None,
+            allowed_tools: ["onedrive_upload".to_string()].into_iter().collect(),
+            require_approval: HashSet::new(),
+        };
+        let ToolOutcome::PendingApproval {
+            approval_id,
+            action_id,
+            ..
+        } = gateway
+            .execute("onedrive_upload", serde_json::json!({}), &context)
+            .await
+            .unwrap()
+        else {
+            panic!("expected approval");
+        };
+        gateway
+            .decide(&context.user_id, &approval_id, Decision::Once)
+            .unwrap();
+        (gateway, context, action_id, seen)
+    }
+
+    fn expire_lease(store: &Store, task_id: &str) {
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET lease_until=?1 WHERE id=?2",
+                rusqlite::params![
+                    (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339(),
+                    task_id
+                ],
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_flags_its_task_and_a_known_outcome_clears_it() {
+        let (gateway, context, action_id, seen) = approved_probe(ProbeMode::Succeed).await;
+        let task_id = context.task_id.clone().unwrap();
+        gateway
+            .execute_approved(&action_id, &context)
+            .await
+            .unwrap();
+        assert!(seen.load(Ordering::SeqCst), "flagged while dispatching");
+        let task = gateway
+            .store()
+            .get_task(&context.user_id, &task_id)
+            .unwrap();
+        assert!(!task.uncertain, "a stored outcome clears the flag");
+    }
+
+    #[tokio::test]
+    async fn a_process_lost_mid_dispatch_is_never_replayed() {
+        let (gateway, context, action_id, seen) = approved_probe(ProbeMode::Hang).await;
+        let task_id = context.task_id.clone().unwrap();
+        // Dropping the future stands in for the process dying mid-call.
+        let killed = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            gateway.execute_approved(&action_id, &context),
+        )
+        .await;
+        assert!(killed.is_err());
+        assert!(seen.load(Ordering::SeqCst));
+        let store = gateway.store();
+        assert!(
+            store
+                .get_task(&context.user_id, &task_id)
+                .unwrap()
+                .uncertain
+        );
+        expire_lease(store, &task_id);
+        store.recover_expired_tasks().unwrap();
+        let task = store.get_task(&context.user_id, &task_id).unwrap();
+        assert_eq!(task.status, "needs_review");
+        assert!(store.claim_task("worker-2", 60).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_outcome_keeps_the_flag_and_a_failed_task_needs_review() {
+        let (gateway, context, action_id, _) = approved_probe(ProbeMode::Ambiguous).await;
+        let task_id = context.task_id.clone().unwrap();
+        assert!(
+            gateway
+                .execute_approved(&action_id, &context)
+                .await
+                .is_err()
+        );
+        let store = gateway.store();
+        let task = store.get_task(&context.user_id, &task_id).unwrap();
+        assert!(task.uncertain);
+        // The worker fails the task with its fencing token: no retry.
+        assert!(
+            store
+                .fail_task(&context.user_id, &task_id, task.fencing_token, "boom", 5)
+                .unwrap()
+        );
+        assert_eq!(
+            store.get_task(&context.user_id, &task_id).unwrap().status,
+            "needs_review"
+        );
+        assert!(store.claim_task("worker-2", 60).unwrap().is_none());
     }
 
     /// A tool whose destination is the page it is on, like a browser secret

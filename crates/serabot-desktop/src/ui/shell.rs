@@ -102,6 +102,9 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
                 Overlay::MeetTeam => rsx! {
                     MeetTeamSheet { session, overlay }
                 },
+                Overlay::Shortcuts => rsx! {
+                    ShortcutsSheet { session, overlay }
+                },
                 Overlay::None => rsx! {},
             }}
             UndoBar { session, undo }
@@ -975,6 +978,7 @@ pub(super) fn Sidebar(
                     }}
                 }
             }
+            RunsSidebar { session }
         }
     }
 }

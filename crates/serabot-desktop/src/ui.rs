@@ -49,26 +49,33 @@ use crate::ui_vault::VaultPage;
 
 mod account_views;
 mod chat;
+mod chat_feed_view;
+mod compose_queue;
 mod connect;
 mod conversations;
 mod markdown;
 mod memory;
 mod providers;
 mod row_menu;
+mod runs;
 mod settings_view;
 mod sheets;
 mod shell;
+mod wait_cards;
 pub(crate) use account_views::*;
 pub(crate) use chat::*;
+pub(crate) use compose_queue::*;
 pub(crate) use connect::*;
 pub(crate) use conversations::*;
 pub(crate) use markdown::*;
 pub(crate) use memory::*;
 pub(crate) use providers::*;
 pub(crate) use row_menu::*;
+pub(crate) use runs::*;
 pub(crate) use settings_view::*;
 pub(crate) use sheets::*;
 pub(crate) use shell::*;
+pub(crate) use wait_cards::*;
 
 const CSS: &str = include_str!("../assets/app.css");
 /// Reports whether the system prefers a dark theme, now and on every change.
@@ -80,7 +87,8 @@ const CSS_PAGES: &str = concat!(
     include_str!("../assets/files.css"),
     include_str!("../assets/jobs.css"),
     include_str!("../assets/foundation.css"),
-    include_str!("../assets/accounts.css")
+    include_str!("../assets/accounts.css"),
+    include_str!("../assets/runs.css")
 );
 
 /// The `data-activity` value the stylesheet keys the avatar ring and the
@@ -325,6 +333,8 @@ pub(crate) enum Overlay {
     Team,
     /// "Meet your team": the shipped bots the owner can add.
     MeetTeam,
+    /// The keyboard shortcuts sheet (F1).
+    Shortcuts,
 }
 
 fn avatar_hue(id: &str) -> u16 {
@@ -933,6 +943,31 @@ pub fn BrandLogo(brand: String, #[props(default = 24)] size: u32) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heavy_work_motion_rules_stay_accessible() {
+        // v0.50 C6: the new surfaces use transitions only (interruptible), have a
+        // reduced-motion block in both forms, and the virtualized feed does not
+        // fade every remounted row in reduced motion.
+        let runs = include_str!("../assets/runs.css");
+        assert!(
+            !runs.contains("@keyframes"),
+            "runs.css must not use keyframes"
+        );
+        for needle in [
+            "@media (prefers-reduced-motion: reduce)",
+            ".root[data-motion=\"reduce\"] .run-chev",
+            ".run-open:focus-visible",
+            "@media (forced-colors: active)",
+        ] {
+            assert!(runs.contains(needle), "missing rule: {needle}");
+        }
+        let app = include_str!("../assets/app.css");
+        assert!(
+            !app.contains("  .pane > *,\n  .msg {"),
+            "reduced motion must not animate every .msg remount"
+        );
+    }
 
     #[test]
     fn civil_from_days_matches_known_dates() {

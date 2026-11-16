@@ -134,6 +134,18 @@ impl Store {
                 reason
             ],
         )?;
+        drop(connection);
+        let _ = self.append_event(
+            user_id,
+            crate::runtime::activity::EVENT_HOLD_SET,
+            &crate::runtime::activity::hold_payload(
+                provider,
+                account_id,
+                model,
+                kind,
+                Some(&to_string(until)),
+            ),
+        );
         Ok(())
     }
 
@@ -142,10 +154,21 @@ impl Store {
     pub fn active_provider_holds(&self, user_id: &str, now: DateTime<Utc>) -> Result<Vec<Hold>> {
         let connection = self.connection()?;
         let cutoff = to_string(now);
-        connection.execute(
-            "DELETE FROM provider_holds WHERE user_id = ?1 AND until <= ?2",
-            params![user_id, cutoff],
+        let mut expired_statement = connection.prepare(
+            "DELETE FROM provider_holds WHERE user_id = ?1 AND until <= ?2
+             RETURNING provider, account_id, model, kind",
         )?;
+        let expired = expired_statement
+            .query_map(params![user_id, cutoff], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(expired_statement);
         let mut statement = connection.prepare(
             "SELECT provider, account_id, model, kind, until, reason FROM provider_holds
              WHERE user_id = ?1 ORDER BY until LIMIT 256",
@@ -163,7 +186,23 @@ impl Store {
                 reason: row.get(5)?,
             })
         })?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        let holds = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        drop(connection);
+        for (provider, account_id, model, kind) in expired {
+            let _ = self.append_event(
+                user_id,
+                crate::runtime::activity::EVENT_HOLD_CLEARED,
+                &crate::runtime::activity::hold_payload(
+                    &provider,
+                    &account_id,
+                    &model,
+                    &kind,
+                    None,
+                ),
+            );
+        }
+        Ok(holds)
     }
 
     /// Remove every hold of one account (a fresh sign-in or a manual retry).
@@ -174,10 +213,19 @@ impl Store {
         account_id: &str,
     ) -> Result<usize> {
         let connection = self.connection()?;
-        Ok(connection.execute(
+        let removed = connection.execute(
             "DELETE FROM provider_holds WHERE user_id = ?1 AND provider = ?2 AND account_id = ?3",
             params![user_id, provider, account_id],
-        )?)
+        )?;
+        drop(connection);
+        if removed > 0 {
+            let _ = self.append_event(
+                user_id,
+                crate::runtime::activity::EVENT_HOLD_CLEARED,
+                &crate::runtime::activity::hold_payload(provider, account_id, "", "", None),
+            );
+        }
+        Ok(removed)
     }
 
     /// Note that an account just served a call.
@@ -793,5 +841,72 @@ mod tests {
         );
         // A hold on one model leaves the account's other models usable.
         assert_eq!(account_block(&item, "p", "other", &[hold], now), None);
+    }
+
+    #[test]
+    fn hold_changes_are_events_with_ids_and_expiry_only() {
+        let store = Store::open_in_memory(384).unwrap();
+        let user = store.admin_user_id().unwrap();
+        let other = store
+            .create_user("microsoft:hold-other", "h@example.example", "H")
+            .unwrap()
+            .id;
+        let now = Utc::now();
+        store
+            .set_provider_hold(
+                &user,
+                "default",
+                "a1",
+                ALL_MODELS,
+                "rate_limit",
+                now + chrono::Duration::seconds(60),
+                "rate_limited",
+            )
+            .unwrap();
+        store
+            .set_provider_hold(
+                &user,
+                "default",
+                "a2",
+                ALL_MODELS,
+                "rate_limit",
+                now - chrono::Duration::seconds(1),
+                "rate_limited",
+            )
+            .unwrap();
+        let of = |kind: &str| {
+            store
+                .events_after(&user, 0, 100)
+                .unwrap()
+                .into_iter()
+                .filter(|event| event.kind == kind)
+                .map(|event| event.payload)
+                .collect::<Vec<_>>()
+        };
+        let set = of("provider.hold_set");
+        assert_eq!(set.len(), 2);
+        assert_eq!(set[0]["account_id"], "a1");
+        assert_eq!(set[0]["kind"], "rate_limit");
+        assert!(set[0]["until"].is_string());
+        assert!(set[0].get("reason").is_none());
+        // The expired hold is removed on the next read and says so once.
+        let active = store.active_provider_holds(&user, now).unwrap();
+        assert_eq!(active.len(), 1);
+        store.active_provider_holds(&user, now).unwrap();
+        let cleared = of("provider.hold_cleared");
+        assert_eq!(cleared.len(), 1);
+        assert_eq!(cleared[0]["account_id"], "a2");
+        // A manual clear of a live hold is an event; clearing nothing is not.
+        assert_eq!(
+            store.clear_provider_holds(&user, "default", "a1").unwrap(),
+            1
+        );
+        assert_eq!(
+            store.clear_provider_holds(&user, "default", "a1").unwrap(),
+            0
+        );
+        assert_eq!(of("provider.hold_cleared").len(), 2);
+        // Another user's stream sees none of it.
+        assert!(store.events_after(&other, 0, 100).unwrap().is_empty());
     }
 }

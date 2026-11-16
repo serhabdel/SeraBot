@@ -1229,6 +1229,12 @@ body {
   overflow-anchor: none;
 }
 
+/* Stand-ins for the rows the virtualized feed does not draw (v0.50). */
+.messages > .feed-spacer {
+  flex: none;
+  pointer-events: none;
+}
+
 .msg {
   display: flex;
   gap: 12px;
@@ -2482,8 +2488,9 @@ body {
     transform: none !important;
   }
 
-  .pane > *,
-  .msg {
+  /* Not .msg: the virtualized feed remounts rows while scrolling, and a
+     fade on every remount would flicker. New rows fade through .msg-enter. */
+  .pane > * {
     animation: fade-in var(--dur-fade) linear !important;
   }
 }

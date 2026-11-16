@@ -90,4 +90,7 @@ OVH is read-only unless the owner explicitly authorizes an additive installation
 - `crates/serabot/src/api/preview.rs`, `api/workflows.rs`, `api/routines.rs` — artifact preview (owner-only, hash-addressed), per-user workflow plans and routines.
 - `crates/serabot/src/accounts.rs`, `api/accounts.rs`, `auth_flows/`, `llm_failure.rs` — per-user provider accounts (sealed, write-only), sign-in flows (PKCE/device; Antigravity, Muse, Claude plan OAuth flag-gated off), single-flight refresh, typed failure classifier (0.49).
 - `crates/serabot/src/wire/`, `route_chain.rs`, `thinking.rs` — Anthropic and Responses transports, bot route chain with failover and holds, thinking levels (0.49).
-- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.49.0.
+- `crates/serabot/src/fleet_mutation.rs`, `tools_bots.rs` — the one path that changes a bot row, and `main`'s management tools (owner turns only; setters approval-gated, never widening) (0.50).
+- `crates/serabot/src/delegate.rs`, `runtime/auto_resume.rs`, `runtime/compaction.rs`, `runtime/activity.rs` — handoff ledger and resume, `waiting_model` parking, context compaction, orchestration event payloads (0.50).
+- `crates/serabot-desktop/src/runs.rs`, `chat_compose.rs`, `chat_failure.rs`, `chat_cards.rs`, `ui/chat_feed_view.rs`, `assets/runs.css` — runs sidebar, composer queue, failed and wait cards, virtualized feed (0.50).
+- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.50.0.

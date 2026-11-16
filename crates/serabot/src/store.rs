@@ -76,12 +76,35 @@ const MIGRATION_34: &str = include_str!("../migrations/0034_bot_chats.sql");
 const MIGRATION_35: &str = include_str!("../migrations/0035_marketplace_installs.sql");
 const MIGRATION_36: &str = include_str!("../migrations/0036_console_pages.sql");
 const MIGRATION_37: &str = include_str!("../migrations/0037_provider_accounts.sql");
+const MIGRATION_38: &str = include_str!("../migrations/0038_handoffs.sql");
 
 /// Fixed admin id written by migration 0008 and mirrored in
 /// `kv['admin_user_id']`. Code resolves the admin through the kv entry (the
 /// database is the source of truth); this constant documents the value and
 /// lets tests and migrations agree without copying the literal around.
 pub const ADMIN_USER_ID: &str = "00000000-0000-7000-8000-000000000001";
+
+/// Task status for work whose outbound effect may have happened: it is never
+/// replayed and waits for the owner.
+pub const TASK_NEEDS_REVIEW: &str = "needs_review";
+
+/// Per-user limits [`Store::claim_task_with`] applies when it picks a task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimLimits {
+    /// Running owner-facing (non-handoff) tasks one user may hold.
+    pub max_turns_per_user: usize,
+    /// Running handoff (subagent) tasks one user may hold.
+    pub max_active_children: usize,
+}
+
+impl ClaimLimits {
+    pub const UNLIMITED: Self = Self {
+        max_turns_per_user: usize::MAX,
+        max_active_children: usize::MAX,
+    };
+}
+/// Task status for a turn parked until a model route is ready.
+pub const TASK_WAITING_MODEL: &str = "waiting_model";
 
 /// The acting user's role. The admin sees audit records and manages users,
 /// invites, and server configuration; members act only within their own
@@ -701,6 +724,11 @@ impl Store {
         if version < 37 {
             connection.execute_batch(MIGRATION_37)?;
             connection.pragma_update(None, "user_version", 37)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 38 {
+            connection.execute_batch(MIGRATION_38)?;
+            connection.pragma_update(None, "user_version", 38)?;
         }
         // VACUUM INTO (backups) may renumber rowids; rebuild the external-content
         // FTS index only when its row count no longer matches `memories`.
@@ -2507,7 +2535,7 @@ impl Store {
         Ok(connection.query_row(
             "SELECT COUNT(*) FROM tasks
              WHERE user_id = ?1
-               AND status IN ('queued','running','awaiting_approval')
+               AND status IN ('queued','running','awaiting_approval','waiting_model')
                AND json_extract(payload_json, '$.team.root_task_id') = ?2",
             params![user_id, root_task_id],
             |row| row.get(0),
@@ -2933,6 +2961,19 @@ impl Store {
         Ok(ids)
     }
 
+    /// Ids of the acting user's active turns of one task. Another user's
+    /// task never matches.
+    pub fn running_turn_ids_for_task(&self, user_id: &str, task_id: &str) -> Result<Vec<String>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id FROM turns WHERE user_id = ?1 AND task_id = ?2 AND status = 'active'",
+        )?;
+        let ids = statement
+            .query_map(params![user_id, task_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(ids)
+    }
+
     pub fn update_turn(&self, user_id: &str, id: &str, status: &str, state: &Value) -> Result<()> {
         let connection = self.connection()?;
         connection.execute(
@@ -2946,6 +2987,61 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Flip the acting user's turn from `limit_reached` to `continuing`, once.
+    /// False when the turn is not in that state (already continued, never
+    /// limited, or another user's).
+    pub fn begin_turn_continue(&self, user_id: &str, id: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE turns SET status='continuing', updated_at=?1
+             WHERE id=?2 AND user_id=?3 AND status=?4",
+            params![
+                now_string(),
+                id,
+                user_id,
+                crate::runtime::LIMIT_REACHED_STATUS
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Undo [`Store::begin_turn_continue`] when the resume could not be queued.
+    pub fn restore_turn_limit(&self, user_id: &str, id: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE turns SET status=?4, updated_at=?1
+             WHERE id=?2 AND user_id=?3 AND status='continuing'",
+            params![
+                now_string(),
+                id,
+                user_id,
+                crate::runtime::LIMIT_REACHED_STATUS
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// The acting user's newest turn in a conversation that stopped at a tool
+    /// limit, if it is still the conversation's latest turn.
+    pub fn latest_limit_turn_id(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<String>> {
+        let connection = self.connection()?;
+        let row = connection
+            .query_row(
+                "SELECT id, status FROM turns WHERE user_id=?1 AND conversation_id=?2
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                params![user_id, conversation_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        Ok(row
+            .filter(|(_, status)| status == crate::runtime::LIMIT_REACHED_STATUS)
+            .map(|(id, _)| id))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4104,27 +4200,66 @@ impl Store {
         Ok(inserted == 1)
     }
 
-    /// Claim the next runnable task for a worker. Cross-user by design: the
-    /// worker pool is shared — a task runs under its owning user (returned
-    /// on the task), regardless of which worker claims it.
+    /// Claim the next runnable task for a worker with no per-user limits.
+    /// Cross-user by design: the worker pool is shared; a task runs under its
+    /// owning user (returned on the task), regardless of which worker claims
+    /// it. The worker uses [`Store::claim_task_with`].
     pub fn claim_task(&self, worker_id: &str, lease_secs: u64) -> Result<Option<Task>> {
+        self.claim_task_with(worker_id, lease_secs, ClaimLimits::UNLIMITED)
+    }
+
+    /// Claim the next runnable task under the fairness limits (0.50). Within a
+    /// priority an owner turn goes before a subagent turn, then the user with
+    /// the fewest running tasks goes first (a round robin across users), then
+    /// the oldest. A user already at `max_turns_per_user` running owner turns,
+    /// or `max_active_children` running subagent turns, is skipped, so one
+    /// user's fan-out can never fill every worker slot.
+    pub fn claim_task_with(
+        &self,
+        worker_id: &str,
+        lease_secs: u64,
+        limits: ClaimLimits,
+    ) -> Result<Option<Task>> {
         let connection = self.connection()?;
         let now = utc_now();
         let lease_until = now + chrono::Duration::seconds(lease_secs as i64);
+        let cap = |value: usize| i64::try_from(value).unwrap_or(i64::MAX);
         let transaction = connection.unchecked_transaction()?;
         let task = transaction
             .query_row(
                 "UPDATE tasks SET status='running', worker_id=?1, lease_until=?2,
                     fencing_token=fencing_token+1, attempts=attempts+1, updated_at=?3
                  WHERE id = (
-                    SELECT id FROM tasks
-                    WHERE status='queued' AND run_after <= ?3
-                    ORDER BY priority DESC, created_at ASC LIMIT 1
+                    SELECT t.id FROM tasks t
+                    WHERE t.status IN ('queued','waiting_model') AND t.run_after <= ?3
+                      AND (
+                        (COALESCE(json_extract(t.payload_json, '$.source'), '') = 'handoff'
+                         AND (SELECT COUNT(*) FROM tasks r
+                              WHERE r.user_id = t.user_id AND r.status = 'running'
+                                AND COALESCE(json_extract(r.payload_json, '$.source'), '') = 'handoff') < ?5)
+                        OR
+                        (COALESCE(json_extract(t.payload_json, '$.source'), '') <> 'handoff'
+                         AND (SELECT COUNT(*) FROM tasks r
+                              WHERE r.user_id = t.user_id AND r.status = 'running'
+                                AND COALESCE(json_extract(r.payload_json, '$.source'), '') <> 'handoff') < ?4)
+                      )
+                    ORDER BY t.priority DESC,
+                             COALESCE(json_extract(t.payload_json, '$.source'), '') = 'handoff' ASC,
+                             (SELECT COUNT(*) FROM tasks r
+                              WHERE r.user_id = t.user_id AND r.status = 'running') ASC,
+                             t.created_at ASC
+                    LIMIT 1
                  )
                  RETURNING id, kind, bot, payload_json, status, priority, attempts, max_attempts,
                     run_after, lease_until, worker_id, fencing_token, uncertain, last_error,
                     created_at, updated_at, user_id",
-                params![worker_id, to_string(lease_until), to_string(now)],
+                params![
+                    worker_id,
+                    to_string(lease_until),
+                    to_string(now),
+                    cap(limits.max_turns_per_user),
+                    cap(limits.max_active_children)
+                ],
                 map_task,
             )
             .optional()?;
@@ -4190,7 +4325,11 @@ impl Store {
         let Some((attempts, max_attempts, uncertain)) = task else {
             return Ok(false);
         };
-        let (status, run_after) = if uncertain || attempts >= max_attempts {
+        let (status, run_after) = if uncertain {
+            // An outbound effect may have happened: never replay, hand it to
+            // the owner.
+            (TASK_NEEDS_REVIEW, now)
+        } else if attempts >= max_attempts {
             ("failed", now)
         } else {
             let delay = retry_backoff_secs.saturating_mul(attempts.max(1) as u64);
@@ -4224,9 +4363,16 @@ impl Store {
     ) -> Result<bool> {
         let connection = self.connection()?;
         let changed = connection.execute(
-            "UPDATE tasks SET status='failed', last_error=?1, lease_until=NULL, worker_id=NULL, updated_at=?2
+            "UPDATE tasks SET status=CASE WHEN uncertain=1 THEN 'needs_review' ELSE 'failed' END,
+                last_error=?1, lease_until=NULL, worker_id=NULL, updated_at=?2
              WHERE id=?3 AND fencing_token=?4 AND status='running' AND user_id=?5",
-            params![truncate(error, 2000), now_string(), id, fencing_token, user_id],
+            params![
+                truncate(error, 2000),
+                now_string(),
+                id,
+                fencing_token,
+                user_id
+            ],
         )?;
         Ok(changed == 1)
     }
@@ -4241,11 +4387,62 @@ impl Store {
         Ok(changed == 1)
     }
 
+    /// Flag the acting user's running task: an outbound effect is being
+    /// dispatched and its outcome is not yet known. A flagged task is never
+    /// replayed; if its worker dies or fails it goes to `needs_review`.
+    pub fn mark_task_uncertain(&self, user_id: &str, id: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE tasks SET uncertain=1, updated_at=?1
+             WHERE id=?2 AND user_id=?3 AND status='running'",
+            params![now_string(), id, user_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Clear the flag once the dispatched effect has a known outcome
+    /// (executed, or failed without having been sent).
+    pub fn clear_task_uncertain(&self, user_id: &str, id: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE tasks SET uncertain=0, updated_at=?1
+             WHERE id=?2 AND user_id=?3 AND status='running'",
+            params![now_string(), id, user_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Park a running task until a model route is ready. Releases the lease
+    /// and does not count the pause as an attempt. The worker claims it again
+    /// at `run_after`, and the turn resumes from its stored state.
+    pub fn park_task_waiting_model(
+        &self,
+        user_id: &str,
+        id: &str,
+        fencing_token: i64,
+        run_after: DateTime<Utc>,
+    ) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE tasks SET status='waiting_model', run_after=?1, attempts=MAX(attempts-1, 0),
+                lease_until=NULL, worker_id=NULL, updated_at=?2
+             WHERE id=?3 AND fencing_token=?4 AND status='running' AND user_id=?5",
+            params![
+                to_string(run_after),
+                now_string(),
+                id,
+                fencing_token,
+                user_id
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
     pub fn requeue_task(&self, user_id: &str, id: &str, run_after: DateTime<Utc>) -> Result<bool> {
         let connection = self.connection()?;
         let changed = connection.execute(
             "UPDATE tasks SET status='queued', run_after=?1, lease_until=NULL, worker_id=NULL, updated_at=?2
-             WHERE id=?3 AND user_id=?4 AND status IN ('awaiting_approval','running')",
+             WHERE id=?3 AND user_id=?4 AND status IN ('awaiting_approval','running','waiting_model')",
             params![to_string(run_after), now_string(), id, user_id],
         )?;
         Ok(changed == 1)
@@ -4258,7 +4455,7 @@ impl Store {
         let connection = self.connection()?;
         Ok(connection.execute(
             "UPDATE tasks SET
-                status=CASE WHEN uncertain=1 THEN 'failed' ELSE 'queued' END,
+                status=CASE WHEN uncertain=1 THEN 'needs_review' ELSE 'queued' END,
                 last_error=CASE WHEN uncertain=1 THEN 'outcome unknown after worker lease expiry' ELSE last_error END,
                 lease_until=NULL, worker_id=NULL, updated_at=?1
              WHERE status='running' AND lease_until IS NOT NULL AND lease_until < ?1",
@@ -4412,7 +4609,7 @@ impl Store {
         let connection = self.connection()?;
         Ok(connection.query_row(
             "SELECT COUNT(*) FROM tasks
-             WHERE user_id = ?1 AND status IN ('queued','running','awaiting_approval')",
+             WHERE user_id = ?1 AND status IN ('queued','running','awaiting_approval','waiting_model')",
             params![user_id],
             |row| row.get(0),
         )?)
@@ -4424,7 +4621,7 @@ impl Store {
     pub fn pending_task_count_all(&self) -> Result<i64> {
         let connection = self.connection()?;
         Ok(connection.query_row(
-            "SELECT COUNT(*) FROM tasks WHERE status IN ('queued','running','awaiting_approval')",
+            "SELECT COUNT(*) FROM tasks WHERE status IN ('queued','running','awaiting_approval','waiting_model')",
             [],
             |row| row.get(0),
         )?)
@@ -4435,7 +4632,7 @@ impl Store {
         let connection = self.connection()?;
         let changed = connection.execute(
             "UPDATE tasks SET status='cancelled', last_error=?1, lease_until=NULL, worker_id=NULL, updated_at=?2
-             WHERE id=?3 AND user_id=?4 AND status IN ('queued','running','awaiting_approval')",
+             WHERE id=?3 AND user_id=?4 AND status IN ('queued','running','awaiting_approval','waiting_model')",
             params![truncate(reason, 2000), now_string(), id, user_id],
         )?;
         Ok(changed == 1)
@@ -5031,7 +5228,7 @@ fn parse_role(value: &str) -> Role {
 /// Insert one queued task row. Shared by the plain and quota-checked
 /// enqueue paths so the row shape (and its owner) has one definition.
 #[allow(clippy::too_many_arguments)]
-fn insert_task_row(
+pub(crate) fn insert_task_row(
     connection: &rusqlite::Connection,
     id: &str,
     user_id: &str,
@@ -5923,7 +6120,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 37);
+        assert_eq!(version, 38);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
@@ -5988,7 +6185,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 37);
+        assert_eq!(version, 38);
         assert!(store.list_device_tokens().unwrap().is_empty());
         // The team table arrives with the same migration batch.
         assert!(
@@ -6062,7 +6259,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 37);
+        assert_eq!(version, 38);
         let admin = admin(&store);
         let memory = crate::memory::get(&store, &admin, "mem-legacy").unwrap();
         assert_eq!(memory.origin, "explicit");
@@ -6151,7 +6348,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 37);
+        assert_eq!(version, 38);
 
         let admin = store.admin_user().unwrap().unwrap();
         assert_eq!(admin.id, ADMIN_USER_ID);
@@ -6282,7 +6479,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 37);
+        assert_eq!(version, 38);
 
         // Every scoped table carries user_id = the admin, and the column is
         // NOT NULL with a real foreign key.
@@ -6437,7 +6634,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 37);
+        assert_eq!(version, 38);
 
         // The old row is now the admin's, with the empty prompt the migration
         // header documents; startup seeding fills it from the template.
@@ -7325,8 +7522,108 @@ mod tests {
         drop(connection);
         store.recover_expired_tasks().unwrap();
         let recovered = store.get_task(&admin, &task.id).unwrap();
-        assert_eq!(recovered.status, "failed");
+        assert_eq!(recovered.status, "needs_review");
         assert_eq!(recovered.fencing_token, claimed.fencing_token);
+        assert!(store.claim_task("worker", 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn marking_a_task_uncertain_is_scoped_to_its_owner_and_running_state() {
+        let store = store();
+        let admin = admin(&store);
+        let other = store
+            .create_user(
+                "microsoft:uncertain-other",
+                "other@example.example",
+                "Other",
+            )
+            .unwrap()
+            .id;
+        let task = store
+            .enqueue_task(&admin, "turn", "main", &serde_json::json!({}), 0, utc_now())
+            .unwrap();
+        // Queued, not running: nothing to flag.
+        assert!(!store.mark_task_uncertain(&admin, &task.id).unwrap());
+        store.claim_task("worker", 60).unwrap().unwrap();
+        // Another user cannot flag it.
+        assert!(!store.mark_task_uncertain(&other, &task.id).unwrap());
+        assert!(!store.get_task(&admin, &task.id).unwrap().uncertain);
+        assert!(store.mark_task_uncertain(&admin, &task.id).unwrap());
+        assert!(store.get_task(&admin, &task.id).unwrap().uncertain);
+        assert!(!store.clear_task_uncertain(&other, &task.id).unwrap());
+        assert!(store.get_task(&admin, &task.id).unwrap().uncertain);
+        assert!(store.clear_task_uncertain(&admin, &task.id).unwrap());
+    }
+
+    #[test]
+    fn an_uncertain_failure_goes_to_review_and_a_plain_one_retries() {
+        let store = store();
+        let admin = admin(&store);
+        let flagged = store
+            .enqueue_task(&admin, "turn", "main", &serde_json::json!({}), 0, utc_now())
+            .unwrap();
+        let claimed = store.claim_task("worker", 60).unwrap().unwrap();
+        assert!(store.mark_task_uncertain(&admin, &flagged.id).unwrap());
+        assert!(
+            store
+                .fail_task(&admin, &flagged.id, claimed.fencing_token, "lost", 5)
+                .unwrap()
+        );
+        assert_eq!(
+            store.get_task(&admin, &flagged.id).unwrap().status,
+            "needs_review"
+        );
+
+        let plain = store
+            .enqueue_task(&admin, "turn", "main", &serde_json::json!({}), 0, utc_now())
+            .unwrap();
+        let claimed = store.claim_task("worker", 60).unwrap().unwrap();
+        assert!(
+            store
+                .fail_task(&admin, &plain.id, claimed.fencing_token, "flaky", 5)
+                .unwrap()
+        );
+        assert_eq!(store.get_task(&admin, &plain.id).unwrap().status, "queued");
+    }
+
+    #[test]
+    fn a_parked_task_waits_for_its_time_and_keeps_its_attempts() {
+        let store = store();
+        let admin = admin(&store);
+        let task = store
+            .enqueue_task(&admin, "turn", "main", &serde_json::json!({}), 0, utc_now())
+            .unwrap();
+        let claimed = store.claim_task("worker", 60).unwrap().unwrap();
+        assert_eq!(claimed.attempts, 1);
+        let until = utc_now() + chrono::Duration::seconds(60);
+        assert!(
+            store
+                .park_task_waiting_model(&admin, &task.id, claimed.fencing_token, until)
+                .unwrap()
+        );
+        let parked = store.get_task(&admin, &task.id).unwrap();
+        assert_eq!(parked.status, "waiting_model");
+        assert_eq!(parked.attempts, 0);
+        assert!(parked.lease_until.is_none());
+        assert!(store.claim_task("worker", 60).unwrap().is_none());
+        assert_eq!(store.pending_task_count(&admin).unwrap(), 1);
+        // Due: claimed again like a queued task.
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET run_after=?1 WHERE id=?2",
+                params![to_string(utc_now() - chrono::Duration::seconds(1)), task.id],
+            )
+            .unwrap();
+        let again = store.claim_task("worker", 60).unwrap().unwrap();
+        assert_eq!(again.id, task.id);
+        // A stale token cannot park it.
+        assert!(
+            !store
+                .park_task_waiting_model(&admin, &task.id, claimed.fencing_token, until)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -8198,5 +8495,90 @@ mod tests {
         let b_jobs = store.list_media_jobs_for_user(&user_b.id, 10).unwrap();
         assert_eq!(b_jobs.len(), 1);
         assert_eq!(b_jobs[0].external_id, "ext-b1");
+    }
+
+    fn queue_for(store: &Store, user: &str, source: &str, n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| {
+                store
+                    .enqueue_task(
+                        user,
+                        "turn",
+                        "analyst",
+                        &serde_json::json!({"source": source, "text": format!("synthetic {i}")}),
+                        0,
+                        chrono::Utc::now(),
+                    )
+                    .unwrap()
+                    .id
+            })
+            .collect()
+    }
+
+    #[test]
+    fn one_users_sixteen_children_do_not_block_another_users_turn() {
+        let store = Store::open_in_memory(384).unwrap();
+        let a = store.admin_user_id().unwrap();
+        let b = store
+            .create_user("microsoft:fair-b", "fair-b@example.example", "B")
+            .unwrap()
+            .id;
+        // A's children are queued first, so plain FIFO would run all 16 before B.
+        queue_for(&store, &a, "handoff", 16);
+        let b_turn = queue_for(&store, &b, "owner", 1).remove(0);
+        let limits = ClaimLimits {
+            max_turns_per_user: 2,
+            max_active_children: 4,
+        };
+        let mut claimed = Vec::new();
+        while let Some(task) = store.claim_task_with("w", 30, limits).unwrap() {
+            claimed.push(task);
+        }
+        // B's turn starts within one claim cycle (the second claim: A, then B).
+        let position = claimed.iter().position(|task| task.id == b_turn).unwrap();
+        assert!(position <= 1, "B's turn was claimed at position {position}");
+        // A never holds more than four subagent slots, and B's turn ran.
+        let a_running = claimed.iter().filter(|task| task.user_id == a).count();
+        assert_eq!(a_running, 4);
+        assert_eq!(claimed.len(), 5);
+        // A slot frees when a child finishes: the next child is claimed.
+        let first = claimed.iter().find(|task| task.user_id == a).unwrap();
+        assert!(
+            store
+                .complete_task(&a, &first.id, first.fencing_token)
+                .unwrap()
+        );
+        assert!(store.claim_task_with("w", 30, limits).unwrap().is_some());
+        assert!(store.claim_task_with("w", 30, limits).unwrap().is_none());
+    }
+
+    #[test]
+    fn owner_turns_go_before_children_and_are_capped_per_user() {
+        let store = Store::open_in_memory(384).unwrap();
+        let a = store.admin_user_id().unwrap();
+        queue_for(&store, &a, "handoff", 2);
+        let owner = queue_for(&store, &a, "owner", 3);
+        let limits = ClaimLimits {
+            max_turns_per_user: 2,
+            max_active_children: 4,
+        };
+        // Same priority: an owner turn goes before the older children.
+        let first = store.claim_task_with("w", 30, limits).unwrap().unwrap();
+        assert_eq!(first.id, owner[0]);
+        let second = store.claim_task_with("w", 30, limits).unwrap().unwrap();
+        // The owner-turn cap is 2 and the next claim is the user's own: with
+        // round robin on running counts it can be a child, but never a third
+        // owner turn.
+        let rest: Vec<Task> =
+            std::iter::from_fn(|| store.claim_task_with("w", 30, limits).unwrap()).collect();
+        let owner_claimed = [first, second]
+            .iter()
+            .chain(&rest)
+            .filter(|task| owner.contains(&task.id))
+            .count();
+        assert_eq!(owner_claimed, 2);
+        assert_eq!(rest.len(), 2);
+        // The unlimited wrapper keeps the old behavior for callers without limits.
+        assert!(store.claim_task("w", 30).unwrap().is_some());
     }
 }

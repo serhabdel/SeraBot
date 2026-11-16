@@ -15,6 +15,110 @@ const MAX_HOST_CHARS: usize = 48;
 /// Longest reasoning text one Thinking step carries.
 const THINKING_EVENT_CHARS: usize = 4000;
 
+/// Orchestration event kinds (0.50). They ride the same event stream and SSE
+/// feed as `turn.step`. Every payload is small and carries ids and short codes
+/// only: no objective, reply or provider text. The desktop looks the rest up by
+/// id, so it can coalesce a burst of these into one refresh.
+pub(crate) const EVENT_HANDOFF_STARTED: &str = "handoff.started";
+pub(crate) const EVENT_HANDOFF_COMPLETED: &str = "handoff.completed";
+pub(crate) const EVENT_HANDOFF_FAILED: &str = "handoff.failed";
+pub(crate) const EVENT_MODEL_FAILOVER: &str = "model.failover";
+pub(crate) const EVENT_HOLD_SET: &str = "provider.hold_set";
+pub(crate) const EVENT_HOLD_CLEARED: &str = "provider.hold_cleared";
+pub(crate) const EVENT_WAITING_MODEL: &str = "task.waiting_model";
+
+/// Where a handoff event points.
+pub(crate) struct HandoffRef<'a> {
+    pub handoff_id: &'a str,
+    pub child_task_id: &'a str,
+    pub parent_task_id: &'a str,
+    pub to_bot: &'a str,
+    pub conversation_id: &'a str,
+}
+
+/// Payload of `handoff.started` and `handoff.completed`.
+pub(crate) fn handoff_payload(handoff: &HandoffRef<'_>) -> Value {
+    json!({
+        "handoff_id": handoff.handoff_id,
+        "child_task_id": handoff.child_task_id,
+        "parent_task_id": handoff.parent_task_id,
+        "to_bot": handoff.to_bot,
+        "conversation_id": handoff.conversation_id,
+    })
+}
+
+/// Payload of `handoff.failed`: the ids plus the outcome, so the sidebar can
+/// show "failed, resumable" without another call.
+pub(crate) fn handoff_failed_payload(
+    handoff: &HandoffRef<'_>,
+    status: &str,
+    outcome_code: &str,
+    effects_unknown: bool,
+    resume_count: i64,
+) -> Value {
+    let mut payload = handoff_payload(handoff);
+    payload["status"] = json!(status);
+    payload["outcome_code"] = json!(outcome_code);
+    payload["effects_unknown"] = json!(effects_unknown);
+    payload["resume_count"] = json!(resume_count);
+    payload
+}
+
+/// Payload of `model.failover`.
+pub(crate) fn failover_payload(
+    conversation_id: &str,
+    task_id: Option<&str>,
+    bot: &str,
+    from: &ModelSelection,
+    to: &ModelSelection,
+    reason: &str,
+) -> Value {
+    json!({
+        "conversation_id": conversation_id,
+        "task_id": task_id,
+        "bot": bot,
+        "from": {"provider": from.provider, "model": from.model, "account": from.account},
+        "to": {"provider": to.provider, "model": to.model, "account": to.account},
+        "reason": reason,
+    })
+}
+
+/// Payload of `provider.hold_set` and `provider.hold_cleared`. `until` is the
+/// hold's expiry for a set hold, and absent when it was cleared.
+pub(crate) fn hold_payload(
+    provider: &str,
+    account_id: &str,
+    model: &str,
+    kind: &str,
+    until: Option<&str>,
+) -> Value {
+    let mut payload = json!({
+        "provider": provider,
+        "account_id": account_id,
+        "model": model,
+        "kind": kind,
+    });
+    if let Some(until) = until {
+        payload["until"] = json!(until);
+    }
+    payload
+}
+
+/// Payload of `task.waiting_model`.
+pub(crate) fn waiting_model_payload(
+    task_id: &str,
+    turn_id: &str,
+    conversation_id: &str,
+    until: &str,
+) -> Value {
+    json!({
+        "task_id": task_id,
+        "turn_id": turn_id,
+        "conversation_id": conversation_id,
+        "until": until,
+    })
+}
+
 /// What the desktop renders for one step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StepView {

@@ -673,6 +673,283 @@ pub fn task_title_from_message(content: &str) -> String {
     }
 }
 
+// ---- Heavy work: the send queue, delegate mentions and the key help (v0.50) ----
+
+/// Most messages one conversation's queue holds.
+pub const MAX_QUEUED: usize = 8;
+
+/// A message waiting for the running reply to end.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedMessage {
+    pub id: u64,
+    pub text: String,
+    /// The bot an `@bot` mention routes this message to.
+    pub target: Option<String>,
+    /// "Steer": the running reply is stopped so this goes next.
+    pub steer: bool,
+}
+
+/// Why a message did not enter the queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueueRefusal {
+    Empty,
+    TooLong,
+    Full,
+}
+
+impl QueueRefusal {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Empty => "Type a message first.",
+            Self::TooLong => "That message is too long to queue. Shorten it first.",
+            Self::Full => "The queue is full. Wait for a reply or delete one.",
+        }
+    }
+}
+
+/// Messages typed while a reply runs. They go out one at a time, in order,
+/// when the conversation is idle. While one is being edited the queue holds:
+/// the front message is never sent from under the owner's cursor.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SendQueue {
+    items: Vec<QueuedMessage>,
+    next_id: u64,
+    editing: Option<u64>,
+}
+
+impl SendQueue {
+    pub fn items(&self) -> &[QueuedMessage] {
+        &self.items
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// The message being edited, if any (the edit hold).
+    pub fn editing(&self) -> Option<u64> {
+        self.editing
+    }
+
+    fn check(text: &str) -> Result<String, QueueRefusal> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            Err(QueueRefusal::Empty)
+        } else if trimmed.chars().count() > MAX_TEXT_CHARS {
+            Err(QueueRefusal::TooLong)
+        } else {
+            Ok(trimmed.to_owned())
+        }
+    }
+
+    fn position(&self, id: u64) -> Option<usize> {
+        self.items.iter().position(|item| item.id == id)
+    }
+
+    pub fn push(&mut self, text: &str, target: Option<String>) -> Result<u64, QueueRefusal> {
+        let text = Self::check(text)?;
+        if self.items.len() >= MAX_QUEUED {
+            return Err(QueueRefusal::Full);
+        }
+        self.next_id = self.next_id.wrapping_add(1);
+        let id = self.next_id;
+        self.items.push(QueuedMessage {
+            id,
+            text,
+            target,
+            steer: false,
+        });
+        Ok(id)
+    }
+
+    pub fn remove(&mut self, id: u64) -> bool {
+        let Some(index) = self.position(id) else {
+            return false;
+        };
+        self.items.remove(index);
+        if self.editing == Some(id) {
+            self.editing = None;
+        }
+        true
+    }
+
+    pub fn move_up(&mut self, id: u64) -> bool {
+        match self.position(id) {
+            Some(index) if index > 0 => {
+                self.items.swap(index, index - 1);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn move_down(&mut self, id: u64) -> bool {
+        match self.position(id) {
+            Some(index) if index + 1 < self.items.len() => {
+                self.items.swap(index, index + 1);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Start editing: the text to put in the field. The queue holds until
+    /// the edit is saved or cancelled.
+    pub fn begin_edit(&mut self, id: u64) -> Option<String> {
+        let index = self.position(id)?;
+        self.editing = Some(id);
+        Some(self.items[index].text.clone())
+    }
+
+    pub fn commit_edit(&mut self, id: u64, text: &str) -> Result<(), QueueRefusal> {
+        let text = Self::check(text)?;
+        if let Some(index) = self.position(id) {
+            self.items[index].text = text;
+        }
+        if self.editing == Some(id) {
+            self.editing = None;
+        }
+        Ok(())
+    }
+
+    pub fn cancel_edit(&mut self) {
+        self.editing = None;
+    }
+
+    /// Steer: send this one next and stop the running reply to make room.
+    /// A message being edited cannot be steered.
+    pub fn steer(&mut self, id: u64) -> bool {
+        if self.editing == Some(id) {
+            return false;
+        }
+        let Some(index) = self.position(id) else {
+            return false;
+        };
+        let mut item = self.items.remove(index);
+        item.steer = true;
+        self.items.insert(0, item);
+        true
+    }
+
+    /// Whether the running reply should be stopped for a steered message.
+    pub fn wants_interrupt(&self) -> bool {
+        self.items
+            .first()
+            .is_some_and(|item| item.steer && self.editing != Some(item.id))
+    }
+
+    /// The next message to send now: none while a reply runs, and none while
+    /// the front message is held by an edit.
+    pub fn take_next(&mut self, run_active: bool) -> Option<QueuedMessage> {
+        let front = self.items.first()?;
+        if run_active || self.editing == Some(front.id) {
+            return None;
+        }
+        Some(self.items.remove(0))
+    }
+}
+
+/// Queues by conversation id, kept while the app runs like the drafts.
+#[derive(Debug, Default)]
+pub struct Queues {
+    by_conversation: HashMap<String, SendQueue>,
+}
+
+impl Queues {
+    /// Put a conversation's queue away (empty queues are not kept).
+    pub fn stash(&mut self, conversation: &str, queue: SendQueue) {
+        if queue.is_empty() {
+            self.by_conversation.remove(conversation);
+        } else {
+            self.by_conversation.insert(conversation.to_owned(), queue);
+        }
+    }
+
+    /// Take a conversation's queue back.
+    pub fn restore(&mut self, conversation: &str) -> SendQueue {
+        self.by_conversation
+            .remove(conversation)
+            .unwrap_or_default()
+    }
+
+    /// Conversations with something waiting (not the open one).
+    pub fn waiting(&self) -> Vec<&str> {
+        self.by_conversation.keys().map(String::as_str).collect()
+    }
+}
+
+/// A message after delegate routing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Routed {
+    /// The bot that answers, when a leading mention picked one.
+    pub target: Option<String>,
+    pub text: String,
+}
+
+/// `@analyst summarize this` goes to `analyst` as `summarize this`. Only a
+/// leading mention of a known bot other than the current one routes; in a
+/// room the server reads mentions itself, so the text goes through as typed.
+pub fn route_mention(text: &str, bots: &[String], current: Option<&str>, room: bool) -> Routed {
+    let plain = Routed {
+        target: None,
+        text: text.to_owned(),
+    };
+    if room {
+        return plain;
+    }
+    let trimmed = text.trim_start();
+    let Some(rest) = trimmed.strip_prefix('@') else {
+        return plain;
+    };
+    let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let (token, body) = rest.split_at(token_end);
+    let body = body.trim();
+    if body.is_empty()
+        || !crate::valid_speaker(token)
+        || Some(token) == current
+        || !bots.iter().any(|bot| bot == token)
+    {
+        return plain;
+    }
+    Routed {
+        target: Some(token.to_owned()),
+        text: body.to_owned(),
+    }
+}
+
+/// One row of the shortcuts sheet: group, keys, what it does.
+pub type ShortcutRow = (&'static str, &'static str, &'static str);
+
+/// The keys the chat answers to, matching the owner's Enter setting.
+pub fn shortcut_rows(enter_sends_pref: bool) -> Vec<ShortcutRow> {
+    let (send, newline) = if enter_sends_pref {
+        ("Enter", "Shift+Enter")
+    } else {
+        ("Ctrl+Enter", "Enter")
+    };
+    vec![
+        ("Writing", send, "Send the message"),
+        ("Writing", newline, "Add a line"),
+        (
+            "Writing",
+            send,
+            "While a reply is running: add the message to the queue",
+        ),
+        ("Writing", "Up", "Bring back your last message (empty box)"),
+        ("Writing", "/", "Commands, skills and tools"),
+        ("Writing", "@", "Mention a bot: it answers that message"),
+        ("Runs", "Esc", "Stop the reply that is running"),
+        ("Runs", "Ctrl+/", "Back to the message box"),
+        ("Chat", "Ctrl+F", "Search this conversation"),
+        ("Chat", "Ctrl+End", "Jump to the latest message"),
+        ("Chat", "F1", "Show this list"),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1018,5 +1295,154 @@ mod tests {
         let title = task_title_from_message(long);
         assert!(title.chars().count() <= 100);
         assert!(title.ends_with('\u{2026}'));
+    }
+
+    fn queue_of(texts: &[&str]) -> (SendQueue, Vec<u64>) {
+        let mut queue = SendQueue::default();
+        let ids = texts
+            .iter()
+            .map(|text| queue.push(text, None).unwrap())
+            .collect();
+        (queue, ids)
+    }
+
+    fn texts(queue: &SendQueue) -> Vec<&str> {
+        queue.items().iter().map(|m| m.text.as_str()).collect()
+    }
+
+    #[test]
+    fn the_queue_refuses_blank_long_and_too_many() {
+        let mut queue = SendQueue::default();
+        assert_eq!(queue.push("  ", None), Err(QueueRefusal::Empty));
+        assert_eq!(
+            queue.push(&"x".repeat(MAX_TEXT_CHARS + 1), None),
+            Err(QueueRefusal::TooLong)
+        );
+        for i in 0..MAX_QUEUED {
+            queue.push(&format!("m{i}"), None).unwrap();
+        }
+        assert_eq!(queue.push("one more", None), Err(QueueRefusal::Full));
+        assert_eq!(queue.len(), MAX_QUEUED);
+    }
+
+    #[test]
+    fn queued_messages_go_out_in_order_and_only_when_idle() {
+        let (mut queue, _) = queue_of(&["first", "second"]);
+        assert!(queue.take_next(true).is_none(), "a reply is running");
+        assert_eq!(queue.take_next(false).unwrap().text, "first");
+        assert_eq!(queue.take_next(false).unwrap().text, "second");
+        assert!(queue.take_next(false).is_none());
+    }
+
+    #[test]
+    fn reorder_moves_one_step_and_stops_at_the_ends() {
+        let (mut queue, ids) = queue_of(&["a", "b", "c"]);
+        assert!(!queue.move_up(ids[0]));
+        assert!(queue.move_up(ids[2]));
+        assert_eq!(texts(&queue), ["a", "c", "b"]);
+        assert!(queue.move_down(ids[0]));
+        assert_eq!(texts(&queue), ["c", "a", "b"]);
+        assert!(!queue.move_down(ids[1]));
+        assert!(!queue.move_up(999));
+    }
+
+    #[test]
+    fn an_edit_holds_the_front_message_until_it_is_saved() {
+        let (mut queue, ids) = queue_of(&["draft one", "draft two"]);
+        assert_eq!(queue.begin_edit(ids[0]).as_deref(), Some("draft one"));
+        assert_eq!(queue.editing(), Some(ids[0]));
+        assert!(queue.take_next(false).is_none(), "held while editing");
+        // A blank save is refused and the hold stays.
+        assert_eq!(queue.commit_edit(ids[0], " "), Err(QueueRefusal::Empty));
+        assert_eq!(queue.editing(), Some(ids[0]));
+        queue.commit_edit(ids[0], "  better  ").unwrap();
+        assert_eq!(queue.editing(), None);
+        assert_eq!(queue.take_next(false).unwrap().text, "better");
+    }
+
+    #[test]
+    fn editing_a_later_message_does_not_hold_the_front() {
+        let (mut queue, ids) = queue_of(&["one", "two"]);
+        queue.begin_edit(ids[1]);
+        assert_eq!(queue.take_next(false).unwrap().text, "one");
+        // Cancelling lets the rest go; deleting the edited message does too.
+        queue.cancel_edit();
+        assert_eq!(queue.editing(), None);
+        queue.begin_edit(ids[1]);
+        assert!(queue.remove(ids[1]));
+        assert_eq!(queue.editing(), None);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn steer_moves_a_message_to_the_front_and_asks_to_interrupt() {
+        let (mut queue, ids) = queue_of(&["a", "b", "c"]);
+        assert!(!queue.wants_interrupt());
+        assert!(queue.steer(ids[2]));
+        assert_eq!(texts(&queue), ["c", "a", "b"]);
+        assert!(queue.wants_interrupt());
+        // Still held while a reply runs; sent once it is stopped.
+        assert!(queue.take_next(true).is_none());
+        let sent = queue.take_next(false).unwrap();
+        assert!(sent.steer);
+        assert!(!queue.wants_interrupt());
+        // A message under edit cannot be steered.
+        queue.begin_edit(ids[1]);
+        assert!(!queue.steer(ids[1]));
+    }
+
+    #[test]
+    fn queues_follow_their_conversation() {
+        let mut queues = Queues::default();
+        let (queue, _) = queue_of(&["later"]);
+        queues.stash("dir:main", queue);
+        queues.stash("dir:other", SendQueue::default());
+        assert_eq!(queues.waiting(), vec!["dir:main"]);
+        assert!(queues.restore("dir:other").is_empty());
+        assert_eq!(queues.restore("dir:main").len(), 1);
+        assert!(queues.restore("dir:main").is_empty(), "taken once");
+    }
+
+    #[test]
+    fn a_leading_mention_routes_to_a_known_delegate() {
+        let bots = vec!["analyst".to_owned(), "maker".to_owned(), "main".to_owned()];
+        let routed = route_mention("@analyst  summarize the notes", &bots, Some("main"), false);
+        assert_eq!(routed.target.as_deref(), Some("analyst"));
+        assert_eq!(routed.text, "summarize the notes");
+        // Unknown bot, the current bot, a bare mention, a mid-text mention and
+        // a look-alike address all stay as typed.
+        for text in [
+            "@ghost hello",
+            "@main hello",
+            "@analyst",
+            "hello @analyst",
+            "@Analyst hello",
+            "@analyst.evil hello",
+        ] {
+            let routed = route_mention(text, &bots, Some("main"), false);
+            assert_eq!(routed.target, None, "{text}");
+            assert_eq!(routed.text, text);
+        }
+        // In a room the server parses mentions itself.
+        let room = route_mention("@analyst hello", &bots, Some("main"), true);
+        assert_eq!(room.target, None);
+        assert_eq!(room.text, "@analyst hello");
+    }
+
+    #[test]
+    fn the_shortcut_sheet_follows_the_enter_setting() {
+        let enter = shortcut_rows(true);
+        assert!(
+            enter
+                .iter()
+                .any(|r| r.1 == "Shift+Enter" && r.2 == "Add a line")
+        );
+        let ctrl = shortcut_rows(false);
+        assert!(
+            ctrl.iter()
+                .any(|r| r.1 == "Ctrl+Enter" && r.2 == "Send the message")
+        );
+        assert!(ctrl.iter().any(|r| r.1 == "Esc"));
+        assert!(ctrl.iter().any(|r| r.1 == "F1"));
     }
 }

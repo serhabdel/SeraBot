@@ -264,6 +264,42 @@ pub fn insert_index(messages: &[String], card_created_at: &str) -> usize {
     messages.partition_point(|at| at.as_str() <= card_created_at)
 }
 
+// ---- Wait and compaction rows (v0.50) ----
+
+/// The waiting-model banner line, only while the main turn is still parked:
+/// a finished, failed or stopped turn never shows a stale countdown.
+pub fn wait_banner(
+    status: Option<crate::TaskStatus>,
+    waiting: Option<&crate::runs::Waiting>,
+    now_secs: i64,
+) -> Option<String> {
+    let status = status?;
+    if status.terminal() {
+        return None;
+    }
+    match waiting {
+        Some(waiting) => Some(crate::runs::waiting_line(waiting, now_secs)),
+        // Parked, but the park event came before this view: no countdown.
+        None if status == crate::TaskStatus::WaitingModel => {
+            Some("Waiting for a model.".to_owned())
+        }
+        None => None,
+    }
+}
+
+/// Compaction rows placed like resolved cards: slot `i` comes before message
+/// `i`, and the last slot trails the transcript.
+pub fn place_compactions(
+    message_times: &[String],
+    rows: &[crate::runs::CompactionRow],
+) -> Vec<Vec<crate::runs::CompactionRow>> {
+    let mut placed = vec![Vec::new(); message_times.len() + 1];
+    for row in rows {
+        placed[insert_index(message_times, &row.at)].push(row.clone());
+    }
+    placed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,5 +496,48 @@ mod tests {
         // Newer than everything: trails the transcript.
         assert_eq!(insert_index(&messages, "2026-11-08T11:00:00.000Z"), 3);
         assert_eq!(insert_index(&[], "2026-11-08T10:00:00.000Z"), 0);
+    }
+
+    #[test]
+    fn the_wait_banner_shows_only_while_the_turn_is_parked() {
+        use crate::TaskStatus;
+        use crate::runs::{Waiting, countdown};
+        let waiting = Waiting {
+            task_id: "t".into(),
+            until: "2026-11-16T10:04:07Z".into(),
+        };
+        let until = crate::workflows::epoch_secs(&waiting.until).unwrap();
+        let line =
+            wait_banner(Some(TaskStatus::WaitingModel), Some(&waiting), until - 247).unwrap();
+        assert!(line.contains(&countdown(247)));
+        assert!(wait_banner(Some(TaskStatus::Failed), Some(&waiting), until).is_none());
+        assert!(wait_banner(Some(TaskStatus::Cancelled), Some(&waiting), until).is_none());
+        assert!(wait_banner(None, Some(&waiting), until).is_none());
+        assert_eq!(
+            wait_banner(Some(TaskStatus::WaitingModel), None, until).as_deref(),
+            Some("Waiting for a model.")
+        );
+        assert!(wait_banner(Some(TaskStatus::Running), None, until).is_none());
+    }
+
+    #[test]
+    fn compaction_rows_sit_before_the_first_later_message() {
+        let times = vec![
+            "2026-11-16T10:00:00Z".to_owned(),
+            "2026-11-16T10:10:00Z".to_owned(),
+        ];
+        let row = |at: &str| crate::runs::CompactionRow {
+            task_id: "t".into(),
+            text: "Earlier messages were summarized.".into(),
+            at: at.into(),
+        };
+        let placed = place_compactions(
+            &times,
+            &[row("2026-11-16T10:05:00Z"), row("2026-11-16T11:00:00Z")],
+        );
+        assert_eq!(placed.len(), 3);
+        assert!(placed[0].is_empty());
+        assert_eq!(placed[1].len(), 1);
+        assert_eq!(placed[2].len(), 1);
     }
 }

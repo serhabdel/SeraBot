@@ -73,7 +73,11 @@ impl Runtime {
                 }
                 permit = self.semaphore.clone().acquire_owned() => {
                     let permit = match permit { Ok(permit) => permit, Err(_) => break };
-                    match self.store.claim_task(&self.worker_id, self.config.runtime.task_lease_secs) {
+                    let limits = crate::store::ClaimLimits {
+                        max_turns_per_user: self.config.runtime.max_turns_per_user,
+                        max_active_children: self.config.runtime.max_active_children,
+                    };
+                    match self.store.claim_task_with(&self.worker_id, self.config.runtime.task_lease_secs, limits) {
                         Ok(Some(task)) => {
                             let runtime = self.clone();
                             tokio::spawn(async move {
@@ -168,6 +172,17 @@ impl Runtime {
             warn!(task = %id, "timed-out task was no longer held under this claim");
             return;
         }
+        let reported = match self.store.get_task(user, id) {
+            Ok(task) => self.on_task_failed(
+                &task,
+                &SeraError::Rejected {
+                    code: "timed_out",
+                    message: reason.into(),
+                },
+            ),
+            Err(_) => false,
+        };
+        let conversation = conversation.filter(|_| !reported);
         if let Some(conversation) = conversation {
             let _ = self
                 .notifier
@@ -245,6 +260,18 @@ impl Runtime {
                     warn!(task = %task.id, "task completion rejected by fencing token");
                 }
             }
+            Ok(TurnOutcome::Waiting { until }) => {
+                // Release the lease; the turn resumes from its stored state
+                // when the worker claims the task again at `until`.
+                if !self.store.park_task_waiting_model(
+                    &user,
+                    &task.id,
+                    task.fencing_token,
+                    until,
+                )? {
+                    warn!(task = %task.id, "task could not be parked: no longer held under this claim");
+                }
+            }
             Ok(TurnOutcome::Suspended) => {
                 self.store.record_audit(
                     &user,
@@ -295,9 +322,12 @@ impl Runtime {
                         self.config.runtime.task_lease_secs.max(5),
                     )?;
                 }
+                // A subagent that failed for good is reported to main, which
+                // answers the owner; the generic notice would only repeat it.
+                let reported = self.on_task_failed(&task, &error);
                 let payload: Option<TurnPayload> =
                     serde_json::from_value(task.payload.clone()).ok();
-                if let Some(payload) = payload {
+                if let Some(payload) = payload.filter(|_| !reported) {
                     let _ = self
                         .notifier
                         .send_text(

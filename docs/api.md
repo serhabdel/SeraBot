@@ -520,7 +520,10 @@ approvals cancel suspended tasks.
 
 Event kinds include `message`, `approval`, `task.queued`, `turn.completed`,
 `turn.step`, `help.queued`, `memory.added`, `memory.deleted`,
-`approval.grants_revoked`, `model.selected`, and `model.used`. Client code
+`approval.grants_revoked`, `model.selected`, `model.used`, and the 0.50
+orchestration kinds `handoff.started|completed|failed`, `model.failover`,
+`provider.hold_set|cleared` and `task.waiting_model` (see
+[Events](events.md)). Client code
 should treat unknown event kinds as informational.
 
 `turn.step` is the live tool card. Phases are `running`, `progress`,
@@ -533,6 +536,27 @@ page fields are documented in [Console pages](console-pages.md).
 `POST /v1/connectors/{id}/test` checks a connection for the signed-in user.
 `POST /v1/providers/{id}/test` checks a model provider. `GET /v1/memories`
 accepts `category` and `pinned`. `PATCH /v1/memories/{id}` accepts `pinned`.
+
+## Subagent handoffs (0.50)
+
+- `GET /v1/handoffs?conversation_id=` lists the session user's subagent
+  handoffs, newest first: `id`, `to_bot`, `status` (`queued`, `running`,
+  `completed`, `failed_resumable`, `failed`, `resumed`), `outcome_code`,
+  `effects_unknown`, `resume_count`, `route` and `conversation_id`. Another
+  user's handoffs are never listed.
+- `POST /v1/handoffs/{id}/retry` is the owner's action to run a failed
+  subagent again: `{"route_override": {"provider","model","account?","thinking?"},
+  "confirm_effects_unknown": false}`. The override is checked against the live
+  catalog and the provider's egress approval. A handoff whose earlier attempt
+  may have had an effect with an unknown outcome is refused unless the owner
+  sets `confirm_effects_unknown`. Another user's id is a 404.
+- `POST /v1/handoffs/{id}/cancel` is the per-run Stop: a queued child is
+  cancelled, a running one ends at its next checkpoint. The reply is
+  `{handoff_id, cancelled, stopping}`. A finished handoff is refused; another
+  user's id is a 404.
+
+Handoff and resume turns count against `[users] child_daily_limit` (default
+500 per user per UTC day), separately from `tasks_per_user_per_day`.
 
 ## Polling guidance
 

@@ -205,6 +205,126 @@ impl SseParser {
     }
 }
 
+/// One frame of the UI: 60 per second at most. The coalescer never hands out
+/// frames closer together than this, so a burst of events costs at most 60
+/// state writes a second however many children report.
+pub const FRAME: Duration = Duration::from_micros(16_667);
+/// Children whose counters are kept; the oldest is forgotten past this.
+const MAX_CHILDREN: usize = 64;
+
+/// What one subagent (child task) did since its counters were last read.
+/// Progress is reduced to numbers: the UI shows "step 7" and a spinner, not a
+/// row per event, so 50 children cost 50 counters, not 50 event streams.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubagentProgress {
+    /// Progress events folded in.
+    pub events: u32,
+    /// Of those, steps that finished.
+    pub steps_done: u32,
+    /// Newest event id folded in.
+    pub last_event_id: i64,
+}
+
+/// Events gathered for one frame.
+#[derive(Debug, Default, PartialEq)]
+pub struct EventFrame {
+    /// Events the UI must see one by one, in order: `(id, kind, payload)`.
+    pub events: Vec<(i64, String, Value)>,
+    /// Folded child progress, by child task id.
+    pub progress: Vec<(String, SubagentProgress)>,
+}
+
+/// Batches stream events into [`FRAME`]-sized frames and folds per-subagent
+/// progress into counters.
+#[derive(Debug, Default)]
+pub struct FrameCoalescer {
+    events: Vec<(i64, String, Value)>,
+    progress: std::collections::BTreeMap<String, SubagentProgress>,
+    children: std::collections::VecDeque<String>,
+    last_frame: Option<Instant>,
+}
+
+/// The child task id of a progress event, if `kind` is one. `known` tells
+/// whether a task id was already seen as a child.
+fn progress_child(kind: &str, payload: &Value, known: impl Fn(&str) -> bool) -> Option<String> {
+    let text = |key: &str| {
+        payload
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    match kind {
+        "handoff.queued" | "handoff.started" | "handoff.resumed" => text("child_task_id"),
+        "turn.step" => {
+            let task = text("task_id")?;
+            (payload.get("parent_task_id").is_some() || known(&task)).then_some(task)
+        }
+        _ => None,
+    }
+}
+
+impl FrameCoalescer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Takes one stream event. Child progress becomes a counter; anything else
+    /// waits for the next frame unchanged.
+    pub fn push(&mut self, id: i64, kind: String, payload: Value) {
+        let child = progress_child(&kind, &payload, |task| {
+            self.children.iter().any(|c| c == task)
+        });
+        let Some(child) = child else {
+            self.events.push((id, kind, payload));
+            return;
+        };
+        if !self.children.iter().any(|known| *known == child) {
+            if self.children.len() >= MAX_CHILDREN
+                && let Some(oldest) = self.children.pop_front()
+            {
+                self.progress.remove(&oldest);
+            }
+            self.children.push_back(child.clone());
+        }
+        let counter = self.progress.entry(child).or_default();
+        counter.events = counter.events.saturating_add(1);
+        if kind == "turn.step" && payload.get("phase").and_then(Value::as_str) == Some("done") {
+            counter.steps_done = counter.steps_done.saturating_add(1);
+        }
+        counter.last_event_id = counter.last_event_id.max(id);
+    }
+
+    /// Whether anything waits for a frame.
+    pub fn is_pending(&self) -> bool {
+        !self.events.is_empty() || !self.progress.is_empty()
+    }
+
+    /// The next frame, if something waits and a frame length passed since the
+    /// last one. Counters are drained: each frame carries what is new.
+    pub fn take_frame(&mut self, now: Instant) -> Option<EventFrame> {
+        if !self.is_pending() {
+            return None;
+        }
+        if self
+            .last_frame
+            .is_some_and(|last| now.saturating_duration_since(last) < FRAME)
+        {
+            return None;
+        }
+        self.last_frame = Some(now);
+        Some(EventFrame {
+            events: std::mem::take(&mut self.events),
+            progress: std::mem::take(&mut self.progress).into_iter().collect(),
+        })
+    }
+
+    /// Drops everything waiting (stream replaced or session cleared).
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 enum StreamEnd {
     Disconnected,
     Unauthorized,
@@ -485,6 +605,71 @@ impl Utf8Decoder {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn frames_are_batched_and_child_progress_folds_into_counters() {
+        let mut co = FrameCoalescer::new();
+        let t0 = Instant::now();
+        co.push(
+            1,
+            "handoff.started".into(),
+            serde_json::json!({"child_task_id": "k1"}),
+        );
+        co.push(
+            2,
+            "turn.step".into(),
+            serde_json::json!({"task_id": "k1", "phase": "done"}),
+        );
+        co.push(
+            3,
+            "turn.completed".into(),
+            serde_json::json!({"task_id": "p"}),
+        );
+        let frame = co.take_frame(t0).expect("first frame is immediate");
+        assert_eq!(
+            frame.events.len(),
+            1,
+            "only the non-progress event stays an event"
+        );
+        assert_eq!(frame.progress.len(), 1);
+        assert_eq!(frame.progress[0].1.events, 2);
+        assert_eq!(frame.progress[0].1.steps_done, 1);
+        // A second burst inside the frame length waits.
+        co.push(4, "task.updated".into(), serde_json::json!({}));
+        assert!(co.take_frame(t0 + Duration::from_millis(5)).is_none());
+        assert!(co.take_frame(t0 + FRAME).is_some());
+        assert!(
+            co.take_frame(t0 + FRAME * 3).is_none(),
+            "nothing pending, no frame"
+        );
+    }
+
+    #[test]
+    fn a_parents_own_steps_are_not_folded() {
+        let mut co = FrameCoalescer::new();
+        co.push(
+            1,
+            "turn.step".into(),
+            serde_json::json!({"task_id": "p", "phase": "running"}),
+        );
+        let frame = co.take_frame(Instant::now()).unwrap();
+        assert_eq!(frame.events.len(), 1);
+        assert!(frame.progress.is_empty());
+    }
+
+    #[test]
+    fn child_counters_are_bounded() {
+        let mut co = FrameCoalescer::new();
+        for n in 0..(MAX_CHILDREN as i64 + 20) {
+            co.push(
+                n,
+                "handoff.started".into(),
+                serde_json::json!({"child_task_id": format!("k{n}")}),
+            );
+        }
+        let frame = co.take_frame(Instant::now()).unwrap();
+        assert!(frame.progress.len() <= MAX_CHILDREN);
+    }
+
     use super::*;
     use std::{
         io::{Read, Write},

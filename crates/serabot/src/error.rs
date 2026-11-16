@@ -54,6 +54,12 @@ pub enum SeraError {
     Secrets(String),
     #[error("internal error: {0}")]
     Internal(String),
+    /// No model route can take the call until `until` (every candidate is on
+    /// hold). The turn parks in `waiting_model` instead of failing.
+    #[error("waiting for a model route until {until}")]
+    ModelWaiting {
+        until: chrono::DateTime<chrono::Utc>,
+    },
 }
 
 impl SeraError {

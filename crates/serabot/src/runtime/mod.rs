@@ -49,7 +49,9 @@ use crate::teams::{
 };
 use crate::util::truncate_chars;
 
-mod activity;
+pub(crate) mod activity;
+mod auto_resume;
+mod compaction;
 use activity::StepPhase;
 mod extract;
 mod failover;
@@ -109,6 +111,10 @@ pub struct ResumePayload {
     pub turn_id: String,
     pub action_id: String,
     pub decision: String,
+    /// Set by "Continue after limit": the turn ended at a tool limit, has no
+    /// pending approval, and carries on with a fresh tool budget.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub continue_after_limit: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +169,12 @@ struct TurnState {
     /// the `model.used` audit row).
     #[serde(default)]
     history_messages: usize,
+    /// Context compactions this turn has used (at most `MAX_COMPACTIONS`).
+    #[serde(default)]
+    compactions: u8,
+    /// Seconds this turn has spent parked in `waiting_model`.
+    #[serde(default)]
+    waited_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,6 +207,11 @@ pub struct Runtime {
 enum TurnOutcome {
     Completed,
     Suspended,
+    /// No model route is ready: the task parks until `until`, and the turn
+    /// resumes from its stored state.
+    Waiting {
+        until: chrono::DateTime<Utc>,
+    },
 }
 
 impl Runtime {
@@ -279,6 +296,19 @@ impl Runtime {
     pub fn request_stop(&self, user_id: &str, conversation_id: &str) -> Result<usize> {
         validate_conversation_id(conversation_id)?;
         let turn_ids = self.store.running_turn_ids(user_id, conversation_id)?;
+        let mut marks = self
+            .stop_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        marks.extend(turn_ids.iter().cloned());
+        Ok(turn_ids.len())
+    }
+
+    /// Ask the acting user's running turn of one task (a subagent's child)
+    /// to stop, with the same checkpoint rules as `request_stop`. Returns how
+    /// many turns were marked.
+    pub fn request_stop_task(&self, user_id: &str, task_id: &str) -> Result<usize> {
+        let turn_ids = self.store.running_turn_ids_for_task(user_id, task_id)?;
         let mut marks = self
             .stop_requests
             .lock()

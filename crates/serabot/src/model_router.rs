@@ -238,7 +238,16 @@ pub struct ModelRouter {
     /// `Some` means credentials are resolved per acting user; `None` means
     /// every provider was built with an explicit client (tests).
     credentials: Option<Arc<dyn ProviderCredentials>>,
+    /// Most model calls in flight on one `(user, provider, account)`.
+    max_inflight_per_account: usize,
+    /// One semaphore per `(user, provider, account)`, created on first use. The
+    /// user is part of the key: accounts are per user, and two users' calls on
+    /// the same provider must never queue behind each other.
+    inflight: Arc<Mutex<BTreeMap<String, Arc<tokio::sync::Semaphore>>>>,
 }
+
+/// Default for `runtime.max_inflight_per_account`.
+pub const DEFAULT_MAX_INFLIGHT_PER_ACCOUNT: usize = 3;
 
 impl std::fmt::Debug for ModelRouter {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -401,7 +410,37 @@ impl ModelRouter {
             default_model: config.model.clone(),
             classes,
             credentials,
+            max_inflight_per_account: DEFAULT_MAX_INFLIGHT_PER_ACCOUNT,
+            inflight: Arc::new(Mutex::new(BTreeMap::new())),
         })
+    }
+
+    /// Cap the model calls in flight per `(user, provider, account)`. Call it
+    /// before the router is cloned: clones made earlier keep their own cap.
+    pub fn with_max_inflight_per_account(mut self, limit: usize) -> Self {
+        self.max_inflight_per_account = limit.max(1);
+        self
+    }
+
+    /// The semaphore guarding one account's model calls.
+    fn inflight_gate(
+        &self,
+        user_id: &str,
+        selection: &ModelSelection,
+    ) -> Arc<tokio::sync::Semaphore> {
+        let key = format!(
+            "{user_id}\u{1}{}\u{1}{}",
+            selection.provider,
+            selection.account.as_deref().unwrap_or("")
+        );
+        let mut gates = self
+            .inflight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        gates
+            .entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(self.max_inflight_per_account)))
+            .clone()
     }
 
     pub(crate) fn add_default_model(&mut self, model: &str) -> Result<()> {
@@ -1162,8 +1201,19 @@ impl ModelRouter {
                 level,
             )
         });
-        provider
-            .client_for_account(&selection.provider, user_id, selection.account.as_deref())?
+        let client = provider.client_for_account(
+            &selection.provider,
+            user_id,
+            selection.account.as_deref(),
+        )?;
+        // Held for the whole call, so a fan-out of subagents on one account
+        // queues here instead of tripping the provider's rate limit.
+        let _permit = self
+            .inflight_gate(user_id, selection)
+            .acquire_owned()
+            .await
+            .map_err(|_| SeraError::InvalidState("model gate closed".into()))?;
+        client
             .complete_with(
                 messages,
                 tools,
@@ -2986,5 +3036,101 @@ mod live_catalog_tests {
         router
             .validate_selection(USER, &live("mistral-large-latest"))
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod inflight_tests {
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn router(server: &MockServer, limit: usize) -> ModelRouter {
+        let config = LlmConfig {
+            base_url: server.uri(),
+            model: "test".into(),
+            data_egress_approved: true,
+            ..LlmConfig::default()
+        };
+        let clients = BTreeMap::from([(
+            "default".into(),
+            LlmClient::new(server.uri(), "synthetic-key", 5, 100)
+                .unwrap()
+                .with_model("test"),
+        )]);
+        ModelRouter::new(&config, clients)
+            .unwrap()
+            .with_max_inflight_per_account(limit)
+    }
+
+    fn selection(account: Option<&str>) -> ModelSelection {
+        ModelSelection {
+            provider: "default".into(),
+            model: "test".into(),
+            account: account.map(str::to_owned),
+        }
+    }
+
+    #[tokio::test]
+    async fn each_user_and_account_has_its_own_gate() {
+        let server = MockServer::start().await;
+        let router = router(&server, 2).await;
+        let a = router.inflight_gate("user-a", &selection(None));
+        // The same key shares one gate, across router clones too.
+        assert!(Arc::ptr_eq(
+            &a,
+            &router.clone().inflight_gate("user-a", &selection(None))
+        ));
+        assert_eq!(a.available_permits(), 2);
+        let held = a.clone().acquire_many_owned(2).await.unwrap();
+        // User B and another account of user A are not behind A's calls.
+        let b = router.inflight_gate("user-b", &selection(None));
+        let other_account = router.inflight_gate("user-a", &selection(Some("acct2")));
+        assert!(!Arc::ptr_eq(&a, &b) && !Arc::ptr_eq(&a, &other_account));
+        assert_eq!(b.available_permits(), 2);
+        assert_eq!(other_account.available_permits(), 2);
+        assert_eq!(a.available_permits(), 0);
+        drop(held);
+        assert_eq!(a.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_call_waits_for_its_accounts_gate_and_not_for_another_users() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]
+            })))
+            .mount(&server)
+            .await;
+        let router = router(&server, 1).await;
+        let held = router
+            .inflight_gate("user-a", &selection(None))
+            .acquire_owned()
+            .await
+            .unwrap();
+        let call = |router: ModelRouter, user: &'static str| async move {
+            router
+                .complete_on(
+                    user,
+                    &selection(None),
+                    &[LlmMessage::user("synthetic")],
+                    &[],
+                    None,
+                    None,
+                )
+                .await
+        };
+        // User B is not held up by user A's busy account.
+        call(router.clone(), "user-b").await.unwrap();
+        // User A's call queues behind the held permit: nothing reaches the server.
+        let waiting = tokio::spawn(call(router.clone(), "user-a"));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!waiting.is_finished());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        drop(held);
+        waiting.await.unwrap().unwrap();
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 }

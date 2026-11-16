@@ -382,6 +382,7 @@ impl Runtime {
             turn_id: turn.id.clone(),
             action_id: result.action.id.clone(),
             decision: decision_label.into(),
+            continue_after_limit: false,
         };
         // A resume continues the turn that already consumed a quota slot at
         // submit time; it is not a new user request and is not re-counted.

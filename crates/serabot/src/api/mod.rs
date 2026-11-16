@@ -62,6 +62,7 @@ mod composio;
 mod connectors;
 mod conversations;
 mod files;
+mod handoffs;
 mod jobs;
 mod local;
 mod logs;
@@ -96,6 +97,7 @@ use cards::*;
 use composio::*;
 use connectors::*;
 use conversations::*;
+use handoffs::*;
 use jobs::*;
 use logs::*;
 use marketplace::*;
@@ -456,6 +458,9 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/v1/bots/{id}/route", put(update_bot_route))
         .route("/v1/route-events", get(list_route_events))
+        .route("/v1/handoffs", get(list_handoffs))
+        .route("/v1/handoffs/{id}/retry", post(retry_handoff))
+        .route("/v1/handoffs/{id}/cancel", post(cancel_handoff))
         .route("/v1/skills", get(list_skills).post(create_skill_pack))
         .route(
             "/v1/conversations",
@@ -660,6 +665,10 @@ pub fn router(state: ApiState) -> Router {
             )),
         )
         .route("/v1/conversations/{id}/cancel", post(cancel_conversation))
+        .route(
+            "/v1/conversations/{id}/continue",
+            post(continue_conversation),
+        )
         .route(
             "/v1/conversations/{id}/auto-approve",
             get(get_auto_approve).put(set_auto_approve),

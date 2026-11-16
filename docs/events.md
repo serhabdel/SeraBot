@@ -74,3 +74,22 @@ refusal ("I can't help", "I'm unable to", "I don't have access to", and a few
 similar phrases). It never changes or blocks the reply. The payload carries
 `bot`, `turn_id`, `conversation_id`, the matched `phrase`, and a `snippet` of at
 most 160 characters. Clients can ignore it.
+
+## Orchestration events (0.50)
+
+These ride the same `GET /v1/events` stream. Every payload is small and carries
+ids and short codes only (no objective, reply or provider text), so a client can
+coalesce a burst into one refresh and look the rest up by id.
+
+| Event | Payload |
+|---|---|
+| `handoff.started` | `handoff_id`, `child_task_id`, `parent_task_id`, `to_bot`, `conversation_id` |
+| `handoff.completed` | same as `handoff.started` |
+| `handoff.failed` | the same ids plus `status` (`failed_resumable` or `failed`), `outcome_code`, `effects_unknown`, `resume_count` |
+| `model.failover` | `conversation_id`, `task_id`, `bot`, `from` and `to` (`provider`, `model`, `account`), `reason` |
+| `provider.hold_set` | `provider`, `account_id`, `model`, `kind`, `until` |
+| `provider.hold_cleared` | `provider`, `account_id`, and `model`/`kind` when a hold expired |
+| `task.waiting_model` | `task_id`, `turn_id`, `conversation_id`, `until` |
+
+`handoff.queued` and `handoff.resumed` are unchanged. `route_switched` is still
+emitted next to `model.failover`.

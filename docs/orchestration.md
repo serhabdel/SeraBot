@@ -1,8 +1,10 @@
 # Orchestration
 
-SeraBot is a single-operator pipeline: one orchestrator bot delegates bounded work
-to specialists. There is no free-form agent-to-agent chat and no multi-user auth.
-A plugin catalog exists (`docs/marketplace.md`); nothing in a room calls a plugin.
+SeraBot is a small-circle, invitation-only pipeline: one orchestrator bot per
+member delegates bounded work to specialists. Everything below is scoped to the
+acting user's id (bots, handoffs, tasks, holds, approvals). There is no
+free-form agent-to-agent chat. Installed `http` MCP plugins expose per-user
+`plugin.<slug>.<tool>` tools (`docs/marketplace.md`) under the usual approvals.
 A room may carry a **team** of 1–5 bots: they answer the
 owner together and may ask each other one bounded question, but the exchange is
 capped, audited, and deterministic (see [Team rooms](#team-rooms)). Examples below
@@ -20,7 +22,9 @@ does not replace the allowlist or consent gates.
 owner traffic and may queue up to 16 audited handoffs per turn — several `delegate`
 calls in one round fan out to parallel specialist subagents (0.27). It does
 not receive specialist-only tools (maker, analyst, watcher pipelines stay on
-those bots). Every bot also gets web search, fetch, memory and `ask_user`.
+those bots). Since 0.50 it also holds the fleet management tools described in
+[Orchestrator management tools](#orchestrator-management-tools-050). Every bot
+also gets web search, fetch, memory and `ask_user`.
 A specialist that still lacks a tool calls `ask_teammate` (one hop) instead of
 refusing. `delegate` stays orchestrator-only.
 
@@ -101,7 +105,9 @@ Startup validation (`load_bots`):
 - Specialists with non-empty `delegates` are rejected.
 - Disabled bots (e.g. `legal`) cannot appear in `delegates`.
 
-Bots load at process start; changing fleet files requires restart.
+Bot definition files load at process start; a new bot file needs a restart.
+Edits to an existing bot row (route, fallbacks, enabled, delegates, profile) go
+through the single mutation path described below and do not need one.
 
 ## Bot creation
 
@@ -243,6 +249,88 @@ parent must **not** await the child inside `process_task` while holding that
 permit — that would deadlock when `max_concurrent_turns` is saturated. The
 delegate tool enqueues the child and ends the parent turn before the child runs.
 
+## Subagent failure, resume and fairness (0.50)
+
+- **Auto-resume.** When a subagent's route chain is exhausted (or it times out)
+  its handoff becomes `failed_resumable`, and main gets one synthetic follow-up
+  turn (`source = "handoff_followup"`) naming the subagent and stable reason
+  codes. The follow-up text is written by the server; no provider or specialist
+  text is copied into it. Main may call `subagent_retry`, at most twice per
+  handoff (`resume_count <= 2`). It refuses when `effects_unknown`. Every resume
+  is a `route_events` row (`reason = handoff_resume`). A follow-up chain stops
+  after three levels.
+- **Fairness.** `[runtime] max_concurrent_turns` is 1..=8 (code default 4;
+  the shipped `serabot.toml` pins 2). `claim_task` skips a user already at
+  `max_turns_per_user` running owner turns (default 2) or
+  `max_active_children` running subagent turns (default 4), prefers owner turns
+  over subagent turns at equal priority, and then takes the user with the fewest
+  running tasks first. `ModelRouter` holds a semaphore per
+  `(user, provider, account)` (`max_inflight_per_account`, default 3).
+- **Load fixture.** `scripts/load-fixture.sh` (or `.bat`) runs the real worker
+  loop with one user's 16 subagent turns and another user's single message. Run
+  it on the target host before relying on more than 2 workers there.
+
+## Orchestrator management tools (0.50)
+
+`main` (and only `main`, and only in a turn the owner started) can read and
+steer its own fleet. The tools live in `tools_bots.rs`; every change runs
+through `fleet_mutation::apply`, the same path as the owner's `PUT /v1/bots/{id}`
+and `/route`, so validation, the content-policy scan, catalog and egress checks
+and the `bot.profile_changed` audit row (with before and after values) are
+shared.
+
+| Tool | Kind | Notes |
+| --- | --- | --- |
+| `bot_list`, `bot_read`, `model_list`, `handoff_status` | read | `model_list` shows accounts as id, label and state only |
+| `bot_set_route`, `bot_set_enabled`, `bot_set_delegates` | change | always need the owner's approval; never a standing grant, never YOLO |
+| `subagent_retry` | resume | at most twice per handoff; approval only for a full `route_override` |
+
+Guards: the acting user comes from the tool context (a `user_id` argument is
+rejected); a bot-started change can never widen `tools`, `skills`,
+`require_approval`, the prompt, the role or cross-provider egress consent;
+`main`'s role and enabled state are never touched; targets are `main` (profile
+only) and its delegates, and must be idle (no running task, no approval
+pending). Handoff, team, help and routine turns never get these tools, so a
+specialist's output cannot steer the fleet.
+
+## Handoff ledger (0.50)
+
+Migration `0038_handoffs.sql` adds a ledger row per `delegate` call, written in
+the same transaction as the child task and keyed by an idempotent `key_hash`.
+Status moves `queued`, `running`, then `completed`, `failed_resumable`, `failed`
+or `resumed`. Each row carries `outcome_code`, `effects_unknown`,
+`resume_count` and the route used. `GET /v1/handoffs`,
+`POST /v1/handoffs/{id}/retry` and `/cancel` are documented in `api.md`.
+Handoff and resume turns count against `[users] child_daily_limit` (default 500
+per user per UTC day).
+
+## Waiting, compaction and review (0.50)
+
+- **Waiting for a model.** When every route in a chain is on hold the turn is
+  parked in `waiting_model` (lease released, attempt not counted) until the
+  earliest hold expires (5 s to 15 min, 6 h total cap), then resumes from its
+  stored state. `task.waiting_model` carries the `until` time.
+- **Context compaction.** A `ContextTooLong` refusal, or a prompt past about 75%
+  of the model window, folds older messages into one summary (at most two
+  compactions per turn); the system prompt, the latest owner request and the
+  recent steps stay verbatim, and the summary is marked as data. Trusted owner
+  turns also store a rolling summary row. `POST /v1/conversations/{id}/continue`
+  resumes a turn that stopped at a limit.
+- **Needs review.** The gateway flags a task before an approved external effect
+  dispatches and clears the flag once the outcome is stored. Lease recovery and
+  failure paths send a flagged task to `needs_review` instead of replaying it.
+  Unknown effect outcomes are never replayed blindly.
+
+## Desktop (0.50)
+
+The console draws a virtualized chat feed, batches stream events into frames of
+about 16 ms, and shows a runs sidebar (subagent tree with status chips, hold
+badge, per-run Stop and Retry), a composer queue (edit, steer, delete, reorder),
+`@bot` mentions that route to a delegate, a failed-turn card with reason chips
+and retry actions, a waiting-model banner and an inline compaction row. Motion
+there is transition-only and falls back to opacity under reduced motion. It has
+not been visually reviewed on a device (see `release-0.50.0.md`).
+
 ## Non-goals
 
 - Free-form agent-to-agent messaging (peer exchange inside a team room is
@@ -257,4 +345,5 @@ delegate tool enqueues the child and ends the parent turn before the child runs.
 ## Related documents
 
 - [Model routing](model-routing.md) — allowlist, consent, autoselect, classes
+- [Events](events.md), [Approvals](approvals.md), [API](api.md) — the 0.50 events, management-tool approvals and handoff routes
 - `AGENTS.md` — product boundary and security invariants
