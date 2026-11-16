@@ -2837,6 +2837,7 @@ mod tests {
                     id: "call-1".into(),
                     name: "echo".into(),
                     arguments: serde_json::json!({"text": "synthetic-secret-a"}),
+                    reasoning_signature: None,
                 }],
             ),
         ];
@@ -2900,6 +2901,7 @@ mod tests {
             name: None,
             tool_call_id: None,
             tool_calls: vec![],
+            is_error: false,
         }];
         let redacted = gateway.redact_messages(&admin, &messages).unwrap();
         let msg = redacted[0].content.as_deref().unwrap();

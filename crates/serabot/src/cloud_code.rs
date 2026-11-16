@@ -30,10 +30,18 @@ pub const CLOUD_CODE_USER_AGENT: &str =
 pub const CLOUD_CODE_API_CLIENT: &str = "google-cloud-sdk vscode/1.96.0";
 pub const THOUGHT_SIGNATURE_SENTINEL: &str = "skip_thought_signature_validator";
 
-const IDE_VERSION: &str = "2.25.0";
+/// The Antigravity Hub version the user agent and `ideVersion` carry when the
+/// provider sets no `client_version`.
+pub const IDE_VERSION: &str = "2.25.0";
 const CALLBACK_PATH: &str = "/oauth-callback";
 const PREFERRED_PORT: u16 = 51121;
 const SESSION_SPACE: u64 = 9_000_000_000_000_000_000;
+
+/// The two hosts project discovery asks, in order (daily, then prod).
+const DISCOVERY_HOSTS: &[&str] = &[
+    "daily-cloudcode-pa.googleapis.com",
+    "cloudcode-pa.googleapis.com",
+];
 
 pub const CLOUD_CODE_HOSTS: &[&str] = &[
     "daily-cloudcode-pa.googleapis.com",
@@ -52,15 +60,32 @@ pub struct CloudCodeToolCall {
     pub id: String,
     pub name: String,
     pub arguments: Value,
+    /// The `thoughtSignature` Google sent with this call, to replay with it.
+    pub signature: Option<String>,
 }
 
 pub struct CloudCodeCompletion {
     pub text: String,
+    /// Text of the `thought: true` parts: untrusted display data.
+    pub reasoning: String,
     pub tool_calls: Vec<CloudCodeToolCall>,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub finish_reason: Option<String>,
 }
+
+impl CloudCodeCompletion {
+    /// Google gave up on the model's tool call and returned nothing else. The
+    /// request is worth sending again.
+    pub fn is_malformed_call(&self) -> bool {
+        self.text.trim().is_empty()
+            && self.tool_calls.is_empty()
+            && self.finish_reason.as_deref() == Some("MALFORMED_FUNCTION_CALL")
+    }
+}
+
+/// Times a request that came back as a malformed tool call is sent in all.
+pub const MALFORMED_CALL_ATTEMPTS: usize = 3;
 
 pub struct AntigravityLogin {
     pub access_token: SecretString,
@@ -75,6 +100,27 @@ impl std::fmt::Debug for AntigravityLogin {
             .field("refresh_token", &"<redacted>")
             .field("project_id", &self.project_id)
             .finish()
+    }
+}
+
+/// A version the operator may set in `client_version`: digits and dots, like
+/// `2.25.0`.
+pub fn client_version_ok(version: &str) -> bool {
+    (1..=16).contains(&version.len())
+        && version.starts_with(|c: char| c.is_ascii_digit())
+        && version.chars().all(|c| c.is_ascii_digit() || c == '.')
+        && !version.contains("..")
+        && !version.ends_with('.')
+}
+
+/// The Cloud Code user agent for `version`; the pinned default when none is set
+/// (or the one given is not a plain version).
+pub fn cloud_code_user_agent(version: Option<&str>) -> String {
+    match version.map(str::trim).filter(|v| client_version_ok(v)) {
+        Some(version) => format!(
+            "antigravity/hub/{version} (aidev_client; os_type=windows; arch=amd64; cl=1003475615)"
+        ),
+        None => CLOUD_CODE_USER_AGENT.to_owned(),
     }
 }
 
@@ -213,6 +259,20 @@ where
 }
 
 pub fn parse_cloud_code_catalog(bytes: &[u8]) -> Result<BTreeSet<String>> {
+    parse_cloud_code_models(bytes).map(|models| models.into_keys().collect())
+}
+
+/// Ids Google still lists but that are retired: the 4.6 Claude models left
+/// Antigravity with the 5.5 generation.
+fn legacy_model(id: &str) -> bool {
+    id.starts_with("claude-") && (id.ends_with("-4-6") || id.contains("-4-6-"))
+}
+
+/// The usable models of a `fetchAvailableModels` answer with what it says about
+/// each. Tab-completion, image, audio and deprecated ids and the legacy `4-6`
+/// Claude ids are left out. Context and output limits come from `maxTokens` and
+/// `maxOutputTokens`, with the family defaults when absent.
+pub fn parse_cloud_code_models(bytes: &[u8]) -> Result<crate::providers::ModelCatalog> {
     if bytes.len() > 1_048_576 {
         return Err(SeraError::External("model catalog is too large".into()));
     }
@@ -233,22 +293,63 @@ pub fn parse_cloud_code_catalog(bytes: &[u8]) -> Result<BTreeSet<String>> {
         .chain(id_set(value.get("audioTranscriptionModelIds")))
         .chain(id_set(value.get("deprecatedModelIds")))
         .collect::<BTreeSet<_>>();
-    let mut ids = BTreeSet::new();
-    for id in models.keys() {
-        if excluded.contains(id) || !cloud_code_model_id(id) {
+    let mut catalog = crate::providers::ModelCatalog::new();
+    for (id, entry) in models {
+        if excluded.contains(id) || !cloud_code_model_id(id) || legacy_model(id) {
             continue;
         }
-        ids.insert(id.clone());
+        catalog.insert(id.clone(), cloud_code_model_meta(id, entry));
     }
-    if ids.is_empty() {
+    if catalog.is_empty() {
         return Err(SeraError::External(
             "model catalog contained no usable model ids".into(),
         ));
     }
-    Ok(ids)
+    Ok(catalog)
+}
+
+fn cloud_code_model_meta(id: &str, entry: &Value) -> crate::providers::ModelMeta {
+    let limit = |key: &str, fallback: u64| {
+        entry
+            .get(key)
+            .and_then(json_u64)
+            .filter(|tokens| *tokens > 0)
+            .unwrap_or(fallback)
+    };
+    let mut tags = vec!["tools".to_owned(), "reasoning".to_owned()];
+    if !id.contains("gpt-oss") {
+        tags.push("vision".to_owned());
+    }
+    crate::providers::ModelMeta {
+        name: entry
+            .get("displayName")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && name.len() <= 120 && *name != id)
+            .filter(|name| !name.chars().any(char::is_control))
+            .map(str::to_owned),
+        context_length: Some(limit("maxTokens", 1_048_576)),
+        max_output_tokens: Some(limit("maxOutputTokens", u64::from(output_cap(id)))),
+        tags,
+    }
 }
 
 pub fn parse_cloud_code_completion(bytes: &[u8]) -> Result<CloudCodeCompletion> {
+    let mut completion = parse_cloud_code_stream(bytes)?;
+    if completion.text.trim().is_empty() && completion.tool_calls.is_empty() {
+        return Err(SeraError::External(
+            "Cloud Code response contained no content".into(),
+        ));
+    }
+    if completion.text.trim().is_empty() {
+        completion.text.clear();
+    }
+    Ok(completion)
+}
+
+/// Read a Cloud Code answer (an SSE stream or one JSON body) without judging
+/// whether it said anything; see [`CloudCodeCompletion::is_malformed_call`].
+pub fn parse_cloud_code_stream(bytes: &[u8]) -> Result<CloudCodeCompletion> {
     if bytes.len() > 4_194_304 {
         return Err(SeraError::External(
             "Cloud Code response is too large".into(),
@@ -259,6 +360,7 @@ pub fn parse_cloud_code_completion(bytes: &[u8]) -> Result<CloudCodeCompletion> 
     let trimmed = text.trim();
     let mut completion = CloudCodeCompletion {
         text: String::new(),
+        reasoning: String::new(),
         tool_calls: Vec::new(),
         prompt_tokens: 0,
         completion_tokens: 0,
@@ -287,18 +389,13 @@ pub fn parse_cloud_code_completion(bytes: &[u8]) -> Result<CloudCodeCompletion> 
             return Err(SeraError::External("malformed Cloud Code response".into()));
         }
     }
-    if completion.text.trim().is_empty() && completion.tool_calls.is_empty() {
-        return Err(SeraError::External(
-            "Cloud Code response contained no content".into(),
-        ));
-    }
-    if completion.text.trim().is_empty() {
-        completion.text.clear();
-    }
     Ok(completion)
 }
 
 pub fn sanitize_schema(value: &Value) -> Value {
+    if !value.is_object() {
+        return placeholder_object();
+    }
     let mut value = value.clone();
     let defs = value
         .get("$defs")
@@ -323,6 +420,26 @@ pub fn build_cloud_code_envelope(
     max_output_tokens: u32,
     temperature: Option<f32>,
 ) -> Result<Value> {
+    build_cloud_code_envelope_with(
+        model,
+        project_id,
+        messages,
+        tools,
+        max_output_tokens,
+        temperature,
+        &EnvelopeOptions::default(),
+    )
+}
+
+pub fn build_cloud_code_envelope_with(
+    model: &str,
+    project_id: &str,
+    messages: &[LlmMessage],
+    tools: &[ToolSpec],
+    max_output_tokens: u32,
+    temperature: Option<f32>,
+    options: &EnvelopeOptions<'_>,
+) -> Result<Value> {
     if !cloud_code_model_id(model) {
         return Err(SeraError::Config("invalid configured model id".into()));
     }
@@ -346,7 +463,7 @@ pub fn build_cloud_code_envelope(
         }
         if message.role == Role::Assistant {
             for call in &message.tool_calls {
-                names.insert(call.id.clone(), sanitize_tool_name(&call.name));
+                names.insert(call.id.clone(), wire_tool_name(&call.name));
             }
         }
     }
@@ -376,11 +493,18 @@ pub fn build_cloud_code_envelope(
                         .cloned()
                         .map(Value::Object)
                         .unwrap_or_else(|| json!({}));
+                    // The signature Google gave this call goes back with it; the
+                    // sentinel stands in only when there is none.
+                    let signature = call
+                        .reasoning_signature
+                        .as_deref()
+                        .filter(|signature| signature_ok(signature))
+                        .unwrap_or(THOUGHT_SIGNATURE_SENTINEL);
                     parts.push(json!({
-                        "thoughtSignature": THOUGHT_SIGNATURE_SENTINEL,
+                        "thoughtSignature": signature,
                         "functionCall": {
                             "id": id,
-                            "name": sanitize_tool_name(&call.name),
+                            "name": wire_tool_name(&call.name),
                             "args": arguments,
                         }
                     }));
@@ -397,7 +521,7 @@ pub fn build_cloud_code_envelope(
                 let name = message
                     .name
                     .as_deref()
-                    .map(sanitize_tool_name)
+                    .map(wire_tool_name)
                     .filter(|name| tool_name_ok(name))
                     .or_else(|| names.get(&id).cloned())
                     .unwrap_or_else(|| sanitize_tool_name(&id));
@@ -409,7 +533,7 @@ pub fn build_cloud_code_envelope(
                         "functionResponse": {
                             "id": id,
                             "name": name,
-                            "response": {"result": result, "is_error": false}
+                            "response": {"result": result, "is_error": message.is_error}
                         }
                     })],
                     true,
@@ -417,8 +541,8 @@ pub fn build_cloud_code_envelope(
             }
         }
     }
-    let model_lower = model.to_ascii_lowercase();
-    if model_lower.contains("claude") && model_lower.contains("thinking") {
+    // Claude rejects an assistant prefill: the request must end on the user.
+    if claude_model(model) {
         while turns.last().is_some_and(|turn| turn.role == "model") {
             turns.pop();
         }
@@ -433,29 +557,20 @@ pub fn build_cloud_code_envelope(
         .map(|turn| json!({"role": turn.role, "parts": turn.parts}))
         .collect::<Vec<_>>();
     let mut request = json!({
-        "sessionId": fresh_session_id(),
+        "sessionId": session_id(project_id, options.conversation, options.session_generation),
         "contents": contents,
-        "generationConfig": generation_config(model, max_output_tokens, temperature),
+        "generationConfig": generation_config(
+            model,
+            max_output_tokens,
+            temperature,
+            options.thinking_level,
+        ),
     });
     if !system.is_empty() {
         request["systemInstruction"] = json!({"parts": [{"text": system.join("\n\n")}]});
     }
-    if !tools.is_empty() {
-        let declarations = tools
-            .iter()
-            .map(|tool| {
-                let description = if tool.description.trim().is_empty() {
-                    sanitize_tool_name(&tool.name)
-                } else {
-                    clean_text(&tool.description, 1_024)
-                };
-                json!({
-                    "name": sanitize_tool_name(&tool.name),
-                    "description": description,
-                    "parameters": sanitize_schema(&tool.parameters),
-                })
-            })
-            .collect::<Vec<_>>();
+    let declarations = tool_declarations(tools);
+    if !declarations.is_empty() {
         request["tools"] = json!([{"functionDeclarations": declarations}]);
         request["toolConfig"] = json!({"functionCallingConfig": {"mode": "VALIDATED"}});
     }
@@ -590,27 +705,130 @@ where
     })
 }
 
-fn generation_config(model: &str, max_output_tokens: u32, temperature: Option<f32>) -> Value {
+/// What the bot asks of one Cloud Code request beyond the messages.
+#[derive(Debug, Clone, Default)]
+pub struct EnvelopeOptions<'a> {
+    /// The conversation the request belongs to; part of the session id.
+    pub conversation: &'a str,
+    /// How many times the account's session was rotated after Google's
+    /// 1M-token wall (see [`session_id`]).
+    pub session_generation: i64,
+    /// The thinking level the bot chose (`off`, `low`, `medium`, `high`, `max`).
+    pub thinking_level: Option<&'a str>,
+}
+
+/// FNV-1a, 64 bit.
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 14_695_981_039_346_656_037;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(1_099_511_628_211);
+    }
+    hash
+}
+
+/// The Cloud Code `sessionId`: stable for one account and conversation so the
+/// server-side cache and the 1M-token session accumulator behave, and rotated
+/// by `generation` when Google says the session is full.
+///
+/// FNV-1a 64 over `"{project}:{conversation}"` (`":gen{N}"` appended when `N`
+/// is above zero), folded with `% 9e18` and prefixed with `-`. The project is
+/// `default` when the account has none.
+pub fn session_id(project: &str, conversation: &str, generation: i64) -> String {
+    let account = if project.is_empty() {
+        "default"
+    } else {
+        project
+    };
+    let key = if generation > 0 {
+        format!("{account}:{conversation}:gen{generation}")
+    } else {
+        format!("{account}:{conversation}")
+    };
+    let folded = fnv1a64(key.as_bytes()) % SESSION_SPACE;
+    format!("-{}", folded.max(1))
+}
+
+fn claude_model(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("claude")
+}
+
+/// The largest reply Cloud Code accepts for a model family.
+fn output_cap(model: &str) -> u32 {
+    if claude_model(model) { 64_000 } else { 65_536 }
+}
+
+/// The reply size to ask for. The server's default of 4096 (or less) means "no
+/// opinion" and takes the model's cap; anything larger is kept. Always inside
+/// `[1024, cap]`.
+pub fn effective_max_output(model: &str, requested: u32) -> u32 {
+    let cap = output_cap(model);
+    let wanted = if requested <= 4_096 { cap } else { requested };
+    wanted.clamp(1_024, cap)
+}
+
+/// The `thinkingConfig` for one request, or `None` when none is sent.
+///
+/// - Level models (Gemini 3 and 4, `-tiered`): `off` becomes
+///   `thinkingBudget: 0`; `low`, `medium` and `high` map to `thinkingLevel`,
+///   `max` to `high`. An id that already ends in `-low`, `-medium` or `-high`
+///   carries its level and gets no config.
+/// - Claude: `off` sends nothing; the others are budgets of 4000, 10000, 24000
+///   and 32000 tokens, kept inside `[1024, max_out - 1024]` and sent only when
+///   `max_out` is above the budget. With no level, a `-thinking` id uses
+///   `medium` and any other id sends nothing.
+pub fn antigravity_thinking(model: &str, level: Option<&str>, max_out: u32) -> Option<Value> {
     let lower = model.to_ascii_lowercase();
-    let claude = lower.contains("claude");
-    let cap: u32 = if claude { 64_000 } else { 65_536 };
-    let mut config = json!({
-        "maxOutputTokens": max_output_tokens.clamp(1, cap),
-    });
-    let thinking = claude && lower.contains("thinking");
-    if let Some(temperature) = temperature.filter(|_| !thinking) {
+    if lower.contains("claude") {
+        let level = match level {
+            Some(level) => level,
+            None if lower.contains("thinking") => "medium",
+            None => return None,
+        };
+        let budget = match level {
+            "low" => 4_000u32,
+            "medium" => 10_000,
+            "high" => 24_000,
+            "max" | "xhigh" => 32_000,
+            "off" => return None,
+            _ => 10_000,
+        };
+        let ceiling = max_out.saturating_sub(1_024).max(1_024);
+        let budget = budget.clamp(1_024, ceiling);
+        return (max_out > budget).then(|| {
+            json!({
+                "thinkingBudget": budget,
+                "includeThoughts": true,
+            })
+        });
+    }
+    if !level_thinking_model(&lower) {
+        return None;
+    }
+    Some(match level.unwrap_or("medium") {
+        "off" => json!({"thinkingBudget": 0}),
+        "low" => json!({"thinkingLevel": "low", "includeThoughts": true}),
+        "high" | "max" | "xhigh" => json!({"thinkingLevel": "high", "includeThoughts": true}),
+        _ => json!({"thinkingLevel": "medium", "includeThoughts": true}),
+    })
+}
+
+fn generation_config(
+    model: &str,
+    max_output_tokens: u32,
+    temperature: Option<f32>,
+    thinking_level: Option<&str>,
+) -> Value {
+    let max_out = effective_max_output(model, max_output_tokens);
+    let mut config = json!({"maxOutputTokens": max_out});
+    let thinking = antigravity_thinking(model, thinking_level, max_out);
+    // Claude rejects a temperature while it thinks; other models keep it.
+    let drop_temperature = claude_model(model) && thinking.is_some();
+    if let Some(temperature) = temperature.filter(|_| !drop_temperature) {
         config["temperature"] = json!(temperature.clamp(0.0, 2.0));
     }
-    if thinking {
-        config["thinkingConfig"] = json!({
-            "includeThoughts": true,
-            "thinkingBudget": 8192
-        });
-    } else if level_thinking_model(&lower) {
-        config["thinkingConfig"] = json!({
-            "includeThoughts": true,
-            "thinkingLevel": "medium"
-        });
+    if let Some(thinking) = thinking {
+        config["thinkingConfig"] = thinking;
     }
     config
 }
@@ -662,13 +880,41 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 }
 
 fn absorb_completion(completion: &mut CloudCodeCompletion, value: &Value) -> Result<()> {
+    // A stream can end with an error object instead of a candidate.
+    if let Some(error) = value.get("error").filter(|error| error.is_object()) {
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .map(|text| clean_text(text, 200))
+            .unwrap_or_default();
+        return Err(match error.get("code").and_then(json_u64) {
+            Some(code @ 400..=599) => SeraError::External(format!("HTTP {code}: {message}")),
+            _ => {
+                let status = error
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(|text| clean_text(text, 40))
+                    .unwrap_or_default();
+                SeraError::External(format!("Antigravity error ({status}): {message}"))
+            }
+        });
+    }
     let root = value.get("response").unwrap_or(value);
     if let Some(usage) = root.get("usageMetadata") {
         if let Some(prompt) = usage.get("promptTokenCount").and_then(json_u64) {
             completion.prompt_tokens = prompt;
         }
-        if let Some(output) = usage.get("candidatesTokenCount").and_then(json_u64) {
-            completion.completion_tokens = output;
+        // Output counts what the model thought as well as what it said.
+        let output = usage
+            .get("candidatesTokenCount")
+            .and_then(json_u64)
+            .unwrap_or(0);
+        let thoughts = usage
+            .get("thoughtsTokenCount")
+            .and_then(json_u64)
+            .unwrap_or(0);
+        if output > 0 || thoughts > 0 {
+            completion.completion_tokens = output.saturating_add(thoughts);
         }
     }
     let Some(candidate) = root
@@ -693,6 +939,11 @@ fn absorb_completion(completion: &mut CloudCodeCompletion, value: &Value) -> Res
     };
     for part in parts {
         if part.get("thought").and_then(Value::as_bool) == Some(true) {
+            if let Some(text) = part.get("text").and_then(Value::as_str)
+                && completion.reasoning.len() < crate::thinking::MAX_REASONING_CHARS * 4
+            {
+                completion.reasoning.push_str(text);
+            }
             continue;
         }
         if let Some(text) = part.get("text").and_then(Value::as_str) {
@@ -718,14 +969,23 @@ fn absorb_completion(completion: &mut CloudCodeCompletion, value: &Value) -> Res
                 }
                 _ => json!({}),
             };
+            let signature = part
+                .get("thoughtSignature")
+                .and_then(Value::as_str)
+                .filter(|signature| signature_ok(signature))
+                .map(str::to_owned);
             if let Some(existing) = completion.tool_calls.iter_mut().find(|item| item.id == id) {
                 existing.name = name.to_owned();
                 existing.arguments = arguments;
+                if signature.is_some() {
+                    existing.signature = signature;
+                }
             } else {
                 completion.tool_calls.push(CloudCodeToolCall {
                     id,
                     name: name.to_owned(),
                     arguments,
+                    signature,
                 });
             }
         }
@@ -814,6 +1074,8 @@ fn sanitize_schema_in(value: &mut Value, depth: u8) {
         return;
     }
     let Value::Object(obj) = value else {
+        // A bare `true` or a string where a schema belongs: any string will do.
+        *value = json!({"type": "STRING"});
         return;
     };
     if let Some(Value::Array(branches)) = obj.remove("allOf") {
@@ -942,14 +1204,33 @@ fn sanitize_schema_in(value: &mut Value, depth: u8) {
             }
         }
     }
-    match obj.get_mut("items") {
-        Some(Value::Array(items)) => {
-            for item in items {
-                sanitize_schema_in(item, depth + 1);
+    // Tuple-style `items` keeps only its first schema.
+    if let Some(Value::Array(items)) = obj.get("items").cloned() {
+        match items.into_iter().next() {
+            Some(first) => {
+                obj.insert("items".into(), first);
+            }
+            None => {
+                obj.remove("items");
             }
         }
-        Some(other) => sanitize_schema_in(other, depth + 1),
-        None => {}
+    }
+    if let Some(items) = obj.get_mut("items") {
+        sanitize_schema_in(items, depth + 1);
+    }
+    // A missing type is inferred from the shape.
+    if obj.get("type").and_then(Value::as_str).is_none() {
+        let inferred = if obj.contains_key("properties") {
+            "OBJECT"
+        } else if obj.contains_key("items") {
+            "ARRAY"
+        } else {
+            "STRING"
+        };
+        obj.insert("type".into(), Value::String(inferred.to_owned()));
+    }
+    if obj.get("type").and_then(Value::as_str) == Some("ARRAY") && !obj.contains_key("items") {
+        obj.insert("items".into(), json!({"type": "STRING"}));
     }
     let is_object = obj.get("type").and_then(Value::as_str) == Some("OBJECT");
     if is_object {
@@ -965,7 +1246,40 @@ fn sanitize_schema_in(value: &mut Value, depth: u8) {
             );
         }
     }
+    // `required` names only properties that exist; Cloud Code answers 400 for
+    // anything else.
+    let existing = obj
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|map| map.keys().cloned().collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    if let Some(Value::Array(names)) = obj.get("required").cloned() {
+        let kept = names
+            .into_iter()
+            .filter(|name| name.as_str().is_some_and(|name| existing.contains(name)))
+            .collect::<Vec<_>>();
+        if kept.is_empty() {
+            obj.remove("required");
+        } else {
+            obj.insert("required".into(), Value::Array(kept));
+        }
+    } else {
+        obj.remove("required");
+    }
+    // An allow-list: any key Cloud Code does not know is a 400 INVALID_ARGUMENT.
+    obj.retain(|key, _| SCHEMA_KEYS.contains(&key.as_str()));
 }
+
+/// The schema keys Cloud Code accepts that this sanitizer keeps.
+const SCHEMA_KEYS: &[&str] = &[
+    "type",
+    "description",
+    "nullable",
+    "items",
+    "enum",
+    "properties",
+    "required",
+];
 
 fn append_hints(obj: &mut Map<String, Value>) {
     const HINTS: &[&str] = &[
@@ -1024,6 +1338,81 @@ fn placeholder_object() -> Value {
         "type": "OBJECT",
         "properties": {"_placeholder": {"type": "BOOLEAN", "description": "unused"}}
     })
+}
+
+/// Tool names Cloud Code reserves for its own built-ins; ours travel under an
+/// alias and are mapped back when the model calls them.
+const TOOL_ALIASES: &[(&str, &str)] = &[
+    ("web_search", "agy_web_search"),
+    ("search_web", "agy_search_web"),
+];
+
+/// The name a tool travels under: sanitized, and aliased when it would clash
+/// with one of Cloud Code's own.
+fn wire_tool_name(name: &str) -> String {
+    let clean = sanitize_tool_name(name);
+    TOOL_ALIASES
+        .iter()
+        .find(|(ours, _)| *ours == clean)
+        .map(|(_, wire)| (*wire).to_owned())
+        .unwrap_or(clean)
+}
+
+/// The other half of [`wire_tool_name`] for the aliased names.
+fn from_wire_tool_name(name: &str) -> &str {
+    TOOL_ALIASES
+        .iter()
+        .find(|(_, wire)| *wire == name)
+        .map(|(ours, _)| *ours)
+        .unwrap_or(name)
+}
+
+/// Give a completion's tool calls back the names the runtime knows: the
+/// aliases are undone, and a name the sanitizer rewrote (`plugin.x.y` became
+/// `plugin_x_y`) is matched to the tool it came from.
+pub fn restore_tool_names(completion: &mut CloudCodeCompletion, tools: &[ToolSpec]) {
+    for call in &mut completion.tool_calls {
+        let wire = call.name.clone();
+        if let Some(tool) = tools.iter().find(|tool| wire_tool_name(&tool.name) == wire) {
+            call.name = tool.name.clone();
+        } else {
+            call.name = from_wire_tool_name(&wire).to_owned();
+        }
+    }
+}
+
+/// The function declarations for `tools`. Cloud Code's own search tools are
+/// skipped, names are made unique ignoring case, and a schema that sanitizes
+/// to nothing is left out.
+fn tool_declarations(tools: &[ToolSpec]) -> Vec<Value> {
+    let mut seen = BTreeSet::new();
+    let mut declarations = Vec::new();
+    for tool in tools {
+        if matches!(tool.name.as_str(), "google_search" | "googleSearch") {
+            continue;
+        }
+        let name = wire_tool_name(&tool.name);
+        if !seen.insert(name.to_ascii_lowercase()) {
+            continue;
+        }
+        let description = if tool.description.trim().is_empty() {
+            name.clone()
+        } else {
+            clean_text(&tool.description, 1_024)
+        };
+        declarations.push(json!({
+            "name": name,
+            "description": description,
+            "parameters": sanitize_schema(&tool.parameters),
+        }));
+    }
+    declarations
+}
+
+/// A thought signature is opaque base64-ish text; refuse anything that is not
+/// a bounded printable token.
+fn signature_ok(value: &str) -> bool {
+    (1..=16_384).contains(&value.len()) && value.chars().all(|c| c.is_ascii_graphic())
 }
 
 fn sanitize_tool_name(name: &str) -> String {
@@ -1110,15 +1499,15 @@ fn credential_ok(value: &str) -> bool {
         && !value.chars().any(char::is_control)
 }
 
-fn fresh_session_id() -> String {
-    let mut bytes = [0u8; 8];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    let value = u64::from_be_bytes(bytes) % SESSION_SPACE;
-    format!("-{}", value.max(1))
-}
-
+/// `agent/{unix ms}/{8 hex}`.
 fn fresh_request_id() -> String {
-    format!("agent-{}", uuid::Uuid::new_v4().simple())
+    let mut bytes = [0u8; 4];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    format!(
+        "agent/{}/{}",
+        chrono::Utc::now().timestamp_millis(),
+        hex::encode(bytes)
+    )
 }
 
 fn validate_loopback_redirect(redirect: &str) -> Result<()> {
@@ -1333,12 +1722,58 @@ async fn discover_project(
     bases: &[String],
     pause: Duration,
 ) -> Option<String> {
+    discover_project_with(http, access_token, bases, pause, None)
+        .await
+        .project
+}
+
+/// What project discovery learned about an account.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Discovery {
+    /// The Cloud Code companion project; `None` means the envelope must omit
+    /// `project` (an empty one is answered with 404).
+    pub project: Option<String>,
+    /// The tier Google reported, for display.
+    pub tier: Option<String>,
+}
+
+/// The origins project discovery asks: daily, then prod. A loopback origin (a
+/// test server) is asked alone.
+pub fn discovery_origins(base: &str) -> Result<Vec<String>> {
+    let endpoint = validate_base_url(base)?;
+    let parsed = url::Url::parse(&endpoint)
+        .map_err(|_| SeraError::Config("invalid provider base url".into()))?;
+    if is_exact_loopback(&parsed) {
+        return Ok(vec![origin_string(&parsed)]);
+    }
+    Ok(DISCOVERY_HOSTS
+        .iter()
+        .map(|host| format!("https://{host}"))
+        .collect())
+}
+
+/// Find (or create) the Cloud Code companion project of the signed-in Google
+/// account: `loadCodeAssist`, then up to three `onboardUser` calls `pause`
+/// apart, each followed by another `loadCodeAssist`. A failing origin moves on
+/// to the next. Never fails: an account with no project simply has none.
+pub async fn discover_project_with(
+    http: &reqwest::Client,
+    access_token: &str,
+    bases: &[String],
+    pause: Duration,
+    version: Option<&str>,
+) -> Discovery {
     let pause = pause.min(Duration::from_secs(5));
+    let agent = cloud_code_user_agent(version);
     let metadata = json!({
         "ideType": "ANTIGRAVITY",
-        "ideVersion": IDE_VERSION,
+        "ideVersion": version
+            .map(str::trim)
+            .filter(|v| client_version_ok(v))
+            .unwrap_or(IDE_VERSION),
         "platform": "WINDOWS_AMD64"
     });
+    let mut found = Discovery::default();
     for base in bases {
         let Ok(origin) = one_origin(base) else {
             continue;
@@ -1348,6 +1783,7 @@ async fn discover_project(
             &format!("{origin}/v1internal:loadCodeAssist"),
             access_token,
             &json!({"metadata": metadata}),
+            &agent,
         )
         .await
         else {
@@ -1356,8 +1792,10 @@ async fn discover_project(
         if !status.is_success() {
             continue;
         }
+        found.tier = found.tier.or_else(|| shown_tier(&body));
         if let Some(project) = extract_project(&body) {
-            return Some(project);
+            found.project = Some(project);
+            return found;
         }
         let tier = default_tier(&body).unwrap_or_else(|| "free-tier".into());
         for _ in 0..3 {
@@ -1366,6 +1804,7 @@ async fn discover_project(
                 &format!("{origin}/v1internal:onboardUser"),
                 access_token,
                 &json!({"tierId": tier, "metadata": metadata}),
+                &agent,
             )
             .await
             else {
@@ -1375,7 +1814,8 @@ async fn discover_project(
                 && let Some(project) = extract_project(&onboard)
                     .or_else(|| onboard.get("response").and_then(extract_project))
             {
-                return Some(project);
+                found.project = Some(project);
+                return found;
             }
             sleep_pause(pause).await;
             let Ok((status, again)) = post_cloud_json(
@@ -1383,6 +1823,7 @@ async fn discover_project(
                 &format!("{origin}/v1internal:loadCodeAssist"),
                 access_token,
                 &json!({"metadata": metadata}),
+                &agent,
             )
             .await
             else {
@@ -1391,11 +1832,12 @@ async fn discover_project(
             if status.is_success()
                 && let Some(project) = extract_project(&again)
             {
-                return Some(project);
+                found.project = Some(project);
+                return found;
             }
         }
     }
-    None
+    found
 }
 
 async fn sleep_pause(pause: Duration) {
@@ -1425,10 +1867,11 @@ async fn post_cloud_json(
     url: &str,
     access_token: &str,
     body: &Value,
+    user_agent: &str,
 ) -> Result<(reqwest::StatusCode, Value)> {
     let response = http
         .post(url)
-        .header("user-agent", CLOUD_CODE_USER_AGENT)
+        .header("user-agent", user_agent)
         .header("x-goog-api-client", CLOUD_CODE_API_CLIENT)
         .header("accept", "application/json")
         .bearer_auth(access_token)
@@ -1458,16 +1901,23 @@ fn extract_project(value: &Value) -> Option<String> {
     project_id_ok(id).then(|| id.to_owned())
 }
 
+fn tier_id_ok(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The tier new accounts are onboarded on: the default of `allowedTiers`, else
+/// the first with a usable id.
 fn default_tier(value: &Value) -> Option<String> {
     let tiers = value.get("allowedTiers")?.as_array()?;
     let mut first = None;
     for tier in tiers {
-        let id = tier.get("id")?.as_str()?;
-        if !(1..=64).contains(&id.len())
-            || !id
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
+        let Some(id) = tier.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if !tier_id_ok(id) {
             continue;
         }
         if first.is_none() {
@@ -1479,6 +1929,188 @@ fn default_tier(value: &Value) -> Option<String> {
     }
     first
 }
+
+/// The tier to show: the account's current one when Google says, else the
+/// default it would be onboarded on.
+fn shown_tier(value: &Value) -> Option<String> {
+    value
+        .pointer("/currentTier/id")
+        .and_then(Value::as_str)
+        .filter(|id| tier_id_ok(id))
+        .map(str::to_owned)
+        .or_else(|| default_tier(value))
+}
+
+/// Most quota windows one snapshot keeps.
+const MAX_QUOTA_WINDOWS: usize = 16;
+
+/// A window label a person recognizes: `week`, `5h`, or the provider's own
+/// short word.
+fn quota_label(bucket: &Value) -> String {
+    let raw = ["window", "bucketId"]
+        .iter()
+        .find_map(|key| bucket.get(*key).and_then(Value::as_str))
+        .unwrap_or("");
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("week") {
+        "week".into()
+    } else if lower.contains("5h") || lower.contains("hour") {
+        "5h".into()
+    } else if raw.is_empty() {
+        "window".into()
+    } else {
+        clean_text(raw, 24)
+    }
+}
+
+fn quota_window(
+    scope: &str,
+    label: &str,
+    remaining: &Value,
+    reset: Option<&Value>,
+) -> Option<Value> {
+    let remaining = remaining
+        .as_f64()
+        .filter(|r| r.is_finite())?
+        .clamp(0.0, 1.0);
+    let used = ((1.0 - remaining) * 1000.0).round() / 10.0;
+    let resets_at = reset
+        .and_then(Value::as_str)
+        .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+        .map(|time| {
+            time.with_timezone(&chrono::Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        });
+    Some(json!({
+        "scope": clean_text(scope, 48),
+        "label": label,
+        "used_percent": used.clamp(0.0, 100.0),
+        "remaining": remaining,
+        "resets_at": resets_at,
+    }))
+}
+
+/// Windows from `retrieveUserQuotaSummary`: groups of buckets, each with a
+/// remaining fraction and a reset time.
+pub fn parse_quota_summary(body: &Value) -> Vec<Value> {
+    let mut windows = Vec::new();
+    let Some(groups) = body.get("groups").and_then(Value::as_array) else {
+        return windows;
+    };
+    for group in groups {
+        let scope = ["displayName", "groupId"]
+            .iter()
+            .find_map(|key| group.get(*key).and_then(Value::as_str))
+            .unwrap_or("quota");
+        for bucket in group
+            .get("buckets")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(remaining) = bucket.get("remainingFraction") else {
+                continue;
+            };
+            if let Some(window) = quota_window(
+                scope,
+                &quota_label(bucket),
+                remaining,
+                bucket.get("resetTime"),
+            ) {
+                windows.push(window);
+            }
+            if windows.len() >= MAX_QUOTA_WINDOWS {
+                return windows;
+            }
+        }
+    }
+    windows
+}
+
+/// Windows from the `quotaInfo` each model of `fetchAvailableModels` may carry
+/// (the fallback when the summary call is not available).
+pub fn parse_quota_models(body: &Value) -> Vec<Value> {
+    let mut windows = Vec::new();
+    let Some(models) = body.get("models").and_then(Value::as_object) else {
+        return windows;
+    };
+    for (id, entry) in models {
+        if !cloud_code_model_id(id) {
+            continue;
+        }
+        let Some(info) = entry.get("quotaInfo") else {
+            continue;
+        };
+        let Some(remaining) = info.get("remainingFraction") else {
+            continue;
+        };
+        if let Some(window) = quota_window(id, "5h", remaining, info.get("resetTime")) {
+            windows.push(window);
+        }
+        if windows.len() >= MAX_QUOTA_WINDOWS {
+            break;
+        }
+    }
+    windows
+}
+
+/// Read an account's remaining quota: the summary call, else the model list's
+/// `quotaInfo`. Any failure is `None` ("no reading"), never an error.
+pub async fn read_quota(
+    http: &reqwest::Client,
+    access_token: &str,
+    project: &str,
+    origins: &[String],
+    version: Option<&str>,
+) -> Option<Value> {
+    let agent = cloud_code_user_agent(version);
+    let body = if project_id_ok(project) {
+        json!({"project": project})
+    } else {
+        json!({})
+    };
+    for base in origins {
+        let Ok(origin) = one_origin(base) else {
+            continue;
+        };
+        for (path, source) in [
+            ("retrieveUserQuotaSummary", "summary"),
+            ("fetchAvailableModels", "models"),
+        ] {
+            let Ok((status, reply)) = post_cloud_json(
+                http,
+                &format!("{origin}/v1internal:{path}"),
+                access_token,
+                &body,
+                &agent,
+            )
+            .await
+            else {
+                continue;
+            };
+            if !status.is_success() {
+                continue;
+            }
+            let windows = if source == "summary" {
+                parse_quota_summary(&reply)
+            } else {
+                parse_quota_models(&reply)
+            };
+            if !windows.is_empty() {
+                return Some(json!({
+                    "sampled_at": chrono::Utc::now()
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    "source": source,
+                    "windows": windows,
+                }));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod parity_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1623,6 +2255,7 @@ mod tests {
                         id: "call_1".into(),
                         name: "rag_search".into(),
                         arguments: json!({"query": "q"}),
+                        reasoning_signature: None,
                     }],
                 ),
             ],

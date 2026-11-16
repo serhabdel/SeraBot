@@ -241,6 +241,13 @@ impl Config {
             .map_err(|error| SeraError::Config(format!("llm.providers.{id}: {error}")))?;
             crate::cloud_code::validate_project_id(&profile.kind, &profile.project_id)
                 .map_err(|error| SeraError::Config(format!("llm.providers.{id}: {error}")))?;
+            if !profile.client_version.is_empty()
+                && !crate::cloud_code::client_version_ok(&profile.client_version)
+            {
+                return Err(SeraError::Config(format!(
+                    "llm.providers.{id}: client_version must look like 2.25.0"
+                )));
+            }
         }
         if self.embeddings.dimension == 0 || self.embeddings.dimension > 4096 {
             return Err(SeraError::Config(
@@ -592,6 +599,10 @@ pub struct ProviderConfig {
     /// Cloud Code companion project. Empty omits `project` from the envelope.
     #[serde(default)]
     pub project_id: String,
+    /// The Antigravity Hub version the Cloud Code user agent reports (for
+    /// example `2.25.0`). Empty uses the version pinned in the build.
+    #[serde(default)]
+    pub client_version: String,
 }
 
 impl Default for ProviderConfig {
@@ -609,6 +620,7 @@ impl Default for ProviderConfig {
             oauth_client_id_secret: String::new(),
             oauth_client_secret_secret: String::new(),
             project_id: String::new(),
+            client_version: String::new(),
         }
     }
 }
@@ -631,6 +643,7 @@ impl LlmConfig {
             oauth_client_id_secret: self.oauth_client_id_secret.clone(),
             oauth_client_secret_secret: self.oauth_client_secret_secret.clone(),
             project_id: self.project_id.clone(),
+            client_version: String::new(),
         }
     }
 }

@@ -462,6 +462,84 @@ impl Store {
         Ok(changed == 1)
     }
 
+    /// Rotate an account's Cloud Code session, once. `seen` is the generation
+    /// the caller's request used: when the row already moved past it (a sibling
+    /// request rotated first) nothing changes. Returns the generation to use.
+    pub fn bump_session_generation(
+        &self,
+        user_id: &str,
+        provider: &str,
+        account_id: &str,
+        seen: i64,
+    ) -> Result<i64> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE provider_accounts
+             SET session_generation = session_generation + 1, updated_at = ?5
+             WHERE user_id = ?1 AND provider = ?2 AND account_id = ?3
+               AND session_generation = ?4",
+            params![user_id, provider, account_id, seen, now_string()],
+        )?;
+        let current: Option<i64> = transaction
+            .query_row(
+                "SELECT session_generation FROM provider_accounts
+                 WHERE user_id = ?1 AND provider = ?2 AND account_id = ?3",
+                params![user_id, provider, account_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        transaction.commit()?;
+        Ok(current.unwrap_or(seen + 1))
+    }
+
+    /// Merge `patch` (a small JSON object) into an account's non-secret
+    /// identity. False when the acting user has no such account.
+    pub fn merge_provider_account_identity(
+        &self,
+        user_id: &str,
+        provider: &str,
+        account_id: &str,
+        patch: &Value,
+    ) -> Result<bool> {
+        let Some(patch) = patch.as_object() else {
+            return Ok(false);
+        };
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<String> = transaction
+            .query_row(
+                "SELECT identity_json FROM provider_accounts
+                 WHERE user_id = ?1 AND provider = ?2 AND account_id = ?3",
+                params![user_id, provider, account_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        let mut identity: Value = serde_json::from_str(&current).unwrap_or_else(|_| json!({}));
+        if let Some(map) = identity.as_object_mut() {
+            for (key, value) in patch {
+                map.insert(key.clone(), value.clone());
+            }
+        }
+        let merged = clean_identity(&identity)?;
+        transaction.execute(
+            "UPDATE provider_accounts SET identity_json = ?4, updated_at = ?5
+             WHERE user_id = ?1 AND provider = ?2 AND account_id = ?3",
+            params![
+                user_id,
+                provider,
+                account_id,
+                serde_json::to_string(&merged)?,
+                now_string()
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
     /// Delete an account row and its sealed credential together. Returns
     /// false when the acting user has no such account.
     pub(crate) fn delete_provider_account(

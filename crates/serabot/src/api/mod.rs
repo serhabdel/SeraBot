@@ -73,6 +73,7 @@ mod monitoring;
 mod preview;
 mod profiles;
 mod provider_accounts;
+mod provider_quota;
 mod routines;
 mod settings;
 mod skills;
@@ -199,7 +200,6 @@ pub struct ApiState {
     /// every sign-in endpoint fails closed.
     auth: Option<Arc<AuthService>>,
     /// Providers with a device sign-in still running in the background.
-    oauth_inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Per-user server browser; None while [browser] is off.
     browser: Option<Arc<crate::browser::BrowserManager>>,
     /// Model call behind the onboarding interview; None uses the runtime.
@@ -259,7 +259,17 @@ impl ApiState {
         )?);
         let accounts = Arc::new(crate::accounts::Accounts::new(store.clone(), users.clone()));
         let refresher = Arc::new(crate::accounts::AccountRefresher::new(accounts.clone()));
-        let signin = Arc::new(crate::auth_flows::SignInService::new(accounts.clone())?);
+        let mut sign_ins = crate::auth_flows::SignInRegistry::standard();
+        sign_ins.register(
+            "google-antigravity",
+            Arc::new(crate::auth_flows::google::GoogleSignIn::from_config(
+                &config,
+                secrets.clone(),
+            )?),
+        );
+        let signin = Arc::new(
+            crate::auth_flows::SignInService::new(accounts.clone())?.with_registry(sign_ins),
+        );
         let (marketplace, plugin_problems) = marketplace::load(&config);
         for problem in &plugin_problems {
             tracing::warn!(%problem, "plugin skipped");
@@ -284,7 +294,6 @@ impl ApiState {
             poll_rate_limit: config.server.poll_rate_limit_per_minute.max(1) as usize,
             admin: AdminStore::open(&config).ok(),
             auth,
-            oauth_inflight: Arc::default(),
             browser: None,
             onboarding_drafter: None,
             local: crate::local_relay::LocalRelay::new(),
@@ -294,7 +303,7 @@ impl ApiState {
             accounts,
             refresher,
             signin,
-            quota_readers: Arc::default(),
+            quota_readers: Arc::new(provider_quota::standard_readers()),
             quota_read_at: Arc::default(),
             config,
         })

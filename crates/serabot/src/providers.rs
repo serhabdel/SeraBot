@@ -465,6 +465,9 @@ pub struct ModelMeta {
     pub name: Option<String>,
     /// Context window in tokens.
     pub context_length: Option<u64>,
+    /// Largest reply in tokens, when the API says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
     /// Capability tags from the API: `vision`, `tools`, `reasoning`, `free`,
     /// `cheap`.
     pub tags: Vec<String>,
@@ -653,6 +656,7 @@ fn model_meta(id: &str, entry: &Value) -> ModelMeta {
     ModelMeta {
         name,
         context_length,
+        max_output_tokens: None,
         tags,
     }
 }
@@ -663,26 +667,83 @@ fn official_model_id(model: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '+'))
 }
 
+/// How long the sign-in mint waits before each retry on a 429 or 5xx. The
+/// device code is one-shot, so a transient mint failure must not fail the login.
+pub const MUSE_MINT_RETRY_WAITS: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(10)];
+
+/// What a successful Muse key mint says. The key is a secret; `Debug` hides it.
+pub struct MuseMint {
+    pub api_key: String,
+    /// Lower-cased account email, when Meta said.
+    pub email: Option<String>,
+    /// The subscription tier name, when Meta said.
+    pub tier: Option<String>,
+    /// Meta's stable user id, when it said.
+    pub user_id: Option<String>,
+}
+
+impl fmt::Debug for MuseMint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MuseMint")
+            .field("email", &self.email)
+            .field("tier", &self.tier)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Re-mint a Muse API key from the Meta identity token. Never sends `onboard`;
+/// only the interactive sign-in does (see [`muse_mint`]).
 pub async fn muse_mint_api_key(
     http: &reqwest::Client,
     token_url: &str,
     identity_token: &str,
 ) -> Result<String> {
-    let response = http
-        .post(token_url)
-        .header("user-agent", USER_AGENT)
-        .header("accept", "application/json")
-        .header("x-api-version", MUSE_API_VERSION)
-        .bearer_auth(identity_token)
-        .json(&serde_json::json!({}))
-        .send()
+    muse_mint(http, token_url, identity_token, false, &[])
         .await
-        .map_err(|_| SeraError::External("Muse API-key mint failed".into()))?;
-    let status = response.status();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|_| SeraError::External("Muse API-key mint failed".into()))?;
+        .map(|mint| mint.api_key)
+}
+
+/// Mint a Muse Code API key. `onboard: true` is for the interactive sign-in
+/// only: it creates the subscription record. On a 429 or a 5xx the mint waits
+/// for each of `retry_waits` and tries again.
+pub async fn muse_mint(
+    http: &reqwest::Client,
+    token_url: &str,
+    identity_token: &str,
+    onboard: bool,
+    retry_waits: &[Duration],
+) -> Result<MuseMint> {
+    let body = if onboard {
+        serde_json::json!({"onboard": true})
+    } else {
+        serde_json::json!({})
+    };
+    let mut attempt = 0;
+    let (status, bytes) = loop {
+        let response = http
+            .post(token_url)
+            .header("user-agent", USER_AGENT)
+            .header("accept", "application/json")
+            .header("x-api-version", MUSE_API_VERSION)
+            .bearer_auth(identity_token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| SeraError::External("Muse API-key mint failed".into()))?;
+        let status = response.status();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|_| SeraError::External("Muse API-key mint failed".into()))?;
+        let transient = status.as_u16() == 429 || status.is_server_error();
+        match retry_waits.get(attempt) {
+            Some(wait) if transient => {
+                attempt += 1;
+                tokio::time::sleep(*wait).await;
+            }
+            _ => break (status, bytes),
+        }
+    };
     if !status.is_success() {
         // Typed, so a re-mint that is refused (401/403) can park the account.
         return Err(SeraError::upstream(
@@ -696,12 +757,47 @@ pub async fn muse_mint_api_key(
     }
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|_| SeraError::External("Muse API-key mint failed".into()))?;
+    if value.get("is_subs_active").and_then(Value::as_bool) == Some(false) {
+        return Err(SeraError::Rejected {
+            code: "muse_inactive",
+            message: "Your Muse Code subscription is inactive. Activate it on muse.ai first."
+                .into(),
+        });
+    }
     let key = value
         .get("api_key")
         .and_then(Value::as_str)
-        .filter(|key| credential_ok(key))
-        .ok_or_else(|| SeraError::External("Muse API-key mint failed".into()))?;
-    Ok(key.to_owned())
+        .filter(|key| credential_ok(key));
+    let Some(key) = key else {
+        let payment = value.get("require_payment").and_then(Value::as_bool) == Some(true)
+            || value.get("action_url").is_some_and(|url| !url.is_null())
+            || value
+                .get("require_payment_action_url")
+                .is_some_and(|url| !url.is_null());
+        return Err(if payment {
+            SeraError::Rejected {
+                code: "muse_subscription_required",
+                message: "A Muse Code subscription is required. Subscribe on muse.ai first.".into(),
+            }
+        } else {
+            SeraError::External("Muse API-key mint failed: the reply had no API key".into())
+        });
+    };
+    let text = |field: &str, max: usize| {
+        value
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty() && text.len() <= max)
+            .filter(|text| !text.chars().any(char::is_control))
+            .map(str::to_owned)
+    };
+    Ok(MuseMint {
+        api_key: key.to_owned(),
+        email: text("user_email", 254).map(|email| email.to_lowercase()),
+        tier: text("subs_tier_name", 64),
+        user_id: text("user_id", 128),
+    })
 }
 
 pub struct AccessGrant {
@@ -912,7 +1008,15 @@ where
     let Some(identity) = identity else {
         return Err(SeraError::External("Muse login request expired".into()));
     };
-    let api_key = muse_mint_api_key(http, &endpoints.mint, &identity).await?;
+    let api_key = muse_mint(
+        http,
+        &endpoints.mint,
+        &identity,
+        true,
+        &MUSE_MINT_RETRY_WAITS,
+    )
+    .await?
+    .api_key;
     Ok(MuseCredentials {
         api_key: SecretString::new(api_key),
         identity_token: SecretString::new(identity),
@@ -1288,10 +1392,100 @@ pub fn open_provider_client(
             }
         }
     }
-    if canonical_kind(&profile.kind)? == "google-antigravity" {
-        client = client.with_cloud_code(&profile.project_id)?;
+    let kind = canonical_kind(&profile.kind)?;
+    if kind == "muse-code" {
+        client = client.with_header("x-api-version", MUSE_API_VERSION);
+    }
+    // The operator's own credential uses the provider's project; a member's
+    // account never does, it has its own.
+    let member_account = owner.account_id != DEFAULT_ACCOUNT;
+    if kind == "google-antigravity" {
+        let project = if member_account {
+            ""
+        } else {
+            profile.project_id.as_str()
+        };
+        client = client.with_cloud_code(project)?;
+        if !profile.client_version.trim().is_empty() {
+            client = client.with_cloud_version(&profile.client_version);
+        }
+    }
+    if member_account && let Some(refresher) = owner.refresher {
+        let accounts = refresher.accounts();
+        let row =
+            accounts
+                .store()
+                .provider_account(owner.user_id, owner.provider, owner.account_id)?;
+        let generation = row.as_ref().map_or(0, |row| row.session_generation);
+        client = client.with_account(
+            AccountRefreshTarget {
+                refresher: refresher.clone(),
+                user_id: owner.user_id.to_owned(),
+                provider: owner.provider.to_owned(),
+                account_id: owner.account_id.to_owned(),
+            },
+            generation,
+            kind == "muse-code",
+        );
+        if kind == "google-antigravity"
+            && let Some(row) = row
+        {
+            let known = row
+                .identity
+                .get("project_id")
+                .and_then(Value::as_str)
+                .filter(|project| {
+                    crate::cloud_code::validate_project_id("google-antigravity", project).is_ok()
+                })
+                .map(str::to_owned);
+            let checked = row
+                .identity
+                .get("project_checked_at")
+                .and_then(Value::as_i64);
+            client = client.with_project_discovery(
+                known,
+                checked,
+                Arc::new(AccountProjectMemo {
+                    accounts: accounts.clone(),
+                    user_id: owner.user_id.to_owned(),
+                    provider: owner.provider.to_owned(),
+                    account_id: owner.account_id.to_owned(),
+                }),
+            );
+        }
     }
     Ok(client)
+}
+
+/// Writes a discovered Cloud Code project (and the fact that discovery ran)
+/// into the member account's own identity.
+struct AccountProjectMemo {
+    accounts: Arc<Accounts>,
+    user_id: String,
+    provider: String,
+    account_id: String,
+}
+
+impl crate::llm::ProjectMemo for AccountProjectMemo {
+    fn record(&self, discovery: &crate::cloud_code::Discovery) {
+        let mut patch = serde_json::json!({
+            "project_checked_at": chrono::Utc::now().timestamp(),
+        });
+        if let Some(project) = &discovery.project {
+            patch["project_id"] = serde_json::json!(project);
+        }
+        if let Some(tier) = &discovery.tier {
+            patch["tier"] = serde_json::json!(tier);
+        }
+        if let Err(error) = self.accounts.store().merge_provider_account_identity(
+            &self.user_id,
+            &self.provider,
+            &self.account_id,
+            &patch,
+        ) {
+            tracing::warn!(%error, "could not remember a discovered Cloud Code project");
+        }
+    }
 }
 
 /// Copy the operator's existing age-store provider credentials into the
@@ -1361,6 +1555,87 @@ pub fn import_age_provider_credentials(
     }
     Ok(imported)
 }
+
+/// Bring an operator's *new* age-store sign-in (after `serabot providers login`
+/// or `serabot secrets set`) into the admin's accounts.
+///
+/// [`import_age_provider_credentials`] runs once per provider, so a later
+/// sign-in used to be ignored. Here the age store's refresh token is
+/// fingerprinted (a keyed hash, never the token) and remembered per provider:
+/// the first run only records it, because the once-only import already copied
+/// that sign-in; when it later differs, the new sign-in is added as another
+/// admin account beside the old ones, with the provider's configured project in
+/// its identity. Nothing is overwritten or removed. Returns the accounts added.
+pub fn import_age_oauth_sign_ins(
+    config: &Config,
+    secrets: &SharedSecrets,
+    accounts: &Accounts,
+    store: &Store,
+    admin_id: &str,
+) -> Result<usize> {
+    let default = config.llm.default_provider();
+    let mut added = 0;
+    for (id, profile) in std::iter::once(("default", &default)).chain(
+        config
+            .llm
+            .providers
+            .iter()
+            .map(|(id, profile)| (id.as_str(), profile)),
+    ) {
+        if profile.refresh_token_secret.trim().is_empty()
+            || canonical_kind(&profile.kind).is_ok_and(|kind| kind != "google-antigravity")
+        {
+            continue;
+        }
+        let (Some(refresh), Some(access)) = (
+            secrets.get(profile.refresh_token_secret.trim()),
+            secrets.get(profile.api_key_secret.trim()),
+        ) else {
+            continue;
+        };
+        if refresh.is_empty() || access.is_empty() {
+            continue;
+        }
+        let fingerprint = accounts.key_fingerprint(admin_id, id, &refresh);
+        let marker = format!("provider_signin_seen:{admin_id}:{id}");
+        match store.kv_get(&marker)? {
+            Some(seen) if seen == fingerprint => continue,
+            // First sight: the once-only import already holds this sign-in.
+            None => {
+                store.kv_set(&marker, &fingerprint)?;
+                continue;
+            }
+            Some(_) => {}
+        }
+        let identity = if profile.project_id.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::json!({"project_id": profile.project_id.trim()})
+        };
+        accounts.add(
+            admin_id,
+            crate::accounts::AddAccount {
+                provider: id.to_owned(),
+                label: "Imported sign-in".into(),
+                auth_kind: crate::accounts::AuthKind::Oauth,
+                fingerprint: fingerprint.clone(),
+                identity,
+                credential: ProviderCredential {
+                    api_key: access,
+                    refresh_token: refresh,
+                    ..Default::default()
+                },
+                priority: 0,
+            },
+        )?;
+        store.kv_set(&marker, &fingerprint)?;
+        added += 1;
+    }
+    Ok(added)
+}
+
+#[cfg(test)]
+mod account_clients_tests;
 
 #[cfg(test)]
 mod tests {

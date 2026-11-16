@@ -616,6 +616,20 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
             "imported the operator's provider credentials into the admin account"
         );
     }
+    let admin_accounts = serabot::accounts::Accounts::new(store.clone(), users.clone());
+    let reimported = serabot::providers::import_age_oauth_sign_ins(
+        &config,
+        &secrets,
+        &admin_accounts,
+        &store,
+        &admin_user_id,
+    )?;
+    if reimported > 0 {
+        tracing::info!(
+            accounts = reimported,
+            "added the operator's new sign-ins to the admin accounts"
+        );
+    }
     // The admin must be able to route the default provider, exactly like the
     // single-operator build required its key at startup. The credential may
     // come from the age store (imported above) or from the console.

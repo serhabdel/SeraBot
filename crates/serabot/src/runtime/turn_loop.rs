@@ -271,6 +271,7 @@ impl Runtime {
                         tool_calls: Vec::new(),
                         tool_call_id: Some(pending.call.id.clone()),
                         name: Some(pending.call.name.clone()),
+                        is_error: true,
                     });
                 }
             }
@@ -293,6 +294,7 @@ impl Runtime {
                 tool_calls: Vec::new(),
                 tool_call_id: Some(pending.call.id.clone()),
                 name: Some(pending.call.name.clone()),
+                is_error: true,
             });
         }
         state.pending = None;
@@ -304,6 +306,7 @@ impl Runtime {
                     tool_calls: Vec::new(),
                     tool_call_id: Some(call.id.clone()),
                     name: Some(call.name.clone()),
+                    is_error: true,
                 });
             }
         } else if !pending.remaining.is_empty()
@@ -630,17 +633,18 @@ impl Runtime {
             // Vault values never reach a model: redact a copy of the request.
             let outgoing = self.gateway.redact_messages(&user, &state.messages)?;
             let thinking = self.turn_thinking(&user, conversation_id, &bot);
-            let response = self
-                .router
-                .complete_with_thinking(
+            let response = crate::llm::with_conversation(
+                conversation_id,
+                self.router.complete_with_thinking(
                     &user,
                     route,
                     &outgoing,
                     &tool_specs,
                     temperature,
                     thinking.as_deref(),
-                )
-                .await?;
+                ),
+            )
+            .await?;
             if let Some(reasoning) = response.reasoning.as_deref() {
                 self.emit_thinking(&user, task, turn, reasoning);
             }
@@ -935,18 +939,19 @@ impl Runtime {
         self.scan_model_messages(user, transcript).ok()?;
         let outgoing = self.gateway.redact_messages(user, transcript).ok()?;
         let thinking = self.turn_thinking(user, conversation_id, bot);
-        let response = self
-            .router
-            .complete_with_thinking(
+        let response = crate::llm::with_conversation(
+            conversation_id,
+            self.router.complete_with_thinking(
                 user,
                 route,
                 &outgoing,
                 &[],
                 bot.config.temperature,
                 thinking.as_deref(),
-            )
-            .await
-            .ok()?;
+            ),
+        )
+        .await
+        .ok()?;
         // With no tools offered, any tool calls in the response are ignored.
         let text = response.message.content?;
         let text = text.trim();
@@ -1132,6 +1137,7 @@ impl Runtime {
                         tool_calls: Vec::new(),
                         tool_call_id: Some(call.id.clone()),
                         name: Some(call.name.clone()),
+                        is_error: true,
                     });
                 }
                 Err(error) => {
@@ -1158,6 +1164,7 @@ impl Runtime {
                         tool_calls: Vec::new(),
                         tool_call_id: Some(call.id.clone()),
                         name: Some(call.name.clone()),
+                        is_error: true,
                     });
                 }
             }
@@ -1191,6 +1198,7 @@ impl Runtime {
             tool_calls: Vec::new(),
             tool_call_id: Some(call.id.clone()),
             name: Some(call.name.clone()),
+            is_error: false,
         });
     }
 

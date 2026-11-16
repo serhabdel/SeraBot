@@ -497,7 +497,7 @@ pub(super) async fn provider_account_quota(
     Path((id, account_id)): Path<(String, String)>,
     Query(query): Query<QuotaQuery>,
 ) -> Result<Json<Value>> {
-    let (_, kind) = provider_context(&state, &id)?;
+    let (profile, kind) = provider_context(&state, &id)?;
     let account = find_account(&state, &user.id, &id, &account_id)?;
     let wants_refresh = matches!(query.refresh.as_deref(), Some("1" | "true"));
     let mut quota = account.quota.clone();
@@ -523,10 +523,37 @@ pub(super) async fn provider_account_quota(
                 if throttled {
                     "throttled"
                 } else {
-                    let credential = state
+                    let mut credential = state
                         .accounts
                         .credential(&user.id, &id, &account_id)?
                         .ok_or_else(|| SeraError::NotFound("account".into()))?;
+                    // A token that is about to lapse is renewed first, so the
+                    // reading is not refused for an old bearer.
+                    if !credential.refresh_token.is_empty()
+                        && crate::accounts::AccountRefresher::is_near_expiry(
+                            &credential,
+                            Utc::now().timestamp(),
+                        )
+                        && let Ok(client) = open_provider_client(
+                            &profile,
+                            &credential,
+                            &state.secrets,
+                            state.config.llm.timeout_secs,
+                            state.config.llm.max_output_tokens,
+                            CredentialOwner {
+                                users: &state.users,
+                                user_id: &user.id,
+                                provider: &id,
+                                account_id: &account_id,
+                                refresher: Some(&state.refresher),
+                            },
+                        )
+                        && client.refresh_if_stale().await.is_ok()
+                        && let Some(fresh) =
+                            state.accounts.credential(&user.id, &id, &account_id)?
+                    {
+                        credential = fresh;
+                    }
                     match reader.read(&credential, &account.identity).await {
                         Ok(Some(reading)) => {
                             if !account.is_default() {

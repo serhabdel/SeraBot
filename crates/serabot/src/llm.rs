@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use zeroize::Zeroize;
 
 use crate::accounts::{AccountRefresher, CredentialStamp, RefreshError, RefreshGrant, Refreshed};
-use crate::cloud_code::{self, CLOUD_CODE_API_CLIENT, CLOUD_CODE_USER_AGENT, CloudCodeCompletion};
+use crate::cloud_code::{self, CLOUD_CODE_API_CLIENT, CloudCodeCompletion, Discovery};
 use crate::providers::{
     ModelCatalog, OAuthMaterial, OAuthStyle, USER_AGENT, enforce_oauth_target, muse_mint_api_key,
     parse_model_catalog, refresh_token_exchange, refresh_token_grant,
@@ -78,6 +78,40 @@ struct OAuthState {
     refresh_unpersisted: AtomicBool,
 }
 
+tokio::task_local! {
+    static CONVERSATION: String;
+}
+
+/// Run `future` with `conversation_id` as the conversation its model calls
+/// belong to. Cloud Code derives its session id from it, so the same
+/// conversation keeps one server-side session.
+pub async fn with_conversation<F: std::future::Future>(
+    conversation_id: &str,
+    future: F,
+) -> F::Output {
+    CONVERSATION.scope(conversation_id.to_owned(), future).await
+}
+
+fn current_conversation() -> String {
+    CONVERSATION.try_with(Clone::clone).unwrap_or_default()
+}
+
+/// Where a member account's discovered Cloud Code project is remembered.
+pub trait ProjectMemo: Send + Sync {
+    /// Record what discovery found (and that it ran).
+    fn record(&self, discovery: &Discovery);
+}
+
+/// How long a failed project discovery is not tried again for an account.
+const DISCOVERY_RETRY_SECS: i64 = 3_600;
+
+struct ProjectState {
+    known: Mutex<Option<String>>,
+    memo: Arc<dyn ProjectMemo>,
+    /// One attempt per client, and none while the last one is recent.
+    tried: AtomicBool,
+}
+
 #[derive(Clone)]
 pub struct LlmClient {
     http: reqwest::Client,
@@ -90,6 +124,18 @@ pub struct LlmClient {
     /// `Some` selects the Cloud Code transport. The string is the project id, or
     /// empty when the envelope must omit `project`.
     cloud_code: Option<String>,
+    /// A header the provider wants on every request (Muse's `x-api-version`).
+    extra_headers: Vec<(&'static str, &'static str)>,
+    /// The member account this client acts for, when it has one.
+    account: Option<AccountRefreshTarget>,
+    /// A 401 with nothing to refresh marks the account `needs_reauth`.
+    reauth_on_401: bool,
+    /// Cloud Code session rotations (see `cloud_code::session_id`).
+    session_generation: Arc<AtomicI64>,
+    /// Lazy project discovery for a member's Cloud Code account.
+    project: Option<Arc<ProjectState>>,
+    /// The Antigravity Hub version for the user agent, when configured.
+    cloud_version: Option<String>,
 }
 
 impl std::fmt::Debug for LlmClient {
@@ -127,7 +173,61 @@ impl LlmClient {
             max_retries: 2,
             oauth: None,
             cloud_code: None,
+            extra_headers: Vec::new(),
+            account: None,
+            reauth_on_401: false,
+            session_generation: Arc::new(AtomicI64::new(0)),
+            project: None,
+            cloud_version: None,
         })
+    }
+
+    /// Send `name: value` on every request.
+    pub fn with_header(mut self, name: &'static str, value: &'static str) -> Self {
+        self.extra_headers.push((name, value));
+        self
+    }
+
+    /// Act for a member's account: session rotations are written to its row,
+    /// and (with `reauth_on_401`) a rejected credential parks it.
+    pub fn with_account(
+        mut self,
+        target: AccountRefreshTarget,
+        session_generation: i64,
+        reauth_on_401: bool,
+    ) -> Self {
+        self.account = Some(target);
+        self.session_generation = Arc::new(AtomicI64::new(session_generation));
+        self.reauth_on_401 = reauth_on_401;
+        self
+    }
+
+    /// Pin the Antigravity Hub version the user agent reports.
+    pub fn with_cloud_version(mut self, version: &str) -> Self {
+        let version = version.trim();
+        if cloud_code::client_version_ok(version) {
+            self.cloud_version = Some(version.to_owned());
+        }
+        self
+    }
+
+    /// Find this Cloud Code account's project on first use when it has none.
+    /// `last_attempt` is when discovery last ran for the account (Unix
+    /// seconds); a recent failure is not repeated.
+    pub fn with_project_discovery(
+        mut self,
+        known: Option<String>,
+        last_attempt: Option<i64>,
+        memo: Arc<dyn ProjectMemo>,
+    ) -> Self {
+        let recent = last_attempt
+            .is_some_and(|at| chrono::Utc::now().timestamp() - at < DISCOVERY_RETRY_SECS);
+        self.project = Some(Arc::new(ProjectState {
+            tried: AtomicBool::new(recent || known.is_some()),
+            known: Mutex::new(known),
+            memo,
+        }));
+        self
     }
 
     pub fn with_cloud_code(mut self, project_id: impl Into<String>) -> Result<Self> {
@@ -262,8 +362,11 @@ impl LlmClient {
         }
         self.ensure_fresh_token().await?;
         if self.cloud_code.is_some() {
+            let level = extra
+                .and_then(|fields| fields.get("thinking_level"))
+                .and_then(Value::as_str);
             return self
-                .complete_cloud_code(messages, tools, &model, temperature)
+                .complete_cloud_code(messages, tools, &model, temperature, level)
                 .await;
         }
         let mut body = json!({
@@ -304,13 +407,11 @@ impl LlmClient {
         for attempt in 0..=self.max_retries + 1 {
             let mut key = self.bearer();
             let used = zeroize::Zeroizing::new(key.clone());
-            let response = self
-                .http
-                .post(&url)
-                .bearer_auth(&key)
-                .json(&body)
-                .send()
-                .await;
+            let mut request = self.http.post(&url).bearer_auth(&key).json(&body);
+            for (name, value) in &self.extra_headers {
+                request = request.header(*name, *value);
+            }
+            let response = request.send().await;
             key.zeroize();
             match response {
                 Ok(response) => {
@@ -319,6 +420,9 @@ impl LlmClient {
                         refreshed = true;
                         self.refresh_oauth(&used).await?;
                         continue;
+                    }
+                    if status.as_u16() == 401 && self.oauth.is_none() {
+                        self.park_for_reauth();
                     }
                     if status.is_success() {
                         let bytes = response.bytes().await.map_err(|error| {
@@ -408,14 +512,16 @@ impl LlmClient {
         for attempt in 0..=self.max_retries + 1 {
             let mut key = self.bearer();
             let used = zeroize::Zeroizing::new(key.clone());
-            let response = self
+            let mut request = self
                 .http
                 .get(&url)
                 .bearer_auth(&key)
                 .header("user-agent", USER_AGENT)
-                .header("accept", "application/json")
-                .send()
-                .await;
+                .header("accept", "application/json");
+            for (name, value) in &self.extra_headers {
+                request = request.header(*name, *value);
+            }
+            let response = request.send().await;
             key.zeroize();
             match response {
                 Ok(response) => {
@@ -424,6 +530,9 @@ impl LlmClient {
                         refreshed = true;
                         self.refresh_oauth(&used).await?;
                         continue;
+                    }
+                    if status.as_u16() == 401 && self.oauth.is_none() {
+                        self.park_for_reauth();
                     }
                     if catalog_body_too_large(&response) {
                         last_error = Some(SeraError::External("model catalog is too large".into()));
@@ -578,6 +687,11 @@ impl LlmClient {
         }
     }
 
+    /// Renew this client's token now when it expires within five minutes.
+    pub async fn refresh_if_stale(&self) -> Result<()> {
+        self.ensure_fresh_token().await
+    }
+
     /// Refresh ahead of expiry: when this account's access token expires within
     /// five minutes, renew it before the request instead of after a 401. A
     /// transient failure is ignored (the current token still works for now);
@@ -707,40 +821,169 @@ impl LlmClient {
         }
     }
 
+    /// A rejected credential nothing can refresh: park the member's account so
+    /// routing skips it until they sign in again.
+    fn park_for_reauth(&self) {
+        if !self.reauth_on_401 {
+            return;
+        }
+        let Some(target) = &self.account else {
+            return;
+        };
+        if let Err(error) = target.refresher.accounts().set_status(
+            &target.user_id,
+            &target.provider,
+            &target.account_id,
+            crate::accounts::AccountStatus::NeedsReauth,
+            Some("sign in again"),
+            None,
+        ) {
+            tracing::warn!(%error, "could not mark an account as needing sign-in");
+        }
+    }
+
+    /// Rotate the Cloud Code session after Google's token wall. `seen` is the
+    /// generation the failed request used; a sibling that already rotated it is
+    /// not rotated twice.
+    fn bump_session(&self, seen: i64) {
+        let next = match &self.account {
+            Some(target) => target
+                .refresher
+                .accounts()
+                .store()
+                .bump_session_generation(
+                    &target.user_id,
+                    &target.provider,
+                    &target.account_id,
+                    seen,
+                )
+                .unwrap_or(seen + 1),
+            None => seen + 1,
+        };
+        self.session_generation.fetch_max(next, Ordering::SeqCst);
+    }
+
+    /// The Cloud Code project for this request: the configured or remembered
+    /// one, else (once per client, and not within an hour of a failed attempt)
+    /// what discovery finds for the signed-in account.
+    async fn cloud_project(&self) -> String {
+        let configured = self.cloud_code.clone().unwrap_or_default();
+        let Some(state) = &self.project else {
+            return configured;
+        };
+        if let Some(known) = state
+            .known
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+        {
+            return known;
+        }
+        if state.tried.swap(true, Ordering::SeqCst) {
+            return configured;
+        }
+        let Ok(origins) = cloud_code::discovery_origins(&self.base_url) else {
+            return configured;
+        };
+        let token = zeroize::Zeroizing::new(self.bearer());
+        let found = cloud_code::discover_project_with(
+            &self.http,
+            &token,
+            &origins,
+            Duration::from_secs(3),
+            self.cloud_version.as_deref(),
+        )
+        .await;
+        state.memo.record(&found);
+        match found.project {
+            Some(project) => {
+                *state
+                    .known
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(project.clone());
+                project
+            }
+            None => configured,
+        }
+    }
+
+    /// Read a finished Cloud Code answer. `None` means Google returned a
+    /// malformed tool call and nothing else: send the request again.
+    fn cloud_answer(&self, bytes: &[u8], tools: &[ToolSpec]) -> Result<Option<LlmResponse>> {
+        let mut parsed = cloud_code::parse_cloud_code_stream(bytes)?;
+        if parsed.is_malformed_call() {
+            return Ok(None);
+        }
+        if parsed.text.trim().is_empty() && parsed.tool_calls.is_empty() {
+            return Err(SeraError::External(
+                "Cloud Code response contained no content".into(),
+            ));
+        }
+        cloud_code::restore_tool_names(&mut parsed, tools);
+        cloud_completion(parsed).map(Some)
+    }
+
     async fn complete_cloud_code(
         &self,
         messages: &[LlmMessage],
         tools: &[ToolSpec],
         model: &str,
         temperature: Option<f32>,
+        thinking_level: Option<&str>,
     ) -> Result<LlmResponse> {
-        let project = self.cloud_code.clone().unwrap_or_default();
+        let project = self.cloud_project().await;
+        let conversation = current_conversation();
         let targets = cloud_code::chat_targets(&self.base_url)?;
         let mut refreshed = false;
+        let mut malformed = 0usize;
         let mut last_error: Option<SeraError> = None;
         for _ in 0..2 {
             let mut restart = false;
             for target in &targets {
                 let mut session_bumped = false;
                 loop {
-                    let envelope = cloud_code::build_cloud_code_envelope(
+                    let generation = self.session_generation.load(Ordering::SeqCst);
+                    let envelope = cloud_code::build_cloud_code_envelope_with(
                         model,
                         &project,
                         messages,
                         tools,
                         self.max_output_tokens,
                         temperature,
+                        &cloud_code::EnvelopeOptions {
+                            conversation: &conversation,
+                            session_generation: generation,
+                            thinking_level,
+                        },
                     )?;
-                    let used = zeroize::Zeroizing::new(self.bearer());
-                    match self
+                    let mut used = zeroize::Zeroizing::new(self.bearer());
+                    let mut post = self
                         .post_cloud(&target.stream, &envelope, model, true)
-                        .await?
-                    {
-                        CloudPost::Ready(bytes) => {
-                            return cloud_completion(cloud_code::parse_cloud_code_completion(
-                                &bytes,
-                            )?);
+                        .await?;
+                    if matches!(post, CloudPost::NotFound) {
+                        used = zeroize::Zeroizing::new(self.bearer());
+                        post = self
+                            .post_cloud(&target.generate, &envelope, model, false)
+                            .await?;
+                        if matches!(post, CloudPost::NotFound) {
+                            last_error = Some(cloud_status_error(404));
+                            break;
                         }
+                    }
+                    match post {
+                        CloudPost::Ready(bytes) => match self.cloud_answer(&bytes, tools)? {
+                            Some(response) => return Ok(response),
+                            None => {
+                                malformed += 1;
+                                if malformed >= cloud_code::MALFORMED_CALL_ATTEMPTS {
+                                    return Err(SeraError::External(
+                                        "The model repeatedly emitted a malformed tool call (MALFORMED_FUNCTION_CALL)."
+                                            .into(),
+                                    ));
+                                }
+                                continue;
+                            }
+                        },
                         CloudPost::Unauthorized if !refreshed && self.oauth.is_some() => {
                             refreshed = true;
                             self.refresh_oauth(&used).await?;
@@ -749,41 +992,8 @@ impl LlmClient {
                         }
                         CloudPost::SessionLimited if !session_bumped => {
                             session_bumped = true;
+                            self.bump_session(generation);
                             continue;
-                        }
-                        CloudPost::NotFound => {
-                            let used = zeroize::Zeroizing::new(self.bearer());
-                            match self
-                                .post_cloud(&target.generate, &envelope, model, false)
-                                .await?
-                            {
-                                CloudPost::Ready(bytes) => {
-                                    return cloud_completion(
-                                        cloud_code::parse_cloud_code_completion(&bytes)?,
-                                    );
-                                }
-                                CloudPost::Unauthorized if !refreshed && self.oauth.is_some() => {
-                                    refreshed = true;
-                                    self.refresh_oauth(&used).await?;
-                                    restart = true;
-                                    break;
-                                }
-                                CloudPost::SessionLimited if !session_bumped => {
-                                    session_bumped = true;
-                                    continue;
-                                }
-                                CloudPost::NotFound => {
-                                    last_error = Some(cloud_status_error(404));
-                                    break;
-                                }
-                                CloudPost::Retryable(error) => {
-                                    last_error = Some(error);
-                                    break;
-                                }
-                                CloudPost::Failed(error) => return Err(error),
-                                CloudPost::Unauthorized => return Err(cloud_status_error(401)),
-                                CloudPost::SessionLimited | CloudPost::Transport => break,
-                            }
                         }
                         CloudPost::Retryable(error) => {
                             last_error = Some(error);
@@ -791,7 +1001,9 @@ impl LlmClient {
                         }
                         CloudPost::Failed(error) => return Err(error),
                         CloudPost::Unauthorized => return Err(cloud_status_error(401)),
-                        CloudPost::SessionLimited | CloudPost::Transport => break,
+                        CloudPost::NotFound | CloudPost::SessionLimited | CloudPost::Transport => {
+                            break;
+                        }
                     }
                 }
                 if restart {
@@ -808,7 +1020,7 @@ impl LlmClient {
 
     async fn fetch_cloud_code_catalog(&self, catalog_url: &str) -> Result<ModelCatalog> {
         let urls = cloud_code::catalog_urls(catalog_url)?;
-        let project = self.cloud_code.clone().unwrap_or_default();
+        let project = self.cloud_project().await;
         let body = if project.is_empty() {
             json!({})
         } else {
@@ -822,11 +1034,7 @@ impl LlmClient {
                 let used = zeroize::Zeroizing::new(self.bearer());
                 match self.post_cloud(url, &body, "", false).await? {
                     CloudPost::Ready(bytes) => {
-                        return cloud_code::parse_cloud_code_catalog(&bytes).map(|ids| {
-                            ids.into_iter()
-                                .map(|id| (id, crate::providers::ModelMeta::default()))
-                                .collect()
-                        });
+                        return cloud_code::parse_cloud_code_models(&bytes);
                     }
                     CloudPost::Unauthorized if !refreshed && self.oauth.is_some() => {
                         refreshed = true;
@@ -834,9 +1042,7 @@ impl LlmClient {
                         restart = true;
                         break;
                     }
-                    CloudPost::Unauthorized => {
-                        return Err(catalog_status_error(401));
-                    }
+                    CloudPost::Unauthorized => return Err(catalog_status_error(401)),
                     CloudPost::NotFound => last_error = Some(catalog_status_error(404)),
                     CloudPost::Retryable(error) => last_error = Some(catalog_retag(error)),
                     CloudPost::SessionLimited => last_error = Some(catalog_status_error(400)),
@@ -864,7 +1070,10 @@ impl LlmClient {
             .http
             .post(url)
             .bearer_auth(&key)
-            .header("user-agent", CLOUD_CODE_USER_AGENT)
+            .header(
+                "user-agent",
+                cloud_code::cloud_code_user_agent(self.cloud_version.as_deref()),
+            )
             .header("x-goog-api-client", CLOUD_CODE_API_CLIENT)
             .header(
                 "accept",
@@ -1044,8 +1253,19 @@ fn cloud_completion(parsed: CloudCodeCompletion) -> Result<LlmResponse> {
             id: call.id,
             name: call.name,
             arguments: call.arguments,
+            reasoning_signature: call.signature,
         })
         .collect::<Vec<_>>();
+    let reasoning = {
+        let text: String = parsed
+            .reasoning
+            .chars()
+            .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+            .take(crate::thinking::MAX_REASONING_CHARS)
+            .collect();
+        let text = text.trim().to_owned();
+        (!text.is_empty()).then_some(text)
+    };
     if content.as_deref().unwrap_or_default().trim().is_empty() && tool_calls.is_empty() {
         return Err(SeraError::External(
             "Cloud Code response contained no content".into(),
@@ -1058,6 +1278,7 @@ fn cloud_completion(parsed: CloudCodeCompletion) -> Result<LlmResponse> {
             tool_calls,
             tool_call_id: None,
             name: None,
+            is_error: false,
         },
         usage: Usage {
             prompt_tokens: parsed.prompt_tokens,
@@ -1067,7 +1288,7 @@ fn cloud_completion(parsed: CloudCodeCompletion) -> Result<LlmResponse> {
                 .saturating_add(parsed.completion_tokens),
         },
         finish_reason: parsed.finish_reason,
-        reasoning: None,
+        reasoning,
     })
 }
 
@@ -1196,6 +1417,7 @@ fn parse_response(bytes: &[u8]) -> Result<LlmResponse> {
                 },
                 name,
                 arguments,
+                reasoning_signature: None,
             });
         }
     }
@@ -1219,6 +1441,7 @@ fn parse_response(bytes: &[u8]) -> Result<LlmResponse> {
             tool_calls,
             tool_call_id: None,
             name: None,
+            is_error: false,
         },
         usage,
         finish_reason,
@@ -1269,6 +1492,7 @@ mod tests {
             tool_calls: Vec::new(),
             tool_call_id: None,
             name: Some("sera-bot".into()),
+            is_error: false,
         };
         let value = message_to_json(&assistant);
         assert!(value.get("name").is_none());
@@ -1286,6 +1510,7 @@ mod tests {
             tool_calls: Vec::new(),
             tool_call_id: Some("call_1".into()),
             name: Some("rag_search".into()),
+            is_error: false,
         };
         assert_eq!(message_to_json(&tool)["name"], json!("rag_search"));
     }
@@ -1609,7 +1834,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1internal:streamGenerateContent"))
             .and(header("authorization", "Bearer synthetic-cloud-token"))
-            .and(header("user-agent", CLOUD_CODE_USER_AGENT))
+            .and(header("user-agent", cloud_code::CLOUD_CODE_USER_AGENT))
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"synthetic-thought\"},{\"text\":\"hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":2,\"candidatesTokenCount\":1}}}\n\n",
             ))

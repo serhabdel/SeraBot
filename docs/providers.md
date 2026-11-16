@@ -11,8 +11,8 @@ else takes an API key, and the console shows a "Get a key" link instead.
 | Provider | How you connect | Notes |
 |---|---|---|
 | OpenRouter | Sign in (OAuth PKCE) or API key | [OAuth PKCE guide](https://openrouter.ai/docs/use-cases/oauth-pkce). No app registration and no client secret. The code is exchanged at `POST /api/v1/auth/keys` for a normal API key in the user's own account. The server does the exchange and stores the key sealed under the signed-in user. Callback is a `localhost` address with a free port. |
-| Google Antigravity | Sign in (Google OAuth PKCE) | Existing admin flow, Cloud Code. No API key. |
-| Muse Code | Sign in (device code) | Existing admin flow. No API key to paste. |
+| Google Antigravity | Sign in (Google OAuth PKCE) | Per member, several accounts each (`docs/antigravity.md`). Cloud Code, no API key. The client secret is the server's (age store); each account has its own tokens, email and project. |
+| Muse Code | Sign in (device code) | Per member, several accounts each. The server runs the device flow, mints the key with `onboard: true` once (retrying a 429 or 5xx after 5 s, then 10 s) and keeps Meta's identity token only to mint again and to read quota. `x-api-version: 1.0.0` goes on every call. No API key to paste. |
 | OpenAI | API key | Keys at platform.openai.com. ChatGPT sign-in is not offered to third-party apps. |
 | Mistral AI | API key | console.mistral.ai. |
 | Google Gemini | API key | Key from Google AI Studio, used on the OpenAI-compatible endpoint. Google's OAuth for the Gemini API needs a Google Cloud project per user, so it is not a one-click sign-in. |

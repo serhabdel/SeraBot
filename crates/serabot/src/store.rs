@@ -2810,6 +2810,7 @@ impl Store {
                 tool_calls: Vec::new(),
                 tool_call_id: message.tool_call_id,
                 name: message.name,
+                is_error: false,
             })
             .collect())
     }
