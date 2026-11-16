@@ -75,6 +75,14 @@ Docs: [agentmail.to/docs](https://www.agentmail.to/docs/api-reference). Send nee
 Specialist scaffolds may list these tools. OAuth reads and both AgentMail tools
 are in the external-effect list, so a scaffold puts them in `require_approval`.
 
+## Marketplace plugins (remote MCP)
+
+Remote MCP apps (Linear, Notion, Sentry, Vercel, Stripe read tools, PostHog,
+Context7, Atlassian) are not `[connectors.*]` sections. Each member installs and
+signs in to them from the Marketplace, and their tokens are sealed per member.
+See [Marketplace](marketplace.md). They are verified only against synthetic
+fixtures until the owner runs them.
+
 ## Personal token connectors (GitHub, Todoist, Slack, Exa)
 
 These connect with a token each user pastes in the console, like Notion. The
@@ -101,14 +109,15 @@ device flow enabled; it is public and no client secret is used), the GitHub
 card offers "Sign in with GitHub": `POST /v1/connectors/github/device/start`
 returns a code to type at `github.com/login/device`, and
 `GET /v1/connectors/github/device/status` reports the result. Tokens are sealed
-per member (`connector.github`) and refreshed ten minutes before they expire,
+per member (`connector:github`, table `github_connector`, migration 0039) and refreshed ten minutes before they expire,
 one refresh at a time; if GitHub rejects the refresh the card shows "expired"
 and keeps the login. Tools come from GitHub's hosted MCP server and are named
 `github.<tool>`: read-only tools run without approval, every other tool asks,
 bound to the repository and arguments, and results are untrusted data.
 `DELETE /v1/connectors/github/native` removes the tokens and returns the app's
 connections page (`manage_url`) to revoke the authorization on GitHub. Without
-a client id the card says "not configured". The pasted token below stays as the
+a client id the card says "not configured". The flow is checked against
+synthetic fixtures only; no live GitHub App was used. The pasted token below stays as the
 fallback and keeps the `github_*` tool names.
 
 1. Open <https://github.com/settings/personal-access-tokens/new> and create a
@@ -122,6 +131,7 @@ fallback and keeps the `github_*` tool names.
 Search results are paged (30 per page at most, 10 pages), files over 200 KB are
 refused, and file text is cut at 20,000 characters. The REST API version header
 is pinned to `2022-11-28`.
+
 ### Todoist
 
 Tools: `todoist_list_tasks` (read), `todoist_add_task` and

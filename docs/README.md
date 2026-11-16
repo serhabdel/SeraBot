@@ -16,7 +16,7 @@ artifacts.
 | [Deployment](deployment.md) | Ubuntu 24.04 release build and additive install on OVH. |
 | [Firecrawl](firecrawl.md) | Optional v2 scrape/map/search/crawl tools and configuration. |
 | [Browser sessions](browser.md) | Loopback CDP browsing vs BrowserOS neo / Firecrawl. |
-| [Connectors](connectors.md) | Configure-later Google, Microsoft, and Notion OAuth; native AgentMail. |
+| [Connectors](connectors.md) | Configure-later Google, Microsoft, and Notion OAuth; native AgentMail; native GitHub sign-in and personal-token connectors. |
 | [Mobile client](mobile-client.md) | Flutter Android owner console. |
 | [CI and secrets](ci-and-secrets.md) | GitHub Actions without credential leaks. |
 | [Crafting Apps adoption](craft-adoption.md) | Storytold craft repos: take `deckcraft-pptx` for text-only generated decks and bounded import/edit of owner decks; skip the editors, MCP servers, and egui shells. |
@@ -39,6 +39,7 @@ artifacts.
 | [Release 0.48.0](release-0.48.0.md) | Logging hardening (noisy-crate caps, shared default filter, per-layer ring filter, durable owner-only `[logging] dir`), approval expiry check at decision time, and negative tests for jobs, workflows, preview, vault autofill and approvals. |
 | [Release 0.49.0](release-0.49.0.md) | Provider accounts (several per member, sealed, write-only), member sign-in for Antigravity and Muse Code, native Anthropic and OpenCode backends, flag-gated Claude plan OAuth, single-flight refresh, bot routes with account/provider failover, and the desktop Providers, route editor and composer route chip. |
 | [Release 0.50.0](release-0.50.0.md) | Orchestration at scale: fleet mutation path and `main` management tools, handoff ledger with auto-resume, `waiting_model` parking, context compaction, `needs_review` for unknown effects, per-user fairness, and the desktop virtualized feed, runs sidebar, composer queue and failure/wait UX. |
+| [Release 0.51.0](release-0.51.0.md) | Marketplace manifest schema v2 and MCP OAuth with per-member accounts and per-tool switches, eight real remote MCP hosts, a native GitHub connector (device flow), `suggest_marketplace_app`, and ChatGPT (Codex) and GitHub Copilot plan sign-in. Synthetic fixtures only. |
 | [Events](events.md) | `turn.step` payload for desktop and Android step cards. |
 | [Tool results](tool-results.md) | Audio, file, image, link, and table cards. |
 | [Console pages](console-pages.md) | Tasks, Memory, Connectors, and Providers fields the next desktop pages read. |

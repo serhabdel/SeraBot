@@ -178,3 +178,15 @@ the desktop virtualized feed, event coalescing, runs sidebar, composer queue,
 failure and wait cards, plus a motion/accessibility pass. No live provider was
 used and the desktop was not visually verified on a device. B7 worker counts
 above 2 are gated on running the load fixture on the target host.
+
+## Status after 0.50.0 (marketplace, providers, 0.51.0)
+
+0.51.0 adds marketplace manifest schema v2, MCP OAuth (`mcp_oauth.rs`) with
+per-member accounts (migration 0039) and per-tool policy (migration 0040),
+runtime bearer injection and read-only annotations, eight real remote MCP host
+manifests, a native GitHub connector (device flow), `suggest_marketplace_app`,
+the desktop accounts, sign-in and tool-switch UI, and ChatGPT (Codex) and GitHub
+Copilot plan sign-in (on by default with a risk banner, per owner decision;
+Mistral sign-in is not wanted). Canva is not shipped. Everything was checked
+against synthetic fixtures; no live host, GitHub App, ChatGPT or Copilot account
+was used, so the owner must run each before it is called working.
