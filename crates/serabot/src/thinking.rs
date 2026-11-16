@@ -22,6 +22,13 @@
 //!   grok-3-mini and grok-4.5+; reasoning cannot be turned off.
 //! - DeepSeek: `reasoning_effort` plus `thinking: {type}`; `deepseek-reasoner`
 //!   takes no level and returns `reasoning_content`.
+//! - Anthropic: `thinking: {type: enabled, budget_tokens}` on Claude 3.7 and
+//!   4.x or later; levels map to budgets of 4k/10k/24k/32k.
+//! - Antigravity (Cloud Code): Gemini 3/4 level models and Claude; the level is
+//!   carried to the envelope builder, which maps it as HielCowork does.
+//! - Muse Code: `reasoning: {effort, summary: auto}`, `off` omits it.
+//! - OpenCode Go/Zen: `reasoning_effort`, only on models whose catalog tags
+//!   say reasoning.
 
 use serde_json::{Map, Value, json};
 
@@ -112,9 +119,101 @@ pub fn levels_for(kind: &str, model: &str, tags: &[String]) -> Vec<&'static str>
                 &[]
             }
         }
+        "anthropic" => {
+            if anthropic_thinks(&id) || (id.starts_with("claude-") && has_reasoning_tag) {
+                &["off", "low", "medium", "high", "xhigh"]
+            } else {
+                &[]
+            }
+        }
+        "google-antigravity" => {
+            if id.contains("gpt-oss") {
+                &[]
+            } else if id.starts_with("claude") {
+                // `off` sends no thinking config; the rest are token budgets.
+                &["off", "low", "medium", "high", "max"]
+            } else if id.ends_with("-tiered") {
+                &["off", "low", "medium", "high", "max"]
+            } else if id.ends_with("-low") || id.ends_with("-medium") || id.ends_with("-high") {
+                // The level is baked into the id; no thinking config is sent.
+                &[]
+            } else if id.starts_with("gemini-3") || id.starts_with("gemini-4") {
+                &["off", "low", "medium", "high", "max"]
+            } else {
+                &[]
+            }
+        }
+        "muse-code" => &["off", "low", "medium", "high"],
+        kind if kind.starts_with("opencode-") => {
+            // Only what the catalog tags as reasoning; OpenCode serves many
+            // vendors' models behind one endpoint.
+            if has_reasoning_tag {
+                &["low", "medium", "high"]
+            } else {
+                &[]
+            }
+        }
         _ => &[],
     };
     rule.to_vec()
+}
+
+/// Whether a Claude model id accepts extended thinking: Claude 3.7 and every
+/// 4.x or later model. The first number in the id is the major version and a
+/// second small number the minor (`claude-3-7-sonnet`, `claude-sonnet-4-5-2025…`).
+fn anthropic_thinks(id: &str) -> bool {
+    if !id.starts_with("claude-") {
+        return false;
+    }
+    let mut numbers = Vec::new();
+    for part in id.split('-').skip(1) {
+        match part.parse::<u32>() {
+            Ok(value) if value < 100 => numbers.push(value),
+            // A date stamp ends the version.
+            Ok(_) => break,
+            // A family name (`sonnet`) or suffix sits between the numbers.
+            Err(_) => {}
+        }
+        if numbers.len() == 2 {
+            break;
+        }
+    }
+    match numbers.as_slice() {
+        [major, ..] if *major >= 4 => true,
+        [3, 7] => true,
+        _ => false,
+    }
+}
+
+/// The token budget Anthropic's extended thinking gets for `level`. The
+/// transport clamps it below `max_tokens`.
+pub fn anthropic_budget(level: &str) -> Option<u32> {
+    match level {
+        "low" => Some(4_000),
+        "medium" => Some(10_000),
+        "high" => Some(24_000),
+        "xhigh" | "max" => Some(32_000),
+        _ => None,
+    }
+}
+
+/// The level a model uses when none is chosen or the old one is unsupported:
+/// `medium`, else `high`, else `low`, else the first it offers.
+pub fn default_level(levels: &[&'static str]) -> Option<&'static str> {
+    ["medium", "high", "low"]
+        .into_iter()
+        .find_map(|wanted| levels.iter().copied().find(|level| *level == wanted))
+        .or_else(|| levels.first().copied())
+}
+
+/// The level to keep after the model changed. A level the new model accepts is
+/// kept; otherwise the new model's default; a model with no levels clears it.
+pub fn level_after_switch(levels: &[&'static str], current: &str) -> Option<&'static str> {
+    levels
+        .iter()
+        .copied()
+        .find(|level| *level == current)
+        .or_else(|| default_level(levels))
 }
 
 /// Whether `level` is offered for the model.
@@ -137,6 +236,31 @@ pub fn wire_fields(
     match kind {
         "openrouter" => {
             fields.insert("reasoning".into(), json!({"effort": level}));
+        }
+        "anthropic" => {
+            // The Messages transport clamps the budget below `max_tokens`
+            // and drops `temperature` while thinking is on.
+            match anthropic_budget(level) {
+                Some(budget) => fields.insert(
+                    "thinking".into(),
+                    json!({"type": "enabled", "budget_tokens": budget}),
+                ),
+                None => fields.insert("thinking".into(), json!({"type": "disabled"})),
+            };
+        }
+        "google-antigravity" => {
+            // A carrier for the Cloud Code envelope builder, which turns it
+            // into `thinkingConfig` for the model. It is never sent as is.
+            fields.insert("thinking_level".into(), json!(level));
+        }
+        "muse-code" => {
+            // Responses-style effort. Off omits it; `max` is not offered.
+            if level != "off" {
+                fields.insert(
+                    "reasoning".into(),
+                    json!({"effort": level, "summary": "auto"}),
+                );
+            }
         }
         "deepseek" => {
             if level == "off" {
@@ -312,6 +436,154 @@ mod tests {
                 "{kind} {model}"
             );
         }
+    }
+
+    #[test]
+    fn anthropic_antigravity_muse_and_opencode_rules() {
+        let full = ["off", "low", "medium", "high", "xhigh"];
+        for model in [
+            "claude-3-7-sonnet-20250219",
+            "claude-sonnet-4-5-20250929",
+            "claude-opus-4-1",
+            "claude-haiku-4-5",
+            "claude-opus-5-5",
+        ] {
+            assert_eq!(levels_for("anthropic", model, &none()), full, "{model}");
+        }
+        for model in [
+            "claude-3-5-sonnet-20241022",
+            "claude-3-opus-20240229",
+            "claude-3-haiku-20240307",
+            "claude-2.1",
+            "gpt-4o",
+        ] {
+            assert!(
+                levels_for("anthropic", model, &none()).is_empty(),
+                "{model}"
+            );
+        }
+        // An unknown Claude id is offered levels only when the catalog says so.
+        assert!(levels_for("anthropic", "claude-next", &none()).is_empty());
+        assert_eq!(
+            levels_for("anthropic", "claude-next", &["reasoning".into()]),
+            full
+        );
+
+        let agy = ["off", "low", "medium", "high", "max"];
+        for model in [
+            "gemini-3-pro",
+            "gemini-4-flash",
+            "gemini-3-pro-tiered",
+            "claude-sonnet-4-5-thinking",
+            "claude-opus-4-6-thinking",
+        ] {
+            assert_eq!(
+                levels_for("google-antigravity", model, &none()),
+                agy,
+                "{model}"
+            );
+        }
+        for model in [
+            "gemini-3-pro-low",
+            "gemini-3-pro-high",
+            "gpt-oss-120b-medium",
+            "gpt-oss-120b",
+            "gemini-2.5-flash",
+        ] {
+            assert!(
+                levels_for("google-antigravity", model, &none()).is_empty(),
+                "{model}"
+            );
+        }
+
+        assert_eq!(
+            levels_for("muse-code", "muse-spark", &none()),
+            ["off", "low", "medium", "high"]
+        );
+
+        let tagged = vec!["reasoning".to_owned()];
+        for kind in ["opencode-go", "opencode-zen"] {
+            assert_eq!(
+                levels_for(kind, "glm-5", &tagged),
+                ["low", "medium", "high"]
+            );
+            assert!(levels_for(kind, "glm-5", &none()).is_empty());
+        }
+        assert!(levels_for("opencode", "glm-5", &tagged).is_empty());
+    }
+
+    #[test]
+    fn new_provider_wire_shapes() {
+        let shape = |kind: &str, model: &str, level: &str| {
+            wire_fields(kind, model, &["reasoning".into()], level).map(Value::Object)
+        };
+        assert_eq!(
+            shape("anthropic", "claude-sonnet-4-5", "low"),
+            Some(json!({"thinking": {"type": "enabled", "budget_tokens": 4000}}))
+        );
+        assert_eq!(
+            shape("anthropic", "claude-sonnet-4-5", "medium"),
+            Some(json!({"thinking": {"type": "enabled", "budget_tokens": 10000}}))
+        );
+        assert_eq!(
+            shape("anthropic", "claude-sonnet-4-5", "high"),
+            Some(json!({"thinking": {"type": "enabled", "budget_tokens": 24000}}))
+        );
+        assert_eq!(
+            shape("anthropic", "claude-sonnet-4-5", "xhigh"),
+            Some(json!({"thinking": {"type": "enabled", "budget_tokens": 32000}}))
+        );
+        assert_eq!(
+            shape("anthropic", "claude-sonnet-4-5", "off"),
+            Some(json!({"thinking": {"type": "disabled"}}))
+        );
+        assert_eq!(
+            wire_fields("anthropic", "claude-3-5-sonnet", &[], "high"),
+            None
+        );
+        assert_eq!(
+            shape("google-antigravity", "gemini-3-pro", "max"),
+            Some(json!({"thinking_level": "max"}))
+        );
+        assert_eq!(
+            shape("google-antigravity", "gemini-3-pro-high", "high"),
+            None
+        );
+        assert_eq!(
+            shape("muse-code", "muse-spark", "high"),
+            Some(json!({"reasoning": {"effort": "high", "summary": "auto"}}))
+        );
+        // Muse `off` omits reasoning; `max` is never offered.
+        assert_eq!(shape("muse-code", "muse-spark", "off"), Some(json!({})));
+        assert_eq!(shape("muse-code", "muse-spark", "max"), None);
+        assert_eq!(
+            shape("opencode-go", "glm-5", "medium"),
+            Some(json!({"reasoning_effort": "medium"}))
+        );
+        assert_eq!(
+            wire_fields("opencode-zen", "glm-5", &[], "medium"),
+            None,
+            "no reasoning tag, no parameter"
+        );
+    }
+
+    #[test]
+    fn a_model_switch_keeps_a_supported_level_or_takes_the_default() {
+        let claude = levels_for("anthropic", "claude-sonnet-4-5", &none());
+        assert_eq!(level_after_switch(&claude, "high"), Some("high"));
+        let deepseek = levels_for("deepseek", "deepseek-flash", &none());
+        // `medium` is not offered there: the default is the next best.
+        assert_eq!(level_after_switch(&deepseek, "medium"), Some("high"));
+        assert_eq!(level_after_switch(&deepseek, "max"), Some("max"));
+        let mistral = levels_for("mistral", "mistral-small-2603", &none());
+        assert_eq!(level_after_switch(&mistral, "xhigh"), Some("high"));
+        let xai = levels_for("xai", "grok-3-mini", &none());
+        assert_eq!(level_after_switch(&xai, "medium"), Some("high"));
+        assert_eq!(level_after_switch(&xai, "low"), Some("low"));
+        // A model with no levels clears the choice.
+        assert_eq!(level_after_switch(&[], "high"), None);
+        assert_eq!(default_level(&["off"]), Some("off"));
+        assert_eq!(default_level(&["minimal", "low", "high"]), Some("high"));
     }
 
     #[test]

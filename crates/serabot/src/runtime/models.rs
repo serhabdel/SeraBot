@@ -275,7 +275,16 @@ impl Runtime {
         &self,
         user_id: &str,
     ) -> Result<Vec<crate::model_router::CatalogEntry>> {
-        let entries = self.router.catalog_entries(user_id);
+        let mut entries = self.router.catalog_entries(user_id);
+        let mut accounts: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for entry in &mut entries {
+            if !accounts.contains_key(&entry.provider) {
+                let ids = self.store.usable_account_ids(user_id, &entry.provider)?;
+                accounts.insert(entry.provider.clone(), ids);
+            }
+            entry.account_ids = accounts[&entry.provider].clone();
+        }
         self.gateway
             .scan_egress(user_id, &serde_json::to_string(&entries)?)?;
         Ok(entries)
@@ -517,7 +526,35 @@ impl Runtime {
         )?;
         self.store
             .kv_set(&Self::model_selection_key(user_id, conversation_id), &value)?;
+        if !stored.is_auto_mode() {
+            self.carry_thinking_to_model(user_id, conversation_id, &stored)?;
+        }
         Ok(stored)
+    }
+
+    /// After a model switch, keep the conversation's thinking level when the
+    /// new model accepts it; otherwise use that model's default, or clear the
+    /// choice when it has no levels. A conversation with no chosen level keeps
+    /// following the bot's default.
+    fn carry_thinking_to_model(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        selection: &ModelSelection,
+    ) -> Result<()> {
+        let Some(current) = self.conversation_thinking(user_id, conversation_id)? else {
+            return Ok(());
+        };
+        let levels = self.router.thinking_levels(user_id, selection);
+        if levels.contains(&current.as_str()) {
+            return Ok(());
+        }
+        let key = Self::thinking_key(user_id, conversation_id);
+        match crate::thinking::level_after_switch(&levels, &current) {
+            Some(level) => self.store.kv_set(&key, level)?,
+            None => self.store.kv_set(&key, "")?,
+        }
+        Ok(())
     }
 
     /// One bounded model call with no tools, outside any turn: used by the

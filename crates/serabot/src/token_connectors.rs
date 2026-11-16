@@ -117,11 +117,7 @@ fn credential_id(provider: &dyn Provider) -> String {
 }
 
 fn upstream(status: u16, code: &'static str, message: String) -> SeraError {
-    SeraError::Upstream {
-        status,
-        code,
-        message,
-    }
+    SeraError::upstream(status, code, message)
 }
 
 fn rejected(provider: &dyn Provider) -> SeraError {

@@ -1216,12 +1216,20 @@ impl Gateway {
     }
 }
 
+/// Whether a failed tool call may have taken effect anyway. Typed errors say
+/// so with their `ambiguous` flag. Untyped `External` text from tools that
+/// predate the flag is still read conservatively, so an unconverted tool can
+/// never turn an unknown outcome into a replayable failure.
 fn is_ambiguous(error: &SeraError) -> bool {
-    matches!(
-        error,
-        SeraError::External(message)
-            if message.contains("timeout") || message.contains("unknown") || message.contains("connection")
-    )
+    match error {
+        SeraError::Upstream { ambiguous, .. } => *ambiguous,
+        SeraError::External(message) => {
+            message.contains("timeout")
+                || message.contains("unknown")
+                || message.contains("connection")
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -1229,6 +1237,30 @@ mod tests {
     use super::*;
     use crate::policy::Policy;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn ambiguity_is_a_flag_not_a_substring() {
+        // A typed error says whether the effect is unknown, whatever its text.
+        assert!(is_ambiguous(&SeraError::upstream_ambiguous(
+            "outcome_unknown",
+            "the upload may or may not have been stored"
+        )));
+        assert!(!is_ambiguous(&SeraError::upstream(
+            503,
+            "provider_down",
+            "the connection timeout was reported by the provider"
+        )));
+        assert!(!is_ambiguous(&SeraError::Validation(
+            "unknown field in timeout connection".into()
+        )));
+        assert!(!is_ambiguous(&SeraError::PolicyViolation));
+        // Untyped tool errors that predate the flag are still treated as
+        // unknown, so an unconverted tool never becomes replayable.
+        assert!(is_ambiguous(&SeraError::External(
+            "connection reset".into()
+        )));
+        assert!(!is_ambiguous(&SeraError::External("HTTP 400".into())));
+    }
 
     struct FakeExternal {
         calls: Arc<AtomicUsize>,

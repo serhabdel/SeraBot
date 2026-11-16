@@ -102,6 +102,15 @@ pub struct CatalogEntry {
     /// no thinking control.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub thinking: Vec<&'static str>,
+    /// The same levels under the name the route editor reads. Kept beside
+    /// `thinking` so older desktops keep working.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub thinking_levels: Vec<&'static str>,
+    /// The acting user's usable accounts for this provider (ids only), best
+    /// first. Filled in by the runtime from the account store; empty when the
+    /// provider is served by a grant or a server-wide key.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub account_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -417,13 +426,13 @@ impl ModelRouter {
                             .and_then(|catalog| catalog.get(&model))
                             .cloned()
                             .unwrap_or_default();
+                        let levels =
+                            crate::thinking::levels_for(&provider.kind, &model, &meta.tags);
                         CatalogEntry {
                             provider: provider.id.clone(),
-                            thinking: crate::thinking::levels_for(
-                                &provider.kind,
-                                &model,
-                                &meta.tags,
-                            ),
+                            thinking: levels.clone(),
+                            thinking_levels: levels,
+                            account_ids: Vec::new(),
                             model,
                             data_egress_approved: provider.data_egress_approved,
                             catalog_verified: verified,

@@ -3099,6 +3099,40 @@ async fn thinking_level_is_applied_and_the_reasoning_shows_as_a_step() {
 }
 
 #[tokio::test]
+async fn a_model_switch_keeps_a_supported_level_or_resets_it() {
+    let server = MockServer::start().await;
+    let (runtime, store, _notifier) = thinking_runtime(&server).await;
+    let user = admin(&store);
+    let small = ModelSelection {
+        provider: "default".into(),
+        model: "mistral-small-2603".into(),
+    };
+    let large = ModelSelection {
+        provider: "default".into(),
+        model: "mistral-large-latest".into(),
+    };
+    runtime.select_model(&user, "s", small.clone()).unwrap();
+    runtime
+        .set_conversation_thinking(&user, "s", "main", Some("high"))
+        .unwrap();
+    // Re-selecting a model that accepts the level keeps it.
+    runtime.select_model(&user, "s", small.clone()).unwrap();
+    assert_eq!(
+        runtime
+            .conversation_thinking(&user, "s")
+            .unwrap()
+            .as_deref(),
+        Some("high")
+    );
+    // A model with no thinking control clears the choice.
+    runtime.select_model(&user, "s", large).unwrap();
+    assert_eq!(runtime.conversation_thinking(&user, "s").unwrap(), None);
+    // A conversation that never chose a level stays on the bot's default.
+    runtime.select_model(&user, "t", small).unwrap();
+    assert_eq!(runtime.conversation_thinking(&user, "t").unwrap(), None);
+}
+
+#[tokio::test]
 async fn bot_thinking_applies_unless_the_conversation_overrides_and_unsupported_is_dropped() {
     let server = MockServer::start().await;
     let (runtime, store, _notifier) = thinking_runtime(&server).await;

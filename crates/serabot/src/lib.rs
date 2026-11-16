@@ -1,3 +1,4 @@
+pub mod accounts;
 pub mod admin;
 pub mod analyst;
 pub mod api;
@@ -38,6 +39,7 @@ pub mod gateway;
 pub mod image_ops;
 pub mod job_tools;
 pub mod llm;
+pub mod llm_failure;
 pub mod local_bulk;
 pub mod local_relay;
 pub mod local_transfer;

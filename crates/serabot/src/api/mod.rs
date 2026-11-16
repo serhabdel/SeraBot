@@ -960,20 +960,29 @@ impl IntoResponse for SeraError {
             // as an unknown outcome. Never 401: the desktop treats that as an
             // expired session.
             let status = match *code {
-                "composio_unavailable" | "connector_unavailable" => StatusCode::BAD_GATEWAY,
-                "composio_rate_limited" | "connector_rate_limited" => {
-                    StatusCode::SERVICE_UNAVAILABLE
-                }
+                "composio_unavailable"
+                | "connector_unavailable"
+                | "provider_down"
+                | "overloaded"
+                | "transport"
+                | "model_unavailable"
+                | "outcome_unknown" => StatusCode::BAD_GATEWAY,
+                "composio_rate_limited"
+                | "connector_rate_limited"
+                | "rate_limited"
+                | "quota_exhausted" => StatusCode::SERVICE_UNAVAILABLE,
                 _ => StatusCode::UNPROCESSABLE_ENTITY,
             };
-            return (
-                status,
-                Json(ApiErrorBody {
-                    error: message.clone(),
-                    code,
-                }),
-            )
-                .into_response();
+            // A model-call failure carries a sanitized provider excerpt for
+            // the logs; clients get the fixed wording for its code instead.
+            let error = match crate::llm_failure::public_message(code) {
+                Some(fixed) => {
+                    warn!(code, reason = %message, "model call failed");
+                    fixed.to_owned()
+                }
+                None => message.clone(),
+            };
+            return (status, Json(ApiErrorBody { error, code })).into_response();
         }
         if let SeraError::Rejected { code, message } = &self {
             warn!(code, reason = %message, "api request rejected");

@@ -16,6 +16,7 @@ use crate::providers::{
 use crate::domain::{LlmMessage, Role, ToolCall};
 use crate::error::{Result, SeraError};
 use crate::gateway::ToolSpec;
+use crate::llm_failure;
 use crate::retry;
 use crate::secrets::{AgeCredentialWriter, CredentialWriter, SharedSecrets};
 
@@ -272,19 +273,37 @@ impl LlmClient {
                     }
                     if status.is_success() {
                         let bytes = response.bytes().await.map_err(|error| {
-                            SeraError::External(format!("LLM response read failed: {error}"))
+                            llm_failure::transport_error(format!(
+                                "LLM response read failed: {error}"
+                            ))
                         })?;
                         return parse_response(&bytes);
                     }
                     // The provider answered, so the completion did not run: safe to retry.
-                    let retryable = retry::transient_status(status.as_u16());
                     let hint = retry::retry_after(response.headers());
+                    let hold = llm_failure::retry_after_hold(response.headers());
                     let text = response.text().await.unwrap_or_default();
                     let sanitized = sanitize_provider_error(&text);
-                    last_error = Some(SeraError::External(format!(
-                        "LLM request failed with status {}: {sanitized}",
-                        status.as_u16()
-                    )));
+                    let error = llm_failure::upstream_error(
+                        status.as_u16(),
+                        &text,
+                        hold,
+                        format!(
+                            "LLM request failed with status {}: {sanitized}",
+                            status.as_u16()
+                        ),
+                    );
+                    // A spent quota does not clear in seconds: retrying only
+                    // delays the failover that can help.
+                    let retryable = retry::transient_status(status.as_u16())
+                        && !matches!(
+                            &error,
+                            SeraError::Upstream {
+                                code: llm_failure::CODE_QUOTA_EXHAUSTED,
+                                ..
+                            }
+                        );
+                    last_error = Some(error);
                     if !retryable || attempt == self.max_retries {
                         break;
                     }
@@ -298,7 +317,9 @@ impl LlmClient {
                 Err(error) => {
                     // A completion POST that timed out may still have run, so only a
                     // connect failure (the request never left) is retried here.
-                    last_error = Some(SeraError::External(format!("LLM request failed: {error}")));
+                    last_error = Some(llm_failure::transport_error(format!(
+                        "LLM request failed: {error}"
+                    )));
                     if !retry::transport_retryable(&error, false) || attempt == self.max_retries {
                         break;
                     }
@@ -311,7 +332,7 @@ impl LlmClient {
                 }
             }
         }
-        Err(last_error.unwrap_or_else(|| SeraError::External("LLM request failed".into())))
+        Err(last_error.unwrap_or_else(|| llm_failure::transport_error("LLM request failed".into())))
     }
 
     pub async fn list_models(&self) -> Result<std::collections::BTreeSet<String>> {
@@ -366,12 +387,15 @@ impl LlmClient {
                     }
                     // Drop the body. Provider errors can echo credentials; the status is enough.
                     let hint = retry::retry_after(response.headers());
+                    let hold = llm_failure::retry_after_hold(response.headers());
                     let _ = response.bytes().await;
                     let retryable = retry::transient_status(status.as_u16());
-                    last_error = Some(SeraError::External(format!(
-                        "model catalog failed with status {}",
-                        status.as_u16()
-                    )));
+                    last_error = Some(llm_failure::upstream_error(
+                        status.as_u16(),
+                        "",
+                        hold,
+                        format!("model catalog failed with status {}", status.as_u16()),
+                    ));
                     if !retryable || attempt == self.max_retries {
                         break;
                     }
@@ -384,7 +408,9 @@ impl LlmClient {
                 }
                 Err(error) => {
                     // A catalog GET is idempotent, so timeouts are retried too.
-                    last_error = Some(SeraError::External("model catalog request failed".into()));
+                    last_error = Some(llm_failure::transport_error(
+                        "model catalog request failed".into(),
+                    ));
                     if !retry::transport_retryable(&error, true) || attempt == self.max_retries {
                         break;
                     }
@@ -398,7 +424,7 @@ impl LlmClient {
             }
         }
         Err(last_error
-            .unwrap_or_else(|| SeraError::External("model catalog request failed".into())))
+            .unwrap_or_else(|| llm_failure::transport_error("model catalog request failed".into())))
     }
 
     async fn refresh_oauth(&self) -> Result<()> {
@@ -504,7 +530,7 @@ impl LlmClient {
         let project = self.cloud_code.clone().unwrap_or_default();
         let targets = cloud_code::chat_targets(&self.base_url)?;
         let mut refreshed = false;
-        let mut last_status = None;
+        let mut last_error: Option<SeraError> = None;
         for _ in 0..2 {
             let mut restart = false;
             for target in &targets {
@@ -558,34 +584,24 @@ impl LlmClient {
                                     continue;
                                 }
                                 CloudPost::NotFound => {
-                                    last_status = Some(404);
+                                    last_error = Some(cloud_status_error(404));
                                     break;
                                 }
-                                CloudPost::Retryable(status) => {
-                                    last_status = Some(status);
+                                CloudPost::Retryable(error) => {
+                                    last_error = Some(error);
                                     break;
                                 }
-                                CloudPost::Failed(message) => {
-                                    return Err(SeraError::External(message));
-                                }
-                                CloudPost::Unauthorized => {
-                                    return Err(SeraError::External(
-                                        "Cloud Code request failed with status 401".into(),
-                                    ));
-                                }
+                                CloudPost::Failed(error) => return Err(error),
+                                CloudPost::Unauthorized => return Err(cloud_status_error(401)),
                                 CloudPost::SessionLimited | CloudPost::Transport => break,
                             }
                         }
-                        CloudPost::Retryable(status) => {
-                            last_status = Some(status);
+                        CloudPost::Retryable(error) => {
+                            last_error = Some(error);
                             break;
                         }
-                        CloudPost::Failed(message) => return Err(SeraError::External(message)),
-                        CloudPost::Unauthorized => {
-                            return Err(SeraError::External(
-                                "Cloud Code request failed with status 401".into(),
-                            ));
-                        }
+                        CloudPost::Failed(error) => return Err(error),
+                        CloudPost::Unauthorized => return Err(cloud_status_error(401)),
                         CloudPost::SessionLimited | CloudPost::Transport => break,
                     }
                 }
@@ -597,12 +613,8 @@ impl LlmClient {
                 break;
             }
         }
-        Err(match last_status {
-            Some(status) => {
-                SeraError::External(format!("Cloud Code request failed with status {status}"))
-            }
-            None => SeraError::External("Cloud Code request failed".into()),
-        })
+        Err(last_error
+            .unwrap_or_else(|| llm_failure::transport_error("Cloud Code request failed".into())))
     }
 
     async fn fetch_cloud_code_catalog(&self, catalog_url: &str) -> Result<ModelCatalog> {
@@ -614,7 +626,7 @@ impl LlmClient {
             json!({"project": project})
         };
         let mut refreshed = false;
-        let mut last_status = None;
+        let mut last_error: Option<SeraError> = None;
         for _ in 0..2 {
             let mut restart = false;
             for url in &urls {
@@ -633,14 +645,12 @@ impl LlmClient {
                         break;
                     }
                     CloudPost::Unauthorized => {
-                        return Err(SeraError::External(
-                            "model catalog failed with status 401".into(),
-                        ));
+                        return Err(catalog_status_error(401));
                     }
-                    CloudPost::NotFound => last_status = Some(404),
-                    CloudPost::Retryable(status) => last_status = Some(status),
-                    CloudPost::SessionLimited => last_status = Some(400),
-                    CloudPost::Failed(message) => return Err(SeraError::External(message)),
+                    CloudPost::NotFound => last_error = Some(catalog_status_error(404)),
+                    CloudPost::Retryable(error) => last_error = Some(catalog_retag(error)),
+                    CloudPost::SessionLimited => last_error = Some(catalog_status_error(400)),
+                    CloudPost::Failed(error) => return Err(catalog_retag(error)),
                     CloudPost::Transport => {}
                 }
             }
@@ -648,12 +658,8 @@ impl LlmClient {
                 break;
             }
         }
-        Err(match last_status {
-            Some(status) => {
-                SeraError::External(format!("model catalog failed with status {status}"))
-            }
-            None => SeraError::External("model catalog request failed".into()),
-        })
+        Err(last_error
+            .unwrap_or_else(|| llm_failure::transport_error("model catalog request failed".into())))
     }
 
     async fn post_cloud(
@@ -697,21 +703,71 @@ enum CloudPost {
     Unauthorized,
     NotFound,
     SessionLimited,
-    Retryable(u16),
-    Failed(String),
+    /// A status worth trying the next endpoint for, already typed.
+    Retryable(SeraError),
+    Failed(SeraError),
     Transport,
+}
+
+/// A Cloud Code status failure with no body to classify.
+fn cloud_status_error(status: u16) -> SeraError {
+    llm_failure::upstream_error(
+        status,
+        "",
+        None,
+        format!("Cloud Code request failed with status {status}"),
+    )
+}
+
+fn catalog_status_error(status: u16) -> SeraError {
+    llm_failure::upstream_error(
+        status,
+        "",
+        None,
+        format!("model catalog failed with status {status}"),
+    )
+}
+
+/// Word a Cloud Code failure as a catalog failure, keeping its typed code.
+fn catalog_retag(error: SeraError) -> SeraError {
+    match error {
+        SeraError::Upstream {
+            status,
+            code,
+            retry_after,
+            ambiguous,
+            ..
+        } if status != 0 => SeraError::Upstream {
+            status,
+            code,
+            message: format!("model catalog failed with status {status}"),
+            retry_after,
+            ambiguous,
+        },
+        other => other,
+    }
+}
+
+/// A bounded error body, read only to pick the failure code.
+async fn cloud_error_body(response: reqwest::Response) -> String {
+    if response.content_length().is_some_and(|len| len > 65_536) {
+        return String::new();
+    }
+    llm_failure::bounded_body(&response.bytes().await.unwrap_or_default())
 }
 
 async fn classify_cloud(response: reqwest::Response, allow_session: bool) -> CloudPost {
     let status = response.status().as_u16();
     if status == 200 {
         if response.content_length().is_some_and(|len| len > 4_194_304) {
-            return CloudPost::Failed("Cloud Code response is too large".into());
+            return CloudPost::Failed(SeraError::External(
+                "Cloud Code response is too large".into(),
+            ));
         }
         return match response.bytes().await {
-            Ok(bytes) if bytes.len() > 4_194_304 => {
-                CloudPost::Failed("Cloud Code response is too large".into())
-            }
+            Ok(bytes) if bytes.len() > 4_194_304 => CloudPost::Failed(SeraError::External(
+                "Cloud Code response is too large".into(),
+            )),
             Ok(bytes) => CloudPost::Ready(bytes.to_vec()),
             Err(_) => CloudPost::Transport,
         };
@@ -722,22 +778,27 @@ async fn classify_cloud(response: reqwest::Response, allow_session: bool) -> Clo
     if status == 404 {
         return CloudPost::NotFound;
     }
+    let hold = llm_failure::retry_after_hold(response.headers());
+    let text = cloud_error_body(response).await;
+    let error = llm_failure::upstream_error(
+        status,
+        &text,
+        hold,
+        format!("Cloud Code request failed with status {status}"),
+    );
     if status == 400 && allow_session {
-        let bytes = response.bytes().await.unwrap_or_default();
-        let limited = bytes.len().min(65_536);
-        let text = String::from_utf8_lossy(&bytes[..limited]);
         if text
             .to_ascii_lowercase()
             .contains("exceeds the maximum number of tokens")
         {
             return CloudPost::SessionLimited;
         }
-        return CloudPost::Failed("Cloud Code request failed with status 400".into());
+        return CloudPost::Failed(error);
     }
     if status == 403 || status == 429 || status >= 500 {
-        return CloudPost::Retryable(status);
+        return CloudPost::Retryable(error);
     }
-    CloudPost::Failed(format!("Cloud Code request failed with status {status}"))
+    CloudPost::Failed(error)
 }
 
 fn cloud_completion(parsed: CloudCodeCompletion) -> Result<LlmResponse> {
@@ -1119,6 +1180,151 @@ mod tests {
         assert!(message.contains("500"));
         assert!(!message.contains(secret));
         assert!(!message.contains("synthetic-key"));
+    }
+
+    /// A failing chat reply as the typed error the failover engine reads.
+    async fn chat_failure(status: u16, body: &str, retry_after: Option<&str>) -> SeraError {
+        let server = MockServer::start().await;
+        let mut response = ResponseTemplate::new(status).set_body_string(body);
+        if let Some(value) = retry_after {
+            response = response.insert_header("retry-after", value);
+        }
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(server.uri(), "synthetic-key", 10, 100)
+            .unwrap()
+            .with_model("test");
+        client
+            .complete(&[LlmMessage::user("salut")], &[], None, None)
+            .await
+            .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn chat_failures_are_typed_and_classified() {
+        use crate::llm_failure::{FailKind, NoSwitch, classify_llm};
+        let quota = r#"{"error":{"type":"insufficient_quota","code":"insufficient_quota","message":"sk-leaky-marker"}}"#;
+        let error = chat_failure(429, quota, None).await;
+        assert!(matches!(
+            error,
+            SeraError::Upstream {
+                status: 429,
+                code: "quota_exhausted",
+                ambiguous: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_llm(&error),
+            Ok(FailKind::QuotaExhausted { .. })
+        ));
+
+        let error = chat_failure(401, "{}", None).await;
+        assert_eq!(classify_llm(&error), Ok(FailKind::CredentialsRejected));
+        let error = chat_failure(403, "{}", None).await;
+        assert_eq!(classify_llm(&error), Ok(FailKind::AccountForbidden));
+        let error = chat_failure(404, "{}", None).await;
+        assert_eq!(classify_llm(&error), Ok(FailKind::ModelUnavailable));
+        let error =
+            chat_failure(400, r#"{"error":{"code":"context_length_exceeded"}}"#, None).await;
+        assert_eq!(classify_llm(&error), Ok(FailKind::ContextTooLong));
+        let error = chat_failure(400, r#"{"error":{"message":"bad field"}}"#, None).await;
+        assert_eq!(classify_llm(&error), Err(NoSwitch::InvalidRequest));
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_keeps_the_servers_retry_hint() {
+        use crate::llm_failure::{FailKind, classify_llm};
+        let error = chat_failure(429, "{}", Some("1")).await;
+        assert_eq!(
+            classify_llm(&error),
+            Ok(FailKind::RateLimited {
+                retry_after: Some(Duration::from_secs(1))
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_provider_is_a_transport_failure() {
+        use crate::llm_failure::{FailKind, classify_llm};
+        // A port nothing listens on: bind, note it, close.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let client = LlmClient::new(format!("http://127.0.0.1:{port}"), "synthetic-key", 2, 100)
+            .unwrap()
+            .with_model("test");
+        let error = client
+            .complete(&[LlmMessage::user("salut")], &[], None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SeraError::Upstream {
+                status: 0,
+                code: "transport",
+                ..
+            }
+        ));
+        assert_eq!(classify_llm(&error), Ok(FailKind::Transport));
+    }
+
+    #[tokio::test]
+    async fn cloud_code_statuses_are_typed() {
+        use crate::llm_failure::{FailKind, classify_llm};
+        for (status, body, expected) in [
+            (403, "{}", FailKind::AccountForbidden),
+            (404, "", FailKind::ModelUnavailable),
+            (401, "", FailKind::CredentialsRejected),
+            (500, "", FailKind::ProviderDown),
+            (429, "{}", FailKind::RateLimited { retry_after: None }),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                .mount(&server)
+                .await;
+            let client = LlmClient::new(server.uri(), "synthetic-key", 10, 128)
+                .unwrap()
+                .with_cloud_code("proj-synthetic")
+                .unwrap()
+                .with_model("gemini-test");
+            let error = client
+                .complete(&[LlmMessage::user("hi")], &[], None, None)
+                .await
+                .unwrap_err();
+            assert_eq!(classify_llm(&error), Ok(expected), "status {status}");
+        }
+        // A spent quota says when it resets.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).set_body_string(
+                r#"{"error":{"code":429,"message":"You have exhausted your capacity on this model. Your quota will reset after 1h.","status":"RESOURCE_EXHAUSTED"}}"#,
+            ))
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(server.uri(), "synthetic-key", 10, 128)
+            .unwrap()
+            .with_cloud_code("proj-synthetic")
+            .unwrap()
+            .with_model("gemini-test");
+        let error = client
+            .complete(&[LlmMessage::user("hi")], &[], None, None)
+            .await
+            .unwrap_err();
+        let Ok(FailKind::QuotaExhausted {
+            resets_at: Some(at),
+        }) = classify_llm(&error)
+        else {
+            panic!("expected a quota reset, got {error:?}");
+        };
+        assert!((at - chrono::Utc::now()).num_seconds() > 3500);
+        assert!(!error.to_string().contains("exhausted your capacity"));
     }
 
     #[tokio::test]

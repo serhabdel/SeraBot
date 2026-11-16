@@ -1561,18 +1561,24 @@ fn transport_error(context: &str, error: reqwest::Error, mutation: bool) -> Sera
     };
 
     if mutation {
-        SeraError::External(format!(
-            "OneDrive {context} outcome unknown: {detail}; the artifact may or may not have been stored"
-        ))
+        SeraError::upstream_ambiguous(
+            "outcome_unknown",
+            format!(
+                "OneDrive {context} outcome unknown: {detail}; the artifact may or may not have been stored"
+            ),
+        )
     } else {
         SeraError::External(format!("OneDrive {context} failed: {detail}"))
     }
 }
 
 fn outcome_unknown(detail: &str) -> SeraError {
-    SeraError::External(format!(
-        "OneDrive upload outcome unknown: {detail}; the artifact may or may not have been stored"
-    ))
+    SeraError::upstream_ambiguous(
+        "outcome_unknown",
+        format!(
+            "OneDrive upload outcome unknown: {detail}; the artifact may or may not have been stored"
+        ),
+    )
 }
 
 /// Keep only short, printable error codes from the service.
@@ -2461,7 +2467,14 @@ mod tests {
             "unexpected message: {message}"
         );
         assert!(!message.contains(server.uri().as_str()));
-        assert!(matches!(error, SeraError::External(_)));
+        assert!(matches!(
+            error,
+            SeraError::Upstream {
+                ambiguous: true,
+                code: "outcome_unknown",
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
