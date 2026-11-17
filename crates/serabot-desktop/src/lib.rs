@@ -1,3 +1,4 @@
+pub mod acp;
 pub mod activity;
 mod api;
 /// Microphone capture through the webview. Needs Dioxus, so it is only built

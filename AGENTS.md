@@ -29,6 +29,15 @@ in passing:
   do not ask the user to paste a secret for a plugin that cannot run.
 - Secrets are write-only in the per-user store. The admin cannot read them.
 
+Claude Code through ACP (0.54, `docs/specs/claude-code-acp.md`) is the one
+approved exception to "no Node runtime" and "no local-process runner": the
+Windows desktop may start the pinned `@agentclientprotocol/claude-agent-acp`
+with the person's own Node.js, in one allowed folder, with a filtered
+environment and every permission request shown to the person. It never runs
+on the server, never offers "always" permissions, and never reads Claude
+Code's credentials. Do not widen it (other agents, terminal capability,
+server-side use) without a new design.
+
 Everything user-owned is UID-scoped — bots, skills, memory, documents,
 conversations, tasks, approvals, credentials, quotas. Store methods for
 user-owned rows always take the acting user's id; there is no unscoped path
@@ -100,4 +109,5 @@ OVH is read-only unless the owner explicitly authorizes an additive installation
 - `crates/serabot-desktop/assets/system.css` (shared cards, stat tiles, segmented controls, skeletons, list motion; loaded last) and `pages-work.css`, `pages-data.css`, `pages-connect.css` (per-area page polish) (0.53).
 - `crates/serabot/src/model_router.rs` `RouterHandle` — the live, swappable model router shared by the runtime and the delegation, team and bot tools; console provider saves rebuild it (0.53).
 - `crates/serabot-desktop/src/runs.rs`, `chat_compose.rs`, `chat_failure.rs`, `chat_cards.rs`, `ui/chat_feed_view.rs`, `assets/runs.css` — runs sidebar, composer queue, failed and wait cards, virtualized feed (0.50).
-- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.53.1.
+- `crates/serabot-desktop/src/acp/` (protocol, client, setup, transcript, controller), `ui_claude_code.rs`, `assets/claude-code.css` — Claude Code on this computer over ACP (0.54).
+- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.54.0.

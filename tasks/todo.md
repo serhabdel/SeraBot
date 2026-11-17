@@ -194,5 +194,13 @@ never merge without the owner's OK.
 - [x] Chat says why a model call failed (status and type, never the body) and when a parked turn resumes.
 - [x] No `anthropic-beta` header to Cloud Code.
 - [ ] Owner: sign in to Antigravity once from the desktop and send one chat (none claimed).
-- [ ] Owner decision: Claude Code through ACP on the desktop (`docs/specs/claude-code-acp.md`) for 0.54.
+- [x] Owner decision: Claude Code through ACP on the desktop (approved; shipped in 0.54.0).
 - [ ] Owner: add the `SERABOT_AGY_CLIENT_SECRET` repository secret (or paste it on the AI providers page).
+
+## Release 0.54.0 — Claude Code through ACP
+
+- [x] ACP client (protocol, process, file fence, permission cards, transcript) with synthetic-agent tests.
+- [x] Setup: Node.js check and winget install, folder choice, Claude Code's own sign-in.
+- [x] Claude Code page in the desktop; the agent keeps running across pages.
+- [ ] Owner: run it once on Windows against the real adapter (none claimed).
+- [ ] Later: keep transcripts across restarts; images and @-file mentions in prompts.

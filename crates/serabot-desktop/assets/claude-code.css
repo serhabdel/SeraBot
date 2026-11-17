@@ -1,0 +1,52 @@
+/* Claude Code page (0.54). Uses the shared tokens from foundation.css. */
+.cc-page .cc-body { display: flex; flex-direction: column; gap: 14px; }
+.cc-head-actions { display: flex; align-items: center; gap: 10px; }
+.cc-status { font-size: 12px; padding: 3px 10px; border-radius: 999px; background: var(--surface-2, rgba(127,127,127,.12)); color: var(--muted, inherit); }
+.cc-status.ok { background: rgba(34,160,90,.14); color: #1f8a4c; }
+.cc-status.busy { background: rgba(80,110,240,.14); color: #4a63d6; }
+.cc-status.warn { background: rgba(220,140,30,.16); color: #a8670c; }
+.cc-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 12px; }
+.cc-step { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border, rgba(127,127,127,.2)); }
+.cc-step.done { border-color: rgba(34,160,90,.35); }
+.cc-step-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.cc-step-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.cc-folders { display: flex; flex-wrap: wrap; gap: 6px; }
+.cc-folder { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 8px; border: 1px solid var(--border, rgba(127,127,127,.25)); background: transparent; color: inherit; cursor: pointer; }
+.cc-folder.on { border-color: var(--accent, #6b5cff); box-shadow: 0 0 0 1px var(--accent, #6b5cff) inset; }
+.cc-folder-name { font-weight: 600; }
+.cc-folder-mode { font-size: 11px; opacity: .7; }
+.cc-start { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 14px; }
+.cc-fine { font-size: 12px; margin: 0; }
+.cc-context { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; opacity: .85; }
+.cc-notice { margin: 0; font-size: 13px; padding: 8px 12px; border-radius: 8px; background: var(--surface-2, rgba(127,127,127,.1)); }
+.cc-signin { border-color: rgba(220,140,30,.45); }
+.cc-feed { display: flex; flex-direction: column; gap: 10px; min-height: 120px; }
+.cc-empty { margin: 24px auto; }
+.cc-row { max-width: 860px; animation: cc-rise .18s ease-out; }
+.cc-user { align-self: flex-end; background: var(--accent-soft, rgba(107,92,255,.12)); padding: 8px 12px; border-radius: 12px 12px 4px 12px; white-space: pre-wrap; }
+.cc-user p { margin: 0; }
+.cc-agent { align-self: flex-start; }
+.cc-thought { font-size: 12px; opacity: .75; }
+.cc-thought p { white-space: pre-wrap; margin: 6px 0 0; }
+.cc-tool { display: flex; gap: 8px; align-items: baseline; font-size: 12px; padding: 6px 10px; border-radius: 8px; border: 1px dashed var(--border, rgba(127,127,127,.3)); }
+.cc-tool.done { border-style: solid; }
+.cc-tool.failed { border-color: rgba(210,60,60,.5); }
+.cc-tool-kind { text-transform: uppercase; letter-spacing: .04em; font-size: 10px; opacity: .7; }
+.cc-tool-title { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.cc-tool-status { opacity: .7; }
+.cc-plan ul { margin: 6px 0 0; padding-left: 18px; font-size: 13px; }
+.cc-plan-completed { text-decoration: line-through; opacity: .65; }
+.cc-plan-in_progress { font-weight: 600; }
+.cc-note { font-size: 12px; opacity: .8; margin: 0; }
+.cc-note.err { color: #c0392b; opacity: 1; }
+.cc-working { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; opacity: .8; }
+.cc-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent, #6b5cff); animation: cc-pulse 1s ease-in-out infinite; }
+.cc-ask { border-color: var(--accent, #6b5cff); display: flex; flex-direction: column; gap: 10px; }
+.cc-ask-head { display: flex; align-items: center; gap: 8px; }
+.cc-composer { position: sticky; bottom: 0; display: flex; flex-direction: column; gap: 8px; padding: 10px; border-radius: 12px; border: 1px solid var(--border, rgba(127,127,127,.25)); background: var(--surface, var(--bg, #fff)); }
+.cc-input { width: 100%; resize: vertical; min-height: 64px; border: 0; outline: none; background: transparent; color: inherit; font: inherit; }
+.cc-composer-actions { display: flex; justify-content: flex-end; gap: 8px; }
+@keyframes cc-rise { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+@keyframes cc-pulse { 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) { .cc-row, .cc-dot { animation: none; } }
+[data-motion="reduce"] .cc-row, [data-motion="reduce"] .cc-dot { animation: none; }

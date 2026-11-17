@@ -1,7 +1,8 @@
-# Claude Code on the owner's computer, through ACP (proposal)
+# Claude Code on the person's computer, through ACP
 
-Status: proposal for 0.54, waiting for the owner's approval. It is a deliberate
-exception to two `AGENTS.md` limits (no Node runtime, no local-process
+Status: approved by the owner and shipped in 0.54.0
+(`crates/serabot-desktop/src/acp/`, `ui_claude_code.rs`). It is a deliberate,
+narrow exception to two `AGENTS.md` limits (no Node runtime, no local-process
 runner without a security design). This document is that design.
 
 ## Why
@@ -21,31 +22,41 @@ can drive natively.
 
 - **Where it runs:** the Windows desktop only, never the server. The server
   never sees the Claude token; Anthropic sees genuine Claude Code.
-- **What it is:** a desktop "Claude Code (this computer)" agent in the chat
-  picker, not a provider for server bots. ACP is agent-level (Claude Code runs
+- **What it is:** a desktop **Claude Code** page (icon rail), not a provider
+  for server bots. ACP is agent-level (Claude Code runs
   its own loop and tools), so it cannot be a raw model behind SeraBot's turn
   loop.
-- **Prerequisites the owner installs:** Node.js and a signed-in Claude Code
-  (`claude` login). SeraBot bundles neither. The card checks both and says
-  what is missing.
-- **Launch:** one fixed command, `npx -y @agentclientprotocol/claude-agent-acp@<pinned>`,
-  no shell, no model-chosen arguments. The child gets a cleared environment
-  (PATH, HOME/USERPROFILE, APPDATA, the Claude config dir), runs in its own
-  process group and is killed with the chat.
-- **Workspace:** the owner picks one folder per chat (the existing local
-  folders contract). ACP `cwd` is that folder; the client refuses `fs/*`
-  requests outside it.
-- **Permissions:** every ACP `session/request_permission` becomes a SeraBot
-  approval card (allow once / deny). Nothing is auto-allowed; there is no
-  "always" in the first version.
-- **Terminal:** ACP terminal capability off in the first version; Claude Code
-  then uses its own sandboxed tools, still behind the permission cards.
+- **Prerequisites:** Node.js 22 or newer, installed by the person (the card
+  offers `winget install OpenJS.NodeJS.LTS` in a console window). SeraBot does
+  not bundle Node. The adapter ships Claude Code itself.
+- **Sign-in:** Claude Code's own, run by the adapter in a console window
+  (`npx -y <adapter> --cli auth login --claudeai`). The token stays in Claude
+  Code's files; SeraBot never reads them. A session that answers ACP
+  `auth_required` shows **Sign in to Claude** and **Try again**.
+- **Launch:** one fixed command, `npx -y @agentclientprotocol/claude-agent-acp@0.100.0`,
+  no shell, no model-chosen arguments, no window. The child gets an allowlist
+  of environment variables (PATH, the profile folders, temp, proxy settings,
+  `CLAUDE_CONFIG_DIR`); API keys and tokens in the desktop's environment are
+  not passed. Stopping closes its input and ends the whole process tree
+  (`taskkill /T`).
+- **Workspace:** the person picks one of their allowed local folders
+  (Settings, Local folders). ACP `cwd` is that folder. File requests the agent
+  sends to the client (`fs/read_text_file`, `fs/write_text_file`) are answered
+  only inside it, with the local-folder checks (no `..`, no links or
+  junctions, no credential-like names, no program files, writes only in a
+  read-write folder, 1 MiB reads, 256 KiB writes). Claude Code's own tools
+  work in that folder under its default permission mode, which asks before
+  edits and commands.
+- **Permissions:** every ACP `session/request_permission` becomes a card with
+  the agent's one-time choices and **Decline**. "Always" choices are never
+  shown and are refused if sent back. Stop answers open requests "cancelled".
+- **Terminal:** the ACP terminal capability is not offered.
 - **Transcript:** streamed `session/update` chunks (text, thinking, tool
-  calls, plans) render with the existing chat cards. The chat is stored on the
-  owner's computer; mirroring it to the server is a later, opt-in step and
-  passes the blocklist like any outgoing text.
-- **Who:** the owner's desktop only. Members use it on their own computers
-  with their own Claude login, or not at all.
+  calls, plans) render on the page. It lives in the desktop's memory only and
+  ends with the app; mirroring it to the server would be a later, opt-in step
+  that passes the blocklist like any outgoing text.
+- **Who:** whoever is signed in to that desktop, on their own computer, with
+  their own Claude login. The server neither offers nor sees it.
 
 ## Out of scope
 

@@ -189,11 +189,14 @@ pub enum Section {
     /// Connectors, Composio and plugins in one place (v0.38): tabs for
     /// Installed, Marketplace and Composio.
     Integrations,
+    /// Claude Code on this computer through ACP (0.54).
+    ClaudeCode,
 }
 
 impl Section {
-    pub const NAV: [Self; 11] = [
+    pub const NAV: [Self; 12] = [
         Self::Chat,
+        Self::ClaudeCode,
         Self::Conversations,
         Self::Browser,
         Self::Tasks,
@@ -220,6 +223,7 @@ impl Section {
             Self::Logs => "Logs",
             Self::Workflows => "Workflows",
             Self::Integrations => "Integrations",
+            Self::ClaudeCode => "Claude Code",
         }
     }
 }
@@ -5019,7 +5023,11 @@ impl Session {
                     None
                 }
             }
-            Section::Browser | Section::Vault | Section::Usage | Section::Settings => None,
+            Section::Browser
+            | Section::Vault
+            | Section::Usage
+            | Section::Settings
+            | Section::ClaudeCode => None,
         }
     }
 

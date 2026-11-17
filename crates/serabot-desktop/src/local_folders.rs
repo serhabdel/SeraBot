@@ -463,7 +463,7 @@ fn handle_in_worker(folders: Vec<LocalFolder>, request: LocalRequest) -> Result<
         }
     }
 }
-fn write(root: &Path, rel: &str, content: &str) -> Result<String, String> {
+pub(crate) fn write(root: &Path, rel: &str, content: &str) -> Result<String, String> {
     if content.len() as u64 > MAX_FILE_BYTES {
         return Err("content is larger than 256 KiB".into());
     }
