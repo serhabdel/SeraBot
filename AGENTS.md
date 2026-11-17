@@ -100,4 +100,4 @@ OVH is read-only unless the owner explicitly authorizes an additive installation
 - `crates/serabot-desktop/assets/system.css` (shared cards, stat tiles, segmented controls, skeletons, list motion; loaded last) and `pages-work.css`, `pages-data.css`, `pages-connect.css` (per-area page polish) (0.53).
 - `crates/serabot/src/model_router.rs` `RouterHandle` — the live, swappable model router shared by the runtime and the delegation, team and bot tools; console provider saves rebuild it (0.53).
 - `crates/serabot-desktop/src/runs.rs`, `chat_compose.rs`, `chat_failure.rs`, `chat_cards.rs`, `ui/chat_feed_view.rs`, `assets/runs.css` — runs sidebar, composer queue, failed and wait cards, virtualized feed (0.50).
-- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.53.0.
+- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.53.1.

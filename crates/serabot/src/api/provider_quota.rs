@@ -293,12 +293,13 @@ impl QuotaReader for AntigravityQuota {
             .get("project_id")
             .and_then(Value::as_str)
             .unwrap_or("");
+        let version = crate::cloud_code::antigravity_version(None).await;
         Ok(crate::cloud_code::read_quota(
             &self.http,
             &credential.api_key,
             project,
             &self.origins,
-            None,
+            Some(&version),
         )
         .await)
     }

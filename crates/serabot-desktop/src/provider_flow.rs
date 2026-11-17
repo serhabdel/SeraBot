@@ -232,11 +232,19 @@ pub struct RedirectPlan {
     pub path: &'static str,
 }
 
-/// The loopback redirect for a provider kind. Antigravity prefers 51121;
-/// Claude's registration allows only `localhost:54545/callback` and Codex's
-/// only `localhost:1455/auth/callback`; OpenRouter documents `localhost`.
+/// The loopback redirect for a provider kind. Antigravity's registration is
+/// `localhost:51121/oauth-callback` (51121 preferred, any free port after it,
+/// exactly as the owner's HielCowork client signs in; Google matches the host
+/// literally, so `127.0.0.1` is refused there). Claude's registration allows
+/// only `localhost:54545/callback` and Codex's only
+/// `localhost:1455/auth/callback`; OpenRouter documents `localhost`.
 pub fn redirect_plan(kind: &str) -> RedirectPlan {
     match kind {
+        "google-antigravity" => RedirectPlan {
+            fixed_port: None,
+            host: "localhost",
+            path: oauth::CALLBACK_PATH,
+        },
         "anthropic" => RedirectPlan {
             fixed_port: Some(oauth::CLAUDE_PORT),
             host: "localhost",
@@ -301,20 +309,20 @@ pub fn run_browser(
     open: &dyn Fn(&str) -> bool,
 ) -> FlowEnd {
     let plan = redirect_plan(kind);
-    let bound = match plan.fixed_port {
-        Some(port) => oauth::bind_loopback_fixed(port).map(|listener| (listener, port)),
-        None => oauth::bind_loopback(),
-    };
-    let Ok((listener, port)) = bound else {
+    // A `localhost` redirect may arrive on `::1` or `127.0.0.1`, whichever the
+    // browser tries first: listen on both where the system has IPv6.
+    let Ok(loopback) = oauth::bind_loopback_both(plan.fixed_port) else {
         return FlowEnd::Failed(match plan.fixed_port {
             Some(port) => format!(
                 "Could not listen on port {port} for the redirect. Close what uses it, then try again."
             ),
-            None => "Could not listen on 127.0.0.1 for the redirect.".to_owned(),
+            None => {
+                "Could not listen on this computer's loopback address for the redirect.".to_owned()
+            }
         });
     };
     let pkce = oauth::new_pkce();
-    let redirect = plan.uri(port);
+    let redirect = plan.uri(loopback.port);
     let started = match client.provider_signin_start(
         provider,
         &serde_json::json!({
@@ -332,8 +340,8 @@ pub fn run_browser(
     let wait = Duration::from_secs(started.expires_in.clamp(30, 600));
     let flow_id = started.flow_id.clone();
     report(FlowMsg::Started { started, opened });
-    let code = match oauth::wait_for_callback_cancellable(
-        &listener,
+    let code = match oauth::wait_for_callback_any(
+        &loopback.listeners,
         &expected_state,
         plan.path,
         wait,
@@ -342,7 +350,7 @@ pub fn run_browser(
         Ok(code) => code,
         Err(error) => return oauth_end(error),
     };
-    drop(listener);
+    drop(loopback);
     match client.provider_signin_complete(provider, &flow_id, &code, &redirect, &pkce.verifier) {
         Ok(done) => FlowEnd::Done {
             account_id: done.account_id,
@@ -556,7 +564,7 @@ mod tests {
     fn redirects_follow_each_providers_registration() {
         let google = redirect_plan("google-antigravity");
         assert_eq!(google.fixed_port, None, "51121 is preferred, not required");
-        assert_eq!(google.uri(51121), "http://127.0.0.1:51121/oauth-callback");
+        assert_eq!(google.uri(51121), "http://localhost:51121/oauth-callback");
         let claude = redirect_plan("anthropic");
         assert_eq!(claude.fixed_port, Some(54545));
         assert_eq!(claude.uri(54545), "http://localhost:54545/callback");

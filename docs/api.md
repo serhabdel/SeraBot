@@ -576,7 +576,9 @@ returned; no restart is needed.
 
 - `POST .../oauth/start` — `google-antigravity` (PKCE): body
   `{"challenge","state","redirect_uri"}` where `redirect_uri` is the console's
-  loopback listener (`http://127.0.0.1:<port>/oauth-callback`). Returns
+  loopback listener (`http://localhost:<port>/oauth-callback` since 0.53.1, as
+  the Antigravity registration expects; the `127.0.0.1` spelling is still
+  accepted). Returns
   `{"flow":"pkce","url":"https://accounts.google.com/...","flow_id"}`. `muse-code`
   (device flow): send `{}`. The server polls in the background (bounded to 15
   minutes) and returns `{"flow":"device","url","code","flow_id","expires_in","interval"}`;
