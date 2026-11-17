@@ -168,6 +168,9 @@ impl std::fmt::Debug for LlmClient {
     }
 }
 
+/// The longest one model call may take while the provider keeps sending.
+const MAX_CALL: Duration = Duration::from_secs(15 * 60);
+
 impl LlmClient {
     pub fn new(
         base_url: impl Into<String>,
@@ -180,8 +183,16 @@ impl LlmClient {
         if api_key.trim().is_empty() {
             return Err(SeraError::Config("LLM credential is missing".into()));
         }
+        // `timeout_secs` is how long the provider may go quiet, not how long
+        // an answer may take: streamed thinking answers routinely run past
+        // it while sending all along (HielCowork never cuts an open stream).
+        // A whole call is still bounded, at the larger of a quarter hour and
+        // the configured value.
+        let idle = Duration::from_secs(timeout_secs.max(1));
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout_secs.max(1)))
+            .read_timeout(idle)
+            .connect_timeout(idle.min(Duration::from_secs(30)))
+            .timeout(idle.max(MAX_CALL))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| SeraError::External(error.to_string()))?;
@@ -1213,12 +1224,12 @@ impl LlmClient {
         &self,
         url: &str,
         body: &Value,
-        model: &str,
+        _model: &str,
         stream: bool,
     ) -> Result<CloudPost> {
         let version = cloud_code::antigravity_version(self.cloud_version.as_deref()).await;
         let mut key = self.bearer();
-        let mut request = self
+        let request = self
             .http
             .post(url)
             .bearer_auth(&key)
@@ -1236,9 +1247,8 @@ impl LlmClient {
                 },
             )
             .json(body);
-        if cloud_code::requests_interleaved_thinking(model) {
-            request = request.header("anthropic-beta", "interleaved-thinking-2025-05-14");
-        }
+        // HielCowork sends no `anthropic-beta` header to Cloud Code, and its
+        // chats work; the model id alone selects thinking.
         let response = request.send().await;
         key.zeroize();
         let response = match response {

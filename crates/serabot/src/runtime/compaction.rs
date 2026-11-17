@@ -336,7 +336,7 @@ impl Runtime {
             if state.handoff.is_none() && state.team.is_none() {
                 let _ = self
                     .notifier
-                    .send_text(&user, conversation_id, "Waiting for a model.")
+                    .send_text(&user, conversation_id, &waiting_notice(task, until))
                     .await;
             }
         }
@@ -552,5 +552,51 @@ mod tests {
             text(Role::Assistant, "hello"),
         ];
         assert!(fold_range(&messages).is_none());
+    }
+}
+
+/// "Waiting for a model" with when it is back and the failure that put it on
+/// hold, so a parked chat never just spins.
+fn waiting_notice(task: &Task, until: chrono::DateTime<Utc>) -> String {
+    let mut text = format!(
+        "Waiting for a model: every route is on hold until {} UTC.",
+        until.format("%H:%M")
+    );
+    if let Some(error) = task
+        .last_error
+        .as_deref()
+        .map(str::trim)
+        .filter(|error| !error.is_empty())
+    {
+        let error: String = error.chars().take(300).collect();
+        text.push_str(&format!(" Last error: {error}."));
+    }
+    text.push_str(" Press Stop to give up.");
+    text
+}
+
+#[cfg(test)]
+mod waiting_notice_tests {
+    use super::*;
+
+    #[test]
+    fn the_waiting_line_names_the_time_and_the_last_error() {
+        let until = chrono::DateTime::parse_from_rfc3339("2026-11-17T14:05:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut task: Task = serde_json::from_value(serde_json::json!({
+            "id": "t", "kind": "turn", "bot": "main", "payload": {}, "status": "running",
+            "priority": 0, "attempts": 1, "max_attempts": 3,
+            "run_after": "2026-11-17T14:00:00Z", "lease_until": null, "worker_id": null,
+            "fencing_token": 1, "uncertain": false,
+            "last_error": "Cloud Code request failed with status 429: quota",
+            "created_at": "2026-11-17T14:00:00Z", "updated_at": "2026-11-17T14:00:00Z",
+            "user_id": "u"
+        }))
+        .unwrap();
+        let line = waiting_notice(&task, until);
+        assert!(line.contains("14:05 UTC") && line.contains("status 429: quota"));
+        task.last_error = None;
+        assert!(!waiting_notice(&task, until).contains("Last error"));
     }
 }

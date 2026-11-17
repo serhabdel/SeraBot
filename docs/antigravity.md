@@ -95,7 +95,7 @@ The turn loop still waits for one assistant message. SeraBot buffers the SSE str
 
 The request is a Cloud Code envelope: `model`, optional `project`, `request.contents`, `systemInstruction`, sanitized tool declarations, and `generationConfig`. Tool schemas are reduced to the uppercase protobuf subset Cloud Code accepts (`OBJECT`, `STRING`, and the other scalar types). Empty objects gain a placeholder property. Unsupported JSON Schema keywords are stripped.
 
-Function-call parts send the `thoughtSignature` Google gave that call, or `skip_thought_signature_validator` when there is none (see Wire details). `claude` models whose ids contain `thinking` also send `anthropic-beta: interleaved-thinking-2025-05-14`; the reference client's current code does not, so this stays only until a fixture shows it is unnecessary. A model id is sent as configured. Since 0.53.1, when Google answers plain `claude-opus-5-5` with a 400 or 404, the request is sent once more as `claude-opus-5-5-thinking` (the id Cloud Code serves it under), as HielCowork does; no other id is rewritten, and a second refusal is reported as it is.
+Function-call parts send the `thoughtSignature` Google gave that call, or `skip_thought_signature_validator` when there is none (see Wire details). Since 0.53.1 no `anthropic-beta` header is sent, as in HielCowork. A model id is sent as configured. Since 0.53.1, when Google answers plain `claude-opus-5-5` with a 400 or 404, the request is sent once more as `claude-opus-5-5-thinking` (the id Cloud Code serves it under), as HielCowork does; no other id is rewritten, and a second refusal is reported as it is.
 
 ## Deferred
 

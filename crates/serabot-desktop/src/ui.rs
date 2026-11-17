@@ -94,6 +94,7 @@ const CSS_PAGES: &str = concat!(
     include_str!("../assets/pages-work.css"),
     include_str!("../assets/pages-data.css"),
     include_str!("../assets/pages-connect.css"),
+    include_str!("../assets/claude-code.css"),
     include_str!("../assets/system.css")
 );
 
@@ -825,6 +826,7 @@ fn App() -> Element {
 pub(crate) fn Icon(name: String, #[props(default = 20)] size: u32) -> Element {
     let path = match name.as_str() {
         "chat" => "M4 5h16v11H8l-4 4V5z",
+        "code" => "M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16",
         "search" => "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14zM20 20l-4-4",
         "plus" => "M12 5v14M5 12h14",
         "send" => "M4 12l16-8-6 16-2-6-8-2z",

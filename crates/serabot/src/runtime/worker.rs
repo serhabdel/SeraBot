@@ -328,12 +328,13 @@ impl Runtime {
                 let payload: Option<TurnPayload> =
                     serde_json::from_value(task.payload.clone()).ok();
                 if let Some(payload) = payload.filter(|_| !reported) {
+                    let retrying = !permanent && task.attempts < task.max_attempts;
                     let _ = self
                         .notifier
                         .send_text(
                             &user,
                             &payload.conversation_id,
-                            "This request failed. The details are available in the audit log.",
+                            &failure_notice(&error, retrying),
                         )
                         .await;
                 }
@@ -392,5 +393,46 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(watch.is_finished());
+    }
+}
+
+/// What the chat says when a turn fails: the status and failure type of a
+/// model call (never the provider's body), and whether the turn runs again.
+pub(super) fn failure_notice(error: &SeraError, retrying: bool) -> String {
+    let reason = match error {
+        SeraError::Upstream { message, code, .. } => {
+            format!(
+                "The model call failed: {message} ({}).",
+                code.replace('_', " ")
+            )
+        }
+        _ => "This request failed.".to_owned(),
+    };
+    if retrying {
+        format!("{reason} Trying again shortly; press Stop to give up.")
+    } else {
+        format!("{reason} The details are available in the audit log.")
+    }
+}
+
+#[cfg(test)]
+mod failure_notice_tests {
+    use super::failure_notice;
+    use crate::error::SeraError;
+
+    #[test]
+    fn a_provider_failure_says_why_and_whether_it_runs_again() {
+        let upstream = SeraError::upstream(
+            429,
+            "rate_limited",
+            "Cloud Code request failed with status 429",
+        );
+        let notice = failure_notice(&upstream, true);
+        assert!(notice.contains("status 429 (rate limited)"));
+        assert!(notice.contains("Trying again shortly"));
+        let other = SeraError::Internal("synthetic internal detail".into());
+        let notice = failure_notice(&other, false);
+        assert!(!notice.contains("synthetic internal detail"));
+        assert!(notice.contains("audit log"));
     }
 }

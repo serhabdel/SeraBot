@@ -12,6 +12,8 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
     let undo = use_signal(|| Option::<String>::None);
     // The topbar's search button and the chat view's find bar share this flag.
     use_context_provider(|| ChatFindOpen(Signal::new(false)));
+    // Claude Code on this computer keeps running while other pages are open.
+    crate::ui_claude_code::use_claude_code_provider();
     // A sign-in the session starts by itself (right after a save, or when an
     // error asks for one) opens its sheet here.
     let mut overlay_for_signin = overlay;
@@ -66,6 +68,7 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
                         Section::Workflows => rsx! { crate::ui_workflows::WorkflowsView { session } },
                         Section::Integrations => rsx! { crate::ui_integrations::IntegrationsView { session } },
                         Section::Settings => rsx! { SettingsView { session } },
+                        Section::ClaudeCode => rsx! { crate::ui_claude_code::ClaudeCodeView { session } },
                     }}
                 }
                 }
@@ -142,8 +145,9 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
 pub(super) fn IconRail(session: Signal<Session>, toast: Signal<Option<(String, bool)>>) -> Element {
     let mut session = session;
     let section = session.read().section;
-    let destinations: [(Section, &str, &str); 10] = [
+    let destinations: [(Section, &str, &str); 11] = [
         (Section::Chat, "chat", "Chats"),
+        (Section::ClaudeCode, "code", "Claude Code"),
         (Section::Browser, "globe", "Browser"),
         (Section::Tasks, "list", "Tasks"),
         (Section::Memory, "memory", "Memory"),

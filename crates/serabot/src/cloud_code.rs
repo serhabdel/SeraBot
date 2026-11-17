@@ -304,11 +304,6 @@ pub fn validate_project_id(kind: &str, project_id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn requests_interleaved_thinking(model: &str) -> bool {
-    let model = model.to_ascii_lowercase();
-    model.contains("claude") && model.contains("thinking")
-}
-
 pub fn cloud_code_origins(base: &str) -> Result<Vec<String>> {
     let endpoint = validate_base_url(base)?;
     let parsed = url::Url::parse(&endpoint)

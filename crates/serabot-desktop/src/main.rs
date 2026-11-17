@@ -9,6 +9,8 @@ mod ui_browser;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_cards;
 #[cfg(any(windows, feature = "ui-check"))]
+mod ui_claude_code;
+#[cfg(any(windows, feature = "ui-check"))]
 mod ui_composio;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_connectors;

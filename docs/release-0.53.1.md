@@ -34,6 +34,29 @@ server refused.
   being dropped from it, as HielCowork appends its presets: Google's list leaves
   out ids that still answer. Malformed and skipped legacy ids stay refused.
 
+## A chat never just spins
+
+- Model calls now time out when the provider goes quiet for the configured
+  time (default 120 s), not when an answer takes longer than that. A long
+  thinking answer from Claude Opus through Antigravity used to be cut at
+  120 s, then tried on the next Google host, and the chat spun for minutes. A
+  whole call is still bounded at 15 minutes.
+- When a model call fails, the chat says so at once with the status and the
+  failure type (for example "status 429 (rate limited)"), and whether the
+  turn will try again. The provider's reply body is still never shown: it can
+  echo credentials.
+- A turn waiting for a model on hold says until when, and the last error.
+- No `anthropic-beta` header is sent to Cloud Code, as in HielCowork.
+
+## Claude plan sign-in
+
+Anthropic accepts a Claude plan sign-in only inside its own apps, so the
+server's direct calls with it end up cooling down. SeraBot will not pretend to
+be Claude Code. The supported way, running the real Claude Code on the owner's
+computer through the Agent Client Protocol, is proposed in
+`docs/specs/claude-code-acp.md` for 0.54. Until then use a Claude API key, or
+the Claude models offered through Antigravity.
+
 ## Not copied
 
 HielCowork's Google client secret is not copied into this public repository.

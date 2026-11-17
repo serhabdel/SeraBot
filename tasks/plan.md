@@ -179,6 +179,14 @@ failure and wait cards, plus a motion/accessibility pass. No live provider was
 used and the desktop was not visually verified on a device. B7 worker counts
 above 2 are gated on running the load fixture on the target host.
 
+## Status after 0.54.0 (Claude Code through ACP)
+
+0.54.0 adds a desktop Claude Code page that runs the real Claude Code through
+the Agent Client Protocol with the person's own Claude login, one allowed
+folder and a permission card for every edit or command, and finishes the
+0.53.1 model-call fixes (idle timeouts, visible failures). Synthetic agent
+tests and a static render only; not yet run against the real adapter.
+
 ## Status after 0.53.1 (Antigravity parity with HielCowork)
 
 0.53.1 moves the Antigravity redirect to `localhost` with IPv4 and IPv6
