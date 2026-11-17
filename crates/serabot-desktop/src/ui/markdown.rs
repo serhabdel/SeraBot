@@ -185,22 +185,25 @@ pub(super) fn markdown_content_hash(content: &str) -> u64 {
 
 /// Parsed markdown blocks keyed by message id and content hash, with bounded
 /// FIFO eviction so streaming replies do not flush the entire cache at once.
-pub(super) fn parse_markdown_cached(message_id: &str, content: &str) -> Vec<MdBlock> {
+pub(super) fn parse_markdown_cached(
+    message_id: &str,
+    content: &str,
+) -> std::sync::Arc<Vec<MdBlock>> {
     use std::collections::{HashMap, VecDeque};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
     #[derive(Default)]
     struct MarkdownCache {
         order: VecDeque<(String, u64)>,
-        entries: HashMap<(String, u64), Vec<MdBlock>>,
+        entries: HashMap<(String, u64), Arc<Vec<MdBlock>>>,
     }
     static CACHE: OnceLock<Mutex<MarkdownCache>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(MarkdownCache::default()));
     let key = (message_id.to_owned(), markdown_content_hash(content));
     let mut guard = cache.lock().expect("markdown cache");
     if let Some(blocks) = guard.entries.get(&key) {
-        return blocks.clone();
+        return Arc::clone(blocks);
     }
-    let blocks = parse_markdown_blocks(content);
+    let blocks = Arc::new(parse_markdown_blocks(content));
     while guard.entries.len() >= MD_CACHE_MAX {
         if let Some(oldest) = guard.order.pop_front() {
             guard.entries.remove(&oldest);
@@ -210,7 +213,7 @@ pub(super) fn parse_markdown_cached(message_id: &str, content: &str) -> Vec<MdBl
         }
     }
     guard.order.push_back(key.clone());
-    guard.entries.insert(key, blocks.clone());
+    guard.entries.insert(key, Arc::clone(&blocks));
     blocks
 }
 
@@ -902,7 +905,7 @@ pub fn MarkdownBody(message_id: String, content: String) -> Element {
     let blocks = use_memo(move || parse_markdown_cached(message_id.as_str(), content.as_str()));
     rsx! {
         div { class: "md-body",
-            for (idx, block) in blocks().into_iter().enumerate() {
+            for (idx, block) in blocks().iter().cloned().enumerate() {
                 {match block {
                     MdBlock::Heading { level, text } => match level {
                         1 => rsx! { h1 { key: "{idx}", class: "md-h1", InlineMarkdown { text } } },
@@ -1204,7 +1207,7 @@ mod tests {
         for idx in 0..=MD_CACHE_MAX + 5 {
             let id = format!("cache-test-{idx}");
             let parsed = parse_markdown_cached(&id, &format!("msg {idx}"));
-            assert_eq!(parsed, vec![MdBlock::Paragraph(format!("msg {idx}"))]);
+            assert_eq!(*parsed, vec![MdBlock::Paragraph(format!("msg {idx}"))]);
         }
     }
 }

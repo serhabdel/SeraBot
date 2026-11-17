@@ -204,3 +204,11 @@ never merge without the owner's OK.
 - [x] Claude Code page in the desktop; the agent keeps running across pages.
 - [ ] Owner: run it once on Windows against the real adapter (none claimed).
 - [ ] Later: keep transcripts across restarts; images and @-file mentions in prompts.
+
+## Release 0.55.0 (next) — bot-integrated Claude Agent, Antigravity parity, chat responsiveness, visual polish
+
+- [x] Remove standalone `Section::ClaudeCode` tab from `IconRail` and `Shell`; integrate local Claude Code ACP mode directly into bot chats (`ClaudeAgentBotView`, Topbar toggle, and Bot Settings).
+- [x] Antigravity provider parity with Hiel-Cowork: attach runtime `loadCodeAssist`/`onboardUser` project discovery for default/non-member accounts when `project_id` is empty, continue catalog fallback on HTTP 400, use `AGY_CLIENT_ID` consistently in `authorize_url`/`exchange_code`, make SSE parsing resilient to non-JSON/bare lines, add empty-turns fallback, and subtract `cachedContentTokenCount`.
+- [x] Chat UI freeze & speed fixes: skip `session.with_mut` on idle ticks via `Session::has_tick_work()`, decouple composer typing from root `Session` signal, expand `Worker` queue to 64 slots with `0ms` request gap, move render-time signal resets to `use_effect`, and wrap `MarkdownCache` entries in `Arc`.
+- [x] Visual & creative design upgrade in `assets/system.css` and `assets/claude-code.css`.
+- [ ] Owner: live verification of Antigravity provider and bot-integrated Claude Agent (ACP) on Windows.

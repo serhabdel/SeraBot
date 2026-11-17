@@ -1206,7 +1206,8 @@ impl LlmClient {
                     CloudPost::NotFound => last_error = Some(catalog_status_error(404)),
                     CloudPost::Retryable(error) => last_error = Some(catalog_retag(error)),
                     CloudPost::SessionLimited => last_error = Some(catalog_status_error(400)),
-                    CloudPost::BadRequest(error) | CloudPost::Failed(error) => {
+                    CloudPost::BadRequest(error) => last_error = Some(catalog_retag(error)),
+                    CloudPost::Failed(error) => {
                         return Err(catalog_retag(error));
                     }
                     CloudPost::Transport => {}

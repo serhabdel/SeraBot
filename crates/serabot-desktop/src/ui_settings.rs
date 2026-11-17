@@ -369,6 +369,26 @@ fn BotForm(session: Signal<Session>, id: String) -> Element {
                 }
                 crate::ui_bots::RouteEditor { session, bot: id.clone() }
                 div { class: "field",
+                    span { class: "field-label", "Local Claude Agent (ACP)" }
+                    {
+                        let acp_on = session.read().bot_uses_claude_agent(&id);
+                        let bot_for_acp = id.clone();
+                        rsx! {
+                            div { class: "row",
+                                button {
+                                    class: if acp_on { "btn primary sm" } else { "btn ghost sm" },
+                                    r#type: "button",
+                                    "aria-pressed": if acp_on { "true" } else { "false" },
+                                    onclick: move |_| session.write().toggle_bot_claude_agent(&bot_for_acp),
+                                    Icon { name: "code", size: 14 }
+                                    span { if acp_on { "Active in this bot chat" } else { "Use local Claude Code agent" } }
+                                }
+                            }
+                            span { class: "hint", "Runs Claude Code on this computer in one allowed folder using your own Claude login." }
+                        }
+                    }
+                }
+                div { class: "field",
                     label { class: "field-label", r#for: "bot-profile", "Browser profile" }
                     select {
                         id: "bot-profile",

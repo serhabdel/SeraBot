@@ -54,7 +54,7 @@ struct FolderStatsChannel {
     receiver: std::sync::mpsc::Receiver<(String, String, crate::local_fs::FolderStats)>,
 }
 
-pub const REQUEST_GAP: Duration = Duration::from_millis(60);
+pub const REQUEST_GAP: Duration = Duration::from_millis(0);
 pub const POLL_GAP: Duration = Duration::from_millis(750);
 pub const POLL_SAFETY: Duration = Duration::from_secs(4);
 
@@ -189,14 +189,11 @@ pub enum Section {
     /// Connectors, Composio and plugins in one place (v0.38): tabs for
     /// Installed, Marketplace and Composio.
     Integrations,
-    /// Claude Code on this computer through ACP (0.54).
-    ClaudeCode,
 }
 
 impl Section {
-    pub const NAV: [Self; 12] = [
+    pub const NAV: [Self; 11] = [
         Self::Chat,
-        Self::ClaudeCode,
         Self::Conversations,
         Self::Browser,
         Self::Tasks,
@@ -223,7 +220,6 @@ impl Section {
             Self::Logs => "Logs",
             Self::Workflows => "Workflows",
             Self::Integrations => "Integrations",
-            Self::ClaudeCode => "Claude Code",
         }
     }
 }
@@ -734,6 +730,8 @@ pub struct Session {
     pending_open: Option<PendingOpen>,
     /// Folders on this PC the bots may use (default empty = off). Device-local.
     pub local_folders: Vec<crate::local_folders::LocalFolder>,
+    /// Bots currently switched to local Claude Agent (ACP) mode in this desktop session.
+    pub claude_agent_bots: std::collections::BTreeSet<String>,
     /// "This PC" numbers for the Usage page, gathered on a worker thread.
     pub pc: crate::pc_stats::PcMonitor,
     local_agent: Option<(crate::local_folders::LocalAgent, usize)>,
@@ -946,6 +944,7 @@ impl Session {
             local_folders: creds::settings_dir()
                 .map(|dir| crate::local_folders::load(&dir))
                 .unwrap_or_default(),
+            claude_agent_bots: std::collections::BTreeSet::new(),
             pc: crate::pc_stats::PcMonitor::new(),
             local_agent: None,
             local_notice: None,
@@ -3092,6 +3091,18 @@ impl Session {
         self.local_agent.is_some()
     }
 
+    /// True when this bot is currently using the local Claude Code ACP agent in chat.
+    pub fn bot_uses_claude_agent(&self, bot_id: &str) -> bool {
+        self.claude_agent_bots.contains(bot_id)
+    }
+
+    /// Toggle local Claude Code ACP mode for a bot in this desktop session.
+    pub fn toggle_bot_claude_agent(&mut self, bot_id: &str) {
+        if !self.claude_agent_bots.remove(bot_id) {
+            self.claude_agent_bots.insert(bot_id.to_owned());
+        }
+    }
+
     /// Picked files still waiting to be uploaded.
     pub fn upload_pending(&self) -> usize {
         self.upload_queue.len()
@@ -3510,6 +3521,41 @@ impl Session {
         self.route_editor.error.hash(&mut h);
         self.route_editor.notice.hash(&mut h);
         h.finish()
+    }
+
+    /// True when `tick()` has pending completions, due timers, or active flows.
+    /// Allows the UI coroutine to skip `session.with_mut` (and full-tree redraws)
+    /// when the app is idle.
+    pub fn has_tick_work(&self) -> bool {
+        let now = Instant::now();
+        self.worker.as_ref().is_some_and(Worker::has_completion)
+            || self.events_active
+            || self.scheduled.as_ref().is_some_and(|(at, _)| now >= *at)
+            || self.reconnect_at.is_some_and(|at| now >= at)
+            || (self.link_down
+                && self.pending.is_none()
+                && self.link_retry_at.is_some_and(|at| now >= at))
+            || (!self.backlog.is_empty() && self.pending.is_none())
+            || !self.queue.is_empty()
+            || self
+                .state
+                .task
+                .as_ref()
+                .is_some_and(|task| !task.status.terminal())
+            || self.sign_in.cancel.is_some()
+            || self.accounts_ui.pending_signin.is_some()
+            || self.downloading
+            || self.download_rx.is_some()
+            || self.folder_pick_rx.is_some()
+            || self.folder_stats_wanted
+            || self.pick_rx.is_some()
+            || self.stop_queued
+            || !self.upload_queue.is_empty()
+            || self.panel.open()
+            || self.panel.session_active()
+            || self.bot_settings.open
+            || self.route_editor.bot.is_some()
+            || (self.pending.is_none() && self.missing_section_op().is_some())
     }
 
     /// Called from the UI timer. Drains completions and advances scheduled work.
@@ -5023,11 +5069,7 @@ impl Session {
                     None
                 }
             }
-            Section::Browser
-            | Section::Vault
-            | Section::Usage
-            | Section::Settings
-            | Section::ClaudeCode => None,
+            Section::Browser | Section::Vault | Section::Usage | Section::Settings => None,
         }
     }
 
@@ -7003,6 +7045,11 @@ mod backlog_tests {
         session.start_request(Operation::ListTasks);
         session.start_request(Operation::TaskPrefs);
         session.start_request(Operation::TaskSyncStatus);
+        for idx in 0..65 {
+            session.start_request(Operation::ListBotChats {
+                bot: format!("bot-{idx}"),
+            });
+        }
         session.start_request(Operation::Workflows);
         assert!(session.state.error.is_none(), "{:?}", session.state.error);
         assert!(!session.backlog.is_empty(), "overflow must wait, not fail");

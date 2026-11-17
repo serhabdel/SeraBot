@@ -68,7 +68,6 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
                         Section::Workflows => rsx! { crate::ui_workflows::WorkflowsView { session } },
                         Section::Integrations => rsx! { crate::ui_integrations::IntegrationsView { session } },
                         Section::Settings => rsx! { SettingsView { session } },
-                        Section::ClaudeCode => rsx! { crate::ui_claude_code::ClaudeCodeView { session } },
                     }}
                 }
                 }
@@ -145,9 +144,8 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
 pub(super) fn IconRail(session: Signal<Session>, toast: Signal<Option<(String, bool)>>) -> Element {
     let mut session = session;
     let section = session.read().section;
-    let destinations: [(Section, &str, &str); 11] = [
+    let destinations: [(Section, &str, &str); 10] = [
         (Section::Chat, "chat", "Chats"),
-        (Section::ClaudeCode, "code", "Claude Code"),
         (Section::Browser, "globe", "Browser"),
         (Section::Tasks, "list", "Tasks"),
         (Section::Memory, "memory", "Memory"),
@@ -1781,6 +1779,22 @@ pub(super) fn Topbar(
                 span { class: "{pill_class}", role: "status", "{pill_label}" }
             }
             div { class: "chat-header-actions",
+                if let Some(bot) = active_bot.clone() {
+                    {
+                        let acp_on = session.read().bot_uses_claude_agent(&bot);
+                        rsx! {
+                            button {
+                                class: if acp_on { "btn primary sm cc-mode-btn" } else { "btn ghost sm cc-mode-btn" },
+                                r#type: "button",
+                                title: if acp_on { "Switch back to server bot model" } else { "Run local Claude Code agent (ACP) in this bot chat" },
+                                "aria-pressed": if acp_on { "true" } else { "false" },
+                                onclick: move |_| session.write().toggle_bot_claude_agent(&bot),
+                                Icon { name: "code", size: 13 }
+                                span { if acp_on { "Claude Agent: On" } else { "Claude Agent" } }
+                            }
+                        }
+                    }
+                }
                 // The member stack belongs to groups and rooms; in a one-to-one
                 // chat it only repeated every enabled bot.
                 if !is_bot_chat {
