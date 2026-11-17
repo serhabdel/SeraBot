@@ -1520,6 +1520,13 @@ pub fn open_provider_client(
                 server_secrets,
                 &profile.oauth_client_id_secret,
             )
+        } else if style == OAuthStyle::RefreshToken {
+            // Antigravity: the same order sign-in uses (age store, then
+            // AGY_CLIENT_ID, then the published id), so refresh matches it.
+            crate::cloud_code::antigravity_client_id(
+                server_secrets,
+                &profile.oauth_client_id_secret,
+            )
         } else if profile.oauth_client_id_secret.trim().is_empty() {
             client_id_fallback.unwrap_or("").to_owned()
         } else {

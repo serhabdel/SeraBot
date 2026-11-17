@@ -183,3 +183,12 @@ never merge without the owner's OK.
 - [ ] Settings panes beyond Account and Appearance, the Vault form and import picker: markup polish.
 - [ ] Marketplace "Coming soon" filter label now that live plugins run.
 
+## Release 0.53.1 — Antigravity parity with HielCowork
+
+- [x] Redirect `http://localhost:<port>/oauth-callback`; desktop and CLI listen on `127.0.0.1` and `[::1]`.
+- [x] `AGY_CLIENT_ID` override for sign-in and refresh.
+- [x] Live Hub version (`client_version`, `AGY_VERSION`, updater, pin).
+- [x] One retry of plain `claude-opus-5-5` as `claude-opus-5-5-thinking` on 400/404.
+- [x] Configured Antigravity models join the verified live list.
+- [ ] Owner: sign in to Antigravity once from the desktop and send one chat (none claimed).
+- [ ] Owner: add the `SERABOT_AGY_CLIENT_SECRET` repository secret (or paste it on the AI providers page).

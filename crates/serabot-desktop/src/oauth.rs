@@ -113,6 +113,30 @@ pub fn bind_loopback() -> Result<(TcpListener, u16), OAuthError> {
     Ok((listener, port))
 }
 
+/// The loopback listeners one redirect waits on: IPv4 always, and IPv6 on the
+/// same port when the system has it. A `localhost` redirect reaches whichever
+/// address the browser tries first, so both are served (as the owner's
+/// HielCowork listener does).
+pub struct Loopback {
+    pub listeners: Vec<TcpListener>,
+    pub port: u16,
+}
+
+/// Bind the loopback for a redirect: exactly `fixed` when the registration
+/// names a port, else the documented port first and then any free one. IPv6
+/// is added on the same port when it binds; its absence is not an error.
+pub fn bind_loopback_both(fixed: Option<u16>) -> Result<Loopback, OAuthError> {
+    let (v4, port) = match fixed {
+        Some(port) => (bind_loopback_fixed(port)?, port),
+        None => bind_loopback()?,
+    };
+    let mut listeners = vec![v4];
+    if let Ok(v6) = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)) {
+        listeners.push(v6);
+    }
+    Ok(Loopback { listeners, port })
+}
+
 /// Bind exactly `port` on loopback, with no fallback. Used when the redirect
 /// URI is fixed in a publicly served client metadata document (CIMD), so the
 /// consent response must arrive on that exact port.
@@ -172,32 +196,60 @@ pub fn wait_for_callback_cancellable(
     timeout: Duration,
     cancel: &AtomicBool,
 ) -> Result<Zeroizing<String>, OAuthError> {
-    listener
-        .set_nonblocking(true)
-        .map_err(|_| OAuthError::Listen)?;
+    wait_for_callback_any(
+        std::slice::from_ref(listener),
+        expected_state,
+        callback_path,
+        timeout,
+        cancel,
+    )
+}
+
+/// Like [`wait_for_callback_cancellable`], over several listeners (IPv4 and
+/// IPv6 loopback): the first redirect on any of them ends the wait.
+pub fn wait_for_callback_any(
+    listeners: &[TcpListener],
+    expected_state: &str,
+    callback_path: &str,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> Result<Zeroizing<String>, OAuthError> {
+    if listeners.is_empty() {
+        return Err(OAuthError::Listen);
+    }
+    for listener in listeners {
+        listener
+            .set_nonblocking(true)
+            .map_err(|_| OAuthError::Listen)?;
+    }
     let deadline = Instant::now() + timeout;
     let mut ignored = 0usize;
     loop {
         if cancel.load(Ordering::SeqCst) {
             return Err(OAuthError::Cancelled);
         }
-        match listener.accept() {
-            Ok((stream, _)) => {
-                if let Some(result) = handle_connection(stream, expected_state, callback_path) {
-                    return result;
+        let mut accepted = false;
+        for listener in listeners {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    accepted = true;
+                    if let Some(result) = handle_connection(stream, expected_state, callback_path) {
+                        return result;
+                    }
+                    ignored += 1;
+                    if ignored >= MAX_IGNORED_REQUESTS {
+                        return Err(OAuthError::TooManyRequests);
+                    }
                 }
-                ignored += 1;
-                if ignored >= MAX_IGNORED_REQUESTS {
-                    return Err(OAuthError::TooManyRequests);
-                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return Err(OAuthError::Listen),
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err(OAuthError::TimedOut);
-                }
-                std::thread::sleep(Duration::from_millis(50));
+        }
+        if !accepted {
+            if Instant::now() >= deadline {
+                return Err(OAuthError::TimedOut);
             }
-            Err(_) => return Err(OAuthError::Listen),
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 }
@@ -475,6 +527,53 @@ mod tests {
         let code = wait_for_callback(&listener, "expected-state", Duration::from_secs(5)).unwrap();
         assert_eq!(code.as_str(), "synthetic-code");
         client.join().unwrap();
+    }
+
+    #[test]
+    fn a_localhost_redirect_is_caught_on_either_loopback_address() {
+        // Bind on a free port so parallel tests never collide on 51121.
+        let probe = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let loopback = bind_loopback_both(Some(port)).unwrap();
+        assert_eq!(loopback.port, port);
+        assert!(!loopback.listeners.is_empty());
+        let has_v6 = loopback.listeners.len() == 2;
+        let client = std::thread::spawn(move || {
+            let address: std::net::SocketAddr = if has_v6 {
+                format!("[::1]:{port}").parse().unwrap()
+            } else {
+                format!("127.0.0.1:{port}").parse().unwrap()
+            };
+            let mut stream = TcpStream::connect(address).unwrap();
+            write!(
+                stream,
+                "GET /oauth-callback?code=either-code&state=expected-state HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"
+            )
+            .unwrap();
+            let mut sink = String::new();
+            let _ = stream.read_to_string(&mut sink);
+        });
+        let code = wait_for_callback_any(
+            &loopback.listeners,
+            "expected-state",
+            CALLBACK_PATH,
+            Duration::from_secs(5),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(code.as_str(), "either-code");
+        client.join().unwrap();
+        assert!(matches!(
+            wait_for_callback_any(
+                &[],
+                "expected-state",
+                CALLBACK_PATH,
+                Duration::from_millis(10),
+                &AtomicBool::new(false),
+            ),
+            Err(OAuthError::Listen)
+        ));
     }
 
     #[test]

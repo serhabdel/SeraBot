@@ -27,8 +27,8 @@ use serde_json::{Value, json};
 
 use crate::accounts::{AuthKind, identity_fingerprint};
 use crate::cloud_code::{
-    ANTIGRAVITY_CLIENT_ID, ANTIGRAVITY_SCOPES, Discovery, antigravity_client_secret,
-    discover_project_with, discovery_origins,
+    ANTIGRAVITY_SCOPES, Discovery, antigravity_client_secret, discover_project_with,
+    discovery_origins,
 };
 use crate::error::{Result, SeraError};
 use crate::secrets::SharedSecrets;
@@ -141,12 +141,14 @@ impl GoogleSignIn {
         antigravity_client_secret(&self.secrets, &self.client_secret_name)
     }
 
+    /// The OAuth client id: the age-store value the provider names, then
+    /// `AGY_CLIENT_ID`, then the published Antigravity id (refresh reads the
+    /// same order, so an account keeps one client).
     fn client_id(&self) -> String {
-        self.client_id_name
-            .as_deref()
-            .and_then(|name| self.secrets.get(name))
-            .filter(|id| !id.trim().is_empty())
-            .unwrap_or_else(|| ANTIGRAVITY_CLIENT_ID.to_owned())
+        crate::cloud_code::antigravity_client_id(
+            &self.secrets,
+            self.client_id_name.as_deref().unwrap_or(""),
+        )
     }
 
     /// The OAuth client. The secret is the registration's public installed-app
@@ -294,12 +296,15 @@ impl SignInProvider for GoogleSignIn {
                 code: "no_stable_identity",
                 message: "Google did not say who signed in, so the account was not saved".into(),
             })?;
+        // The live Antigravity Hub version, as HielCowork presents it (the
+        // provider's own `client_version` and `AGY_VERSION` win).
+        let version = crate::cloud_code::antigravity_version(self.client_version.as_deref()).await;
         let discovery = discover_project_with(
             http,
             &tokens.access_token,
             &self.origins,
             self.pause,
-            self.client_version.as_deref(),
+            Some(&version),
         )
         .await;
         let label = who.email.clone().unwrap_or_else(|| "Google account".into());
@@ -330,7 +335,7 @@ mod tests {
     use super::*;
     use crate::accounts::Accounts;
     use crate::auth_flows::{CompleteRequest, SignInRegistry, SignInService, StartRequest};
-    use crate::cloud_code::ANTIGRAVITY_DEFAULT_CLIENT_SECRET;
+    use crate::cloud_code::{ANTIGRAVITY_CLIENT_ID, ANTIGRAVITY_DEFAULT_CLIENT_SECRET};
     use crate::secrets::SecretStore;
     use crate::store::Store;
     use crate::user_secrets::UserSecrets;

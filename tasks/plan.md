@@ -179,6 +179,13 @@ failure and wait cards, plus a motion/accessibility pass. No live provider was
 used and the desktop was not visually verified on a device. B7 worker counts
 above 2 are gated on running the load fixture on the target host.
 
+## Status after 0.53.1 (Antigravity parity with HielCowork)
+
+0.53.1 moves the Antigravity redirect to `localhost` with IPv4 and IPv6
+loopback listeners, adds `AGY_CLIENT_ID`, presents the live Hub version, retries
+plain Claude Opus once under its wire id, and keeps configured models in the
+verified live list. Synthetic fixtures only; the owner signs in once to verify.
+
 ## Status after 0.53.0 (consistency, motion, live providers)
 
 0.53.0 shares one swappable model router across the runtime and the tools that

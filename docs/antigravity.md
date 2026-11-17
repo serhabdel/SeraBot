@@ -6,10 +6,10 @@ Since 0.49 every member signs in to Antigravity from the desktop and keeps their
 
 ## Member sign-in (0.49)
 
-The desktop starts `POST /v1/providers/{id}/signin/start` (`flow: "pkce"`), opens the returned Google URL, catches the redirect on `http://127.0.0.1:<port>/oauth-callback` (51121 first, any free loopback port if that one is busy), and sends the code to `POST .../signin/complete`. The server follows the reference client exactly:
+The desktop starts `POST /v1/providers/{id}/signin/start` (`flow: "pkce"`), opens the returned Google URL, catches the redirect on `http://localhost:<port>/oauth-callback` (51121 first, any free loopback port if that one is busy), and sends the code to `POST .../signin/complete`. Since 0.53.1 the redirect names `localhost`, as HielCowork's does, not `127.0.0.1`: Google matches the redirect host against the installed-app registration, and the desktop listens on both `127.0.0.1` and `[::1]` at that port because a browser may resolve `localhost` to either. The server follows the reference client exactly:
 
 - scopes are `cloud-platform`, `userinfo.email`, `userinfo.profile`, `cclog` and `experimentsandconfigs`, and never `openid` (Google hangs a desktop PKCE flow that asks for it); `access_type=offline` and `prompt=consent` make Google return a refresh token, and a login without one is refused;
-- the OAuth client id and secret are Google's public installed-application credential for the Antigravity desktop app, compiled in as defaults exactly as the owner's HielCowork ships them (it is not a private secret, and PKCE protects the exchange). Sign-in works with no setup step. An optional override wins, in this order: a secret saved in the age store (`antigravity_oauth_client_secret`, or the provider's `oauth_client_secret_secret`; the console's Advanced field writes it), then the `AGY_CLIENT_SECRET` environment variable, then the compiled-in default;
+- the OAuth client id and secret are Google's public installed-application credential for the Antigravity desktop app, compiled in as defaults exactly as the owner's HielCowork ships them (it is not a private secret, and PKCE protects the exchange). Sign-in works with no setup step. An optional override wins, in this order: a secret saved in the age store (`antigravity_oauth_client_secret`, or the provider's `oauth_client_secret_secret`; the console's Advanced field writes it), then the `AGY_CLIENT_SECRET` environment variable, then the compiled-in default. The client id follows the same order (the provider's `oauth_client_id_secret`, then `AGY_CLIENT_ID`, then the compiled-in id) for sign-in and refresh alike;
 - the email comes from `GET https://www.googleapis.com/oauth2/v1/userinfo?alt=json` and names the account (a login with no email and no Google id is refused);
 - project discovery runs `loadCodeAssist` and, when the account has no project, `onboardUser` up to three times, three seconds apart, asking the daily host and then prod. The project and tier are stored in the account's identity. A member's account never uses the provider's configured `project_id`; an account whose discovery found nothing omits `project` and looks again on first use (at most once an hour).
 
@@ -29,7 +29,7 @@ The owner's `POST /v1/admin/providers/{id}/oauth/start|complete` routes now do t
 - Our `web_search` and `search_web` tools travel as `agy_web_search` and `agy_search_web` and are mapped back; `google_search` is never offered. Tool schemas pass an allow-list (union `type` arrays become `nullable`, `const` becomes `enum`, `required` keeps only existing properties).
 - The catalog skips tab, image, audio and deprecated ids and the legacy `claude-*-4-6` models, and carries `maxTokens` and `maxOutputTokens` into each model's limits.
 - Quota: `POST /v1internal:retrieveUserQuotaSummary`, with `fetchAvailableModels` `quotaInfo` as the fallback, is cached in the account's `quota_json` (`GET /v1/providers/{id}/accounts/{aid}/quota?refresh=1`, at most once every four minutes). Any failure is "no reading".
-- The user agent's Hub version is pinned in the build and can be set with `[llm.providers.<id>] client_version = "2.25.0"`. SeraBot does not fetch an updater URL.
+- The Hub version in the user agent and `ideVersion` is chosen in HielCowork's order: the provider's `client_version`, then the `AGY_VERSION` environment variable, then the version the public Antigravity auto-updater reports (asked once per process, three-second timeout, no redirects, and used only when it is a plain dotted version), then the pinned `2.25.0`. Google retires old client versions, so a server whose pin ages still presents a current one.
 
 None of this was run against a live Google account; tests use synthetic fixtures.
 
@@ -60,7 +60,7 @@ Full browser UI is out of scope. Login is a loopback PKCE flow, the same shape a
    serabot providers login google-antigravity
    ```
 
-   SeraBot listens on `127.0.0.1:51121` (or an ephemeral loopback port if that port is taken), prints an `https://accounts.google.com/o/oauth2/v2/auth` URL, and waits up to five minutes. Open that URL, approve access, and let the browser hit the loopback redirect. SeraBot exchanges the code with `https://oauth2.googleapis.com/token` (`authorization_code`, S256 PKCE, `access_type=offline`, `prompt=consent`) and stores the access token and refresh token under the configured secret names. It prints those names, not the token values.
+   SeraBot listens on `127.0.0.1:51121` and `[::1]:51121` (or an ephemeral loopback port if that port is taken) behind the redirect `http://localhost:<port>/oauth-callback`, prints an `https://accounts.google.com/o/oauth2/v2/auth` URL, and waits up to five minutes. Open that URL, approve access, and let the browser hit the loopback redirect. SeraBot exchanges the code with `https://oauth2.googleapis.com/token` (`authorization_code`, S256 PKCE, `access_type=offline`, `prompt=consent`) and stores the access token and refresh token under the configured secret names. It prints those names, not the token values.
 
 4. If Cloud Code returns a companion project id, the command prints `project_id=...`. Copy that value into the provider. An empty `project_id` omits the `project` field. Sending `"project": ""` makes Cloud Code return 404, so the field is omitted rather than blank.
 
@@ -87,13 +87,15 @@ With `catalog_fetch = true` and `data_egress_approved = true`, SeraBot POSTs `{ 
 
 The body must be a `models` object. Ids come from the object's keys. Image, audio, tab, and deprecated ids are skipped. An OpenAI-style `{ "object": "list", "data": [...] }` body is rejected and the cache closes. Allowlist ids are not invented when the fetch fails.
 
+Since 0.53.1 the models listed on the provider itself join a verified live list instead of being dropped from it (HielCowork appends its presets the same way): Google's list leaves out ids that still answer. A listed id still has to be a well-formed Cloud Code id and not one of the skipped legacy models; anything else stays refused.
+
 ## Chat
 
 The turn loop still waits for one assistant message. SeraBot buffers the SSE stream (or the JSON fallback) and does not forward chunks to the owner.
 
 The request is a Cloud Code envelope: `model`, optional `project`, `request.contents`, `systemInstruction`, sanitized tool declarations, and `generationConfig`. Tool schemas are reduced to the uppercase protobuf subset Cloud Code accepts (`OBJECT`, `STRING`, and the other scalar types). Empty objects gain a placeholder property. Unsupported JSON Schema keywords are stripped.
 
-Function-call parts send the `thoughtSignature` Google gave that call, or `skip_thought_signature_validator` when there is none (see Wire details). `claude` models whose ids contain `thinking` also send `anthropic-beta: interleaved-thinking-2025-05-14`; the reference client's current code does not, so this stays only until a fixture shows it is unnecessary. Model ids in config must be ids the live catalog actually returns; SeraBot does not rewrite them.
+Function-call parts send the `thoughtSignature` Google gave that call, or `skip_thought_signature_validator` when there is none (see Wire details). `claude` models whose ids contain `thinking` also send `anthropic-beta: interleaved-thinking-2025-05-14`; the reference client's current code does not, so this stays only until a fixture shows it is unnecessary. A model id is sent as configured. Since 0.53.1, when Google answers plain `claude-opus-5-5` with a 400 or 404, the request is sent once more as `claude-opus-5-5-thinking` (the id Cloud Code serves it under), as HielCowork does; no other id is rewritten, and a second refusal is reported as it is.
 
 ## Deferred
 

@@ -749,6 +749,14 @@ impl ModelRouter {
             .await
         {
             Ok(models) => {
+                // Antigravity keeps its configured models next to the live
+                // list (as HielCowork does): Google's list can leave out an id
+                // it still serves through a wire alias.
+                let models = if provider.kind == "google-antigravity" {
+                    crate::cloud_code::with_configured_models(models, &provider.models)
+                } else {
+                    models
+                };
                 provider.record_snapshot(user_id, models);
                 Ok(CatalogRefresh {
                     provider: id.to_owned(),
@@ -2590,7 +2598,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn antigravity_catalog_posts_to_cloud_code_and_fails_closed() {
+    async fn antigravity_catalog_posts_to_cloud_code_and_keeps_configured_models() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1internal:fetchAvailableModels"))
@@ -2615,7 +2623,7 @@ mod tests {
             catalog_fetch: true,
             catalog_ttl_secs: 60,
             project_id: "proj-synthetic".into(),
-            models: vec!["missing-model".into()],
+            models: vec!["missing-model".into(), "bad/id".into()],
             ..LlmConfig::default()
         };
         let clients = BTreeMap::from([(
@@ -2628,23 +2636,30 @@ mod tests {
         let router = ModelRouter::new(&config, clients).unwrap();
         let reports = router.refresh_catalogs(TEST_USER).await.unwrap();
         assert!(reports[0].fetched && reports[0].verified);
-        assert_eq!(reports[0].model_count, 2);
+        // A model the provider lists by hand joins the live list (Google's
+        // list leaves out ids that still answer); a malformed id never does.
+        assert_eq!(reports[0].model_count, 3);
         assert_eq!(
             router.catalog(TEST_USER)[0].models,
-            vec!["extra-model".to_string(), "kept-model".to_string()]
+            vec![
+                "extra-model".to_string(),
+                "kept-model".to_string(),
+                "missing-model".to_string()
+            ]
         );
-        assert!(
-            router
-                .catalog_gate(
-                    TEST_USER,
-                    &ModelSelection {
-                        provider: "default".into(),
-                        model: "missing-model".into(),
-                        account: None,
-                    }
-                )
-                .is_err()
-        );
+        let gate = |model: &str| {
+            router.catalog_gate(
+                TEST_USER,
+                &ModelSelection {
+                    provider: "default".into(),
+                    model: model.into(),
+                    account: None,
+                },
+            )
+        };
+        assert!(gate("missing-model").is_ok());
+        assert!(gate("bad/id").is_err());
+        assert!(gate("unlisted-model").is_err());
 
         let loose = MockServer::start().await;
         Mock::given(method("POST"))

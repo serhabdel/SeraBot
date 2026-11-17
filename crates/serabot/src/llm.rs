@@ -1012,13 +1012,14 @@ impl LlmClient {
         let Ok(origins) = cloud_code::discovery_origins(&self.base_url) else {
             return configured;
         };
+        let version = cloud_code::antigravity_version(self.cloud_version.as_deref()).await;
         let token = zeroize::Zeroizing::new(self.bearer());
         let found = cloud_code::discover_project_with(
             &self.http,
             &token,
             &origins,
             Duration::from_secs(3),
-            self.cloud_version.as_deref(),
+            Some(&version),
         )
         .await;
         state.memo.record(&found);
@@ -1063,6 +1064,10 @@ impl LlmClient {
         let targets = cloud_code::chat_targets(&self.base_url)?;
         let mut refreshed = false;
         let mut malformed = 0usize;
+        // The id sent on the wire: the asked model, or once its HielCowork wire
+        // alias when a cluster does not know the plain name.
+        let mut wire_model = model;
+        let mut tried_wire = false;
         let mut last_error: Option<SeraError> = None;
         for _ in 0..2 {
             let mut restart = false;
@@ -1071,7 +1076,7 @@ impl LlmClient {
                 loop {
                     let generation = self.session_generation.load(Ordering::SeqCst);
                     let envelope = cloud_code::build_cloud_code_envelope_with(
-                        model,
+                        wire_model,
                         &project,
                         messages,
                         tools,
@@ -1085,14 +1090,21 @@ impl LlmClient {
                     )?;
                     let mut used = zeroize::Zeroizing::new(self.bearer());
                     let mut post = self
-                        .post_cloud(&target.stream, &envelope, model, true)
+                        .post_cloud(&target.stream, &envelope, wire_model, true)
                         .await?;
                     if matches!(post, CloudPost::NotFound) {
                         used = zeroize::Zeroizing::new(self.bearer());
                         post = self
-                            .post_cloud(&target.generate, &envelope, model, false)
+                            .post_cloud(&target.generate, &envelope, wire_model, false)
                             .await?;
                         if matches!(post, CloudPost::NotFound) {
+                            if !tried_wire
+                                && let Some(alias) = cloud_code::wire_fallback_model(wire_model)
+                            {
+                                tried_wire = true;
+                                wire_model = alias;
+                                continue;
+                            }
                             last_error = Some(cloud_status_error(404));
                             break;
                         }
@@ -1125,6 +1137,16 @@ impl LlmClient {
                         CloudPost::Retryable(error) => {
                             last_error = Some(error);
                             break;
+                        }
+                        CloudPost::BadRequest(error) => {
+                            if !tried_wire
+                                && let Some(alias) = cloud_code::wire_fallback_model(wire_model)
+                            {
+                                tried_wire = true;
+                                wire_model = alias;
+                                continue;
+                            }
+                            return Err(error);
                         }
                         CloudPost::Failed(error) => return Err(error),
                         CloudPost::Unauthorized => return Err(cloud_status_error(401)),
@@ -1173,7 +1195,9 @@ impl LlmClient {
                     CloudPost::NotFound => last_error = Some(catalog_status_error(404)),
                     CloudPost::Retryable(error) => last_error = Some(catalog_retag(error)),
                     CloudPost::SessionLimited => last_error = Some(catalog_status_error(400)),
-                    CloudPost::Failed(error) => return Err(catalog_retag(error)),
+                    CloudPost::BadRequest(error) | CloudPost::Failed(error) => {
+                        return Err(catalog_retag(error));
+                    }
                     CloudPost::Transport => {}
                 }
             }
@@ -1192,6 +1216,7 @@ impl LlmClient {
         model: &str,
         stream: bool,
     ) -> Result<CloudPost> {
+        let version = cloud_code::antigravity_version(self.cloud_version.as_deref()).await;
         let mut key = self.bearer();
         let mut request = self
             .http
@@ -1199,7 +1224,7 @@ impl LlmClient {
             .bearer_auth(&key)
             .header(
                 "user-agent",
-                cloud_code::cloud_code_user_agent(self.cloud_version.as_deref()),
+                cloud_code::cloud_code_user_agent(Some(&version)),
             )
             .header("x-goog-api-client", CLOUD_CODE_API_CLIENT)
             .header(
@@ -1281,6 +1306,9 @@ enum CloudPost {
     Unauthorized,
     NotFound,
     SessionLimited,
+    /// A chat 400 that is not the session wall: the model id may only be
+    /// unknown on this cluster (HielCowork retries its wire id once).
+    BadRequest(SeraError),
     /// A status worth trying the next endpoint for, already typed.
     Retryable(SeraError),
     Failed(SeraError),
@@ -1371,7 +1399,7 @@ async fn classify_cloud(response: reqwest::Response, allow_session: bool) -> Clo
         {
             return CloudPost::SessionLimited;
         }
-        return CloudPost::Failed(error);
+        return CloudPost::BadRequest(error);
     }
     if status == 403 || status == 429 || status >= 500 {
         return CloudPost::Retryable(error);

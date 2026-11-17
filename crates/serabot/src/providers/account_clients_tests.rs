@@ -769,3 +769,66 @@ fn a_new_age_store_sign_in_becomes_another_admin_account() {
         .id;
     assert!(accounts.list(&member, "antigravity").unwrap().is_empty());
 }
+
+/// A cluster that does not know plain `claude-opus-5-5` answers 400; the
+/// request is sent once more as HielCowork's wire id and succeeds. A model with
+/// no wire id fails on its first 400, as before.
+#[tokio::test]
+async fn a_plain_claude_id_retries_once_as_its_wire_id() {
+    let env = env();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1internal:streamGenerateContent"))
+        .and(body_string_contains("\"model\":\"claude-opus-5-5\""))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_string("{\"error\":{\"message\":\"Requested model is not found\"}}"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1internal:streamGenerateContent"))
+        .and(body_string_contains(
+            "\"model\":\"claude-opus-5-5-thinking\"",
+        ))
+        .respond_with(ok_stream())
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1internal:streamGenerateContent"))
+        .and(body_string_contains("\"model\":\"gemini-3.8-flash\""))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_string("{\"error\":{\"message\":\"Invalid argument\"}}"),
+        )
+        .mount(&server)
+        .await;
+    let profile = agy_profile(&server);
+    let account = add_google(
+        &env,
+        "wire@example.example",
+        json!({"project_id": "proj-wire"}),
+    );
+    let client = env
+        .credentials
+        .client_for_account(&env.alice, AGY, &profile, &account)
+        .unwrap();
+    let answer = client
+        .clone()
+        .with_model("claude-opus-5-5")
+        .complete(&[LlmMessage::user("hi")], &[], None, None)
+        .await
+        .unwrap();
+    assert_eq!(answer.message.content.as_deref(), Some("ok"));
+    let models: Vec<String> = chat_bodies(&server.received_requests().await.unwrap())
+        .iter()
+        .map(|body| body["model"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(models, ["claude-opus-5-5", "claude-opus-5-5-thinking"]);
+    // No wire id: the 400 is the answer, and nothing is sent again.
+    assert!(chat(&client).await.is_err());
+    assert_eq!(
+        chat_bodies(&server.received_requests().await.unwrap()).len(),
+        3
+    );
+}

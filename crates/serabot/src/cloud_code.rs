@@ -61,6 +61,128 @@ pub fn antigravity_client_secret(
     pick_antigravity_client_secret(stored.as_deref(), env.as_deref())
 }
 
+/// Environment override for the client id (the same name HielCowork reads).
+pub const ANTIGRAVITY_CLIENT_ID_ENV: &str = "AGY_CLIENT_ID";
+
+/// Choose the Antigravity client id: the age-store value the provider names,
+/// then `AGY_CLIENT_ID`, then the published Antigravity client id. Sign-in and
+/// refresh read the same order, so one account always uses one client.
+pub fn pick_antigravity_client_id(stored: Option<&str>, env: Option<&str>) -> String {
+    [stored, env]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .unwrap_or(ANTIGRAVITY_CLIENT_ID)
+        .to_owned()
+}
+
+/// The Antigravity client id for a provider whose override lives under
+/// `stored_name` in the age store (empty or absent means no override).
+pub fn antigravity_client_id(secrets: &crate::secrets::SharedSecrets, stored_name: &str) -> String {
+    let stored = Some(stored_name.trim())
+        .filter(|name| !name.is_empty())
+        .and_then(|name| secrets.get(name));
+    let env = std::env::var(ANTIGRAVITY_CLIENT_ID_ENV).ok();
+    pick_antigravity_client_id(stored.as_deref(), env.as_deref())
+}
+
+/// Where the Antigravity Hub publishes its current release, as HielCowork
+/// reads it. Asked once per process, anonymously, for its `version` only.
+pub const ANTIGRAVITY_UPDATER_URL: &str =
+    "https://antigravity-hub-auto-updater-971186067036.us-central1.run.app/releases/latest";
+/// Environment override for the Antigravity Hub version (HielCowork's name).
+pub const ANTIGRAVITY_VERSION_ENV: &str = "AGY_VERSION";
+/// The live version, once asked (`None` when the updater did not answer).
+static LIVE_VERSION: tokio::sync::OnceCell<Option<String>> = tokio::sync::OnceCell::const_new();
+
+/// The version in an updater answer (`{"version": "2.31.4", ...}`), when it
+/// is a plain dotted version.
+pub fn parse_updater_version(bytes: &[u8]) -> Option<String> {
+    if bytes.len() > 16_384 {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    let version = value.get("version")?.as_str()?.trim();
+    client_version_ok(version).then(|| version.to_owned())
+}
+
+/// Ask the Antigravity updater for the current Hub version: one GET, three
+/// seconds, no redirects, no credentials. `None` on any failure.
+#[cfg(not(test))]
+async fn fetch_live_version() -> Option<String> {
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()?;
+    let response = http
+        .get(ANTIGRAVITY_UPDATER_URL)
+        .header("accept", "application/json")
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let bytes = response.bytes().await.ok()?;
+    parse_updater_version(&bytes)
+}
+
+/// Tests never reach the network: the live version is "not known".
+#[cfg(test)]
+async fn fetch_live_version() -> Option<String> {
+    None
+}
+
+/// The Antigravity Hub version this server presents (user agent and
+/// `ideVersion`), in HielCowork's order: the provider's own `client_version`,
+/// then `AGY_VERSION`, then the live updater's (asked once per process), then
+/// the pinned [`IDE_VERSION`]. Google retires old client versions, so a server
+/// that never updates its pin still presents the current one.
+pub async fn antigravity_version(configured: Option<&str>) -> String {
+    let env = std::env::var(ANTIGRAVITY_VERSION_ENV).ok();
+    if let Some(version) = [configured, env.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|version| client_version_ok(version))
+    {
+        return version.to_owned();
+    }
+    LIVE_VERSION
+        .get_or_init(fetch_live_version)
+        .await
+        .clone()
+        .unwrap_or_else(|| IDE_VERSION.to_owned())
+}
+
+/// The model Cloud Code serves when a Claude 5.5 name is not aliased on the
+/// cluster that answered, as HielCowork maps it: plain Opus 5.5 is served as
+/// its thinking variant. `None` when there is no other id to try.
+pub fn wire_fallback_model(model: &str) -> Option<&'static str> {
+    match model.trim().to_ascii_lowercase().as_str() {
+        "claude-opus-5-5" => Some("claude-opus-5-5-thinking"),
+        _ => None,
+    }
+}
+
+/// Add the provider's configured models to an account's live Cloud Code list,
+/// as HielCowork does: a model Google leaves out of `fetchAvailableModels` (a
+/// plain Claude id served through its wire alias) stays selectable. Live
+/// entries keep their own metadata.
+pub fn with_configured_models<'a>(
+    mut catalog: crate::providers::ModelCatalog,
+    configured: impl IntoIterator<Item = &'a String>,
+) -> crate::providers::ModelCatalog {
+    for id in configured {
+        if cloud_code_model_id(id) && !legacy_model(id) && !catalog.contains_key(id) {
+            catalog.insert(id.clone(), cloud_code_model_meta(id, &Value::Null));
+        }
+    }
+    catalog
+}
+
 pub const ANTIGRAVITY_SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs";
 pub const CLOUD_CODE_USER_AGENT: &str =
     "antigravity/hub/2.25.0 (aidev_client; os_type=windows; arch=amd64; cl=1003475615)";
@@ -708,13 +830,15 @@ where
         return Err(SeraError::Config("oauth client secret is missing".into()));
     }
     let token_url = pin_token_url(token_url)?;
-    let (listener, port) = bind_loopback().await?;
-    let redirect_uri = format!("http://127.0.0.1:{port}{CALLBACK_PATH}");
+    let listeners = bind_loopback().await?;
+    // The Antigravity registration names `localhost` (as HielCowork signs in);
+    // the browser reaches the IPv4 or IPv6 listener through it.
+    let redirect_uri = format!("http://localhost:{}{CALLBACK_PATH}", listeners.port);
     let (mut verifier, challenge) = pkce_s256();
     let state = random_token();
     let url = authorize_url(&redirect_uri, &challenge, &state)?;
     on_url(&url);
-    let code = match tokio::time::timeout(timeout, accept_callback(listener, &state)).await {
+    let code = match tokio::time::timeout(timeout, accept_callback(listeners, &state)).await {
         Ok(result) => result,
         Err(_) => {
             verifier.zeroize();
@@ -1555,7 +1679,7 @@ fn validate_loopback_redirect(redirect: &str) -> Result<()> {
     let url = url::Url::parse(redirect)
         .map_err(|_| SeraError::External("oauth redirect was rejected".into()))?;
     if url.scheme() != "http"
-        || url.host_str() != Some("127.0.0.1")
+        || !matches!(url.host_str(), Some("127.0.0.1" | "localhost"))
         || url.port().is_none()
         || url.path() != CALLBACK_PATH
         || !url.username().is_empty()
@@ -1586,7 +1710,16 @@ fn pin_token_url(url: &str) -> Result<String> {
     }
 }
 
-async fn bind_loopback() -> Result<(tokio::net::TcpListener, u16)> {
+/// The loopback listeners for the `localhost` redirect: IPv4 always, and
+/// IPv6 on the same port when this computer has it, because a browser may
+/// resolve `localhost` to either address.
+struct LoopbackListeners {
+    v4: tokio::net::TcpListener,
+    v6: Option<tokio::net::TcpListener>,
+    port: u16,
+}
+
+async fn bind_loopback() -> Result<LoopbackListeners> {
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", PREFERRED_PORT)).await {
         Ok(listener) => listener,
         Err(_) => tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -1599,14 +1732,24 @@ async fn bind_loopback() -> Result<(tokio::net::TcpListener, u16)> {
         .local_addr()
         .map_err(|_| SeraError::External("oauth callback could not listen on loopback".into()))?
         .port();
-    Ok((listener, port))
+    let v6 = tokio::net::TcpListener::bind(("::1", port)).await.ok();
+    Ok(LoopbackListeners {
+        v4: listener,
+        v6,
+        port,
+    })
 }
 
-async fn accept_callback(listener: tokio::net::TcpListener, state: &str) -> Result<String> {
-    let (mut stream, _) = listener
-        .accept()
-        .await
-        .map_err(|_| SeraError::External("oauth callback was rejected".into()))?;
+async fn accept_callback(listeners: LoopbackListeners, state: &str) -> Result<String> {
+    let accepted = match &listeners.v6 {
+        Some(v6) => tokio::select! {
+            accepted = listeners.v4.accept() => accepted,
+            accepted = v6.accept() => accepted,
+        },
+        None => listeners.v4.accept().await,
+    };
+    let (mut stream, _) =
+        accepted.map_err(|_| SeraError::External("oauth callback was rejected".into()))?;
     let mut buf = vec![0u8; 8_192];
     let mut filled = 0usize;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
@@ -2472,6 +2615,116 @@ mod tests {
         assert_eq!(login.refresh_token.expose_secret(), "refresh-synthetic");
         assert_eq!(login.project_id.as_deref(), Some("proj-synthetic"));
         assert!(!format!("{login:?}").contains("access-synthetic"));
+    }
+
+    #[test]
+    fn the_updater_version_is_read_only_when_it_is_a_plain_version() {
+        assert_eq!(
+            parse_updater_version(br#"{"version":"2.31.4","url":"x"}"#).as_deref(),
+            Some("2.31.4")
+        );
+        assert_eq!(
+            parse_updater_version(br#"{"version":" 3.0.1 "}"#).as_deref(),
+            Some("3.0.1")
+        );
+        for bad in [
+            &br#"{"version":"v2.31"}"#[..],
+            br#"{"version":"2..1"}"#,
+            br#"{"name":"2.31.4"}"#,
+            b"not json",
+        ] {
+            assert_eq!(parse_updater_version(bad), None);
+        }
+        let mut large = br#"{"version":"2.31.4","pad":""#.to_vec();
+        large.extend(std::iter::repeat_n(b'x', 20_000));
+        large.extend(br#""}"#);
+        assert_eq!(parse_updater_version(&large), None);
+    }
+
+    #[tokio::test]
+    async fn the_presented_version_prefers_the_providers_own_then_the_pin() {
+        assert_eq!(antigravity_version(Some("2.40.1")).await, "2.40.1");
+        if std::env::var(ANTIGRAVITY_VERSION_ENV).is_err() {
+            // Tests never ask the updater, so the pin stands in for it.
+            assert_eq!(antigravity_version(None).await, IDE_VERSION);
+            assert_eq!(antigravity_version(Some("latest")).await, IDE_VERSION);
+        }
+    }
+
+    #[test]
+    fn the_client_id_prefers_the_store_then_the_environment_then_the_published_one() {
+        assert_eq!(
+            pick_antigravity_client_id(Some(" stored "), Some("env")),
+            "stored"
+        );
+        assert_eq!(pick_antigravity_client_id(None, Some(" env ")), "env");
+        assert_eq!(
+            pick_antigravity_client_id(Some(" "), Some("")),
+            ANTIGRAVITY_CLIENT_ID
+        );
+        assert_eq!(
+            pick_antigravity_client_id(None, None),
+            ANTIGRAVITY_CLIENT_ID
+        );
+    }
+
+    #[test]
+    fn only_plain_opus_has_a_wire_id() {
+        assert_eq!(
+            wire_fallback_model("claude-opus-5-5"),
+            Some("claude-opus-5-5-thinking")
+        );
+        assert_eq!(
+            wire_fallback_model(" CLAUDE-OPUS-5-5 "),
+            Some("claude-opus-5-5-thinking")
+        );
+        for none in [
+            "claude-opus-5-5-thinking",
+            "claude-sonnet-5-5",
+            "gemini-4-argon-high",
+        ] {
+            assert_eq!(wire_fallback_model(none), None, "{none}");
+        }
+    }
+
+    #[test]
+    fn configured_models_join_the_live_list_without_replacing_it() {
+        let live = parse_cloud_code_models(
+            br#"{"models": {"gemini-4-argon-high": {"displayName": "Gemini 4 Argon", "maxTokens": 2000000}}}"#,
+        )
+        .unwrap();
+        let configured = vec![
+            "gemini-4-argon-high".to_owned(),
+            "claude-opus-5-5".to_owned(),
+            "claude-opus-4-6-thinking".to_owned(),
+        ];
+        let merged = with_configured_models(live.clone(), &configured);
+        assert!(merged.contains_key("claude-opus-5-5"));
+        assert!(
+            !merged.contains_key("claude-opus-4-6-thinking"),
+            "legacy ids stay out"
+        );
+        assert_eq!(merged["gemini-4-argon-high"], live["gemini-4-argon-high"]);
+    }
+
+    #[test]
+    fn the_operator_redirect_takes_localhost_like_hielcowork() {
+        for ok in [
+            "http://localhost:51121/oauth-callback",
+            "http://localhost:53811/oauth-callback",
+            "http://127.0.0.1:51121/oauth-callback",
+        ] {
+            assert!(validate_loopback_redirect(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "https://localhost:51121/oauth-callback",
+            "http://localhost/oauth-callback",
+            "http://localhost:51121/callback",
+            "http://example.com:51121/oauth-callback",
+            "http://localhost:51121/oauth-callback?x=1",
+        ] {
+            assert!(validate_loopback_redirect(bad).is_err(), "{bad}");
+        }
     }
 
     #[tokio::test]
