@@ -377,14 +377,7 @@ pub fn MarketplaceTab(session: Signal<Session>, query: Signal<String>) -> Elemen
                 p { class: "empty-text", "The plugin catalog loads once your SeraBot session is connected." }
             }
         } else if !loaded && error.is_none() {
-            div { role: "status", "aria-busy": "true",
-                p { class: "tiny", "Loading plugins\u{2026}" }
-                div { class: "mp-grid", "aria-hidden": "true",
-                    for index in 0..6 {
-                        div { key: "{index}", class: "mp-card skeleton", " " }
-                    }
-                }
-            }
+            crate::ui_integrations::SkeletonGrid { label: "Loading plugins", count: 8 }
         } else if let (false, Some(message)) = (loaded, error.clone()) {
             div { class: "banner err", role: "alert",
                 span { class: "grow", "{message}" }

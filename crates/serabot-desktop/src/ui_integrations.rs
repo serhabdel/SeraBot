@@ -185,6 +185,44 @@ pub fn IntegrationCard(session: Signal<Session>, entry: Entry) -> Element {
     }
 }
 
+/// A placeholder card with the real card's anatomy (logo, name, status,
+/// description, footer), shown while the lists load. Hidden from assistive tech.
+#[component]
+pub fn SkeletonCard() -> Element {
+    rsx! {
+        div { class: "mp-card integration-card mp-skel", "aria-hidden": "true",
+            div { class: "integration-card-head",
+                div { class: "skeleton sk-logo" }
+                div { class: "integration-card-identity",
+                    div { class: "skeleton sk-line sk-w60" }
+                    div { class: "skeleton sk-line sk-w40" }
+                }
+                div { class: "skeleton sk-chip" }
+            }
+            div { class: "skeleton sk-line sk-w90" }
+            div { class: "skeleton sk-line sk-w70" }
+            div { class: "integration-card-foot",
+                div { class: "skeleton sk-line sk-w30" }
+                div { class: "skeleton sk-line sk-w20" }
+            }
+        }
+    }
+}
+
+/// A grid of placeholder cards under a polite "Loading" label.
+#[component]
+pub fn SkeletonGrid(label: String, count: usize) -> Element {
+    rsx! {
+        div { role: "status", "aria-busy": "true", "aria-label": "{label}",
+            div { class: "mp-grid", "aria-hidden": "true",
+                for index in 0..count {
+                    SkeletonCard { key: "{index}" }
+                }
+            }
+        }
+    }
+}
+
 /// The Installed tab: what is set up, then the connectors still open to set up,
 /// by suite. The search filters both.
 #[component]
@@ -256,14 +294,7 @@ fn InstalledTab(session: Signal<Session>, query: Signal<String>, tab: Signal<Tab
             }
         }
         if loading {
-            div { role: "status", "aria-busy": "true",
-                p { class: "tiny", "Loading integrations\u{2026}" }
-                div { class: "mp-grid", "aria-hidden": "true",
-                    for index in 0..6 {
-                        div { key: "{index}", class: "mp-card skeleton", " " }
-                    }
-                }
-            }
+            SkeletonGrid { label: "Loading integrations", count: 8 }
         } else if nothing && needle.trim().is_empty() {
             div { class: "empty",
                 div { class: "empty-icon", Icon { name: "connectors", size: 20 } }
@@ -364,10 +395,7 @@ fn ComposioTab(session: Signal<Session>) -> Element {
     match connector {
         Some(connector) => rsx! { ComposioCard { session, connector } },
         None if !loaded => rsx! {
-            div { role: "status", "aria-busy": "true",
-                p { class: "tiny", "Loading Composio\u{2026}" }
-                div { class: "mp-card skeleton", " " }
-            }
+            SkeletonGrid { label: "Loading Composio", count: 1 }
         },
         None => rsx! {
             div { class: "empty compact", role: "status",

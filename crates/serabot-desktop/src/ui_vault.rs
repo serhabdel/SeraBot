@@ -133,8 +133,11 @@ pub fn VaultPage(session: Signal<Session>) -> Element {
             }
             div { class: "pane-body",
                 div { class: "vault-panel",
-                    if let Some(message) = error {
-                        div { class: "error-text vault-error", role: "alert", "{message}" }
+                    if let Some(message) = error.clone().filter(|_| loaded || has_form) {
+                        div { class: "banner err vault-error", role: "alert",
+                            Icon { name: "alert", size: 14 }
+                            span { "{message}" }
+                        }
                     }
                     if has_form {
                         VaultFormView { session }
@@ -146,33 +149,49 @@ pub fn VaultPage(session: Signal<Session>) -> Element {
                             }
                         }
 
-                        // Security Overview Hero / Stats Strip
-                        div { class: "vault-hero", role: "region", "aria-label": "Vault overview",
-                            div { class: "vault-stat-card",
-                                span { class: "vault-stat-value", "{total_creds}" }
-                                span { class: "vault-stat-label", "Total Credentials" }
-                                span { class: "vault-stat-sub", "Across all sources" }
-                            }
-                            div { class: "vault-stat-card",
-                                span { class: "vault-stat-value", "{local_sealed}" }
-                                span { class: "vault-stat-label", "Local Sealed" }
-                                span { class: "vault-stat-sub", "AES-256 envelope" }
-                            }
-                            div { class: "vault-stat-card",
-                                span { class: "vault-stat-value", "{manager_linked}" }
-                                span { class: "vault-stat-label", "Manager Linked" }
-                                span { class: "vault-stat-sub", "1Password & Proton Pass" }
-                            }
-                            div { class: "vault-stat-card",
-                                span { class: "vault-stat-value", "{domain_rules}" }
-                                span { class: "vault-stat-label", "Domain Rules" }
-                                span { class: "vault-stat-sub", "Host allowlists" }
+                        if loaded {
+                            div { class: "vault-hero", role: "region", "aria-label": "Vault overview",
+                                div { class: "vault-stat-card",
+                                    span { class: "vault-stat-value", "{total_creds}" }
+                                    span { class: "vault-stat-label", "Total credentials" }
+                                    span { class: "vault-stat-sub", "Across all sources" }
+                                }
+                                div { class: "vault-stat-card",
+                                    span { class: "vault-stat-value", "{local_sealed}" }
+                                    span { class: "vault-stat-label", "Stored here" }
+                                    span { class: "vault-stat-sub", "Sealed on the server" }
+                                }
+                                div { class: "vault-stat-card",
+                                    span { class: "vault-stat-value", "{manager_linked}" }
+                                    span { class: "vault-stat-label", "Manager linked" }
+                                    span { class: "vault-stat-sub", "1Password and Proton Pass" }
+                                }
+                                div { class: "vault-stat-card",
+                                    span { class: "vault-stat-value", "{domain_rules}" }
+                                    span { class: "vault-stat-label", "Site rules" }
+                                    span { class: "vault-stat-sub", "Hosts a login may be used on" }
+                                }
                             }
                         }
 
+                        div { class: "page-section-head",
+                            div {
+                                h2 { class: "page-section-title", "Password managers" }
+                                p { class: "tiny", "Link a manager to reference logins without copying their values." }
+                            }
+                        }
                         PasswordManagersPanel { session }
 
                         if loaded || !entries.is_empty() || !pending.is_empty() {
+                            div { class: "page-section-head",
+                                div {
+                                    h2 { class: "page-section-title", "Credentials" }
+                                    p { class: "tiny", "Names and sites only. Values are never shown." }
+                                }
+                                if loaded {
+                                    span { class: "page-count", "{filtered_entries.len()} of {entries.len()}" }
+                                }
+                            }
                             div { class: "vault-toolbar",
                                 div { class: "vault-filter-row",
                                     input {
@@ -253,10 +272,11 @@ pub fn VaultPage(session: Signal<Session>) -> Element {
                                 }
                             }
                         }
-                        if loading && !loaded {
+                        if !loaded && (loading || error.is_none()) {
                             div { class: "vault-entry-grid", "aria-busy": "true",
-                                div { class: "skeleton row", " " }
-                                div { class: "skeleton row", " " }
+                                div { class: "skeleton vault-skeleton", " " }
+                                div { class: "skeleton vault-skeleton", " " }
+                                div { class: "skeleton vault-skeleton", " " }
                             }
                         } else if loaded && filtered_entries.is_empty() {
                             if any_filter_active {
@@ -296,12 +316,17 @@ pub fn VaultPage(session: Signal<Session>) -> Element {
                                 }
                             }
                         } else if !loaded {
-                            div { class: "vault-empty",
-                                p { class: "empty-text", "Could not load your vault entries." }
+                            div { class: "vault-empty vault-load-error", role: "alert",
+                                div { class: "empty-icon danger", Icon { name: "alert", size: 20 } }
+                                h2 { class: "empty-title", "Could not load your vault" }
+                                p { class: "empty-text",
+                                    "{error.as_deref().unwrap_or(\"The server did not answer. Nothing was changed.\")}"
+                                }
                                 button {
-                                    class: "btn",
+                                    class: "btn primary",
                                     r#type: "button",
                                     onclick: move |_| session.write().panel.ask_vault_list(),
+                                    Icon { name: "refresh", size: 14 }
                                     "Try again"
                                 }
                             }

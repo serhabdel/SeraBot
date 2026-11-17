@@ -179,7 +179,7 @@ impl Runtime {
         self.heal_conversation_model(user_id, conversation_id, &fleet[&bot])?;
         let selection = self.effective_model_selection(user_id, conversation_id, &bot)?;
         let route = self
-            .router
+            .router()
             .pin_for_bot(user_id, &selection, &fleet[&bot].config)?;
         let owner_text = text.clone();
         // In rooms, `@mention` tokens are parsed from the owner text and
@@ -299,7 +299,9 @@ impl Runtime {
             };
             let payload = (|| -> Result<serde_json::Value> {
                 let selection = self.effective_model_selection(user_id, conversation_id, member)?;
-                let route = self.router.pin_for_bot(user_id, &selection, &bot.config)?;
+                let route = self
+                    .router()
+                    .pin_for_bot(user_id, &selection, &bot.config)?;
                 Ok(serde_json::to_value(TurnPayload {
                     conversation_id: conversation_id.to_owned(),
                     text: text.to_owned(),

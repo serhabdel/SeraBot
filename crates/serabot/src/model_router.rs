@@ -260,7 +260,97 @@ impl std::fmt::Debug for ModelRouter {
     }
 }
 
+/// The model router the server uses right now, shared by the runtime and the
+/// tools that read it. A provider saved in the console replaces it in place
+/// ([`ModelRouter::rebuilt`]), so bots use the change without a restart. A turn
+/// already running keeps the router it started with.
+#[derive(Clone)]
+pub struct RouterHandle(Arc<std::sync::RwLock<Arc<ModelRouter>>>);
+
+impl RouterHandle {
+    pub fn new(router: ModelRouter) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(Arc::new(router))))
+    }
+
+    /// The current router.
+    pub fn get(&self) -> Arc<ModelRouter> {
+        self.0
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Put `router` in place for every caller from now on.
+    pub fn replace(&self, router: ModelRouter) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(router);
+    }
+
+    /// Change the current router before anyone shares it (startup only: the
+    /// runtime adds the bots' default models).
+    pub(crate) fn update(&self, change: impl FnOnce(&mut ModelRouter) -> Result<()>) -> Result<()> {
+        let mut guard = self
+            .0
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut router = (**guard).clone();
+        change(&mut router)?;
+        *guard = Arc::new(router);
+        Ok(())
+    }
+}
+
+impl From<ModelRouter> for RouterHandle {
+    fn from(router: ModelRouter) -> Self {
+        Self::new(router)
+    }
+}
+
+impl std::fmt::Debug for RouterHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.get().fmt(formatter)
+    }
+}
+
 impl ModelRouter {
+    /// A router for a changed provider list, for a console save that should
+    /// not need a restart. The per-user credentials, the in-flight cap and its
+    /// gates carry over; a provider whose profile did not change keeps its
+    /// cached clients and model catalog; the default provider keeps the models
+    /// the bots added to it. Only a router that resolves credentials per user
+    /// can be rebuilt.
+    pub fn rebuilt(&self, config: &LlmConfig) -> Result<Self> {
+        let credentials = self.credentials.clone().ok_or_else(|| {
+            SeraError::Config("this router has fixed clients and cannot be rebuilt".into())
+        })?;
+        let mut next = Self::build(config, BTreeMap::new(), Some(credentials))?;
+        next.max_inflight_per_account = self.max_inflight_per_account;
+        next.inflight = self.inflight.clone();
+        for (id, provider) in next.providers.iter_mut() {
+            let Some(old) = self.providers.get(id) else {
+                continue;
+            };
+            let same = old.fingerprint == provider.fingerprint
+                && serde_json::to_value(&old.profile).ok()
+                    == serde_json::to_value(&provider.profile).ok();
+            if same {
+                provider.user_clients = old.user_clients.clone();
+                provider.catalog = old.catalog.clone();
+            }
+            if id == "default" {
+                provider.models.extend(old.models.iter().cloned());
+            }
+        }
+        Ok(next)
+    }
+
+    /// The profile a provider is served with, as this router was built.
+    pub fn provider_profile(&self, id: &str) -> Option<&ProviderConfig> {
+        self.providers.get(id).map(|provider| &provider.profile)
+    }
+
     /// Build a router from explicit clients. Every configured provider must
     /// have one; used by tests and by callers that resolve credentials
     /// themselves.

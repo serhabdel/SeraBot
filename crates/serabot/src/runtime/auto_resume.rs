@@ -196,7 +196,7 @@ impl Runtime {
         self.scan_owner_output(user, &text)?;
         let selection =
             self.effective_model_selection(user, &payload.conversation_id, ORCHESTRATOR_BOT)?;
-        let route = self.router.pin_for_bot(user, &selection, &main.config)?;
+        let route = self.router().pin_for_bot(user, &selection, &main.config)?;
         let followup = self.store.enqueue_task(
             user,
             "turn",

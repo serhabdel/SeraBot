@@ -169,7 +169,7 @@
   min-width: 0;
   padding: 16px;
   border: 1px solid var(--glass-edge);
-  border-radius: var(--r-lg);
+  border-radius: var(--card-radius, 16px);
   background: var(--card-bg);
   box-shadow: var(--shadow-1), inset 0 1px 0 var(--glass-highlight);
   transition: border-color var(--dur-2) var(--ease), box-shadow var(--dur-2) var(--ease);
@@ -455,7 +455,7 @@
   min-width: 0;
   padding: 16px;
   border: 1px solid var(--glass-edge);
-  border-radius: var(--r-lg);
+  border-radius: var(--card-radius, 16px);
   background:
     radial-gradient(120% 90% at 0% 0%, var(--accent-soft), transparent 55%),
     var(--card-bg);

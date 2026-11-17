@@ -147,7 +147,7 @@ impl Runtime {
         if tokens < WINDOW_CHECK_FLOOR_TOKENS {
             return false;
         }
-        self.router
+        self.router()
             .catalog_entries(user)
             .into_iter()
             .find(|entry| {

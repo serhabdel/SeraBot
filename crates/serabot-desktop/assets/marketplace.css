@@ -226,7 +226,7 @@
   gap: 12px 14px;
   padding: 16px;
   border-color: var(--glass-edge);
-  border-radius: var(--r-lg);
+  border-radius: var(--card-radius, 16px);
   background: var(--card-bg);
   box-shadow: var(--shadow-1), inset 0 1px 0 var(--glass-highlight);
 }

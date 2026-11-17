@@ -34,7 +34,7 @@ use crate::error::{Result, SeraError};
 use crate::fleet::{Fleet, FleetRegistry};
 use crate::fleet_mutation::{self, BotPatch, MutationEnv, Origin};
 use crate::gateway::{ApprovalDetails, Tool, ToolContext, ToolOutput, ToolRegistry, ToolSpec};
-use crate::model_router::ModelRouter;
+use crate::model_router::RouterHandle;
 use crate::orchestration::{BotRole, ORCHESTRATOR_BOT, safe_bot_label};
 use crate::policy::Policy;
 use crate::store::Store;
@@ -92,7 +92,7 @@ enum Kind {
 struct Deps {
     store: Store,
     fleet: Arc<FleetRegistry>,
-    router: ModelRouter,
+    router: RouterHandle,
     policy: Arc<Policy>,
     child_daily_limit: u64,
 }
@@ -109,14 +109,14 @@ pub fn register_bot_tools(
     registry: &mut ToolRegistry,
     store: &Store,
     fleet: &Arc<FleetRegistry>,
-    router: &ModelRouter,
+    router: impl Into<RouterHandle>,
     policy: &Arc<Policy>,
     child_daily_limit: u64,
 ) -> Result<()> {
     let deps = Arc::new(Deps {
         store: store.clone(),
         fleet: fleet.clone(),
-        router: router.clone(),
+        router: router.into(),
         policy: policy.clone(),
         child_daily_limit,
     });
@@ -349,7 +349,7 @@ impl BotTool {
         let env = MutationEnv {
             store: &self.deps.store,
             fleet: &self.deps.fleet,
-            router: &self.deps.router,
+            router: &self.deps.router.get(),
             policy: &self.deps.policy,
             tool_registered: &registered,
         };
@@ -373,7 +373,7 @@ impl BotTool {
             .deps
             .store
             .bot_settings(&context.user_id, &config.name)?;
-        let chain = self.deps.router.bot_chain(&context.user_id, config);
+        let chain = self.deps.router.get().bot_chain(&context.user_id, config);
         Ok(json!({
             "id": config.name,
             "role": config.role.as_str(),
@@ -430,6 +430,7 @@ impl BotTool {
         let entries = self
             .deps
             .router
+            .get()
             .catalog_entries(&context.user_id)
             .into_iter()
             .filter(|entry| entry.data_egress_approved)
@@ -623,6 +624,7 @@ impl BotTool {
             }
             self.deps
                 .router
+                .get()
                 .ensure_catalogs(&context.user_id, std::time::Duration::from_secs(8))
                 .await;
         }
@@ -656,7 +658,7 @@ impl BotTool {
         };
         let resumed = resume_handoff(
             &self.deps.store,
-            &self.deps.router,
+            &self.deps.router.get(),
             config,
             &context.user_id,
             &args.handoff_id,
@@ -882,6 +884,7 @@ mod tests {
     use crate::delegate::DelegateTool;
     use crate::gateway::{Decision, Gateway, ToolOutcome};
     use crate::llm::LlmClient;
+    use crate::model_router::ModelRouter;
     use rusqlite::params;
     use std::collections::{BTreeMap, HashSet};
 
@@ -952,7 +955,7 @@ mod tests {
         .unwrap();
         let policy = Arc::new(Policy::from_text("TopSecret"));
         let mut registry = ToolRegistry::default();
-        register_bot_tools(&mut registry, &store, &fleet, &router, &policy, 500).unwrap();
+        register_bot_tools(&mut registry, &store, &fleet, router.clone(), &policy, 500).unwrap();
         registry
             .register(DelegateTool::new(
                 store.clone(),

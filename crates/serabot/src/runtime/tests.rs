@@ -567,12 +567,15 @@ async fn submit_text_enforces_the_per_user_daily_task_quota() {
 #[tokio::test]
 async fn conversation_selection_is_isolated_persisted_and_pinned_at_enqueue() {
     let server = MockServer::start().await;
-    let (mut runtime, store) = setup(
+    let (runtime, store) = setup(
         &server.uri(),
         Arc::new(Capture::default()),
         Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     );
-    runtime.router.add_default_model("alternative").unwrap();
+    runtime
+        .router_handle()
+        .update(|router| router.add_default_model("alternative"))
+        .unwrap();
     let initial = runtime
         .model_selection(&admin(&store), "one", "main")
         .unwrap();
@@ -655,7 +658,10 @@ async fn policy_scans_catalog_selection_and_all_message_metadata() {
         1,
         false,
     );
-    runtime.router.add_default_model("restricted").unwrap();
+    runtime
+        .router_handle()
+        .update(|router| router.add_default_model("restricted"))
+        .unwrap();
     assert!(runtime.model_catalog(&admin(&store)).is_err());
     let selection = ModelSelection {
         provider: "default".into(),
@@ -1073,8 +1079,11 @@ async fn approval_suspends_then_resumes_once() {
         .await;
     let notifier = Arc::new(Capture::default());
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let (mut runtime, store) = setup(&server.uri(), notifier.clone(), calls.clone());
-    runtime.router.add_default_model("alternative").unwrap();
+    let (runtime, store) = setup(&server.uri(), notifier.clone(), calls.clone());
+    runtime
+        .router_handle()
+        .update(|router| router.add_default_model("alternative"))
+        .unwrap();
     runtime
         .submit_text(&admin(&store), "owner", "deliver it", None)
         .unwrap();
@@ -2117,7 +2126,7 @@ async fn team_reply_stops_after_two_peer_questions_per_bot() {
     let selection = runtime
         .effective_model_selection(&admin(&store), "room:review", "analyst")
         .unwrap();
-    let route = runtime.router.pin(&selection).unwrap();
+    let route = runtime.router().pin(&selection).unwrap();
     let task = store
         .enqueue_task(
             &admin(&store),
@@ -3480,9 +3489,9 @@ async fn run_call(
     may_switch: bool,
 ) -> Result<failover::RoutedResponse> {
     let user = admin(store);
-    let chain = runtime.router.bot_chain(&user, config);
+    let chain = runtime.router().bot_chain(&user, config);
     let head = chain.head.clone().expect("route head");
-    let route = runtime.router.pin_for_bot(&user, &head, config).unwrap();
+    let route = runtime.router().pin_for_bot(&user, &head, config).unwrap();
     let messages = vec![LlmMessage::user("hello")];
     runtime
         .complete_with_failover(
@@ -3834,12 +3843,12 @@ async fn holds_are_per_user() {
         Default::default(),
     );
     let route = runtime
-        .router
+        .router()
         .pin_for_bot(&bob, &route_to_selection("default", "test"), &config)
         .unwrap();
     let plan = crate::route_chain::plan_candidates(
         &store,
-        &runtime.router,
+        &runtime.router(),
         &bob,
         &route,
         None,
@@ -3886,7 +3895,7 @@ async fn editing_the_chain_invalidates_queued_pins() {
     );
     let pinned = Some(
         runtime
-            .router
+            .router()
             .pin_for_bot(&user, &route_to_selection("default", "test"), &before)
             .unwrap(),
     );
@@ -4146,10 +4155,10 @@ async fn a_held_route_waits_per_user() {
         .unwrap();
     let plan = crate::route_chain::plan_candidates(
         &store,
-        &runtime.router,
+        &runtime.router(),
         &bob,
         &runtime
-            .router
+            .router()
             .pin(&route_to_selection("default", "test"))
             .unwrap(),
         None,
@@ -4418,7 +4427,7 @@ async fn a_failed_subagent_becomes_resumable_and_main_gets_one_follow_up() {
     let config = runtime.fleet.load(&user).unwrap()["analyst"].config.clone();
     let resumed = crate::delegate::resume_handoff(
         &store,
-        runtime.router(),
+        &runtime.router(),
         &config,
         &user,
         &view.id,
@@ -4485,7 +4494,7 @@ async fn unknown_effects_are_reported_but_never_retried() {
     let config = runtime.fleet.load(&user).unwrap()["analyst"].config.clone();
     let error = crate::delegate::resume_handoff(
         &store,
-        runtime.router(),
+        &runtime.router(),
         &config,
         &user,
         &view.id,
@@ -4538,7 +4547,7 @@ async fn auto_resume_stops_at_the_retry_cap_without_a_loop() {
             assert_eq!(view.status, "failed_resumable");
             let resumed = crate::delegate::resume_handoff(
                 &store,
-                runtime.router(),
+                &runtime.router(),
                 &config,
                 &user,
                 &view.id,
@@ -4561,7 +4570,7 @@ async fn auto_resume_stops_at_the_retry_cap_without_a_loop() {
             assert!(text.contains("No retries remain"));
             let error = crate::delegate::resume_handoff(
                 &store,
-                runtime.router(),
+                &runtime.router(),
                 &config,
                 &user,
                 &view.id,
