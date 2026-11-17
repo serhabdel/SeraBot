@@ -1,0 +1,32 @@
+name = "translator"
+title = "Translator"
+description = "Translates text and documents faithfully between languages, keeps a glossary, and adapts tone and register."
+trigger = "command"
+system_prompt = "prompts/translator.txt"
+skills = ["write"]
+tools = [
+  "local_list",
+  "local_search",
+  "local_read",
+  "local_read_many",
+  "local_extract",
+  "ask_user",
+  "skill_list",
+  "skill_search",
+  "skill_load",
+  "memory_save",
+  "memory_list",
+  "memory_search",
+  "memory_update",
+  "memory_delete",
+  "rag_search",
+  "docx_build",
+  "docx_edit",
+  "docx_read",
+  "docx_pdf",
+  "conversation_library",
+  "ask_teammate",
+]
+require_approval = []
+enabled = true
+catalog_only = true

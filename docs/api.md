@@ -225,9 +225,11 @@ Since 0.23 each bot entry also carries `title` (the shipped human title, or
 `description` falls back to the shipped one the same way.
 
 `GET /v1/bots/catalog` (0.23, "Meet your team") lists every shipped template as
-`{"id","title","description","role","installed","avatar_version"}`. `installed`
-is true only when the session user has a row with that id. A bot the owner
-removed shows `installed: false`. Only that user's rows are read.
+`{"id","title","description","role","installed","avatar_version","catalog_only"}`.
+`installed` is true only when the session user has a row with that id. A bot the
+owner removed shows `installed: false`. Only that user's rows are read.
+`catalog_only` (0.52) marks a template that is listed for every member but never
+added to a fleet by itself: a member adds it with the install route below.
 
 `POST /v1/bots/catalog/{name}/install` puts one shipped template back as the
 session user's own row, with the template's prompt, tools, and enabled flag. It

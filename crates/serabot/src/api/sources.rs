@@ -219,6 +219,7 @@ mod tests {
                     route: None,
                     fallbacks: Vec::new(),
                     failover: Default::default(),
+                    catalog_only: false,
                 },
                 prompt: "test prompt".into(),
             }],

@@ -852,6 +852,10 @@ pub struct ShippedBot {
     pub enabled: bool,
     #[serde(default)]
     pub avatar_version: Option<String>,
+    /// An opt-in bot the owner adds from the marketplace; false for the
+    /// default fleet and for an older server that omits it.
+    #[serde(default)]
+    pub catalog_only: bool,
 }
 
 /// Full bot record from `GET /v1/bots/{id}`: profile, routing, instructions

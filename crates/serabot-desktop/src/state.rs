@@ -1999,6 +1999,7 @@ mod tests {
             installed,
             enabled: installed,
             avatar_version: None,
+            catalog_only: false,
         }
     }
 

@@ -115,3 +115,27 @@ are not confirmed; check them before a filing or a payment.
 
 To add the owner's own reference guides for the comptable bot, see
 [knowledge packs](knowledge-packs.md).
+
+## Catalog-only bots (0.52)
+
+A shipped template with `catalog_only = true` in `bots/<name>.toml` is listed in
+the marketplace's **Bots** tab (`GET /v1/bots/catalog`) for every member, but it
+is not added to anyone's team automatically: new users and server upgrades skip
+it. A member adds it with **Add to my team** (`POST
+/v1/bots/catalog/{name}/install`); from then on it is that member's own bot and
+later template upgrades reach it like any shipped bot. Removing it keeps it out
+until the member adds it again. `fleet reseed` skips catalog-only templates.
+
+| Bot | Title | What it does |
+|---|---|---|
+| `researcher` | Researcher | Researches a question on the web and in your documents, compares sources, and reports with citations and dates. |
+| `writer` | Writer | Drafts, rewrites, edits and proofreads long-form text in your voice. |
+| `translator` | Translator | Translates text and documents faithfully, keeps a glossary, and adapts tone and register. |
+| `planner` | Planner | Turns goals into weekly plans, to-do lists and time blocks from your tasks and calendar. |
+| `support` | Support Writer | Drafts customer replies and FAQ answers from your policies. Never sends anything itself. |
+| `product` | Product Writer | Writes PRDs, user stories, acceptance criteria, roadmaps and release notes. |
+| `tutor` | Tutor | Explains concepts step by step, builds study plans, and quizzes you with feedback. |
+
+None of them has a tool with an outbound effect, so none asks for approval;
+each drafts and hands files to Main for delivery, like the other shipped bots.
+They have no bundled picture yet and show a letter tile.

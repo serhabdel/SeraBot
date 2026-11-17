@@ -92,6 +92,14 @@ struct BotOffering {
     removed: bool,
 }
 
+/// The config a template writes into a user's row: the template with the
+/// catalog-only marker cleared, since a stored row is an ordinary bot.
+fn row_config(template: &LoadedBot) -> Result<serde_json::Value> {
+    let mut config = template.config.clone();
+    config.catalog_only = false;
+    Ok(serde_json::to_value(&config)?)
+}
+
 impl BotOffering {
     fn of(template: &LoadedBot) -> Self {
         Self {
@@ -135,11 +143,13 @@ pub fn reseed_user(store: &Store, user_id: &str, templates: &[LoadedBot]) -> Res
         store.delete_bot(user_id, &row.name)?;
     }
     let mut offerings = Offerings::default();
-    for template in templates {
+    let mut written = 0;
+    for template in templates.iter().filter(|t| !t.config.catalog_only) {
+        written += 1;
         store.upsert_bot(
             user_id,
             &template.config.name,
-            &serde_json::to_value(&template.config)?,
+            &row_config(template)?,
             &template.prompt,
             template.config.enabled,
         )?;
@@ -148,7 +158,7 @@ pub fn reseed_user(store: &Store, user_id: &str, templates: &[LoadedBot]) -> Res
             .insert(template.config.name.clone(), BotOffering::of(template));
     }
     store.set_fleet_offerings(user_id, &serde_json::to_string(&offerings)?)?;
-    Ok(templates.len())
+    Ok(written)
 }
 
 /// One shipped template as the owner sees it on "Meet your team".
@@ -158,6 +168,8 @@ pub struct CatalogEntry {
     pub title: Option<String>,
     pub description: Option<String>,
     pub role: String,
+    /// Opt-in template: never inserted by seed or upgrade, only by install.
+    pub catalog_only: bool,
     /// Whether the acting user has a row for this bot.
     pub installed: bool,
     /// Whether the user's row is enabled (false when not installed).
@@ -249,7 +261,9 @@ impl FleetRegistry {
     /// [`Self::invalidate`] clears the mark. Per template, against the user's
     /// offering record:
     /// - no row, not marked removed: insert it, so every shipped bot reaches
-    ///   every user. A bot the owner removed (the record's `removed` flag, set
+    ///   every user, except a catalog-only template (`catalog_only`), which is
+    ///   inserted only once the user has installed it and a record tracks it.
+    ///   A bot the owner removed (the record's `removed` flag, set
     ///   by [`Self::mark_removed`]) stays gone until re-added.
     /// - a row: add the tools, skills, and delegates the template gained since
     ///   the baseline, never re-adding one the owner removed. Replace the
@@ -314,12 +328,19 @@ impl FleetRegistry {
             let Some(row) = rows.iter().find(|row| row.name == name) else {
                 // Only an explicit owner removal keeps a template out; a
                 // record without the flag is stale (row never written or lost)
-                // and the template is restored.
-                if !record.is_some_and(|record| record.removed) {
+                // and the template is restored. A catalog-only template is
+                // restored only when the user's record already tracks it (they
+                // installed it before); with no record it waits for an install.
+                let wanted = if template.config.catalog_only {
+                    record.as_ref().is_some_and(|record| !record.removed)
+                } else {
+                    !record.is_some_and(|record| record.removed)
+                };
+                if wanted {
                     self.store.upsert_bot(
                         user_id,
                         name,
-                        &serde_json::to_value(&template.config)?,
+                        &row_config(template)?,
                         &template.prompt,
                         template.config.enabled,
                     )?;
@@ -504,6 +525,7 @@ impl FleetRegistry {
                 title: template.config.title.clone(),
                 description: template.config.description.clone(),
                 role: template.config.role.as_str().to_owned(),
+                catalog_only: template.config.catalog_only,
                 installed: rows.iter().any(|row| row.name == template.config.name),
                 enabled: rows
                     .iter()
@@ -537,7 +559,7 @@ impl FleetRegistry {
         let user_lock = self.user_lock(user_id);
         let _guard = user_lock.lock().unwrap_or_else(|error| error.into_inner());
         let mut offerings = self.offerings(user_id)?;
-        let config = serde_json::to_value(&template.config)?;
+        let config = row_config(template)?;
         if !self.store.insert_bot(
             user_id,
             name,
@@ -675,6 +697,7 @@ mod tests {
                 route: None,
                 fallbacks: Vec::new(),
                 failover: Default::default(),
+                catalog_only: false,
             },
             prompt: format!("{name} prompt"),
         }
@@ -911,13 +934,50 @@ mod tests {
         let templates =
             crate::config::load_bots(&config, &config.fleet.bots_dir).expect("seed templates");
         assert!(templates.len() >= 13, "the shipped fleet has thirteen bots");
+        let catalog_only = templates
+            .iter()
+            .filter(|template| template.config.catalog_only)
+            .map(|template| template.config.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            catalog_only,
+            [
+                "planner",
+                "product",
+                "researcher",
+                "support",
+                "translator",
+                "tutor",
+                "writer"
+            ],
+            "the opt-in marketplace bots"
+        );
+        assert!(
+            templates
+                .iter()
+                .filter(|template| template.config.catalog_only)
+                .all(|template| template.config.enabled
+                    && template.config.role == BotRole::Specialist),
+            "marketplace bots ship enabled specialists"
+        );
+        let templates_total = templates.len();
         let catalog = Arc::new(SkillCatalog::load(&config).unwrap());
         let store = Store::open_in_memory(384).unwrap();
         let registry =
             FleetRegistry::new(Arc::new(config), store.clone(), templates, catalog).unwrap();
         let admin = store.admin_user_id().unwrap();
+        // The seven catalog-only bots are listed but not seeded.
         assert_eq!(registry.seed(&admin).unwrap(), 13);
         let fleet = registry.load(&admin).unwrap();
+        assert_eq!(fleet.len(), 13);
+        assert!(!fleet.contains_key("researcher"));
+        let listed = registry.template_catalog(&admin).unwrap();
+        assert_eq!(listed.len(), templates_total);
+        assert!(
+            listed
+                .iter()
+                .any(|entry| entry.name == "researcher" && entry.catalog_only && !entry.installed)
+        );
         assert!(fleet["main"].config.enabled);
         assert_eq!(fleet["main"].config.role, BotRole::Orchestrator);
         assert!(!fleet["legal"].config.enabled);
@@ -1552,6 +1612,96 @@ mod tests {
             config_of(&store, &admin, "watcher").tools,
             vec!["fetch_url".to_owned(), "memory_search".to_owned()]
         );
+    }
+
+    /// A fleet whose `watcher` template is catalog-only (opt-in).
+    fn with_catalog_only_watcher() -> Vec<LoadedBot> {
+        let mut templates = with_watcher(&["fetch_url"]);
+        templates[2].config.catalog_only = true;
+        templates
+    }
+
+    /// A catalog-only template is listed for a fresh user as not installed and
+    /// is not inserted by seed.
+    #[test]
+    fn a_catalog_only_template_is_listed_but_not_seeded() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let registry = registry_with(&store, with_catalog_only_watcher());
+        assert_eq!(registry.seed(&admin).unwrap(), 2);
+        assert!(store.get_bot(&admin, "watcher").unwrap().is_none());
+        let catalog = registry.template_catalog(&admin).unwrap();
+        let entry = catalog.iter().find(|e| e.name == "watcher").unwrap();
+        assert!(entry.catalog_only && !entry.installed && !entry.enabled);
+        assert!(registry.has_template("watcher"));
+        // A later process does not add it either.
+        let restarted = registry_with(&store, with_catalog_only_watcher());
+        assert_eq!(restarted.seed(&admin).unwrap(), 0);
+        assert!(store.get_bot(&admin, "watcher").unwrap().is_none());
+    }
+
+    /// Install adds the row as an ordinary bot, and a later seed or upgrade
+    /// keeps it and still upgrades its tools.
+    #[test]
+    fn installing_a_catalog_only_bot_keeps_it_across_seeds() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let other = member(&store);
+        let registry = registry_with(&store, with_catalog_only_watcher());
+        registry.seed(&admin).unwrap();
+        assert!(registry.install_template(&admin, "watcher").unwrap());
+        assert!(!registry.install_template(&admin, "watcher").unwrap());
+        let stored = config_of(&store, &admin, "watcher");
+        assert!(!stored.catalog_only);
+        assert!(registry.load(&admin).unwrap().contains_key("watcher"));
+        let catalog = registry.template_catalog(&admin).unwrap();
+        assert!(
+            catalog
+                .iter()
+                .any(|e| e.name == "watcher" && e.installed && e.enabled)
+        );
+
+        let mut next = with_catalog_only_watcher();
+        next[2].config.tools.push("memory_search".into());
+        let next = registry_with(&store, next);
+        assert_eq!(next.seed(&admin).unwrap(), 0);
+        assert_eq!(
+            config_of(&store, &admin, "watcher").tools,
+            vec!["fetch_url".to_owned(), "memory_search".to_owned()]
+        );
+        // Another user is unaffected.
+        next.seed(&other).unwrap();
+        assert!(store.get_bot(&other, "watcher").unwrap().is_none());
+    }
+
+    /// Removing an installed catalog-only bot keeps it out; installing again
+    /// brings it back like any other shipped bot.
+    #[test]
+    fn a_removed_catalog_only_bot_is_not_reseeded_until_reinstalled() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let registry = registry_with(&store, with_catalog_only_watcher());
+        registry.seed(&admin).unwrap();
+        assert!(registry.install_template(&admin, "watcher").unwrap());
+        store.delete_bot(&admin, "watcher").unwrap();
+        registry.mark_removed(&admin, "watcher").unwrap();
+        let restarted = registry_with(&store, with_catalog_only_watcher());
+        assert_eq!(restarted.seed(&admin).unwrap(), 0);
+        assert!(store.get_bot(&admin, "watcher").unwrap().is_none());
+        assert!(restarted.install_template(&admin, "watcher").unwrap());
+        let again = registry_with(&store, with_catalog_only_watcher());
+        assert_eq!(again.seed(&admin).unwrap(), 0);
+        assert!(store.get_bot(&admin, "watcher").unwrap().is_some());
+    }
+
+    /// `fleet reseed` writes the default fleet only.
+    #[test]
+    fn reseed_skips_catalog_only_templates() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let written = reseed_user(&store, &admin, &with_catalog_only_watcher()).unwrap();
+        assert_eq!(written, 2);
+        assert!(store.get_bot(&admin, "watcher").unwrap().is_none());
     }
 
     /// A record that names a template but has no row and no `removed` flag is

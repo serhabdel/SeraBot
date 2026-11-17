@@ -1,0 +1,33 @@
+name = "writer"
+title = "Writer"
+description = "Drafts, rewrites, edits and proofreads long-form text such as articles, reports, letters and speeches in your voice."
+trigger = "command"
+system_prompt = "prompts/writer.txt"
+skills = ["write", "copy", "synthesis"]
+tools = [
+  "local_list",
+  "local_search",
+  "local_read",
+  "local_read_many",
+  "local_extract",
+  "ask_user",
+  "skill_list",
+  "skill_search",
+  "skill_load",
+  "memory_save",
+  "memory_list",
+  "memory_search",
+  "memory_update",
+  "memory_delete",
+  "rag_search",
+  "docx_build",
+  "docx_edit",
+  "docx_read",
+  "docx_pdf",
+  "fetch_url",
+  "conversation_library",
+  "ask_teammate",
+]
+require_approval = []
+enabled = true
+catalog_only = true

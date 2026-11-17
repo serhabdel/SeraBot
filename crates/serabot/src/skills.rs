@@ -1018,6 +1018,7 @@ mod tests {
                 route: None,
                 fallbacks: Vec::new(),
                 failover: Default::default(),
+                catalog_only: false,
             },
             prompt: "prompt".into(),
         }];
@@ -1059,6 +1060,7 @@ mod tests {
                 route: None,
                 fallbacks: Vec::new(),
                 failover: Default::default(),
+                catalog_only: false,
             },
             prompt: "prompt".into(),
         }];
@@ -1154,6 +1156,7 @@ mod tests {
                             route: None,
                             fallbacks: Vec::new(),
                             failover: Default::default(),
+                            catalog_only: false,
                         },
                         prompt: String::new(),
                     },

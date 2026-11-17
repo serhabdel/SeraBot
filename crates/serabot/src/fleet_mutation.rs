@@ -667,6 +667,7 @@ mod tests {
             route: None,
             fallbacks: vec![],
             failover: FailoverPolicy::default(),
+            catalog_only: false,
         }
     }
 

@@ -278,3 +278,11 @@
   padding-top: 10px;
   border-top: 1px solid var(--hairline);
 }
+
+.meet-new {
+  margin-left: 8px;
+  padding: 1px 7px;
+  font-size: var(--fs-micro);
+  font-weight: 650;
+  vertical-align: 1px;
+}

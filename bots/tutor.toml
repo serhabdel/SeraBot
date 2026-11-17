@@ -1,0 +1,32 @@
+name = "tutor"
+title = "Tutor"
+description = "Explains concepts step by step at your level, builds study plans, and quizzes you with feedback."
+trigger = "command"
+system_prompt = "prompts/tutor.txt"
+skills = ["ask", "write"]
+tools = [
+  "local_list",
+  "local_search",
+  "local_read",
+  "local_read_many",
+  "local_extract",
+  "ask_user",
+  "skill_list",
+  "skill_search",
+  "skill_load",
+  "memory_save",
+  "memory_list",
+  "memory_search",
+  "memory_update",
+  "memory_delete",
+  "rag_search",
+  "tavily_search",
+  "fetch_url",
+  "docx_build",
+  "xlsx_build",
+  "conversation_library",
+  "ask_teammate",
+]
+require_approval = []
+enabled = true
+catalog_only = true
