@@ -37,8 +37,9 @@ pub fn use_claude_code_provider() {
     });
 }
 
+/// Embedded inside a bot's chat pane when local Claude Agent (ACP) mode is active.
 #[component]
-pub fn ClaudeCodeView(session: Signal<Session>) -> Element {
+pub fn ClaudeAgentBotView(session: Signal<Session>, bot_id: String) -> Element {
     let ClaudeCode(mut controller) = use_context::<ClaudeCode>();
     let mut draft = use_signal(String::new);
     use_hook(move || {
@@ -48,6 +49,7 @@ pub fn ClaudeCodeView(session: Signal<Session>) -> Element {
         }
     });
     let folders = session.read().local_folders.clone();
+    let bot_name = session.read().bot_display_name(&bot_id);
     let c = controller.read();
     let status = c.status.clone();
     let running = status.running();
@@ -72,26 +74,32 @@ pub fn ClaudeCodeView(session: Signal<Session>) -> Element {
         Status::Idle => "cc-status",
     };
     let can_send = status == Status::Ready && !draft().trim().is_empty();
+    let bot_for_toggle = bot_id.clone();
 
     rsx! {
-        div { class: "pane cc-page",
-            div { class: "pane-head",
-                div {
-                    h1 { class: "pane-title", "Claude Code" }
-                    p { class: "muted",
-                        "Claude Code on this computer, with your own Claude login. It works in one folder you allow, and asks before it edits or runs anything."
-                    }
+        div { class: "pane cc-page cc-embedded",
+            div { class: "cc-inline-bar",
+                div { class: "cc-inline-title",
+                    Icon { name: "code", size: 15 }
+                    strong { "{bot_name} \u{00b7} Local Claude Agent (ACP)" }
+                    span { class: "{status_class}", role: "status", "{status.label()}" }
                 }
                 div { class: "cc-head-actions",
-                    span { class: "{status_class}", role: "status", "{status.label()}" }
                     if running {
                         button {
                             class: "btn ghost sm",
                             r#type: "button",
                             onclick: move |_| controller.write().stop(),
                             Icon { name: "stop", size: 14 }
-                            "Stop Claude Code"
+                            "Stop agent"
                         }
+                    }
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        onclick: move |_| session.write().toggle_bot_claude_agent(&bot_for_toggle),
+                        Icon { name: "chat", size: 14 }
+                        "Server model chat"
                     }
                 }
             }

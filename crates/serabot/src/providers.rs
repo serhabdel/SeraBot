@@ -1613,6 +1613,7 @@ pub fn open_provider_client(
             client = client.with_cloud_version(&profile.client_version);
         }
     }
+    let mut attached_project_discovery = false;
     if member_account && let Some(refresher) = owner.refresher {
         let accounts = refresher.accounts();
         let row =
@@ -1673,9 +1674,22 @@ pub fn open_provider_client(
                     account_id: owner.account_id.to_owned(),
                 }),
             );
+            attached_project_discovery = true;
         }
     }
+    if kind == "google-antigravity"
+        && !attached_project_discovery
+        && profile.project_id.trim().is_empty()
+    {
+        client = client.with_project_discovery(None, None, Arc::new(NoopProjectMemo));
+    }
     Ok(client)
+}
+
+struct NoopProjectMemo;
+
+impl crate::llm::ProjectMemo for NoopProjectMemo {
+    fn record(&self, _discovery: &crate::cloud_code::Discovery) {}
 }
 
 /// Writes a discovered Cloud Code project (and the fact that discovery ran)

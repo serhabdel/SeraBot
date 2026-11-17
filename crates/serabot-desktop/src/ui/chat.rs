@@ -504,15 +504,22 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let chat_failure = session.read().state.chat_failure.clone();
     let held_draft = session.read().state.held_draft.is_some();
     let failure_attempt = session.read().state.failure_attempt;
-    if chat_failure.is_none() && dismissed_failure().is_some() {
-        dismissed_failure.set(None);
-    }
-    if !held_draft && dismissed_held() {
-        dismissed_held.set(false);
-    }
-    if transcript_error.is_none() && dismissed_transcript_err().is_some() {
-        dismissed_transcript_err.set(None);
-    }
+    use_effect(move || {
+        let s = session.read();
+        let no_fail = s.state.chat_failure.is_none();
+        let no_held = s.state.held_draft.is_none();
+        let no_err = s.state.transcript_error.is_none();
+        drop(s);
+        if no_fail && dismissed_failure.peek().is_some() {
+            dismissed_failure.set(None);
+        }
+        if no_held && *dismissed_held.peek() {
+            dismissed_held.set(false);
+        }
+        if no_err && dismissed_transcript_err.peek().is_some() {
+            dismissed_transcript_err.set(None);
+        }
+    });
     let show_failure = chat_failure
         .as_ref()
         .filter(|f| dismissed_failure() != Some((f.message.clone(), failure_attempt)))
@@ -815,6 +822,14 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         });
         feed_view::feed_window(row_views.len(), anchor, at_bottom())
     };
+    if is_one_to_one
+        && let Some(bot_id) = active_bot.clone()
+        && session.read().bot_uses_claude_agent(&bot_id)
+    {
+        return rsx! {
+            crate::ui_claude_code::ClaudeAgentBotView { session, bot_id }
+        };
+    }
     rsx! {
         div { class: "pane-body chat-body",
             onkeydown: move |event: KeyboardEvent| {
@@ -1434,12 +1449,17 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                             placeholder: if accepts { format!("Message {active_name}…") } else { "This node does not accept turns".into() },
                             disabled: !accepts,
                             onfocus: move |_| composer_focused.set(true),
-                            onblur: move |_| composer_focused.set(false),
+                            onblur: move |_| {
+                                composer_focused.set(false);
+                                let draft = composer_draft();
+                                if session.peek().composer != draft {
+                                    session.write().composer = draft;
+                                }
+                            },
                             oninput: move |event| {
                                 let value = event.value();
                                 confirm_regen.set(None);
                                 composer_draft.set(value.clone());
-                                session.write().composer = value.clone();
                                 mention.set(mention_query(&value));
                                 mention_idx.set(0);
                                 slash.set(slash_query(&value));
@@ -1618,7 +1638,10 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     ) {
                                         event.prevent_default();
                                         // While a reply runs, Enter queues the message.
-                                        session.write().send_or_queue();
+                                        let mut s = session.write();
+                                        s.composer = composer_draft();
+                                        s.send_or_queue();
+                                        composer_draft.set(s.composer.clone());
                                     }
                                 }
                             },
@@ -1743,7 +1766,12 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                             title: "Add to the queue; it is sent when the reply is done",
                                             "aria-label": "Add the message to the queue",
                                             disabled: !accepts || queued_count >= chat_compose::MAX_QUEUED,
-                                            onclick: move |_| session.write().queue_composer(),
+                                            onclick: move |_| {
+                                                let mut s = session.write();
+                                                s.composer = composer_draft();
+                                                s.queue_composer();
+                                                composer_draft.set(s.composer.clone());
+                                            },
                                             Icon { name: "list", size: 14 }
                                             "Queue"
                                         }
@@ -1761,7 +1789,12 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                         title: "Send",
                                         "aria-label": "Send message",
                                         disabled: !can_send || !send_ready,
-                                        onclick: move |_| session.write().submit(),
+                                        onclick: move |_| {
+                                            let mut s = session.write();
+                                            s.composer = composer_draft();
+                                            s.submit();
+                                            composer_draft.set(s.composer.clone());
+                                        },
                                         Icon { name: "send", size: 16 }
                                     }
                                 }

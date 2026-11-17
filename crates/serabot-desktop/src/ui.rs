@@ -759,11 +759,13 @@ fn App() -> Element {
                         }
                     }
                 }
-                let before = session.read().ui_fingerprint();
-                session.with_mut(|session| session.tick());
-                let after = session.read().ui_fingerprint();
-                if before != after {
-                    revision.set(revision() + 1);
+                if saw_wake || session.peek().has_tick_work() {
+                    let before = session.peek().ui_fingerprint();
+                    session.with_mut(|session| session.tick());
+                    let after = session.peek().ui_fingerprint();
+                    if before != after {
+                        revision.set(revision() + 1);
+                    }
                 }
                 // SSE wakes skip the idle wait; pace at ~60fps so we do not spin.
                 if saw_wake {

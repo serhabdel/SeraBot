@@ -371,8 +371,10 @@ pub fn authorize_url(redirect_uri: &str, challenge: &str, state: &str) -> Result
     }
     let mut url = url::Url::parse("https://accounts.google.com/o/oauth2/v2/auth")
         .map_err(|_| SeraError::External("oauth login could not start".into()))?;
+    let env_id = std::env::var(ANTIGRAVITY_CLIENT_ID_ENV).ok();
+    let client_id = pick_antigravity_client_id(None, env_id.as_deref());
     url.query_pairs_mut()
-        .append_pair("client_id", ANTIGRAVITY_CLIENT_ID)
+        .append_pair("client_id", &client_id)
         .append_pair("response_type", "code")
         .append_pair("redirect_uri", redirect_uri)
         .append_pair("scope", ANTIGRAVITY_SCOPES)
@@ -527,15 +529,20 @@ pub fn parse_cloud_code_stream(bytes: &[u8]) -> Result<CloudCodeCompletion> {
     } else {
         let mut saw = false;
         for line in text.lines() {
-            let Some(data) = line.trim().strip_prefix("data:") else {
+            let trimmed_line = line.trim();
+            let payload = if let Some(data) = trimmed_line.strip_prefix("data:") {
+                data.trim()
+            } else if trimmed_line.starts_with('{') {
+                trimmed_line
+            } else {
                 continue;
             };
-            let data = data.trim();
-            if data.is_empty() || data == "[DONE]" {
+            if payload.is_empty() || payload == "[DONE]" {
                 continue;
             }
-            let value: Value = serde_json::from_str(data)
-                .map_err(|_| SeraError::External("malformed Cloud Code response".into()))?;
+            let Ok(value) = serde_json::from_str::<Value>(payload) else {
+                continue;
+            };
             absorb_completion(&mut completion, &value)?;
             saw = true;
         }
@@ -702,9 +709,7 @@ pub fn build_cloud_code_envelope_with(
         }
     }
     if turns.is_empty() {
-        return Err(SeraError::Validation(
-            "Cloud Code request has no messages".into(),
-        ));
+        push_turn(&mut turns, "user", vec![json!({"text": "Hello"})], false);
     }
     let contents = turns
         .into_iter()
@@ -1058,7 +1063,11 @@ fn absorb_completion(completion: &mut CloudCodeCompletion, value: &Value) -> Res
     let root = value.get("response").unwrap_or(value);
     if let Some(usage) = root.get("usageMetadata") {
         if let Some(prompt) = usage.get("promptTokenCount").and_then(json_u64) {
-            completion.prompt_tokens = prompt;
+            let cached = usage
+                .get("cachedContentTokenCount")
+                .and_then(json_u64)
+                .unwrap_or(0);
+            completion.prompt_tokens = prompt.saturating_sub(cached);
         }
         // Output counts what the model thought as well as what it said.
         let output = usage
@@ -1853,12 +1862,14 @@ async fn exchange_code(
     verifier: &str,
 ) -> Result<(SecretString, SecretString)> {
     validate_loopback_redirect(redirect_uri)?;
+    let env_id = std::env::var(ANTIGRAVITY_CLIENT_ID_ENV).ok();
+    let client_id = pick_antigravity_client_id(None, env_id.as_deref());
     let response = http
         .post(token_url)
         .header("user-agent", "SeraBot/0.1")
         .header("accept", "application/json")
         .form(&[
-            ("client_id", ANTIGRAVITY_CLIENT_ID),
+            ("client_id", client_id.as_str()),
             ("client_secret", client_secret),
             ("code", code),
             ("grant_type", "authorization_code"),
@@ -2776,5 +2787,37 @@ mod tests {
         assert!(message.contains("400"));
         assert!(!message.contains(secret));
         assert!(pin_token_url("https://evil.example/token").is_err());
+    }
+
+    #[test]
+    fn stream_parser_skips_non_json_lines_and_subtracts_cached_tokens() {
+        let sse = b"data: keepalive\n\ndata: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello \"}]}}],\"usageMetadata\":{\"promptTokenCount\":120,\"cachedContentTokenCount\":80,\"candidatesTokenCount\":5}}}\n{\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"world\"}]},\"finishReason\":\"STOP\"}]}}\ndata: [DONE]\n";
+        let parsed = parse_cloud_code_stream(sse).expect("sse parses");
+        assert_eq!(parsed.text, "hello world");
+        assert_eq!(parsed.prompt_tokens, 40);
+        assert_eq!(parsed.completion_tokens, 5);
+        assert_eq!(parsed.finish_reason.as_deref(), Some("STOP"));
+    }
+
+    #[test]
+    fn empty_messages_insert_fallback_user_turn() {
+        let envelope = build_cloud_code_envelope_with(
+            "gemini-4-argon-high",
+            "proj-1",
+            &[LlmMessage::system("Be helpful.")],
+            &[],
+            1024,
+            None,
+            &EnvelopeOptions {
+                conversation: "c1",
+                session_generation: 0,
+                thinking_level: None,
+            },
+        )
+        .expect("envelope builds");
+        let contents = envelope["request"]["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[0]["parts"][0]["text"], "Hello");
     }
 }

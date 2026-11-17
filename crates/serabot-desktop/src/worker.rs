@@ -887,14 +887,17 @@ pub struct Worker {
     sender: SyncSender<Job>,
     receiver: Receiver<Completion>,
     epoch: Arc<AtomicU64>,
+    pending_completions: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Worker {
     pub fn start() -> std::io::Result<Self> {
-        let (sender, jobs) = mpsc::sync_channel::<Job>(1);
+        let (sender, jobs) = mpsc::sync_channel::<Job>(64);
         let (results, receiver) = mpsc::channel();
         let epoch = Arc::new(AtomicU64::new(0));
         let current = Arc::clone(&epoch);
+        let pending_completions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pending_tx = Arc::clone(&pending_completions);
         std::thread::Builder::new()
             .name("serabot-http".into())
             .spawn(move || {
@@ -912,6 +915,7 @@ impl Worker {
                     if current.load(Ordering::SeqCst) != job.scope.epoch {
                         continue;
                     }
+                    pending_tx.fetch_add(1, Ordering::Release);
                     if results
                         .send(Completion {
                             scope: job.scope,
@@ -920,6 +924,7 @@ impl Worker {
                         })
                         .is_err()
                     {
+                        pending_tx.fetch_sub(1, Ordering::AcqRel);
                         break;
                     }
                 }
@@ -928,6 +933,7 @@ impl Worker {
             sender,
             receiver,
             epoch,
+            pending_completions,
         })
     }
 
@@ -939,8 +945,17 @@ impl Worker {
         // inflate the Result error variant.
         self.sender.try_send(job).map_err(Box::new)
     }
+    pub fn has_completion(&self) -> bool {
+        self.pending_completions.load(Ordering::Acquire) > 0
+    }
     pub fn completion(&self) -> Option<Completion> {
-        self.receiver.try_recv().ok()
+        match self.receiver.try_recv() {
+            Ok(item) => {
+                self.pending_completions.fetch_sub(1, Ordering::AcqRel);
+                Some(item)
+            }
+            Err(_) => None,
+        }
     }
 }
 
