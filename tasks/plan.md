@@ -179,6 +179,13 @@ failure and wait cards, plus a motion/accessibility pass. No live provider was
 used and the desktop was not visually verified on a device. B7 worker counts
 above 2 are gated on running the load fixture on the target host.
 
+## Status after 0.53.0 (consistency, motion, live providers)
+
+0.53.0 shares one swappable model router across the runtime and the tools that
+read it, so console provider saves and removals apply without a restart, adds
+the shared surface system (`assets/system.css`), and polishes every remaining
+console page. Checked against synthetic fixtures and a local render only.
+
 ## Status after 0.52.0 (sign-in fixes, design, marketplace bots)
 
 0.52.0 fixes Claude plan sign-in from the console (no key needed while plan

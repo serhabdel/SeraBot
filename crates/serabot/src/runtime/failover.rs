@@ -62,7 +62,7 @@ impl Runtime {
         let now = Utc::now();
         let plan = plan_candidates(
             &self.store,
-            &self.router,
+            &self.router(),
             call.user,
             route,
             head_thinking,
@@ -129,7 +129,7 @@ impl Runtime {
             };
             let thinking = if candidate.hop > 0 {
                 candidate.thinking.as_deref().filter(|level| {
-                    self.router
+                    self.router()
                         .thinking_levels(call.user, &candidate.selection)
                         .contains(level)
                 })
@@ -138,7 +138,7 @@ impl Runtime {
             };
             let result = crate::llm::with_conversation(
                 call.conversation_id,
-                self.router.complete_on(
+                self.router().complete_on(
                     call.user,
                     &candidate.selection,
                     &messages,

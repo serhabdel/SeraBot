@@ -1,0 +1,279 @@
+/* Shared surface system (0.53). Loaded last so every page reads the same
+   cards, stat tiles, segmented controls, skeletons and list motion. Pages keep
+   their own layout; this file only settles what they share. Tokens only, and
+   every animation stops under reduced motion (system or the console switch). */
+
+:root {
+  /* One card: radius, padding, rest and lift. */
+  --card-radius: 16px;
+  --card-pad: 16px;
+  --card-shadow: var(--shadow-1), inset 0 1px 0 var(--glass-highlight);
+  --card-shadow-lift: var(--shadow-2), inset 0 1px 0 var(--glass-highlight);
+  --lift: translateY(-1px);
+  /* List entry: a short rise, 28 ms apart for the first eight items. */
+  --enter-dur: var(--dur-3);
+  --enter-step: 28ms;
+}
+
+/* ---- Cards: one look for every top-level card ---- */
+
+.card,
+.integration-card,
+.mp-card,
+.prov-card,
+.prov-plan,
+.usage-card,
+.quota-card,
+.settings-card {
+  border-radius: var(--card-radius);
+}
+
+/* Cards you can press or open lift a pixel on hover and settle on press. */
+.integration-card,
+.mp-card,
+.prov-plan,
+.prov-key,
+.mp-bots .roster-row {
+  transition: border-color var(--dur-1) var(--ease), box-shadow var(--dur-2) var(--ease),
+    transform var(--dur-2) var(--spring), background var(--dur-1) var(--ease);
+}
+
+.integration-card:hover,
+.mp-card:hover,
+.prov-plan:hover,
+.prov-key:hover,
+.mp-bots .roster-row:hover {
+  border-color: var(--hairline-strong);
+  box-shadow: var(--card-shadow-lift);
+  transform: var(--lift);
+}
+
+/* ---- Stat tiles: Vault, Workflows and Usage read the same ---- */
+
+.stat-tile,
+.vault-stat-card,
+.wf-stat-card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 132px;
+  padding: 12px 14px;
+  border: 1px solid var(--glass-edge);
+  border-radius: var(--r-md);
+  background: var(--card-bg);
+  box-shadow: var(--card-shadow);
+}
+
+.stat-tile-value,
+.vault-stat-value,
+.wf-stat-value {
+  color: var(--label-1);
+  font-size: var(--fs-title);
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-tile-label,
+.vault-stat-label,
+.wf-stat-label {
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+  font-weight: 550;
+}
+
+.stat-tile-sub,
+.vault-stat-sub {
+  color: var(--label-3);
+  font-size: var(--fs-micro);
+}
+
+/* ---- Segmented controls never wrap a label onto two lines ---- */
+
+.seg-btn {
+  white-space: nowrap;
+}
+
+.pane-head .seg {
+  flex: 0 0 auto;
+}
+
+/* ---- Skeletons: one shimmer, softer, and still under reduced motion ---- */
+
+.skeleton,
+.mp-card.skeleton {
+  background: linear-gradient(
+    100deg,
+    var(--surface-2) 20%,
+    color-mix(in srgb, var(--active) 70%, var(--surface-2)) 50%,
+    var(--surface-2) 80%
+  );
+  background-size: 220% 100%;
+  animation: skeleton 1.6s var(--ease) infinite;
+}
+
+/* ---- Empty and error states: centred, calm, one action ---- */
+
+.empty {
+  text-align: center;
+}
+
+.empty .empty-icon {
+  margin-inline: auto;
+}
+
+.empty .empty-text {
+  max-width: 46ch;
+  margin-inline: auto;
+}
+
+/* ---- List and grid entry: items rise in once, in order ---- */
+
+@keyframes item-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.mp-grid > *,
+.prov-grid > *,
+.prov-plan-grid > *,
+.prov-key-grid > *,
+.mp-bots .roster > *,
+.conv-list > *,
+.card-grid > * {
+  animation: item-in var(--enter-dur) var(--spring) both;
+}
+
+.mp-grid > :nth-child(2),
+.prov-grid > :nth-child(2),
+.prov-plan-grid > :nth-child(2),
+.prov-key-grid > :nth-child(2),
+.mp-bots .roster > :nth-child(2),
+.conv-list > :nth-child(2),
+.card-grid > :nth-child(2) {
+  animation-delay: calc(var(--enter-step) * 1);
+}
+
+.mp-grid > :nth-child(3),
+.prov-grid > :nth-child(3),
+.prov-plan-grid > :nth-child(3),
+.prov-key-grid > :nth-child(3),
+.mp-bots .roster > :nth-child(3),
+.conv-list > :nth-child(3),
+.card-grid > :nth-child(3) {
+  animation-delay: calc(var(--enter-step) * 2);
+}
+
+.mp-grid > :nth-child(4),
+.prov-grid > :nth-child(4),
+.prov-plan-grid > :nth-child(4),
+.prov-key-grid > :nth-child(4),
+.mp-bots .roster > :nth-child(4),
+.conv-list > :nth-child(4),
+.card-grid > :nth-child(4) {
+  animation-delay: calc(var(--enter-step) * 3);
+}
+
+.mp-grid > :nth-child(5),
+.prov-grid > :nth-child(5),
+.prov-plan-grid > :nth-child(5),
+.prov-key-grid > :nth-child(5),
+.mp-bots .roster > :nth-child(5),
+.conv-list > :nth-child(5),
+.card-grid > :nth-child(5) {
+  animation-delay: calc(var(--enter-step) * 4);
+}
+
+.mp-grid > :nth-child(6),
+.prov-grid > :nth-child(6),
+.prov-plan-grid > :nth-child(6),
+.prov-key-grid > :nth-child(6),
+.mp-bots .roster > :nth-child(6),
+.conv-list > :nth-child(6),
+.card-grid > :nth-child(6) {
+  animation-delay: calc(var(--enter-step) * 5);
+}
+
+.mp-grid > :nth-child(7),
+.prov-grid > :nth-child(7),
+.prov-plan-grid > :nth-child(7),
+.prov-key-grid > :nth-child(7),
+.mp-bots .roster > :nth-child(7),
+.conv-list > :nth-child(7),
+.card-grid > :nth-child(7) {
+  animation-delay: calc(var(--enter-step) * 6);
+}
+
+.mp-grid > :nth-child(n + 8),
+.prov-grid > :nth-child(n + 8),
+.prov-plan-grid > :nth-child(n + 8),
+.prov-key-grid > :nth-child(n + 8),
+.mp-bots .roster > :nth-child(n + 8),
+.conv-list > :nth-child(n + 8),
+.card-grid > :nth-child(n + 8) {
+  animation-delay: calc(var(--enter-step) * 7);
+}
+
+/* ---- Focus: one visible ring on every pressable surface ---- */
+
+.integration-card:focus-visible,
+.mp-card:focus-visible,
+.prov-key:focus-visible,
+.roster-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ---- Reduced motion: no rise, no lift, no shimmer sweep ---- */
+
+@media (prefers-reduced-motion: reduce) {
+  .mp-grid > *,
+  .prov-grid > *,
+  .prov-plan-grid > *,
+  .prov-key-grid > *,
+  .mp-bots .roster > *,
+  .conv-list > *,
+  .card-grid > * {
+    animation: none;
+  }
+
+  .integration-card:hover,
+  .mp-card:hover,
+  .prov-plan:hover,
+  .prov-key:hover,
+  .mp-bots .roster-row:hover {
+    transform: none;
+  }
+
+  .skeleton,
+  .mp-card.skeleton {
+    animation: none;
+  }
+}
+
+.root[data-motion="reduce"] .mp-grid > *,
+.root[data-motion="reduce"] .prov-grid > *,
+.root[data-motion="reduce"] .prov-plan-grid > *,
+.root[data-motion="reduce"] .prov-key-grid > *,
+.root[data-motion="reduce"] .mp-bots .roster > *,
+.root[data-motion="reduce"] .conv-list > *,
+.root[data-motion="reduce"] .card-grid > *,
+.root[data-motion="reduce"] .skeleton,
+.root[data-motion="reduce"] .mp-card.skeleton {
+  animation: none;
+}
+
+.root[data-motion="reduce"] .integration-card:hover,
+.root[data-motion="reduce"] .mp-card:hover,
+.root[data-motion="reduce"] .prov-plan:hover,
+.root[data-motion="reduce"] .prov-key:hover,
+.root[data-motion="reduce"] .mp-bots .roster-row:hover {
+  transform: none;
+}

@@ -12,7 +12,7 @@ use crate::error::{Result, SeraError};
 use crate::fleet::{Fleet, FleetRegistry};
 use crate::gateway::{Tool, ToolContext, ToolOutput, ToolSpec};
 use crate::memory;
-use crate::model_router::{ModelRouter, ModelSelection, PinnedRoute};
+use crate::model_router::{ModelRouter, ModelSelection, PinnedRoute, RouterHandle};
 use crate::orchestration::HandoffContext;
 use crate::orchestration::{BotRole, Handoff, ModelClass, ORCHESTRATOR_BOT, validate_handoff};
 use crate::route_chain::NewRouteEvent;
@@ -34,16 +34,16 @@ pub const MAX_RESUMES: i64 = 2;
 pub struct DelegateTool {
     store: Store,
     fleet: Arc<FleetRegistry>,
-    router: ModelRouter,
+    router: RouterHandle,
     child_daily_limit: u64,
 }
 
 impl DelegateTool {
-    pub fn new(store: Store, fleet: Arc<FleetRegistry>, router: ModelRouter) -> Self {
+    pub fn new(store: Store, fleet: Arc<FleetRegistry>, router: impl Into<RouterHandle>) -> Self {
         Self {
             store,
             fleet,
-            router,
+            router: router.into(),
             child_daily_limit: DEFAULT_CHILD_DAILY_LIMIT,
         }
     }
@@ -208,11 +208,12 @@ impl Tool for DelegateTool {
         // that model for it. Without one, the class picks.
         let selection = match self
             .router
+            .get()
             .bot_chain(&context.user_id, &specialist.config)
             .head
         {
             Some(head) => head,
-            None => self.router.select_class(
+            None => self.router.get().select_class(
                 &context.user_id,
                 Some(class_name),
                 specialist.config.model.as_deref(),
@@ -220,9 +221,10 @@ impl Tool for DelegateTool {
                 &Default::default(),
             )?,
         };
-        let route = self
-            .router
-            .pin_for_bot(&context.user_id, &selection, &specialist.config)?;
+        let route =
+            self.router
+                .get()
+                .pin_for_bot(&context.user_id, &selection, &specialist.config)?;
 
         let parent_task = self.store.get_task(&context.user_id, task_id)?;
         let help_depth = parent_task

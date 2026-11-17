@@ -136,6 +136,18 @@ fn WorkflowCanvas(
     }
 }
 
+/// Compact empty state used inside a studio section.
+#[component]
+fn WfEmpty(icon: &'static str, title: &'static str, text: &'static str) -> Element {
+    rsx! {
+        div { class: "empty compact wf-empty", role: "status",
+            span { class: "empty-icon", Icon { name: icon, size: 18 } }
+            h3 { class: "empty-title", "{title}" }
+            p { class: "empty-text", "{text}" }
+        }
+    }
+}
+
 /// Routine card with Visual Flow selection, structured editor, Run Now, and Delete.
 #[component]
 fn RoutineCard(
@@ -953,27 +965,12 @@ pub fn WorkflowsView(session: Signal<Session>) -> Element {
     let feed_url_ready = workflows::is_valid_feed_url(&new_feed_url.read());
 
     rsx! {
-        div { class: "pane",
+        div { class: "pane wf-page",
             div { class: "pane-head wf-hero",
                 div { class: "wf-hero-copy",
                     h1 { class: "pane-title", "Workflow Studio" }
                     p { class: "muted",
                         "Visual node flows, scheduled routines, watcher feeds and multi-step plans."
-                    }
-                    div { class: "wf-hero-stats",
-                        div { class: "wf-stat-card",
-                            span { class: "wf-stat-label", "Active Schedules" }
-                            span { class: "wf-stat-value", "{enabled_routines}/{total_routines}" }
-                        }
-                        div { class: "wf-stat-card",
-                            span { class: "wf-stat-label", "Healthy Sources" }
-                            span { class: "wf-stat-value", "{healthy_sources}/{total_sources}" }
-                        }
-                        div { class: "wf-stat-card",
-                            span { class: "wf-stat-label", "Active Multi-Step Plans" }
-                            span { class: "wf-stat-value", "{active_plans_count}" }
-                        }
-                        span { class: "wf-tz-pill", "TZ: {tz_display}" }
                     }
                 }
                 div { class: "pane-actions wf-head-actions",
@@ -1004,15 +1001,46 @@ pub fn WorkflowsView(session: Signal<Session>) -> Element {
             }
             div { class: "pane-body",
                 if let Some(message) = error.as_ref() {
-                    p { class: "wf-banner err", role: "alert", "{message}" }
+                    div { class: "wf-banner err", role: "alert",
+                        span { "{message}" }
+                        button {
+                            class: "btn ghost sm",
+                            r#type: "button",
+                            onclick: move |_| session.write().refresh_workflows(),
+                            "Retry"
+                        }
+                    }
                 }
                 if !loaded && error.is_none() {
                     div { class: "wf-skeleton", role: "status", "aria-label": "Loading workflows",
-                        for n in 0..5 {
-                            div { key: "{n}", class: "skeleton", style: "height: 44px; margin-bottom: 10px;" }
+                        div { class: "wf-hero-stats",
+                            for n in 0..3 {
+                                div { key: "{n}", class: "skeleton wf-skeleton-tile" }
+                            }
+                        }
+                        div { class: "skeleton wf-skeleton-canvas" }
+                        div { class: "wf-skeleton-cards",
+                            for n in 0..4 {
+                                div { key: "{n}", class: "skeleton wf-skeleton-card" }
+                            }
                         }
                     }
                 } else {
+                    div { class: "wf-hero-stats",
+                        div { class: "stat-tile wf-stat-card",
+                            span { class: "stat-tile-value wf-stat-value", "{enabled_routines}/{total_routines}" }
+                            span { class: "stat-tile-label wf-stat-label", "Active schedules" }
+                        }
+                        div { class: "stat-tile wf-stat-card",
+                            span { class: "stat-tile-value wf-stat-value", "{healthy_sources}/{total_sources}" }
+                            span { class: "stat-tile-label wf-stat-label", "Healthy sources" }
+                        }
+                        div { class: "stat-tile wf-stat-card",
+                            span { class: "stat-tile-value wf-stat-value", "{active_plans_count}" }
+                            span { class: "stat-tile-label wf-stat-label", "Active plans" }
+                        }
+                        span { class: "wf-tz-pill", "TZ: {tz_display}" }
+                    }
                     if let Some(graph) = active_graph {
                         {
                             let sel_for_click = active_selection.clone();
@@ -1099,20 +1127,19 @@ pub fn WorkflowsView(session: Signal<Session>) -> Element {
                     }
                     div { class: "wf-studio-grid",
                         section { class: "wf-section",
-                            h2 { class: "wf-section-title", "Scheduled Routines" }
+                            div { class: "wf-section-head",
+                                h2 { class: "wf-section-title", "Scheduled routines" }
+                                span { class: "wf-section-count", "{total_routines}" }
+                            }
                             if !snapshot.routines_supported {
-                                p { class: "muted", role: "status",
-                                    "This server does not expose /v1/routines yet."
-                                }
+                                WfEmpty { icon: "alert", title: "Routines unavailable", text: "This server does not expose /v1/routines yet. Update SeraBot to manage schedules." }
                             } else {
                                 if snapshot.routines.is_empty() {
-                                    p { class: "muted", role: "status",
-                                        "No routines yet. Add the morning brief or a watch schedule below."
-                                    }
+                                    WfEmpty { icon: "workflows", title: "No routines yet", text: "Add the morning brief or a watch schedule below." }
                                 } else if filtered_routines.is_empty() {
-                                    p { class: "muted", role: "status", "No routines match this filter." }
+                                    WfEmpty { icon: "search", title: "No routines match", text: "Clear the search or switch the state filter." }
                                 } else {
-                                    div { class: "wf-cards", role: "list",
+                                    div { class: "wf-cards card-grid", role: "list",
                                         for routine in filtered_routines {
                                             {
                                                 let is_sel = active_selection.as_ref()
@@ -1162,20 +1189,19 @@ pub fn WorkflowsView(session: Signal<Session>) -> Element {
                             }
                         }
                         section { class: "wf-section",
-                            h2 { class: "wf-section-title", "Monitoring Sources" }
+                            div { class: "wf-section-head",
+                                h2 { class: "wf-section-title", "Monitoring sources" }
+                                span { class: "wf-section-count", "{total_sources}" }
+                            }
                             if !snapshot.sources_supported {
-                                p { class: "muted", role: "status",
-                                    "This server does not expose /v1/monitoring/sources yet."
-                                }
+                                WfEmpty { icon: "alert", title: "Sources unavailable", text: "This server does not expose /v1/monitoring/sources yet. Update SeraBot to watch feeds." }
                             } else {
                                 if snapshot.sources.is_empty() {
-                                    p { class: "muted", role: "status",
-                                        "No watcher sources yet. Add an RSS feed below."
-                                    }
+                                    WfEmpty { icon: "globe", title: "No sources yet", text: "Add an RSS feed below and the watcher checks it for you." }
                                 } else if filtered_sources.is_empty() {
-                                    p { class: "muted", role: "status", "No watcher sources match this filter." }
+                                    WfEmpty { icon: "search", title: "No sources match", text: "Clear the search or switch the state filter." }
                                 } else {
-                                    div { class: "wf-cards", role: "list",
+                                    div { class: "wf-cards card-grid", role: "list",
                                         for source in filtered_sources {
                                             {
                                                 let is_sel = active_selection.as_ref()
@@ -1255,17 +1281,18 @@ pub fn WorkflowsView(session: Signal<Session>) -> Element {
                             }
                         }
                         section { class: "wf-section wf-section-wide",
-                            h2 { class: "wf-section-title", "Active Multi-Step Plans" }
+                            div { class: "wf-section-head",
+                                h2 { class: "wf-section-title", "Active multi-step plans" }
+                                span { class: "wf-section-count", "{active_plans_count}" }
+                            }
                             if !snapshot.active_supported {
-                                p { class: "muted", role: "status",
-                                    "This server does not expose /v1/workflows/active yet."
-                                }
+                                WfEmpty { icon: "alert", title: "Plans unavailable", text: "This server does not expose /v1/workflows/active yet. Update SeraBot to track plans." }
                             } else if snapshot.active.is_empty() {
-                                p { class: "muted", role: "status", "No incomplete plans." }
+                                WfEmpty { icon: "check", title: "No active plans", text: "Multi-step plans started in chat show up here until every step is done." }
                             } else if filtered_active.is_empty() {
-                                p { class: "muted", role: "status", "No active plans match this filter." }
+                                WfEmpty { icon: "search", title: "No plans match", text: "Clear the search or switch the state filter." }
                             } else {
-                                div { class: "wf-cards", role: "list",
+                                div { class: "wf-cards card-grid", role: "list",
                                     for plan in filtered_active {
                                         {
                                             let is_sel = active_selection.as_ref()

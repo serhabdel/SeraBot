@@ -287,6 +287,7 @@ fn BrowserGrid(session: Signal<Session>) -> Element {
             s.panel.browser_error.clone(),
         )
     };
+    let has_error = browser_error.is_some();
     let needle = query.read().trim().to_ascii_lowercase();
     let visible_cards: Vec<Card> = if needle.is_empty() {
         cards.clone()
@@ -349,9 +350,22 @@ fn BrowserGrid(session: Signal<Session>) -> Element {
                     }
                 }
                 if !loaded {
-                    div { class: "browser-grid", "aria-busy": "true",
-                        div { class: "browser-card skeleton-card", div { class: "skeleton block", " " } }
-                        div { class: "browser-card skeleton-card", div { class: "skeleton block", " " } }
+                    if !has_error {
+                        div { class: "browser-grid", role: "status", "aria-busy": "true", "aria-label": "Loading browsers",
+                            for index in 0..3 {
+                                div { key: "{index}", class: "browser-card browser-skel", "aria-hidden": "true",
+                                    div { class: "browser-thumb skeleton" }
+                                    div { class: "browser-card-copy",
+                                        div { class: "browser-card-top",
+                                            div { class: "skeleton sk-line sk-w40" }
+                                            div { class: "skeleton sk-chip" }
+                                        }
+                                        div { class: "skeleton sk-line sk-w70" }
+                                        div { class: "skeleton sk-line sk-w50" }
+                                    }
+                                }
+                            }
+                        }
                     }
                 } else if cards.is_empty() {
                     div { class: "empty browser-empty",
@@ -384,7 +398,10 @@ fn BrowserGrid(session: Signal<Session>) -> Element {
                                                 if let Some(src) = shot {
                                                     img { class: "browser-shot", alt: "Live view of {host}", draggable: false, src: "{src}" }
                                                 } else {
-                                                    div { class: "skeleton block", " " }
+                                                    div { class: "browser-thumb-empty", "aria-hidden": "true",
+                                                        Icon { name: "globe", size: 22 }
+                                                        span { "Waiting for a picture" }
+                                                    }
                                                 }
                                             }
                                             div { class: "browser-card-copy",

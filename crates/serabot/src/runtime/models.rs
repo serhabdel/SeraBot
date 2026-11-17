@@ -8,7 +8,7 @@ const ENSURE_CATALOG_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 
 impl Runtime {
     pub async fn refresh_model_catalogs(&self, user_id: &str) -> Result<()> {
-        for report in self.router.refresh_catalogs(user_id).await? {
+        for report in self.router().refresh_catalogs(user_id).await? {
             if !report.fetched {
                 continue;
             }
@@ -35,7 +35,7 @@ impl Runtime {
     /// the provider really offers and not the short configured allowlist.
     /// Bounded and infallible: on any problem the allowlist stays in force.
     pub async fn ensure_model_catalogs(&self, user_id: &str) {
-        self.router
+        self.router()
             .ensure_catalogs(user_id, ENSURE_CATALOG_TIMEOUT)
             .await;
     }
@@ -58,14 +58,14 @@ impl Runtime {
     fn fallback_selection(&self, user_id: &str, bot_hint: Option<&str>) -> Option<ModelSelection> {
         let candidates = [
             self.default_route(user_id).ok().flatten(),
-            Some(self.router.default_selection(user_id, bot_hint)),
-            Some(self.router.default_selection(user_id, None)),
-            self.router.first_approved(user_id),
+            Some(self.router().default_selection(user_id, bot_hint)),
+            Some(self.router().default_selection(user_id, None)),
+            self.router().first_approved(user_id),
         ];
         candidates.into_iter().flatten().find(|candidate| {
             !candidate.is_auto_mode()
-                && self.router.validate_selection(user_id, candidate).is_ok()
-                && self.router.pin(candidate).is_ok()
+                && self.router().validate_selection(user_id, candidate).is_ok()
+                && self.router().pin(candidate).is_ok()
         })
     }
 
@@ -80,7 +80,7 @@ impl Runtime {
         if intended.is_auto_mode() {
             return Ok((intended, false));
         }
-        match self.router.validate_selection(user_id, &intended) {
+        match self.router().validate_selection(user_id, &intended) {
             Ok(()) => Ok((intended, false)),
             Err(error) if Self::is_model_gone(&error) => {
                 match self.fallback_selection(user_id, bot_hint) {
@@ -198,7 +198,7 @@ impl Runtime {
         bot: &str,
     ) -> Result<Vec<&'static str>> {
         let selection = self.effective_model_selection(user_id, conversation_id, bot)?;
-        Ok(self.router.thinking_levels(user_id, &selection))
+        Ok(self.router().thinking_levels(user_id, &selection))
     }
 
     /// Set (or with `None`, clear) the conversation's thinking level. The
@@ -271,7 +271,7 @@ impl Runtime {
     /// The acting user's routable provider catalog. A provider they hold no
     /// credential for is absent, never shown with another account's status.
     pub fn model_catalog(&self, user_id: &str) -> Result<Vec<ProviderView>> {
-        let catalog = self.router.catalog(user_id);
+        let catalog = self.router().catalog(user_id);
         self.gateway
             .scan_egress(user_id, &serde_json::to_string(&catalog)?)?;
         Ok(catalog)
@@ -281,7 +281,7 @@ impl Runtime {
         &self,
         user_id: &str,
     ) -> Result<Vec<crate::model_router::CatalogEntry>> {
-        let mut entries = self.router.catalog_entries(user_id);
+        let mut entries = self.router().catalog_entries(user_id);
         let mut accounts: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         for entry in &mut entries {
@@ -309,7 +309,7 @@ impl Runtime {
         {
             return chosen;
         }
-        self.router.default_selection(user_id, bot_hint)
+        self.router().default_selection(user_id, bot_hint)
     }
 
     /// The route a conversation with no choice of its own starts on: the
@@ -320,7 +320,7 @@ impl Runtime {
         user_id: &str,
         bot: &crate::config::LoadedBot,
     ) -> ModelSelection {
-        match self.router.bot_chain(user_id, &bot.config).head {
+        match self.router().bot_chain(user_id, &bot.config).head {
             Some(head) => head,
             None => self.user_default_selection(user_id, self.bot_model_hint(bot).as_deref()),
         }
@@ -338,7 +338,7 @@ impl Runtime {
         let Some(route) = route else {
             return Ok(());
         };
-        let chain = self.router.bot_chain(user_id, &bot.config);
+        let chain = self.router().bot_chain(user_id, &bot.config);
         let expected: Vec<_> = chain
             .hops
             .into_iter()
@@ -366,7 +366,7 @@ impl Runtime {
             return Ok(None);
         };
         Ok(self
-            .router
+            .router()
             .validate_selection(user_id, &stored)
             .ok()
             .map(|_| stored))
@@ -384,9 +384,9 @@ impl Runtime {
                 "pick a provider and model for the default route".into(),
             ));
         }
-        self.router.pin(&selection)?;
-        self.router.catalog_gate(user_id, &selection)?;
-        self.router.validate_selection(user_id, &selection)?;
+        self.router().pin(&selection)?;
+        self.router().catalog_gate(user_id, &selection)?;
+        self.router().validate_selection(user_id, &selection)?;
         let value = serde_json::to_string(&selection)?;
         self.gateway.scan_egress(user_id, &value)?;
         self.store.record_audit(
@@ -410,7 +410,7 @@ impl Runtime {
         user_id: &str,
         provider: &str,
     ) -> Result<crate::model_router::CatalogRefresh> {
-        let report = self.router.test_provider(user_id, provider).await?;
+        let report = self.router().test_provider(user_id, provider).await?;
         self.store.record_audit(
             user_id,
             "model.provider_tested",
@@ -433,8 +433,8 @@ impl Runtime {
     /// affect more than one user).
     pub fn invalidate_model_credentials(&self, user_id: Option<&str>) {
         match user_id {
-            Some(user_id) => self.router.invalidate_user(user_id),
-            None => self.router.invalidate_all(),
+            Some(user_id) => self.router().invalidate_user(user_id),
+            None => self.router().invalidate_all(),
         }
     }
 
@@ -531,7 +531,7 @@ impl Runtime {
         };
         let (stored, _) =
             self.selection_or_fallback(user_id, stored, self.bot_model_hint(bot).as_deref())?;
-        let resolved = self.router.resolve_selection(
+        let resolved = self.router().resolve_selection(
             user_id,
             &stored,
             bot.config.model.as_deref(),
@@ -552,15 +552,15 @@ impl Runtime {
         validate_conversation_id(conversation_id)?;
         self.guard_conversation_scope(user_id, conversation_id)?;
         let stored = if selection.is_auto_mode() {
-            if !self.router.autoselect_available(user_id) {
+            if !self.router().autoselect_available(user_id) {
                 return Err(SeraError::Forbidden(
                     "no provider with data-egress approval is configured for autoselect".into(),
                 ));
             }
             ModelSelection::auto_mode()
         } else {
-            self.router.pin(&selection)?;
-            self.router.catalog_gate(user_id, &selection)?;
+            self.router().pin(&selection)?;
+            self.router().catalog_gate(user_id, &selection)?;
             selection
         };
         let value = serde_json::to_string(&stored)?;
@@ -596,7 +596,7 @@ impl Runtime {
         let Some(current) = self.conversation_thinking(user_id, conversation_id)? else {
             return Ok(());
         };
-        let levels = self.router.thinking_levels(user_id, selection);
+        let levels = self.router().thinking_levels(user_id, selection);
         if levels.contains(&current.as_str()) {
             return Ok(());
         }
@@ -640,7 +640,7 @@ impl Runtime {
     ) -> Result<String> {
         let selection = match model {
             Some(model) => {
-                let provider = self.router.provider_for_model(model).ok_or_else(|| {
+                let provider = self.router().provider_for_model(model).ok_or_else(|| {
                     SeraError::Config(format!("memory.extract_model {model} is not served"))
                 })?;
                 ModelSelection {
@@ -663,13 +663,13 @@ impl Runtime {
                 }
             }
         };
-        let route = Some(self.router.pin(&selection)?);
+        let route = Some(self.router().pin(&selection)?);
         let route = self.checked_route(user_id, &route)?;
         let messages = vec![LlmMessage::system(system), LlmMessage::user(input)];
         self.scan_model_messages(user_id, &messages)?;
         let outgoing = self.gateway.redact_messages(user_id, &messages)?;
         let response = self
-            .router
+            .router()
             .complete(user_id, route, &outgoing, &[], Some(0.2))
             .await?;
         self.store.record_audit(
@@ -700,7 +700,7 @@ impl Runtime {
                 "turn has no pinned model route; owner must resubmit the request".into(),
             )
         })?;
-        self.router.validate_pinned(route)?;
+        self.router().validate_pinned(route)?;
         self.gateway
             .scan_egress(user_id, &serde_json::to_string(&route.selection)?)?;
         Ok(route)

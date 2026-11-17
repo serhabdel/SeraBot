@@ -994,7 +994,7 @@ impl State {
             }
             // The session applies the optimistic cache update and toast for
             // a saved bot config; the state only keeps the match exhaustive.
-            Reply::BotConfigSaved { .. } => {}
+            Reply::BotConfigSaved { .. } | Reply::ProviderSaved { .. } => {}
             // Applied by the session (it owns the editable draft).
             Reply::Voice(settings) => {
                 self.voice = Some(settings);

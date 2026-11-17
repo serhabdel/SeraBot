@@ -566,7 +566,7 @@ async fn run_mutation(
     let env = MutationEnv {
         store: &state.store,
         fleet: &fleet,
-        router: state.runtime.router(),
+        router: &state.runtime.router(),
         policy: state.runtime.policy(),
         tool_registered: &registered,
     };

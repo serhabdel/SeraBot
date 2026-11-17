@@ -1,0 +1,597 @@
+/* pages-data (0.53): Memory, Vault, Usage and Settings. Tokens only. Every
+   animation stops under reduced motion (system or the console switch). */
+
+/* ---- Shared page pieces ---- */
+
+.page-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.memory-page .pane-body,
+.usage-page .pane-body,
+.vault-page .pane-body {
+  width: 100%;
+  max-width: 1240px;
+  box-sizing: border-box;
+}
+
+.memory-page .pane-body,
+.usage-page .pane-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.page-section-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+}
+
+.page-section-head > div:first-child {
+  min-width: 0;
+}
+
+.page-section-title,
+.usage-section-title {
+  margin: 0;
+  color: var(--label-1);
+  font-size: var(--fs-title);
+  font-weight: 650;
+  letter-spacing: -0.015em;
+}
+
+.page-section-head .tiny,
+.usage-section-sub {
+  margin: 3px 0 0;
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+}
+
+.page-count {
+  padding: 3px 10px;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+  font-weight: 550;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.empty-icon.danger {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-color: transparent;
+}
+
+/* ---- Memory ---- */
+
+.mem-composer {
+  gap: 12px;
+  animation: item-in var(--enter-dur) var(--spring) both;
+}
+
+.mem-composer .textarea {
+  min-height: 64px;
+}
+
+.mem-composer-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 200px) minmax(160px, 1fr) auto;
+  align-items: end;
+  gap: 12px;
+}
+
+.mem-composer-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.mem-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 16px;
+}
+
+.mem-search {
+  flex: 1 1 320px;
+  max-width: 560px;
+}
+
+.mem-grid {
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 14px;
+}
+
+.mem-card {
+  gap: 10px;
+  transition: border-color var(--dur-1) var(--ease), box-shadow var(--dur-2) var(--ease),
+    transform var(--dur-2) var(--spring), opacity var(--dur-2) var(--ease);
+}
+
+.mem-card:hover {
+  transform: var(--lift);
+  box-shadow: var(--card-shadow-lift);
+}
+
+.mem-card.pending {
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--glass-edge));
+}
+
+.mem-card.superseded {
+  opacity: 0.68;
+}
+
+.mem-card.superseded:hover {
+  opacity: 1;
+}
+
+.mem-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.mem-text {
+  flex: 1;
+  margin: 0;
+  color: var(--label-1);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.mem-foot {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.mem-foot .tiny {
+  margin: 0;
+  color: var(--label-3);
+}
+
+.mem-importance {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mem-importance .meter {
+  flex: 0 0 72px;
+  height: 4px;
+}
+
+.mem-actions {
+  margin-top: 2px;
+  padding-top: 8px;
+  border-top: 1px solid var(--hairline);
+}
+
+.memory-page .empty {
+  padding: 56px 24px;
+}
+
+/* ---- Vault ---- */
+
+.vault-page .pane-body {
+  max-width: 1240px;
+}
+
+.vault-page .vault-panel {
+  max-width: none;
+  gap: 16px;
+}
+
+.vault-hero {
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px;
+  margin-bottom: 0;
+}
+
+.vault-stat-card {
+  border-color: var(--glass-edge);
+  box-shadow: var(--card-shadow);
+}
+
+.vault-provider-grid {
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  margin-bottom: 0;
+}
+
+.vault-provider-card .vault-name {
+  font-family: inherit;
+}
+
+.vault-provider-sub {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-micro);
+}
+
+.vault-provider-title-col {
+  min-width: 0;
+}
+
+.vault-toolbar {
+  margin-bottom: 0;
+  justify-content: space-between;
+  gap: 10px 16px;
+}
+
+.vault-toolbar .vault-filter-row {
+  flex: 1 1 420px;
+}
+
+.vault-entry-grid {
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+}
+
+.vault-entry-card {
+  border-color: var(--glass-edge);
+  border-radius: var(--card-radius);
+  box-shadow: var(--card-shadow);
+  transition: border-color var(--dur-1) var(--ease), box-shadow var(--dur-2) var(--ease),
+    transform var(--dur-2) var(--spring);
+}
+
+.vault-entry-card:hover {
+  border-color: var(--hairline-strong);
+  box-shadow: var(--card-shadow-lift);
+  transform: var(--lift);
+}
+
+.vault-entry-card .vault-name {
+  font-family: inherit;
+  font-weight: 650;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.vault-ref-chip {
+  max-width: 100%;
+  border: 1px solid var(--hairline);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--fs-micro);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vault-ref-chip:hover {
+  border-color: var(--hairline-strong);
+  color: var(--label-1);
+}
+
+.vault-skeleton {
+  height: 150px;
+  border-radius: var(--card-radius);
+}
+
+.vault-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.vault-page .vault-empty {
+  padding: 44px 24px;
+  border: 1px dashed var(--hairline-strong);
+  border-radius: var(--card-radius);
+  background: var(--card-bg);
+}
+
+.vault-page .vault-empty .empty-text {
+  max-width: 46ch;
+}
+
+.vault-entry-grid > *,
+.vault-provider-grid > *,
+.vault-hero > *,
+.mem-grid > *,
+.usage-tiles > *,
+.usage-breakdown > * {
+  animation: item-in var(--enter-dur) var(--spring) both;
+}
+
+.vault-entry-grid > :nth-child(2),
+.vault-provider-grid > :nth-child(2),
+.vault-hero > :nth-child(2),
+.usage-tiles > :nth-child(2),
+.usage-breakdown > :nth-child(2) {
+  animation-delay: calc(var(--enter-step) * 1);
+}
+
+.vault-entry-grid > :nth-child(3),
+.vault-hero > :nth-child(3),
+.usage-tiles > :nth-child(3) {
+  animation-delay: calc(var(--enter-step) * 2);
+}
+
+.vault-entry-grid > :nth-child(n + 4),
+.vault-hero > :nth-child(n + 4),
+.usage-tiles > :nth-child(n + 4) {
+  animation-delay: calc(var(--enter-step) * 3);
+}
+
+/* ---- Usage ---- */
+
+.usage-page .pane-body {
+  gap: 28px;
+}
+
+.usage-section {
+  gap: 12px;
+}
+
+.usage-tiles {
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+}
+
+.usage-tiles .stat-tile {
+  padding: 14px 16px;
+}
+
+.usage-tiles .stat-tile-value {
+  font-size: var(--fs-display);
+}
+
+.muted-value {
+  color: var(--label-3);
+}
+
+.usage-skeleton {
+  height: 88px;
+  border-radius: var(--r-md);
+}
+
+.usage-chart-card {
+  margin-top: 4px;
+}
+
+.usage-chart {
+  height: 180px;
+  gap: 4px;
+  padding-top: 12px;
+  border-bottom: 1px solid var(--hairline);
+  background: repeating-linear-gradient(
+    to top,
+    transparent 0,
+    transparent calc(25% - 1px),
+    var(--hairline) calc(25% - 1px),
+    var(--hairline) 25%
+  );
+}
+
+.usage-bar-col {
+  min-width: 4px;
+  cursor: default;
+}
+
+.usage-bar {
+  border-radius: 4px 4px 0 0;
+  background: linear-gradient(to top, var(--accent), color-mix(in srgb, var(--accent) 65%, var(--accent-2)));
+  opacity: 0.85;
+  transform-origin: bottom;
+  transition: opacity var(--dur-1) var(--ease);
+  animation: bar-in 480ms var(--spring) both;
+  animation-delay: var(--bar-delay, 0ms);
+}
+
+.usage-bar-col:hover .usage-bar {
+  opacity: 1;
+}
+
+@keyframes bar-in {
+  from {
+    transform: scaleY(0);
+  }
+  to {
+    transform: none;
+  }
+}
+
+.usage-breakdown {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+  gap: 16px;
+  align-items: start;
+}
+
+.usage-toolbar {
+  margin-bottom: 0;
+  gap: 10px;
+}
+
+.usage-table th {
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.usage-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.usage-table tbody tr:hover td {
+  background: var(--surface-2);
+}
+
+.usage-model {
+  overflow-wrap: anywhere;
+}
+
+.usage-page .quota-card {
+  gap: 12px;
+}
+
+.usage-page .quota-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.usage-page .quota-body .health-value {
+  font-size: var(--fs-display);
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-page .meter {
+  height: 6px;
+}
+
+.meter-fill {
+  transition: width var(--dur-3) var(--ease);
+}
+
+.health-card .health-item {
+  background: var(--surface-2);
+  border-color: var(--hairline);
+}
+
+.health-item .status-chip,
+.health-item .chip {
+  align-self: flex-start;
+}
+
+.health-card .health-summary {
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+}
+
+.health-heading {
+  margin: 12px 0 0;
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+/* ---- Settings ---- */
+
+.settings-layout {
+  gap: 32px;
+  max-width: 1040px;
+}
+
+.settings-nav {
+  flex: 0 0 188px;
+  gap: 2px;
+  padding: 6px;
+  border: 1px solid var(--glass-edge);
+  border-radius: var(--card-radius);
+  background: var(--card-bg);
+  box-shadow: var(--card-shadow);
+}
+
+.settings-nav-item {
+  position: relative;
+  padding: 8px 12px 8px 14px;
+  transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+
+.settings-nav-item::before {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 9px;
+  bottom: 9px;
+  width: 3px;
+  border-radius: 3px;
+  background: var(--accent);
+  transform: scaleY(0);
+  transition: transform var(--dur-2) var(--spring);
+}
+
+.settings-nav-item.on::before {
+  transform: scaleY(1);
+}
+
+.settings-nav-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.settings-content {
+  gap: 16px;
+  max-width: 760px;
+}
+
+.settings-content > * {
+  animation: item-in var(--enter-dur) var(--spring) both;
+}
+
+.settings-content .card {
+  border-radius: var(--card-radius);
+}
+
+.settings-content .card-head {
+  padding-bottom: 2px;
+}
+
+.settings-content .kv-row {
+  gap: 16px;
+}
+
+/* ---- Reduced motion ---- */
+
+@media (prefers-reduced-motion: reduce) {
+  .mem-composer,
+  .vault-entry-grid > *,
+  .vault-provider-grid > *,
+  .vault-hero > *,
+  .mem-grid > *,
+  .usage-tiles > *,
+  .usage-breakdown > *,
+  .settings-content > *,
+  .usage-bar {
+    animation: none;
+  }
+
+  .mem-card:hover,
+  .vault-entry-card:hover {
+    transform: none;
+  }
+
+  .settings-nav-item::before,
+  .meter-fill {
+    transition: none;
+  }
+}
+
+.root[data-motion="reduce"] .mem-composer,
+.root[data-motion="reduce"] .vault-entry-grid > *,
+.root[data-motion="reduce"] .vault-provider-grid > *,
+.root[data-motion="reduce"] .vault-hero > *,
+.root[data-motion="reduce"] .mem-grid > *,
+.root[data-motion="reduce"] .usage-tiles > *,
+.root[data-motion="reduce"] .usage-breakdown > *,
+.root[data-motion="reduce"] .settings-content > *,
+.root[data-motion="reduce"] .usage-bar {
+  animation: none;
+}
+
+.root[data-motion="reduce"] .mem-card:hover,
+.root[data-motion="reduce"] .vault-entry-card:hover {
+  transform: none;
+}
+
+.root[data-motion="reduce"] .settings-nav-item::before,
+.root[data-motion="reduce"] .meter-fill {
+  transition: none;
+}

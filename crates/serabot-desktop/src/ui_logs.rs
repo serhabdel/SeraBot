@@ -107,21 +107,24 @@ pub fn LogsView(session: Signal<Session>) -> Element {
                 }
             }
             div { class: "pane-body",
-                div { class: "logs-toolbar", role: "group", "aria-label": "Log level filter",
-                    for (value, label, tip) in level_buttons {
-                        button {
-                            key: "{label}",
-                            class: if level.as_deref() == value { "seg-btn active" } else { "seg-btn" },
-                            title: "{tip}",
-                            "aria-pressed": if level.as_deref() == value { "true" } else { "false" },
-                            onclick: {
-                                let query = query();
-                                move |_| {
-                                    let level = value.map(str::to_owned);
-                                    session.write().set_logs_filter(level, query.clone());
-                                }
-                            },
-                            "{label}"
+                div { class: "logs-toolbar",
+                    div { class: "seg logs-levels", role: "group", "aria-label": "Log level filter",
+                        for (value, label, tip) in level_buttons {
+                            button {
+                                key: "{label}",
+                                class: if level.as_deref() == value { "seg-btn active" } else { "seg-btn" },
+                                r#type: "button",
+                                title: "{tip}",
+                                "aria-pressed": if level.as_deref() == value { "true" } else { "false" },
+                                onclick: {
+                                    let query = query();
+                                    move |_| {
+                                        let level = value.map(str::to_owned);
+                                        session.write().set_logs_filter(level, query.clone());
+                                    }
+                                },
+                                "{label}"
+                            }
                         }
                     }
                     input {
@@ -204,17 +207,22 @@ pub fn LogsView(session: Signal<Session>) -> Element {
                 }
                 div { id: "logs-body", class: "{body_class}", role: "log", "aria-label": "Server logs",
                     if !supported {
-                        p { class: "muted", role: "status",
-                            "This server does not expose logs yet (no /v1/logs route). Update SeraBot to see them."
+                        div { class: "empty logs-empty", role: "status",
+                            span { class: "empty-icon", Icon { name: "alert", size: 20 } }
+                            h2 { class: "empty-title", "Logs are not available" }
+                            p { class: "empty-text",
+                                "This server does not expose logs yet (no /v1/logs route). Update SeraBot to see them."
+                            }
                         }
                     } else if !loaded {
                         div { class: "logs-skeleton", role: "status", "aria-label": "Loading logs",
-                            for n in 0..6 {
-                                div { key: "{n}", class: "skeleton", style: "height: 22px; margin-bottom: 8px;" }
+                            for n in 0..8 {
+                                div { key: "{n}", class: "skeleton logs-skeleton-row" }
                             }
                         }
                     } else if entries.is_empty() {
                         div { class: "empty logs-empty",
+                            span { class: "empty-icon", Icon { name: "logs", size: 20 } }
                             h2 { class: "empty-title", "No log entries yet" }
                             p { class: "empty-text",
                                 "Logs appear once the server starts a task, a routine or a sign-in."
@@ -227,6 +235,7 @@ pub fn LogsView(session: Signal<Session>) -> Element {
                         }
                     } else if filtered.is_empty() {
                         div { class: "empty logs-empty",
+                            span { class: "empty-icon", Icon { name: "search", size: 20 } }
                             h2 { class: "empty-title", "No lines match these filters" }
                             p { class: "empty-text", "Clear the level or search to see every line." }
                             button {

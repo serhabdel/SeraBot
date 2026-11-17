@@ -20,7 +20,7 @@ use crate::domain::{Role, new_id};
 use crate::error::{Result, SeraError};
 use crate::fleet::{Fleet, FleetRegistry};
 use crate::gateway::{Tool, ToolContext, ToolOutput, ToolSpec};
-use crate::model_router::ModelRouter;
+use crate::model_router::{ModelRouter, RouterHandle};
 use crate::orchestration::{
     BotRole, ConversationKind, MAX_HANDOFF_OBJECTIVE_LEN, ModelClass, ORCHESTRATOR_BOT,
     parse_conversation_scope, safe_bot_label,
@@ -341,15 +341,15 @@ pub(crate) fn enqueue_turn_task_with_id(
 pub struct TeamAskTool {
     store: Store,
     fleet: Arc<FleetRegistry>,
-    router: ModelRouter,
+    router: RouterHandle,
 }
 
 impl TeamAskTool {
-    pub fn new(store: Store, fleet: Arc<FleetRegistry>, router: ModelRouter) -> Self {
+    pub fn new(store: Store, fleet: Arc<FleetRegistry>, router: impl Into<RouterHandle>) -> Self {
         Self {
             store,
             fleet,
-            router,
+            router: router.into(),
         }
     }
 
@@ -519,7 +519,7 @@ impl Tool for TeamAskTool {
             let child = new_id();
             let payload = member_turn_payload(
                 &fleet,
-                &self.router,
+                &self.router.get(),
                 &context.user_id,
                 conversation_id,
                 to_bot,
@@ -578,7 +578,7 @@ impl Tool for TeamAskTool {
 pub struct TeamReplyTool {
     store: Store,
     fleet: Arc<FleetRegistry>,
-    router: ModelRouter,
+    router: RouterHandle,
     policy: Arc<Policy>,
 }
 
@@ -586,13 +586,13 @@ impl TeamReplyTool {
     pub fn new(
         store: Store,
         fleet: Arc<FleetRegistry>,
-        router: ModelRouter,
+        router: impl Into<RouterHandle>,
         policy: Arc<Policy>,
     ) -> Self {
         Self {
             store,
             fleet,
-            router,
+            router: router.into(),
             policy,
         }
     }
@@ -728,7 +728,7 @@ impl Tool for TeamReplyTool {
         let fleet = self.fleet.load(&context.user_id)?;
         let payload = member_turn_payload(
             &fleet,
-            &self.router,
+            &self.router.get(),
             &context.user_id,
             conversation_id,
             &to_bot,

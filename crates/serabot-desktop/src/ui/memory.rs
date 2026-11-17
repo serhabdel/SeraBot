@@ -52,6 +52,7 @@ pub(super) struct MemoryRow {
     delete_label: &'static str,
     bot: Option<String>,
     importance: String,
+    importance_pct: u32,
     created: String,
     recalled: String,
 }
@@ -80,6 +81,7 @@ pub(super) fn memory_rows(memories: &[MemoryEntry]) -> Vec<MemoryRow> {
                 "{:.0}% important",
                 memory.importance.clamp(0.0, 1.0) * 100.0
             ),
+            importance_pct: (memory.importance.clamp(0.0, 1.0) * 100.0).round() as u32,
             created: stamp(&memory.created_at),
             recalled: match &memory.last_recalled_at {
                 Some(at) => format!(
@@ -119,6 +121,7 @@ pub(super) fn memory_header(stats: Option<&MemoryStatsView>) -> String {
 #[component]
 pub(super) fn MemoryView(session: Signal<Session>) -> Element {
     let mut draft_error = use_signal(|| Option::<&'static str>::None);
+    let mut composing = use_signal(|| false);
     let (memories, memories_loaded, header, app_error) = {
         let s = session.read();
         (
@@ -140,86 +143,139 @@ pub(super) fn MemoryView(session: Signal<Session>) -> Element {
     let content_chars = content.trim().chars().count();
     let can_add = validate_memory_content(&content).is_ok();
     let (empty_title, empty_text, empty_filtered) = memory_empty_copy(&filter, &query);
+    let is_composing = composing();
     rsx! {
-        div { class: "pane",
+        div { class: "pane memory-page",
             div { class: "pane-head",
                 div {
                     h1 { class: "pane-title", "Memory" }
                     p { class: "muted", "{header}" }
                 }
-                button {
-                    class: "btn ghost",
-                    r#type: "button",
-                    onclick: move |_| session.write().load_memories(),
-                    "Refresh"
+                div { class: "page-actions",
+                    button {
+                        class: "btn ghost",
+                        r#type: "button",
+                        onclick: move |_| session.write().load_memories(),
+                        Icon { name: "refresh", size: 14 }
+                        "Refresh"
+                    }
+                    button {
+                        class: if is_composing { "btn" } else { "btn primary" },
+                        r#type: "button",
+                        "aria-expanded": if is_composing { "true" } else { "false" },
+                        "aria-controls": "mem-composer",
+                        onclick: move |_| {
+                            draft_error.set(None);
+                            composing.set(!is_composing);
+                        },
+                        if is_composing {
+                            "Close"
+                        } else {
+                            Icon { name: "plus", size: 15 }
+                            "Add memory"
+                        }
+                    }
                 }
             }
             div { class: "pane-body",
                 if let Some(error) = app_error {
                     div { class: "banner err", role: "alert", span { "{error}" } }
                 }
-                div { class: "card",
-                    div { class: "form-grid",
+                if is_composing {
+                    div { class: "card mem-composer", id: "mem-composer",
                         div { class: "field",
-                            label { class: "field-label", r#for: "mem-kind", "Kind" }
-                            select {
-                                id: "mem-kind",
-                                class: "select",
-                                value: "{kind}",
-                                onchange: move |event| session.write().memory.kind = event.value(),
-                                for kind in Session::memory_kinds() {
-                                    option { value: "{kind}", "{kind}" }
-                                }
-                            }
-                        }
-                        div { class: "field",
-                            label { class: "field-label", r#for: "mem-source", "Source" }
-                            input {
-                                id: "mem-source",
-                                class: "input",
-                                value: "{source}",
-                                placeholder: "source",
-                                oninput: move |event| session.write().memory.source = event.value(),
-                            }
-                        }
-                    }
-                    div { class: "field",
-                        label { class: "field-label", r#for: "mem-content", "Content" }
-                        textarea {
-                            id: "mem-content",
-                            class: if draft_error().is_some() || content_chars > MAX_MEMORY_CHARS { "textarea invalid" } else { "textarea" },
-                            value: "{content}",
-                            placeholder: "A durable preference, fact, decision, context or note",
-                            oninput: move |event| {
-                                draft_error.set(None);
-                                session.write().memory.content = event.value();
-                            },
-                        }
-                        if let Some(msg) = draft_error() {
-                            span { class: "field-error", role: "alert", "{msg}" }
-                        } else if content_chars > 3_500 {
-                            span { class: "tiny", "{content_chars}/{MAX_MEMORY_CHARS}" }
-                        }
-                    }
-                    button {
-                        class: "btn primary",
-                        r#type: "button",
-                        disabled: !can_add,
-                        onclick: move |_| {
-                            let current = session.read().memory.content.clone();
-                            match validate_memory_content(&current) {
-                                Ok(()) => {
+                            label { class: "field-label", r#for: "mem-content", "What should be remembered?" }
+                            textarea {
+                                id: "mem-content",
+                                class: if draft_error().is_some() || content_chars > MAX_MEMORY_CHARS { "textarea invalid" } else { "textarea" },
+                                rows: "2",
+                                autofocus: true,
+                                value: "{content}",
+                                placeholder: "A durable preference, fact, decision, context or note",
+                                oninput: move |event| {
                                     draft_error.set(None);
-                                    session.write().add_memory();
-                                }
-                                Err(msg) => draft_error.set(Some(msg)),
+                                    session.write().memory.content = event.value();
+                                },
+                                onkeydown: move |event: KeyboardEvent| {
+                                    if event.key() == Key::Escape {
+                                        event.stop_propagation();
+                                        composing.set(false);
+                                    } else if event.key() == Key::Enter
+                                        && (event.modifiers().contains(Modifiers::CONTROL)
+                                            || event.modifiers().contains(Modifiers::META))
+                                    {
+                                        event.prevent_default();
+                                        let current = session.read().memory.content.clone();
+                                        match validate_memory_content(&current) {
+                                            Ok(()) => {
+                                                draft_error.set(None);
+                                                session.write().add_memory();
+                                                composing.set(false);
+                                            }
+                                            Err(msg) => draft_error.set(Some(msg)),
+                                        }
+                                    }
+                                },
                             }
-                        },
-                        "Add memory"
+                            if let Some(msg) = draft_error() {
+                                span { class: "field-error", role: "alert", "{msg}" }
+                            } else if content_chars > 3_500 {
+                                span { class: "tiny", "{content_chars}/{MAX_MEMORY_CHARS}" }
+                            }
+                        }
+                        div { class: "mem-composer-row",
+                            div { class: "field",
+                                label { class: "field-label", r#for: "mem-kind", "Kind" }
+                                select {
+                                    id: "mem-kind",
+                                    class: "select",
+                                    value: "{kind}",
+                                    onchange: move |event| session.write().memory.kind = event.value(),
+                                    for kind in Session::memory_kinds() {
+                                        option { value: "{kind}", "{kind}" }
+                                    }
+                                }
+                            }
+                            div { class: "field",
+                                label { class: "field-label", r#for: "mem-source", "Source" }
+                                input {
+                                    id: "mem-source",
+                                    class: "input",
+                                    value: "{source}",
+                                    placeholder: "source",
+                                    oninput: move |event| session.write().memory.source = event.value(),
+                                }
+                            }
+                            div { class: "mem-composer-actions",
+                                button {
+                                    class: "btn ghost",
+                                    r#type: "button",
+                                    onclick: move |_| composing.set(false),
+                                    "Cancel"
+                                }
+                                button {
+                                    class: "btn primary",
+                                    r#type: "button",
+                                    disabled: !can_add,
+                                    onclick: move |_| {
+                                        let current = session.read().memory.content.clone();
+                                        match validate_memory_content(&current) {
+                                            Ok(()) => {
+                                                draft_error.set(None);
+                                                session.write().add_memory();
+                                                composing.set(false);
+                                            }
+                                            Err(msg) => draft_error.set(Some(msg)),
+                                        }
+                                    },
+                                    "Save memory"
+                                }
+                            }
+                        }
                     }
                 }
-                div { class: "field-row",
-                    div { class: "search-wrap", style: "flex: 1;",
+                div { class: "mem-toolbar",
+                    div { class: "search-wrap mem-search",
                         input {
                             class: "input",
                             r#type: "search",
@@ -249,48 +305,51 @@ pub(super) fn MemoryView(session: Signal<Session>) -> Element {
                                 "Clear"
                             }
                         }
-                    }
-                    button {
-                        class: "btn ghost",
-                        r#type: "button",
-                        onclick: move |_| session.write().load_memories(),
-                        "Search"
-                    }
-                }
-                div { class: "field-row", role: "group", "aria-label": "Filter memories",
-                    for (key, label) in MEMORY_FILTERS.iter().copied() {
                         button {
-                            key: "{key}",
+                            class: "btn sm",
                             r#type: "button",
-                            class: if filter == key { "chip accent" } else { "chip" },
-                            "aria-pressed": if filter == key { "true" } else { "false" },
-                            onclick: move |_| session.write().set_memory_filter(key),
-                            "{label}"
+                            onclick: move |_| session.write().load_memories(),
+                            "Search"
+                        }
+                    }
+                    div { class: "seg", role: "group", "aria-label": "Filter memories",
+                        for (key, label) in MEMORY_FILTERS.iter().copied() {
+                            button {
+                                key: "{key}",
+                                r#type: "button",
+                                class: if filter == key { "seg-btn active" } else { "seg-btn" },
+                                "aria-pressed": if filter == key { "true" } else { "false" },
+                                onclick: move |_| session.write().set_memory_filter(key),
+                                "{label}"
+                            }
                         }
                     }
                 }
-                div { class: "card-grid",
+                div { class: "card-grid mem-grid",
                     if !memories_loaded {
-                        div { class: "card", "aria-busy": "true",
-                            div { class: "skeleton title" }
-                            div { class: "skeleton block" }
+                        for n in 0..3 {
+                            div { key: "{n}", class: "card mem-card", "aria-busy": "true",
+                                div { class: "skeleton title" }
+                                div { class: "skeleton block" }
+                            }
                         }
                     }
                     for memory in memories {
-                        div { class: "card", key: "{memory.id}",
-                            div { class: "card-head",
+                        div {
+                            class: if memory.superseded { "card mem-card superseded" } else if memory.pending { "card mem-card pending" } else { "card mem-card" },
+                            key: "{memory.id}",
+                            div { class: "mem-meta",
                                 span { class: if memory.origin == "Learned" { "chip" } else { "chip accent" }, "{memory.origin}" }
+                                span { class: "chip", "{memory.kind}" }
                                 if let Some(bot) = memory.bot.clone() {
                                     span { class: "chip", "{bot}" }
                                 }
-                                span { class: "chip", "{memory.kind}" }
                                 if memory.superseded {
                                     span { class: "chip", "Superseded" }
                                 }
                                 if memory.pending {
-                                    span { class: "chip accent", "To review" }
+                                    span { class: "chip warn", "To review" }
                                 }
-                                span { class: "tiny", "{memory.importance}" }
                             }
                             if editing.as_deref() == Some(memory.id.as_str()) {
                                 {
@@ -317,7 +376,7 @@ pub(super) fn MemoryView(session: Signal<Session>) -> Element {
                                                 }
                                             },
                                         }
-                                        div { class: "field-row",
+                                        div { class: "row-actions",
                                             button {
                                                 class: "btn primary sm",
                                                 r#type: "button",
@@ -335,9 +394,17 @@ pub(super) fn MemoryView(session: Signal<Session>) -> Element {
                                     }
                                 }
                             } else {
-                                p { "{memory.content}" }
-                                p { class: "tiny", "{memory.created} · {memory.recalled}" }
-                                div { class: "row-actions",
+                                p { class: "mem-text", "{memory.content}" }
+                                div { class: "mem-foot",
+                                    div { class: "mem-importance", title: "{memory.importance}",
+                                        div { class: "meter",
+                                            div { class: "meter-fill", style: "width: {memory.importance_pct}%;" }
+                                        }
+                                        span { class: "tiny", "{memory.importance_pct}%" }
+                                    }
+                                    p { class: "tiny", "{memory.created} \u{b7} {memory.recalled}" }
+                                }
+                                div { class: "row-actions mem-actions",
                                     if memory.pending {
                                         button {
                                             class: "btn primary sm",
@@ -392,21 +459,28 @@ pub(super) fn MemoryView(session: Signal<Session>) -> Element {
                             }
                         }
                     }
-                    if memories_loaded && memories_empty {
-                        div { class: "empty",
-                            div { class: "empty-icon", Icon { name: "bolt", size: 20 } }
-                            h3 { class: "empty-title", "{empty_title}" }
-                            p { class: "empty-text", "{empty_text}" }
-                            if empty_filtered {
-                                button {
-                                    class: "btn sm",
-                                    r#type: "button",
-                                    onclick: move |_| {
-                                        session.write().memory.query.clear();
-                                        session.write().set_memory_filter("all");
-                                    },
-                                    "Clear filters"
-                                }
+                }
+                if memories_loaded && memories_empty {
+                    div { class: "empty",
+                        div { class: "empty-icon", Icon { name: if empty_filtered { "search" } else { "bolt" }, size: 20 } }
+                        h3 { class: "empty-title", "{empty_title}" }
+                        p { class: "empty-text", "{empty_text}" }
+                        if empty_filtered {
+                            button {
+                                class: "btn sm",
+                                r#type: "button",
+                                onclick: move |_| {
+                                    session.write().memory.query.clear();
+                                    session.write().set_memory_filter("all");
+                                },
+                                "Clear filters"
+                            }
+                        } else {
+                            button {
+                                class: "btn primary sm",
+                                r#type: "button",
+                                onclick: move |_| composing.set(true),
+                                "Add memory"
                             }
                         }
                     }

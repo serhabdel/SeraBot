@@ -95,7 +95,7 @@ pub(super) async fn retry_handoff(
         .ok_or_else(|| SeraError::NotFound(format!("bot {}", view.to_bot)))?;
     let resumed = resume_handoff(
         &state.store,
-        state.runtime.router(),
+        &state.runtime.router(),
         &bot.config,
         &user.id,
         &id,

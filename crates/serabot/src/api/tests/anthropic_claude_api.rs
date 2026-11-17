@@ -467,8 +467,8 @@ async fn listings_show_the_plan_sign_in_and_its_risk_only_to_the_admin() {
 
 /// "Sign in with Claude" on a card that was never saved: the console posts the
 /// Anthropic preset with no key. The save must work with exactly that, the
-/// admin's sign-in must start at once, and the listing must say bots use the
-/// provider only after a restart.
+/// admin's sign-in must start at once, and bots must be able to use the
+/// provider at once too: the console save swaps the model router (0.53).
 #[tokio::test]
 async fn a_console_saved_claude_provider_signs_in_without_a_key() {
     let env = env().await;
@@ -486,6 +486,7 @@ async fn a_console_saved_claude_provider_signs_in_without_a_key() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{saved}");
+    assert_eq!(saved["restart_required"], false, "{saved}");
     let (status, started) = call(
         &env,
         OWNER,
@@ -499,7 +500,7 @@ async fn a_console_saved_claude_provider_signs_in_without_a_key() {
     let listed = provider(&admin, "claude-console");
     assert_eq!(listed["signin"], json!(["pkce"]), "{listed}");
     assert!(listed["plan_signin"].is_null(), "{listed}");
-    assert_eq!(listed["pending_restart"], true, "{listed}");
+    assert_eq!(listed["pending_restart"], false, "{listed}");
     // A member sees why there is no sign-in button instead of nothing.
     let (_, member) = call(&env, &env.alice, "GET", "/v1/providers", None).await;
     let listed = provider(&member, "claude-console");
@@ -526,4 +527,73 @@ async fn the_accounts_listing_says_why_a_plan_sign_in_is_missing() {
     )
     .await;
     assert_eq!(member["plan_signin"], "admin_only", "{member}");
+}
+
+/// Saving and removing a console provider reach the bots without a restart:
+/// the provider is served as soon as it is saved and gone once removed.
+#[tokio::test]
+async fn console_provider_changes_apply_without_a_restart() {
+    let env = env().await;
+    let (status, saved) = call(
+        &env,
+        OWNER,
+        "POST",
+        "/v1/admin/providers",
+        Some(json!({
+            "id": "claude-live", "kind": "anthropic",
+            "base_url": "https://api.anthropic.com/v1",
+            "models": ["claude-haiku-5-5"],
+            "api_key_secret": "claude_live_api_key", "catalog_fetch": false,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+    assert_eq!(saved["restart_required"], false, "{saved}");
+    let (_, listed) = call(&env, OWNER, "GET", "/v1/providers", None).await;
+    let live = provider(&listed, "claude-live");
+    assert_eq!(live["managed"], true, "{live}");
+    assert_eq!(live["pending_restart"], false, "{live}");
+    // Saved again with another model: the router serves the new list at once.
+    let (status, saved) = call(
+        &env,
+        OWNER,
+        "POST",
+        "/v1/admin/providers",
+        Some(json!({
+            "id": "claude-live", "kind": "anthropic",
+            "base_url": "https://api.anthropic.com/v1",
+            "models": ["claude-haiku-5-5", "claude-sonnet-5-5"],
+            "api_key_secret": "claude_live_api_key", "catalog_fetch": false,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+    let (_, listed) = call(&env, OWNER, "GET", "/v1/providers", None).await;
+    let live = provider(&listed, "claude-live");
+    assert_eq!(
+        live["models"],
+        json!(["claude-haiku-5-5", "claude-sonnet-5-5"]),
+        "{live}"
+    );
+    assert_eq!(live["pending_restart"], false, "{live}");
+    // Removed: no longer served or listed, and no restart is asked for.
+    let (status, removed) = call(
+        &env,
+        OWNER,
+        "DELETE",
+        "/v1/admin/providers/claude-live",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    assert_eq!(removed["restart_required"], false, "{removed}");
+    let (_, listed) = call(&env, OWNER, "GET", "/v1/providers", None).await;
+    assert!(
+        listed["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|provider| provider["id"] != "claude-live"),
+        "{listed}"
+    );
 }

@@ -35,7 +35,7 @@ use crate::gateway::{
     Decision, DecisionResult, Gateway, Tool, ToolContext, ToolOutcome, ToolOutput, ToolSpec,
 };
 use crate::memory::{self, MemoryHub};
-use crate::model_router::{ModelRouter, ModelSelection, PinnedRoute, ProviderView};
+use crate::model_router::{ModelRouter, ModelSelection, PinnedRoute, ProviderView, RouterHandle};
 use crate::orchestration::{
     BotRole, ConversationKind, HandoffContext, ORCHESTRATOR_BOT, assistant_speaker,
     parse_conversation_scope, safe_bot_label, validate_conversation_id,
@@ -190,7 +190,8 @@ pub struct Runtime {
     config: Arc<Config>,
     store: Store,
     gateway: Gateway,
-    router: ModelRouter,
+    /// The live model router: a console provider save swaps it in place.
+    router: RouterHandle,
     fleet: Arc<FleetRegistry>,
     notifier: Arc<dyn Notifier>,
     semaphore: Arc<Semaphore>,
@@ -223,7 +224,7 @@ impl Runtime {
         config: Arc<Config>,
         store: Store,
         gateway: Gateway,
-        router: ModelRouter,
+        router: impl Into<RouterHandle>,
         bots: Vec<LoadedBot>,
         notifier: Arc<dyn Notifier>,
         shutdown: CancellationToken,
@@ -243,7 +244,7 @@ impl Runtime {
         config: Arc<Config>,
         store: Store,
         gateway: Gateway,
-        mut router: ModelRouter,
+        router: impl Into<RouterHandle>,
         fleet: Arc<FleetRegistry>,
         notifier: Arc<dyn Notifier>,
         shutdown: CancellationToken,
@@ -253,15 +254,19 @@ impl Runtime {
                 "runtime.max_concurrent_turns must be positive".into(),
             ));
         }
-        for bot in fleet.templates() {
-            if let Some(model) = &bot.config.model {
-                router.add_default_model(model)?;
+        let router: RouterHandle = router.into();
+        router.update(|router| {
+            for bot in fleet.templates() {
+                if let Some(model) = &bot.config.model {
+                    router.add_default_model(model)?;
+                }
             }
-        }
+            Ok(())
+        })?;
         let semaphore = Arc::new(Semaphore::new(config.runtime.max_concurrent_turns));
         let memory = MemoryHub::new(&config.memory, gateway.clone())?;
         if let Some(model) = &config.memory.extract_model
-            && router.provider_for_model(model).is_none()
+            && router.get().provider_for_model(model).is_none()
         {
             return Err(SeraError::Config(format!(
                 "memory.extract_model {model} is not served by any configured provider"
@@ -362,8 +367,21 @@ impl Runtime {
             .and_then(|fleet| fleet.get(name).cloned())
     }
 
-    pub fn router(&self) -> &ModelRouter {
+    /// The model router as it stands now. Hold the returned `Arc` for one
+    /// piece of work; a console provider save may replace it for the next.
+    pub fn router(&self) -> Arc<ModelRouter> {
+        self.router.get()
+    }
+
+    /// The shared handle, for tools that read the live router.
+    pub fn router_handle(&self) -> &RouterHandle {
         &self.router
+    }
+
+    /// Serve `router` from now on (a console provider save). Cached
+    /// per-user clients of changed providers are dropped with the old one.
+    pub fn replace_router(&self, router: ModelRouter) {
+        self.router.replace(router);
     }
 
     pub fn gateway(&self) -> &Gateway {

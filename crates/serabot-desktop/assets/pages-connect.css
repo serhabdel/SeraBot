@@ -1,0 +1,520 @@
+/* pages-connect (0.53): page refinements for Integrations, Browser, the shared
+   sheets and the sign-in screen. Tokens only; motion stops under reduced
+   motion (system) and under the console's own switch (.root[data-motion]). */
+
+/* ---------------------------------------------------------------- toolbar --- */
+
+.mp-toolbar {
+  gap: 10px 12px;
+  margin-bottom: 18px;
+}
+
+.mp-toolbar .seg {
+  flex: 0 1 auto;
+}
+
+.mp-toolbar .seg-btn {
+  padding: 6px 12px;
+}
+
+.mp-toolbar.integrations-bar {
+  flex-wrap: nowrap;
+}
+
+.integrations-bar .search-wrap {
+  flex: 0 1 300px;
+  margin-left: auto;
+}
+
+.integrations-bar .mp-search {
+  flex: 1 1 auto;
+  max-width: none;
+}
+
+/* The second row (category, status) is a filter strip: quieter and pushed
+   to the right edge so the tab bar stays the one primary control. */
+.mp-toolbar:not(.integrations-bar) {
+  margin-top: -4px;
+}
+
+.mp-toolbar:not(.integrations-bar) .seg:last-of-type {
+  margin-left: auto;
+}
+
+.mp-toolbar:not(.integrations-bar) .seg-btn {
+  padding: 4px 10px;
+}
+
+@media (max-width: 760px) {
+  .mp-toolbar.integrations-bar {
+    flex-wrap: wrap;
+  }
+
+  .integrations-bar .search-wrap {
+    flex: 1 1 100%;
+    margin-left: 0;
+  }
+}
+
+/* ------------------------------------------------------------------ cards --- */
+
+.mp-grid {
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 290px), 1fr));
+  gap: 14px;
+  align-items: stretch;
+}
+
+/* The listitem wrapper stretches, and so does the card in it, so a row of
+   cards is one height whatever the length of the description. */
+.mp-grid > [role="listitem"] {
+  display: flex;
+  min-width: 0;
+}
+
+.mp-grid > [role="listitem"] > .mp-card {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+}
+
+.mp-card.integration-card {
+  gap: 10px;
+  min-height: 136px;
+  padding: var(--card-pad);
+  border-color: var(--glass-edge);
+  background: var(--card-bg);
+  box-shadow: var(--card-shadow);
+}
+
+.mp-card.integration-card:hover {
+  background: var(--card-bg);
+}
+
+.integration-card-head {
+  gap: 12px;
+}
+
+.integration-card-name {
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+/* Reserve two lines so the footers line up across a row. */
+.integration-card-blurb {
+  min-height: 2.9em;
+}
+
+.integration-card-cta {
+  display: inline-block;
+  transition: transform var(--dur-2) var(--spring);
+}
+
+.integration-card:hover .integration-card-cta {
+  text-decoration: none;
+  transform: translateX(2px);
+}
+
+.integrations .connector-suite-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 26px 0 12px;
+}
+
+.integrations .connector-suite-title:first-of-type {
+  margin-top: 4px;
+}
+
+.integrations .connector-suite-title::after {
+  content: "";
+  flex: 1 1 auto;
+  height: 1px;
+  background: var(--hairline);
+}
+
+/* ------------------------------------------------------- loading skeletons --- */
+
+.mp-skel {
+  cursor: default;
+  pointer-events: none;
+}
+
+.mp-skel .skeleton {
+  height: 10px;
+}
+
+.sk-logo {
+  flex: 0 0 auto;
+  width: 38px;
+  height: 38px !important;
+  border-radius: 10px;
+}
+
+.sk-line {
+  border-radius: var(--r-pill);
+}
+
+.sk-chip {
+  flex: 0 0 auto;
+  width: 72px;
+  height: 22px !important;
+  margin-left: auto;
+  border-radius: var(--r-pill);
+}
+
+.sk-w20 { width: 20%; }
+.sk-w30 { width: 30%; }
+.sk-w40 { width: 40%; }
+.sk-w50 { width: 50%; }
+.sk-w60 { width: 60%; }
+.sk-w70 { width: 70%; }
+.sk-w90 { width: 90%; }
+
+.mp-skel .integration-card-foot .sk-line:last-child {
+  margin-left: auto;
+}
+
+/* ----------------------------------------------------------- empty/error --- */
+
+.integrations .empty,
+.browser-page .empty {
+  padding: 36px 16px;
+  border: 1px dashed var(--hairline-strong);
+  border-radius: var(--card-radius);
+  background: var(--card-bg);
+}
+
+.integrations .empty.compact {
+  padding: 28px 16px;
+}
+
+.integrations .banner,
+.browser-page .banner {
+  margin-bottom: 14px;
+}
+
+/* ---------------------------------------------------------------- browser --- */
+
+.browser-page .search-wrap {
+  max-width: 420px;
+  margin-bottom: 18px;
+}
+
+.browser-grid {
+  gap: 16px;
+}
+
+.browser-card {
+  border-color: var(--glass-edge);
+  border-radius: var(--card-radius);
+  box-shadow: var(--card-shadow);
+  transition: border-color var(--dur-1) var(--ease), box-shadow var(--dur-2) var(--ease),
+    transform var(--dur-2) var(--spring);
+}
+
+.browser-card:hover {
+  border-color: var(--hairline-strong);
+  box-shadow: var(--card-shadow-lift);
+  transform: var(--lift);
+}
+
+.browser-card:active {
+  transform: scale(var(--press-scale));
+}
+
+.browser-card-top {
+  min-height: 24px;
+}
+
+.browser-card-copy {
+  gap: 6px;
+}
+
+.browser-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  color: var(--label-3);
+  font-size: var(--fs-caption);
+}
+
+.browser-thumb-empty {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: var(--label-3);
+  font-size: var(--fs-caption);
+  background:
+    radial-gradient(70% 90% at 50% 0%, var(--glow-1), var(--clear) 70%),
+    var(--code-bg);
+}
+
+.browser-skel {
+  pointer-events: none;
+}
+
+.browser-skel .browser-thumb.skeleton {
+  height: auto;
+  border-radius: 0;
+}
+
+.browser-skel .skeleton.sk-line {
+  height: 10px;
+}
+
+.browser-skel .skeleton.sk-chip {
+  height: 22px;
+}
+
+.browser-ready {
+  margin-top: 30px;
+}
+
+.browser-ready .pane-subtitle {
+  margin: 0;
+  font-size: var(--fs-title);
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+
+.browser-ready .muted {
+  margin: 2px 0 14px;
+}
+
+.browser-card-idle {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+}
+
+.browser-card-idle .browser-card-copy {
+  padding: 0;
+  gap: 2px;
+  min-width: 0;
+}
+
+.browser-card-idle .btn {
+  flex: 0 0 auto;
+}
+
+.profiles-section {
+  margin-top: 34px;
+}
+
+.profile-list {
+  border-color: var(--glass-edge);
+  border-radius: var(--card-radius);
+  box-shadow: var(--card-shadow);
+}
+
+.profile-row {
+  transition: background var(--dur-1) var(--ease);
+}
+
+.profile-row:hover {
+  background: var(--hover);
+}
+
+.profile-list > .hint {
+  margin: 0;
+  padding: 14px;
+}
+
+.profile-list > .skeleton.row {
+  height: 52px;
+  border-radius: 0;
+}
+
+.signin-banner {
+  border-radius: var(--r-md);
+}
+
+/* ---------------------------------------------------------------- sheets --- */
+
+/* One head, body and foot for the centred sheet and the side sheet. */
+.sheet-head,
+.mp-sheet-head {
+  align-items: center;
+  padding: 18px 20px 14px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.sheet-body {
+  padding: 16px 20px 18px;
+}
+
+.sheet-foot {
+  padding: 12px 20px 14px;
+  background: color-mix(in srgb, var(--surface-2) 55%, transparent);
+}
+
+.mp-sheet {
+  background: var(--glass-sheet);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  box-shadow: inset 1px 0 0 var(--glass-highlight), var(--shadow-3);
+  animation: mp-sheet-in var(--dur-3) var(--spring) both;
+}
+
+.mp-sheet-scrim {
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+  animation: mp-scrim-in var(--dur-2) var(--ease) both;
+}
+
+.mp-sheet-title {
+  font-size: var(--fs-title);
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+
+.mp-sheet-head .mp-head .muted {
+  margin: 2px 0 0;
+  font-size: var(--fs-caption);
+}
+
+.mp-sheet-body {
+  gap: 14px;
+  padding: 16px 20px 24px;
+}
+
+.mp-section-title {
+  margin: 10px 0 0;
+  font-size: var(--fs-body);
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.mp-actions {
+  padding-top: 12px;
+  border-top: 1px solid var(--hairline);
+}
+
+.mp-field,
+.mp-confirm {
+  border-radius: var(--r-md);
+}
+
+@keyframes mp-sheet-in {
+  from {
+    opacity: 0;
+    transform: translateX(24px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes mp-scrim-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* ----------------------------------------------------------------- toasts --- */
+
+.toast {
+  max-width: min(560px, calc(100vw - 48px));
+  text-align: center;
+}
+
+.toast.err {
+  border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
+}
+
+/* ---------------------------------------------------------------- connect --- */
+
+.connect-card {
+  align-items: stretch;
+  gap: 14px;
+  padding: 32px;
+}
+
+.connect-card .brand-lg {
+  align-self: center;
+}
+
+.connect-card > h1,
+.connect-card > .muted {
+  text-align: center;
+}
+
+.connect-card > h1 {
+  margin-top: 2px;
+}
+
+.connect-card > .muted {
+  margin: -8px 0 6px;
+}
+
+.connect-card > .row:has(.btn.primary) .btn.primary {
+  flex: 1 1 auto;
+  justify-content: center;
+  min-height: 38px;
+}
+
+.connect-card > .btn.ghost.sm {
+  align-self: center;
+}
+
+.connect-card > .row:last-of-type {
+  justify-content: center;
+}
+
+.connect-card > p.tiny {
+  text-align: center;
+  line-height: 1.5;
+}
+
+/* ----------------------------------------------------------- reduced motion --- */
+
+@media (prefers-reduced-motion: reduce) {
+  .mp-sheet,
+  .mp-sheet-scrim {
+    animation: none;
+  }
+
+  .browser-card:hover {
+    transform: none;
+  }
+
+  .integration-card-cta,
+  .integration-card:hover .integration-card-cta {
+    transition: none;
+    transform: none;
+  }
+}
+
+.root[data-motion="reduce"] .mp-sheet,
+.root[data-motion="reduce"] .mp-sheet-scrim {
+  animation: none;
+}
+
+.root[data-motion="reduce"] .browser-card:hover {
+  transform: none;
+}
+
+.root[data-motion="reduce"] .integration-card-cta,
+.root[data-motion="reduce"] .integration-card:hover .integration-card-cta {
+  transition: none;
+  transform: none;
+}
+
+.mp-sheet-body > p,
+.mp-sheet-body > ul {
+  margin: 0;
+}
+
+.mp-section-title + p.tiny {
+  margin: -8px 0 0;
+}

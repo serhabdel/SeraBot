@@ -652,8 +652,12 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     // The API and the model clients refresh account tokens through one
     // single-flight refresher, so a rotated token is never spent twice.
     let account_refresher = credentials.refresher().clone();
-    let router = serabot::model_router::ModelRouter::with_credentials(&config.llm, credentials)?
-        .with_max_inflight_per_account(config.runtime.max_inflight_per_account);
+    // One live router shared by the runtime and the tools that read it, so a
+    // provider saved in the console is used without a restart.
+    let router = serabot::model_router::RouterHandle::new(
+        serabot::model_router::ModelRouter::with_credentials(&config.llm, credentials)?
+            .with_max_inflight_per_account(config.runtime.max_inflight_per_account),
+    );
 
     let embedder: Arc<dyn Embedder> = Arc::new(LazyEmbedder::new(
         &config.embeddings,
@@ -985,7 +989,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         &mut registry,
         &store,
         &fleet,
-        &router,
+        router.clone(),
         &policy,
         config.users.child_daily_limit,
     )?;

@@ -198,6 +198,7 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
     let empty = report
         .as_ref()
         .is_some_and(|report| report.totals.calls == 0);
+    let report_ready = report.is_some();
     let filter_text = filter.read().clone();
     let model_rows = report
         .as_ref()
@@ -248,199 +249,114 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
                     .filter(|quota| quota.limit > 0)
                 {
                     section { class: "usage-section", "aria-labelledby": "usage-quota-title",
-                        h2 { class: "usage-section-title", id: "usage-quota-title", "Quota" }
+                        div { class: "page-section-head",
+                            div {
+                                h2 { class: "usage-section-title", id: "usage-quota-title", "Quota" }
+                                p { class: "usage-section-sub", "Your daily budget of bot tasks." }
+                            }
+                        }
                         DailyTaskQuotaCard { quota }
                     }
                 }
                 if is_admin {
                     section { class: "usage-section", "aria-labelledby": "usage-reliability-title",
-                        h2 { class: "usage-section-title", id: "usage-reliability-title", "Reliability" }
-                        p { class: "usage-section-sub", "Only you, the owner, see this." }
+                        div { class: "page-section-head",
+                            div {
+                                h2 { class: "usage-section-title", id: "usage-reliability-title", "Reliability" }
+                                p { class: "usage-section-sub", "How your server is doing. Only you, the owner, see this." }
+                            }
+                        }
                         ServerHealthCard { session }
                     }
                 }
-                h2 { class: "usage-section-title", "Activity" }
-                if loading && report.is_none() {
-                    p { class: "caption", role: "status", "Loading your usage\u{2026}" }
-                } else if let Some(report) = report {
-                    if empty {
-                        div { class: "card",
-                            p { class: "card-sub", "Nothing used in the last {days} days." }
-                            p { class: "tiny", "Once your bots answer, the numbers show up here." }
-                        }
-                    } else {
-                        div { class: "usage-tiles",
-                            div { class: "usage-tile",
-                                span { class: "usage-tile-label", "AI replies" }
-                                span { class: "usage-tile-value", "{group_digits(report.totals.calls)}" }
-                            }
-                            div { class: "usage-tile",
-                                span { class: "usage-tile-label", "Tokens used" }
-                                span { class: "usage-tile-value", "{group_digits(report.totals.total_tokens)}" }
-                                span { class: "tiny",
-                                    "{group_digits(report.totals.prompt_tokens)} in · {group_digits(report.totals.completion_tokens)} out"
-                                }
-                            }
-                            div { class: "usage-tile",
-                                span { class: "usage-tile-label", "Tool runs" }
-                                span { class: "usage-tile-value", "{group_digits(tool_runs)}" }
-                            }
-                            div { class: "usage-tile",
-                                span { class: "usage-tile-label", "Estimated cost" }
-                                span { class: "usage-tile-value", "Not available" }
-                                span { class: "tiny", "Your server does not record prices." }
-                            }
-                        }
-                        div { class: "card",
-                            div { class: "card-head",
-                                h3 { class: "card-title", "Tokens per day" }
-                                if loading {
-                                    span { class: "spinner", title: "Refreshing" }
-                                }
-                            }
-                            if bars.is_empty() {
-                                p { class: "tiny", "No daily breakdown reported for this period." }
-                            } else {
-                                div { class: "usage-chart-wrap",
-                                    div { class: "usage-chart", role: "img", "aria-label": "Tokens used per day",
-                                        for (day, tokens, height) in bars {
-                                            div {
-                                                key: "{day}",
-                                                class: "usage-bar-col",
-                                                title: "{day}: {group_digits(tokens)} tokens",
-                                                div { class: "usage-bar", style: "height: {height}%;" }
-                                            }
-                                        }
-                                    }
-                                    div { class: "usage-chart-axis",
-                                        span { "{axis_start}" }
-                                        span { "{axis_peak}" }
-                                        span { "{axis_end}" }
-                                    }
-                                }
-                            }
-                        }
-                        div { class: "usage-toolbar",
-                            div { class: "search-wrap",
-                                input {
-                                    class: "input",
-                                    r#type: "search",
-                                    placeholder: "Filter models or bots\u{2026}",
-                                    "aria-label": "Filter usage tables",
-                                    value: "{filter}",
-                                    oninput: move |event| filter.set(event.value()),
-                                }
-                                if !filter.read().trim().is_empty() {
-                                    button {
-                                        class: "btn ghost sm",
-                                        r#type: "button",
-                                        onclick: move |_| filter.set(String::new()),
-                                        "Clear"
-                                    }
-                                }
-                            }
-                            div { class: "seg", role: "group", "aria-label": "Sort usage rows",
-                                button {
-                                    class: if sort_by() == UsageSort::TokensDesc { "seg-btn active" } else { "seg-btn" },
-                                    r#type: "button",
-                                    onclick: move |_| sort_by.set(UsageSort::TokensDesc),
-                                    "By tokens"
-                                }
-                                button {
-                                    class: if sort_by() == UsageSort::CallsDesc { "seg-btn active" } else { "seg-btn" },
-                                    r#type: "button",
-                                    onclick: move |_| sort_by.set(UsageSort::CallsDesc),
-                                    "By replies"
-                                }
-                                button {
-                                    class: if sort_by() == UsageSort::NameAsc { "seg-btn active" } else { "seg-btn" },
-                                    r#type: "button",
-                                    onclick: move |_| sort_by.set(UsageSort::NameAsc),
-                                    "Name"
-                                }
-                            }
-                        }
-                        div { class: "card",
-                            div { class: "card-head",
-                                h3 { class: "card-title", "By model" }
-                            }
-                            if model_rows.is_empty() {
-                                p { class: "tiny",
-                                    if filter.read().trim().is_empty() {
-                                        "No per-model breakdown reported for this period."
-                                    } else {
-                                        "No models match \u{201c}{filter}\u{201d}."
-                                    }
-                                }
-                            } else {
-                                div { class: "usage-table-wrap",
-                                    table { class: "usage-table",
-                                        thead {
-                                            tr {
-                                                th { "Provider" }
-                                                th { "Model" }
-                                                th { class: "num", "Replies" }
-                                                th { class: "num", "Tokens" }
-                                            }
-                                        }
-                                        tbody {
-                                            for row in model_rows {
-                                                tr { key: "{row.provider}/{row.model}",
-                                                    td { "{human_provider(&row.provider)}" }
-                                                    td { "{row.model}" }
-                                                    td { class: "num", "{group_digits(row.calls)}" }
-                                                    td { class: "num", "{group_digits(row.total_tokens)}" }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        div { class: "card",
-                            div { class: "card-head",
-                                h3 { class: "card-title", "By bot" }
-                            }
-                            if bot_rows.is_empty() {
-                                p { class: "tiny",
-                                    if filter.read().trim().is_empty() {
-                                        "No per-bot breakdown reported for this period."
-                                    } else {
-                                        "No bots match \u{201c}{filter}\u{201d}."
-                                    }
-                                }
-                            } else {
-                                div { class: "usage-table-wrap",
-                                    table { class: "usage-table",
-                                        thead {
-                                            tr {
-                                                th { "Bot" }
-                                                th { class: "num", "Replies" }
-                                                th { class: "num", "Tokens" }
-                                            }
-                                        }
-                                        tbody {
-                                            for row in bot_rows {
-                                                tr { key: "{row.bot.clone().unwrap_or_default()}",
-                                                    td { "{humanize_label(&row.bot.clone().unwrap_or_default())}" }
-                                                    td { class: "num", "{group_digits(row.calls)}" }
-                                                    td { class: "num", "{group_digits(row.total_tokens)}" }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                section { class: "usage-section", "aria-labelledby": "usage-activity-title",
+                    div { class: "page-section-head",
+                        div {
+                            h2 { class: "usage-section-title", id: "usage-activity-title", "Activity" }
+                            p { class: "usage-section-sub", "Replies, tokens and tool runs in the last {days} days." }
                         }
                     }
-                } else {
-                    div { class: "card",
-                        p { class: "field-error", role: "alert",
-                            "{error.as_deref().unwrap_or(\"Usage could not be loaded.\")}"
+                    if loading && report.is_none() {
+                        div { class: "usage-tiles", role: "status", "aria-busy": "true", "aria-label": "Loading your usage",
+                            for n in 0..4 {
+                                div { key: "{n}", class: "stat-tile skeleton usage-skeleton", " " }
+                            }
                         }
-                        div { class: "card-actions",
+                    } else if let Some(report) = report {
+                        if empty {
+                            div { class: "empty",
+                                div { class: "empty-icon", Icon { name: "bolt", size: 20 } }
+                                h3 { class: "empty-title", "Nothing used in the last {days} days" }
+                                p { class: "empty-text", "Once your bots answer, the numbers show up here." }
+                            }
+                        } else {
+                            div { class: "usage-tiles",
+                                div { class: "stat-tile",
+                                    span { class: "stat-tile-value", "{group_digits(report.totals.calls)}" }
+                                    span { class: "stat-tile-label", "AI replies" }
+                                    span { class: "stat-tile-sub", "Answers your bots gave" }
+                                }
+                                div { class: "stat-tile",
+                                    span { class: "stat-tile-value", "{group_digits(report.totals.total_tokens)}" }
+                                    span { class: "stat-tile-label", "Tokens used" }
+                                    span { class: "stat-tile-sub",
+                                        "{group_digits(report.totals.prompt_tokens)} in \u{b7} {group_digits(report.totals.completion_tokens)} out"
+                                    }
+                                }
+                                div { class: "stat-tile",
+                                    span { class: "stat-tile-value", "{group_digits(tool_runs)}" }
+                                    span { class: "stat-tile-label", "Tool runs" }
+                                    span { class: "stat-tile-sub", "Searches, documents and more" }
+                                }
+                                div { class: "stat-tile",
+                                    span { class: "stat-tile-value muted-value", "\u{2014}" }
+                                    span { class: "stat-tile-label", "Estimated cost" }
+                                    span { class: "stat-tile-sub", "Your server does not record prices." }
+                                }
+                            }
+                            div { class: "card usage-chart-card",
+                                div { class: "card-head",
+                                    h3 { class: "card-title", "Tokens per day" }
+                                    if loading {
+                                        span { class: "spinner", title: "Refreshing" }
+                                    } else if !axis_peak.is_empty() {
+                                        span { class: "page-count", "{axis_peak}" }
+                                    }
+                                }
+                                if bars.is_empty() {
+                                    p { class: "tiny", "No daily breakdown reported for this period." }
+                                } else {
+                                    div { class: "usage-chart-wrap",
+                                        div { class: "usage-chart", role: "img", "aria-label": "Tokens used per day",
+                                            for (index, (day, tokens, height)) in bars.into_iter().enumerate() {
+                                                div {
+                                                    key: "{day}",
+                                                    class: "usage-bar-col",
+                                                    title: "{day}: {group_digits(tokens)} tokens",
+                                                    div {
+                                                        class: "usage-bar",
+                                                        style: "height: {height}%; --bar-delay: {index.min(40) * 12}ms;",
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        div { class: "usage-chart-axis",
+                                            span { "{axis_start}" }
+                                            span { "{axis_end}" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        div { class: "empty usage-error", role: "alert",
+                            div { class: "empty-icon danger", Icon { name: "alert", size: 20 } }
+                            h3 { class: "empty-title", "Usage could not be loaded" }
+                            p { class: "empty-text",
+                                "{error.as_deref().unwrap_or(\"The server did not answer. Try again in a moment.\")}"
+                            }
                             button {
-                                class: "btn sm",
+                                class: "btn primary sm",
                                 r#type: "button",
                                 onclick: move |_| session.write().load_usage_days(days),
                                 Icon { name: "refresh", size: 14 }
@@ -449,8 +365,146 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
                         }
                     }
                 }
-                h2 { class: "usage-section-title", "This computer" }
-                ThisPcCard { session }
+                if report_ready && !empty {
+                    section { class: "usage-section", "aria-labelledby": "usage-breakdown-title",
+                        div { class: "page-section-head",
+                            div {
+                                h2 { class: "usage-section-title", id: "usage-breakdown-title", "Breakdown" }
+                                p { class: "usage-section-sub", "Where the tokens went." }
+                            }
+                            div { class: "usage-toolbar",
+                                div { class: "search-wrap",
+                                    input {
+                                        class: "input",
+                                        r#type: "search",
+                                        placeholder: "Filter models or bots\u{2026}",
+                                        "aria-label": "Filter usage tables",
+                                        value: "{filter}",
+                                        oninput: move |event| filter.set(event.value()),
+                                    }
+                                    if !filter.read().trim().is_empty() {
+                                        button {
+                                            class: "btn ghost sm",
+                                            r#type: "button",
+                                            onclick: move |_| filter.set(String::new()),
+                                            "Clear"
+                                        }
+                                    }
+                                }
+                                div { class: "seg", role: "group", "aria-label": "Sort usage rows",
+                                    button {
+                                        class: if sort_by() == UsageSort::TokensDesc { "seg-btn active" } else { "seg-btn" },
+                                        r#type: "button",
+                                        onclick: move |_| sort_by.set(UsageSort::TokensDesc),
+                                        "By tokens"
+                                    }
+                                    button {
+                                        class: if sort_by() == UsageSort::CallsDesc { "seg-btn active" } else { "seg-btn" },
+                                        r#type: "button",
+                                        onclick: move |_| sort_by.set(UsageSort::CallsDesc),
+                                        "By replies"
+                                    }
+                                    button {
+                                        class: if sort_by() == UsageSort::NameAsc { "seg-btn active" } else { "seg-btn" },
+                                        r#type: "button",
+                                        onclick: move |_| sort_by.set(UsageSort::NameAsc),
+                                        "Name"
+                                    }
+                                }
+                            }
+                        }
+                        div { class: "usage-breakdown",
+                            div { class: "card",
+                                div { class: "card-head",
+                                    h3 { class: "card-title", "By model" }
+                                }
+                                if model_rows.is_empty() {
+                                    p { class: "tiny",
+                                        if filter.read().trim().is_empty() {
+                                            "No per-model breakdown reported for this period."
+                                        } else {
+                                            "No models match \u{201c}{filter}\u{201d}."
+                                        }
+                                    }
+                                } else {
+                                    div { class: "usage-table-wrap",
+                                        table { class: "usage-table",
+                                            thead {
+                                                tr {
+                                                    th { "Provider" }
+                                                    th { "Model" }
+                                                    th { class: "num", "Replies" }
+                                                    th { class: "num", "Tokens" }
+                                                }
+                                            }
+                                            tbody {
+                                                for row in model_rows {
+                                                    tr { key: "{row.provider}/{row.model}",
+                                                        td { "{human_provider(&row.provider)}" }
+                                                        td { class: "usage-model", "{row.model}" }
+                                                        td { class: "num", "{group_digits(row.calls)}" }
+                                                        td { class: "num", "{group_digits(row.total_tokens)}" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            div { class: "card",
+                                div { class: "card-head",
+                                    h3 { class: "card-title", "By bot" }
+                                }
+                                if bot_rows.is_empty() {
+                                    p { class: "tiny",
+                                        if filter.read().trim().is_empty() {
+                                            "No per-bot breakdown reported for this period."
+                                        } else {
+                                            "No bots match \u{201c}{filter}\u{201d}."
+                                        }
+                                    }
+                                } else {
+                                    div { class: "usage-table-wrap",
+                                        table { class: "usage-table",
+                                            thead {
+                                                tr {
+                                                    th { "Bot" }
+                                                    th { class: "num", "Replies" }
+                                                    th { class: "num", "Tokens" }
+                                                }
+                                            }
+                                            tbody {
+                                                for row in bot_rows {
+                                                    tr { key: "{row.bot.clone().unwrap_or_default()}",
+                                                        td { "{humanize_label(&row.bot.clone().unwrap_or_default())}" }
+                                                        td { class: "num", "{group_digits(row.calls)}" }
+                                                        td { class: "num", "{group_digits(row.total_tokens)}" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                section { class: "usage-section", "aria-labelledby": "usage-pc-title",
+                    div { class: "page-section-head",
+                        div {
+                            h2 { class: "usage-section-title", id: "usage-pc-title", "This computer" }
+                            p { class: "usage-section-sub", "What SeraBot uses on this computer." }
+                        }
+                        button {
+                            class: "btn ghost sm",
+                            r#type: "button",
+                            onclick: move |_| session.read().refresh_pc(),
+                            Icon { name: "refresh", size: 14 }
+                            "Refresh"
+                        }
+                    }
+                    ThisPcCard { session }
+                }
             }
         }
     }
@@ -485,7 +539,7 @@ fn DailyTaskQuotaCard(quota: serabot_desktop::UsageDailyTaskQuota) -> Element {
                 h3 { class: "card-title", "Daily task quota" }
                 LevelChip { level }
             }
-            div { class: "health-item",
+            div { class: "quota-body",
                 span { class: "usage-tile-label", "Tasks today (UTC)" }
                 span { class: "health-value",
                     "{group_digits(quota.used)} of {group_digits(quota.limit as i64)}"
@@ -607,10 +661,7 @@ fn ServerHealthCard(session: Signal<Session>) -> Element {
     rsx! {
         div { class: "card health-card",
             div { class: "card-head",
-                div {
-                    h3 { class: "card-title", "Your server" }
-                    p { class: "tiny", "Only you, the owner, see this." }
-                }
+                h3 { class: "card-title", "Your server" }
                 if loading {
                     span { class: "spinner", title: "Refreshing" }
                 }
@@ -660,7 +711,7 @@ fn ServerHealthCard(session: Signal<Session>) -> Element {
                     level: Level::from_percent(storage_pct, 90).flagged(),
                 }
             }
-            h4 { class: "health-heading", "Reliability" }
+            h4 { class: "health-heading", "Background jobs" }
             div { class: "health-summary",
                 HealthItem {
                     label: "Scheduler lag",
@@ -784,12 +835,12 @@ fn ThisPcCard(session: Signal<Session>) -> Element {
     let view = session.read().pc.view();
     let Some(quick) = view.quick else {
         return rsx! {
-            div { class: "card health-card",
-                div { class: "card-head",
-                    h3 { class: "card-title", "This PC" }
-                    span { class: "spinner", title: "Reading" }
+            div { class: "card health-card", "aria-busy": "true",
+                div { class: "health-summary",
+                    for n in 0..3 {
+                        div { key: "{n}", class: "skeleton usage-skeleton", " " }
+                    }
                 }
-                p { class: "caption", "Reading this computer…" }
             }
         };
     };
@@ -821,19 +872,6 @@ fn ThisPcCard(session: Signal<Session>) -> Element {
     let open_confirm = confirming();
     rsx! {
         div { class: "card health-card",
-            div { class: "card-head",
-                div {
-                    h3 { class: "card-title", "This PC" }
-                    p { class: "tiny", "What SeraBot uses on this computer." }
-                }
-                button {
-                    class: "btn ghost sm",
-                    r#type: "button",
-                    onclick: move |_| session.read().refresh_pc(),
-                    Icon { name: "refresh", size: 14 }
-                    "Refresh"
-                }
-            }
             div { class: "health-summary",
                 HealthItem {
                     label: "App memory",

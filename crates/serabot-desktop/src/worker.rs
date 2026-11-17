@@ -833,6 +833,11 @@ pub enum Reply {
     BotConfigSaved {
         restart_required: bool,
     },
+    /// A console provider save or removal. Since 0.53 the server applies it
+    /// at once and says `restart_required` only when it could not.
+    ProviderSaved {
+        restart_required: bool,
+    },
     Usage(UsageReport),
     ServerHealth(ServerHealth),
     /// The shipped templates for "Meet your team".
@@ -1310,11 +1315,19 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         Operation::TranscribeAudio { filename, bytes } => client
             .transcribe_audio(filename, bytes)
             .map(Reply::Transcribed),
-        Operation::AdminSaveProvider(request) => client
-            .admin_add_provider(request)
-            .map(|_| Reply::AdminSaved),
+        Operation::AdminSaveProvider(request) => {
+            client
+                .admin_add_provider(request)
+                .map(|ack| Reply::ProviderSaved {
+                    restart_required: ack.restart_required,
+                })
+        }
         Operation::AdminRemoveProvider(id) => {
-            client.admin_remove_provider(id).map(|_| Reply::AdminSaved)
+            client
+                .admin_remove_provider(id)
+                .map(|ack| Reply::ProviderSaved {
+                    restart_required: ack.restart_required,
+                })
         }
         Operation::SaveProviderKey { id, key } => client
             .set_provider_key(id, key)

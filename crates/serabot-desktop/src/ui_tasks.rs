@@ -229,13 +229,11 @@ fn is_valid_iso_date(raw: &str) -> bool {
     if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
         return false;
     }
-    let Ok(year) = raw[..4].parse::<i64>() else {
+    let (Some(y), Some(m), Some(d)) = (raw.get(..4), raw.get(5..7), raw.get(8..10)) else {
         return false;
     };
-    let Ok(month) = raw[5..7].parse::<u32>() else {
-        return false;
-    };
-    let Ok(day) = raw[8..10].parse::<u32>() else {
+    let (Ok(year), Ok(month), Ok(day)) = (y.parse::<i64>(), m.parse::<u32>(), d.parse::<u32>())
+    else {
         return false;
     };
     (1..=12).contains(&month) && (1..=days_in_month(year, month)).contains(&day)
@@ -518,16 +516,19 @@ pub fn TasksView(mut session: Signal<Session>) -> Element {
             div { class: "pane-head",
                 div {
                     h1 { class: "pane-title", "Tasks" }
-                    p { class: "pane-sub", "Plan your day, track progress, and sync with your calendar." }
+                    p { class: "muted", "Plan your day, track progress, and sync with your calendar." }
                 }
                 div { class: "tasks-head-actions",
-                    for v in VIEWS {
-                        button {
-                            class: if *view.read() == v { "seg on" } else { "seg" },
-                            r#type: "button",
-                            "aria-pressed": if *view.read() == v { "true" } else { "false" },
-                            onclick: move |_| view.set(v),
-                            "{v.label()}"
+                    div { class: "seg tasks-view-seg", role: "group", "aria-label": "Task view",
+                        for v in VIEWS {
+                            button {
+                                key: "{v.label()}",
+                                class: if *view.read() == v { "seg-btn active" } else { "seg-btn" },
+                                r#type: "button",
+                                "aria-pressed": if *view.read() == v { "true" } else { "false" },
+                                onclick: move |_| view.set(v),
+                                "{v.label()}"
+                            }
                         }
                     }
                 }
@@ -544,13 +545,28 @@ pub fn TasksView(mut session: Signal<Session>) -> Element {
                             div { class: "tasks-progress-fill", style: "width: {pct}%;" }
                         }
                     }
-                    div { class: "tasks-stat-pills",
-                        span { class: "tasks-stat-pill todo", "To Do: {stats.todo}" }
-                        span { class: "tasks-stat-pill doing", "In Progress: {stats.doing}" }
-                        span { class: "tasks-stat-pill done", "Done: {stats.done}" }
-                        span { class: "tasks-stat-pill today", "Due Today: {stats.due_today}" }
+                    div { class: "tasks-stat-tiles",
+                        div { class: "stat-tile tasks-tile todo",
+                            span { class: "stat-tile-value", "{stats.todo}" }
+                            span { class: "stat-tile-label", "To do" }
+                        }
+                        div { class: "stat-tile tasks-tile doing",
+                            span { class: "stat-tile-value", "{stats.doing}" }
+                            span { class: "stat-tile-label", "In progress" }
+                        }
+                        div { class: "stat-tile tasks-tile done",
+                            span { class: "stat-tile-value", "{stats.done}" }
+                            span { class: "stat-tile-label", "Done" }
+                        }
+                        div { class: "stat-tile tasks-tile today",
+                            span { class: "stat-tile-value", "{stats.due_today}" }
+                            span { class: "stat-tile-label", "Due today" }
+                        }
                         if stats.overdue > 0 {
-                            span { class: "tasks-stat-pill overdue", "Overdue: {stats.overdue}" }
+                            div { class: "stat-tile tasks-tile overdue",
+                                span { class: "stat-tile-value", "{stats.overdue}" }
+                                span { class: "stat-tile-label", "Overdue" }
+                            }
                         }
                     }
                 }
@@ -613,7 +629,7 @@ pub fn TasksView(mut session: Signal<Session>) -> Element {
                 if !tasks_loaded && tasks.is_empty() {
                     div { class: "tasks-skeleton", role: "status", "aria-label": "Loading tasks",
                         for n in 0..4 {
-                            div { key: "{n}", class: "skeleton", style: "height: 44px; margin-bottom: 8px;" }
+                            div { key: "{n}", class: "skeleton tasks-skeleton-row" }
                         }
                     }
                 } else {
@@ -720,11 +736,12 @@ pub fn TasksView(mut session: Signal<Session>) -> Element {
 
                             if !tasks.is_empty() {
                                 div { class: "tasks-toolbar",
-                                    div { class: "tasks-filters", role: "group", "aria-label": "Status filter",
+                                    div { class: "seg tasks-filters", role: "group", "aria-label": "Status filter",
                                         for sf in STATUS_FILTERS {
                                             button {
                                                 key: "{sf.label()}",
-                                                class: if filter == sf { "seg on" } else { "seg" },
+                                                class: if filter == sf { "seg-btn active" } else { "seg-btn" },
+                                                "aria-pressed": if filter == sf { "true" } else { "false" },
                                                 r#type: "button",
                                                 onclick: move |_| status_filter.set(sf),
                                                 "{sf.label()}"
@@ -735,10 +752,18 @@ pub fn TasksView(mut session: Signal<Session>) -> Element {
                             }
 
                             if tasks.is_empty() {
-                                div { class: "empty-note", "No tasks yet. Add one above, or sync a provider." }
+                                div { class: "empty tasks-empty",
+                                    span { class: "empty-icon", Icon { name: "check", size: 20 } }
+                                    h2 { class: "empty-title", "No tasks yet" }
+                                    p { class: "empty-text",
+                                        "Add your first task above, or choose a sync provider to import the ones you already have."
+                                    }
+                                }
                             } else if filtered_tasks.is_empty() {
-                                div { class: "empty-note",
-                                    "No tasks match this filter. "
+                                div { class: "empty tasks-empty",
+                                    span { class: "empty-icon", Icon { name: "search", size: 20 } }
+                                    h2 { class: "empty-title", "No tasks match" }
+                                    p { class: "empty-text", "Try a different search or show every status." }
                                     button {
                                         class: "btn ghost sm",
                                         r#type: "button",
@@ -779,14 +804,20 @@ pub fn TasksView(mut session: Signal<Session>) -> Element {
                                 }
                                 if !groups.completed.is_empty() {
                                     details { class: "tasks-done", open: filter == TaskStatusFilter::Done,
-                                        summary { "Completed ({groups.completed.len()})" }
-                                        for task in groups.completed {
-                                            TaskCard {
-                                                key: "{task.id}",
-                                                session,
-                                                task,
-                                                today_iso: today_iso.clone(),
-                                                editing_task,
+                                        summary {
+                                            Icon { name: "chevron-right", size: 14 }
+                                            "Completed"
+                                            span { class: "tasks-section-count", "{groups.completed.len()}" }
+                                        }
+                                        div { class: "card-grid tasks-list",
+                                            for task in groups.completed {
+                                                TaskCard {
+                                                    key: "{task.id}",
+                                                    session,
+                                                    task,
+                                                    today_iso: today_iso.clone(),
+                                                    editing_task,
+                                                }
                                             }
                                         }
                                     }
@@ -810,15 +841,17 @@ pub fn TasksView(mut session: Signal<Session>) -> Element {
                                                     span { class: "kanban-count", "{col_tasks.len()}" }
                                                 }
                                                 if col_tasks.is_empty() {
-                                                    p { class: "empty-note kanban-empty", "Nothing here." }
+                                                    p { class: "kanban-empty", "Nothing here." }
                                                 } else {
-                                                    for task in col_tasks {
-                                                        KanbanTaskCard {
-                                                            key: "{task.id}",
-                                                            session,
-                                                            task,
-                                                            today_iso: today_iso.clone(),
-                                                            editing_task,
+                                                    div { class: "card-grid tasks-list",
+                                                        for task in col_tasks {
+                                                            KanbanTaskCard {
+                                                                key: "{task.id}",
+                                                                session,
+                                                                task,
+                                                                today_iso: today_iso.clone(),
+                                                                editing_task,
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -918,11 +951,21 @@ pub fn TasksView(mut session: Signal<Session>) -> Element {
                                             };
                                             let extra = (day_tasks.len() + day_events.len()).saturating_sub(3);
                                             let click_iso = day_iso.clone();
+                                            let key_iso = day_iso.clone();
                                             rsx! {
                                                 div {
                                                     key: "{day_iso}",
                                                     class: "{cell_class}",
+                                                    role: "button",
+                                                    tabindex: "0",
+                                                    "aria-pressed": if is_selected { "true" } else { "false" },
+                                                    "aria-label": "{day_iso}",
                                                     onclick: move |_| selected_day.set(click_iso.clone()),
+                                                    onkeydown: move |evt: KeyboardEvent| {
+                                                        if evt.key() == Key::Enter || evt.key() == Key::Character(" ".into()) {
+                                                            selected_day.set(key_iso.clone());
+                                                        }
+                                                    },
                                                     div { class: "cal-day",
                                                         span { "{day}" }
                                                         if !day_tasks.is_empty() || !day_events.is_empty() {
@@ -975,7 +1018,7 @@ pub fn TasksView(mut session: Signal<Session>) -> Element {
                                             }
                                             div { class: "tasks-cal-sidebar-list",
                                                 if sel_tasks.is_empty() && sel_events.is_empty() {
-                                                    p { class: "empty-note", "No tasks or calendar events on this day." }
+                                                    p { class: "kanban-empty", "No tasks or calendar events on this day." }
                                                 }
                                                 for task in sel_tasks {
                                                     TaskCard {
@@ -1030,13 +1073,15 @@ fn TaskGroupSection(
                 h3 { class: "tasks-section-title", "{title}" }
                 span { class: "tasks-section-count", "{tasks.len()}" }
             }
-            for task in tasks {
-                TaskCard {
-                    key: "{task.id}",
-                    session,
-                    task,
-                    today_iso: today_iso.clone(),
-                    editing_task,
+            div { class: "card-grid tasks-list",
+                for task in tasks {
+                    TaskCard {
+                        key: "{task.id}",
+                        session,
+                        task,
+                        today_iso: today_iso.clone(),
+                        editing_task,
+                    }
                 }
             }
         }

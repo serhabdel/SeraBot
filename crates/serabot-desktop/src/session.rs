@@ -4402,6 +4402,11 @@ impl Session {
                     if matches!(reply, Reply::RunActed) {
                         self.run_action_done();
                     }
+                    // `None` for every write but a provider save or removal.
+                    let provider_restart = match &reply {
+                        Reply::ProviderSaved { restart_required } => Some(*restart_required),
+                        _ => None,
+                    };
                     let bot_config_saved = match &reply {
                         Reply::BotConfigSaved { restart_required } => Some(*restart_required),
                         _ => None,
@@ -4857,6 +4862,12 @@ impl Session {
                                 self.admin_notice =
                                     Some("Saved. Opening the sign-in page\u{2026}".into());
                                 self.sign_in_after_save(id);
+                            } else if provider_restart == Some(false) {
+                                // The server put the provider change in front of
+                                // the bots at once; the lists below show it.
+                                self.admin_notice = Some("Saved. Your bots can use it now.".into());
+                                self.state.providers_loaded = false;
+                                self.schedule(Operation::Catalog, Duration::ZERO);
                             } else {
                                 self.admin_notice =
                                     Some("Saved. Restart the server to apply the change.".into());

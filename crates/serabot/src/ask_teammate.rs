@@ -17,7 +17,7 @@ use crate::domain::new_id;
 use crate::error::{Result, SeraError};
 use crate::fleet::FleetRegistry;
 use crate::gateway::{Tool, ToolContext, ToolOutput, ToolSpec};
-use crate::model_router::ModelRouter;
+use crate::model_router::RouterHandle;
 use crate::store::Store;
 use crate::teams::enqueue_turn_task_with_id;
 use crate::util::truncate_chars;
@@ -30,15 +30,15 @@ const MAX_REASON: usize = 300;
 pub struct AskTeammateTool {
     store: Store,
     fleet: Arc<FleetRegistry>,
-    router: ModelRouter,
+    router: RouterHandle,
 }
 
 impl AskTeammateTool {
-    pub fn new(store: Store, fleet: Arc<FleetRegistry>, router: ModelRouter) -> Self {
+    pub fn new(store: Store, fleet: Arc<FleetRegistry>, router: impl Into<RouterHandle>) -> Self {
         Self {
             store,
             fleet,
-            router,
+            router: router.into(),
         }
     }
 }
@@ -154,9 +154,14 @@ impl Tool for AskTeammateTool {
             MAX_REASON,
         );
 
-        let selection = match self.router.bot_chain(&context.user_id, &target.config).head {
+        let selection = match self
+            .router
+            .get()
+            .bot_chain(&context.user_id, &target.config)
+            .head
+        {
             Some(head) => head,
-            None => self.router.select_class(
+            None => self.router.get().select_class(
                 &context.user_id,
                 Some("routine"),
                 target.config.model.as_deref(),
@@ -166,6 +171,7 @@ impl Tool for AskTeammateTool {
         };
         let route = self
             .router
+            .get()
             .pin_for_bot(&context.user_id, &selection, &target.config)?;
         let child_task_id = new_id();
         let text = objective_text(&context.bot, &reason, &objective);
@@ -231,6 +237,7 @@ mod tests {
     use super::*;
     use crate::config::{BotConfig, Config, LoadedBot};
     use crate::llm::LlmClient;
+    use crate::model_router::ModelRouter;
     use crate::orchestration::{BotRole, ORCHESTRATOR_BOT};
     use rusqlite::params;
     use std::collections::{BTreeMap, HashSet};

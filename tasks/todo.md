@@ -174,3 +174,12 @@ never merge without the owner's OK.
 - [ ] Visual review of the redesigned screens on a Windows device.
 - [ ] Optional: rebuild the model router when the console saves a provider, so no restart is needed.
 
+## Release 0.53.0 — consistency, motion, live providers
+
+- [x] Shared, swappable model router (`RouterHandle`) and `ModelRouter::rebuilt`; console provider saves and removals apply at once.
+- [x] `assets/system.css`: cards, stat tiles, segmented controls, skeletons, list motion, focus rings, reduced motion.
+- [x] Page polish: Tasks, Workflows, Logs, Memory, Vault, Usage, Settings, Integrations, Marketplace, Browser, sheets.
+- [ ] Visual review on a Windows device (light and dark), including Kanban and Calendar views.
+- [ ] Settings panes beyond Account and Appearance, the Vault form and import picker: markup polish.
+- [ ] Marketplace "Coming soon" filter label now that live plugins run.
+
