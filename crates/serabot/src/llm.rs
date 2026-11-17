@@ -1213,12 +1213,12 @@ impl LlmClient {
         &self,
         url: &str,
         body: &Value,
-        model: &str,
+        _model: &str,
         stream: bool,
     ) -> Result<CloudPost> {
         let version = cloud_code::antigravity_version(self.cloud_version.as_deref()).await;
         let mut key = self.bearer();
-        let mut request = self
+        let request = self
             .http
             .post(url)
             .bearer_auth(&key)
@@ -1236,9 +1236,8 @@ impl LlmClient {
                 },
             )
             .json(body);
-        if cloud_code::requests_interleaved_thinking(model) {
-            request = request.header("anthropic-beta", "interleaved-thinking-2025-05-14");
-        }
+        // HielCowork sends no `anthropic-beta` header to Cloud Code, and its
+        // chats work; the model id alone selects thinking.
         let response = request.send().await;
         key.zeroize();
         let response = match response {
