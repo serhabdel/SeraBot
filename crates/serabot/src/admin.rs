@@ -5,7 +5,7 @@
 //! which is merged over the file at startup. Credential values still travel to
 //! the age store through [`SharedSecrets::persist`] and are never echoed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::audio::resolve_audio_provider;
-use crate::config::{Config, OAuthConnectorSettings, ProviderConfig};
+use crate::config::{Config, LlmConfig, OAuthConnectorSettings, ProviderConfig};
 use crate::error::{Result, SeraError};
 use crate::providers::{canonical_kind, check_profile};
 use crate::secrets::SharedSecrets;
@@ -212,17 +212,40 @@ pub struct AdminStore {
     path: PathBuf,
     overlay: Arc<Mutex<AdminOverlay>>,
     write_lock: Arc<Mutex<()>>,
+    /// The console providers the server started with (already merged into
+    /// the startup configuration), so a later removal can be undone in the
+    /// live provider list.
+    startup_providers: Arc<BTreeSet<String>>,
 }
 
 impl AdminStore {
     pub fn open(config: &Config) -> Result<Self> {
         let path = AdminOverlay::path_for(config);
         let overlay = AdminOverlay::load(&path)?;
+        let startup_providers = overlay.providers.keys().cloned().collect();
         Ok(Self {
             path,
             overlay: Arc::new(Mutex::new(overlay)),
             write_lock: Arc::new(Mutex::new(())),
+            startup_providers: Arc::new(startup_providers),
         })
+    }
+
+    /// The provider list as the console has it now: the startup `[llm]`
+    /// configuration, without the console providers removed since start and
+    /// with every console provider as last saved. A `serabot.toml` provider
+    /// that a console provider of the same id replaced at startup comes back
+    /// only after a restart.
+    pub fn live_llm(&self, startup: &LlmConfig) -> LlmConfig {
+        let overlay = self.snapshot();
+        let mut llm = startup.clone();
+        for id in self.startup_providers.iter() {
+            if !overlay.providers.contains_key(id) {
+                llm.providers.remove(id);
+            }
+        }
+        llm.providers.extend(overlay.providers);
+        llm
     }
 
     pub fn manages_provider(&self, id: &str) -> bool {

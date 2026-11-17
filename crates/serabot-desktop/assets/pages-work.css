@@ -1,1 +1,660 @@
 /* pages-work (0.53): page refinements for this area. Tokens only; reduced motion respected. */
+
+/* ===================== Tasks ===================== */
+
+.tasks-page .pane-body,
+.wf-page .pane-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.tasks-head-actions .tasks-view-seg .seg-btn {
+  min-width: 76px;
+  padding: 6px 14px;
+  font-size: var(--fs-body-2);
+}
+
+.tasks-hero {
+  margin-bottom: 0;
+  gap: 14px;
+}
+
+.tasks-progress-bar {
+  height: 6px;
+}
+
+.tasks-progress-fill {
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+}
+
+.tasks-stat-tiles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.tasks-tile {
+  min-width: 112px;
+  flex: 0 1 auto;
+}
+
+.tasks-tile.doing .stat-tile-value {
+  color: var(--accent-ink);
+}
+
+.tasks-tile.done .stat-tile-value {
+  color: var(--ok);
+}
+
+.tasks-tile.today .stat-tile-value {
+  color: var(--accent-2);
+}
+
+.tasks-tile.overdue {
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--glass-edge));
+}
+
+.tasks-tile.overdue .stat-tile-value {
+  color: var(--danger);
+}
+
+/* Sync bar: controls on the left, search takes the rest. */
+.tasks-sync-bar {
+  justify-content: flex-start;
+  box-shadow: var(--card-shadow);
+  border-radius: var(--card-radius);
+}
+
+.tasks-sync-bar .tasks-search {
+  flex: 1 1 200px;
+  margin-left: auto;
+  max-width: 320px;
+}
+
+.tasks-composer,
+.tasks-cal-sidebar {
+  border-radius: var(--card-radius);
+  box-shadow: var(--card-shadow);
+}
+
+.tasks-composer {
+  margin-bottom: 0;
+}
+
+.tasks-composer-row > .input:not(.tasks-due) {
+  flex: 1 1 auto;
+}
+
+.tasks-toolbar {
+  margin: 0;
+}
+
+.tasks-filters.seg {
+  display: inline-flex;
+  flex-wrap: nowrap;
+  gap: 2px;
+  padding: 2px;
+}
+
+.tasks-filters.seg .seg-btn {
+  flex: 0 0 auto;
+  padding: 5px 14px;
+}
+
+.tasks-section {
+  margin-bottom: 0;
+  gap: 8px;
+}
+
+.tasks-section-title {
+  font-size: var(--fs-body);
+  letter-spacing: -0.01em;
+}
+
+.tasks-list.card-grid {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+}
+
+.tasks-card,
+.tasks-kanban-card {
+  border-radius: var(--r-md);
+  box-shadow: var(--card-shadow);
+  transition: border-color var(--dur-1) var(--ease), box-shadow var(--dur-2) var(--ease),
+    transform var(--dur-2) var(--spring);
+}
+
+.tasks-card:hover,
+.tasks-kanban-card:hover {
+  border-color: var(--hairline-strong);
+  box-shadow: var(--card-shadow-lift);
+  transform: var(--lift);
+}
+
+/* The status button reads as a compact chip, not a raw grey box. */
+.tasks-card-check {
+  flex: 0 0 auto;
+  min-width: 56px;
+  padding: 3px 10px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  color: var(--label-2);
+  font: inherit;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  text-transform: capitalize;
+  transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease),
+    border-color var(--dur-1) var(--ease);
+}
+
+.tasks-card-check:hover {
+  border-color: var(--hairline-strong);
+  color: var(--label-1);
+}
+
+.tasks-card-check.doing {
+  background: var(--accent-soft);
+  border-color: transparent;
+  color: var(--accent-ink);
+}
+
+.tasks-card-check.done {
+  background: var(--ok-soft);
+  border-color: transparent;
+  color: var(--ok);
+}
+
+.tasks-card-check:focus-visible,
+.tasks-cal-cell:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.tasks-card-check.done ~ .tasks-card-body .tasks-card-title {
+  color: var(--label-2);
+  text-decoration: line-through;
+  text-decoration-color: var(--label-3);
+}
+
+.tasks-card-actions {
+  flex: 0 0 auto;
+  align-self: flex-start;
+  flex-wrap: nowrap;
+}
+
+.tasks-kanban-card .tasks-card-actions {
+  flex-wrap: wrap;
+}
+
+.tasks-kanban-move {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  justify-content: center;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--label-2);
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+
+.tasks-kanban-move:hover {
+  background: var(--surface-2);
+  color: var(--label-1);
+}
+
+/* Completed: a disclosure that rotates its chevron and fades its list in. */
+.tasks-done {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tasks-done > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  list-style: none;
+  cursor: pointer;
+  color: var(--label-1);
+  font-size: var(--fs-body);
+  font-weight: 600;
+}
+
+.tasks-done > summary::-webkit-details-marker {
+  display: none;
+}
+
+.tasks-done > summary svg {
+  color: var(--label-3);
+  transition: transform var(--dur-2) var(--spring);
+}
+
+.tasks-done[open] > summary svg {
+  transform: rotate(90deg);
+}
+
+.tasks-done > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--r-xs);
+}
+
+.tasks-done[open] > .tasks-list {
+  animation: tasks-fade var(--dur-3) var(--ease) both;
+}
+
+@keyframes tasks-fade {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Kanban */
+.tasks-kanban {
+  gap: 14px;
+  align-items: start;
+}
+
+.tasks-kanban-col {
+  border-radius: var(--card-radius);
+  min-height: 200px;
+  gap: 8px;
+}
+
+.tasks-kanban-head h3 {
+  margin: 0;
+  font-size: var(--fs-body);
+  font-weight: 650;
+}
+
+.kanban-count {
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  color: var(--label-2);
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
+}
+
+.kanban-empty {
+  margin: 0;
+  padding: 20px 8px;
+  border: 1px dashed var(--hairline-strong);
+  border-radius: var(--r-md);
+  color: var(--label-3);
+  font-size: var(--fs-caption);
+  text-align: center;
+}
+
+/* Calendar */
+.cal-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.cal-head strong {
+  min-width: 9ch;
+  font-size: var(--fs-title);
+  letter-spacing: -0.02em;
+}
+
+.tasks-cal-grid {
+  gap: 6px;
+}
+
+.tasks-cal-cell {
+  transition: border-color var(--dur-1) var(--ease), background var(--dur-1) var(--ease),
+    box-shadow var(--dur-2) var(--ease);
+}
+
+.tasks-cal-cell:not(.empty):hover {
+  border-color: var(--hairline-strong);
+  background: var(--surface-2);
+}
+
+.tasks-cal-cell.empty {
+  border-color: transparent;
+  background: transparent;
+  cursor: default;
+}
+
+.tasks-cal-cell.today .cal-day span:first-child {
+  color: var(--accent-2);
+  font-weight: 700;
+}
+
+.tasks-cal-dot.event {
+  background: var(--accent-2);
+}
+
+/* Task editor: fade the scrim, rise the dialog. */
+.tasks-editor-overlay {
+  animation: tasks-fade-in var(--dur-2) var(--ease) both;
+}
+
+.tasks-editor-modal {
+  animation: item-in var(--dur-3) var(--spring) both;
+}
+
+@keyframes tasks-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* Loading and empty */
+.tasks-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tasks-skeleton-row {
+  height: 64px;
+  border-radius: var(--r-md);
+}
+
+.tasks-empty,
+.logs-empty,
+.wf-empty {
+  border: 1px dashed var(--hairline-strong);
+  border-radius: var(--card-radius);
+  background: color-mix(in srgb, var(--surface-2) 40%, transparent);
+}
+
+.tasks-empty {
+  padding: 40px 24px;
+}
+
+/* ===================== Workflows ===================== */
+
+.wf-hero {
+  flex-wrap: nowrap;
+  align-items: flex-end;
+}
+
+.wf-hero-copy {
+  flex: 1 1 auto;
+  gap: 0;
+}
+
+.wf-head-actions {
+  flex: 0 0 auto;
+}
+
+.wf-hero-stats {
+  margin-top: 0;
+  gap: 10px;
+}
+
+.wf-hero-stats .stat-tile {
+  min-width: 132px;
+}
+
+.wf-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.wf-skeleton-tile {
+  width: 148px;
+  height: 62px;
+  border-radius: var(--r-md);
+}
+
+.wf-skeleton-canvas {
+  height: 150px;
+  border-radius: var(--card-radius);
+}
+
+.wf-skeleton-cards {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.wf-skeleton-card {
+  height: 92px;
+  border-radius: var(--r-md);
+}
+
+.wf-banner.err {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0;
+}
+
+.wf-canvas {
+  border-radius: var(--card-radius);
+  box-shadow: var(--card-shadow);
+}
+
+.wf-node {
+  transition: border-color var(--dur-1) var(--ease), box-shadow var(--dur-2) var(--ease),
+    transform var(--dur-2) var(--spring);
+}
+
+.wf-node:hover {
+  transform: var(--lift);
+}
+
+.wf-node:focus-visible,
+.wf-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.wf-toolbar {
+  margin-bottom: 0;
+}
+
+.wf-toolbar .seg {
+  flex: 0 0 auto;
+}
+
+.wf-toolbar .seg-btn {
+  padding: 5px 14px;
+}
+
+.wf-studio-grid {
+  gap: 20px;
+  align-items: start;
+}
+
+.wf-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.wf-section-head .wf-section-title {
+  margin: 0;
+  font-size: var(--fs-body);
+  letter-spacing: -0.01em;
+}
+
+.wf-section-count {
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  color: var(--label-2);
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
+}
+
+.wf-cards.card-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.wf-card {
+  border-radius: var(--card-radius);
+  box-shadow: var(--card-shadow);
+  transition: border-color var(--dur-1) var(--ease), box-shadow var(--dur-2) var(--ease),
+    transform var(--dur-2) var(--spring);
+}
+
+.wf-card:hover {
+  box-shadow: var(--card-shadow-lift);
+  transform: var(--lift);
+}
+
+.wf-card.selected {
+  box-shadow: var(--ring), var(--card-shadow);
+}
+
+.wf-editor {
+  animation: tasks-fade var(--dur-3) var(--ease) both;
+}
+
+.wf-empty {
+  padding: 24px 16px;
+}
+
+.wf-empty .empty-title {
+  margin: 0;
+  font-size: var(--fs-body);
+}
+
+.wf-empty .empty-text {
+  margin: 0;
+}
+
+.wf-form {
+  padding: 12px 14px;
+  border: 1px dashed var(--hairline-strong);
+  border-radius: var(--r-md);
+}
+
+/* ===================== Logs ===================== */
+
+.logs-toolbar {
+  gap: 8px;
+  padding-bottom: 12px;
+}
+
+/* The level filter hugs its labels instead of spreading across the width. */
+.logs-levels.seg {
+  flex: 0 0 auto;
+  display: inline-flex;
+}
+
+.logs-levels .seg-btn {
+  flex: 0 0 auto;
+  padding: 5px 12px;
+  text-transform: capitalize;
+}
+
+.logs-search {
+  flex: 1 1 220px;
+  min-width: 180px;
+}
+
+.logs-body {
+  border-radius: var(--card-radius);
+  box-shadow: var(--card-shadow);
+  padding: 8px 0;
+}
+
+.log-row {
+  padding: 5px 14px;
+  border-left: 2px solid transparent;
+  transition: background var(--dur-1) var(--ease);
+}
+
+.log-row.log-warn {
+  border-left-color: var(--warn);
+}
+
+.log-row.log-error {
+  border-left-color: var(--danger);
+  background: color-mix(in srgb, var(--danger-soft) 55%, transparent);
+}
+
+.logs-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px 14px;
+}
+
+.logs-skeleton-row {
+  height: 20px;
+  border-radius: var(--r-xs);
+}
+
+.logs-body > .logs-empty {
+  margin: 16px;
+}
+
+@media (max-width: 960px) {
+  .wf-skeleton-cards {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .wf-hero {
+    flex-wrap: wrap;
+  }
+}
+
+/* ===================== Reduced motion ===================== */
+
+@media (prefers-reduced-motion: reduce) {
+  .tasks-card:hover,
+  .tasks-kanban-card:hover,
+  .wf-card:hover,
+  .wf-node:hover {
+    transform: none;
+  }
+
+  .tasks-done[open] > .tasks-list,
+  .tasks-editor-overlay,
+  .tasks-editor-modal,
+  .wf-editor {
+    animation: none;
+  }
+
+  .tasks-done > summary svg,
+  .tasks-progress-fill {
+    transition: none;
+  }
+}
+
+.root[data-motion="reduce"] .tasks-card:hover,
+.root[data-motion="reduce"] .tasks-kanban-card:hover,
+.root[data-motion="reduce"] .wf-card:hover,
+.root[data-motion="reduce"] .wf-node:hover {
+  transform: none;
+}
+
+.root[data-motion="reduce"] .tasks-done[open] > .tasks-list,
+.root[data-motion="reduce"] .tasks-editor-overlay,
+.root[data-motion="reduce"] .tasks-editor-modal,
+.root[data-motion="reduce"] .wf-editor {
+  animation: none;
+}
+
+.root[data-motion="reduce"] .tasks-done > summary svg,
+.root[data-motion="reduce"] .tasks-progress-fill {
+  transition: none;
+}

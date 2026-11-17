@@ -97,5 +97,7 @@ OVH is read-only unless the owner explicitly authorizes an additive installation
 - `crates/serabot/src/wire/`, `route_chain.rs`, `thinking.rs` — Anthropic and Responses transports, bot route chain with failover and holds, thinking levels (0.49).
 - `crates/serabot/src/fleet_mutation.rs`, `tools_bots.rs` — the one path that changes a bot row, and `main`'s management tools (owner turns only; setters approval-gated, never widening) (0.50).
 - `crates/serabot/src/delegate.rs`, `runtime/auto_resume.rs`, `runtime/compaction.rs`, `runtime/activity.rs` — handoff ledger and resume, `waiting_model` parking, context compaction, orchestration event payloads (0.50).
+- `crates/serabot-desktop/assets/system.css` (shared cards, stat tiles, segmented controls, skeletons, list motion; loaded last) and `pages-work.css`, `pages-data.css`, `pages-connect.css` (per-area page polish) (0.53).
+- `crates/serabot/src/model_router.rs` `RouterHandle` — the live, swappable model router shared by the runtime and the delegation, team and bot tools; console provider saves rebuild it (0.53).
 - `crates/serabot-desktop/src/runs.rs`, `chat_compose.rs`, `chat_failure.rs`, `chat_cards.rs`, `ui/chat_feed_view.rs`, `assets/runs.css` — runs sidebar, composer queue, failed and wait cards, virtualized feed (0.50).
-- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.52.0.
+- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.53.0.

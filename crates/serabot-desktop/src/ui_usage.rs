@@ -539,7 +539,7 @@ fn DailyTaskQuotaCard(quota: serabot_desktop::UsageDailyTaskQuota) -> Element {
                 h3 { class: "card-title", "Daily task quota" }
                 LevelChip { level }
             }
-            div { class: "health-item",
+            div { class: "quota-body",
                 span { class: "usage-tile-label", "Tasks today (UTC)" }
                 span { class: "health-value",
                     "{group_digits(quota.used)} of {group_digits(quota.limit as i64)}"
@@ -661,10 +661,7 @@ fn ServerHealthCard(session: Signal<Session>) -> Element {
     rsx! {
         div { class: "card health-card",
             div { class: "card-head",
-                div {
-                    h3 { class: "card-title", "Your server" }
-                    p { class: "tiny", "Only you, the owner, see this." }
-                }
+                h3 { class: "card-title", "Your server" }
                 if loading {
                     span { class: "spinner", title: "Refreshing" }
                 }
@@ -714,7 +711,7 @@ fn ServerHealthCard(session: Signal<Session>) -> Element {
                     level: Level::from_percent(storage_pct, 90).flagged(),
                 }
             }
-            h4 { class: "health-heading", "Reliability" }
+            h4 { class: "health-heading", "Background jobs" }
             div { class: "health-summary",
                 HealthItem {
                     label: "Scheduler lag",
@@ -838,12 +835,12 @@ fn ThisPcCard(session: Signal<Session>) -> Element {
     let view = session.read().pc.view();
     let Some(quick) = view.quick else {
         return rsx! {
-            div { class: "card health-card",
-                div { class: "card-head",
-                    h3 { class: "card-title", "This PC" }
-                    span { class: "spinner", title: "Reading" }
+            div { class: "card health-card", "aria-busy": "true",
+                div { class: "health-summary",
+                    for n in 0..3 {
+                        div { key: "{n}", class: "skeleton usage-skeleton", " " }
+                    }
                 }
-                p { class: "caption", "Reading this computer…" }
             }
         };
     };
@@ -875,19 +872,6 @@ fn ThisPcCard(session: Signal<Session>) -> Element {
     let open_confirm = confirming();
     rsx! {
         div { class: "card health-card",
-            div { class: "card-head",
-                div {
-                    h3 { class: "card-title", "This PC" }
-                    p { class: "tiny", "What SeraBot uses on this computer." }
-                }
-                button {
-                    class: "btn ghost sm",
-                    r#type: "button",
-                    onclick: move |_| session.read().refresh_pc(),
-                    Icon { name: "refresh", size: 14 }
-                    "Refresh"
-                }
-            }
             div { class: "health-summary",
                 HealthItem {
                     label: "App memory",

@@ -84,7 +84,6 @@
   border-color: var(--glass-edge);
   background: var(--card-bg);
   box-shadow: var(--card-shadow);
-  font: inherit;
 }
 
 .mp-card.integration-card:hover {
@@ -509,4 +508,13 @@
 .root[data-motion="reduce"] .integration-card:hover .integration-card-cta {
   transition: none;
   transform: none;
+}
+
+.mp-sheet-body > p,
+.mp-sheet-body > ul {
+  margin: 0;
+}
+
+.mp-section-title + p.tiny {
+  margin: -8px 0 0;
 }

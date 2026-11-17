@@ -500,7 +500,9 @@ pub fn Mem0RecallCard(session: Signal<Session>) -> Element {
         }
         Mem0CardState::Available => {}
     }
-    let settings = settings.expect("Available state implies settings");
+    let Some(settings) = settings else {
+        return rsx! {};
+    };
     let configured = settings.mem0.configured;
     rsx! {
         div { class: "card",

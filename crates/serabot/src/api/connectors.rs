@@ -429,14 +429,17 @@ pub(super) fn live_provider_profile(state: &ApiState, id: &str) -> Result<Provid
 }
 
 /// Whether the console holds a newer copy of this provider than the one the
-/// model router was built from, so bots use the change only after a restart.
+/// live model router serves, so bots use the change only after a restart.
+/// A console save normally swaps the router at once; this stays true only
+/// when that rebuild was refused.
 pub(super) fn provider_pending_restart(state: &ApiState, id: &str) -> bool {
     let Some(saved) = state.admin.as_ref().and_then(|admin| admin.provider(id)) else {
         return false;
     };
-    match state.config.llm.providers.get(id) {
+    let router = state.runtime.router();
+    match router.provider_profile(id) {
         None => true,
-        Some(loaded) => serde_json::to_value(&saved).ok() != serde_json::to_value(loaded).ok(),
+        Some(served) => serde_json::to_value(&saved).ok() != serde_json::to_value(served).ok(),
     }
 }
 

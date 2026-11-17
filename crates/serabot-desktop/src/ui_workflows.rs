@@ -965,7 +965,7 @@ pub fn WorkflowsView(session: Signal<Session>) -> Element {
     let feed_url_ready = workflows::is_valid_feed_url(&new_feed_url.read());
 
     rsx! {
-        div { class: "pane",
+        div { class: "pane wf-page",
             div { class: "pane-head wf-hero",
                 div { class: "wf-hero-copy",
                     h1 { class: "pane-title", "Workflow Studio" }

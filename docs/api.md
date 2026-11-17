@@ -632,7 +632,7 @@ use yet (0.52), so a page can explain instead of hiding a button:
 |---|---|---|
 | `plan_signin` | `null`, `"off"`, `"admin_only"` | Why a plan sign-in (Claude, Codex, Copilot) is not offered: the operator set `plan_oauth = false`, or Claude's sign-in to a member. |
 | `signin_setup` | `null`, `"client_secret"` | What the server still lacks before the sign-in can finish: Antigravity's Google client secret. `signin/start` then answers `422 signin_not_set_up` before any browser opens. |
-| `pending_restart` | `true` / `false` | The console saved a newer copy of this provider than the one the model router was built from; bots use it after a restart (`POST /v1/admin/restart`). |
+| `pending_restart` | `true` / `false` | The console saved a newer copy of this provider than the one the live model router serves. Since 0.53 a console save or removal swaps the router at once (`POST /v1/admin/providers` and `DELETE .../{id}` answer `restart_required: false`); this is `true` only when that rebuild was refused, and a restart (`POST /v1/admin/restart`) applies it. |
 
 A console-saved provider's last saved profile decides its sign-in at once (for
 example turning Claude's plan sign-in back on by saving it again); the router

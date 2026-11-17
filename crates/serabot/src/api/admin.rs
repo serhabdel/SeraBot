@@ -126,16 +126,39 @@ pub(super) async fn admin_add_provider(
             },
         )
         .map_err(admin_error)?;
+    let applied = apply_provider_change(&state);
     audit_config(
         &state,
         &user.id,
         "config.provider_saved",
-        json!({"provider": request.id, "kind": kind, "catalog_fetch": catalog_fetch}),
+        json!({"provider": request.id, "kind": kind, "catalog_fetch": catalog_fetch, "applied": applied}),
     )?;
     Ok((
         StatusCode::CREATED,
-        Json(json!({"saved": true, "restart_required": true})),
+        Json(json!({"saved": true, "restart_required": !applied})),
     ))
+}
+
+/// Put a console provider change in front of the bots at once: rebuild the
+/// model router from the live provider list and swap it in. Returns whether
+/// it was applied; when the new list does not build (it is checked the same
+/// way as at startup), the running router stays and a restart applies the
+/// change, so a bad save never takes the working providers down.
+pub(super) fn apply_provider_change(state: &ApiState) -> bool {
+    let Some(admin) = state.admin.as_ref() else {
+        return false;
+    };
+    let llm = admin.live_llm(&state.config.llm);
+    match state.runtime.router().rebuilt(&llm) {
+        Ok(router) => {
+            state.runtime.replace_router(router);
+            true
+        }
+        Err(error) => {
+            tracing::warn!(%error, "provider change waits for a restart");
+            false
+        }
+    }
 }
 
 pub(super) async fn admin_remove_provider(
@@ -146,13 +169,14 @@ pub(super) async fn admin_remove_provider(
     require_admin(&user).map_err(admin_error)?;
     let admin = admin_store(&state)?;
     admin.remove_provider(&id).map_err(admin_error)?;
+    let applied = apply_provider_change(&state);
     audit_config(
         &state,
         &user.id,
         "config.provider_removed",
-        json!({"provider": id}),
+        json!({"provider": id, "applied": applied}),
     )?;
-    Ok(Json(json!({"removed": id, "restart_required": true})))
+    Ok(Json(json!({"removed": id, "restart_required": !applied})))
 }
 
 #[derive(Deserialize, Default)]
