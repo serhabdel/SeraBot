@@ -190,5 +190,9 @@ never merge without the owner's OK.
 - [x] Live Hub version (`client_version`, `AGY_VERSION`, updater, pin).
 - [x] One retry of plain `claude-opus-5-5` as `claude-opus-5-5-thinking` on 400/404.
 - [x] Configured Antigravity models join the verified live list.
+- [x] Idle read timeout for model calls (long thinking answers no longer cut at 120 s); 15-minute cap per call.
+- [x] Chat says why a model call failed (status and type, never the body) and when a parked turn resumes.
+- [x] No `anthropic-beta` header to Cloud Code.
 - [ ] Owner: sign in to Antigravity once from the desktop and send one chat (none claimed).
+- [ ] Owner decision: Claude Code through ACP on the desktop (`docs/specs/claude-code-acp.md`) for 0.54.
 - [ ] Owner: add the `SERABOT_AGY_CLIENT_SECRET` repository secret (or paste it on the AI providers page).
