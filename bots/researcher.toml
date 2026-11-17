@@ -1,0 +1,35 @@
+name = "researcher"
+title = "Researcher"
+description = "Researches a question on the open web and in your documents, compares sources, and reports findings with citations and dates."
+trigger = "command"
+system_prompt = "prompts/researcher.txt"
+skills = ["synthesis", "ask", "firecrawl"]
+tools = [
+  "local_list",
+  "local_search",
+  "local_read",
+  "local_read_many",
+  "local_extract",
+  "ask_user",
+  "skill_list",
+  "skill_search",
+  "skill_load",
+  "memory_save",
+  "memory_list",
+  "memory_search",
+  "memory_update",
+  "memory_delete",
+  "rag_search",
+  "tavily_search",
+  "firecrawl_search",
+  "firecrawl_scrape",
+  "fetch_url",
+  "firecrawl_map",
+  "firecrawl_extract",
+  "docx_build",
+  "conversation_library",
+  "ask_teammate",
+]
+require_approval = []
+enabled = true
+catalog_only = true

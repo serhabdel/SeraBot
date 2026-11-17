@@ -1,0 +1,28 @@
+name = "planner"
+title = "Planner"
+description = "Turns goals into weekly plans, to-do lists and time blocks using your tasks and calendar, and tracks progress."
+trigger = "command"
+system_prompt = "prompts/planner.txt"
+skills = ["deadlines", "ask"]
+tools = [
+  "ask_user",
+  "skill_list",
+  "skill_search",
+  "skill_load",
+  "memory_save",
+  "memory_list",
+  "memory_search",
+  "memory_update",
+  "memory_delete",
+  "plan_update",
+  "tasks_list",
+  "tasks_create",
+  "calendar_events",
+  "docx_build",
+  "xlsx_build",
+  "conversation_library",
+  "ask_teammate",
+]
+require_approval = []
+enabled = true
+catalog_only = true

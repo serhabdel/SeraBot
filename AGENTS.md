@@ -88,7 +88,7 @@ OVH is read-only unless the owner explicitly authorizes an additive installation
 - `crates/serabot/src/mcp_oauth.rs`, `marketplace_auth.rs`, `marketplace_suggest.rs`, `github_connector.rs` — MCP OAuth (discovery, CIMD/DCR, PKCE, revoke), per-member plugin accounts, the `suggest_marketplace_app` card, and the native GitHub device-flow connector (0.51).
 - `crates/serabot/src/auth_flows/codex.rs`, `copilot.rs` — ChatGPT (Codex) and GitHub Copilot plan sign-in, on by default with a risk banner, `plan_oauth = false` turns them off (0.51).
 - `plugins/` — catalog manifests: eight real remote hosts (schema v2, unverified until the owner runs them) and placeholder hosts (`*.example.invalid`) for the rest.
-- `bots/` + `prompts/` — default fleet templates, seeded per user.
+- `bots/` + `prompts/` — default fleet templates, seeded per user; `catalog_only = true` templates are only listed in the marketplace Bots tab until a member adds them (0.52).
 - `crates/serabot/src/logging.rs` — daily files (`[logging] dir`, default `data/logs`, owner-only), redacting ring buffer, shared `DEFAULT_FILTER`; noisy transport crates stay at `warn`.
 - `crates/serabot/src/vault.rs`, `vault_providers.rs`, `api/vault.rs`, `api/browser.rs` — per-user vault, password-manager CLIs (cleared child env, `Zeroizing`), and browser autofill (host-bound).
 - `crates/serabot/src/job_tools.rs`, `bots/jobfinder.toml` — `jobfinder` tools; task/calendar tools use the acting user's id.
@@ -98,4 +98,4 @@ OVH is read-only unless the owner explicitly authorizes an additive installation
 - `crates/serabot/src/fleet_mutation.rs`, `tools_bots.rs` — the one path that changes a bot row, and `main`'s management tools (owner turns only; setters approval-gated, never widening) (0.50).
 - `crates/serabot/src/delegate.rs`, `runtime/auto_resume.rs`, `runtime/compaction.rs`, `runtime/activity.rs` — handoff ledger and resume, `waiting_model` parking, context compaction, orchestration event payloads (0.50).
 - `crates/serabot-desktop/src/runs.rs`, `chat_compose.rs`, `chat_failure.rs`, `chat_cards.rs`, `ui/chat_feed_view.rs`, `assets/runs.css` — runs sidebar, composer queue, failed and wait cards, virtualized feed (0.50).
-- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.51.0.
+- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.52.0.

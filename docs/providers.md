@@ -271,5 +271,15 @@ plugin.
   only the legacy default key, and a plan token under the default row is refused.
 * The providers list carries a `signin_risk` text for the page to show as a
   banner beside the sign-in.
+* Since 0.52 the console saves an Anthropic provider with no API key while the
+  plan sign-in is on, so **Sign in with Claude** on the AI providers page works
+  in one press. Before, the save was refused ("secret anthropic_api_key is
+  empty") and the sign-in never opened.
+* A console-saved provider stored before 0.50.1 kept `plan_oauth = false`. The
+  card now says "Plan sign-in is turned off for this provider" and the admin's
+  **Turn on Claude sign-in** saves it again (a console save turns it on). A
+  provider set in `serabot.toml` keeps its own `plan_oauth` value.
+* Members see "Sign in with Claude is only for the server admin" with the
+  API-key path instead of a missing button (`plan_signin = "admin_only"`).
 
 None of this was run against a live account.

@@ -571,13 +571,14 @@ pub fn ShippedList(
                     bot.description.clone().unwrap_or_default(),
                     bot.installed,
                     bot.enabled,
+                    bot.catalog_only,
                 )
             })
             .collect::<Vec<_>>();
         let total = all_rows.len();
         let filtered = all_rows
             .into_iter()
-            .filter(|(_, name, _, role, desc, _, _)| {
+            .filter(|(_, name, _, role, desc, _, _, _)| {
                 needle.is_empty()
                     || name.to_ascii_lowercase().contains(&needle)
                     || role.to_ascii_lowercase().contains(&needle)
@@ -608,11 +609,16 @@ pub fn ShippedList(
             p { class: "hint", "No shipped bots match \"{query}\"." }
         }
         div { class: "roster",
-            for (id, name, letter, role, description, installed, enabled) in rows {
+            for (id, name, letter, role, description, installed, enabled, catalog_only) in rows {
                 div { key: "{id}", class: "roster-row",
                     span { class: "avatar lg bot", style: avatar_style(&id), "{letter}" }
                     span { class: "meet-copy",
-                        span { class: "thread-title", "{name}" }
+                        span { class: "thread-title",
+                            "{name}"
+                            if catalog_only && !installed {
+                                span { class: "chip accent meet-new", title: "Not on your team yet: add it here", "New" }
+                            }
+                        }
                         span { class: "thread-meta", "{role}" }
                         if !description.is_empty() {
                             span { class: "hint meet-desc", "{description}" }

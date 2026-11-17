@@ -2172,6 +2172,11 @@ pub struct BotConfig {
     pub fallbacks: Vec<BotRoute>,
     #[serde(default, skip_serializing_if = "FailoverPolicy::is_default")]
     pub failover: FailoverPolicy,
+    /// Shipped templates only: list the bot in the marketplace "Bots" tab but
+    /// do not insert it into fleets automatically. A member adds it with the
+    /// install route. Always false on a stored row.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub catalog_only: bool,
 }
 
 impl BotConfig {
@@ -2591,6 +2596,7 @@ pub fn build_specialist_bot(
         route: None,
         fallbacks: Vec::new(),
         failover: Default::default(),
+        catalog_only: false,
     };
     Ok(ScaffoldedSpecialist {
         id: id.to_owned(),
@@ -3411,6 +3417,7 @@ plan_oauth = false",
             route: None,
             fallbacks: Vec::new(),
             failover: Default::default(),
+            catalog_only: false,
         };
         let long_title = "t".repeat(MAX_BOT_TITLE_CHARS + 1);
         let long_description = "d".repeat(MAX_BOT_TEMPLATE_DESCRIPTION_CHARS + 1);
@@ -3698,6 +3705,7 @@ plan_oauth = false",
                 route: None,
                 fallbacks: Vec::new(),
                 failover: Default::default(),
+                catalog_only: false,
             },
             prompt: String::new(),
         };

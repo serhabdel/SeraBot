@@ -339,8 +339,10 @@ fn BotsTab(session: Signal<Session>, query: Signal<String>) -> Element {
         )
     };
     rsx! {
-        p { class: "hint", "{installed} of {total} built-in bots are on your team. Remove one and add it back here any time." }
-        crate::ui_bots::ShippedList { session, query: query(), overlay: None }
+        div { class: "mp-bots",
+            p { class: "hint", "{installed} of {total} bots are on your team. Add any of them; each one you add becomes your own, and you can remove it and add it back here any time." }
+            crate::ui_bots::ShippedList { session, query: query(), overlay: None }
+        }
     }
 }
 

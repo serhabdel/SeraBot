@@ -108,6 +108,7 @@ fn test_bot(name: &str, role: crate::orchestration::BotRole) -> LoadedBot {
             route: None,
             fallbacks: Vec::new(),
             failover: Default::default(),
+            catalog_only: false,
         },
         prompt: "test prompt".into(),
     }

@@ -464,3 +464,66 @@ async fn listings_show_the_plan_sign_in_and_its_risk_only_to_the_admin() {
     assert_eq!(flows["signin"], json!([]));
     assert!(flows["signin_risk"].is_null());
 }
+
+/// "Sign in with Claude" on a card that was never saved: the console posts the
+/// Anthropic preset with no key. The save must work with exactly that, the
+/// admin's sign-in must start at once, and the listing must say bots use the
+/// provider only after a restart.
+#[tokio::test]
+async fn a_console_saved_claude_provider_signs_in_without_a_key() {
+    let env = env().await;
+    let (status, saved) = call(
+        &env,
+        OWNER,
+        "POST",
+        "/v1/admin/providers",
+        Some(json!({
+            "id": "claude-console", "kind": "anthropic",
+            "base_url": "https://api.anthropic.com/v1",
+            "models": ["claude-sonnet-5-5"],
+            "api_key_secret": "claude_console_api_key", "catalog_fetch": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+    let (status, started) = call(
+        &env,
+        OWNER,
+        "POST",
+        "/v1/providers/claude-console/signin/start",
+        Some(json!({"flow": "pkce", "redirect_uri": REDIRECT})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    let (_, admin) = call(&env, OWNER, "GET", "/v1/providers", None).await;
+    let listed = provider(&admin, "claude-console");
+    assert_eq!(listed["signin"], json!(["pkce"]), "{listed}");
+    assert!(listed["plan_signin"].is_null(), "{listed}");
+    assert_eq!(listed["pending_restart"], true, "{listed}");
+    // A member sees why there is no sign-in button instead of nothing.
+    let (_, member) = call(&env, &env.alice, "GET", "/v1/providers", None).await;
+    let listed = provider(&member, "claude-console");
+    assert_eq!(listed["signin"], json!([]), "{listed}");
+    assert_eq!(listed["plan_signin"], "admin_only", "{listed}");
+}
+
+#[tokio::test]
+async fn the_accounts_listing_says_why_a_plan_sign_in_is_missing() {
+    let env = env().await;
+    let (_, off) = call(&env, OWNER, "GET", "/v1/providers/anthropic/accounts", None).await;
+    assert_eq!(off["plan_signin"], "off", "{off}");
+    assert_eq!(off["signin"], json!([]));
+    let (_, on) = call(&env, OWNER, "GET", "/v1/providers/claude/accounts", None).await;
+    assert!(on["plan_signin"].is_null(), "{on}");
+    assert!(on["signin_setup"].is_null(), "{on}");
+    assert_eq!(on["pending_restart"], false, "{on}");
+    let (_, member) = call(
+        &env,
+        &env.alice,
+        "GET",
+        "/v1/providers/claude/accounts",
+        None,
+    )
+    .await;
+    assert_eq!(member["plan_signin"], "admin_only", "{member}");
+}

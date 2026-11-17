@@ -34,6 +34,9 @@ struct ConvCardRow {
     id: String,
     title: String,
     subtitle: String,
+    /// The latest message ("You: ..." for the owner's), else the subtitle.
+    preview: String,
+    avatar: String,
     updated: String,
     updated_raw: String,
     kind_key: String,
@@ -53,6 +56,7 @@ pub(super) fn ConversationsView(session: Signal<Session>) -> Element {
     let mut search = use_signal(String::new);
     let mut kind_filter = use_signal(|| Option::<&'static str>::None);
     let mut auto_slug = use_signal(|| true);
+    let mut creating = use_signal(|| false);
 
     let kind = session.read().fleet.conv_kind;
     let current = session.read().conversation.clone();
@@ -84,7 +88,12 @@ pub(super) fn ConversationsView(session: Signal<Session>) -> Element {
                     id: conversation.id.clone(),
                     title: state.conversation_label(conversation),
                     subtitle: state.conversation_subtitle(conversation),
-                    updated: stamp(&conversation.updated_at),
+                    preview: state.conversation_list_subtitle(conversation),
+                    avatar: match conversation.id.strip_prefix("dir:") {
+                        Some(bot) => state.bot_avatar(bot),
+                        None => initial_of(&state.conversation_label(conversation)),
+                    },
+                    updated: msg_stamp(&conversation.updated_at),
                     updated_raw: conversation.updated_at.clone(),
                     kind_key: norm_kind,
                     kind_label,
@@ -134,6 +143,23 @@ pub(super) fn ConversationsView(session: Signal<Session>) -> Element {
     let total_count = items.len();
     let needle = search().trim().to_lowercase();
     let active_kind = kind_filter();
+    let kind_count = |key: Option<&str>| {
+        items
+            .iter()
+            .filter(|row| key.is_none_or(|k| row.kind_key == k))
+            .count()
+    };
+    let filter_chips: Vec<(Option<&'static str>, &'static str, usize)> = [
+        (None, "All"),
+        (Some("direct"), "Direct"),
+        (Some("room"), "Room"),
+        (Some("group"), "Group"),
+        (Some("section"), "Section"),
+    ]
+    .into_iter()
+    .map(|(key, label)| (key, label, kind_count(key)))
+    .filter(|(key, _, count)| key.is_none() || *count > 0 || active_kind == *key)
+    .collect();
     let filtered_items: Vec<ConvCardRow> = items
         .into_iter()
         .filter(|row| {
@@ -141,6 +167,7 @@ pub(super) fn ConversationsView(session: Signal<Session>) -> Element {
             let text_ok = needle.is_empty()
                 || row.title.to_lowercase().contains(&needle)
                 || row.subtitle.to_lowercase().contains(&needle)
+                || row.preview.to_lowercase().contains(&needle)
                 || row.id.to_lowercase().contains(&needle)
                 || row
                     .parent_label
@@ -158,19 +185,30 @@ pub(super) fn ConversationsView(session: Signal<Session>) -> Element {
         div { class: "pane",
             div { class: "pane-head",
                 div {
-                    h1 { class: "pane-title", "Conversations" }
-                    p { class: "muted", "Sections, groups, direct threads and rooms." }
+                    h1 { class: "pane-title", "All chats" }
+                    p { class: "muted", "Every conversation: direct chats, group chats, folders and sections." }
                 }
-                button {
-                    class: "btn ghost",
-                    r#type: "button",
-                    onclick: move |_| session.write().load_conversations(),
-                    Icon { name: "refresh", size: 14 }
-                    " Refresh"
+                div { class: "pane-head-actions",
+                    button {
+                        class: "btn ghost",
+                        r#type: "button",
+                        onclick: move |_| session.write().load_conversations(),
+                        Icon { name: "refresh", size: 14 }
+                        " Refresh"
+                    }
+                    button {
+                        class: "btn primary",
+                        r#type: "button",
+                        "aria-expanded": if creating() { "true" } else { "false" },
+                        onclick: move |_| creating.set(!creating()),
+                        Icon { name: if creating() { "x" } else { "plus" }, size: 14 }
+                        if creating() { " Close" } else { " New conversation" }
+                    }
                 }
             }
-            div { class: "pane-body",
-                div { class: "card",
+            div { class: "pane-body conv-body",
+                if creating() {
+                div { class: "card conv-new",
                     div { class: "card-head",
                         h3 { class: "card-title", "New conversation" }
                     }
@@ -215,6 +253,7 @@ pub(super) fn ConversationsView(session: Signal<Session>) -> Element {
                                         let title = session.read().fleet.conv_title.clone();
                                         let parent = session.read().fleet.conv_parent.trim().to_owned();
                                         auto_slug.set(true);
+                                        creating.set(false);
                                         session.write().create_conversation(
                                             kind,
                                             slug,
@@ -244,6 +283,7 @@ pub(super) fn ConversationsView(session: Signal<Session>) -> Element {
                                         let title = session.read().fleet.conv_title.clone();
                                         let parent = session.read().fleet.conv_parent.trim().to_owned();
                                         auto_slug.set(true);
+                                        creating.set(false);
                                         session.write().create_conversation(
                                             kind,
                                             slug,
@@ -285,6 +325,7 @@ pub(super) fn ConversationsView(session: Signal<Session>) -> Element {
                                 let title = session.read().fleet.conv_title.clone();
                                 let parent = session.read().fleet.conv_parent.trim().to_owned();
                                 auto_slug.set(true);
+                                creating.set(false);
                                 session.write().create_conversation(
                                     kind,
                                     slug,
@@ -296,36 +337,36 @@ pub(super) fn ConversationsView(session: Signal<Session>) -> Element {
                         }
                     }
                 }
+                }
                 if total_count > 0 {
-                    div { class: "approval-filter",
-                        input {
-                            class: "input",
-                            r#type: "search",
-                            "aria-label": "Search conversations",
-                            placeholder: "Search conversations by name, id, or parent\u{2026}",
-                            value: "{search}",
-                            oninput: move |event| search.set(event.value()),
-                            onkeydown: move |event: KeyboardEvent| {
-                                if event.key() == Key::Escape && !search.read().is_empty() {
-                                    event.prevent_default();
-                                    search.set(String::new());
-                                }
-                            },
+                    div { class: "conv-toolbar",
+                        div { class: "conv-search",
+                            span { class: "search-glyph", Icon { name: "search", size: 15 } }
+                            input {
+                                class: "input",
+                                r#type: "search",
+                                "aria-label": "Search conversations",
+                                placeholder: "Search by name, message, id or parent\u{2026}",
+                                value: "{search}",
+                                oninput: move |event| search.set(event.value()),
+                                onkeydown: move |event: KeyboardEvent| {
+                                    if event.key() == Key::Escape && !search.read().is_empty() {
+                                        event.prevent_default();
+                                        search.set(String::new());
+                                    }
+                                },
+                            }
                         }
-                        div { class: "row", role: "group", "aria-label": "Filter by kind",
-                            for (key, label) in [
-                                (None, "All"),
-                                (Some("direct"), "Direct"),
-                                (Some("room"), "Room"),
-                                (Some("group"), "Group"),
-                                (Some("section"), "Section"),
-                            ] {
+                        div { class: "conv-filter", role: "group", "aria-label": "Filter by kind",
+                            for (key, label, count) in filter_chips {
                                 button {
                                     key: "{label}",
-                                    class: if active_kind == key { "btn primary sm" } else { "btn ghost sm" },
+                                    class: if active_kind == key { "conv-chip active" } else { "conv-chip" },
                                     r#type: "button",
+                                    "aria-pressed": if active_kind == key { "true" } else { "false" },
                                     onclick: move |_| kind_filter.set(key),
                                     "{label}"
+                                    span { class: "conv-chip-count", "{count}" }
                                 }
                             }
                         }
@@ -370,61 +411,63 @@ pub(super) fn ConversationsView(session: Signal<Session>) -> Element {
                         }
                     }
                 }
-                div { class: "card-grid",
-                    for row in filtered_items {
-                        {
-                            let id = row.id;
-                            let title = row.title;
-                            let subtitle = row.subtitle;
-                            let updated = row.updated;
-                            let updated_raw = row.updated_raw;
-                            let is_confirming = archiving.as_deref() == Some(id.as_str());
-                            rsx! {
-                                div { class: "card", key: "{id}",
-                                    div { class: "card-head",
-                                        div {
-                                            div { class: "row",
-                                                h3 { class: "card-title", "{title}" }
-                                                span { class: "chip", "{row.kind_label}" }
-                                                if row.active {
-                                                    span { class: "chip accent", "Active" }
+                if !list_empty {
+                    div { class: "conv-list", role: "list", "aria-label": "Conversations",
+                        for row in filtered_items {
+                            {
+                                let id = row.id;
+                                let title = row.title;
+                                let preview = row.preview;
+                                let updated = row.updated;
+                                let updated_raw = row.updated_raw;
+                                let is_confirming = archiving.as_deref() == Some(id.as_str());
+                                let is_editing = editing.as_ref().is_some_and(|(edit_id, _)| edit_id == &id);
+                                let busy = is_confirming || is_editing;
+                                let tile = conversation_avatar_style(&id);
+                                let tile_class = if id.starts_with("room:") { "avatar bot group" } else { "avatar bot" };
+                                rsx! {
+                                    div {
+                                        class: match (row.active, busy) {
+                                            (true, true) => "conv-row active busy",
+                                            (true, false) => "conv-row active",
+                                            (false, true) => "conv-row busy",
+                                            (false, false) => "conv-row",
+                                        },
+                                        key: "{id}",
+                                        role: "listitem",
+                                        button {
+                                            class: "conv-main",
+                                            r#type: "button",
+                                            title: "Open {title}",
+                                            onclick: {
+                                                let id = id.clone();
+                                                move |_| session.write().open_conversation(id.clone())
+                                            },
+                                            span { class: "{tile_class}", style: "{tile}", "{row.avatar}" }
+                                            span { class: "conv-copy",
+                                                span { class: "conv-title-line",
+                                                    span { class: "conv-title", "{title}" }
+                                                    span { class: "conv-kind", "{row.kind_label}" }
+                                                    if let Some(parent_name) = row.parent_label.as_deref() {
+                                                        span { class: "conv-parent", "in {parent_name}" }
+                                                    }
+                                                    RunCountChips { running: row.runs.0, failed: row.runs.1 }
                                                 }
-                                                if row.unread > 0 {
-                                                    span { class: "chip accent", "{row.unread} unread" }
-                                                }
-                                                RunCountChips { running: row.runs.0, failed: row.runs.1 }
+                                                span { class: "conv-preview", "{preview}" }
                                             }
-                                            span { class: "card-sub", title: "{updated_raw}",
-                                                if let Some(parent_name) = row.parent_label.as_deref() {
-                                                    "In {parent_name} \u{00B7} {subtitle} \u{00B7} {updated}"
-                                                } else {
-                                                    "{subtitle} \u{00B7} {updated}"
+                                            span { class: "conv-side",
+                                                span { class: "conv-time", title: "{updated_raw}", "{updated}" }
+                                                if let Some(badge) = chat_feed::unread_badge(row.unread) {
+                                                    span {
+                                                        class: "unread-badge",
+                                                        role: "img",
+                                                        "aria-label": "{chat_feed::unread_label(row.unread)}",
+                                                        "{badge}"
+                                                    }
                                                 }
                                             }
                                         }
-                                        div { class: "card-actions",
-                                            button {
-                                                class: "btn ghost sm",
-                                                r#type: "button",
-                                                onclick: {
-                                                    let id = id.clone();
-                                                    move |_| session.write().open_conversation(id.clone())
-                                                },
-                                                "Open"
-                                            }
-                                            button {
-                                                class: "btn ghost sm",
-                                                r#type: "button",
-                                                onclick: {
-                                                    let id = id.clone();
-                                                    let title = title.clone();
-                                                    move |_| {
-                                                        confirm_archive.set(None);
-                                                        rename.set(Some((id.clone(), title.clone())));
-                                                    }
-                                                },
-                                                "Rename"
-                                            }
+                                        div { class: "conv-actions",
                                             if is_confirming {
                                                 div { class: "conv-confirm",
                                                     button {
@@ -448,7 +491,29 @@ pub(super) fn ConversationsView(session: Signal<Session>) -> Element {
                                                 }
                                             } else {
                                                 button {
-                                                    class: "btn danger sm",
+                                                    class: "btn ghost sm",
+                                                    r#type: "button",
+                                                    onclick: {
+                                                        let id = id.clone();
+                                                        move |_| session.write().open_conversation(id.clone())
+                                                    },
+                                                    "Open"
+                                                }
+                                                button {
+                                                    class: "btn ghost sm",
+                                                    r#type: "button",
+                                                    onclick: {
+                                                        let id = id.clone();
+                                                        let title = title.clone();
+                                                        move |_| {
+                                                            confirm_archive.set(None);
+                                                            rename.set(Some((id.clone(), title.clone())));
+                                                        }
+                                                    },
+                                                    "Rename"
+                                                }
+                                                button {
+                                                    class: "btn ghost sm danger-text",
                                                     r#type: "button",
                                                     onclick: {
                                                         let id = id.clone();
@@ -461,56 +526,57 @@ pub(super) fn ConversationsView(session: Signal<Session>) -> Element {
                                                 }
                                             }
                                         }
-                                    }
-                                    if let Some((edit_id, text)) = editing.clone() {
-                                        if edit_id == id {
-                                            div { class: "field-row",
-                                                input {
-                                                    class: "input",
-                                                    value: "{text}",
-                                                    oninput: move |event| {
-                                                        if let Some((_, text)) = rename.write().as_mut() {
-                                                            *text = event.value();
-                                                        }
-                                                    },
-                                                    onkeydown: {
-                                                        let id = id.clone();
-                                                        move |event: KeyboardEvent| {
-                                                            if event.is_composing() {
-                                                                return;
+                                        if let Some((edit_id, text)) = editing.clone() {
+                                            if edit_id == id {
+                                                div { class: "field-row conv-rename",
+                                                    input {
+                                                        class: "input",
+                                                        "aria-label": "Conversation name",
+                                                        value: "{text}",
+                                                        oninput: move |event| {
+                                                            if let Some((_, text)) = rename.write().as_mut() {
+                                                                *text = event.value();
                                                             }
-                                                            if event.key() == Key::Enter {
-                                                                event.prevent_default();
-                                                                if let Some((_, new_title)) = rename() {
-                                                                    session.write().rename_conversation(id.clone(), new_title);
+                                                        },
+                                                        onkeydown: {
+                                                            let id = id.clone();
+                                                            move |event: KeyboardEvent| {
+                                                                if event.is_composing() {
+                                                                    return;
+                                                                }
+                                                                if event.key() == Key::Enter {
+                                                                    event.prevent_default();
+                                                                    if let Some((_, new_title)) = rename() {
+                                                                        session.write().rename_conversation(id.clone(), new_title);
+                                                                        rename.set(None);
+                                                                    }
+                                                                } else if event.key() == Key::Escape {
+                                                                    event.prevent_default();
                                                                     rename.set(None);
                                                                 }
-                                                            } else if event.key() == Key::Escape {
-                                                                event.prevent_default();
-                                                                rename.set(None);
                                                             }
-                                                        }
-                                                    },
-                                                }
-                                                button {
-                                                    class: "btn primary sm",
-                                                    r#type: "button",
-                                                    onclick: {
-                                                        let id = id.clone();
-                                                        move |_| {
-                                                            if let Some((_, title)) = rename() {
-                                                                session.write().rename_conversation(id.clone(), title);
-                                                                rename.set(None);
+                                                        },
+                                                    }
+                                                    button {
+                                                        class: "btn primary sm",
+                                                        r#type: "button",
+                                                        onclick: {
+                                                            let id = id.clone();
+                                                            move |_| {
+                                                                if let Some((_, title)) = rename() {
+                                                                    session.write().rename_conversation(id.clone(), title);
+                                                                    rename.set(None);
+                                                                }
                                                             }
-                                                        }
-                                                    },
-                                                    "Save"
-                                                }
-                                                button {
-                                                    class: "btn ghost sm",
-                                                    r#type: "button",
-                                                    onclick: move |_| rename.set(None),
-                                                    "Cancel"
+                                                        },
+                                                        "Save"
+                                                    }
+                                                    button {
+                                                        class: "btn ghost sm",
+                                                        r#type: "button",
+                                                        onclick: move |_| rename.set(None),
+                                                        "Cancel"
+                                                    }
                                                 }
                                             }
                                         }

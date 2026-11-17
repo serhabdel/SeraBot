@@ -123,6 +123,11 @@ mod tests {
                 continue;
             }
             let stem = path.file_stem().and_then(|value| value.to_str()).unwrap();
+            // Opt-in marketplace bots (`catalog_only`) may use the letter tile.
+            let raw = std::fs::read_to_string(&path).expect("bot template");
+            if raw.lines().any(|line| line.trim() == "catalog_only = true") {
+                continue;
+            }
             assert!(
                 default_avatar(stem).is_some(),
                 "{stem} has no default avatar"

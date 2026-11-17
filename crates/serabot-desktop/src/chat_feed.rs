@@ -265,6 +265,41 @@ const JOBFINDER_SUGGESTIONS: &[&str] = &[
     "Tailor my CV for this job description",
     "Draft a concise cover letter and application checklist",
 ];
+const RESEARCHER_SUGGESTIONS: &[&str] = &[
+    "Research the pros and cons of this approach, with sources",
+    "Compare three public sources on this topic and note where they disagree",
+    "Fact-check these claims and cite what you find",
+];
+const WRITER_SUGGESTIONS: &[&str] = &[
+    "Draft a 600-word article from this outline",
+    "Edit this text for clarity and keep my voice",
+    "Proofread this letter and list what you changed",
+];
+const TRANSLATOR_SUGGESTIONS: &[&str] = &[
+    "Translate this text into French and keep the tone",
+    "Translate this document and build a glossary of key terms",
+    "Rewrite this translation in a more formal register",
+];
+const PLANNER_SUGGESTIONS: &[&str] = &[
+    "Plan my week from my tasks and calendar",
+    "Break this goal into next actions with time estimates",
+    "Review what is overdue and propose a catch-up plan",
+];
+const SUPPORT_SUGGESTIONS: &[&str] = &[
+    "Draft a calm reply to this customer complaint",
+    "Write FAQ answers from our policy document",
+    "Suggest the next step for this support request",
+];
+const PRODUCT_SUGGESTIONS: &[&str] = &[
+    "Write a PRD from these notes",
+    "Turn this feature idea into user stories with acceptance criteria",
+    "Draft customer-facing release notes from this change list",
+];
+const TUTOR_SUGGESTIONS: &[&str] = &[
+    "Explain this concept step by step with an example",
+    "Quiz me on this chapter, one question at a time",
+    "Build a two-week study plan for this topic",
+];
 const GENERAL_SUGGESTIONS: &[&str] = &[
     "Summarize the attached file",
     "Help me plan the next step",
@@ -289,6 +324,13 @@ pub fn suggestions(bot_id: Option<&str>) -> &'static [&'static str] {
         Some("inbox") => INBOX_SUGGESTIONS,
         Some("whatsapp") => WHATSAPP_SUGGESTIONS,
         Some("jobfinder") => JOBFINDER_SUGGESTIONS,
+        Some("researcher") => RESEARCHER_SUGGESTIONS,
+        Some("writer") => WRITER_SUGGESTIONS,
+        Some("translator") => TRANSLATOR_SUGGESTIONS,
+        Some("planner") => PLANNER_SUGGESTIONS,
+        Some("support") => SUPPORT_SUGGESTIONS,
+        Some("product") => PRODUCT_SUGGESTIONS,
+        Some("tutor") => TUTOR_SUGGESTIONS,
         _ => GENERAL_SUGGESTIONS,
     }
 }

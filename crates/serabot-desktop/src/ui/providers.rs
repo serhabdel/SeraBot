@@ -1,8 +1,8 @@
 use super::*;
 use crate::ui_widgets::StatusChip;
-use serabot_desktop::provider_accounts as accounts;
-use serabot_desktop::provider_presets::{DirectoryFilter, filter_presets, provider_matches_preset};
-use serabot_desktop::theme::Tone;
+use serabot_desktop::ProviderStatus;
+use serabot_desktop::provider_accounts::{self as accounts, SigninBlocker};
+use serabot_desktop::provider_presets::{ProviderPreset, provider_matches_preset};
 
 /// The "Add provider" sheet.
 ///
@@ -94,7 +94,7 @@ pub(super) fn AddProviderSheet(session: Signal<Session>, overlay: Signal<Overlay
             class: "sheet open",
             role: "dialog",
             "aria-modal": "true",
-            "aria-label": "Add provider",
+            "aria-label": "Add or configure a provider",
             tabindex: "0",
             onkeydown: move |event: KeyboardEvent| {
                 if event.key() == Key::Escape {
@@ -103,7 +103,7 @@ pub(super) fn AddProviderSheet(session: Signal<Session>, overlay: Signal<Overlay
                 }
             },
             div { class: "sheet-head",
-                h2 { class: "sheet-title", "Add provider" }
+                h2 { class: "sheet-title", if existing_ids.iter().any(|existing| existing == id.trim()) { "Configure provider" } else { "Add provider" } }
                 button {
                     class: "icon-btn escape-close",
                     r#type: "button",
@@ -411,51 +411,550 @@ pub(super) fn AddProviderSheet(session: Signal<Session>, overlay: Signal<Overlay
     }
 }
 
-/// Fill the Add provider draft from a preset, or from the provider already
-/// saved for it.
-fn fill_provider_draft(
-    s: &mut Session,
-    preset: &provider_presets::ProviderPreset,
-    existing: Option<&serabot_desktop::ProviderStatus>,
-) {
-    if let Some(cur) = existing {
-        s.provider.id = cur.id.clone();
-        s.provider.kind = cur.kind.clone();
-        s.provider.base_url = preset.base_url.to_owned();
-        s.provider.secret_name = cur
-            .secrets
-            .values()
-            .find_map(|secret| secret.name.clone())
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| preset.secret_name.to_owned());
-        s.provider.models = cur.models.join(", ");
-        s.provider.catalog_fetch = cur.catalog_fetch;
-        s.provider.auth = cur.auth.clone();
-    } else {
-        s.provider.id = preset.default_id.to_owned();
-        s.provider.kind = preset.kind.to_owned();
-        s.provider.base_url = preset.base_url.to_owned();
-        s.provider.secret_name = preset.secret_name.to_owned();
-        s.provider.models = preset.models.join(", ");
-        s.provider.catalog_fetch = preset.catalog_fetch;
-        s.provider.auth = preset.auth.to_owned();
-    }
-    s.provider.api_key.clear();
-    s.provider.oauth_client_secret.clear();
-    s.admin_error = None;
+/// Whether a provider works for the signed-in member right now.
+fn usable(provider: &ProviderStatus) -> bool {
+    provider_view::provider_usable(
+        provider,
+        provider_signed_in(&provider.kind, &provider.secrets),
+    )
 }
 
+/// Open the Add provider sheet on a fresh draft (a custom endpoint).
+fn open_custom(mut session: Signal<Session>, mut overlay: Signal<Overlay>) {
+    let mut s = session.write();
+    s.provider = Default::default();
+    s.admin_error = None;
+    drop(s);
+    overlay.set(Overlay::AddProvider);
+}
+
+/// The AI providers page: the providers this server offers (each with the
+/// member's own accounts), then, for the admin, the providers that can still
+/// be added: sign-in first, then API keys.
 #[component]
 pub(super) fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
+    let mut query = use_signal(String::new);
+    let (providers, loaded, can_write, is_admin) = {
+        let s = session.read();
+        (
+            s.state.providers.clone(),
+            s.state.providers_loaded,
+            s.can_admin(),
+            s.is_admin(),
+        )
+    };
+    let order = provider_view::card_order(&providers, usable);
+    let usable_count = providers.iter().filter(|provider| usable(provider)).count();
+    let (sign_in_presets, key_presets) = provider_view::presets_to_add(&providers, &query());
+    let searching = !query().trim().is_empty();
+    let nothing_to_add = sign_in_presets.is_empty() && key_presets.is_empty();
+    rsx! {
+        div { class: "pane providers-page",
+            div { class: "pane-head providers-head",
+                div { class: "providers-intro",
+                    h1 { class: "pane-title", "AI providers" }
+                    p { class: "muted",
+                        "Connect the models your bots use. Sign in with a plan you already have, or add an API key. Every account is yours alone and stays encrypted."
+                    }
+                }
+                div { class: "row providers-head-actions",
+                    button {
+                        class: "btn ghost",
+                        r#type: "button",
+                        title: "Ask every provider for its current model list",
+                        disabled: !can_write,
+                        // Reloads the provider list once the catalogs are in.
+                        onclick: move |_| session.write().fetch_models(),
+                        Icon { name: "refresh", size: 15 }
+                        "Refresh models"
+                    }
+                    if is_admin {
+                        button {
+                            class: "btn primary",
+                            r#type: "button",
+                            onclick: move |_| open_custom(session, overlay),
+                            Icon { name: "plus", size: 15 }
+                            "Custom provider"
+                        }
+                    }
+                }
+            }
+            div { class: "pane-body providers-body",
+                section { class: "prov-default", "aria-label": "Default model",
+                    div { class: "prov-default-copy",
+                        span { class: "prov-eyebrow", "Default for new chats" }
+                        span { class: "tiny", "Applies from the next message. A running reply keeps the route it started with." }
+                    }
+                    div { class: "prov-default-picker", ModelBar { session } }
+                }
+                if !loaded {
+                    div { class: "prov-grid", role: "status", "aria-busy": "true",
+                        div { class: "prov-card skeleton-card",
+                            div { class: "skeleton title" }
+                            div { class: "skeleton block" }
+                        }
+                        div { class: "prov-card skeleton-card",
+                            div { class: "skeleton title" }
+                            div { class: "skeleton block" }
+                        }
+                    }
+                } else if providers.is_empty() {
+                    div { class: "empty prov-empty",
+                        div { class: "empty-icon", Icon { name: "providers", size: 20 } }
+                        h2 { class: "empty-title", "No AI providers yet" }
+                        p { class: "empty-text",
+                            if is_admin {
+                                "Sign in with Claude, ChatGPT, Google Antigravity or GitHub Copilot below, or add an API key, so your bots can answer."
+                            } else {
+                                "Your admin has not added a provider yet. Ask them to add one, then sign in or add your key here."
+                            }
+                        }
+                    }
+                } else {
+                    section { class: "prov-section", "aria-labelledby": "prov-yours",
+                        div { class: "prov-section-head",
+                            h2 { id: "prov-yours", class: "prov-section-title", "Your providers" }
+                            span { class: "prov-count", "{usable_count} of {providers.len()} ready" }
+                        }
+                        div { class: "prov-grid",
+                            for index in order {
+                                ProviderCard {
+                                    key: "{providers[index].id}",
+                                    session,
+                                    overlay,
+                                    provider: providers[index].clone(),
+                                }
+                            }
+                        }
+                    }
+                }
+                if is_admin && loaded {
+                    section { class: "prov-section prov-add", "aria-labelledby": "prov-add-title",
+                        div { class: "prov-section-head",
+                            div {
+                                h2 { id: "prov-add-title", class: "prov-section-title", "Add a provider" }
+                                p { class: "tiny", "Members sign in or add their own keys once a provider is here." }
+                            }
+                            div { class: "search-wrap prov-search",
+                                span { class: "search-glyph", Icon { name: "search", size: 14 } }
+                                input {
+                                    class: "input",
+                                    r#type: "search",
+                                    placeholder: "Search providers or models",
+                                    "aria-label": "Search providers to add",
+                                    value: "{query}",
+                                    oninput: move |event| query.set(event.value()),
+                                    onkeydown: move |event: KeyboardEvent| {
+                                        if event.key() == Key::Escape && !query.read().is_empty() {
+                                            event.prevent_default();
+                                            query.set(String::new());
+                                        }
+                                    },
+                                }
+                            }
+                        }
+                        if !sign_in_presets.is_empty() {
+                            h3 { class: "prov-sub-title",
+                                Icon { name: "external", size: 13 }
+                                "Sign in with an account"
+                            }
+                            div { class: "prov-plan-grid",
+                                for preset in sign_in_presets {
+                                    PlanTile { key: "{preset.id}", session, overlay, preset: *preset }
+                                }
+                            }
+                        }
+                        if !key_presets.is_empty() {
+                            h3 { class: "prov-sub-title",
+                                Icon { name: "lock", size: 13 }
+                                "Use an API key"
+                            }
+                            div { class: "prov-key-grid",
+                                for preset in key_presets {
+                                    KeyTile { key: "{preset.id}", session, overlay, preset: *preset }
+                                }
+                            }
+                        }
+                        if searching && nothing_to_add {
+                            div { class: "empty compact",
+                                p { class: "empty-text", "No provider matches \"{query}\"." }
+                                button {
+                                    class: "btn ghost sm",
+                                    r#type: "button",
+                                    onclick: move |_| query.set(String::new()),
+                                    "Clear search"
+                                }
+                            }
+                        }
+                    }
+                }
+                UsageCard { session }
+            }
+        }
+    }
+}
+
+/// One provider the server offers, with the member's accounts on it.
+#[component]
+fn ProviderCard(
+    session: Signal<Session>,
+    overlay: Signal<Overlay>,
+    provider: ProviderStatus,
+) -> Element {
+    let mut confirm = use_signal(|| false);
+    let (can_write, is_admin, testing, test_outcome) = {
+        let s = session.read();
+        (
+            s.can_admin(),
+            s.is_admin(),
+            s.provider_testing.as_deref() == Some(provider.id.as_str()),
+            s.state
+                .provider_tests
+                .get(&provider.id)
+                .map(provider_view::format_provider_test),
+        )
+    };
+    let signed_in = provider_signed_in(&provider.kind, &provider.secrets);
+    let conn = provider_view::connection(&provider, signed_in);
+    let preset = provider_view::preset_of(&provider).copied();
+    let brand = if branding::brand_label(&provider.id).is_some() {
+        provider.id.clone()
+    } else {
+        preset
+            .map(|p| p.id.to_owned())
+            .unwrap_or_else(|| provider.kind.clone())
+    };
+    let title = provider_view::card_title(&provider, branding::brand_label(&provider.kind));
+    let kind_label = provider_view::human_kind(&provider.kind).to_owned();
+    let model_line = provider_view::model_line(&provider);
+    let shown: Vec<String> = provider.models.iter().take(4).cloned().collect();
+    let extra = provider.models.len().saturating_sub(shown.len());
+    let star_model = provider
+        .default_model
+        .clone()
+        .or_else(|| provider.models.first().cloned());
+    let key_url = preset.map(|p| p.key_url).filter(|url| !url.is_empty());
+    let blocker = accounts::signin_blocker(&provider, is_admin);
+    let id = provider.id.clone();
+    let class = match (provider.is_default, conn.is_connected()) {
+        (true, _) => "prov-card is-default",
+        (false, true) => "prov-card is-ready",
+        (false, false) => "prov-card",
+    };
+    rsx! {
+        article { class: "{class}", "aria-label": "{title}",
+            header { class: "prov-card-head",
+                BrandLogo { brand, size: 36 }
+                div { class: "prov-card-title",
+                    div { class: "prov-card-name",
+                        h3 { "{title}" }
+                        if provider.is_default {
+                            span { class: "prov-badge accent",
+                                Icon { name: "star", size: 11 }
+                                "Default"
+                            }
+                        }
+                    }
+                    span { class: "prov-card-sub",
+                        if title != kind_label && !title.contains(&kind_label) {
+                            "{kind_label} · "
+                        }
+                        "{model_line}"
+                    }
+                }
+                StatusChip { tone: conn.tone(), text: conn.label().to_owned() }
+            }
+            if !shown.is_empty() {
+                div { class: "prov-models", "aria-label": "Models",
+                    for model in shown {
+                        span { class: "prov-model", "{model}" }
+                    }
+                    if extra > 0 {
+                        span { class: "prov-model more", "+{extra}" }
+                    }
+                }
+            }
+            if !provider.data_egress_approved {
+                div { class: "prov-note warn", role: "note",
+                    Icon { name: "alert", size: 14 }
+                    span { "Data egress is not approved for this provider, so bots do not send it anything yet." }
+                }
+            }
+            if let Some(blocker) = blocker {
+                SigninNotice { session, provider_id: id.clone(), blocker }
+            }
+            if provider.pending_restart {
+                div { class: "prov-note info", role: "status",
+                    Icon { name: "refresh", size: 14 }
+                    if is_admin {
+                        span { class: "grow", "Saved. Restart the server so your bots can use it." }
+                        button {
+                            class: "btn primary sm",
+                            r#type: "button",
+                            disabled: !can_write,
+                            onclick: move |_| session.write().request_restart(),
+                            "Restart server"
+                        }
+                    } else {
+                        span { "Your bots can use it once the admin restarts the server." }
+                    }
+                }
+            }
+            if let Some((tone, text)) = test_outcome {
+                div { class: "provider-test-line", role: "status",
+                    StatusChip { tone, text }
+                }
+            }
+            AccountsBlock { session, provider_id: id.clone(), overlay }
+            footer { class: "prov-card-foot",
+                if !provider.is_default && conn.is_connected() && star_model.is_some() {
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        title: "Use this provider for new chats",
+                        disabled: !can_write,
+                        onclick: {
+                            let id = id.clone();
+                            let model = star_model.clone().unwrap_or_default();
+                            move |_| session.write().set_default_provider(id.clone(), model.clone())
+                        },
+                        Icon { name: "star", size: 14 }
+                        "Make default"
+                    }
+                }
+                if provider.accounts.is_empty() && conn.is_connected() {
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        title: "Ask the provider for its model list with the saved key",
+                        disabled: !can_write || testing,
+                        onclick: {
+                            let id = id.clone();
+                            move |_| session.write().test_provider(id.clone())
+                        },
+                        Icon { name: "refresh", size: 14 }
+                        if testing { "Testing\u{2026}" } else { "Test" }
+                    }
+                }
+                if let Some(url) = key_url {
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        title: "Open the provider's site to create a key",
+                        onclick: move |_| session.write().open_in_browser(url.to_owned()),
+                        Icon { name: "external", size: 14 }
+                        "Get a key"
+                    }
+                }
+                span { class: "grow" }
+                if provider.managed && is_admin {
+                    if confirm() {
+                        div { class: "prov-confirm", role: "alertdialog", "aria-label": "Confirm removing provider",
+                            span { class: "tiny", "Remove {title} for everyone? Chats pinned to it pick another route." }
+                            button {
+                                class: "btn danger sm",
+                                r#type: "button",
+                                disabled: !can_write,
+                                onclick: {
+                                    let id = id.clone();
+                                    move |_| {
+                                        session.write().remove_provider(id.clone());
+                                        confirm.set(false);
+                                    }
+                                },
+                                "Remove"
+                            }
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                onclick: move |_| confirm.set(false),
+                                "Cancel"
+                            }
+                        }
+                    } else {
+                        button {
+                            class: "btn ghost sm prov-remove",
+                            r#type: "button",
+                            title: "Remove this provider from the server",
+                            onclick: move |_| confirm.set(true),
+                            Icon { name: "trash", size: 14 }
+                            "Remove"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Why a provider's sign-in cannot start, and the fix when the viewer can make
+/// it: the Antigravity client secret field, or turning a plan sign-in back on.
+#[component]
+fn SigninNotice(session: Signal<Session>, provider_id: String, blocker: SigninBlocker) -> Element {
+    let mut secret = use_signal(String::new);
+    let can_write = session.read().can_admin();
+    let fix = blocker.fix_label();
+    let tone = if fix.is_some() {
+        "prov-note action"
+    } else {
+        "prov-note warn"
+    };
+    rsx! {
+        div { class: "{tone}", role: "note",
+            Icon { name: "alert", size: 14 }
+            div { class: "prov-note-body",
+                span { "{blocker.message()}" }
+                match (blocker, fix) {
+                    (SigninBlocker::ClientSecret { can_fix: true }, Some(label)) => rsx! {
+                        div { class: "prov-secret-row",
+                            input {
+                                class: "input",
+                                r#type: "password",
+                                autocomplete: "off",
+                                spellcheck: false,
+                                placeholder: "Google client secret",
+                                "aria-label": "Google Antigravity client secret",
+                                value: "{secret}",
+                                oninput: move |event| secret.set(event.value()),
+                            }
+                            button {
+                                class: "btn primary sm",
+                                r#type: "button",
+                                disabled: !can_write || secret().trim().is_empty(),
+                                onclick: {
+                                    let id = provider_id.clone();
+                                    move |_| {
+                                        let value = std::mem::take(&mut *secret.write());
+                                        session.write().resave_provider(&id, Some(value));
+                                    }
+                                },
+                                "{label}"
+                            }
+                        }
+                        span { class: "tiny", "Stored encrypted on the server and never shown again. It is the public secret of Google's Antigravity desktop client." }
+                    },
+                    (_, Some(label)) => rsx! {
+                        div {
+                            button {
+                                class: "btn primary sm",
+                                r#type: "button",
+                                disabled: !can_write,
+                                onclick: {
+                                    let id = provider_id.clone();
+                                    move |_| session.write().resave_provider(&id, None)
+                                },
+                                "{label}"
+                            }
+                        }
+                    },
+                    _ => rsx! {},
+                }
+            }
+        }
+    }
+}
+
+/// A provider the admin can add by signing in (Claude, ChatGPT, Antigravity,
+/// Copilot, Muse, OpenRouter). One press saves it and opens the sign-in.
+#[component]
+fn PlanTile(session: Signal<Session>, overlay: Signal<Overlay>, preset: ProviderPreset) -> Element {
     let mut overlay = overlay;
-    let mut dir_query = use_signal(String::new);
-    let mut dir_filter = use_signal(DirectoryFilter::default);
-    let providers = session.read().state.providers.clone();
-    let provider_tests = session.read().state.provider_tests.clone();
-    let loaded = session.read().state.providers_loaded;
-    let can_save = session.read().can_admin();
+    let can_write = session.read().can_admin();
+    let takes_key = preset.auth == "api_key";
+    let button_label = match preset.kind {
+        "anthropic" => "Sign in with Claude",
+        "openai-codex" => "Sign in with ChatGPT",
+        "google-antigravity" => "Sign in with Google",
+        "github-copilot" => "Sign in with GitHub",
+        _ => "Sign in",
+    };
+    let how = match preset.sign_in {
+        "device" => "One-time code",
+        _ => "Browser sign-in",
+    };
+    rsx! {
+        article { class: "prov-plan", "aria-label": "{preset.label}",
+            div { class: "prov-plan-head",
+                BrandLogo { brand: preset.id.to_owned(), size: 32 }
+                div { class: "prov-plan-title",
+                    h4 { "{preset.label}" }
+                    span { class: "tiny", "{how}" if takes_key { " or API key" } }
+                }
+            }
+            p { class: "prov-plan-text", "{preset.note}" }
+            if !preset.risk.is_empty() {
+                p { class: "prov-plan-risk", title: "{preset.risk}",
+                    Icon { name: "alert", size: 12 }
+                    "Uses the vendor's own app sign-in"
+                }
+            }
+            div { class: "prov-plan-actions",
+                button {
+                    class: "btn primary sm",
+                    r#type: "button",
+                    disabled: !can_write,
+                    onclick: move |_| {
+                        let mut s = session.write();
+                        s.fill_provider_draft(&preset, None);
+                        // Saves the provider, then opens its sign-in at once.
+                        s.save_provider();
+                    },
+                    Icon { name: "external", size: 13 }
+                    "{button_label}"
+                }
+                if takes_key {
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        onclick: move |_| {
+                            session.write().fill_provider_draft(&preset, None);
+                            overlay.set(Overlay::AddProvider);
+                        },
+                        "Add a key"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A provider the admin can add with an API key (or a local server, or a
+/// custom endpoint): opens the Add provider sheet filled from the preset.
+#[component]
+fn KeyTile(session: Signal<Session>, overlay: Signal<Overlay>, preset: ProviderPreset) -> Element {
+    let mut overlay = overlay;
+    let label = match preset.auth {
+        "none" => "Set up",
+        _ if preset.id == "custom" => "Configure",
+        _ => "Add key",
+    };
+    rsx! {
+        button {
+            class: "prov-key",
+            r#type: "button",
+            title: "{preset.subtitle}",
+            onclick: move |_| {
+                if preset.id == "custom" {
+                    open_custom(session, overlay);
+                } else {
+                    session.write().fill_provider_draft(&preset, None);
+                    overlay.set(Overlay::AddProvider);
+                }
+            },
+            BrandLogo { brand: preset.id.to_owned(), size: 26 }
+            span { class: "prov-key-copy",
+                span { class: "prov-key-name", "{preset.label}" }
+                span { class: "prov-key-sub", "{preset.note}" }
+            }
+            span { class: "prov-key-cta", "{label}" }
+        }
+    }
+}
+
+/// The member's recent token use, folded away until asked for.
+#[component]
+fn UsageCard(session: Signal<Session>) -> Element {
     let usage = session.read().state.usage.clone();
-    // Per-day rows preformatted: (day label, "N tokens · M calls").
     let usage_days: Vec<(String, String)> = usage
         .as_ref()
         .map(|report| {
@@ -465,15 +964,18 @@ pub(super) fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) 
                 .take(14)
                 .map(|bucket| {
                     (
-                        bucket.day.clone().unwrap_or_else(|| "—".to_owned()),
-                        format!("{} tokens · {} calls", bucket.total_tokens, bucket.calls),
+                        bucket.day.clone().unwrap_or_else(|| "\u{2014}".to_owned()),
+                        format!(
+                            "{} tokens \u{b7} {} calls",
+                            bucket.total_tokens, bucket.calls
+                        ),
                     )
                 })
                 .collect()
         })
         .unwrap_or_default();
-    let usage_card = rsx! {
-        details { class: "card advanced",
+    rsx! {
+        details { class: "card advanced prov-usage",
             summary { "Recent token usage" }
             div { class: "advanced-body",
                 div { class: "card-actions",
@@ -484,7 +986,7 @@ pub(super) fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) 
                         "Load last 7 days"
                     }
                 }
-                if let Some(report) = usage.clone() {
+                if let Some(report) = usage {
                     div { class: "kv-row",
                         span { class: "kv-key", "Calls" }
                         span { class: "kv-val", "{report.totals.calls}" }
@@ -504,7 +1006,7 @@ pub(super) fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) 
                     if report.per_day.is_empty() {
                         p { class: "caption", "No calls in this window." }
                     }
-                    for (day, summary) in usage_days.clone() {
+                    for (day, summary) in usage_days {
                         div { class: "kv-row",
                             span { class: "kv-key", "{day}" }
                             span { class: "kv-val", "{summary}" }
@@ -512,421 +1014,6 @@ pub(super) fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) 
                     }
                 } else {
                     p { class: "caption", "No usage report loaded yet. Load the last 7 days to see calls and tokens." }
-                }
-            }
-        }
-    };
-    let provider_cards: Vec<serabot_desktop::ProviderStatus> = providers.clone();
-    let mut confirm = use_signal(|| Option::<String>::None);
-    let preset_is_connected = |preset: &provider_presets::ProviderPreset| {
-        providers.iter().any(|p| {
-            provider_matches_preset(&p.id, &p.kind, preset)
-                && (p.credential.configured
-                    || p.accounts
-                        .iter()
-                        .any(|a| serabot_desktop::provider_accounts::state_of(a).usable())
-                    || (p.auth == "oauth" && p.secrets.values().any(|s| s.configured)))
-        })
-    };
-    let filtered_presets = filter_presets(&dir_query(), dir_filter(), preset_is_connected);
-    let dir_filtering = !dir_query().trim().is_empty() || dir_filter() != DirectoryFilter::All;
-    rsx! {
-        div { class: "pane",
-            div { class: "pane-head",
-                div {
-                    h1 { class: "pane-title", "Providers" }
-                    p { class: "muted", "Add a provider, sign in with one or more accounts, and pick the route per conversation or per bot." }
-                }
-                div { class: "row",
-                    button {
-                        class: "btn primary",
-                        r#type: "button",
-                        onclick: move |_| {
-                            let mut s = session.write();
-                            s.provider = Default::default();
-                            s.admin_error = None;
-                            drop(s);
-                            overlay.set(Overlay::AddProvider);
-                        },
-                        Icon { name: "plus", size: 16 }
-                        "Add provider"
-                    }
-                    button {
-                        class: "btn ghost",
-                        r#type: "button",
-                        onclick: move |_| session.write().fetch_models(),
-                        "Fetch models"
-                    }
-                    button {
-                        class: "btn ghost",
-                        r#type: "button",
-                        onclick: move |_| session.write().refresh_providers(),
-                        "Refresh"
-                    }
-                }
-            }
-            div { class: "pane-body",
-                div { class: "card",
-                    ModelBar { session }
-                    p { class: "tiny", "Applies to the next turn; a running turn keeps its pinned route." }
-                }
-                if !loaded {
-                    div { class: "card", role: "status", "aria-busy": "true",
-                        div { class: "skeleton title" }
-                        div { class: "skeleton block" }
-                    }
-                }
-                if loaded && provider_cards.is_empty() {
-                    div { class: "empty",
-                        div { class: "empty-icon", Icon { name: "providers", size: 20 } }
-                        h2 { class: "empty-title", "No AI providers yet" }
-                        p { class: "empty-text", "Add a provider and an API key so your bots can answer." }
-                        button {
-                            class: "btn primary",
-                            r#type: "button",
-                            onclick: move |_| {
-                                let mut s = session.write();
-                                s.provider = Default::default();
-                                s.admin_error = None;
-                                drop(s);
-                                overlay.set(Overlay::AddProvider);
-                            },
-                            Icon { name: "plus", size: 16 }
-                            "Add provider"
-                        }
-                    }
-                }
-                div { class: "card-grid provider-grid",
-                    for provider in provider_cards {
-                        {
-                            let provider_id = provider.id.clone();
-                            let signed_in = provider_signed_in(&provider.kind, &provider.secrets);
-                            let conn = provider_view::connection(&provider, signed_in);
-                            let preset = provider_presets::presets()
-                                .iter()
-                                .find(|preset| preset.id == provider.id)
-                                .or_else(|| {
-                                    provider_presets::presets().iter().find(|preset| {
-                                        preset.kind == provider.kind && preset.kind != "openai-compatible"
-                                    })
-                                })
-                                .copied();
-                            let brand = if branding::brand_label(&provider.id).is_some() {
-                                provider.id.clone()
-                            } else {
-                                provider.kind.clone()
-                            };
-                            let title = provider_view::display_name(
-                                &provider.id,
-                                &provider.kind,
-                                branding::brand_label(&provider.kind),
-                            );
-                            let key_url = preset.map(|p| p.key_url).filter(|url| !url.is_empty());
-                            let testing = session.read().provider_testing.as_deref() == Some(provider.id.as_str());
-                            let test_outcome = provider_tests.get(&provider.id).map(provider_view::format_provider_test);
-                            let has_accounts = !provider.accounts.is_empty();
-                            let model_line = provider_view::model_line(&provider);
-                            let shown: Vec<String> = provider.models.iter().take(6).cloned().collect();
-                            let extra = provider.models.len().saturating_sub(shown.len());
-                            let star_model = provider
-                                .default_model
-                                .clone()
-                                .or_else(|| provider.models.first().cloned());
-                            let is_default = provider.is_default;
-                            let managed = provider.managed;
-                            let routing = provider.routing_classes.join(", ");
-                            let egress = provider.data_egress_approved;
-                            let kind_label = provider_view::human_kind(&provider.kind);
-                            let sub = if provider.id == provider.kind || provider.id == "default" {
-                                kind_label.to_owned()
-                            } else {
-                                format!("{} ({kind_label})", provider.id)
-                            };
-                            rsx! {
-                                div { class: if is_default { "card provider-card is-default" } else { "card provider-card" }, key: "{provider_id}",
-                                    div { class: "card-head",
-                                        div { class: "provider-card-head",
-                                            BrandLogo { brand: brand.clone(), size: 36 }
-                                            div { class: "provider-card-title",
-                                                h3 { class: "card-title", "{title}" }
-                                                span { class: "card-sub provider-card-sub", "{sub}" }
-                                            }
-                                        }
-                                        if is_default {
-                                            span { class: "chip accent default-badge",
-                                                Icon { name: "star", size: 12 }
-                                                "Default"
-                                            }
-                                        }
-                                    }
-                                    div { class: "chips provider-card-badges",
-                                        StatusChip { tone: conn.tone(), text: conn.label().to_owned() }
-                                        if managed {
-                                            span { class: "chip accent", "Custom" }
-                                        }
-                                        if !egress {
-                                            StatusChip { tone: Tone::Warn, text: "Data egress off".to_owned() }
-                                        }
-                                    }
-                                    p { class: "tiny", "{model_line}" }
-                                    if let Some((test_tone, test_text)) = test_outcome {
-                                        div { class: "provider-test-line", role: "status",
-                                            StatusChip { tone: test_tone, text: test_text }
-                                        }
-                                    }
-                                    div { class: "chips",
-                                        for model in shown {
-                                            span { class: "chip", "{model}" }
-                                        }
-                                        if extra > 0 {
-                                            span { class: "chip muted", "+{extra} more" }
-                                        }
-                                    }
-                                    if !routing.is_empty() {
-                                        p { class: "tiny", "Used for: {routing}" }
-                                    }
-                                    AccountsBlock { session, provider_id: provider_id.clone(), overlay }
-                                    div { class: "card-actions",
-                                        if let Some(url) = key_url {
-                                            button {
-                                                class: "btn ghost sm",
-                                                r#type: "button",
-                                                title: "Open the provider's site to create a key",
-                                                onclick: move |_| session.write().open_in_browser(url.to_owned()),
-                                                Icon { name: "external", size: 14 }
-                                                "Get a key"
-                                            }
-                                        }
-                                        if !has_accounts {
-                                            button {
-                                                class: "btn ghost sm",
-                                                r#type: "button",
-                                                title: "Ask the provider for its model list with the saved key",
-                                                disabled: !can_save || testing || !conn.is_connected(),
-                                                onclick: {
-                                                    let id = provider.id.clone();
-                                                    move |_| session.write().test_provider(id.clone())
-                                                },
-                                                Icon { name: "refresh", size: 14 }
-                                                if testing { "Testing…" } else { "Test" }
-                                            }
-                                        }
-                                        if !is_default && conn.is_connected() && star_model.is_some() {
-                                            button {
-                                                class: "btn ghost sm",
-                                                r#type: "button",
-                                                title: "Use this provider for new chats",
-                                                disabled: !can_save,
-                                                onclick: {
-                                                    let id = provider.id.clone();
-                                                    let model = star_model.clone().unwrap_or_default();
-                                                    move |_| session.write().set_default_provider(id.clone(), model.clone())
-                                                },
-                                                Icon { name: "star", size: 14 }
-                                                "Set as default"
-                                            }
-                                        }
-                                    }
-                                    if managed {
-                                        if confirm() == Some(provider_id.clone()) {
-                                            div { class: "mp-confirm", role: "alertdialog", "aria-label": "Confirm removing provider",
-                                                span { class: "tiny", "Remove {provider_id}? Conversations pinned to it must pick another route." }
-                                                button {
-                                                    class: "btn danger sm",
-                                                    r#type: "button",
-                                                    disabled: !can_save,
-                                                    onclick: {
-                                                        let id = provider_id.clone();
-                                                        move |_| {
-                                                            session.write().remove_provider(id.clone());
-                                                            confirm.set(None);
-                                                        }
-                                                    },
-                                                    "Remove"
-                                                }
-                                                button {
-                                                    class: "btn ghost sm",
-                                                    r#type: "button",
-                                                    onclick: move |_| confirm.set(None),
-                                                    "Cancel"
-                                                }
-                                            }
-                                        } else {
-                                            button {
-                                                class: "btn ghost sm",
-                                                r#type: "button",
-                                                onclick: {
-                                                    let id = provider_id.clone();
-                                                    move |_| confirm.set(Some(id.clone()))
-                                                },
-                                                "Remove provider"
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                {usage_card}
-                div { class: "card",
-                    div { class: "card-head",
-                        div {
-                            h3 { class: "card-title", "Provider Directory" }
-                            p { class: "muted", "Supported model providers and gateways. Connect a preset or customize endpoints." }
-                        }
-                    }
-                    div { class: "provider-dir-toolbar",
-                        div { class: "search-wrap",
-                            input {
-                                class: "input mp-search",
-                                r#type: "search",
-                                placeholder: "Search providers or models",
-                                "aria-label": "Search provider directory",
-                                value: "{dir_query}",
-                                oninput: move |event| dir_query.set(event.value()),
-                                onkeydown: move |event: KeyboardEvent| {
-                                    if event.key() == Key::Escape && !dir_query.read().is_empty() {
-                                        event.prevent_default();
-                                        dir_query.set(String::new());
-                                    }
-                                },
-                            }
-                            if !dir_query().trim().is_empty() {
-                                button {
-                                    class: "btn ghost sm",
-                                    r#type: "button",
-                                    onclick: move |_| dir_query.set(String::new()),
-                                    "Clear"
-                                }
-                            }
-                        }
-                        div { class: "seg", role: "group", "aria-label": "Filter providers",
-                            for filter_opt in DirectoryFilter::ALL {
-                                button {
-                                    key: "{filter_opt.label()}",
-                                    r#type: "button",
-                                    class: if dir_filter() == filter_opt { "seg-btn active" } else { "seg-btn" },
-                                    "aria-pressed": if dir_filter() == filter_opt { "true" } else { "false" },
-                                    onclick: move |_| dir_filter.set(filter_opt),
-                                    "{filter_opt.label()}"
-                                }
-                            }
-                        }
-                    }
-                    if filtered_presets.is_empty() {
-                        div { class: "empty compact",
-                            h4 { class: "empty-title", "No matching providers" }
-                            p { class: "empty-text", "Try clearing your search or switching the filter." }
-                            if dir_filtering {
-                                button {
-                                    class: "btn ghost sm",
-                                    r#type: "button",
-                                    onclick: move |_| {
-                                        dir_query.set(String::new());
-                                        dir_filter.set(DirectoryFilter::All);
-                                    },
-                                    "Clear filters"
-                                }
-                            }
-                        }
-                    } else {
-                        div { class: "integration-grid",
-                            for preset in filtered_presets {
-                                {
-                                    let existing = providers
-                                        .iter()
-                                        .find(|p| provider_matches_preset(&p.id, &p.kind, preset))
-                                        .cloned();
-                                    let is_connected = existing.as_ref().is_some_and(|p| {
-                                        p.credential.configured
-                                            || p.accounts.iter().any(|a| {
-                                                serabot_desktop::provider_accounts::state_of(a).usable()
-                                            })
-                                            || (p.auth == "oauth" && p.secrets.values().any(|s| s.configured))
-                                    });
-                                    let offers_sign_in = accounts::directory_offers_sign_in(existing.as_ref(), preset);
-                                    let takes_key = preset.auth == "api_key";
-                                    let has_accounts = existing.as_ref().is_some_and(|p| !p.accounts.is_empty());
-                                    rsx! {
-                                        div { class: "integration-card", key: "{preset.id}",
-                                            div {
-                                                div { class: "card-head",
-                                                    div { class: "provider-card-head",
-                                                        BrandLogo { brand: preset.id.to_owned(), size: 30 }
-                                                        div { class: "provider-card-title",
-                                                            h4 { class: "card-title", "{preset.label}" }
-                                                            span { class: "card-sub provider-card-sub",
-                                                                "{provider_view::human_kind(preset.kind)}"
-                                                            }
-                                                        }
-                                                    }
-                                                    span { class: "chip accent", "{preset.badge}" }
-                                                }
-                                                p { class: "tiny", "{preset.subtitle}" }
-                                                div { class: "chips",
-                                                    for model in preset.models.iter().take(3) {
-                                                        span { class: "chip", "{model}" }
-                                                    }
-                                                    if preset.models.len() > 3 {
-                                                        span { class: "chip muted", "+{preset.models.len() - 3} more" }
-                                                    }
-                                                }
-                                            }
-                                            div { class: "card-actions",
-                                                StatusChip {
-                                                    tone: if is_connected { Tone::Ok } else { Tone::Muted },
-                                                    text: if is_connected { "Connected".to_owned() } else { "Not connected".to_owned() },
-                                                }
-                                                if offers_sign_in {
-                                                    button {
-                                                        class: if is_connected || takes_key { "btn ghost sm" } else { "btn primary sm" },
-                                                        r#type: "button",
-                                                        title: "Sign in with your browser",
-                                                        disabled: !can_save,
-                                                        onclick: {
-                                                            let preset = *preset;
-                                                            let existing = existing.clone();
-                                                            move |_| {
-                                                                let mut s = session.write();
-                                                                s.admin_error = None;
-                                                                if let Some(cur) = existing.as_ref() {
-                                                                    s.sign_in_now(&cur.id);
-                                                                } else {
-                                                                    // No card yet: save the profile and sign in, in one press.
-                                                                    fill_provider_draft(&mut s, &preset, None);
-                                                                    s.save_provider();
-                                                                }
-                                                            }
-                                                        },
-                                                        Icon { name: "external", size: 14 }
-                                                        if has_accounts { "Add account" } else { "Sign in" }
-                                                    }
-                                                }
-                                                if takes_key || is_connected {
-                                                    button {
-                                                        class: if is_connected { "btn ghost sm" } else { "btn primary sm" },
-                                                        r#type: "button",
-                                                        onclick: {
-                                                            let preset = *preset;
-                                                            let existing = existing.clone();
-                                                            move |_| {
-                                                                let mut s = session.write();
-                                                                fill_provider_draft(&mut s, &preset, existing.as_ref());
-                                                                drop(s);
-                                                                overlay.set(Overlay::AddProvider);
-                                                            }
-                                                        },
-                                                        if is_connected { "Configure" } else { "Connect with a key" }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
             }
         }

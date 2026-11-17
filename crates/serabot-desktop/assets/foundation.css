@@ -284,10 +284,10 @@
   display: inline-flex;
 }
 
-/* Composer size (PR-F): about three lines at rest, growing to 40% of the
-   window, 70% when expanded. */
+/* Composer size: one line at rest, growing to 40% of the window, 70% when
+   expanded. */
 .composer .composer-input {
-  min-height: 72px;
+  min-height: 28px;
   max-height: 40vh;
 }
 
@@ -428,7 +428,7 @@
   flex: 0 0 auto;
   width: 100%;
   min-width: 0;
-  min-height: 72px;
+  min-height: 28px;
   max-height: 40vh;
   padding: 2px 0;
   border: 0;
@@ -1404,4 +1404,962 @@ details.step-more[open] > summary.step-more-summary::before {
   color: #fff;
   border-color: var(--danger);
   opacity: 1;
+}
+
+/* =========================================================================
+   Chat redesign (0.52): letter tiles, sidebar rows, topbar, transcript,
+   composer and the All chats list. Everything below consumes tokens; this
+   block loads after app.css, so it wins at equal specificity.
+   ========================================================================= */
+
+:root,
+:root:has(.root[data-theme="light"]),
+[data-theme="light"] {
+  /* Letter tile: hue at low alpha for the fill, the same hue in a readable
+     shade for the letter. Only the hue comes from the row. */
+  --tile-fill-sat: 62%;
+  --tile-fill-l: 46%;
+  --tile-fill-a: 0.15;
+  --tile-ink-sat: 58%;
+  --tile-ink-l: 32%;
+  --tile-edge-a: 0.22;
+  --list-w: 268px;
+}
+
+:root:has(.root[data-theme="dark"]),
+[data-theme="dark"] {
+  --tile-fill-sat: 72%;
+  --tile-fill-l: 62%;
+  --tile-fill-a: 0.2;
+  --tile-ink-sat: 86%;
+  --tile-ink-l: 80%;
+  --tile-edge-a: 0.3;
+}
+
+.avatar:not(.user):not([style*="--avatar-img"]) {
+  background-color: hsl(var(--avatar-hue, 210) var(--tile-fill-sat) var(--tile-fill-l) / var(--tile-fill-a));
+  background-image: none;
+  color: hsl(var(--avatar-hue, 210) var(--tile-ink-sat) var(--tile-ink-l));
+  box-shadow: inset 0 0 0 1px hsl(var(--avatar-hue, 210) var(--tile-fill-sat) var(--tile-fill-l) / var(--tile-edge-a));
+  font-weight: 650;
+}
+
+/* Tiles that are pictures keep a hairline rim and nothing else. */
+.avatar[style*="--avatar-img"] {
+  box-shadow: inset 0 0 0 1px var(--hairline);
+}
+
+/* ------------------------------------------------------------- sidebar --- */
+
+.sidebar {
+  padding: 12px 8px 8px;
+  gap: 8px;
+}
+
+.sidebar .sidebar-search .input {
+  min-height: 34px;
+  padding-left: 32px;
+  border-radius: var(--r-sm);
+  border-color: transparent;
+  background: var(--hover);
+  font-size: 13px;
+}
+
+.sidebar .sidebar-search .input:hover {
+  background: var(--active);
+  border-color: transparent;
+}
+
+.sidebar .sidebar-search .input:focus {
+  background: var(--surface);
+  border-color: var(--accent);
+  box-shadow: var(--ring);
+}
+
+.thread-list {
+  gap: 1px;
+  padding-right: 0;
+}
+
+/* Group headers: small calm section labels with a muted count. */
+.thread-group {
+  min-height: 24px;
+  margin-top: 14px;
+  padding: 4px 8px;
+  gap: 6px;
+  border-radius: var(--r-xs);
+  color: var(--label-3);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  text-align: left;
+}
+
+.thread-list > .thread-group:first-child {
+  margin-top: 2px;
+}
+
+.thread-group:hover {
+  color: var(--label-1);
+}
+
+.thread-group .thread-title {
+  flex: 1;
+  min-width: 0;
+  color: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+}
+
+.thread-group > svg {
+  flex: none;
+  opacity: 0.8;
+}
+
+.thread-count {
+  flex: none;
+  min-width: 18px;
+  padding: 1px 6px;
+  border-radius: var(--r-pill);
+  background: var(--hover);
+  color: var(--label-3);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0;
+  line-height: 1.4;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Rows: 48px, a 32px tile with a 10px radius, a clear hover, an accent-soft
+   active state with a thin indicator. */
+.thread {
+  min-height: 48px;
+  padding: 6px 8px;
+  padding-left: calc(8px + var(--depth, 0) * 12px);
+  gap: 8px;
+  border-radius: 10px;
+}
+
+.thread .avatar,
+.thread .avatar-wrap {
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  font-size: 13px;
+}
+
+.thread .avatar-wrap .avatar {
+  width: 100%;
+  height: 100%;
+}
+
+.thread-main.thread-bot {
+  gap: 10px;
+  border-radius: 8px;
+}
+
+.thread-main:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.thread-title {
+  font-size: 13.5px;
+  font-weight: 560;
+  line-height: 1.3;
+}
+
+.thread-meta {
+  font-size: 12px;
+  line-height: 1.3;
+  color: var(--label-3);
+}
+
+.thread.active {
+  background: var(--accent-soft);
+}
+
+.thread.active::before {
+  display: block;
+  left: 0;
+  top: 12px;
+  bottom: 12px;
+  width: 3px;
+}
+
+.thread.active .thread-title {
+  font-weight: 650;
+}
+
+.thread.active .thread-meta {
+  color: var(--label-2);
+}
+
+.thread .unread-badge {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.thread .bot-chat-count {
+  height: 16px;
+  min-width: 16px;
+  padding: 0 4px;
+  font-size: 10.5px;
+  background: var(--hover);
+  color: var(--label-3);
+}
+
+.thread:has(> .row-more) > .thread-main {
+  padding-right: 0;
+}
+
+.thread.active:has(> .row-more) > .thread-main {
+  padding-right: 26px;
+}
+
+/* Row actions: only on hover, keyboard focus, the active row or an open
+   menu. They sit over the end of the row on a solid chip. */
+.thread .row-more,
+.thread .row-new {
+  right: 6px;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--surface-2);
+  box-shadow: 0 0 0 1px var(--hairline);
+  color: var(--label-2);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--dur-1) var(--ease), background var(--dur-1) var(--ease);
+}
+
+.thread .row-new {
+  right: 34px;
+}
+
+.thread:hover .row-more,
+.thread:focus-within .row-more,
+.thread.active .row-more,
+.thread .row-more[aria-expanded="true"],
+.thread:hover .row-new,
+.thread:focus-within .row-new {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.thread .row-more:hover,
+.thread .row-new:hover,
+.thread .row-more[aria-expanded="true"] {
+  background: var(--active);
+  color: var(--label-1);
+}
+
+.thread .row-new:disabled {
+  opacity: 0.35;
+}
+
+/* The unread pill steps aside for the row actions. */
+.thread:hover .unread-badge,
+.thread:focus-within .unread-badge {
+  visibility: hidden;
+}
+
+/* "Add more bots": the quiet last row of the Bots group. */
+.thread-add {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 34px;
+  padding: 4px 8px;
+  border: 0;
+  border-radius: 10px;
+  background: var(--clear);
+  color: var(--label-3);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+
+.thread-add-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 32px;
+}
+
+.thread-add:hover {
+  background: var(--hover);
+  color: var(--label-1);
+}
+
+.thread-add:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.skeleton.row {
+  height: 48px;
+}
+
+/* -------------------------------------------------------------- topbar --- */
+
+.topbar.chat-header {
+  gap: 12px;
+  min-height: 56px;
+  padding: 9px 16px;
+}
+
+.chat-header .avatar,
+.chat-header .avatar-wrap {
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+}
+
+.chat-header .avatar-wrap .avatar {
+  width: 100%;
+  height: 100%;
+}
+
+.chat-header .avatar-stack .avatar {
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
+}
+
+/* The name takes whatever the actions leave; it only truncates when the
+   window is genuinely out of room. */
+.chat-header .chat-header-copy {
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 1px;
+}
+
+.chat-header-copy > strong,
+.chat-header-copy .chat-switcher-btn strong {
+  font-size: 15px;
+  font-weight: 650;
+  line-height: 1.3;
+}
+
+.chat-header-copy .chat-switcher {
+  max-width: 100%;
+  min-width: 0;
+}
+
+.chat-header-copy .chat-switcher-count {
+  color: var(--accent-ink);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.chat-header .chat-header-copy > .topbar-sub {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.3;
+  color: var(--label-3);
+}
+
+.chat-header .chat-header-copy > .topbar-status {
+  color: var(--label-2);
+}
+
+.status-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: var(--r-pill);
+  background: var(--ok);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .status-dot {
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+}
+
+.root[data-motion="reduce"] .status-dot {
+  animation: none;
+}
+
+.chat-header .chat-header-actions {
+  flex: 0 0 auto;
+  gap: 2px;
+}
+
+.chat-header .chat-header-actions .icon-btn,
+.chat-header .chat-header-actions .btn.sm {
+  width: auto;
+  min-width: 32px;
+  height: 32px;
+  min-height: 32px;
+  padding: 0 7px;
+  border-radius: 9px;
+  border-color: transparent;
+  background: var(--clear);
+  color: var(--label-2);
+  box-shadow: none;
+}
+
+.chat-header .chat-header-actions .icon-btn {
+  width: 32px;
+  padding: 0;
+}
+
+.chat-header .chat-header-actions .icon-btn:hover,
+.chat-header .chat-header-actions .btn.sm:hover {
+  background: var(--hover);
+  color: var(--label-1);
+}
+
+.chat-header .chat-header-actions .icon-btn[aria-pressed="true"],
+.chat-header .chat-header-actions .btn.sm.active,
+.chat-header .chat-header-actions .btn.sm[aria-pressed="true"] {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+
+/* Labels only where they carry state: Auto-approve says so when it is on. */
+.chat-header .chat-header-actions .btn-label {
+  display: none;
+}
+
+.chat-header .chat-header-actions .yolo-btn.active .btn-label {
+  display: inline;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.chat-header .pill {
+  flex: none;
+}
+
+/* ---------------------------------------------------------- transcript --- */
+
+.messages {
+  gap: 4px;
+  padding: 12px 18px 16px;
+}
+
+.msg {
+  position: relative;
+  gap: 10px;
+}
+
+.msg.speaker-change {
+  margin-top: 16px;
+}
+
+.msg.speaker-change:first-child {
+  margin-top: 0;
+}
+
+.day-sep {
+  margin: 12px auto 4px;
+}
+
+.msg-main {
+  gap: 2px;
+}
+
+.msg-body > :last-child {
+  margin-bottom: 0;
+}
+
+.msg-body p {
+  margin: 0 0 8px;
+}
+
+.msg-avatar.avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 9px;
+  font-size: 12px;
+}
+
+.msg.bot .msg-body {
+  padding-top: 3px;
+  line-height: 1.6;
+}
+
+/* Owner bubble: a smaller corner on the sender side. */
+.msg.user .msg-body {
+  padding: 8px 14px;
+  border-radius: 16px 16px 4px 16px;
+  max-width: min(580px, 82%);
+  line-height: 1.5;
+}
+
+/* The speaker line, where several bots talk. */
+.messages.group .msg-head {
+  align-items: center;
+  gap: 6px;
+  min-height: 20px;
+  padding-left: 0;
+}
+
+.msg-name {
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: -0.005em;
+}
+
+.msg-time {
+  font-size: 11.5px;
+}
+
+.msg-head .team-chip,
+.msg-head .chip {
+  padding: 0 7px;
+  border-color: transparent;
+  background: var(--hover);
+  color: var(--label-3);
+  font-size: 11px;
+  line-height: 18px;
+}
+
+.msg-head .chip.ok {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.msg-head .chip.warn {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+/* Message actions: a small floating bar over the message's top corner, so
+   they take no room between messages. The newest reply keeps its bar in the
+   flow underneath, where nothing follows it. */
+.msg .msg-actions {
+  position: absolute;
+  right: 0;
+  top: -16px;
+  z-index: 3;
+  min-height: 0;
+  margin: 0;
+  padding: 2px;
+  gap: 1px;
+  border-radius: 9px;
+  background: var(--surface);
+  box-shadow: 0 0 0 1px var(--hairline), var(--shadow-1);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.msg:hover .msg-actions,
+.msg:focus-within .msg-actions,
+.msg .msg-actions:focus-within {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.msg.last-reply .msg-actions {
+  position: static;
+  align-self: flex-start;
+  padding: 0;
+  margin-top: 2px;
+  background: var(--clear);
+  box-shadow: none;
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.msg.user .msg-actions {
+  left: auto;
+}
+
+@media (hover: none) {
+  .msg .msg-actions {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+
+/* The in-conversation search bar sits at the top of the column. */
+.chat-find-bar {
+  width: min(760px, calc(100% - 36px));
+  margin: 8px auto 0;
+  box-sizing: border-box;
+}
+
+/* ------------------------------------------------------------ composer --- */
+
+.composer-wrap .composer {
+  gap: 2px;
+  padding: 8px 8px 6px 14px;
+  border-radius: 16px;
+}
+
+.composer-wrap .composer .composer-input {
+  padding: 4px 0;
+  font-family: inherit;
+  font-size: var(--fs-body);
+  line-height: 1.5;
+}
+
+.composer-wrap .composer .composer-row {
+  min-height: 34px;
+  gap: 6px;
+}
+
+.composer-wrap .composer .composer-row .composer-actions {
+  gap: 2px;
+}
+
+/* One toolbar language: 30px quiet buttons with a 9px radius. */
+.composer .composer-row .icon-btn.primary {
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  background: var(--hover);
+  color: var(--label-2);
+  box-shadow: none;
+}
+
+.composer .composer-row .icon-btn.primary:hover {
+  background: var(--active);
+  color: var(--label-1);
+}
+
+.composer-mic {
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+}
+
+.composer .send-btn {
+  width: 32px;
+  height: 32px;
+  min-height: 32px;
+  margin-left: 2px;
+  border-radius: 10px;
+}
+
+.composer .stop-btn,
+.composer .composer-stop {
+  width: 32px;
+  height: 32px;
+  min-height: 32px;
+  border-radius: 10px;
+}
+
+.model-bar.compact .menu-trigger {
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: 9px;
+  background: var(--hover);
+  color: var(--label-2);
+  font-size: 12.5px;
+}
+
+.model-bar.compact .menu-trigger:hover {
+  background: var(--active);
+  color: var(--label-1);
+}
+
+.composer-wrap .composer-hint {
+  padding: 4px 14px 0;
+  color: var(--label-3);
+}
+
+/* ------------------------------------------------------------ All chats --- */
+
+.pane-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.conv-body > * {
+  max-width: 880px;
+}
+
+.conv-new {
+  margin-bottom: 16px;
+}
+
+.conv-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 12px;
+}
+
+.conv-search {
+  position: relative;
+  flex: 1 1 260px;
+  min-width: 0;
+}
+
+.conv-search .input {
+  min-height: 36px;
+  padding-left: 34px;
+  border-color: transparent;
+  background: var(--hover);
+}
+
+.conv-search .input:focus {
+  background: var(--surface);
+  border-color: var(--accent);
+}
+
+.conv-filter {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 11px;
+  background: var(--hover);
+}
+
+.conv-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 11px;
+  border: 0;
+  border-radius: 9px;
+  background: var(--clear);
+  color: var(--label-2);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 550;
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+
+.conv-chip:hover {
+  color: var(--label-1);
+}
+
+.conv-chip.active {
+  background: var(--surface);
+  color: var(--label-1);
+  box-shadow: 0 0 0 1px var(--hairline), var(--shadow-1);
+}
+
+.conv-chip-count {
+  color: var(--label-3);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.conv-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 4px;
+  border: 1px solid var(--hairline);
+  border-radius: 14px;
+  background: var(--card-bg);
+}
+
+.conv-row {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  min-height: 58px;
+  border-radius: 10px;
+  transition: background var(--dur-1) var(--ease);
+}
+
+.conv-row:hover,
+.conv-row:focus-within {
+  background: var(--hover);
+}
+
+.conv-row.active {
+  background: var(--accent-soft);
+}
+
+.conv-row.active::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 14px;
+  bottom: 14px;
+  width: 3px;
+  border-radius: var(--r-pill);
+  background: var(--accent);
+}
+
+.conv-main {
+  display: flex;
+  align-items: center;
+  flex: 1 1 0;
+  gap: 12px;
+  min-width: 0;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 10px;
+  background: var(--clear);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.conv-main:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.conv-main .avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 11px;
+  font-size: 14px;
+}
+
+.conv-copy {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  gap: 2px;
+  min-width: 0;
+}
+
+.conv-title-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.conv-title {
+  overflow: hidden;
+  color: var(--label-1);
+  font-size: 14px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conv-kind {
+  flex: none;
+  padding: 0 7px;
+  border-radius: var(--r-pill);
+  background: var(--hover);
+  color: var(--label-3);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  line-height: 18px;
+  text-transform: uppercase;
+}
+
+.conv-parent {
+  overflow: hidden;
+  color: var(--label-3);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conv-preview {
+  overflow: hidden;
+  color: var(--label-3);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conv-side {
+  display: flex;
+  align-items: center;
+  flex: none;
+  gap: 8px;
+}
+
+.conv-time {
+  color: var(--label-3);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Actions replace the time on hover or focus; they stay while one is in
+   progress (rename, confirm archive). */
+.conv-actions {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: 0 0 0 1px var(--hairline), var(--shadow-1);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-50%);
+  transition: opacity var(--dur-1) var(--ease);
+}
+
+.conv-row:hover .conv-actions,
+.conv-row:focus-within .conv-actions,
+.conv-row.busy .conv-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.conv-row.busy .conv-actions {
+  position: static;
+  margin: 0 10px 0 0;
+  transform: none;
+  box-shadow: none;
+  background: var(--clear);
+}
+
+.conv-actions .btn.danger-text {
+  color: var(--danger);
+}
+
+.conv-rename {
+  flex: 1 0 100%;
+  padding: 0 12px 10px 60px;
+}
+
+@media (hover: none) {
+  .conv-actions {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .thread,
+  .thread .row-more,
+  .thread .row-new,
+  .thread-add,
+  .conv-row,
+  .conv-actions,
+  .conv-chip {
+    transition: none;
+  }
+}
+
+.root[data-motion="reduce"] .thread,
+.root[data-motion="reduce"] .thread .row-more,
+.root[data-motion="reduce"] .thread .row-new,
+.root[data-motion="reduce"] .thread-add,
+.root[data-motion="reduce"] .conv-row,
+.root[data-motion="reduce"] .conv-actions,
+.root[data-motion="reduce"] .conv-chip {
+  transition: none;
 }

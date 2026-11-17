@@ -49,19 +49,65 @@ pub(super) fn signin_flows(
     provider_id: &str,
     kind: &str,
 ) -> Vec<&'static str> {
-    if matches!(kind, "anthropic" | "openai-codex" | "github-copilot") {
-        let enabled = state
-            .config
-            .llm
-            .providers
-            .get(provider_id)
-            // Not saved yet: the directory offers the sign-in (it is on by default).
-            .is_none_or(ProviderConfig::plan_oauth_enabled);
-        if !enabled || (kind == "anthropic" && !is_admin) {
-            return Vec::new();
-        }
+    if plan_signin_blocked(state, is_admin, provider_id, kind).is_some() {
+        return Vec::new();
     }
     state.signin.registry().flows_for(kind)
+}
+
+/// Why a plan sign-in (Claude, Codex, Copilot) is not offered, so the page can
+/// say so instead of silently showing no button: `"off"` when the operator set
+/// `plan_oauth = false` on this provider, `"admin_only"` for Claude's to a
+/// member. `None` when it is offered or the kind has no plan sign-in.
+pub(super) fn plan_signin_blocked(
+    state: &ApiState,
+    is_admin: bool,
+    provider_id: &str,
+    kind: &str,
+) -> Option<&'static str> {
+    if !matches!(kind, "anthropic" | "openai-codex" | "github-copilot") {
+        return None;
+    }
+    // The copy last saved in the console counts at once; a provider that is
+    // not saved yet offers the sign-in (it is on by default).
+    let enabled = live_provider_profile(state, provider_id)
+        .ok()
+        .is_none_or(|profile| profile.plan_oauth_enabled());
+    if !enabled {
+        Some("off")
+    } else if kind == "anthropic" && !is_admin {
+        Some("admin_only")
+    } else {
+        None
+    }
+}
+
+/// What the server still needs before this provider's sign-in can work, for
+/// the page to ask the admin instead of failing after the member approved:
+/// `"client_secret"` when Antigravity's Google client secret is missing.
+pub(super) fn signin_setup_missing(state: &ApiState, kind: &str) -> Option<&'static str> {
+    state
+        .signin
+        .registry()
+        .get(kind)
+        .and_then(|provider| provider.setup_missing())
+}
+
+/// The sign-in state a provider card needs beyond its flows: why a plan
+/// sign-in is not offered (`plan_signin`), what the server still lacks for a
+/// sign-in to work (`signin_setup`), and whether bots pick up the provider only
+/// after a restart (`pending_restart`). Shown to members too, so a card can say
+/// "ask your admin" instead of failing.
+pub(super) fn add_signin_status(
+    view: &mut Value,
+    state: &ApiState,
+    is_admin: bool,
+    provider_id: &str,
+    kind: &str,
+) {
+    view["plan_signin"] = json!(plan_signin_blocked(state, is_admin, provider_id, kind));
+    view["signin_setup"] = json!(signin_setup_missing(state, kind));
+    view["pending_restart"] = json!(provider_pending_restart(state, provider_id));
 }
 
 /// The risk a plan sign-in carries, for the banner the page shows beside it.
@@ -184,7 +230,7 @@ pub(super) fn parked_provider_views(
             continue;
         };
         let kind = canonical_kind(&profile.kind)?;
-        parked.push(json!({
+        let mut view = json!({
             "id": account.provider,
             "kind": kind,
             "auth": if matches!(auth_plan(&kind, &profile.auth)?, AuthPlan::OAuth { .. }) { "oauth" } else { "api_key" },
@@ -206,14 +252,16 @@ pub(super) fn parked_provider_views(
             "accounts": provider_account_views(state, user_id, &account.provider)?,
             "signin": signin_flows(state, is_admin, &account.provider, &kind),
             "signin_risk": signin_risk(&kind, &signin_flows(state, is_admin, &account.provider, &kind)),
-        }));
+        });
+        add_signin_status(&mut view, state, is_admin, &account.provider, &kind);
+        parked.push(view);
     }
     Ok(parked)
 }
 
 /// The configured provider and its canonical kind, or a 404 / 422.
 fn provider_context(state: &ApiState, id: &str) -> Result<(ProviderConfig, String)> {
-    let profile = provider_profile(state, id)?;
+    let profile = live_provider_profile(state, id)?;
     let kind = canonical_kind(&profile.kind)?;
     Ok((profile, kind))
 }
@@ -239,11 +287,13 @@ pub(super) async fn list_provider_accounts(
 ) -> Result<Json<Value>> {
     let (_, kind) = provider_context(&state, &id)?;
     let flows = signin_flows(&state, user.is_admin(), &id, &kind);
-    Ok(Json(json!({
+    let mut body = json!({
         "accounts": provider_account_views(&state, &user.id, &id)?,
         "signin_risk": signin_risk(&kind, &flows),
         "signin": flows,
-    })))
+    });
+    add_signin_status(&mut body, &state, user.is_admin(), &id, &kind);
+    Ok(Json(body))
 }
 
 #[derive(Debug, Deserialize)]

@@ -307,7 +307,11 @@ async fn main() -> anyhow::Result<()> {
                 if store.get_user(&user_id)?.is_none() {
                     anyhow::bail!("no user with id {user_id}");
                 }
-                let templates = load_bots(&config, config.path(&config.fleet.bots_dir))?;
+                // Catalog-only bots are opt-in installs, not part of a reseed.
+                let templates = load_bots(&config, config.path(&config.fleet.bots_dir))?
+                    .into_iter()
+                    .filter(|bot| !bot.config.catalog_only)
+                    .collect::<Vec<_>>();
                 let existing = store.list_bots(&user_id)?;
                 println!(
                     "user {user_id}: {} existing bot(s), {} template(s)",

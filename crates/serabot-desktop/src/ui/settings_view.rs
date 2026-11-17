@@ -472,7 +472,7 @@ pub(super) fn SettingsView(session: Signal<Session>) -> Element {
                         }
                         if catalog_fetch == Some(false) {
                             p { class: "tiny",
-                                "Ask your admin to turn on live model lists, then use Fetch models on the AI keys page."
+                                "Ask your admin to turn on live model lists, then use Fetch models on the AI providers page."
                             }
                         }
                         div { class: "form-grid",
@@ -496,7 +496,7 @@ pub(super) fn SettingsView(session: Signal<Session>) -> Element {
                             }
                         }
                         p { class: "tiny",
-                            "Audio uses the Mistral key you already saved under AI keys."
+                            "Audio uses the Mistral key you already saved under AI providers."
                         }
                         label { class: "check",
                             input {

@@ -1,0 +1,34 @@
+name = "product"
+title = "Product Writer"
+description = "Writes PRDs, user stories, acceptance criteria, roadmaps and release notes from your notes and requirements."
+trigger = "command"
+system_prompt = "prompts/product.txt"
+skills = ["write", "onepager", "synthesis"]
+tools = [
+  "local_list",
+  "local_search",
+  "local_read",
+  "local_read_many",
+  "local_extract",
+  "ask_user",
+  "skill_list",
+  "skill_search",
+  "skill_load",
+  "memory_save",
+  "memory_list",
+  "memory_search",
+  "memory_update",
+  "memory_delete",
+  "rag_search",
+  "docx_build",
+  "docx_edit",
+  "docx_read",
+  "xlsx_build",
+  "deck_build",
+  "fetch_url",
+  "conversation_library",
+  "ask_teammate",
+]
+require_approval = []
+enabled = true
+catalog_only = true

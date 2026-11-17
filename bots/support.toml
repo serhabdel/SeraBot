@@ -1,0 +1,30 @@
+name = "support"
+title = "Support Writer"
+description = "Drafts customer replies and FAQ answers from your policies and past answers. Never sends anything itself."
+trigger = "command"
+system_prompt = "prompts/support.txt"
+skills = ["write", "ask"]
+tools = [
+  "local_list",
+  "local_search",
+  "local_read",
+  "local_read_many",
+  "local_extract",
+  "ask_user",
+  "skill_list",
+  "skill_search",
+  "skill_load",
+  "memory_save",
+  "memory_list",
+  "memory_search",
+  "memory_update",
+  "memory_delete",
+  "rag_search",
+  "docx_build",
+  "fetch_url",
+  "conversation_library",
+  "ask_teammate",
+]
+require_approval = []
+enabled = true
+catalog_only = true

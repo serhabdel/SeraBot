@@ -300,6 +300,12 @@ pub trait SignInProvider: Send + Sync {
         None
     }
 
+    /// What this server still lacks before the sign-in can finish (for one, a
+    /// client secret the operator has to supply). `None` when it is ready.
+    fn setup_missing(&self) -> Option<&'static str> {
+        None
+    }
+
     /// The authorization page for a PKCE flow.
     fn authorize_url(&self, _redirect_uri: &str, _challenge: &str, _state: &str) -> Result<String> {
         Err(unsupported())

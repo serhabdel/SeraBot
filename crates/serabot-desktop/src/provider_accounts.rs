@@ -456,6 +456,88 @@ pub fn can_add(provider: &ProviderStatus) -> bool {
     provider.accounts.len() < MAX_ACCOUNTS_PER_PROVIDER
 }
 
+/// Why a provider's sign-in cannot start from this console, read from what the
+/// server reported. The card says it in words and offers the fix when the
+/// viewer can make it, instead of sending them to the provider's page only to
+/// fail afterwards.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SigninBlocker {
+    /// The server has no Google client secret for Antigravity. `can_fix`: the
+    /// viewer is the admin and the provider is saved in the console.
+    ClientSecret { can_fix: bool },
+    /// The operator turned the plan sign-in off for this provider. `can_fix`:
+    /// the admin can turn it back on from the console.
+    PlanOff { brand: &'static str, can_fix: bool },
+    /// Claude's plan sign-in is for the server admin only.
+    AdminOnly,
+}
+
+impl SigninBlocker {
+    /// One plain sentence for the card or the sign-in sheet.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::ClientSecret { can_fix: true } => {
+                "Sign-in is not set up on this server yet: it needs Google's Antigravity client secret. Paste it below once and every member can sign in."
+            }
+            Self::ClientSecret { can_fix: false } => {
+                "Sign-in is not set up on this server yet. Ask your admin to finish setting up Google Antigravity."
+            }
+            Self::PlanOff { can_fix: true, .. } => {
+                "Plan sign-in is turned off for this provider. Turn it on to sign in with your plan."
+            }
+            Self::PlanOff { can_fix: false, .. } => {
+                "Plan sign-in is turned off for this provider on this server. Add an API key instead."
+            }
+            Self::AdminOnly => {
+                "Sign in with Claude is only for the server admin. Add an Anthropic API key to use Claude."
+            }
+        }
+    }
+
+    /// The button that fixes it, when the viewer can.
+    pub fn fix_label(self) -> Option<&'static str> {
+        match self {
+            Self::ClientSecret { can_fix: true } => Some("Save client secret"),
+            Self::PlanOff {
+                can_fix: true,
+                brand,
+            } => Some(match brand {
+                "Claude" => "Turn on Claude sign-in",
+                "ChatGPT" => "Turn on ChatGPT sign-in",
+                _ => "Turn on Copilot sign-in",
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// The plan's brand name for a provider kind, for the words on a card.
+fn plan_brand(kind: &str) -> &'static str {
+    match kind {
+        "anthropic" => "Claude",
+        "openai-codex" => "ChatGPT",
+        _ => "Copilot",
+    }
+}
+
+/// What stops this provider's sign-in, if anything. Older servers send none of
+/// these fields, so this is `None` there and the page behaves as before.
+pub fn signin_blocker(provider: &ProviderStatus, is_admin: bool) -> Option<SigninBlocker> {
+    if provider.signin_setup.as_deref() == Some("client_secret") {
+        return Some(SigninBlocker::ClientSecret {
+            can_fix: is_admin && provider.managed,
+        });
+    }
+    match provider.plan_signin.as_deref() {
+        Some("off") => Some(SigninBlocker::PlanOff {
+            brand: plan_brand(&provider.kind),
+            can_fix: is_admin && provider.managed,
+        }),
+        Some("admin_only") => Some(SigninBlocker::AdminOnly),
+        _ => None,
+    }
+}
+
 /// A short count line for the card: `2 accounts, 1 ready`.
 pub fn summary_line(accounts: &[ProviderAccount]) -> String {
     let ready = accounts.iter().filter(|a| state_of(a).usable()).count();
@@ -492,6 +574,60 @@ mod tests {
             signin: signin.iter().map(|s| (*s).to_owned()).collect(),
             ..ProviderStatus::default()
         }
+    }
+
+    #[test]
+    fn a_missing_client_secret_blocks_sign_in_and_only_the_admin_can_fix_it() {
+        let mut agy = provider("oauth", &["pkce"]);
+        agy.kind = "google-antigravity".into();
+        agy.signin_setup = Some("client_secret".into());
+        agy.managed = true;
+        assert_eq!(
+            signin_blocker(&agy, true),
+            Some(SigninBlocker::ClientSecret { can_fix: true })
+        );
+        let member = signin_blocker(&agy, false).unwrap();
+        assert_eq!(member, SigninBlocker::ClientSecret { can_fix: false });
+        assert!(member.message().contains("Ask your admin"));
+        assert_eq!(member.fix_label(), None);
+        // Configured in serabot.toml: the console cannot write it.
+        agy.managed = false;
+        assert_eq!(
+            signin_blocker(&agy, true),
+            Some(SigninBlocker::ClientSecret { can_fix: false })
+        );
+        agy.signin_setup = None;
+        assert_eq!(signin_blocker(&agy, true), None);
+    }
+
+    #[test]
+    fn a_plan_sign_in_that_is_off_or_admin_only_says_so() {
+        let mut claude = provider("api_key", &[]);
+        claude.kind = "anthropic".into();
+        claude.managed = true;
+        claude.plan_signin = Some("off".into());
+        let off = signin_blocker(&claude, true).unwrap();
+        assert_eq!(off.fix_label(), Some("Turn on Claude sign-in"));
+        assert!(
+            signin_blocker(&claude, false)
+                .unwrap()
+                .fix_label()
+                .is_none()
+        );
+        claude.plan_signin = Some("admin_only".into());
+        let member = signin_blocker(&claude, false).unwrap();
+        assert_eq!(member, SigninBlocker::AdminOnly);
+        assert!(member.message().contains("API key"));
+        let mut codex = provider("oauth", &[]);
+        codex.kind = "openai-codex".into();
+        codex.managed = true;
+        codex.plan_signin = Some("off".into());
+        assert_eq!(
+            signin_blocker(&codex, true).unwrap().fix_label(),
+            Some("Turn on ChatGPT sign-in")
+        );
+        // An older server sends neither field.
+        assert_eq!(signin_blocker(&provider("oauth", &["pkce"]), true), None);
     }
 
     #[test]

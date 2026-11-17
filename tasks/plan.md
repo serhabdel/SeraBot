@@ -179,6 +179,16 @@ failure and wait cards, plus a motion/accessibility pass. No live provider was
 used and the desktop was not visually verified on a device. B7 worker counts
 above 2 are gated on running the load fixture on the target host.
 
+## Status after 0.52.0 (sign-in fixes, design, marketplace bots)
+
+0.52.0 fixes Claude plan sign-in from the console (no key needed while plan
+sign-in is on), makes Antigravity refuse to start without a Google client
+secret and lets the admin save one, reports `plan_signin`, `signin_setup` and
+`pending_restart` on provider listings, rebuilds the AI providers page, redesigns
+the chat sidebar, topbar, transcript, composer and All chats list, and adds seven
+catalog-only bots to the marketplace. Synthetic fixtures only; the owner adds the
+`SERABOT_AGY_CLIENT_SECRET` repository secret for the deploy build.
+
 ## Status after 0.50.0 (marketplace, providers, 0.51.0)
 
 0.51.0 adds marketplace manifest schema v2, MCP OAuth (`mcp_oauth.rs`) with

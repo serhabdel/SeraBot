@@ -13,6 +13,10 @@ The desktop starts `POST /v1/providers/{id}/signin/start` (`flow: "pkce"`), open
 - the email comes from `GET https://www.googleapis.com/oauth2/v1/userinfo?alt=json` and names the account (a login with no email and no Google id is refused);
 - project discovery runs `loadCodeAssist` and, when the account has no project, `onboardUser` up to three times, three seconds apart, asking the daily host and then prod. The project and tier are stored in the account's identity. A member's account never uses the provider's configured `project_id`; an account whose discovery found nothing omits `project` and looks again on first use (at most once an hour).
 
+If no client secret is available at all (no console value, no `AGY_CLIENT_SECRET`, and a build without `config/agy.local.toml` or `SERABOT_AGY_CLIENT_SECRET`), Google refuses the code exchange after the member has already approved. Since 0.52 the server checks first: `signin/start` answers `422 signin_not_set_up` with words that point the admin at the AI providers page, the provider listing carries `signin_setup = "client_secret"`, and the admin's card shows a **Google client secret** field that saves it to the age store (no restart). The server deploy workflow (`deploy-ovh.yml`) passes the repository secret `SERABOT_AGY_CLIENT_SECRET` to the release build; until the owner adds that secret, a deployed server needs the console field or `AGY_CLIENT_SECRET`.
+
+The model router reads providers when the server starts. A provider first saved from the console can be signed into at once, but bots use it only after a restart: the listing says `pending_restart`, and the card and the "Account added" notice offer **Restart server**.
+
 The owner's `POST /v1/admin/providers/{id}/oauth/start|complete` routes now do the same for the owner's own account in the per-user store; there is no restart and no age-store write. A new sign-in the operator stores with `serabot providers login` is added to the admin's accounts at the next start.
 
 ## Wire details
