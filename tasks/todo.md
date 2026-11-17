@@ -169,7 +169,7 @@ never merge without the owner's OK.
 - [x] AI providers page (rename and rebuild); chat sidebar, topbar, transcript, composer and All chats redesign.
 - [x] Catalog-only bots: researcher, writer, translator, planner, support, product, tutor; Bots tab card grid.
 - [ ] Owner: add the `SERABOT_AGY_CLIENT_SECRET` repository secret (or paste it on the AI providers page).
-- [ ] Version bump to 0.52.0 when the owner wants the release.
+- [x] Version bump to 0.52.0 (owner approved the release).
 - [ ] Live owner verification of Claude, Antigravity, Codex and Copilot sign-in (none claimed).
 - [ ] Visual review of the redesigned screens on a Windows device.
 - [ ] Optional: rebuild the model router when the console saves a provider, so no restart is needed.

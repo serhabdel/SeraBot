@@ -1,8 +1,7 @@
-# Release 0.52.0 (draft)
+# Release 0.52.0
 
 Sign-in that works, an AI providers page, a calmer chat, and bots anyone can
-add from the marketplace. The workspace version is not bumped yet, so merging
-this does not cut a release by itself.
+add from the marketplace.
 
 ## Sign-in fixes
 
