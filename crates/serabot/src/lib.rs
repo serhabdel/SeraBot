@@ -71,6 +71,7 @@ pub mod policy;
 #[cfg(feature = "pptx")]
 pub mod pptx_ops;
 pub mod profiles;
+pub mod projects;
 pub mod providers;
 pub mod reliability;
 pub mod render;

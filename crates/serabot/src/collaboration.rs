@@ -35,6 +35,9 @@ pub const SHARED_TOOLS: &[&str] = &[
     // documents, whatever its stored list says.
     "document_index",
     "rag_search",
+    "project_list",
+    "project_create",
+    "project_file",
     "conversation_library",
     "pdf_inspect",
     "pdf_edit",
