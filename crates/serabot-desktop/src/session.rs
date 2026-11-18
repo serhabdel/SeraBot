@@ -3427,17 +3427,25 @@ impl Session {
         self.attachment_thumbs.insert(id, url);
     }
 
+    /// Whether an optimistic user bubble ("opt-...") is waiting for Submit to land.
+    pub fn has_optimistic_pending(&self) -> bool {
+        self.state
+            .messages
+            .last()
+            .is_some_and(|message| message.role == Role::User && message.id.starts_with("opt-"))
+    }
+
     /// The Stop button: ask the server to end this conversation's running
-    /// reply. When another request holds the slot, the stop waits for it.
+    /// reply or queued send. When another request holds the slot, the stop
+    /// waits for it.
     pub fn stop_turn(&mut self) {
-        if self
-            .state
-            .task
-            .as_ref()
-            .is_none_or(|task| task.status.terminal())
+        if !self.main_run_active()
+            && crate::runs::active_count(&self.state.runs.rows) == 0
+            && !self.has_optimistic_pending()
         {
             return;
         }
+        self.state.stopping = true;
         self.stop_queued = true;
         self.flush_stop();
     }
@@ -3448,13 +3456,12 @@ impl Session {
         if !self.stop_queued {
             return;
         }
-        let running = self
-            .state
-            .task
-            .as_ref()
-            .is_some_and(|task| !task.status.terminal());
+        let running = self.main_run_active()
+            || crate::runs::active_count(&self.state.runs.rows) > 0
+            || self.has_optimistic_pending();
         if !running {
             self.stop_queued = false;
+            self.state.stopping = false;
         } else if self.ready() {
             self.stop_queued = false;
             self.start_request(Operation::StopTurn);
@@ -4451,6 +4458,7 @@ impl Session {
                     let sign_in_message = error.sign_in_text();
                     let rate_limited = error == ApiError::Http(429);
                     let not_found = error == ApiError::Http(404);
+                    let forbidden = error == ApiError::Http(403);
                     let dropped = error.is_transport();
                     let submit_failure = (completion.kind == OperationKind::Submit)
                         .then(|| crate::chat_failure::classify_send_error(&error));
@@ -4558,6 +4566,7 @@ impl Session {
                             self.schedule(Operation::Catalog, Duration::ZERO);
                         }
                         OperationKind::StopTurn => {
+                            self.state.stopping = false;
                             // The reply keeps running; Stop can be pressed again.
                             self.toast = Some(format!("Could not stop the reply: {message}"));
                             self.state.error = None;
@@ -4576,6 +4585,11 @@ impl Session {
                         }
                         OperationKind::Logs => {
                             // The tab shows its own message; no global banner.
+                            self.state.logs_error = Some(if forbidden {
+                                "Admin access is required to view server logs.".to_owned()
+                            } else {
+                                message
+                            });
                             self.state.logs_loaded = true;
                             self.state.error = None;
                         }
@@ -4628,7 +4642,11 @@ impl Session {
                                 self.state.error = None;
                             }
                         }
-                        OperationKind::Submit => self.note_submit_failure(submit_failure),
+                        OperationKind::Submit => {
+                            self.state.stopping = false;
+                            self.stop_queued = false;
+                            self.note_submit_failure(submit_failure);
+                        }
                         // The transcript has its own failure state: the chat
                         // shows a Retry panel that no other reply can clear.
                         OperationKind::History if !self.state.history_loaded => {
@@ -4695,9 +4713,27 @@ impl Session {
                         }
                         continue;
                     }
-                    // Nothing marked means no turn was running when Stop was pressed.
-                    if matches!(reply, Reply::Stopping(0)) {
-                        self.toast = Some("Nothing is running to stop.".into());
+                    if let Reply::Stopping(count) = &reply {
+                        self.run_action_done();
+                        if *count == 0 {
+                            self.state.stopping = false;
+                            self.schedule(Operation::History, Duration::ZERO);
+                            if !self.main_run_active()
+                                && crate::runs::active_count(&self.state.runs.rows) == 0
+                            {
+                                self.toast = Some("Nothing is running to stop.".into());
+                            }
+                        } else if let Some(task) = self
+                            .state
+                            .task
+                            .as_ref()
+                            .filter(|task| !task.status.terminal())
+                        {
+                            self.schedule(Operation::Task(task.id.clone()), Duration::ZERO);
+                        } else {
+                            self.state.stopping = false;
+                            self.schedule(Operation::History, Duration::ZERO);
+                        }
                     }
                     if matches!(reply, Reply::RunActed) {
                         self.run_action_done();
@@ -4846,7 +4882,9 @@ impl Session {
                         OperationKind::ListConversations => self.schedule_next_avatar(),
                         OperationKind::Submit => {
                             self.poll_history = false;
-                            self.schedule(Operation::History, Duration::ZERO);
+                            if !self.stop_queued {
+                                self.schedule(Operation::History, Duration::ZERO);
+                            }
                         }
                         OperationKind::Decide => {
                             self.schedule(Operation::Approvals, Duration::ZERO);
@@ -7728,5 +7766,39 @@ mod backlog_tests {
             }
         }
         assert_eq!(saved_count, 2);
+    }
+
+    #[test]
+    fn stop_works_during_optimistic_send_and_clears_on_stopping_zero() {
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        session.state.connected = true;
+        session.state.history_loaded = true;
+        session.state.messages.push(Message {
+            id: "opt-1".into(),
+            role: Role::User,
+            content: "hello".into(),
+            created_at: "Just now".into(),
+            name: None,
+            bot: None,
+            attachments: Vec::new(),
+            limit_reached: false,
+        });
+        assert!(session.has_optimistic_pending());
+        assert!(session.any_run_active());
+
+        // Simulate Submit currently holding the worker request slot.
+        session.pending = Some(OperationKind::Submit);
+        session.stop_turn_or_runs();
+        assert!(session.state.stopping);
+        assert!(session.stop_queued);
+
+        // Once Submit completes with a non-terminal task, flush_stop would fire
+        // StopTurn; if StopTurn returns 0, stopping clears and History queues.
+        session.pending = None;
+        let scope = session.state.scope.clone();
+        assert!(session.state.receive(&scope, Reply::Stopping(0)));
+        session.state.stopping = false;
+        assert!(!session.state.stopping);
     }
 }

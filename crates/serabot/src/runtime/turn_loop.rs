@@ -157,18 +157,33 @@ impl Runtime {
             compactions: 0,
             waited_secs: 0,
         };
+        if self.take_task_stop(&task.id) || self.stop_requested(&turn.id) {
+            return self
+                .finish_stopped(task, &turn, &state, &payload.conversation_id)
+                .await;
+        }
         // Recalled facts answer the owner's message (or the objective of a
         // handoff or team turn). Only owner turns also get the conversation's
         // rolling summary.
         let owner_turn = payload.handoff.is_none() && payload.team.is_none();
-        let memory_block = self
-            .memory_context(
-                &user,
-                owner_turn.then_some(payload.conversation_id.as_str()),
-                bot,
-                &payload.text,
-            )
-            .await;
+        let memory_block = {
+            let (stop_token, _pre_stop_guard) = self.register_stop_token(&turn.id);
+            tokio::select! {
+                biased;
+                _ = stop_token.cancelled() => None,
+                block = self.memory_context(
+                    &user,
+                    owner_turn.then_some(payload.conversation_id.as_str()),
+                    bot,
+                    &payload.text,
+                ) => Some(block),
+            }
+        };
+        let Some(memory_block) = memory_block else {
+            return self
+                .finish_stopped(task, &turn, &state, &payload.conversation_id)
+                .await;
+        };
         let system = if let Some(ref handoff) = payload.handoff {
             self.handoff_system_prompt(
                 &user,
@@ -233,6 +248,11 @@ impl Runtime {
         let turn = self.store.get_turn(&user, &payload.turn_id)?;
         let mut state: TurnState = serde_json::from_value(turn.state.clone())
             .map_err(|_| SeraError::InvalidState("stored turn state is invalid".into()))?;
+        if self.take_task_stop(&task.id) || self.stop_requested(&turn.id) {
+            return self
+                .finish_stopped(task, &turn, &state, &turn.conversation_id)
+                .await;
+        }
         self.checked_route(&user, &state.route)?;
         let fleet = self.fleet.load(&user)?;
         let bot = fleet
@@ -341,6 +361,11 @@ impl Runtime {
                 .await?
         {
             return self.suspend_for_approval(task, &turn, state, next).await;
+        }
+        if self.stop_requested(&turn.id) {
+            return self
+                .finish_stopped(task, &turn, &state, &turn.conversation_id)
+                .await;
         }
         self.store
             .update_turn(&user, &turn.id, "active", &serde_json::to_value(&state)?)?;
@@ -553,7 +578,7 @@ impl Runtime {
     /// End a turn the owner stopped. The reply is one short line; no further
     /// model or tool step runs. Tool calls that already finished keep their
     /// results, and nothing that had an external effect is retried.
-    async fn finish_stopped(
+    pub(super) async fn finish_stopped(
         &self,
         task: &Task,
         turn: &Turn,
@@ -602,6 +627,12 @@ impl Runtime {
                 .ok_or_else(|| SeraError::NotFound(format!("bot {}", turn.bot)))?
         };
         let user = task.user_id.clone();
+        let (stop_token, _stop_guard) = self.register_stop_token(&turn.id);
+        if self.take_task_stop(&task.id) || self.stop_requested(&turn.id) {
+            return self
+                .finish_stopped(task, turn, &state, conversation_id)
+                .await;
+        }
         if turn.status == crate::store::TASK_WAITING_MODEL {
             // Back from a model wait: the turn is running again.
             self.store
@@ -689,14 +720,23 @@ impl Runtime {
                 if state.compactions < MAX_COMPACTIONS
                     && self.near_window(&user, &route, &state.messages)
                 {
-                    self.compact_turn(
-                        task,
-                        turn,
-                        &mut state,
-                        conversation_id,
-                        CompactReason::NearWindow,
-                    )
-                    .await?;
+                    let compact_res = tokio::select! {
+                        biased;
+                        _ = stop_token.cancelled() => None,
+                        res = self.compact_turn(
+                            task,
+                            turn,
+                            &mut state,
+                            conversation_id,
+                            CompactReason::NearWindow,
+                        ) => Some(res),
+                    };
+                    let Some(compact_res) = compact_res else {
+                        return self
+                            .finish_stopped(task, turn, &state, conversation_id)
+                            .await;
+                    };
+                    compact_res?;
                 }
                 self.scan_model_messages(&user, &state.messages)?;
                 self.gateway
@@ -704,23 +744,32 @@ impl Runtime {
                 // Vault values never reach a model: redact a copy of the request.
                 let outgoing = self.gateway.redact_messages(&user, &state.messages)?;
                 let may_switch = self.turn_may_switch(&user, &state);
-                let result = self
-                    .complete_with_failover(
-                        &failover::RouteCall {
-                            user: &user,
-                            task_id: Some(&task.id),
-                            conversation_id,
-                            bot: &turn.bot,
-                        },
+                let route_call = failover::RouteCall {
+                    user: &user,
+                    task_id: Some(&task.id),
+                    conversation_id,
+                    bot: &turn.bot,
+                };
+                let thinking_ref = thinking.as_deref();
+                let routed_res = tokio::select! {
+                    biased;
+                    _ = stop_token.cancelled() => None,
+                    res = self.complete_with_failover(
+                        &route_call,
                         &route,
-                        thinking.as_deref(),
+                        thinking_ref,
                         &state.messages,
                         &outgoing,
                         &tool_specs,
                         temperature,
                         may_switch,
-                    )
-                    .await;
+                    ) => Some(res),
+                };
+                let Some(result) = routed_res else {
+                    return self
+                        .finish_stopped(task, turn, &state, conversation_id)
+                        .await;
+                };
                 match result {
                     Ok(routed) => break routed,
                     Err(SeraError::ModelWaiting { until }) => {
@@ -733,15 +782,23 @@ impl Runtime {
                     Err(error)
                         if is_context_too_long(&error) && state.compactions < MAX_COMPACTIONS =>
                     {
-                        let compacted = self
-                            .compact_turn(
+                        let compact_res = tokio::select! {
+                            biased;
+                            _ = stop_token.cancelled() => None,
+                            res = self.compact_turn(
                                 task,
                                 turn,
                                 &mut state,
                                 conversation_id,
                                 CompactReason::ContextTooLong,
-                            )
-                            .await?;
+                            ) => Some(res),
+                        };
+                        let Some(compact_res) = compact_res else {
+                            return self
+                                .finish_stopped(task, turn, &state, conversation_id)
+                                .await;
+                        };
+                        let compacted = compact_res?;
                         if !compacted {
                             return Err(error);
                         }
@@ -875,6 +932,7 @@ impl Runtime {
                         conversation_id,
                         LimitKind::Calls,
                         &skipped,
+                        &stop_token,
                     )
                     .await;
             }
@@ -886,6 +944,11 @@ impl Runtime {
                 .await?
             {
                 return self.suspend_for_approval(task, turn, state, pending).await;
+            }
+            if self.stop_requested(&turn.id) {
+                return self
+                    .finish_stopped(task, turn, &state, conversation_id)
+                    .await;
             }
             if state.handoff_queued {
                 // 0.27: several handoffs may be queued in one turn, fanning out
@@ -949,6 +1012,7 @@ impl Runtime {
             conversation_id,
             LimitKind::Rounds,
             &[],
+            &stop_token,
         )
         .await
     }
@@ -968,7 +1032,13 @@ impl Runtime {
         conversation_id: &str,
         kind: LimitKind,
         skipped: &[String],
+        stop_token: &CancellationToken,
     ) -> Result<TurnOutcome> {
+        if self.stop_requested(&turn.id) {
+            return self
+                .finish_stopped(task, turn, state, conversation_id)
+                .await;
+        }
         let user = task.user_id.clone();
         let mut transcript = state.messages.clone();
         let mut note = LIMIT_NOTE.to_string();
@@ -979,9 +1049,21 @@ impl Runtime {
             ));
         }
         transcript.push(LlmMessage::system(note));
-        let answer = self
-            .limit_answer(&user, bot, state, conversation_id, &transcript)
-            .await;
+        let answer_or_stopped = tokio::select! {
+            biased;
+            _ = stop_token.cancelled() => None,
+            answer = self.limit_answer(&user, bot, state, conversation_id, &transcript) => Some(answer),
+        };
+        let Some(answer) = answer_or_stopped else {
+            return self
+                .finish_stopped(task, turn, state, conversation_id)
+                .await;
+        };
+        if self.stop_requested(&turn.id) {
+            return self
+                .finish_stopped(task, turn, state, conversation_id)
+                .await;
+        }
         let answered = answer.is_some();
         let mut text = answer.unwrap_or_else(|| limit_summary(state, skipped));
         if self.gateway.scan_egress(&user, &text).is_err() {

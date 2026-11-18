@@ -23,6 +23,10 @@ tools = [
   "composio_search_tools",
   "composio_connect",
   "composio_execute",
+  "whatsapp_phone_info",
+  "whatsapp_list_templates",
+  "whatsapp_send_message",
+  "whatsapp_send_template",
   "conversation_library",
   "telegram_send_document",
   "tavily_search",
@@ -31,5 +35,9 @@ tools = [
   "fetch_url",
   "ask_teammate",
 ]
-require_approval = ["composio_execute"]
+require_approval = [
+  "composio_execute",
+  "whatsapp_send_message",
+  "whatsapp_send_template",
+]
 enabled = true

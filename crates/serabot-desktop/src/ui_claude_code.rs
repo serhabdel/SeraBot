@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::ui::{Icon, MarkdownBody};
+use crate::ui::{BrandLogo, Icon, MarkdownBody};
 use dioxus::prelude::*;
 use serabot_desktop::acp::controller::{Ask, Inbound, folder_label};
 use serabot_desktop::acp::setup::NodeCheck;
@@ -203,7 +203,7 @@ pub fn ClaudeAgentBotView(session: Signal<Session>, bot_id: String) -> Element {
         div { class: "pane cc-page cc-embedded",
             div { class: "cc-inline-bar",
                 div { class: "cc-inline-title",
-                    Icon { name: "code", size: 15 }
+                    BrandLogo { brand: "claude".to_owned(), size: 16 }
                     strong { "{bot_name} \u{00b7} Local Claude Code (ACP)" }
                     span { class: "{status_class}", role: "status", "{status.label()}" }
                     if has_persona {

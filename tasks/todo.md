@@ -219,3 +219,12 @@ never merge without the owner's OK.
 - [x] Right-align sidebar `NewMenu`, add explicit `r#type: "button"` attributes, raise `.sidebar` above `.main`, and remove WebView2 `backdrop-filter` blur fuzziness in `assets/system.css`.
 - [x] Compile all 20 shipped bots/prompts and 37 shipped skills into `crates/serabot/src/shipped.rs` and merge them behind disk overrides in `load_bots_with_builtin` and `SkillCatalog::load_with_builtin`.
 - [ ] Owner: verify composer input, sidebar `+ New chat` crispness/menu, and 20-bot Marketplace catalog on Windows + upgraded server.
+
+## Release 0.57.0 — logos, Logs fix, immediate Stop, Chat UX polish & WhatsApp Cloud API
+
+- [x] Official Anthropic (`SVG_ANTHROPIC`), Claude (`SVG_CLAUDE`), and WhatsApp (`SVG_WHATSAPP`) brand SVGs; `BrandLogo` used in Claude Agent banner and Command Palette.
+- [x] Fix empty desktop Logs tab: preserve `RingLayer` + stdout in `logging::install` when `log_dir` cannot be created, and distinguish `logs_error` from empty logs with Retry in `ui_logs.rs`.
+- [x] Immediate Stop chat cancellation: server `CancellationToken` + `tokio::select!` aborts slow model/compaction/`limit_answer` calls, cancels queued/waiting tasks atomically, and closes pre-turn claim races; desktop enables Stop during optimistic `opt-` sends with `"Stopping…"` feedback.
+- [x] Chat UX polish: per-bot `quick_chips(bot_id)` starter prompts and `"Stopping…"` / Escape-to-stop responsiveness.
+- [x] Native WhatsApp Business Cloud API connector (`token_connectors/whatsapp.rs`, `whatsapp_*` gateway tools, `bots/whatsapp.toml`, `prompts/whatsapp.txt`, live `Test` endpoint, and 2-field + optional WABA ID Integrations UI card).
+- [ ] Owner: verify WhatsApp Cloud API connector with a real Meta Phone Number ID + System User token and review desktop UI/logs/stop behavior on Windows.

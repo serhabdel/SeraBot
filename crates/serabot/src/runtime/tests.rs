@@ -2723,6 +2723,79 @@ async fn stop_during_model_call_discards_the_answer() {
     assert_eq!(store.pending_task_count(&owner).unwrap(), 0);
 }
 
+#[tokio::test]
+async fn stop_aborts_slow_model_call_immediately() {
+    let server = MockServer::start().await;
+    let notifier = Arc::new(Capture::default());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (runtime, store) = setup(&server.uri(), notifier.clone(), calls);
+    let owner = admin(&store);
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(bonjour_reply())
+                .set_delay(std::time::Duration::from_secs(10)),
+        )
+        .mount(&server)
+        .await;
+    runtime
+        .submit_text(&owner, "owner", "slow turn", None)
+        .unwrap();
+    let task = store.claim_task("test", 30).unwrap().unwrap();
+    let handle = tokio::spawn({
+        let runtime = runtime.clone();
+        let task = task.clone();
+        async move { runtime.process_task(task).await }
+    });
+    for _ in 0..200 {
+        if !server.received_requests().await.unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    let stopped_at = std::time::Instant::now();
+    assert_eq!(runtime.request_stop(&owner, "owner").unwrap(), 1);
+    handle.await.unwrap().unwrap();
+    assert!(
+        stopped_at.elapsed() < std::time::Duration::from_secs(2),
+        "slow model call was not aborted immediately ({:?})",
+        stopped_at.elapsed()
+    );
+    assert_eq!(
+        notifier.texts.lock().unwrap().as_slice(),
+        ["Stopped.".to_string()]
+    );
+    let turn = store.get_turn_by_task(&owner, &task.id).unwrap().unwrap();
+    assert_eq!(turn.status, "stopped");
+}
+
+#[tokio::test]
+async fn stop_cancels_queued_turn_before_execution() {
+    let notifier = Arc::new(Capture::default());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (runtime, store) = setup("http://127.0.0.1:9", notifier.clone(), calls.clone());
+    let owner = admin(&store);
+    runtime
+        .submit_text(&owner, "owner", "wait in queue", None)
+        .unwrap();
+    assert_eq!(runtime.request_stop(&owner, "owner").unwrap(), 1);
+    assert!(store.claim_task("test", 30).unwrap().is_none());
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let messages = store.list_messages(&owner, "owner", 10).unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|msg| msg.role == Role::User && msg.content == "wait in queue")
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|msg| msg.role == Role::Assistant && msg.content == "Stopped.")
+    );
+}
+
 /// Another user's stop aimed at the same conversation id marks nothing, so
 /// the owner's turn finishes with its normal reply.
 #[tokio::test]

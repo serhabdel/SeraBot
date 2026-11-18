@@ -1831,7 +1831,7 @@ pub(super) fn Topbar(
                                 title: if acp_on { "Switch back to server bot model" } else { "Run local Claude Code agent (ACP) in this bot chat" },
                                 "aria-pressed": if acp_on { "true" } else { "false" },
                                 onclick: move |_| session.write().toggle_bot_claude_agent(&bot),
-                                Icon { name: "code", size: 13 }
+                                BrandLogo { brand: "claude".to_owned(), size: 14 }
                                 span { if acp_on { "Claude Agent: On" } else { "Claude Agent" } }
                             }
                         }

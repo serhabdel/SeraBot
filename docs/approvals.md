@@ -23,6 +23,8 @@ or sends something to a third party that cannot be recalled. The list lives in
 | `todoist_add_task` | Adds a task to the user's Todoist. |
 | `todoist_complete_task` | Completes a Todoist task (a recurring task moves on). |
 | `slack_post_message` | Posts a message that everyone in a Slack channel can read. The approval names the channel. |
+| `whatsapp_send_message` | Sends a WhatsApp message to an external contact via WhatsApp Business Cloud API. The approval names the recipient and exact text. |
+| `whatsapp_send_template` | Sends an approved WhatsApp template message to an external contact. The approval names the recipient and template. |
 
 ## Not destructive (no approval)
 
@@ -33,7 +35,7 @@ or sends something to a third party that cannot be recalled. The list lives in
 - Documents (produce new artifacts): `docx_build`, `docx_import`, `docx_inspect`, `docx_read`, `docx_edit`, `docx_pdf`, `xlsx_build`, `xlsx_import`, `xlsx_inspect`, `xlsx_read`, `xlsx_edit`, `xlsx_analyze`, `timesheet_analyze`, `pptx_import`, `pptx_inspect`, `pptx_edit`, `pptx_pdf`, `pdf_inspect`, `pdf_edit`, `pdf_merge`, `deck_build`, `document_index`, `rag_search`.
 - Local folders (read only): `local_list`, `local_search`, `local_stat`, `local_read`, `local_import`. They only work while the desktop is online and only inside folders the user allowed.
 - Image tools (image_inspect, image_resize, image_convert): run without approval; results are new artifacts with metadata removed.
-- Read-only connectors: `google_drive_list`, `google_sheets_read`, `google_calendar_list_events`, `gmail_list_messages`, `outlook_list_messages`, `outlook_calendar_list_events`, `notion_query_database`, `agentmail_inboxes_list`, `onedrive_list`, `github_search_repos`, `github_list_issues`, `github_get_issue`, `github_get_file`, `todoist_list_tasks`, `slack_list_channels`, `slack_read_channel`, `exa_search`, `exa_get_contents`.
+- Read-only connectors: `google_drive_list`, `google_sheets_read`, `google_calendar_list_events`, `gmail_list_messages`, `outlook_list_messages`, `outlook_calendar_list_events`, `notion_query_database`, `agentmail_inboxes_list`, `onedrive_list`, `github_search_repos`, `github_list_issues`, `github_get_issue`, `github_get_file`, `todoist_list_tasks`, `slack_list_channels`, `slack_read_channel`, `whatsapp_phone_info`, `whatsapp_list_templates`, `exa_search`, `exa_get_contents`.
 - Orchestration: `delegate`, `team_ask`, `team_reply`, `skill_list`, `skill_search`, `skill_load`.
 - Fleet reads (v0.50, `main` only, audited): `bot_list`, `bot_read`, `model_list`, `handoff_status`. `model_list` shows accounts as id, label and state only.
 - Chat cards: `ask_user` (asks the owner a question in the chat; it sends nothing outside SeraBot and returns at once). See [API](api.md#chat-cards-023).

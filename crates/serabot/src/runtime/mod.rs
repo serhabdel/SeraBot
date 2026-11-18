@@ -14,7 +14,7 @@
 //! slot when the user submitted it. Admin-configured scheduled routines are
 //! server work and are likewise not charged to the user's request budget.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -202,6 +202,26 @@ pub struct Runtime {
     /// Turn ids the owner asked to stop. The turn loop checks this between
     /// model and tool steps; a marked turn never starts another step.
     stop_requests: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Per-turn cancellation tokens fired by `request_stop` / `request_stop_task`
+    /// so in-flight model/compaction calls abort immediately without waiting for
+    /// upstream timeouts.
+    stop_tokens: Arc<std::sync::Mutex<HashMap<String, CancellationToken>>>,
+    /// Task ids whose stop arrived while claimed before the turn row was inserted.
+    stop_tasks: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+pub(super) struct TurnStopGuard {
+    turn_id: String,
+    tokens: Arc<std::sync::Mutex<HashMap<String, CancellationToken>>>,
+}
+
+impl Drop for TurnStopGuard {
+    fn drop(&mut self) {
+        self.tokens
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.turn_id);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,6 +305,8 @@ impl Runtime {
             memory,
             extract_gate: Arc::new(extract::ExtractGate::default()),
             stop_requests: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            stop_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            stop_tasks: Arc::new(std::sync::Mutex::new(HashSet::new())),
         })
     }
 
@@ -294,32 +316,117 @@ impl Runtime {
         &self.memory
     }
 
-    /// Ask the acting user's running turns in one conversation to stop.
-    /// Each running turn is marked; its loop ends at the next checkpoint with
-    /// a "Stopped." reply and never starts another model or tool step. Only
-    /// the caller's own turns are marked. Returns how many were marked.
+    /// Ask the acting user's running or pending turns in one conversation to
+    /// stop immediately: in-flight model calls are cancelled, queued/parked
+    /// tasks are cancelled in the database, and any in-flight turn ends at its
+    /// next safe point with `"Stopped."`. Returns how many turns/tasks were
+    /// stopped or signalled.
     pub fn request_stop(&self, user_id: &str, conversation_id: &str) -> Result<usize> {
         validate_conversation_id(conversation_id)?;
+        let mut count = self
+            .store
+            .cancel_pending_conversation_tasks(user_id, conversation_id)?;
         let turn_ids = self.store.running_turn_ids(user_id, conversation_id)?;
-        let mut marks = self
-            .stop_requests
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        marks.extend(turn_ids.iter().cloned());
-        Ok(turn_ids.len())
+        if !turn_ids.is_empty() {
+            {
+                let mut marks = self
+                    .stop_requests
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                marks.extend(turn_ids.iter().cloned());
+            }
+            let tokens: Vec<CancellationToken> = {
+                let map = self
+                    .stop_tokens
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                turn_ids
+                    .iter()
+                    .filter_map(|id| map.get(id).cloned())
+                    .collect()
+            };
+            for token in tokens {
+                token.cancel();
+            }
+            count += turn_ids.len();
+        }
+        let early_tasks = self
+            .store
+            .running_task_ids_without_turn(user_id, conversation_id)?;
+        if !early_tasks.is_empty() {
+            let mut pending_tasks = self
+                .stop_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for task_id in &early_tasks {
+                if pending_tasks.insert(task_id.clone()) {
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
     }
 
     /// Ask the acting user's running turn of one task (a subagent's child)
-    /// to stop, with the same checkpoint rules as `request_stop`. Returns how
-    /// many turns were marked.
+    /// to stop immediately. Returns how many turns were marked.
     pub fn request_stop_task(&self, user_id: &str, task_id: &str) -> Result<usize> {
         let turn_ids = self.store.running_turn_ids_for_task(user_id, task_id)?;
-        let mut marks = self
-            .stop_requests
+        if !turn_ids.is_empty() {
+            {
+                let mut marks = self
+                    .stop_requests
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                marks.extend(turn_ids.iter().cloned());
+            }
+            let tokens: Vec<CancellationToken> = {
+                let map = self
+                    .stop_tokens
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                turn_ids
+                    .iter()
+                    .filter_map(|id| map.get(id).cloned())
+                    .collect()
+            };
+            for token in tokens {
+                token.cancel();
+            }
+            return Ok(turn_ids.len());
+        }
+        if let Ok(task) = self.store.get_task(user_id, task_id)
+            && matches!(task.status.as_str(), "running" | "queued" | "waiting_model")
+        {
+            self.stop_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(task_id.to_owned());
+            return Ok(1);
+        }
+        Ok(0)
+    }
+
+    pub(super) fn register_stop_token(&self, turn_id: &str) -> (CancellationToken, TurnStopGuard) {
+        let token = CancellationToken::new();
+        if self.stop_requested(turn_id) {
+            token.cancel();
+        }
+        self.stop_tokens
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        marks.extend(turn_ids.iter().cloned());
-        Ok(turn_ids.len())
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(turn_id.to_owned(), token.clone());
+        let guard = TurnStopGuard {
+            turn_id: turn_id.to_owned(),
+            tokens: Arc::clone(&self.stop_tokens),
+        };
+        (token, guard)
+    }
+
+    pub(super) fn take_task_stop(&self, task_id: &str) -> bool {
+        self.stop_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(task_id)
     }
 
     fn stop_requested(&self, turn_id: &str) -> bool {
@@ -331,6 +438,10 @@ impl Runtime {
 
     fn clear_stop(&self, turn_id: &str) {
         self.stop_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(turn_id);
+        self.stop_tokens
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(turn_id);

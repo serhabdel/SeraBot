@@ -50,12 +50,13 @@ pub fn LogsView(session: Signal<Session>) -> Element {
     let mut query = use_signal(|| session.read().logs_query.clone());
     let mut wrap = use_signal(|| false);
     let mut copied_all = use_signal(|| false);
-    let (entries, supported, loaded) = {
+    let (entries, supported, loaded, logs_error) = {
         let state = session.read();
         (
             state.state.logs.clone(),
             state.state.logs_supported,
             state.state.logs_loaded,
+            state.state.logs_error.clone(),
         )
     };
     let level = session.read().logs_level.clone();
@@ -220,6 +221,17 @@ pub fn LogsView(session: Signal<Session>) -> Element {
                                 div { key: "{n}", class: "skeleton logs-skeleton-row" }
                             }
                         }
+                    } else if let Some(err) = logs_error.as_deref().filter(|_| entries.is_empty()) {
+                        div { class: "empty logs-empty", role: "alert",
+                            span { class: "empty-icon", Icon { name: "alert", size: 20 } }
+                            h2 { class: "empty-title", "Could not load logs" }
+                            p { class: "empty-text", "{err}" }
+                            button {
+                                class: "btn ghost sm",
+                                onclick: move |_| session.write().refresh_logs(),
+                                "Retry"
+                            }
+                        }
                     } else if entries.is_empty() {
                         div { class: "empty logs-empty",
                             span { class: "empty-icon", Icon { name: "logs", size: 20 } }
@@ -234,6 +246,9 @@ pub fn LogsView(session: Signal<Session>) -> Element {
                             }
                         }
                     } else if filtered.is_empty() {
+                        if let Some(err) = logs_error.as_deref() {
+                            div { class: "banner err", role: "alert", "{err}" }
+                        }
                         div { class: "empty logs-empty",
                             span { class: "empty-icon", Icon { name: "search", size: 20 } }
                             h2 { class: "empty-title", "No lines match these filters" }
@@ -248,6 +263,9 @@ pub fn LogsView(session: Signal<Session>) -> Element {
                             }
                         }
                     } else {
+                        if let Some(err) = logs_error.as_deref() {
+                            div { class: "banner err", role: "alert", "{err}" }
+                        }
                         for (index, entry) in filtered.into_iter().enumerate() {
                             LogRow { key: "{index}", entry: entry.clone() }
                         }

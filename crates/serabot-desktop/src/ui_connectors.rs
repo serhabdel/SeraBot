@@ -17,7 +17,7 @@ use serabot_desktop::ConnectorStatus;
 use serabot_desktop::connector_card::{
     CardState, DEFAULT_ADMIN_HINT, GOOGLE_CONSOLE_URL, GOOGLE_SETUP_STEPS, NOTION_SHARE_HINT,
     connector_card_state, editable_roles, is_internal_role, legacy_connected, legacy_tone,
-    supports_sign_in, token_help,
+    pack_whatsapp_token, supports_sign_in, token_help,
 };
 use serabot_desktop::integrations::{connector_blurb, connector_title};
 use serabot_desktop::session::Session;
@@ -193,6 +193,9 @@ pub(crate) fn ConnectorCard(session: Signal<Session>, connector: ConnectorStatus
 fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element {
     let mut session = session;
     let mut token = use_signal(String::new);
+    let mut wa_phone_id = use_signal(String::new);
+    let mut wa_waba_id = use_signal(String::new);
+    let mut wa_local_err = use_signal(|| None::<String>);
     let mut confirm_action = use_signal(|| None::<&'static str>);
     let is_admin = session.read().is_admin();
     let id = connector.id.clone();
@@ -216,6 +219,15 @@ fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element
             if !token.read().is_empty() {
                 token.set(String::new());
             }
+            if !wa_phone_id.read().is_empty() {
+                wa_phone_id.set(String::new());
+            }
+            if !wa_waba_id.read().is_empty() {
+                wa_waba_id.set(String::new());
+            }
+            if wa_local_err.read().is_some() {
+                wa_local_err.set(None);
+            }
         } else {
             confirm_action.set(None);
         }
@@ -225,10 +237,40 @@ fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element
         .as_ref()
         .and_then(|personal| personal.redirect_uri.clone());
     let is_notion = id == "notion";
+    let is_whatsapp = id == "whatsapp";
     let help = token_help(&id);
     let token_label = help.map_or("Token", |help| help.label);
     let token_hint = help.map_or("", |help| help.hint);
     let testing = session.read().connector_testing.as_deref() == Some(id.as_str());
+    let can_submit_token = if is_whatsapp {
+        !wa_phone_id.read().trim().is_empty() && !token.read().trim().is_empty()
+    } else {
+        !token.read().trim().is_empty()
+    };
+    let mut submit_token = move |connector_id: &str| {
+        if busy {
+            return;
+        }
+        if connector_id == "whatsapp" {
+            match pack_whatsapp_token(&wa_phone_id(), &token(), &wa_waba_id()) {
+                Ok(packed) => {
+                    wa_local_err.set(None);
+                    session
+                        .write()
+                        .panel
+                        .connect_connector_token(connector_id, &packed);
+                }
+                Err(msg) => {
+                    wa_local_err.set(Some(msg.to_owned()));
+                }
+            }
+        } else if !token().trim().is_empty() {
+            session
+                .write()
+                .panel
+                .connect_connector_token(connector_id, &token());
+        }
+    };
     rsx! {
         div { class: "card connector-card",
             div { class: "card-head",
@@ -252,6 +294,22 @@ fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element
                 },
                 CardState::Connect { oauth, token: takes_token } => rsx! {
                     if takes_token {
+                        if is_whatsapp {
+                            div { class: "field",
+                                span { class: "field-label", "Phone Number ID" }
+                                input {
+                                    class: "input",
+                                    r#type: "text",
+                                    placeholder: "e.g. 109876543210987",
+                                    disabled: busy,
+                                    value: "{wa_phone_id}",
+                                    oninput: move |e| {
+                                        wa_phone_id.set(e.value());
+                                        wa_local_err.set(None);
+                                    },
+                                }
+                            }
+                        }
                         div { class: "field",
                             span { class: "field-label", "{token_label}" }
                             SecretField {
@@ -261,12 +319,29 @@ fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element
                                 disabled: busy,
                                 on_submit: {
                                     let id = id.clone();
-                                    move |_| {
-                                        if !busy && !token().trim().is_empty() {
-                                            session.write().panel.connect_connector_token(&id, &token());
-                                        }
-                                    }
+                                    move |_| submit_token(&id)
                                 },
+                            }
+                        }
+                        if is_whatsapp {
+                            div { class: "field",
+                                span { class: "field-label", "WhatsApp Business Account ID (optional, for templates)" }
+                                input {
+                                    class: "input",
+                                    r#type: "text",
+                                    placeholder: "e.g. 987654321098765",
+                                    disabled: busy,
+                                    value: "{wa_waba_id}",
+                                    oninput: move |e| {
+                                        wa_waba_id.set(e.value());
+                                        wa_local_err.set(None);
+                                    },
+                                }
+                            }
+                            if let Some(local_err) = wa_local_err() {
+                                div { class: "banner err", role: "alert",
+                                    span { class: "grow", "{local_err}" }
+                                }
                             }
                         }
                         if !token_hint.is_empty() {
@@ -293,12 +368,10 @@ fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element
                             button {
                                 class: "btn primary",
                                 r#type: "button",
-                                disabled: busy || token().trim().is_empty(),
+                                disabled: busy || !can_submit_token,
                                 onclick: {
                                     let id = id.clone();
-                                    move |_| {
-                                        session.write().panel.connect_connector_token(&id, &token());
-                                    }
+                                    move |_| submit_token(&id)
                                 },
                                 if busy { "Connecting…" } else { "Connect" }
                             }

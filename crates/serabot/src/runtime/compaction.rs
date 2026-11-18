@@ -403,6 +403,11 @@ impl Runtime {
         }
         let mut state: TurnState = serde_json::from_value(turn.state.clone())
             .map_err(|_| SeraError::InvalidState("stored turn state is invalid".into()))?;
+        if self.take_task_stop(&task.id) || self.stop_requested(&turn.id) {
+            return self
+                .finish_stopped(task, &turn, &state, &turn.conversation_id)
+                .await;
+        }
         self.checked_route(&user, &state.route)?;
         let fleet = self.fleet.load(&user)?;
         let bot = fleet

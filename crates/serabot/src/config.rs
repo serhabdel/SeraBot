@@ -1285,7 +1285,7 @@ fn default_composio_max_bytes() -> usize {
     256 * 1024
 }
 
-/// API bases for the per-user token connectors (GitHub, Todoist, Slack, Exa).
+/// API bases for the per-user token connectors (GitHub, Todoist, Slack, Exa, WhatsApp).
 /// Tokens are pasted by each user and sealed per user; only the bases, the
 /// timeout and the response cap live here. Bases must be HTTPS.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1298,6 +1298,8 @@ pub struct TokenConnectorsConfig {
     pub slack_api_base: String,
     #[serde(default = "default_exa_api_base")]
     pub exa_api_base: String,
+    #[serde(default = "default_whatsapp_api_base")]
+    pub whatsapp_api_base: String,
     #[serde(default = "default_token_connectors_timeout")]
     pub timeout_secs: u64,
     /// Largest provider response body read, in bytes.
@@ -1312,6 +1314,7 @@ impl Default for TokenConnectorsConfig {
             todoist_api_base: default_todoist_api_base(),
             slack_api_base: default_slack_api_base(),
             exa_api_base: default_exa_api_base(),
+            whatsapp_api_base: default_whatsapp_api_base(),
             timeout_secs: default_token_connectors_timeout(),
             max_response_bytes: default_token_connectors_max_bytes(),
         }
@@ -1325,6 +1328,7 @@ impl TokenConnectorsConfig {
             ("todoist_api_base", &self.todoist_api_base),
             ("slack_api_base", &self.slack_api_base),
             ("exa_api_base", &self.exa_api_base),
+            ("whatsapp_api_base", &self.whatsapp_api_base),
         ] {
             let url = url::Url::parse(base.trim()).map_err(|_| {
                 SeraError::Config(format!("token_connectors.{name} must be an https URL"))
@@ -1361,6 +1365,9 @@ fn default_slack_api_base() -> String {
 }
 fn default_exa_api_base() -> String {
     "https://api.exa.ai".into()
+}
+fn default_whatsapp_api_base() -> String {
+    "https://graph.facebook.com/v22.0".into()
 }
 fn default_token_connectors_timeout() -> u64 {
     30
@@ -2540,6 +2547,10 @@ const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
     "slack_list_channels",
     "slack_read_channel",
     "slack_post_message",
+    "whatsapp_phone_info",
+    "whatsapp_list_templates",
+    "whatsapp_send_message",
+    "whatsapp_send_template",
     "exa_search",
     "exa_get_contents",
     "local_list",

@@ -31,10 +31,12 @@ impl Session {
         self.start_request(Operation::Handoffs);
     }
 
-    /// Whether a reply or a subagent is running in this chat: the Stop button
-    /// stays on screen for either.
+    /// Whether a reply, pending send, or subagent is running in this chat:
+    /// the Stop button stays on screen for any of them.
     pub fn any_run_active(&self) -> bool {
-        self.main_run_active() || crate::runs::active_count(&self.state.runs.rows) > 0
+        self.main_run_active()
+            || crate::runs::active_count(&self.state.runs.rows) > 0
+            || self.has_optimistic_pending()
     }
 
     /// Whether this chat's own turn is running.
@@ -45,16 +47,15 @@ impl Session {
             .is_some_and(|task| !task.status.terminal())
     }
 
-    /// The Stop button and Esc: end this chat's own reply, or, when only
-    /// subagents are left running, ask the server to stop the chat's turns.
+    /// The Stop button and Esc: end this chat's own reply, pending send, or
+    /// any running subagents by stopping the conversation's turns cleanly.
     pub fn stop_turn_or_runs(&mut self) {
-        if self.main_run_active() {
-            self.stop_turn();
-        } else if crate::runs::active_count(&self.state.runs.rows) > 0 {
-            self.state.error = None;
-            self.start_request(Operation::StopTurn);
-            self.run_action_done();
+        if !self.any_run_active() {
+            return;
         }
+        self.state.error = None;
+        self.stop_turn();
+        self.run_action_done();
     }
 
     /// The per-run Stop.

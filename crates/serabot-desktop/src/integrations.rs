@@ -80,7 +80,7 @@ pub const SUITES: [(&str, &[&str]); 7] = [
     ),
     ("Notes and email", &["notion", "agentmail"]),
     ("Code and tasks", &["github", "todoist"]),
-    ("Messages", &["slack"]),
+    ("Messages", &["slack", "whatsapp"]),
     ("Web search", &["tavily", "firecrawl", "exa"]),
     ("Voice", &["elevenlabs"]),
 ];
@@ -108,6 +108,7 @@ pub fn connector_title(id: &str) -> String {
         "github" => "GitHub",
         "todoist" => "Todoist",
         "slack" => "Slack",
+        "whatsapp" => "WhatsApp",
         "exa" => "Exa Search",
         "agentmail" => "AgentMail",
         "tavily" => "Tavily Search",
@@ -145,6 +146,7 @@ pub fn connector_blurb(id: &str) -> &'static str {
         }
         "todoist" => "Your to-do list.",
         "slack" => "Read channels and post with your approval.",
+        "whatsapp" => "Connect WhatsApp Business Cloud API and send approved messages.",
         "agentmail" => "A mailbox for your bots.",
         "tavily" | "firecrawl" | "exa" => "Let bots search and read the web.",
         "elevenlabs" => {
@@ -174,6 +176,7 @@ pub fn suite_label_for_connector(id: &str) -> &'static str {
         "tavily" | "firecrawl" | "exa" => "Web & Research",
         "github" => "Developer",
         "slack" => "Team Chat",
+        "whatsapp" => "Messaging",
         "composio" => "Apps & Tools",
         _ => "Connector",
     }
