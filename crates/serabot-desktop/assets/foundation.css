@@ -2056,6 +2056,16 @@ details.step-more[open] > summary.step-more-summary::before {
   border-radius: 10px;
 }
 
+.composer .composer-stop.stopping {
+  width: auto;
+  padding: 0 10px;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  opacity: 0.78;
+  cursor: wait;
+}
+
 .model-bar.compact .menu-trigger {
   min-height: 28px;
   padding: 0 10px;

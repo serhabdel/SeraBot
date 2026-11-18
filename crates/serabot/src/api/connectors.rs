@@ -1184,6 +1184,25 @@ async fn connector_test_outcome(
             Err(error) => Ok((false, format!("OneDrive connection check failed: {error}"))),
         };
     }
+    if id == "whatsapp" {
+        return match state
+            .token_connectors
+            .verify_stored(&user.id, "whatsapp")
+            .await
+        {
+            Ok(None) => Ok((
+                false,
+                "No WhatsApp credentials are saved for this account. Add them, then test again."
+                    .into(),
+            )),
+            Ok(Some(Some(account))) => Ok((true, format!("Connected as {account}."))),
+            Ok(Some(None)) => Ok((
+                true,
+                "WhatsApp Business Cloud API credentials verified.".into(),
+            )),
+            Err(error) => Ok((false, error.to_string())),
+        };
+    }
     if crate::token_connectors::TokenConnectors::ids().contains(&id) {
         let personal = state.token_connectors.view(&user.id, id)?;
         return Ok(if personal.state == "connected" {
@@ -1255,7 +1274,7 @@ pub(super) fn connector_group(id: &str) -> &'static str {
         "agentmail" => "Email",
         "composio" => "Apps & tools",
         "github" | "todoist" => "Code and tasks",
-        "slack" => "Messages",
+        "slack" | "whatsapp" => "Messages",
         "exa" => "Web Research",
         _ => "Productivity",
     }

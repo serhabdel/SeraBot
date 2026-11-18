@@ -179,6 +179,20 @@ failure and wait cards, plus a motion/accessibility pass. No live provider was
 used and the desktop was not visually verified on a device. B7 worker counts
 above 2 are gated on running the load fixture on the target host.
 
+## Status after 0.57.0 (official logos, Logs fix, Immediate Stop, Chat UX polish & WhatsApp Cloud API)
+
+0.57.0 adds official Anthropic, Claude, and WhatsApp SVG logos in
+`crates/serabot-desktop/src/branding.rs`; fixes empty desktop Logs by keeping
+`RingLayer` active when the log directory is unwritable and surfacing
+`logs_error` explicitly in `ui_logs.rs`; makes Stop chat abort in-flight model
+calls, compaction, and queued/early-claimed tasks immediately via
+`CancellationToken` + `tokio::select!`; adds per-bot starter quick-chips in
+`chat_feed.rs`; and connects the `whatsapp` bot to a native per-user WhatsApp
+Business Cloud API connector (`token_connectors/whatsapp.rs`) with
+approval-gated send tools and a dedicated multi-field Integrations card.
+Tested against synthetic fixtures and `ui-check`; live Meta Graph API and
+desktop visual verification remain pending owner testing.
+
 ## Status after 0.56.0 (composer, sidebar New chat & crisp chrome, built-in 20-bot fallback)
 
 0.56.0 fixes the desktop composer self-wipe regression via generation-checked

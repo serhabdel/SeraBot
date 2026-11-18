@@ -83,19 +83,20 @@ signs in to them from the Marketplace, and their tokens are sealed per member.
 See [Marketplace](marketplace.md). They are verified only against synthetic
 fixtures until the owner runs them.
 
-## Personal token connectors (GitHub, Todoist, Slack, Exa)
+## Personal token connectors (GitHub, Todoist, Slack, WhatsApp, Exa)
 
 These connect with a token each user pastes in the console, like Notion. The
 server verifies it with one cheap read, seals it in the per-user credential
 store, and never shows it again. Tools always run as the acting user with that
 user's own token; a user who has not connected gets a "connect it first" answer
 and never anyone else's access. The API bases live under `[token_connectors]`
-(`github_api_base`, `todoist_api_base`, `slack_api_base`, `exa_api_base`,
-`timeout_secs`, `max_response_bytes`). Bases must be HTTPS. Every tool goes
-through the gateway, results are untrusted data, responses are size capped, and
-the token is redacted from all output. A `401` shows "<name> rejected your
-token" without echoing it. Writes ask for approval and the approval is bound
-to where the effect lands (the repository, the channel, the task).
+(`github_api_base`, `todoist_api_base`, `slack_api_base`, `whatsapp_api_base`,
+`exa_api_base`, `timeout_secs`, `max_response_bytes`). Bases must be HTTPS.
+Every tool goes through the gateway, results are untrusted data, responses are
+size capped, and the token is redacted from all output. A `401` shows
+"<name> rejected your token" without echoing it. Writes ask for approval and the
+approval is bound to where the effect lands (the repository, the channel, the
+recipient phone number, the task).
 
 ### GitHub
 
@@ -169,6 +170,26 @@ messages (revoked token, bot not in the channel, missing scope with the scope
 name). Channel ids (`C…` or `G…`) are validated before any request, history is
 capped at 50 messages per call, and posting refuses `@channel`, `@here` and
 `@everyone` mentions and turns link previews off.
+
+### WhatsApp (Meta Business Cloud API, v0.57)
+
+Tools: `whatsapp_phone_info`, `whatsapp_list_templates` (read) and
+`whatsapp_send_message`, `whatsapp_send_template` (write, approval bound to the
+recipient phone number and template/message).
+
+1. Open <https://developers.facebook.com/apps> and select your Meta app with
+   **WhatsApp -> API Setup**.
+2. Copy your **Phone number ID** and a permanent **System User Access Token**
+   from Meta Business Settings (temporary 24h test tokens work for sandbox
+   testing too). Optionally copy your **WhatsApp Business Account ID (WABA ID)**
+   to list templates with `whatsapp_list_templates`.
+3. In Integrations -> Messages -> **WhatsApp**, enter the Phone Number ID and
+   Access Token (plus optional WABA ID). Connecting verifies the number against
+   Meta Graph API `v22.0` (`GET /{phone_number_id}`) and seals the access token
+   per user in `user_secrets`.
+4. Pressing **Test** runs a live read-only check against Meta Graph API for your
+   connected Phone Number ID.
+
 ### Exa (web search)
 
 Tools: `exa_search`, `exa_get_contents` (both read). Exa sits with Tavily and

@@ -94,6 +94,7 @@ pub fn tool_heading(tool: &str) -> String {
         t if t.starts_with("elevenlabs_") || t.starts_with("audio_") => "ElevenLabs",
         t if t.starts_with("browser_") => "Browser",
         t if t.starts_with("slack_") => "Slack",
+        t if t.starts_with("whatsapp_") => "WhatsApp",
         t if t.starts_with("github_") => "GitHub",
         t if t.starts_with("outlook_") || t.starts_with("agentmail_") => "Email",
         t if t.starts_with("onedrive_") => "OneDrive",

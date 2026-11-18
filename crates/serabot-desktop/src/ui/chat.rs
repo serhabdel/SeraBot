@@ -246,7 +246,10 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         )
     };
     // Stop stays on screen while the reply or any subagent runs.
-    let any_run_active = session.read().any_run_active();
+    let (any_run_active, stopping) = {
+        let s = session.read();
+        (s.any_run_active(), s.state.stopping)
+    };
     let queued_count = session.read().queue.len();
     let (steps, steps_summary, steps_dropped, steps_attention, sending, history_ready) = {
         let state = session.read();
@@ -894,6 +897,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     overlay.set(Overlay::Shortcuts);
                 } else if event.key() == Key::Escape
                     && !command
+                    && !stopping
                     && any_run_active
                     && !search_open()
                     && !show_mention
@@ -1078,11 +1082,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                             }
                             if accepts {
                                 div { class: "starter-quick-chips", role: "group", "aria-label": "Quick actions",
-                                    for text in [
-                                        "Check today's tasks & calendar",
-                                        "List my OneDrive files",
-                                        "Ask Vault for a secret safely",
-                                    ] {
+                                    for text in chat_feed::quick_chips(active_bot.as_deref()).iter().copied() {
                                         button {
                                             key: "{text}",
                                             class: "starter-quick-chip",
@@ -1247,13 +1247,19 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     }
                     if sending && live_task.is_none() {
                         div { class: "activity", role: "status",
-                            span { class: "shimmer", "Sending…" }
+                            span { class: "shimmer", if stopping { "Stopping\u{2026}" } else { "Sending\u{2026}" } }
                         }
                     }
                     if live_task.is_some() {
                         div { class: "activity", role: "status", "aria-live": "polite",
                             span { class: "working",
-                                span { class: "working-text", "{working}" }
+                                span { class: "working-text",
+                                    if stopping {
+                                        "Stopping\u{2026}"
+                                    } else {
+                                        "{working}"
+                                    }
+                                }
                                 span { class: "working-dots", "aria-hidden": "true",
                                     span {}
                                     span {}
@@ -1630,6 +1636,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                 }
                                 // Esc stops a running reply, like the Stop button.
                                 if event.key() == Key::Escape
+                                    && !stopping
                                     && chat_compose::escape_stops_run(any_run_active, awaiting_approval)
                                 {
                                     event.prevent_default();
@@ -1805,11 +1812,15 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                         }
                                     }
                                     button {
-                                        class: "btn stop-btn composer-stop",
-                                        title: "Stop (Esc)",
-                                        "aria-label": "Stop generating",
+                                        class: if stopping { "btn stop-btn composer-stop stopping" } else { "btn stop-btn composer-stop" },
+                                        title: if stopping { "Stopping reply\u{2026}" } else { "Stop (Esc)" },
+                                        "aria-label": if stopping { "Stopping reply" } else { "Stop generating" },
+                                        disabled: stopping,
                                         onclick: move |_| session.write().stop_turn_or_runs(),
                                         Icon { name: "stop", size: 14 }
+                                        if stopping {
+                                            span { "Stopping\u{2026}" }
+                                        }
                                     }
                                 } else {
                                     button {
@@ -2545,8 +2556,8 @@ pub(super) fn ModelBar(
                             div { key: "{item_value}",
                             if item_value == LOCAL_ACP_VALUE {
                                 div { class: "pop-group model-group",
-                                    Icon { name: "code", size: 15 }
-                                    span { "Local · Desktop (ACP)" }
+                                    BrandLogo { brand: "claude".to_owned(), size: 16 }
+                                    span { "Local \u{00b7} Desktop (ACP)" }
                                 }
                             } else if let Some((brand, name)) = header {
                                 div { class: "pop-group model-group",

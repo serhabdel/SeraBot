@@ -55,6 +55,8 @@ pub const DESTRUCTIVE_TOOLS: &[&str] = &[
     "todoist_add_task",
     "todoist_complete_task",
     "slack_post_message",
+    "whatsapp_send_message",
+    "whatsapp_send_template",
 ];
 
 /// Audit reason recorded when the owner's YOLO setting approved a call.
@@ -3041,6 +3043,8 @@ mod tests {
             "todoist_add_task",
             "todoist_complete_task",
             "slack_post_message",
+            "whatsapp_send_message",
+            "whatsapp_send_template",
         ] {
             assert!(is_destructive_tool(name), "{name}");
         }
@@ -3055,6 +3059,8 @@ mod tests {
             "todoist_list_tasks",
             "slack_list_channels",
             "slack_read_channel",
+            "whatsapp_phone_info",
+            "whatsapp_list_templates",
             "exa_search",
             "exa_get_contents",
             "memory_save",

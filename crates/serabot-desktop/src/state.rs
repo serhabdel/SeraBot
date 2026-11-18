@@ -148,6 +148,8 @@ pub struct State {
     /// The last cards read failed; the cards on screen may be stale.
     pub cards_degraded: bool,
     pub task: Option<Task>,
+    /// True once the user clicked Stop and the server has not yet finished halting.
+    pub stopping: bool,
     /// Live steps of the latest turn, from the event stream.
     pub activity: crate::activity::Activity,
     /// Which bots are working now (rail, header and room rings).
@@ -218,6 +220,8 @@ pub struct State {
     /// False once the server answers 404 on `/v1/logs`: the tab then says the
     /// route is not available instead of retrying forever.
     pub logs_supported: bool,
+    /// Plain error message when `/v1/logs` fails (for example 403 for non-admins).
+    pub logs_error: Option<String>,
     /// The Workflows tab (0.29.0): latest visibility bundle.
     pub workflows: crate::workflows::WorkflowsSnapshot,
     pub workflows_loaded: bool,
@@ -334,6 +338,7 @@ impl Default for State {
             older_error: None,
             cards_degraded: false,
             task: None,
+            stopping: false,
             activity: Default::default(),
             working: Default::default(),
             approvals: Vec::new(),
@@ -380,6 +385,7 @@ impl Default for State {
             logs: Vec::new(),
             logs_loaded: false,
             logs_supported: true,
+            logs_error: None,
             workflows: crate::workflows::WorkflowsSnapshot::default(),
             workflows_loaded: false,
             workflows_error: None,
@@ -706,7 +712,12 @@ impl State {
                     catalog.selection = selection;
                 }
             }
-            Reply::Task(task) => self.task = Some(task),
+            Reply::Task(task) => {
+                if task.status.terminal() {
+                    self.stopping = false;
+                }
+                self.task = Some(task);
+            }
             Reply::Approvals(approvals) => {
                 self.approvals = approvals;
                 self.approvals_loaded = true;
@@ -926,6 +937,7 @@ impl State {
             }
             Reply::MediaJobs(jobs) => self.media_jobs = jobs,
             Reply::Logs(entries) => {
+                self.logs_error = None;
                 match entries {
                     Some(entries) => {
                         self.logs = entries;
@@ -2239,5 +2251,40 @@ mod tests {
         state.clear_unread("dir:analyst");
         assert_eq!(state.conversations[0].unread_count, 0);
         assert_eq!(state.conversations[1].unread_count, 6);
+    }
+
+    #[test]
+    fn terminal_task_clears_stopping_and_logs_reply_clears_logs_error() {
+        let mut state = State::default();
+        let scope = state.scope.clone();
+        state.stopping = true;
+        state.logs_error = Some("Admin access is required to view server logs.".into());
+
+        state.receive(
+            &scope,
+            Reply::Task(Task {
+                id: "t1".into(),
+                kind: "turn".into(),
+                bot: "main".into(),
+                status: TaskStatus::Running,
+            }),
+        );
+        assert!(state.stopping);
+
+        state.receive(
+            &scope,
+            Reply::Task(Task {
+                id: "t1".into(),
+                kind: "turn".into(),
+                bot: "main".into(),
+                status: TaskStatus::Cancelled,
+            }),
+        );
+        assert!(!state.stopping);
+
+        state.receive(&scope, Reply::Logs(Some(Vec::new())));
+        assert!(state.logs_error.is_none());
+        assert!(state.logs_loaded);
+        assert!(state.logs_supported);
     }
 }

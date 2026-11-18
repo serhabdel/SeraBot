@@ -2989,7 +2989,8 @@ impl Store {
     pub fn running_turn_ids(&self, user_id: &str, conversation_id: &str) -> Result<Vec<String>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id FROM turns WHERE user_id = ?1 AND conversation_id = ?2 AND status = 'active'",
+            "SELECT id FROM turns
+             WHERE user_id = ?1 AND conversation_id = ?2 AND status IN ('active', 'continuing')",
         )?;
         let ids = statement
             .query_map(params![user_id, conversation_id], |row| row.get(0))?
@@ -3002,12 +3003,263 @@ impl Store {
     pub fn running_turn_ids_for_task(&self, user_id: &str, task_id: &str) -> Result<Vec<String>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id FROM turns WHERE user_id = ?1 AND task_id = ?2 AND status = 'active'",
+            "SELECT id FROM turns
+             WHERE user_id = ?1 AND task_id = ?2 AND status IN ('active', 'continuing')",
         )?;
         let ids = statement
             .query_map(params![user_id, task_id], |row| row.get(0))?
             .collect::<rusqlite::Result<Vec<String>>>()?;
         Ok(ids)
+    }
+
+    /// Ids of the acting user's `'running'` tasks in `conversation_id` that do
+    /// not yet have a row in `turns`.
+    pub fn running_task_ids_without_turn(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<String>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT t.id FROM tasks t
+             WHERE t.user_id = ?1
+               AND t.kind IN ('turn', 'resume')
+               AND t.status = 'running'
+               AND NOT EXISTS (SELECT 1 FROM turns u WHERE u.task_id = t.id AND u.user_id = ?1)
+               AND (
+                   (t.kind = 'turn' AND json_extract(t.payload_json, '$.conversation_id') = ?2)
+                   OR (t.kind = 'resume' AND EXISTS (
+                       SELECT 1 FROM turns u2
+                       WHERE u2.id = json_extract(t.payload_json, '$.turn_id')
+                         AND u2.user_id = ?1
+                         AND u2.conversation_id = ?2
+                   ))
+               )",
+        )?;
+        let ids = statement
+            .query_map(params![user_id, conversation_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(ids)
+    }
+
+    /// Cancel any of the acting user's queued or model-waiting `turn` / `resume`
+    /// tasks belonging to `conversation_id`. Returns how many tasks were cancelled.
+    pub fn cancel_pending_conversation_tasks(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<usize> {
+        let candidates: Vec<(String, String, String, String)> = {
+            let connection = self.connection()?;
+            let mut statement = connection.prepare(
+                "SELECT t.id, t.kind, t.bot, t.payload_json
+                 FROM tasks t
+                 WHERE t.user_id = ?1
+                   AND t.kind IN ('turn', 'resume')
+                   AND t.status IN ('queued', 'waiting_model')
+                   AND (
+                       EXISTS (
+                           SELECT 1 FROM turns u
+                           WHERE u.task_id = t.id AND u.user_id = ?1 AND u.conversation_id = ?2
+                       )
+                       OR (t.kind = 'turn' AND json_extract(t.payload_json, '$.conversation_id') = ?2)
+                       OR (t.kind = 'resume' AND EXISTS (
+                           SELECT 1 FROM turns u2
+                           WHERE u2.id = json_extract(t.payload_json, '$.turn_id')
+                             AND u2.user_id = ?1
+                             AND u2.conversation_id = ?2
+                       ))
+                   )",
+            )?;
+            let rows = statement.query_map(params![user_id, conversation_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut cancelled = 0usize;
+        for (task_id, kind, bot, payload_json) in candidates {
+            let changed = {
+                let connection = self.connection()?;
+                connection.execute(
+                    "UPDATE tasks
+                     SET status='cancelled', last_error='stopped by owner',
+                         lease_until=NULL, worker_id=NULL, updated_at=?1
+                     WHERE id=?2 AND user_id=?3 AND status IN ('queued','waiting_model')",
+                    params![now_string(), task_id, user_id],
+                )?
+            };
+            if changed != 1 {
+                continue;
+            }
+            cancelled += 1;
+            self.finalize_cancelled_pending_turn(
+                user_id,
+                conversation_id,
+                &task_id,
+                &kind,
+                &bot,
+                &payload_json,
+            )?;
+        }
+        Ok(cancelled)
+    }
+
+    fn finalize_cancelled_pending_turn(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        task_id: &str,
+        kind: &str,
+        bot: &str,
+        payload_json: &str,
+    ) -> Result<()> {
+        let payload: Value = serde_json::from_str(payload_json).unwrap_or(Value::Null);
+        if let Some(existing_turn) = self.get_turn_by_task(user_id, task_id)? {
+            self.update_turn(user_id, &existing_turn.id, "stopped", &existing_turn.state)?;
+            let speaker =
+                crate::orchestration::assistant_speaker(conversation_id, &existing_turn.bot, false);
+            let _ = self.append_message_named(
+                user_id,
+                conversation_id,
+                Some(&existing_turn.id),
+                Role::Assistant,
+                "Stopped.",
+                speaker,
+            );
+            let _ = self.record_audit(
+                user_id,
+                "turn.stopped",
+                None,
+                Some(task_id),
+                None,
+                None,
+                None,
+                Some(&serde_json::json!({"turn_id": existing_turn.id, "pending": true})),
+            );
+            let _ = self.append_event(
+                user_id,
+                "turn.completed",
+                &serde_json::json!({"turn_id": existing_turn.id, "task_id": task_id, "stopped": true}),
+            );
+            return Ok(());
+        }
+
+        if kind == "turn" {
+            let is_owner = payload.get("handoff").is_none_or(Value::is_null)
+                && payload.get("team").is_none_or(Value::is_null)
+                && payload.get("source").and_then(Value::as_str) != Some("auto_resume_followup");
+            if is_owner {
+                if let Ok(turn) = self.create_turn(
+                    user_id,
+                    task_id,
+                    bot,
+                    conversation_id,
+                    &serde_json::json!({}),
+                ) {
+                    if let Some(text) = payload.get("text").and_then(Value::as_str) {
+                        let _ = self.append_message(
+                            user_id,
+                            conversation_id,
+                            Some(&turn.id),
+                            Role::User,
+                            text,
+                        );
+                    }
+                    if let Some(atts) = payload.get("attachments").and_then(Value::as_array) {
+                        let ids: Vec<String> = atts
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect();
+                        if !ids.is_empty() {
+                            let _ = self.attach_chat_attachments_to_turn(user_id, &turn.id, &ids);
+                        }
+                    }
+                    let speaker =
+                        crate::orchestration::assistant_speaker(conversation_id, bot, false);
+                    let _ = self.append_message_named(
+                        user_id,
+                        conversation_id,
+                        Some(&turn.id),
+                        Role::Assistant,
+                        "Stopped.",
+                        speaker,
+                    );
+                    let _ = self.update_turn(user_id, &turn.id, "stopped", &serde_json::json!({}));
+                    let _ = self.record_audit(
+                        user_id,
+                        "turn.stopped",
+                        None,
+                        Some(task_id),
+                        None,
+                        None,
+                        None,
+                        Some(&serde_json::json!({"turn_id": turn.id, "queued": true})),
+                    );
+                    let _ = self.append_event(
+                        user_id,
+                        "turn.completed",
+                        &serde_json::json!({"turn_id": turn.id, "task_id": task_id, "stopped": true}),
+                    );
+                }
+            } else {
+                let _ = self.record_audit(
+                    user_id,
+                    "turn.stopped",
+                    None,
+                    Some(task_id),
+                    None,
+                    None,
+                    None,
+                    Some(&serde_json::json!({"task_id": task_id, "queued": true})),
+                );
+                let _ = self.append_event(
+                    user_id,
+                    "turn.completed",
+                    &serde_json::json!({"task_id": task_id, "stopped": true}),
+                );
+            }
+            return Ok(());
+        }
+
+        if kind == "resume"
+            && let Some(tid) = payload.get("turn_id").and_then(Value::as_str)
+            && let Ok(turn) = self.get_turn(user_id, tid)
+        {
+            let _ = self.update_turn(user_id, tid, "stopped", &turn.state);
+            let speaker =
+                crate::orchestration::assistant_speaker(conversation_id, &turn.bot, false);
+            let _ = self.append_message_named(
+                user_id,
+                conversation_id,
+                Some(tid),
+                Role::Assistant,
+                "Stopped.",
+                speaker,
+            );
+            let _ = self.record_audit(
+                user_id,
+                "turn.stopped",
+                None,
+                Some(task_id),
+                None,
+                None,
+                None,
+                Some(&serde_json::json!({"turn_id": tid, "pending": true})),
+            );
+            let _ = self.append_event(
+                user_id,
+                "turn.completed",
+                &serde_json::json!({"turn_id": tid, "task_id": task_id, "stopped": true}),
+            );
+        }
+        Ok(())
     }
 
     pub fn update_turn(&self, user_id: &str, id: &str, status: &str, state: &Value) -> Result<()> {

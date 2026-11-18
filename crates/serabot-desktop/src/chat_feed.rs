@@ -335,6 +335,61 @@ pub fn suggestions(bot_id: Option<&str>) -> &'static [&'static str] {
     }
 }
 
+const MAIN_QUICK_CHIPS: &[&str] = &[
+    "Check today's tasks & calendar",
+    "List my OneDrive files",
+    "Ask Vault for a secret safely",
+];
+const WHATSAPP_QUICK_CHIPS: &[&str] = &[
+    "Check my WhatsApp number status",
+    "List approved WhatsApp templates",
+    "Send a WhatsApp update",
+];
+const ANALYST_QUICK_CHIPS: &[&str] = &[
+    "Analyze my uploaded spreadsheet",
+    "Compare monthly totals",
+    "Flag missing ledger rows",
+];
+const MAKER_QUICK_CHIPS: &[&str] = &[
+    "Create an executive PDF brief",
+    "Build a presentation deck",
+    "Format a clean summary doc",
+];
+const WATCHER_QUICK_CHIPS: &[&str] = &[
+    "Check my tracked deadlines",
+    "Monitor a webpage for changes",
+    "Show today's reminders",
+];
+const COMPTABLE_QUICK_CHIPS: &[&str] = &[
+    "Review bank reconciliation",
+    "Check invoice & TVA totals",
+    "Summarize payroll entries",
+];
+const RESEARCHER_QUICK_CHIPS: &[&str] = &[
+    "Compare sources with citations",
+    "Fact-check a claim",
+    "Summarize recent news on a topic",
+];
+const GENERAL_QUICK_CHIPS: &[&str] = &[
+    "Summarize an attached file",
+    "Break this goal into next steps",
+    "Draft a concise message",
+];
+
+/// Short action chips shown above starter prompts in an empty chat, tailored to the open bot.
+pub fn quick_chips(bot_id: Option<&str>) -> &'static [&'static str] {
+    match bot_id {
+        Some("main") | None => MAIN_QUICK_CHIPS,
+        Some("whatsapp") => WHATSAPP_QUICK_CHIPS,
+        Some("analyst") | Some("auditor") => ANALYST_QUICK_CHIPS,
+        Some("maker") | Some("writer") => MAKER_QUICK_CHIPS,
+        Some("watcher") | Some("planner") => WATCHER_QUICK_CHIPS,
+        Some("comptable") => COMPTABLE_QUICK_CHIPS,
+        Some("researcher") | Some("markets") => RESEARCHER_QUICK_CHIPS,
+        Some(_) => GENERAL_QUICK_CHIPS,
+    }
+}
+
 /// Library artifacts grouped by the assistant message of the turn that
 /// produced them, plus any artifacts from an in-progress turn (or a
 /// conversation with no assistant reply yet).

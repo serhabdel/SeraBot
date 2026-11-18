@@ -2,7 +2,7 @@
 
 Each PNG is the vendor's own icon, fetched from the vendor's official domain (or the vendor's CDN named in its own page markup) and resized to 64x64 with transparent padding. The logos are trademarks of their owners and are used only to identify the integration. SeraBot is not affiliated with or endorsed by them.
 
-`outlook.png` also serves Outlook Calendar and `minimax.png` also serves MiniMax (China). Muse Code, OpenAI-compatible and Custom belong to no vendor and use neutral inline SVGs in `src/branding.rs`.
+`outlook.png` also serves Outlook Calendar and `minimax.png` also serves MiniMax (China). Anthropic, Claude, and WhatsApp use clean vector SVG marks in `src/branding.rs`. Muse Code, OpenAI-compatible and Custom belong to no vendor and use neutral inline SVGs in `src/branding.rs`.
 
 | File | Source URL |
 |---|---|

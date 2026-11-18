@@ -54,10 +54,66 @@ pub fn token_help(id: &str) -> Option<TokenHelp> {
             url: EXA_HELP_URL,
             hint: "Create a key in the Exa dashboard. Connecting runs one small search to check it.",
         },
+        "whatsapp" => TokenHelp {
+            label: "Access token",
+            url: WHATSAPP_HELP_URL,
+            hint: "Enter your Phone Number ID and System User Access Token from Meta for Developers (WhatsApp \u{2192} API Setup). Add your WABA ID too if you want bots to list message templates.",
+        },
         _ => return None,
     })
 }
 
+/// Validate and pack the 2-3 WhatsApp Cloud API fields into canonical compact JSON
+/// before sending them through `connect_connector_token`.
+pub fn pack_whatsapp_token(
+    phone_number_id: &str,
+    access_token: &str,
+    waba_id: &str,
+) -> Result<String, &'static str> {
+    let phone_number_id = phone_number_id.trim();
+    if !(5..=32).contains(&phone_number_id.len())
+        || !phone_number_id.chars().all(|c| c.is_ascii_digit())
+    {
+        return Err("Phone Number ID must be 5 to 32 digits (from WhatsApp \u{2192} API Setup).");
+    }
+    let access_token = access_token.trim();
+    if access_token.len() < 16
+        || access_token
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err("Access token looks too short or contains spaces.");
+    }
+    let waba_id = waba_id.trim();
+    if !waba_id.is_empty()
+        && (!(5..=32).contains(&waba_id.len()) || !waba_id.chars().all(|c| c.is_ascii_digit()))
+    {
+        return Err("WhatsApp Business Account ID must be 5 to 32 digits when provided.");
+    }
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "phone_number_id".to_owned(),
+        serde_json::Value::String(phone_number_id.to_owned()),
+    );
+    map.insert(
+        "access_token".to_owned(),
+        serde_json::Value::String(access_token.to_owned()),
+    );
+    if !waba_id.is_empty() {
+        map.insert(
+            "waba_id".to_owned(),
+            serde_json::Value::String(waba_id.to_owned()),
+        );
+    }
+    let packed = serde_json::Value::Object(map).to_string();
+    if packed.len() > 2048 {
+        return Err("WhatsApp credentials are longer than allowed.");
+    }
+    Ok(packed)
+}
+
+/// Where a WhatsApp user creates a Meta Developer app and System User token.
+pub const WHATSAPP_HELP_URL: &str = "https://developers.facebook.com/apps";
 /// Where an Exa user creates an API key.
 pub const EXA_HELP_URL: &str = "https://dashboard.exa.ai/api-keys";
 /// Where a Slack user creates an app and copies its bot token.
@@ -270,7 +326,7 @@ mod tests {
 
     #[test]
     fn token_connectors_have_fixed_https_help_links() {
-        for id in ["notion", "github", "todoist", "slack", "exa"] {
+        for id in ["notion", "github", "todoist", "slack", "exa", "whatsapp"] {
             let help = token_help(id).expect(id);
             assert!(help.url.starts_with("https://"), "{id}");
             assert!(!help.label.is_empty() && !help.hint.is_empty(), "{id}");
@@ -484,5 +540,43 @@ mod tests {
         assert_eq!(legacy_tone(true, true), Tone::Danger);
         assert_eq!(legacy_tone(false, false), Tone::Warn);
         assert_eq!(legacy_tone(false, true), Tone::Danger);
+    }
+
+    #[test]
+    fn pack_whatsapp_token_validates_fields_and_packs_compact_json() {
+        assert!(pack_whatsapp_token("1234", "EAAG-synthetic-token-0123", "").is_err());
+        assert!(pack_whatsapp_token("abc12345", "EAAG-synthetic-token-0123", "").is_err());
+        assert!(pack_whatsapp_token("109876543210987", "short", "").is_err());
+        assert!(pack_whatsapp_token("109876543210987", "EAAG synthetic space 0123", "").is_err());
+        assert!(pack_whatsapp_token("109876543210987", "EAAG-synthetic-token-0123", "12").is_err());
+
+        let minimal =
+            pack_whatsapp_token(" 109876543210987 ", " EAAG-synthetic-token-0123 ", "   ")
+                .expect("valid minimal credentials");
+        let parsed: serde_json::Value = serde_json::from_str(&minimal).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "phone_number_id": "109876543210987",
+                "access_token": "EAAG-synthetic-token-0123"
+            })
+        );
+        assert!(!minimal.contains('\n'));
+
+        let with_waba = pack_whatsapp_token(
+            "109876543210987",
+            "EAAG-synthetic-token-0123",
+            "987654321098765",
+        )
+        .expect("valid credentials with waba");
+        let parsed: serde_json::Value = serde_json::from_str(&with_waba).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "phone_number_id": "109876543210987",
+                "access_token": "EAAG-synthetic-token-0123",
+                "waba_id": "987654321098765"
+            })
+        );
     }
 }

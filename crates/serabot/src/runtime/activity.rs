@@ -287,6 +287,11 @@ pub(super) fn describe_step(tool: &str, args: &Value, bot_label: Option<&str>) -
         "slack_list_channels" => ("mail", "Checking Slack channels".into()),
         "slack_read_channel" => ("mail", "Reading a Slack channel".into()),
         "slack_post_message" => ("mail", "Posting to Slack".into()),
+        "whatsapp_phone_info" => ("mail", "Checking WhatsApp number".into()),
+        "whatsapp_list_templates" => ("mail", "Checking WhatsApp templates".into()),
+        "whatsapp_send_message" | "whatsapp_send_template" => {
+            ("mail", "Sending a WhatsApp message".into())
+        }
         "todoist_list_tasks" => ("bolt", "Checking your tasks".into()),
         "todoist_add_task" | "todoist_complete_task" => ("bolt", "Updating your tasks".into()),
         "github_get_file" => (

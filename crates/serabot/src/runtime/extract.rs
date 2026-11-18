@@ -95,6 +95,7 @@ const UNTRUSTED_SOURCE_PREFIXES: &[&str] = &[
     "github_",
     "todoist_",
     "slack_",
+    "whatsapp_",
     "exa_",
     "notion_",
     "onedrive_",

@@ -208,6 +208,21 @@ pub const CAPABILITIES: &[Capability] = &[
             "slack_post_message",
         ],
     },
+    Capability {
+        group: "Messages",
+        needs: Needs::Connector {
+            name: "WhatsApp",
+            ids: &["whatsapp"],
+        },
+        label: "Send and check WhatsApp",
+        hint: "Check your Business number or templates. Sending a message asks you first.",
+        tools: &[
+            "whatsapp_phone_info",
+            "whatsapp_list_templates",
+            "whatsapp_send_message",
+            "whatsapp_send_template",
+        ],
+    },
     // ---- Code and tasks
     Capability {
         group: "Code and tasks",
