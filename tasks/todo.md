@@ -220,6 +220,14 @@ never merge without the owner's OK.
 - [x] Compile all 20 shipped bots/prompts and 37 shipped skills into `crates/serabot/src/shipped.rs` and merge them behind disk overrides in `load_bots_with_builtin` and `SkillCatalog::load_with_builtin`.
 - [ ] Owner: verify composer input, sidebar `+ New chat` crispness/menu, and 20-bot Marketplace catalog on Windows + upgraded server.
 
+## Release 0.58.0 — basic tools, readable attachments, projects, WhatsApp linked device
+
+- [x] Every bot gets document, OCR, audio, image, local-file and connector tools (`SHARED_TOOLS`).
+- [x] Scanned PDF attachments point to `document_index` (OCR); handoffs inherit attachments.
+- [x] Per-user project folders (`project_list`, `project_create`, `project_file`).
+- [x] rusqlite 0.39 upgrade; WhatsApp linked device (server, API, desktop card).
+- [ ] Owner: pair a spare number and verify WhatsApp live; turn on `[ocr]` and `[logging] dir`.
+
 ## Release 0.57.0 — logos, Logs fix, immediate Stop, Chat UX polish & WhatsApp Cloud API
 
 - [x] Official Anthropic (`SVG_ANTHROPIC`), Claude (`SVG_CLAUDE`), and WhatsApp (`SVG_WHATSAPP`) brand SVGs; `BrandLogo` used in Claude Agent banner and Command Palette.

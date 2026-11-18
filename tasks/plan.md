@@ -179,6 +179,14 @@ failure and wait cards, plus a motion/accessibility pass. No live provider was
 used and the desktop was not visually verified on a device. B7 worker counts
 above 2 are gated on running the load fixture on the target host.
 
+## Status after 0.58.0 (basic tools, readable attachments, projects, WhatsApp linked device)
+
+0.58.0 gives every bot the shared document, OCR, audio, image, local-file and
+connector tools, makes attached PDFs readable (OCR hint, attachments passed to
+handoffs), adds per-user project folders, and adds WhatsApp as a linked device
+of a spare number (`docs/specs/whatsapp-linked-device.md`), off by default and
+not yet verified live.
+
 ## Status after 0.57.0 (official logos, Logs fix, Immediate Stop, Chat UX polish & WhatsApp Cloud API)
 
 0.57.0 adds official Anthropic, Claude, and WhatsApp SVG logos in
