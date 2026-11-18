@@ -578,7 +578,7 @@ impl Runtime {
     /// End a turn the owner stopped. The reply is one short line; no further
     /// model or tool step runs. Tool calls that already finished keep their
     /// results, and nothing that had an external effect is retried.
-    async fn finish_stopped(
+    pub(super) async fn finish_stopped(
         &self,
         task: &Task,
         turn: &Turn,
@@ -744,18 +744,20 @@ impl Runtime {
                 // Vault values never reach a model: redact a copy of the request.
                 let outgoing = self.gateway.redact_messages(&user, &state.messages)?;
                 let may_switch = self.turn_may_switch(&user, &state);
+                let route_call = failover::RouteCall {
+                    user: &user,
+                    task_id: Some(&task.id),
+                    conversation_id,
+                    bot: &turn.bot,
+                };
+                let thinking_ref = thinking.as_deref();
                 let routed_res = tokio::select! {
                     biased;
                     _ = stop_token.cancelled() => None,
                     res = self.complete_with_failover(
-                        &failover::RouteCall {
-                            user: &user,
-                            task_id: Some(&task.id),
-                            conversation_id,
-                            bot: &turn.bot,
-                        },
+                        &route_call,
                         &route,
-                        thinking.as_deref(),
+                        thinking_ref,
                         &state.messages,
                         &outgoing,
                         &tool_specs,

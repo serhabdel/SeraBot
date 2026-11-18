@@ -448,16 +448,11 @@ pub fn install(log_dir: impl Into<PathBuf>, level: Option<&str>) -> Result<()> {
 
     let env = std::env::var("RUST_LOG").ok();
     let directives = env.as_deref().or(level);
-    let stdout_layer = tracing_subscriber::fmt::layer()
-        .with_writer(io::stdout)
-        .event_format(RedactingFormatter)
-        .with_filter(build_filter(directives));
-    // The ring buffer is filtered too, so a verbose RUST_LOG cannot push
-    // third-party noise into the console Logs tab.
-    let ring_layer = RingLayer.with_filter(build_filter(directives));
 
     // `try_init` fails only when a dispatcher is already installed (tests);
     // that is the idempotent path, not an error.
+    // The ring buffer is filtered too, so a verbose RUST_LOG cannot push
+    // third-party noise into the console Logs tab.
     if dir_error.is_none() {
         let file_writer = DailyWriter::new(dir.clone());
         let file_layer = tracing_subscriber::fmt::layer()
@@ -465,12 +460,22 @@ pub fn install(log_dir: impl Into<PathBuf>, level: Option<&str>) -> Result<()> {
             .with_ansi(false)
             .event_format(RedactingFormatter)
             .with_filter(build_filter(directives));
+        let stdout_layer = tracing_subscriber::fmt::layer()
+            .with_writer(io::stdout)
+            .event_format(RedactingFormatter)
+            .with_filter(build_filter(directives));
+        let ring_layer = RingLayer.with_filter(build_filter(directives));
         let _ = tracing_subscriber::registry()
             .with(file_layer)
             .with(stdout_layer)
             .with(ring_layer)
             .try_init();
     } else {
+        let stdout_layer = tracing_subscriber::fmt::layer()
+            .with_writer(io::stdout)
+            .event_format(RedactingFormatter)
+            .with_filter(build_filter(directives));
+        let ring_layer = RingLayer.with_filter(build_filter(directives));
         let _ = tracing_subscriber::registry()
             .with(stdout_layer)
             .with(ring_layer)

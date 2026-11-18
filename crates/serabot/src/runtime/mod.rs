@@ -395,7 +395,7 @@ impl Runtime {
             return Ok(turn_ids.len());
         }
         if let Ok(task) = self.store.get_task(user_id, task_id)
-            && task.status == crate::domain::TaskStatus::Running
+            && matches!(task.status.as_str(), "running" | "queued" | "waiting_model")
         {
             self.stop_tasks
                 .lock()
