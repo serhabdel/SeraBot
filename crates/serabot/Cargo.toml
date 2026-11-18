@@ -62,9 +62,9 @@ rand = "0.8"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "stream"] }
 rss = "2"
-rusqlite = { version = "0.31", features = ["bundled", "chrono", "serde_json"] }
+rusqlite = { version = "0.39", features = ["bundled", "chrono", "serde_json"] }
 r2d2 = "0.8"
-r2d2_sqlite = "0.24"
+r2d2_sqlite = "0.34"
 rust_decimal = { version = "1", features = ["serde"] }
 scraper = "0.20"
 secrecy = "0.8"
