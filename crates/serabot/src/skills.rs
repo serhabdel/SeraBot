@@ -83,6 +83,26 @@ impl SkillCatalog {
         })
     }
 
+    /// Load skills from `config.skills.dir` (when it exists) and merge any
+    /// built-in shipped skill packs whose `id` is absent on disk, keeping
+    /// on-disk overrides intact.
+    pub fn load_with_builtin(config: &Config) -> Result<Self> {
+        let mut catalog = Self::load(config)?;
+        for builtin in crate::shipped::BUILTIN_SKILLS {
+            if catalog.skills.contains_key(builtin.id) {
+                continue;
+            }
+            validate_skill_id(builtin.id)?;
+            let record = parse_skill_contents(
+                builtin.id,
+                builtin.pack.map(str::to_owned),
+                builtin.markdown,
+            )?;
+            catalog.skills.insert(builtin.id.to_owned(), record);
+        }
+        Ok(catalog)
+    }
+
     pub fn skill_ids(&self) -> Vec<String> {
         self.skills.keys().cloned().collect()
     }
@@ -289,6 +309,26 @@ fn collect_packs(
     Ok(())
 }
 
+fn parse_skill_contents(id: &str, pack: Option<String>, raw: &str) -> Result<SkillRecord> {
+    if raw.len() > MAX_SKILL_BYTES {
+        return Err(SeraError::Config(format!(
+            "skill '{}' exceeds the maximum size",
+            id
+        )));
+    }
+    let (frontmatter, body) = split_frontmatter(raw);
+    let (name, description) = parse_frontmatter(frontmatter, &body, id);
+    Ok(SkillRecord {
+        summary: SkillSummary {
+            id: id.to_owned(),
+            name,
+            description,
+            pack,
+        },
+        body,
+    })
+}
+
 fn parse_skill_file(
     base_dir: &Path,
     id: &str,
@@ -308,23 +348,7 @@ fn parse_skill_file(
         )));
     }
     let raw = std::fs::read_to_string(&canonical)?;
-    if raw.len() > MAX_SKILL_BYTES {
-        return Err(SeraError::Config(format!(
-            "skill '{}' exceeds the maximum size",
-            id
-        )));
-    }
-    let (frontmatter, body) = split_frontmatter(&raw);
-    let (name, description) = parse_frontmatter(frontmatter, &body, id);
-    Ok(SkillRecord {
-        summary: SkillSummary {
-            id: id.to_owned(),
-            name,
-            description,
-            pack,
-        },
-        body,
-    })
+    parse_skill_contents(id, pack, &raw)
 }
 
 fn split_frontmatter(raw: &str) -> (Option<&str>, String) {
@@ -1466,5 +1490,28 @@ mod tests {
             found >= 23,
             "expected the shipped skill packs, found {found}"
         );
+    }
+
+    #[test]
+    fn catalog_with_builtin_fills_missing_skills_and_preserves_disk_override() {
+        let base = tempfile::tempdir().unwrap();
+        let skills = base.path().join("skills");
+        write_skill(
+            &skills,
+            "ask",
+            "---\nname: Custom Ask\ndescription: Custom override\n---\n\n# Custom Ask\n\nBody.\n",
+        );
+        let config = test_config(base.path());
+        let catalog = SkillCatalog::load_with_builtin(&config).unwrap();
+        assert_eq!(catalog.skill_ids().len(), 37);
+        assert_eq!(catalog.skills["ask"].summary.name, "Custom Ask");
+        assert_eq!(
+            catalog.skills["xlsx"].summary.pack.as_deref(),
+            Some("office")
+        );
+
+        let bots = crate::config::load_bots_with_builtin(&config, &config.fleet.bots_dir).unwrap();
+        assert_eq!(bots.len(), 20);
+        catalog.validate_bot_skills(&bots).unwrap();
     }
 }

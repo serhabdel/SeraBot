@@ -2226,9 +2226,39 @@ pub(crate) fn expand_all_tools(bot: &mut BotConfig) {
     }
 }
 
-pub fn load_bots(config: &Config, dir: impl AsRef<Path>) -> Result<Vec<LoadedBot>> {
-    let dir = config.path(dir);
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)?
+fn parse_loaded_bot(label: &str, raw: &str, prompt: String) -> Result<LoadedBot> {
+    let mut bot: BotConfig =
+        toml::from_str(raw).map_err(|error| SeraError::Config(format!("{label}: {error}")))?;
+    rename_legacy_tools(&mut bot);
+    expand_all_tools(&mut bot);
+    if bot.name.is_empty() || bot.name.len() > 64 {
+        return Err(SeraError::Config(format!("{label}: invalid bot name")));
+    }
+    if !matches!(bot.trigger.as_str(), "command" | "cron" | "file") {
+        return Err(SeraError::Config(format!(
+            "{label}: trigger must be command, cron, or file"
+        )));
+    }
+    if bot.system_prompt.is_empty() {
+        return Err(SeraError::Config(format!(
+            "{label}: system_prompt is required"
+        )));
+    }
+    bot.validate_metadata()
+        .map_err(|error| SeraError::Config(format!("{label}: {error}")))?;
+    validate_route(bot.route.as_ref(), &bot.fallbacks, &bot.failover)
+        .map_err(|error| SeraError::Config(format!("{label}: {error}")))?;
+    if prompt.len() > 100_000 {
+        return Err(SeraError::Config(format!("{label}: prompt is too large")));
+    }
+    Ok(LoadedBot {
+        config: bot,
+        prompt,
+    })
+}
+
+fn load_bots_from_dir(config: &Config, dir: &Path) -> Result<Vec<LoadedBot>> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
@@ -2237,60 +2267,34 @@ pub fn load_bots(config: &Config, dir: impl AsRef<Path>) -> Result<Vec<LoadedBot
 
     let mut bots = Vec::new();
     for path in paths {
+        let label = path.display().to_string();
         let raw = std::fs::read_to_string(&path)?;
-        let mut bot: BotConfig = toml::from_str(&raw)
-            .map_err(|error| SeraError::Config(format!("{}: {error}", path.display())))?;
-        rename_legacy_tools(&mut bot);
-        expand_all_tools(&mut bot);
-        if bot.name.is_empty() || bot.name.len() > 64 {
+        let preview: BotConfig =
+            toml::from_str(&raw).map_err(|error| SeraError::Config(format!("{label}: {error}")))?;
+        if preview.system_prompt.is_empty() {
             return Err(SeraError::Config(format!(
-                "{}: invalid bot name",
-                path.display()
+                "{label}: system_prompt is required"
             )));
         }
-        if !matches!(bot.trigger.as_str(), "command" | "cron" | "file") {
-            return Err(SeraError::Config(format!(
-                "{}: trigger must be command, cron, or file",
-                path.display()
-            )));
-        }
-        if bot.system_prompt.is_empty() {
-            return Err(SeraError::Config(format!(
-                "{}: system_prompt is required",
-                path.display()
-            )));
-        }
-        bot.validate_metadata()
-            .map_err(|error| SeraError::Config(format!("{}: {error}", path.display())))?;
-        validate_route(bot.route.as_ref(), &bot.fallbacks, &bot.failover)
-            .map_err(|error| SeraError::Config(format!("{}: {error}", path.display())))?;
-        let prompt_path = config.path(&bot.system_prompt);
+        let prompt_path = config.path(&preview.system_prompt);
         let canonical = prompt_path.canonicalize().map_err(|error| {
             SeraError::Config(format!(
-                "{}: cannot resolve prompt {}: {error}",
-                path.display(),
+                "{label}: cannot resolve prompt {}: {error}",
                 prompt_path.display()
             ))
         })?;
         if !canonical.starts_with(&config.base_dir) {
             return Err(SeraError::Config(format!(
-                "{}: prompt escapes the configuration directory",
-                path.display()
+                "{label}: prompt escapes the configuration directory"
             )));
         }
         let prompt = std::fs::read_to_string(&canonical)?;
-        if prompt.len() > 100_000 {
-            return Err(SeraError::Config(format!(
-                "{}: prompt is too large",
-                path.display()
-            )));
-        }
-        bots.push(LoadedBot {
-            config: bot,
-            prompt,
-        });
+        bots.push(parse_loaded_bot(&label, &raw, prompt)?);
     }
+    Ok(bots)
+}
 
+fn finish_loaded_bots(bots: Vec<LoadedBot>) -> Result<Vec<LoadedBot>> {
     let mut names = std::collections::HashSet::new();
     for bot in &bots {
         if !names.insert(bot.config.name.clone()) {
@@ -2313,6 +2317,40 @@ pub fn load_bots(config: &Config, dir: impl AsRef<Path>) -> Result<Vec<LoadedBot
     validate_bot_fleet(&fleet)?;
 
     Ok(bots)
+}
+
+pub fn load_bots(config: &Config, dir: impl AsRef<Path>) -> Result<Vec<LoadedBot>> {
+    let dir = config.path(dir);
+    let bots = load_bots_from_dir(config, &dir)?;
+    finish_loaded_bots(bots)
+}
+
+/// Load bots from `dir` (when `dir` exists) and merge any built-in shipped
+/// templates whose `name` is absent on disk, so upgraded servers that only
+/// swap the binary still serve all shipped bots and templates. On-disk files
+/// take precedence for matching bot names.
+pub fn load_bots_with_builtin(config: &Config, dir: impl AsRef<Path>) -> Result<Vec<LoadedBot>> {
+    let dir = config.path(dir);
+    let mut bots = if dir.exists() {
+        load_bots_from_dir(config, &dir)?
+    } else {
+        Vec::new()
+    };
+    let present: std::collections::HashSet<String> =
+        bots.iter().map(|bot| bot.config.name.clone()).collect();
+    for builtin in crate::shipped::BUILTIN_BOTS {
+        if present.contains(builtin.name) {
+            continue;
+        }
+        let label = format!("builtin:bots/{}.toml", builtin.name);
+        bots.push(parse_loaded_bot(
+            &label,
+            builtin.toml,
+            builtin.prompt.to_owned(),
+        )?);
+    }
+    bots.sort_by(|a, b| a.config.name.cmp(&b.config.name));
+    finish_loaded_bots(bots)
 }
 
 /// Reject a bot row that names a tool this binary cannot register.
@@ -4069,5 +4107,37 @@ tasks_per_user_per_day = 500
         // The new keys are optional in a config file.
         let parsed: RuntimeConfig = toml::from_str("max_concurrent_turns = 3").unwrap();
         assert_eq!(parsed.max_active_children, 4);
+    }
+
+    #[test]
+    fn load_bots_with_builtin_fills_missing_shipped_bots_and_keeps_disk_overrides() {
+        let base = tempfile::tempdir().unwrap();
+        let bots_dir = base.path().join("bots");
+        let prompts_dir = base.path().join("prompts");
+        std::fs::create_dir_all(&bots_dir).unwrap();
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        // Only copy the main bot with a customized title to simulate an old server
+        // install that also edited one local bot file.
+        let custom_main = std::fs::read_to_string(repo.join("bots/main.toml"))
+            .unwrap()
+            .replace("title = \"SeraBot\"", "title = \"Custom Main\"");
+        std::fs::write(bots_dir.join("main.toml"), custom_main).unwrap();
+        std::fs::copy(repo.join("prompts/main.txt"), prompts_dir.join("main.txt")).unwrap();
+
+        let mut config = Config::default();
+        config.base_dir = base.path().canonicalize().unwrap();
+        let loaded = load_bots_with_builtin(&config, &config.fleet.bots_dir).unwrap();
+        assert_eq!(loaded.len(), 20);
+        let main = loaded.iter().find(|b| b.config.name == "main").unwrap();
+        assert_eq!(main.config.title.as_deref(), Some("Custom Main"));
+
+        // Missing bots/ directory also falls back cleanly to all 20 built-ins.
+        let empty_base = tempfile::tempdir().unwrap();
+        let mut empty_config = Config::default();
+        empty_config.base_dir = empty_base.path().canonicalize().unwrap();
+        let all_builtin =
+            load_bots_with_builtin(&empty_config, &empty_config.fleet.bots_dir).unwrap();
+        assert_eq!(all_builtin.len(), 20);
     }
 }

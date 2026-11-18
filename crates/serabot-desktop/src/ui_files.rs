@@ -53,6 +53,7 @@ pub const COMPOSER_CARET_SETUP_JS: &str = r#"
 (function () {
   if (window.__serabotComposerCaret) return;
   window.__serabotComposerCaret = true;
+  window.__serabotComposerGen = 0;
   const remember = () => {
     const el = document.getElementById('composer-input');
     if (!el || el !== document.activeElement) return;
@@ -60,9 +61,15 @@ pub const COMPOSER_CARET_SETUP_JS: &str = r#"
     const end = el.selectionEnd;
     if (start == null || end == null) return;
     window.__serabotComposerSel = [start, end];
+    window.__serabotComposerGen = (window.__serabotComposerGen || 0) + 1;
   };
   document.addEventListener('selectionchange', remember);
   document.addEventListener('input', remember, true);
+  document.addEventListener('keydown', (e) => {
+    if (e.target && e.target.id === 'composer-input') {
+      window.__serabotComposerGen = (window.__serabotComposerGen || 0) + 1;
+    }
+  }, true);
 })();
 "#;
 
@@ -73,8 +80,11 @@ pub const COMPOSER_CARET_BRIDGE_JS: &str = r#"
   if (!Array.isArray(sel) || sel.length !== 2) return;
   const el = document.getElementById('composer-input');
   if (!el || el !== document.activeElement) return;
+  const gen = window.__serabotComposerGen || 0;
   requestAnimationFrame(() => {
     if (document.activeElement !== el) return;
+    if ((window.__serabotComposerGen || 0) !== gen) return;
+    if (el.selectionStart === sel[0] && el.selectionEnd === sel[1]) return;
     try {
       el.setSelectionRange(sel[0], sel[1]);
     } catch (_) {}

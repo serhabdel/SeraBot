@@ -179,6 +179,16 @@ failure and wait cards, plus a motion/accessibility pass. No live provider was
 used and the desktop was not visually verified on a device. B7 worker counts
 above 2 are gated on running the load fixture on the target host.
 
+## Status after 0.56.0 (composer, sidebar New chat & crisp chrome, built-in 20-bot fallback)
+
+0.56.0 fixes the desktop composer self-wipe regression via generation-checked
+caret restoration and `should_sync_external_composer`, aligns the sidebar
+`NewMenu` right (`right: true`) above `.main` with explicit button types, removes
+WebView2 `backdrop-filter` blur fuzziness across static chrome in `system.css`,
+and compiles all 20 shipped bots/prompts and 37 skills into
+`crates/serabot/src/shipped.rs` as a disk-override-friendly fallback so binary-only
+server upgrades still serve the complete 20-bot Marketplace Bots catalog.
+
 ## Status after 0.55.0 (bot-integrated Claude Agent, Antigravity SSE, chat stability & Studio UI)
 
 0.55.0 removes the standalone Claude Code rail tab and integrates local Claude

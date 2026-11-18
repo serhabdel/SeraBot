@@ -81,6 +81,7 @@ pub mod route_chain;
 pub mod runtime;
 pub mod scheduler;
 pub mod secrets;
+pub mod shipped;
 pub mod skills;
 pub mod sources;
 pub mod spreadsheets;

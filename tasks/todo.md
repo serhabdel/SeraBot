@@ -212,3 +212,10 @@ never merge without the owner's OK.
 - [x] Chat UI freeze & speed fixes: keep `ChatView` mounted across conversation switches (no destructive key remount), coordinate `CHAT_SCROLL_BRIDGE_JS` and `feed_window_js` resets on `data-conv` changes, replace owner-scoped clones with `std::mem::take` in `State::new_scope`, and offload blocking disk/keyring writes + `LocalAgent::start_with_credentials` construction onto background `PersistWorker`.
 - [x] Studio workspace redesign: grouped `IconRail` (Work / Data / Connect / System), `Ctrl+K` `CommandPaletteSheet`, updated `Marketplace` `Available` filter + `"Not live yet"` copy, and elevated glassmorphic surfaces in `assets/system.css`, `assets/claude-code.css`, and `ConnectView`.
 - [ ] Owner: live verification of Antigravity provider and bot-integrated Claude Agent (ACP) on Windows.
+
+## Release 0.56.0 — composer & sidebar fixes, crisp UI, built-in 20-bot / 37-skill fallback
+
+- [x] Fix `#composer-input` draft wipe in `ChatView` via `should_sync_external_composer` and harden caret restoration across streaming repaints with `window.__serabotComposerGen`.
+- [x] Right-align sidebar `NewMenu`, add explicit `r#type: "button"` attributes, raise `.sidebar` above `.main`, and remove WebView2 `backdrop-filter` blur fuzziness in `assets/system.css`.
+- [x] Compile all 20 shipped bots/prompts and 37 shipped skills into `crates/serabot/src/shipped.rs` and merge them behind disk overrides in `load_bots_with_builtin` and `SkillCatalog::load_with_builtin`.
+- [ ] Owner: verify composer input, sidebar `+ New chat` crispness/menu, and 20-bot Marketplace catalog on Windows + upgraded server.
