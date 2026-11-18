@@ -576,6 +576,19 @@ impl Gateway {
         let started = std::time::Instant::now();
         let (output, listed) = run_tool_call(tool.as_ref(), args, context).await;
         let output = self.redact_output(context, output);
+        if let Err(error) = &output {
+            // The model sees the error; without this line the log only says
+            // the tool ran, so a failed read looks like a bot wandering off.
+            tracing::warn!(
+                user_id = %context.user_id,
+                turn_id = tracing::field::display(
+                    context.turn_id.as_deref().unwrap_or_default()
+                ),
+                tool = %name,
+                %error,
+                "gateway tool failed"
+            );
+        }
         self.finish_tool_call(tool.as_ref(), &output, &listed, context, started.elapsed())?;
         output.map(ToolOutcome::Completed)
     }

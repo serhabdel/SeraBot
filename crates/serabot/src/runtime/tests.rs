@@ -4879,3 +4879,55 @@ fn the_app_notice_is_one_line_updated_in_place_and_removed_when_clear() {
     upsert_app_notice(&mut messages, &[]);
     assert_eq!(messages.len(), 2);
 }
+
+/// A teammate reached through a chain of handoffs gets the files the owner
+/// attached to the turn the chain started from.
+#[tokio::test]
+async fn handoff_turns_inherit_the_owner_turns_attachments() {
+    let server = MockServer::start().await;
+    let notifier = Arc::new(Capture::default());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (runtime, store) = setup(&server.uri(), notifier, calls);
+    let owner = admin(&store);
+    runtime.submit_text(&owner, "owner", "salut", None).unwrap();
+    let task = store.claim_task("test", 30).unwrap().unwrap();
+    let root = store
+        .create_turn(&owner, &task.id, "main", "owner", &serde_json::json!({}))
+        .unwrap();
+    let child = store
+        .create_turn(
+            &owner,
+            &task.id,
+            "comptable",
+            "owner",
+            &serde_json::json!({"handoff": {"parent_turn_id": root.id}}),
+        )
+        .unwrap();
+    let attachment = crate::attachments::StoredAttachment {
+        id: "att-1".into(),
+        conversation_id: "owner".into(),
+        filename: "bilan.pdf".into(),
+        rel_path: format!("{owner}/chat/owner/bilan.pdf"),
+        mime: "application/pdf".into(),
+        size_bytes: 10,
+        sha256: "00".into(),
+        turn_id: None,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    store.insert_chat_attachment(&owner, &attachment).unwrap();
+    store
+        .attach_chat_attachments_to_turn(&owner, &root.id, &["att-1".to_string()])
+        .unwrap();
+
+    // Directly from the owner turn, and two hops up from a nested handoff.
+    assert_eq!(runtime.handoff_attachments(&owner, &root.id).len(), 1);
+    let found = runtime.handoff_attachments(&owner, &child.id);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].filename, "bilan.pdf");
+    // Another user's chain finds nothing.
+    assert!(
+        runtime
+            .handoff_attachments("someone-else", &child.id)
+            .is_empty()
+    );
+}
