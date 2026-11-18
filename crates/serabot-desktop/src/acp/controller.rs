@@ -57,6 +57,9 @@ pub struct Ask {
 }
 
 pub struct Controller {
+    pub bot_id: Option<String>,
+    pub bot_context: Option<String>,
+    pub persona_sent: bool,
     pub node: Option<NodeCheck>,
     node_rx: Option<Receiver<NodeCheck>>,
     pub folder_id: Option<String>,
@@ -74,6 +77,9 @@ pub struct Controller {
 impl Default for Controller {
     fn default() -> Self {
         Self {
+            bot_id: None,
+            bot_context: None,
+            persona_sent: false,
             node: None,
             node_rx: None,
             folder_id: None,
@@ -89,7 +95,61 @@ impl Default for Controller {
     }
 }
 
+impl Drop for Controller {
+    fn drop(&mut self) {
+        self.stop_quietly();
+    }
+}
+
 impl Controller {
+    /// Build a controller bound to one bot, loading any saved local transcript
+    /// and restoring the last selected folder id if one was saved.
+    pub fn for_bot(bot_id: String, folder_id: Option<String>, node: Option<NodeCheck>) -> Self {
+        let transcript = crate::creds::settings_dir()
+            .map(|dir| Transcript::load_for_bot(&dir, &bot_id))
+            .unwrap_or_default();
+        let mut controller = Self::default();
+        controller.bot_id = Some(bot_id);
+        controller.folder_id = folder_id;
+        controller.node = node;
+        controller.transcript = transcript;
+        controller
+    }
+
+    pub fn set_bot_context(&mut self, context: Option<String>) {
+        self.bot_context = context.and_then(|text| {
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        });
+    }
+
+    /// Format a prompt for ACP: prepends the bot's persona/instructions once
+    /// per live session so Claude Code follows the bot's identity without
+    /// polluting the displayed user bubble.
+    pub fn format_prompt(&self, user_text: &str) -> String {
+        let clean = user_text.trim();
+        if !self.persona_sent
+            && let Some(ctx) = &self.bot_context
+            && !ctx.trim().is_empty()
+        {
+            return format!(
+                "[Bot persona context — follow this role and style]\n{}\n\n[User request]\n{}",
+                ctx.trim(),
+                clean
+            );
+        }
+        clean.to_owned()
+    }
+
+    fn save_transcript(&self) {
+        let Some(bot_id) = self.bot_id.as_deref() else {
+            return;
+        };
+        if let Some(dir) = crate::creds::settings_dir() {
+            let _ = self.transcript.save_for_bot(&dir, bot_id);
+        }
+    }
+
     /// Look for Node.js in the background (once, or again on request).
     pub fn check_node(&mut self) {
         if self.node_rx.is_some() {
@@ -118,6 +178,7 @@ impl Controller {
             return;
         };
         self.stop_quietly();
+        self.persona_sent = false;
         let workspace = Workspace {
             root: std::path::PathBuf::from(&folder.path),
             writable: folder.mode == FolderMode::ReadWrite,
@@ -139,6 +200,7 @@ impl Controller {
                     ),
                     false,
                 );
+                self.save_transcript();
             }
             Err(error) => {
                 self.status = Status::Stopped(error.clone());
@@ -149,13 +211,20 @@ impl Controller {
 
     /// Send a message. Returns false (with a notice) when it cannot go.
     pub fn send(&mut self, text: &str) -> bool {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let wire_prompt = self.format_prompt(trimmed);
         let Some(client) = &self.client else {
             self.notice = Some("Start Claude Code first.".into());
             return false;
         };
-        match client.prompt(text) {
+        match client.prompt(&wire_prompt) {
             Ok(()) => {
-                self.transcript.push_user(text.trim());
+                self.persona_sent = true;
+                self.transcript.push_user(trimmed);
+                self.save_transcript();
                 self.status = Status::Working;
                 self.notice = None;
                 true
@@ -178,8 +247,10 @@ impl Controller {
     /// End the agent.
     pub fn stop(&mut self) {
         self.stop_quietly();
+        self.persona_sent = false;
         self.status = Status::Idle;
         self.transcript.notice("Claude Code stopped.", false);
+        self.save_transcript();
     }
 
     fn stop_quietly(&mut self) {
@@ -232,6 +303,7 @@ impl Controller {
         match &self.client {
             Some(client) => match client.new_session() {
                 Ok(()) => {
+                    self.persona_sent = false;
                     self.status = Status::Starting;
                     self.notice = None;
                 }
@@ -254,6 +326,8 @@ impl Controller {
 
     pub fn clear(&mut self) {
         self.transcript = Transcript::default();
+        self.persona_sent = false;
+        self.save_transcript();
     }
 
     /// Take what arrived without changing the page state (only the channels
@@ -331,6 +405,7 @@ impl Controller {
                         .transcript
                         .notice(format!("The turn ended: {other}."), false),
                 }
+                self.save_transcript();
             }
             Event::AuthRequired => {
                 self.status = Status::NeedsSignIn;
@@ -339,6 +414,7 @@ impl Controller {
                     "Claude Code is not signed in on this computer. Sign in, then press Try again.",
                     true,
                 );
+                self.save_transcript();
             }
             Event::Failed(message) => {
                 if self.status == Status::Working {
@@ -348,6 +424,7 @@ impl Controller {
                     self.status = Status::Stopped(message.clone());
                 }
                 self.transcript.notice(message, true);
+                self.save_transcript();
             }
             Event::FileUsed { path, write, ok } => {
                 if !ok {
@@ -369,6 +446,7 @@ impl Controller {
                     self.status = Status::Stopped(message.clone());
                     self.transcript.notice(message, true);
                 }
+                self.save_transcript();
             }
         }
     }
@@ -407,10 +485,8 @@ mod tests {
 
     #[test]
     fn events_move_the_status_and_fill_the_transcript() {
-        let mut controller = Controller {
-            status: Status::Starting,
-            ..Controller::default()
-        };
+        let mut controller = Controller::default();
+        controller.status = Status::Starting;
         controller.apply(Event::Ready);
         assert_eq!(controller.status, Status::Ready);
         controller.status = Status::Working;
@@ -467,5 +543,18 @@ mod tests {
             controller.transcript.items.last(),
             Some(Item::Notice { text, .. }) if text.starts_with("Declined")
         ));
+    }
+
+    #[test]
+    fn persona_prompt_prepends_context_until_sent() {
+        let mut controller = Controller::default();
+        controller.set_bot_context(Some("You are Analyst — concise and cited.".into()));
+        let first = controller.format_prompt("Summarize README.md");
+        assert!(first.contains("You are Analyst"));
+        assert!(first.contains("Summarize README.md"));
+
+        controller.persona_sent = true;
+        let second = controller.format_prompt("Next question");
+        assert_eq!(second, "Next question");
     }
 }

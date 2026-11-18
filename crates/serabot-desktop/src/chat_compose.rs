@@ -946,7 +946,8 @@ pub fn shortcut_rows(enter_sends_pref: bool) -> Vec<ShortcutRow> {
         ("Runs", "Ctrl+/", "Back to the message box"),
         ("Chat", "Ctrl+F", "Search this conversation"),
         ("Chat", "Ctrl+End", "Jump to the latest message"),
-        ("Chat", "F1", "Show this list"),
+        ("Navigation", "Ctrl+K", "Open command palette"),
+        ("Navigation", "F1", "Show this list"),
     ]
 }
 

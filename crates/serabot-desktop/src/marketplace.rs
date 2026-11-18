@@ -234,7 +234,7 @@ impl ActivationBlock {
                 "Coming soon. SeraBot cannot call plugins yet, so this one cannot be installed or turned on."
             }
             Self::PlaceholderHost => {
-                "Coming soon. This plugin does not point at a live service yet, so it cannot be installed or turned on."
+                "Not live yet. This plugin does not point at a live service yet, so it cannot be installed or turned on."
             }
             Self::LocalProgram => {
                 "This plugin starts a program on the server, which is not supported yet."
@@ -456,6 +456,7 @@ pub enum StatusFilter {
     #[default]
     All,
     Installed,
+    Available,
     ComingSoon,
 }
 
@@ -464,6 +465,7 @@ impl StatusFilter {
         match self {
             Self::All => "All",
             Self::Installed => "Installed",
+            Self::Available => "Available",
             Self::ComingSoon => "Coming soon",
         }
     }
@@ -478,6 +480,7 @@ impl StatusFilter {
                     | PluginStatus::NeedsSetup
                     | PluginStatus::NeedsSignIn
             ),
+            Self::Available => status == PluginStatus::Available,
             Self::ComingSoon => status == PluginStatus::ComingSoon,
         }
     }
@@ -1813,6 +1816,10 @@ mod tests {
         assert_eq!(
             filter_plugins_with_status(&all, "", "", StatusFilter::Installed).len(),
             2
+        );
+        assert_eq!(
+            filter_plugins_with_status(&all, "", "", StatusFilter::Available).len(),
+            1
         );
         assert_eq!(
             filter_plugins_with_status(&all, "", "", StatusFilter::ComingSoon).len(),

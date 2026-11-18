@@ -437,7 +437,7 @@ pub fn MarketplaceTab(session: Signal<Session>, query: Signal<String>) -> Elemen
                         }
                     }
                     div { class: "seg", role: "group", "aria-label": "Status",
-                        for filter_opt in [StatusFilter::All, StatusFilter::Installed, StatusFilter::ComingSoon] {
+                        for filter_opt in [StatusFilter::All, StatusFilter::Installed, StatusFilter::Available] {
                             button {
                                 key: "{filter_opt.label()}",
                                 r#type: "button",

@@ -54,6 +54,131 @@ struct FolderStatsChannel {
     receiver: std::sync::mpsc::Receiver<(String, String, crate::local_fs::FolderStats)>,
 }
 
+/// Serialized disk/keyring write request executed off the UI thread.
+enum PersistTask {
+    Settings {
+        origin: String,
+        theme: String,
+        pins: Vec<String>,
+        prefs: creds::UiPrefs,
+    },
+    Credentials {
+        origin: String,
+        theme: String,
+        pins: Vec<String>,
+        prefs: creds::UiPrefs,
+        token: secrecy::SecretString,
+        expires: Option<u64>,
+    },
+    SessionToken {
+        token: secrecy::SecretString,
+        expires: Option<u64>,
+    },
+    LocalFolders(Vec<crate::local_folders::LocalFolder>),
+    ClaudeAgent(creds::ClaudeAgentPrefs),
+}
+
+enum PersistOutcome {
+    SettingsFailed,
+    Credentials {
+        token_failed: bool,
+        settings_failed: bool,
+    },
+    LocalFoldersFailed(String),
+    ClaudeAgentFailed(String),
+}
+
+struct PersistWorker {
+    sender: std::sync::mpsc::Sender<PersistTask>,
+    receiver: std::sync::mpsc::Receiver<PersistOutcome>,
+}
+
+impl PersistWorker {
+    fn start(wake: Arc<AtomicBool>) -> Option<Self> {
+        let (sender, task_rx) = std::sync::mpsc::channel::<PersistTask>();
+        let (outcome_tx, receiver) = std::sync::mpsc::channel::<PersistOutcome>();
+        std::thread::Builder::new()
+            .name("serabot-persist".into())
+            .spawn(move || {
+                while let Ok(task) = task_rx.recv() {
+                    if let Some(outcome) = Self::run_task(task) {
+                        let _ = outcome_tx.send(outcome);
+                        wake.store(true, Ordering::Release);
+                    }
+                }
+            })
+            .ok()?;
+        Some(Self { sender, receiver })
+    }
+
+    fn run_task(task: PersistTask) -> Option<PersistOutcome> {
+        match task {
+            PersistTask::Settings {
+                origin,
+                theme,
+                pins,
+                prefs,
+            } => {
+                if origin.is_empty() {
+                    return None;
+                }
+                let stored = creds::load_settings();
+                let snapshot = creds::Settings {
+                    server: origin,
+                    theme: Some(theme),
+                    pins: (!pins.is_empty()).then_some(pins),
+                    prefs: Some(prefs),
+                    sign_in_timeout_secs: stored.sign_in_timeout_secs,
+                    session_expires_at: stored.session_expires_at,
+                };
+                creds::save_settings(&snapshot)
+                    .is_err()
+                    .then_some(PersistOutcome::SettingsFailed)
+            }
+            PersistTask::Credentials {
+                origin,
+                theme,
+                pins,
+                prefs,
+                token,
+                expires,
+            } => {
+                let stored = creds::load_settings();
+                let settings_failed = if origin.is_empty() {
+                    false
+                } else {
+                    let snapshot = creds::Settings {
+                        server: origin,
+                        theme: Some(theme),
+                        pins: (!pins.is_empty()).then_some(pins),
+                        prefs: Some(prefs),
+                        sign_in_timeout_secs: stored.sign_in_timeout_secs,
+                        session_expires_at: stored.session_expires_at,
+                    };
+                    creds::save_settings(&snapshot).is_err()
+                };
+                let token_failed = creds::save_session(token.expose_secret(), expires).is_err();
+                (token_failed || settings_failed).then_some(PersistOutcome::Credentials {
+                    token_failed,
+                    settings_failed,
+                })
+            }
+            PersistTask::SessionToken { token, expires } => {
+                let _ = creds::save_session(token.expose_secret(), expires);
+                None
+            }
+            PersistTask::LocalFolders(folders) => creds::settings_dir().and_then(|dir| {
+                crate::local_folders::save(&dir, &folders)
+                    .err()
+                    .map(PersistOutcome::LocalFoldersFailed)
+            }),
+            PersistTask::ClaudeAgent(prefs) => creds::save_claude_agent(&prefs)
+                .err()
+                .map(PersistOutcome::ClaudeAgentFailed),
+        }
+    }
+}
+
 pub const REQUEST_GAP: Duration = Duration::from_millis(0);
 pub const POLL_GAP: Duration = Duration::from_millis(750);
 pub const POLL_SAFETY: Duration = Duration::from_secs(4);
@@ -732,6 +857,8 @@ pub struct Session {
     pub local_folders: Vec<crate::local_folders::LocalFolder>,
     /// Bots currently switched to local Claude Agent (ACP) mode in this desktop session.
     pub claude_agent_bots: std::collections::BTreeSet<String>,
+    /// Last selected local folder id per bot for Claude Agent (ACP).
+    pub claude_agent_folders: std::collections::BTreeMap<String, String>,
     /// "This PC" numbers for the Usage page, gathered on a worker thread.
     pub pc: crate::pc_stats::PcMonitor,
     local_agent: Option<(crate::local_folders::LocalAgent, usize)>,
@@ -826,6 +953,7 @@ pub struct Session {
     poll_approvals: bool,
     /// Consecutive 429s on background polls; resets on any success.
     rate_attempts: u32,
+    persist_worker: Option<PersistWorker>,
 }
 
 impl Default for Session {
@@ -850,9 +978,12 @@ impl Session {
             .map(|token| token.expose_secret().to_owned())
             .unwrap_or_default();
         let worker = Worker::start().ok();
+        let claude_prefs = creds::load_claude_agent();
         let mut session = Self::assemble(server, theme, pins, token, worker);
         session.session_expires = session_expires;
         session.prefs = settings.prefs.clone().unwrap_or_default().sanitized();
+        session.claude_agent_bots = claude_prefs.bots;
+        session.claude_agent_folders = claude_prefs.folders;
         if session.worker.is_some()
             && !session.server.trim().is_empty()
             && valid_token(&session.token)
@@ -873,12 +1004,16 @@ impl Session {
         worker: Option<Worker>,
     ) -> Self {
         let (launch_tx, launch_rx) = std::sync::mpsc::channel();
+        let ui_wake = Arc::new(AtomicBool::new(false));
+        let persist_worker = worker
+            .as_ref()
+            .and_then(|_| PersistWorker::start(Arc::clone(&ui_wake)));
         Self {
             state: State::default(),
             worker,
             credentials: None,
             events: None,
-            ui_wake: Arc::new(AtomicBool::new(false)),
+            ui_wake,
             events_active: false,
             events_seen: false,
             events_dirty: false,
@@ -945,6 +1080,7 @@ impl Session {
                 .map(|dir| crate::local_folders::load(&dir))
                 .unwrap_or_default(),
             claude_agent_bots: std::collections::BTreeSet::new(),
+            claude_agent_folders: std::collections::BTreeMap::new(),
             pc: crate::pc_stats::PcMonitor::new(),
             local_agent: None,
             local_notice: None,
@@ -1001,6 +1137,7 @@ impl Session {
             rate_attempts: 0,
             panel: PanelState::new(),
             panel_worker: None,
+            persist_worker,
         }
     }
 
@@ -1308,34 +1445,72 @@ impl Session {
         }
     }
 
-    /// Build the settings snapshot to persist: the current server origin,
-    /// theme and pins. `None` when no origin is known yet.
-    fn ui_settings_snapshot(&self) -> Option<creds::Settings> {
-        let origin = self
-            .credentials
+    fn ui_origin(&self) -> String {
+        self.credentials
             .as_ref()
             .map(|credentials| credentials.endpoint.origin().ascii_serialization())
-            .unwrap_or_else(|| self.server.clone());
-        // Keep the stored sign-in wait and session expiry: this snapshot is written whole.
-        let stored = creds::load_settings();
-        (!origin.is_empty()).then(|| creds::Settings {
-            server: origin,
-            theme: Some(self.theme.as_str().into()),
-            pins: (!self.pins.is_empty()).then(|| self.pins.clone()),
-            prefs: Some(self.prefs.clone()),
-            sign_in_timeout_secs: stored.sign_in_timeout_secs,
-            session_expires_at: stored.session_expires_at,
-        })
+            .unwrap_or_else(|| self.server.clone())
+    }
+
+    fn apply_persist_outcome(&mut self, outcome: PersistOutcome) {
+        match outcome {
+            PersistOutcome::SettingsFailed => self.toast = Some(SETTINGS_NOT_SAVED.into()),
+            PersistOutcome::Credentials {
+                token_failed,
+                settings_failed,
+            } => {
+                self.credential_save_failed = token_failed;
+                if settings_failed {
+                    self.state.error =
+                        Some("Connected, but the settings could not be saved.".into());
+                }
+            }
+            PersistOutcome::LocalFoldersFailed(error) => {
+                self.local_notice = Some(format!("Could not save the folder list: {error}"));
+            }
+            PersistOutcome::ClaudeAgentFailed(error) => {
+                self.toast = Some(format!("Could not save local agent mode: {error}"));
+            }
+        }
+    }
+
+    fn enqueue_persist(&mut self, task: PersistTask) {
+        if let Some(worker) = &self.persist_worker {
+            if let Err(std::sync::mpsc::SendError(task)) = worker.sender.send(task)
+                && let Some(outcome) = PersistWorker::run_task(task)
+            {
+                self.apply_persist_outcome(outcome);
+            }
+        } else if let Some(outcome) = PersistWorker::run_task(task) {
+            self.apply_persist_outcome(outcome);
+        }
+    }
+
+    fn poll_persist(&mut self) {
+        let mut outcomes = Vec::new();
+        if let Some(worker) = &self.persist_worker {
+            while let Ok(outcome) = worker.receiver.try_recv() {
+                outcomes.push(outcome);
+            }
+        }
+        for outcome in outcomes {
+            self.apply_persist_outcome(outcome);
+        }
     }
 
     /// Persist theme and pins next to the server origin, like the credential
     /// save does. A failed write keeps the change for this run and says so.
     fn save_ui_settings(&mut self) {
-        if let Some(settings) = self.ui_settings_snapshot()
-            && creds::save_settings(&settings).is_err()
-        {
-            self.toast = Some(SETTINGS_NOT_SAVED.into());
+        let origin = self.ui_origin();
+        if origin.is_empty() {
+            return;
         }
+        self.enqueue_persist(PersistTask::Settings {
+            origin,
+            theme: self.theme.as_str().into(),
+            pins: self.pins.clone(),
+            prefs: self.prefs.clone(),
+        });
     }
 
     pub fn set_theme(&mut self, theme: Theme) {
@@ -1918,7 +2093,10 @@ impl Session {
         let mut token = signed_in.token.expose_secret().to_owned();
         let expires = signed_in.expires_at.as_deref().and_then(parse_rfc3339_unix);
         // A store failure is reported by persist_credentials once connected.
-        let _ = creds::save_session(&token, expires);
+        self.enqueue_persist(PersistTask::SessionToken {
+            token: secrecy::SecretString::new(token.clone()),
+            expires,
+        });
         self.token.zeroize();
         self.token = token.clone();
         token.zeroize();
@@ -3052,11 +3230,7 @@ impl Session {
     }
 
     fn persist_local_folders(&mut self) {
-        if let Some(dir) = creds::settings_dir()
-            && let Err(error) = crate::local_folders::save(&dir, &self.local_folders)
-        {
-            self.local_notice = Some(format!("Could not save the folder list: {error}"));
-        }
+        self.enqueue_persist(PersistTask::LocalFolders(self.local_folders.clone()));
         // Takes effect for requests already in flight too.
         if let Some((agent, _)) = &self.local_agent {
             agent.update(self.local_folders.clone());
@@ -3078,10 +3252,11 @@ impl Session {
             return;
         }
         self.local_agent = None;
-        if let Ok(client) = ApiClient::new(credentials.endpoint.clone(), credentials.token.clone())
-            && let Some(agent) =
-                crate::local_folders::LocalAgent::start(client, self.local_folders.clone())
-        {
+        if let Some(agent) = crate::local_folders::LocalAgent::start_with_credentials(
+            credentials.endpoint.clone(),
+            credentials.token.clone(),
+            self.local_folders.clone(),
+        ) {
             self.local_agent = Some((agent, key));
         }
     }
@@ -3091,16 +3266,89 @@ impl Session {
         self.local_agent.is_some()
     }
 
+    fn persist_claude_agent(&mut self) {
+        self.enqueue_persist(PersistTask::ClaudeAgent(creds::ClaudeAgentPrefs {
+            bots: self.claude_agent_bots.clone(),
+            folders: self.claude_agent_folders.clone(),
+        }));
+    }
+
     /// True when this bot is currently using the local Claude Code ACP agent in chat.
     pub fn bot_uses_claude_agent(&self, bot_id: &str) -> bool {
         self.claude_agent_bots.contains(bot_id)
     }
 
+    /// Enable or disable local Claude Code ACP mode for `bot_id` and persist.
+    pub fn set_bot_claude_agent(&mut self, bot_id: &str, enabled: bool) {
+        let changed = if enabled {
+            crate::valid_speaker(bot_id) && self.claude_agent_bots.insert(bot_id.to_owned())
+        } else {
+            self.claude_agent_bots.remove(bot_id)
+        };
+        if changed {
+            self.persist_claude_agent();
+        }
+    }
+
     /// Toggle local Claude Code ACP mode for a bot in this desktop session.
     pub fn toggle_bot_claude_agent(&mut self, bot_id: &str) {
-        if !self.claude_agent_bots.remove(bot_id) {
-            self.claude_agent_bots.insert(bot_id.to_owned());
+        let next = !self.bot_uses_claude_agent(bot_id);
+        self.set_bot_claude_agent(bot_id, next);
+    }
+
+    /// Last selected local folder id for `bot_id` when using Claude Code ACP.
+    pub fn bot_claude_agent_folder(&self, bot_id: &str) -> Option<String> {
+        self.claude_agent_folders.get(bot_id).cloned()
+    }
+
+    /// Persist the preferred local folder id for `bot_id`'s Claude Code ACP sessions.
+    pub fn set_bot_claude_agent_folder(&mut self, bot_id: &str, folder_id: String) {
+        if !crate::valid_speaker(bot_id) || !valid_id(&folder_id) {
+            return;
         }
+        if self.claude_agent_folders.get(bot_id) == Some(&folder_id) {
+            return;
+        }
+        self.claude_agent_folders
+            .insert(bot_id.to_owned(), folder_id);
+        self.persist_claude_agent();
+    }
+
+    /// Persona prompt snippet passed once when starting a bot's local ACP session.
+    pub fn bot_acp_context(&self, bot_id: &str) -> Option<String> {
+        let detail = self.state.bot_details.get(bot_id);
+        let name = detail
+            .map(|d| d.display_name.trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.bot_display_name(bot_id));
+        let listed = self.state.listed_bots.iter().find(|b| b.id == bot_id);
+        let role = detail
+            .map(|d| d.role.as_str())
+            .or_else(|| listed.map(|b| b.role.as_str()))
+            .unwrap_or_default();
+        let description = detail
+            .map(|d| d.description.as_str())
+            .or_else(|| listed.and_then(|b| b.description.as_deref()))
+            .unwrap_or_default();
+        let instructions = detail
+            .and_then(|d| d.instructions.as_deref())
+            .unwrap_or_default();
+        let mut lines = Vec::new();
+        if !name.trim().is_empty() {
+            if role.trim().is_empty() {
+                lines.push(format!("Bot name: {}", name.trim()));
+            } else {
+                lines.push(format!("Bot name: {} (role: {})", name.trim(), role.trim()));
+            }
+        }
+        if !description.trim().is_empty() {
+            lines.push(format!("Description: {}", description.trim()));
+        }
+        if !instructions.trim().is_empty() {
+            lines.push(format!("Instructions:\n{}", instructions.trim()));
+        }
+        (!lines.is_empty()).then(|| lines.join("\n"))
     }
 
     /// Picked files still waiting to be uploaded.
@@ -3520,6 +3768,7 @@ impl Session {
         self.route_editor.saving.hash(&mut h);
         self.route_editor.error.hash(&mut h);
         self.route_editor.notice.hash(&mut h);
+        self.credential_save_failed.hash(&mut h);
         h.finish()
     }
 
@@ -3560,6 +3809,7 @@ impl Session {
 
     /// Called from the UI timer. Drains completions and advances scheduled work.
     pub fn tick(&mut self) {
+        self.poll_persist();
         self.check_session_expiry();
         self.state.note_history_wait(Instant::now());
         self.poll_events();
@@ -4987,15 +5237,16 @@ impl Session {
             return;
         };
         let origin = credentials.endpoint.origin().ascii_serialization();
-        let settings = self
-            .ui_settings_snapshot()
-            .map(|snapshot| creds::save_settings(&snapshot));
-        let token = creds::save_session(credentials.token.expose_secret(), self.session_expires);
-        self.server = origin;
-        self.credential_save_failed = token.is_err();
-        if settings.as_ref().is_some_and(|result| result.is_err()) {
-            self.state.error = Some("Connected, but the settings could not be saved.".into());
-        }
+        self.server = origin.clone();
+        self.credential_save_failed = false;
+        self.enqueue_persist(PersistTask::Credentials {
+            origin,
+            theme: self.theme.as_str().into(),
+            pins: self.pins.clone(),
+            prefs: self.prefs.clone(),
+            token: credentials.token.clone(),
+            expires: self.session_expires,
+        });
     }
 
     /// Try again to write the session token to the OS credential store after
@@ -6623,7 +6874,7 @@ mod tests {
             )],
         );
         let saved = session.state.marketplace_error.clone().unwrap();
-        assert!(saved.contains("Coming soon"), "{saved}");
+        assert!(saved.contains("Not live yet"), "{saved}");
         assert!(
             !saved.contains("synthetic-plugin-key"),
             "a refused save must not echo the typed value"
@@ -7410,5 +7661,72 @@ mod backlog_tests {
         other.request_auto_approve(true);
         other.open_conversation("dir:main".into());
         assert!(!other.auto_approve_confirming);
+    }
+
+    #[test]
+    fn claude_agent_per_bot_state_folder_and_context() {
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        let (task_tx, task_rx) = std::sync::mpsc::channel();
+        let (_outcome_tx, outcome_rx) = std::sync::mpsc::channel();
+        session.persist_worker = Some(PersistWorker {
+            sender: task_tx,
+            receiver: outcome_rx,
+        });
+        session.state.bot_details.insert(
+            "analyst".into(),
+            crate::BotDetail {
+                id: "analyst".into(),
+                display_name: "Research Analyst".into(),
+                role: "specialist".into(),
+                description: "Reads financial statements".into(),
+                avatar: "A".into(),
+                enabled: true,
+                provider: String::new(),
+                model: String::new(),
+                fallback_provider: None,
+                fallback_model: None,
+                routing_classes: Vec::new(),
+                instructions: Some("Cite page numbers".into()),
+                instructions_bytes: 17,
+                skills: Vec::new(),
+                tools: Vec::new(),
+                require_approval: Vec::new(),
+                memory_count: 0,
+                artifact_count: 0,
+                browser_profile: None,
+                thinking: None,
+                thinking_levels: Vec::new(),
+                route: None,
+            },
+        );
+        session.set_bot_claude_agent("analyst", true);
+        assert!(session.bot_uses_claude_agent("analyst"));
+        assert!(!session.bot_uses_claude_agent("main"));
+        session.set_bot_claude_agent_folder("analyst", "proj-1".into());
+        assert_eq!(
+            session.bot_claude_agent_folder("analyst").as_deref(),
+            Some("proj-1")
+        );
+        // Bad ids are ignored safely.
+        session.set_bot_claude_agent("../evil", true);
+        assert!(!session.bot_uses_claude_agent("../evil"));
+        session.set_bot_claude_agent_folder("analyst", "bad/id".into());
+        assert_eq!(
+            session.bot_claude_agent_folder("analyst").as_deref(),
+            Some("proj-1")
+        );
+        let ctx = session.bot_acp_context("analyst").expect("context");
+        assert!(ctx.contains("Research Analyst"));
+        assert!(ctx.contains("Reads financial statements"));
+        assert!(ctx.contains("Cite page numbers"));
+        // PersistWorker received two ClaudeAgent tasks without touching disk.
+        let mut saved_count = 0;
+        while let Ok(task) = task_rx.try_recv() {
+            if matches!(task, PersistTask::ClaudeAgent(_)) {
+                saved_count += 1;
+            }
+        }
+        assert_eq!(saved_count, 2);
     }
 }

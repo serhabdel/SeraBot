@@ -34,9 +34,14 @@ pub(super) fn ConnectView(session: Signal<Session>) -> Element {
     rsx! {
         div { class: "connect",
             div { class: "connect-card",
+                div { class: "connect-badge",
+                    span { "SeraBot Desktop" }
+                    span { "\u{00b7}" }
+                    span { "v{version}" }
+                }
                 div { class: "brand brand-lg", "S" }
                 h1 { "SeraBot" }
-                p { class: "muted", "Sign in to continue" }
+                p { class: "muted", "Sign in to your private bot workspace" }
                 div { class: "field",
                     label { class: "field-label", r#for: "server-input", "Server" }
                     input {

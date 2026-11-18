@@ -1,33 +1,70 @@
-//! The Claude Code page (0.54): Claude Code running on this computer with the
-//! person's own Claude login, driven over ACP (`serabot_desktop::acp`).
+//! Per-bot local Claude Code (ACP) surface (0.55): Claude Code running on
+//! this computer with the person's own Claude login, driven over ACP
+//! (`serabot_desktop::acp`) inside a bot's chat pane rather than a separate tab.
 //!
-//! Setup card (Node.js, folder, sign-in), the transcript, permission cards and
-//! a composer. The agent lives in an app-wide [`Controller`] so it keeps
-//! running while other pages are open; the shell polls it.
+//! Each bot keeps its own [`Controller`], persisted transcript under
+//! `acp-transcripts/<bot_id>.json`, and preferred allowed desktop folder, while
+//! sharing a single cached Node.js environment probe across bots.
+
+use std::collections::BTreeMap;
 
 use crate::ui::{Icon, MarkdownBody};
 use dioxus::prelude::*;
-use serabot_desktop::acp::controller::folder_label;
+use serabot_desktop::acp::controller::{Ask, Inbound, folder_label};
 use serabot_desktop::acp::setup::NodeCheck;
 use serabot_desktop::acp::{Controller, Item, Status};
 use serabot_desktop::local_folders::FolderMode;
 use serabot_desktop::session::{Section, Session, SettingsSection};
 
-/// The app-wide controller, provided once by the shell.
-#[derive(Clone, Copy)]
-pub struct ClaudeCode(pub Signal<Controller>);
+/// App-wide per-bot ACP controllers, provided once by the shell so running
+/// local bot sessions survive page and conversation switches.
+#[derive(Default)]
+pub struct ClaudeCodeState {
+    pub node: Option<NodeCheck>,
+    pub controllers: BTreeMap<String, Controller>,
+}
 
-/// Provide the controller and drain it while the app runs.
+/// The app-wide controller store, provided once by the shell.
+#[derive(Clone, Copy)]
+pub struct ClaudeCode(pub Signal<ClaudeCodeState>);
+
+/// Provide the per-bot controller store and drain inbound events while the app runs.
 pub fn use_claude_code_provider() {
-    let controller = use_context_provider(|| ClaudeCode(Signal::new(Controller::default())));
-    let mut signal = controller.0;
+    let store = use_context_provider(|| ClaudeCode(Signal::new(ClaudeCodeState::default())));
+    let mut signal = store.0;
     use_future(move || async move {
         loop {
             // Drain without subscribing; write (and redraw) only when
-            // something arrived.
-            let got = signal.peek().take();
-            if !got.is_empty() {
-                signal.write().absorb(got);
+            // something arrived for at least one bot.
+            let mut batches: Vec<(String, Vec<Inbound>)> = Vec::new();
+            {
+                let state = signal.peek();
+                for (bot_id, controller) in &state.controllers {
+                    let got = controller.take();
+                    if !got.is_empty() {
+                        batches.push((bot_id.clone(), got));
+                    }
+                }
+            }
+            if !batches.is_empty() {
+                let mut state = signal.write();
+                let mut discovered_node: Option<NodeCheck> = None;
+                for (bot_id, got) in batches {
+                    if let Some(controller) = state.controllers.get_mut(&bot_id) {
+                        controller.absorb(got);
+                        if controller.node.is_some() {
+                            discovered_node = controller.node.clone();
+                        }
+                    }
+                }
+                if let Some(node) = discovered_node {
+                    state.node = Some(node.clone());
+                    for controller in state.controllers.values_mut() {
+                        if controller.node.is_none() {
+                            controller.node = Some(node.clone());
+                        }
+                    }
+                }
             }
             #[cfg(windows)]
             tokio::time::sleep(std::time::Duration::from_millis(80)).await;
@@ -37,36 +74,122 @@ pub fn use_claude_code_provider() {
     });
 }
 
+fn ensure_bot_controller<'a>(
+    state: &'a mut ClaudeCodeState,
+    session: &Session,
+    bot_id: &str,
+) -> &'a mut Controller {
+    let cached_node = state.node.clone();
+    let preferred_folder = session.bot_claude_agent_folder(bot_id);
+    let context = session.bot_acp_context(bot_id);
+    let controller = state
+        .controllers
+        .entry(bot_id.to_owned())
+        .or_insert_with(|| Controller::for_bot(bot_id.to_owned(), preferred_folder, cached_node));
+    controller.set_bot_context(context);
+    controller
+}
+
 /// Embedded inside a bot's chat pane when local Claude Agent (ACP) mode is active.
 #[component]
 pub fn ClaudeAgentBotView(session: Signal<Session>, bot_id: String) -> Element {
-    let ClaudeCode(mut controller) = use_context::<ClaudeCode>();
+    let ClaudeCode(mut store) = use_context::<ClaudeCode>();
     let mut draft = use_signal(String::new);
-    use_hook(move || {
-        let mut c = controller.write();
-        if c.node.is_none() {
-            c.check_node();
+    let bot_for_effect = use_signal(|| bot_id.clone());
+    // Keep signal synced with the latest bot_id prop when switching bot chats
+    // without unmounting.
+    if *bot_for_effect.peek() != bot_id {
+        let mut tracked = bot_for_effect;
+        tracked.set(bot_id.clone());
+        draft.set(String::new());
+    }
+    use_effect(move || {
+        let current_bot = bot_for_effect();
+        let s = session.read();
+        let mut st = store.write();
+        let any_checking = st.controllers.values().any(Controller::checking_node);
+        let needs_check = st.node.is_none() && !any_checking;
+        let controller = ensure_bot_controller(&mut st, &s, &current_bot);
+        if needs_check && controller.node.is_none() && !controller.checking_node() {
+            controller.check_node();
         }
     });
+
     let folders = session.read().local_folders.clone();
     let bot_name = session.read().bot_display_name(&bot_id);
-    let c = controller.read();
-    let status = c.status.clone();
+    let has_persona = session.read().bot_acp_context(&bot_id).is_some();
+    struct BotViewSnapshot {
+        status: Status,
+        node: Option<NodeCheck>,
+        checking: bool,
+        selected: Option<String>,
+        items: Vec<Item>,
+        asks: Vec<Ask>,
+        notice: Option<String>,
+        folder_label_now: Option<String>,
+        writable: bool,
+    }
+
+    let snap = {
+        let state = store.read();
+        if let Some(c) = state.controllers.get(&bot_id) {
+            let selected = c
+                .folder_id
+                .clone()
+                .filter(|id| folders.iter().any(|f| &f.id == id))
+                .or_else(|| {
+                    session
+                        .read()
+                        .bot_claude_agent_folder(&bot_id)
+                        .filter(|id| folders.iter().any(|f| &f.id == id))
+                })
+                .or_else(|| folders.first().map(|f| f.id.clone()));
+            BotViewSnapshot {
+                status: c.status.clone(),
+                node: c.node.clone().or_else(|| state.node.clone()),
+                checking: c.checking_node()
+                    || state.controllers.values().any(Controller::checking_node),
+                selected,
+                items: c.transcript.items.clone(),
+                asks: c.asks.clone(),
+                notice: c.notice.clone(),
+                folder_label_now: c.folder_label.clone(),
+                writable: c.writable,
+            }
+        } else {
+            let selected = session
+                .read()
+                .bot_claude_agent_folder(&bot_id)
+                .filter(|id| folders.iter().any(|f| &f.id == id))
+                .or_else(|| folders.first().map(|f| f.id.clone()));
+            BotViewSnapshot {
+                status: Status::Idle,
+                node: state.node.clone(),
+                checking: state.controllers.values().any(Controller::checking_node),
+                selected,
+                items: Vec::new(),
+                asks: Vec::new(),
+                notice: None,
+                folder_label_now: None,
+                writable: false,
+            }
+        }
+    };
+    let BotViewSnapshot {
+        status,
+        node,
+        checking,
+        selected,
+        items,
+        asks,
+        notice,
+        folder_label_now,
+        writable,
+    } = snap;
+
     let running = status.running();
     let working = status == Status::Working;
-    let node = c.node.clone();
-    let checking = c.checking_node();
     let node_ready = node.as_ref().is_some_and(|n| n.npx().is_some());
-    let selected = c
-        .folder_id
-        .clone()
-        .or_else(|| folders.first().map(|f| f.id.clone()));
-    let items = c.transcript.items.clone();
-    let asks = c.asks.clone();
-    let notice = c.notice.clone();
-    let folder_label_now = c.folder_label.clone();
-    let writable = c.writable;
-    drop(c);
     let status_class = match &status {
         Status::Ready => "cc-status ok",
         Status::Working | Status::Starting => "cc-status busy",
@@ -81,15 +204,40 @@ pub fn ClaudeAgentBotView(session: Signal<Session>, bot_id: String) -> Element {
             div { class: "cc-inline-bar",
                 div { class: "cc-inline-title",
                     Icon { name: "code", size: 15 }
-                    strong { "{bot_name} \u{00b7} Local Claude Agent (ACP)" }
+                    strong { "{bot_name} \u{00b7} Local Claude Code (ACP)" }
                     span { class: "{status_class}", role: "status", "{status.label()}" }
+                    if has_persona {
+                        span { class: "chip muted", title: "This bot sends its role and instructions into its local session", "Persona active" }
+                    }
                 }
                 div { class: "cc-head-actions",
+                    if !items.is_empty() && !working {
+                        button {
+                            class: "btn ghost sm",
+                            r#type: "button",
+                            onclick: {
+                                let bot_id = bot_id.clone();
+                                move |_| {
+                                    let s = session.read();
+                                    let mut st = store.write();
+                                    ensure_bot_controller(&mut st, &s, &bot_id).clear();
+                                }
+                            },
+                            "Clear history"
+                        }
+                    }
                     if running {
                         button {
                             class: "btn ghost sm",
                             r#type: "button",
-                            onclick: move |_| controller.write().stop(),
+                            onclick: {
+                                let bot_id = bot_id.clone();
+                                move |_| {
+                                    let s = session.read();
+                                    let mut st = store.write();
+                                    ensure_bot_controller(&mut st, &s, &bot_id).stop();
+                                }
+                            },
                             Icon { name: "stop", size: 14 }
                             "Stop agent"
                         }
@@ -97,7 +245,7 @@ pub fn ClaudeAgentBotView(session: Signal<Session>, bot_id: String) -> Element {
                     button {
                         class: "btn ghost sm",
                         r#type: "button",
-                        onclick: move |_| session.write().toggle_bot_claude_agent(&bot_for_toggle),
+                        onclick: move |_| session.write().set_bot_claude_agent(&bot_for_toggle, false),
                         Icon { name: "chat", size: 14 }
                         "Server model chat"
                     }
@@ -107,7 +255,8 @@ pub fn ClaudeAgentBotView(session: Signal<Session>, bot_id: String) -> Element {
                 if !running {
                     section { class: "card cc-setup", "aria-labelledby": "cc-setup-title",
                         div { class: "card-head",
-                            h2 { class: "card-title", id: "cc-setup-title", "Set up" }
+                            h2 { class: "card-title", id: "cc-setup-title", "Local desktop runtime for {bot_name}" }
+                            span { class: "tiny muted", "ACP · Folder-scoped · Every tool approved here" }
                         }
                         ol { class: "cc-steps",
                             li { class: if node_ready { "cc-step done" } else { "cc-step" },
@@ -126,7 +275,14 @@ pub fn ClaudeAgentBotView(session: Signal<Session>, bot_id: String) -> Element {
                                             button {
                                                 class: "btn primary sm",
                                                 r#type: "button",
-                                                onclick: move |_| controller.write().install_node(),
+                                                onclick: {
+                                                    let bot_id = bot_id.clone();
+                                                    move |_| {
+                                                        let s = session.read();
+                                                        let mut st = store.write();
+                                                        ensure_bot_controller(&mut st, &s, &bot_id).install_node();
+                                                    }
+                                                },
                                                 Icon { name: "download", size: 14 }
                                                 "Install Node.js"
                                             }
@@ -134,7 +290,14 @@ pub fn ClaudeAgentBotView(session: Signal<Session>, bot_id: String) -> Element {
                                         button {
                                             class: "btn ghost sm",
                                             r#type: "button",
-                                            onclick: move |_| controller.write().check_node(),
+                                            onclick: {
+                                                let bot_id = bot_id.clone();
+                                                move |_| {
+                                                    let s = session.read();
+                                                    let mut st = store.write();
+                                                    ensure_bot_controller(&mut st, &s, &bot_id).check_node();
+                                                }
+                                            },
                                             Icon { name: "refresh", size: 14 }
                                             "Check again"
                                         }
@@ -172,6 +335,7 @@ pub fn ClaudeAgentBotView(session: Signal<Session>, bot_id: String) -> Element {
                                             {
                                                 let on = selected.as_deref() == Some(folder.id.as_str());
                                                 let id = folder.id.clone();
+                                                let bot_for_folder = bot_id.clone();
                                                 let label = folder_label(&folder);
                                                 let mode = if folder.mode == FolderMode::ReadWrite { "read and write" } else { "read only" };
                                                 rsx! {
@@ -181,7 +345,12 @@ pub fn ClaudeAgentBotView(session: Signal<Session>, bot_id: String) -> Element {
                                                         r#type: "button",
                                                         role: "radio",
                                                         "aria-checked": if on { "true" } else { "false" },
-                                                        onclick: move |_| controller.write().folder_id = Some(id.clone()),
+                                                        onclick: move |_| {
+                                                            session.write().set_bot_claude_agent_folder(&bot_for_folder, id.clone());
+                                                            let s = session.read();
+                                                            let mut st = store.write();
+                                                            ensure_bot_controller(&mut st, &s, &bot_for_folder).folder_id = Some(id.clone());
+                                                        },
                                                         Icon { name: "folder", size: 14 }
                                                         span { class: "cc-folder-name", "{label}" }
                                                         span { class: "cc-folder-mode", "{mode}" }
@@ -204,7 +373,14 @@ pub fn ClaudeAgentBotView(session: Signal<Session>, bot_id: String) -> Element {
                                         button {
                                             class: "btn ghost sm",
                                             r#type: "button",
-                                            onclick: move |_| controller.write().sign_in(),
+                                            onclick: {
+                                                let bot_id = bot_id.clone();
+                                                move |_| {
+                                                    let s = session.read();
+                                                    let mut st = store.write();
+                                                    ensure_bot_controller(&mut st, &s, &bot_id).sign_in();
+                                                }
+                                            },
                                             Icon { name: "key", size: 14 }
                                             "Sign in to Claude"
                                         }
@@ -220,20 +396,24 @@ pub fn ClaudeAgentBotView(session: Signal<Session>, bot_id: String) -> Element {
                                 onclick: {
                                     let folders = folders.clone();
                                     let selected = selected.clone();
+                                    let bot_id = bot_id.clone();
                                     move |_| {
                                         if let Some(folder) = folders
                                             .iter()
                                             .find(|f| Some(f.id.as_str()) == selected.as_deref())
                                         {
-                                            controller.write().start(folder);
+                                            session.write().set_bot_claude_agent_folder(&bot_id, folder.id.clone());
+                                            let s = session.read();
+                                            let mut st = store.write();
+                                            ensure_bot_controller(&mut st, &s, &bot_id).start(folder);
                                         }
                                     }
                                 },
                                 Icon { name: "bolt", size: 16 }
-                                "Start Claude Code"
+                                "Start {bot_name} in folder"
                             }
                             p { class: "muted cc-fine",
-                                "The first start downloads the Claude Code adapter with npx. Nothing is sent to your SeraBot server."
+                                "The first start downloads the Claude Code adapter with npx. Nothing leaves this computer for SeraBot server execution."
                             }
                         }
                     }
@@ -251,14 +431,28 @@ pub fn ClaudeAgentBotView(session: Signal<Session>, bot_id: String) -> Element {
                             button {
                                 class: "btn primary sm",
                                 r#type: "button",
-                                onclick: move |_| controller.write().sign_in(),
+                                onclick: {
+                                    let bot_id = bot_id.clone();
+                                    move |_| {
+                                        let s = session.read();
+                                        let mut st = store.write();
+                                        ensure_bot_controller(&mut st, &s, &bot_id).sign_in();
+                                    }
+                                },
                                 Icon { name: "key", size: 14 }
                                 "Sign in to Claude"
                             }
                             button {
                                 class: "btn sm",
                                 r#type: "button",
-                                onclick: move |_| controller.write().retry_session(),
+                                onclick: {
+                                    let bot_id = bot_id.clone();
+                                    move |_| {
+                                        let s = session.read();
+                                        let mut st = store.write();
+                                        ensure_bot_controller(&mut st, &s, &bot_id).retry_session();
+                                    }
+                                },
                                 Icon { name: "refresh", size: 14 }
                                 "Try again"
                             }
@@ -270,7 +464,7 @@ pub fn ClaudeAgentBotView(session: Signal<Session>, bot_id: String) -> Element {
                 }
                 div { class: "cc-feed", role: "log", "aria-live": "polite",
                     if items.is_empty() && running {
-                        p { class: "muted cc-empty", "Ask Claude Code to explain, fix or build something in this folder." }
+                        p { class: "muted cc-empty", "Ask {bot_name} to explain, fix or build something in this folder." }
                     }
                     for (index, item) in items.into_iter().enumerate() {
                         TranscriptRow { key: "{index}", index, item }
@@ -289,13 +483,18 @@ pub fn ClaudeAgentBotView(session: Signal<Session>, bot_id: String) -> Element {
                             for option in ask.request.shown_options() {
                                 {
                                     let id = option.id.clone();
+                                    let bot_id = bot_id.clone();
                                     let class = if option.allows() { "btn primary sm" } else { "btn sm" };
                                     rsx! {
                                         button {
                                             key: "{id}",
                                             class: "{class}",
                                             r#type: "button",
-                                            onclick: move |_| controller.write().answer(index, Some(&id)),
+                                            onclick: move |_| {
+                                                let s = session.read();
+                                                let mut st = store.write();
+                                                ensure_bot_controller(&mut st, &s, &bot_id).answer(index, Some(&id));
+                                            },
                                             "{option.name}"
                                         }
                                     }
@@ -304,7 +503,14 @@ pub fn ClaudeAgentBotView(session: Signal<Session>, bot_id: String) -> Element {
                             button {
                                 class: "btn ghost sm",
                                 r#type: "button",
-                                onclick: move |_| controller.write().answer(index, None),
+                                onclick: {
+                                    let bot_id = bot_id.clone();
+                                    move |_| {
+                                        let s = session.read();
+                                        let mut st = store.write();
+                                        ensure_bot_controller(&mut st, &s, &bot_id).answer(index, None);
+                                    }
+                                },
                                 "Decline"
                             }
                         }
@@ -313,11 +519,16 @@ pub fn ClaudeAgentBotView(session: Signal<Session>, bot_id: String) -> Element {
                 if running {
                     form {
                         class: "cc-composer",
-                        onsubmit: move |event| {
-                            event.prevent_default();
-                            let text = draft();
-                            if controller.write().send(&text) {
-                                draft.set(String::new());
+                        onsubmit: {
+                            let bot_id = bot_id.clone();
+                            move |event| {
+                                event.prevent_default();
+                                let text = draft();
+                                let s = session.read();
+                                let mut st = store.write();
+                                if ensure_bot_controller(&mut st, &s, &bot_id).send(&text) {
+                                    draft.set(String::new());
+                                }
                             }
                         },
                         textarea {
@@ -327,12 +538,17 @@ pub fn ClaudeAgentBotView(session: Signal<Session>, bot_id: String) -> Element {
                             "aria-label": "Message Claude Code",
                             value: "{draft}",
                             oninput: move |event| draft.set(event.value()),
-                            onkeydown: move |event| {
-                                if event.key() == Key::Enter && event.modifiers().ctrl() {
-                                    event.prevent_default();
-                                    let text = draft();
-                                    if controller.write().send(&text) {
-                                        draft.set(String::new());
+                            onkeydown: {
+                                let bot_id = bot_id.clone();
+                                move |event| {
+                                    if event.key() == Key::Enter && event.modifiers().ctrl() {
+                                        event.prevent_default();
+                                        let text = draft();
+                                        let s = session.read();
+                                        let mut st = store.write();
+                                        if ensure_bot_controller(&mut st, &s, &bot_id).send(&text) {
+                                            draft.set(String::new());
+                                        }
                                     }
                                 }
                             },
@@ -342,7 +558,14 @@ pub fn ClaudeAgentBotView(session: Signal<Session>, bot_id: String) -> Element {
                                 button {
                                     class: "btn sm",
                                     r#type: "button",
-                                    onclick: move |_| controller.write().cancel(),
+                                    onclick: {
+                                        let bot_id = bot_id.clone();
+                                        move |_| {
+                                            let s = session.read();
+                                            let mut st = store.write();
+                                            ensure_bot_controller(&mut st, &s, &bot_id).cancel();
+                                        }
+                                    },
                                     Icon { name: "stop", size: 14 }
                                     "Stop"
                                 }
@@ -350,7 +573,14 @@ pub fn ClaudeAgentBotView(session: Signal<Session>, bot_id: String) -> Element {
                             button {
                                 class: "btn ghost sm",
                                 r#type: "button",
-                                onclick: move |_| controller.write().clear(),
+                                onclick: {
+                                    let bot_id = bot_id.clone();
+                                    move |_| {
+                                        let s = session.read();
+                                        let mut st = store.write();
+                                        ensure_bot_controller(&mut st, &s, &bot_id).clear();
+                                    }
+                                },
                                 "Clear"
                             }
                             button {

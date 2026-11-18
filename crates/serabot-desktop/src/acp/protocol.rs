@@ -139,7 +139,7 @@ pub fn cancel_params(session_id: &str) -> Value {
 }
 
 /// One step of a plan.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlanEntry {
     pub content: String,
     /// `pending`, `in_progress` or `completed`.

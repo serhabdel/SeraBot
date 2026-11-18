@@ -560,13 +560,34 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         seen_conversation.set(conversation.clone());
         {
             let mut guard = entered_messages_effect.borrow_mut();
-            guard.0 = conversation;
+            guard.0 = conversation.clone();
             guard.1.clear();
         }
         *last_mark_reset.borrow_mut() = chat_scroll::TranscriptMark::default();
         last_count.set(0);
         at_bottom.set(true);
         unseen.set(0);
+        feed_anchor.set(None);
+        feed_reported.set(None);
+        mention.set(None);
+        mention_idx.set(0);
+        slash.set(None);
+        slash_idx.set(0);
+        confirm_regen.set(None);
+        search_query.set(String::new());
+        search_open.set(false);
+        dismissed_failure.set(None);
+        dismissed_held.set(false);
+        dismissed_transcript_err.set(None);
+        dismissed_fallback.set(None);
+        was_running.set(false);
+        announcement.set(String::new());
+        composer_expanded.set(false);
+        if let Ok(conv_json) = serde_json::to_string(&conversation) {
+            let _ =
+                dioxus::document::eval(&format!("window.__serabotOnConvSwitch?.({conv_json});"));
+        }
+        focus_composer();
     });
     use_effect(move || {
         let count = session.read().state.messages.len();
@@ -2193,19 +2214,31 @@ fn MessageRow(
 
 /// Shown under the picker when the server lists no concrete model.
 pub(super) const NO_MODELS_HINT: &str = "Ask the admin to allow more models.";
+const LOCAL_ACP_VALUE: &str = "local-acp|claude-code";
 
 #[component]
 pub(super) fn ModelBar(
     session: Signal<Session>,
     #[props(default = false)] compact: bool,
 ) -> Element {
-    // Picker items: (value, label). "auto" first, then the catalog entries
-    // (or the static provider model lists when the catalog is empty).
-    let (items, current, allowed, saved, rows, kinds, provider_accounts) = {
+    // Picker items: (value, label). "auto" first, optional local Claude Code
+    // (ACP) entry in a 1:1 bot chat, then the catalog entries (or the static
+    // provider model lists when the catalog is empty).
+    let (active_bot, acp_active, items, current, allowed, saved, rows, kinds, provider_accounts) = {
         let session = session.read();
+        let active_bot = session.conversation_bot(&session.conversation);
+        let acp_active = active_bot
+            .as_deref()
+            .is_some_and(|bot| session.bot_uses_claude_agent(bot));
         let catalog = session.state.catalog.as_ref();
         let mut items: Vec<(String, String)> =
             vec![("auto".to_owned(), "Auto · approved route".to_owned())];
+        if active_bot.is_some() {
+            items.push((
+                LOCAL_ACP_VALUE.to_owned(),
+                "Claude Code · Local desktop (ACP)".to_owned(),
+            ));
+        }
         let mut current = "auto".to_owned();
         let mut allowed = false;
         let mut saved = "auto".to_owned();
@@ -2276,6 +2309,8 @@ pub(super) fn ModelBar(
             }
         }
         (
+            active_bot,
+            acp_active,
             items,
             current,
             allowed,
@@ -2304,8 +2339,9 @@ pub(super) fn ModelBar(
         )
     };
     let changed = value != current || draft_account != saved_account;
-    // Only "auto" is left: the server offered no concrete model.
-    let no_models = session.read().state.catalog.is_some() && items.len() <= 1;
+    // Only "auto" (plus local ACP in bot chat) left: the server offered no concrete model.
+    let no_models = session.read().state.catalog.is_some()
+        && items.len() <= if active_bot.is_some() { 2 } else { 1 };
     // Thinking levels the saved model accepts, and the one in force. The
     // picker is absent for a model with no thinking control.
     let (thinking_levels, thinking_now) = {
@@ -2323,7 +2359,9 @@ pub(super) fn ModelBar(
             .unwrap_or_default()
     };
     // The chip: `provider/account · model · thinking`.
-    let current_label = {
+    let current_label = if acp_active {
+        "Claude Code · Local ACP".to_owned()
+    } else {
         let s = session.read();
         let level = (!changed && !thinking_now.is_empty()).then_some(thinking_now.as_str());
         route_chip::chip_label(&s.route_options(), &s.state.draft, level)
@@ -2389,6 +2427,8 @@ pub(super) fn ModelBar(
             })
             .collect()
     };
+    let bot_for_enter = active_bot.clone();
+    let bot_for_click = active_bot.clone();
     rsx! {
         div { class: if compact { "model-bar compact" } else { "model-bar" },
             if !compact {
@@ -2418,8 +2458,19 @@ pub(super) fn ModelBar(
                             if let Some((_, item_value, _)) =
                                 keyed.get(active_idx().min(count.saturating_sub(1)))
                             {
+                                if item_value == LOCAL_ACP_VALUE {
+                                    if let Some(bot) = bot_for_enter.as_deref() {
+                                        session.write().set_bot_claude_agent(bot, true);
+                                    }
+                                    open.set(false);
+                                    query.set(String::new());
+                                    return;
+                                }
                                 let account = picked_account_for(&session.read(), &picked_account.read(), item_value);
                                 let mut session = session.write();
+                                if let Some(bot) = bot_for_enter.as_deref() {
+                                    session.set_bot_claude_agent(bot, false);
+                                }
                                 set_model_draft_with(&mut session, item_value, account);
                                 if compact {
                                     let parsed = session.state.draft.clone();
@@ -2451,7 +2502,8 @@ pub(super) fn ModelBar(
                     onclick: move |_| {
                         if !open() {
                             query.set(String::new());
-                            let position = items.iter().position(|(v, _)| *v == value).unwrap_or(0);
+                            let target = if acp_active { LOCAL_ACP_VALUE } else { value.as_str() };
+                            let position = items.iter().position(|(v, _)| v == target).unwrap_or(0);
                             active_idx.set(position);
                         }
                         open.set(!open());
@@ -2484,7 +2536,12 @@ pub(super) fn ModelBar(
                         }
                         for (pos, (_index, item_value, label, header, row)) in render_rows.into_iter().enumerate() {
                             div { key: "{item_value}",
-                            if let Some((brand, name)) = header {
+                            if item_value == LOCAL_ACP_VALUE {
+                                div { class: "pop-group model-group",
+                                    Icon { name: "code", size: 15 }
+                                    span { "Local · Desktop (ACP)" }
+                                }
+                            } else if let Some((brand, name)) = header {
                                 div { class: "pop-group model-group",
                                     BrandLogo { brand, size: 16 }
                                     span { "{name}" }
@@ -2507,9 +2564,21 @@ pub(super) fn ModelBar(
                                 class: if pos == active { "pop-item active" } else { "pop-item" },
                                 onclick: {
                                     let item_value = item_value.clone();
+                                    let bot_for_click = bot_for_click.clone();
                                     move |_| {
+                                        if item_value == LOCAL_ACP_VALUE {
+                                            if let Some(bot) = bot_for_click.as_deref() {
+                                                session.write().set_bot_claude_agent(bot, true);
+                                            }
+                                            open.set(false);
+                                            query.set(String::new());
+                                            return;
+                                        }
                                         let account = picked_account_for(&session.read(), &picked_account.read(), &item_value);
                                         let mut session = session.write();
+                                        if let Some(bot) = bot_for_click.as_deref() {
+                                            session.set_bot_claude_agent(bot, false);
+                                        }
                                         set_model_draft_with(&mut session, &item_value, account);
                                         if compact {
                                             let parsed = session.state.draft.clone();
@@ -2526,7 +2595,15 @@ pub(super) fn ModelBar(
                                         query.set(String::new());
                                     }
                                 },
-                                if let Some(row) = row {
+                                if item_value == LOCAL_ACP_VALUE {
+                                    div { class: "model-row",
+                                        span { class: "model-title", "Claude Code" }
+                                        div { class: "model-meta",
+                                            span { class: "chip", "Local ACP" }
+                                            span { class: "model-id", "Runs locally in allowed folder" }
+                                        }
+                                    }
+                                } else if let Some(row) = row {
                                     div { class: "model-row",
                                         span { class: "model-title", "{row.title}" }
                                         div { class: "model-meta",
@@ -2544,7 +2621,7 @@ pub(super) fn ModelBar(
                                 } else {
                                     span { "{label}" }
                                 }
-                                if item_value == current {
+                                if (item_value == LOCAL_ACP_VALUE && acp_active) || (!acp_active && item_value == current) {
                                     Icon { name: "check", size: 14 }
                                 }
                             }
