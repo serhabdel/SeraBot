@@ -300,6 +300,7 @@ fn choose_event_kind(current: &mut String, dirty: &mut bool, conversation: &str,
 pub enum Section {
     Chat,
     Conversations,
+    Projects,
     Memory,
     Providers,
     Browser,
@@ -317,9 +318,10 @@ pub enum Section {
 }
 
 impl Section {
-    pub const NAV: [Self; 11] = [
+    pub const NAV: [Self; 12] = [
         Self::Chat,
         Self::Conversations,
+        Self::Projects,
         Self::Browser,
         Self::Tasks,
         Self::Memory,
@@ -335,6 +337,7 @@ impl Section {
         match self {
             Self::Chat => "Chat",
             Self::Conversations => "Conversations",
+            Self::Projects => "Projects",
             Self::Memory => "Memory",
             Self::Providers => "Providers",
             Self::Browser => "Browser",
@@ -1613,6 +1616,62 @@ impl Session {
         } else {
             Operation::Health
         });
+    }
+
+    /// Friendly warning when a persisted session is within 48 hours of expiry,
+    /// so the user can re-sign-in before hitting a 401.
+    pub fn session_expires_soon(&self) -> Option<String> {
+        let expires = self.session_expires?;
+        let now = unix_now();
+        if expires <= now {
+            return None;
+        }
+        let remaining = expires - now;
+        const WARN_WINDOW_SECS: u64 = 48 * 3600;
+        if remaining > WARN_WINDOW_SECS {
+            return None;
+        }
+        let hours = (remaining / 3600).max(1);
+        Some(if hours >= 24 {
+            format!(
+                "Your session expires in about {} day(s).",
+                hours.div_ceil(24)
+            )
+        } else {
+            format!("Your session expires in about {hours} hour(s).")
+        })
+    }
+
+    /// Export the active conversation's loaded messages as clean Markdown.
+    pub fn conversation_markdown(&self) -> Option<String> {
+        if self.state.messages.is_empty() {
+            return None;
+        }
+        let title = self
+            .state
+            .conversations
+            .iter()
+            .find(|c| c.id == self.conversation)
+            .and_then(|c| c.title.clone())
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| "Conversation".to_owned());
+        let mut out = format!("# {title}\n\n");
+        for msg in &self.state.messages {
+            let speaker = match msg.role {
+                crate::api::Role::User => "You".to_owned(),
+                crate::api::Role::Assistant => msg
+                    .bot
+                    .as_deref()
+                    .map(|b| self.bot_display_name(b))
+                    .unwrap_or_else(|| "Assistant".to_owned()),
+            };
+            let content = msg.content.trim();
+            if content.is_empty() {
+                continue;
+            }
+            out.push_str(&format!("### {speaker}\n\n{content}\n\n"));
+        }
+        Some(out)
     }
 
     pub fn open_section(&mut self, section: Section) {
@@ -5329,6 +5388,7 @@ impl Session {
                     include_archived: false,
                 })
             }
+            Section::Projects => None,
             Section::Memory => {
                 if self.state.memories_loaded {
                     None
@@ -7800,5 +7860,75 @@ mod backlog_tests {
         assert!(session.state.receive(&scope, Reply::Stopping(0)));
         session.state.stopping = false;
         assert!(!session.state.stopping);
+    }
+
+    #[test]
+    fn session_expires_soon_warns_inside_48h_window_only() {
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        assert!(session.session_expires_soon().is_none());
+
+        // 10 days away -> no warning.
+        session.session_expires = Some(unix_now() + 10 * 24 * 3600);
+        assert!(session.session_expires_soon().is_none());
+
+        // 5 hours away -> hour warning.
+        session.session_expires = Some(unix_now() + 5 * 3600 + 120);
+        let msg = session.session_expires_soon().expect("warning expected");
+        assert!(msg.contains("hour(s)"));
+
+        // Already expired -> None (handled by auth redirect).
+        session.session_expires = Some(unix_now().saturating_sub(60));
+        assert!(session.session_expires_soon().is_none());
+    }
+
+    #[test]
+    fn conversation_markdown_exports_title_and_speakers() {
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        assert!(session.conversation_markdown().is_none());
+
+        session.conversation = "c-1".into();
+        session
+            .state
+            .conversations
+            .push(crate::ConversationSummary {
+                id: "c-1".into(),
+                kind: "chat".into(),
+                parent_id: None,
+                title: Some("Q4 Review".into()),
+                created_at: "2026-11-18T00:00:00Z".into(),
+                updated_at: "2026-11-18T00:00:00Z".into(),
+                last_message_at: None,
+                archived_at: None,
+                unread_count: 0,
+                accepts_turns: true,
+                last_message: None,
+                avatar_version: None,
+            });
+        session.state.messages.push(Message {
+            id: "m-1".into(),
+            role: Role::User,
+            content: "Summarize the deck.".into(),
+            created_at: "Now".into(),
+            name: None,
+            bot: None,
+            attachments: Vec::new(),
+            limit_reached: false,
+        });
+        session.state.messages.push(Message {
+            id: "m-2".into(),
+            role: Role::Assistant,
+            content: "Here is the summary.".into(),
+            created_at: "Now".into(),
+            name: None,
+            bot: Some("main".into()),
+            attachments: Vec::new(),
+            limit_reached: false,
+        });
+        let md = session.conversation_markdown().expect("markdown expected");
+        assert!(md.starts_with("# Q4 Review\n\n"));
+        assert!(md.contains("### You\n\nSummarize the deck."));
+        assert!(md.contains("Here is the summary."));
     }
 }

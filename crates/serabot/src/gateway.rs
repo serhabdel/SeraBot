@@ -3189,6 +3189,7 @@ mod tests {
             tool_call_id: None,
             tool_calls: vec![],
             is_error: false,
+            images: Vec::new(),
         }];
         let redacted = gateway.redact_messages(&admin, &messages).unwrap();
         let msg = redacted[0].content.as_deref().unwrap();

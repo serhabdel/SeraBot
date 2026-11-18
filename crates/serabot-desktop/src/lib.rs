@@ -36,6 +36,7 @@ pub mod oauth;
 pub mod panel;
 pub mod pc_stats;
 pub mod preview;
+pub mod projects;
 pub mod provider_accounts;
 pub mod provider_flow;
 pub mod provider_presets;

@@ -46,6 +46,7 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
                 }
                 StatusBanner { session }
                 UpdateBanner { session }
+                SessionExpiryBanner { session }
                 if onboarding_open {
                     OnboardingView { session }
                 } else {
@@ -57,6 +58,7 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
                             ChatView { session, overlay }
                         },
                         Section::Conversations => rsx! { ConversationsView { session } },
+                        Section::Projects => rsx! { crate::ui_projects::ProjectsView { session } },
                         Section::Memory => rsx! { MemoryView { session } },
                         Section::Providers => rsx! { ProvidersView { session, overlay } },
                         Section::Browser => rsx! { BrowserView { session, overlay } },
@@ -156,7 +158,8 @@ pub(super) fn IconRail(
         (Section::Workflows, "workflows", "Workflows"),
         (Section::Tasks, "list", "Tasks"),
     ];
-    let data: [(Section, &str, &str); 3] = [
+    let data: [(Section, &str, &str); 4] = [
+        (Section::Projects, "folder", "Projects"),
         (Section::Browser, "globe", "Browser"),
         (Section::Memory, "memory", "Memory"),
         (Section::Vault, "lock", "Vault"),
@@ -1880,6 +1883,20 @@ pub(super) fn Topbar(
                         Icon { name: "search", size: 16 }
                     }
                 }
+                if can_search {
+                    button {
+                        class: "icon-btn",
+                        title: "Copy conversation as Markdown",
+                        "aria-label": "Copy conversation as Markdown",
+                        onclick: move |_| {
+                            if let Some(md) = session.read().conversation_markdown() {
+                                let _ = dioxus::document::eval(&crate::ui_files::copy_script(&md));
+                                toast.set(Some(("Copied conversation as Markdown.".into(), false)));
+                            }
+                        },
+                        Icon { name: "copy", size: 16 }
+                    }
+                }
                 button {
                     class: "icon-btn",
                     title: "Reload",
@@ -2145,6 +2162,39 @@ pub(super) fn format_size(bytes: u64) -> String {
         format!("{:.1} MB", bytes as f64 / MB)
     } else {
         format!("{} KB", bytes.div_ceil(1024))
+    }
+}
+
+#[component]
+pub(super) fn SessionExpiryBanner(session: Signal<Session>) -> Element {
+    let mut dismissed = use_signal(|| false);
+    let warning = session.read().session_expires_soon();
+    let Some(message) = warning else {
+        return rsx! {};
+    };
+    if dismissed() {
+        return rsx! {};
+    }
+    rsx! {
+        div { class: "banner warn",
+            span { "{message} Sign in again soon to avoid interruption." }
+            div { class: "row",
+                button {
+                    r#type: "button",
+                    class: "btn sm",
+                    onclick: move |_| {
+                        session.write().open_section(Section::Settings);
+                    },
+                    "Account settings"
+                }
+                button {
+                    r#type: "button",
+                    class: "btn ghost sm",
+                    onclick: move |_| dismissed.set(true),
+                    "Dismiss"
+                }
+            }
+        }
     }
 }
 

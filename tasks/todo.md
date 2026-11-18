@@ -236,3 +236,14 @@ never merge without the owner's OK.
 - [x] Chat UX polish: per-bot `quick_chips(bot_id)` starter prompts and `"Stopping…"` / Escape-to-stop responsiveness.
 - [x] Native WhatsApp Business Cloud API connector (`token_connectors/whatsapp.rs`, `whatsapp_*` gateway tools, `bots/whatsapp.toml`, `prompts/whatsapp.txt`, live `Test` endpoint, and 2-field + optional WABA ID Integrations UI card).
 - [ ] Owner: verify WhatsApp Cloud API connector with a real Meta Phone Number ID + System User token and review desktop UI/logs/stop behavior on Windows.
+
+## Release 0.59.0 — Projects UI, multimodal vision, drag-and-drop, Copilot/Codex parity, ACP prompts & WhatsApp link enabled
+
+- [x] Projects end-to-end: fix `project_file` attachment relocation updating `chat_attachments.rel_path`, add user-scoped `/v1/projects/*` HTTP API (`api/projects.rs`), and add desktop `ProjectsView` (`Section::Projects`).
+- [x] Real multimodal image vision (`LlmImage`, `load_images_for_model`) across OpenAI-compat, Anthropic, Responses, and Antigravity/Cloud Code transports, plus bounded inline Office excerpts (`.docx`/`.xlsx`/`.pptx`).
+- [x] Desktop chat drag-and-drop upload bridge (`ui_files.rs`), 48h session-expiry warning banner (`SessionExpiryBanner`), and conversation Markdown export (`Topbar`).
+- [x] Provider quota readers for `github-copilot` and `openai-codex`, Copilot `auto` model + Responses-only routing + `reasoning_effort`, and Responses reasoning-item capture/replay (`resp:`).
+- [x] Local Claude Code (ACP) `@`-file mentions scoped to the allowed folder and base64 image prompt blocks (`PromptImage`).
+- [x] Enable `[whatsapp_link] enabled = true` by default in `config.rs`, `serabot.toml`, and `deploy/serabot.production.toml.example` (still opt-out via `enabled = false`, no widening).
+- [ ] Owner: live verification of WhatsApp linked-device pairing, image vision, Copilot/Codex quotas, and ACP `@`-file / image prompts on Windows + upgraded server.
+

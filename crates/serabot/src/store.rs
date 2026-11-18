@@ -2881,6 +2881,7 @@ impl Store {
                 tool_call_id: message.tool_call_id,
                 name: message.name,
                 is_error: false,
+                images: Vec::new(),
             })
             .collect())
     }

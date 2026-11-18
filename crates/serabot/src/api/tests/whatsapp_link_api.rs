@@ -6,7 +6,12 @@ use super::*;
 const ADMIN_TOKEN: &str = "test-token-that-is-long-enough-123";
 
 #[tokio::test]
-async fn whatsapp_link_routes_are_per_member_and_off_by_default() {
+async fn whatsapp_link_routes_are_per_member_and_refuse_pair_when_disabled() {
+    // v0.59 enables [whatsapp_link] by default in Config; an ApiState without
+    // a wired WhatsappLink handle (e.g. when enabled = false) reports
+    // enabled: false and refuses /pair with 422.
+    assert!(crate::config::Config::default().whatsapp_link.enabled);
+
     let (app, _, store) = app_with_root(true, Policy::empty(), temp_base());
     let member = store
         .create_user("subject-wa", "wa@example.example", "Synthetic Member")
@@ -29,7 +34,6 @@ async fn whatsapp_link_routes_are_per_member_and_off_by_default() {
     assert_eq!(body["status"], "signed_out");
     assert!(body["risk"].as_str().unwrap().contains("spare number"));
 
-    // Linking is off on this server: pairing is refused, nothing is started.
     let response = app
         .clone()
         .oneshot(request_with_token(

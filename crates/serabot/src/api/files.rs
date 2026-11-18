@@ -120,8 +120,11 @@ pub(super) async fn download_attachment(
         .get_chat_attachment(&user.id, &id)?
         .ok_or_else(|| SeraError::NotFound("attachment".into()))?;
     let root = state.config.path(&state.config.documents.watch_dir);
-    let prefix = format!("{}/chat/", user.id);
-    if !record.rel_path.starts_with(&prefix) || record.rel_path.contains("..") {
+    let chat_prefix = format!("{}/chat/", user.id);
+    let project_prefix = format!("{}/projects/", user.id);
+    if (!record.rel_path.starts_with(&chat_prefix) && !record.rel_path.starts_with(&project_prefix))
+        || record.rel_path.contains("..")
+    {
         return Err(SeraError::Forbidden("attachment path".into()));
     }
     let bytes = std::fs::read(root.join(&record.rel_path))

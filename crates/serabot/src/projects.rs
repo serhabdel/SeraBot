@@ -161,6 +161,258 @@ fn files_in(dir: &Path, prefix: &str, out: &mut Vec<String>, depth: usize) -> Re
     Ok(())
 }
 
+use serde::Serialize;
+
+use crate::store::Store;
+
+/// Summary of one user project folder, returned by `GET /v1/projects`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectSummary {
+    pub slug: String,
+    pub file_count: usize,
+    pub total_bytes: u64,
+}
+
+/// One file inside a user project folder, returned by `GET /v1/projects/{slug}/files`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectFileEntry {
+    pub name: String,
+    /// Relative path inside the project (e.g. `invoices/2026/a.pdf`).
+    pub path: String,
+    /// Inbox path usable with bot document tools (`<user>/projects/<slug>/...`).
+    pub inbox_path: String,
+    pub size_bytes: u64,
+    pub mime: String,
+    pub modified_at: Option<String>,
+}
+
+fn collect_entries(
+    dir: &Path,
+    user_id: &str,
+    slug: &str,
+    sub_prefix: &str,
+    out: &mut Vec<ProjectFileEntry>,
+    depth: usize,
+) -> Result<()> {
+    if depth > 3 || out.len() >= MAX_LISTED_FILES * 4 {
+        return Ok(());
+    }
+    let mut entries = std::fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let rel_in_project = if sub_prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{sub_prefix}/{name}")
+        };
+        if kind.is_dir() {
+            collect_entries(
+                &entry.path(),
+                user_id,
+                slug,
+                &rel_in_project,
+                out,
+                depth + 1,
+            )?;
+        } else if kind.is_file() {
+            let meta = entry.metadata()?;
+            let modified_at = meta.modified().ok().map(|t| {
+                let dt: chrono::DateTime<chrono::Utc> = t.into();
+                dt.to_rfc3339()
+            });
+            let inbox_path = format!("{user_id}/{PROJECTS_DIR}/{slug}/{rel_in_project}");
+            out.push(ProjectFileEntry {
+                mime: crate::util::mime_for_filename(&name).to_owned(),
+                name,
+                path: rel_in_project,
+                inbox_path,
+                size_bytes: meta.len(),
+                modified_at,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// List all projects owned by `user_id` with file counts and sizes.
+pub fn list_projects_with_stats(config: &Config, user_id: &str) -> Result<Vec<ProjectSummary>> {
+    let inbox = Inbox {
+        config: Arc::new(config.clone()),
+    };
+    let slugs = inbox.list(user_id)?;
+    let base = inbox.projects_dir(user_id)?;
+    let mut out = Vec::with_capacity(slugs.len());
+    for slug in slugs {
+        let mut entries = Vec::new();
+        let dir = base.join(&slug);
+        if dir.is_dir() {
+            collect_entries(&dir, user_id, &slug, "", &mut entries, 0)?;
+        }
+        let total_bytes = entries.iter().map(|e| e.size_bytes).sum();
+        out.push(ProjectSummary {
+            slug,
+            file_count: entries.len(),
+            total_bytes,
+        });
+    }
+    Ok(out)
+}
+
+/// Create a project for `user_id`. Returns `(slug, created)`.
+pub fn create_project(config: &Config, user_id: &str, name: &str) -> Result<(String, bool)> {
+    let inbox = Inbox {
+        config: Arc::new(config.clone()),
+    };
+    inbox.create(user_id, name)
+}
+
+/// List files inside one project owned by `user_id`.
+pub fn list_project_files(
+    config: &Config,
+    user_id: &str,
+    project: &str,
+) -> Result<(String, Vec<ProjectFileEntry>)> {
+    let slug = slugify(project)?;
+    let inbox = Inbox {
+        config: Arc::new(config.clone()),
+    };
+    let dir = inbox.projects_dir(user_id)?.join(&slug);
+    if !dir.is_dir() {
+        return Err(SeraError::NotFound(format!("no project named {slug}")));
+    }
+    let mut entries = Vec::new();
+    collect_entries(&dir, user_id, &slug, "", &mut entries, 0)?;
+    Ok((slug, entries))
+}
+
+/// Save a validated uploaded file directly into a user's project folder.
+pub fn save_project_upload(
+    config: &Config,
+    user_id: &str,
+    project: &str,
+    subfolder: Option<&str>,
+    filename: &str,
+    bytes: &[u8],
+) -> Result<ProjectFileEntry> {
+    crate::attachments::validate_upload(filename, bytes)?;
+    let safe_name = crate::telegram::safe_upload_name(filename);
+    let sub_parts = safe_subfolder(subfolder.unwrap_or(""))?;
+    let inbox = Inbox {
+        config: Arc::new(config.clone()),
+    };
+    let (slug, _) = inbox.create(user_id, project)?;
+    let projects_root = inbox.projects_dir(user_id)?.canonicalize()?;
+    let mut target_dir = inbox.projects_dir(user_id)?.join(&slug);
+    for part in &sub_parts {
+        target_dir.push(part);
+    }
+    std::fs::create_dir_all(&target_dir)?;
+    if !target_dir.canonicalize()?.starts_with(&projects_root) {
+        return Err(SeraError::Forbidden(
+            "the target is outside the projects folder".into(),
+        ));
+    }
+    let target = target_dir.join(&safe_name);
+    if target.exists() {
+        return Err(SeraError::Validation(format!(
+            "{safe_name} already exists in that project; rename or choose a subfolder"
+        )));
+    }
+    std::fs::write(&target, bytes)?;
+    let mut path_parts = sub_parts;
+    path_parts.push(safe_name.clone());
+    let rel_in_project = path_parts.join("/");
+    let inbox_path = format!("{user_id}/{PROJECTS_DIR}/{slug}/{rel_in_project}");
+    Ok(ProjectFileEntry {
+        mime: crate::util::mime_for_filename(&safe_name).to_owned(),
+        name: safe_name,
+        path: rel_in_project,
+        inbox_path,
+        size_bytes: bytes.len() as u64,
+        modified_at: Some(chrono::Utc::now().to_rfc3339()),
+    })
+}
+
+/// Resolve a relative file path inside `<user>/projects/<slug>/` safely.
+fn resolve_project_file(
+    config: &Config,
+    user_id: &str,
+    project: &str,
+    rel_file: &str,
+) -> Result<(String, PathBuf)> {
+    let slug = slugify(project)?;
+    if rel_file.trim().is_empty()
+        || rel_file.contains("..")
+        || rel_file.starts_with('/')
+        || rel_file.starts_with('\\')
+    {
+        return Err(SeraError::Validation("invalid project file path".into()));
+    }
+    let inbox = Inbox {
+        config: Arc::new(config.clone()),
+    };
+    let project_dir = inbox.projects_dir(user_id)?.join(&slug);
+    if !project_dir.is_dir() {
+        return Err(SeraError::NotFound(format!("no project named {slug}")));
+    }
+    let project_canon = project_dir.canonicalize()?;
+    let mut candidate = project_dir;
+    for part in rel_file.split(['/', '\\']).filter(|p| !p.is_empty()) {
+        if part == "." || part == ".." {
+            return Err(SeraError::Validation("invalid project file path".into()));
+        }
+        candidate.push(part);
+    }
+    let meta = std::fs::symlink_metadata(&candidate)
+        .map_err(|_| SeraError::NotFound("project file".into()))?;
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return Err(SeraError::NotFound("project file".into()));
+    }
+    let canon = candidate.canonicalize()?;
+    if !canon.starts_with(&project_canon) {
+        return Err(SeraError::Forbidden(
+            "the file is outside the project folder".into(),
+        ));
+    }
+    let filename = canon
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+    Ok((filename, canon))
+}
+
+/// Read one file inside a user's project folder. Returns `(filename, bytes)`.
+pub fn read_project_file(
+    config: &Config,
+    user_id: &str,
+    project: &str,
+    rel_file: &str,
+) -> Result<(String, Vec<u8>)> {
+    let (filename, path) = resolve_project_file(config, user_id, project, rel_file)?;
+    let bytes = std::fs::read(&path)?;
+    Ok((filename, bytes))
+}
+
+/// Delete one file inside a user's project folder. Returns the deleted filename.
+pub fn delete_project_file(
+    config: &Config,
+    user_id: &str,
+    project: &str,
+    rel_file: &str,
+) -> Result<String> {
+    let (filename, path) = resolve_project_file(config, user_id, project, rel_file)?;
+    std::fs::remove_file(&path)?;
+    Ok(filename)
+}
+
 pub struct ProjectListTool {
     inbox: Inbox,
 }
@@ -171,9 +423,18 @@ pub struct ProjectCreateTool {
 
 pub struct ProjectFileTool {
     inbox: Inbox,
+    store: Option<Arc<Store>>,
 }
 
 pub fn register(registry: &mut crate::gateway::ToolRegistry, config: Arc<Config>) -> Result<()> {
+    register_with_store(registry, config, None)
+}
+
+pub fn register_with_store(
+    registry: &mut crate::gateway::ToolRegistry,
+    config: Arc<Config>,
+    store: Option<Arc<Store>>,
+) -> Result<()> {
     let inbox = Inbox { config };
     registry.register(ProjectListTool {
         inbox: inbox.clone(),
@@ -181,7 +442,7 @@ pub fn register(registry: &mut crate::gateway::ToolRegistry, config: Arc<Config>
     registry.register(ProjectCreateTool {
         inbox: inbox.clone(),
     })?;
-    registry.register(ProjectFileTool { inbox })?;
+    registry.register(ProjectFileTool { inbox, store })?;
     Ok(())
 }
 
@@ -348,11 +609,19 @@ impl Tool for ProjectFileTool {
                 "{filename} already exists in that project; rename or choose a subfolder"
             )));
         }
+        let old_rel = source
+            .strip_prefix(self.inbox.root())
+            .ok()
+            .and_then(|p| p.to_str())
+            .map(|s| s.replace('\\', "/"));
         std::fs::rename(&source, &target)?;
         let mut parts: Vec<&str> = vec![&slug];
         parts.extend(subfolder.iter().map(String::as_str));
         parts.push(&filename);
         let new_path = rel(user, &parts);
+        if let (Some(store), Some(old_rel)) = (&self.store, old_rel.as_deref()) {
+            let _ = store.relocate_chat_attachment(user, old_rel, &new_path);
+        }
         Ok(ToolOutput {
             content: format!("Moved {filename} to {new_path}."),
             data: Some(json!({"project": slug, "path": new_path})),
@@ -408,6 +677,7 @@ mod tests {
         };
         let tool = ProjectFileTool {
             inbox: inbox.clone(),
+            store: None,
         };
         let out = tool
             .execute(
@@ -448,6 +718,7 @@ mod tests {
             inbox: Inbox {
                 config: config.clone(),
             },
+            store: None,
         };
         assert!(
             tool.execute(

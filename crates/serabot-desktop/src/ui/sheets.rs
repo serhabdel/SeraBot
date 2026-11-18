@@ -734,6 +734,12 @@ pub(super) fn CommandPaletteSheet(session: Signal<Session>, overlay: Signal<Over
                 "Approvals, deadlines & runs",
             ),
             (
+                Section::Projects,
+                "folder",
+                "Projects",
+                "Server project folders & files",
+            ),
+            (
                 Section::Browser,
                 "globe",
                 "Browser",

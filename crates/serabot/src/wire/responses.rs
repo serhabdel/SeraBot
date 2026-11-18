@@ -81,11 +81,34 @@ pub fn build_request(
         match message.role {
             Role::System => {}
             Role::User => {
-                if let Some(text) = message.content.as_deref().filter(|t| !t.is_empty()) {
+                if !message.images.is_empty() {
+                    let mut parts = Vec::with_capacity(message.images.len() + 1);
+                    if let Some(text) = message.content.as_deref().filter(|t| !t.is_empty()) {
+                        parts.push(json!({"type": "input_text", "text": text}));
+                    }
+                    for img in &message.images {
+                        parts.push(json!({
+                            "type": "input_image",
+                            "image_url": format!("data:{};base64,{}", img.mime, img.data_base64),
+                        }));
+                    }
+                    if !parts.is_empty() {
+                        input.push(json!({"role": "user", "content": parts}));
+                    }
+                } else if let Some(text) = message.content.as_deref().filter(|t| !t.is_empty()) {
                     input.push(json!({"role": "user", "content": text}));
                 }
             }
             Role::Assistant => {
+                if !message.tool_calls.is_empty()
+                    && let Some(items) = message
+                        .tool_calls
+                        .iter()
+                        .find_map(|call| call.reasoning_signature.as_deref())
+                        .and_then(decode_reasoning_items)
+                {
+                    input.extend(items);
+                }
                 if let Some(text) = message.content.as_deref().filter(|t| !t.trim().is_empty()) {
                     input.push(json!({"role": "assistant", "content": text}));
                 }
@@ -291,6 +314,35 @@ fn stream_failure(error: &Value) -> SeraError {
     )
 }
 
+const REASONING_PREFIX: &str = "resp:";
+
+fn encode_reasoning_items(items: &[Value]) -> Option<String> {
+    if items.is_empty() {
+        return None;
+    }
+    let json = serde_json::to_string(items).ok()?;
+    Some(format!("{REASONING_PREFIX}{json}"))
+}
+
+fn decode_reasoning_items(sig: &str) -> Option<Vec<Value>> {
+    let raw = sig.strip_prefix(REASONING_PREFIX)?;
+    let items: Vec<Value> = serde_json::from_str(raw).ok()?;
+    let filtered: Vec<Value> = items
+        .into_iter()
+        .filter(|v| v.get("type").and_then(Value::as_str) == Some("reasoning"))
+        .collect();
+    (!filtered.is_empty()).then_some(filtered)
+}
+
+fn is_replayable_reasoning_item(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("reasoning")
+        && (item
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_some()
+            || item.get("summary").and_then(Value::as_array).is_some())
+}
+
 fn text_of(value: &Value, key: &str) -> Option<String> {
     value.get(key).and_then(Value::as_str).map(str::to_owned)
 }
@@ -299,6 +351,7 @@ fn text_of(value: &Value, key: &str) -> Option<String> {
 pub fn parse_stream(body: &[u8]) -> Result<ParsedResponse> {
     let mut parsed = ParsedResponse::default();
     let mut calls: Vec<PendingCall> = Vec::new();
+    let mut reasoning_items: Vec<Value> = Vec::new();
     let mut completed: Option<Value> = None;
     for event in sse::events(body) {
         if event.data.trim() == "[DONE]" {
@@ -358,31 +411,36 @@ pub fn parse_stream(body: &[u8]) -> Result<ParsedResponse> {
                 }
             }
             "response.output_item.done" => {
-                if let Some(item) = data.get("item")
-                    && item.get("type").and_then(Value::as_str) == Some("function_call")
-                {
-                    let item_id = text_of(item, "id");
-                    let index = data.get("output_index").and_then(Value::as_u64);
-                    match find_call(&mut calls, item_id.as_deref(), index) {
-                        Some(call) => {
-                            if let Some(name) = text_of(item, "name").filter(|n| !n.is_empty()) {
-                                call.name = name;
+                if let Some(item) = data.get("item") {
+                    if is_replayable_reasoning_item(item) {
+                        reasoning_items.push(item.clone());
+                    } else if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                        let item_id = text_of(item, "id");
+                        let index = data.get("output_index").and_then(Value::as_u64);
+                        match find_call(&mut calls, item_id.as_deref(), index) {
+                            Some(call) => {
+                                if let Some(name) = text_of(item, "name").filter(|n| !n.is_empty())
+                                {
+                                    call.name = name;
+                                }
+                                if let Some(id) = text_of(item, "call_id").filter(|n| !n.is_empty())
+                                {
+                                    call.call_id = id;
+                                }
+                                if let Some(full) =
+                                    text_of(item, "arguments").filter(|a| !a.is_empty())
+                                {
+                                    call.arguments = full;
+                                }
                             }
-                            if let Some(id) = text_of(item, "call_id").filter(|n| !n.is_empty()) {
-                                call.call_id = id;
-                            }
-                            if let Some(full) = text_of(item, "arguments").filter(|a| !a.is_empty())
-                            {
-                                call.arguments = full;
-                            }
+                            None => calls.push(PendingCall {
+                                item_id: item_id.unwrap_or_default(),
+                                output_index: index,
+                                call_id: text_of(item, "call_id").unwrap_or_default(),
+                                name: text_of(item, "name").unwrap_or_default(),
+                                arguments: text_of(item, "arguments").unwrap_or_default(),
+                            }),
                         }
-                        None => calls.push(PendingCall {
-                            item_id: item_id.unwrap_or_default(),
-                            output_index: index,
-                            call_id: text_of(item, "call_id").unwrap_or_default(),
-                            name: text_of(item, "name").unwrap_or_default(),
-                            arguments: text_of(item, "arguments").unwrap_or_default(),
-                        }),
                     }
                 }
             }
@@ -434,6 +492,15 @@ pub fn parse_stream(body: &[u8]) -> Result<ParsedResponse> {
                 total_tokens: input.saturating_sub(cached).saturating_add(output),
             };
         }
+        if reasoning_items.is_empty()
+            && let Some(items) = response.get("output").and_then(Value::as_array)
+        {
+            for item in items {
+                if is_replayable_reasoning_item(item) {
+                    reasoning_items.push(item.clone());
+                }
+            }
+        }
         // A reply that came as one finished object, with no deltas.
         if parsed.text.is_empty()
             && calls.is_empty()
@@ -467,6 +534,7 @@ pub fn parse_stream(body: &[u8]) -> Result<ParsedResponse> {
             }
         }
     }
+    let reasoning_signature = encode_reasoning_items(&reasoning_items);
     for (index, call) in calls.into_iter().enumerate() {
         if call.name.is_empty() {
             return Err(SeraError::External("tool call missing name".into()));
@@ -491,7 +559,11 @@ pub fn parse_stream(body: &[u8]) -> Result<ParsedResponse> {
             id,
             name: call.name,
             arguments,
-            reasoning_signature: None,
+            reasoning_signature: if index == 0 {
+                reasoning_signature.clone()
+            } else {
+                None
+            },
         });
     }
     if parsed.finish_reason.is_none() {
@@ -886,5 +958,66 @@ mod tests {
                    "item": {"type": "function_call", "id": "f", "call_id": "c", "name": "lookup", "arguments": "{nope"}}),
         )]);
         assert!(matches!(parse_stream(&body), Err(SeraError::External(_))));
+    }
+
+    #[test]
+    fn user_images_serialize_as_input_image_parts() {
+        let messages = vec![LlmMessage::user_with_images(
+            "What is in this screenshot?",
+            vec![crate::domain::LlmImage {
+                mime: "image/png".into(),
+                data_base64: "iVBORw0KGgo=".into(),
+                filename: Some("screen.png".into()),
+            }],
+        )];
+        let body = build_request(&messages, &[], &options(None));
+        let parts = body["input"][0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "input_text");
+        assert_eq!(parts[1]["type"], "input_image");
+        assert_eq!(parts[1]["image_url"], "data:image/png;base64,iVBORw0KGgo=");
+    }
+
+    #[test]
+    fn reasoning_items_are_captured_and_replayed_before_function_calls() {
+        let reasoning = json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [{"type": "summary_text", "text": "Checking file"}],
+            "encrypted_content": "enc-blob-synthetic"
+        });
+        let body = sse(&[
+            (
+                "response.output_item.done",
+                json!({"type": "response.output_item.done", "output_index": 0, "item": reasoning}),
+            ),
+            (
+                "response.output_item.done",
+                json!({"type": "response.output_item.done", "output_index": 1,
+                       "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "lookup", "arguments": "{\"q\":\"x\"}"}}),
+            ),
+            (
+                "response.completed",
+                json!({"type": "response.completed", "response": {"status": "completed"}}),
+            ),
+        ]);
+        let parsed = parse_stream(&body).unwrap();
+        assert_eq!(parsed.tool_calls.len(), 1);
+        let sig = parsed.tool_calls[0]
+            .reasoning_signature
+            .as_deref()
+            .expect("reasoning signature captured");
+        assert!(sig.starts_with("resp:"));
+
+        let messages = vec![
+            LlmMessage::user("check"),
+            LlmMessage::assistant(None, parsed.tool_calls.clone()),
+            tool_result("call_1", "{\"ok\":true}"),
+        ];
+        let req = build_request(&messages, &[], &options(None));
+        let input = req["input"].as_array().unwrap();
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[1]["encrypted_content"], "enc-blob-synthetic");
+        assert_eq!(input[2]["type"], "function_call");
     }
 }
