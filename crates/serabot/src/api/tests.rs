@@ -3220,7 +3220,9 @@ async fn providers_and_connectors_report_status_without_secret_values() {
     .await;
     let list = connectors["connectors"].as_array().unwrap();
     // 0.28: the ElevenLabs API-key connector was removed (17 → 16).
-    assert_eq!(list.len(), 16);
+    // 0.57: native WhatsApp Business Cloud API connector added (16 → 17).
+    assert_eq!(list.len(), 17);
+    assert!(list.iter().any(|connector| connector["id"] == "whatsapp"));
     let gmail = list
         .iter()
         .find(|connector| connector["id"] == "gmail")
