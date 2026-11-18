@@ -4125,8 +4125,10 @@ tasks_per_user_per_day = 500
         std::fs::write(bots_dir.join("main.toml"), custom_main).unwrap();
         std::fs::copy(repo.join("prompts/main.txt"), prompts_dir.join("main.txt")).unwrap();
 
-        let mut config = Config::default();
-        config.base_dir = base.path().canonicalize().unwrap();
+        let config = Config {
+            base_dir: base.path().canonicalize().unwrap(),
+            ..Default::default()
+        };
         let loaded = load_bots_with_builtin(&config, &config.fleet.bots_dir).unwrap();
         assert_eq!(loaded.len(), 20);
         let main = loaded.iter().find(|b| b.config.name == "main").unwrap();
@@ -4134,8 +4136,10 @@ tasks_per_user_per_day = 500
 
         // Missing bots/ directory also falls back cleanly to all 20 built-ins.
         let empty_base = tempfile::tempdir().unwrap();
-        let mut empty_config = Config::default();
-        empty_config.base_dir = empty_base.path().canonicalize().unwrap();
+        let empty_config = Config {
+            base_dir: empty_base.path().canonicalize().unwrap(),
+            ..Default::default()
+        };
         let all_builtin =
             load_bots_with_builtin(&empty_config, &empty_config.fleet.bots_dir).unwrap();
         assert_eq!(all_builtin.len(), 20);

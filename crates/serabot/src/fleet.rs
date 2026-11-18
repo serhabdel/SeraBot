@@ -1809,8 +1809,10 @@ mod tests {
             )
             .unwrap();
         }
-        let mut config = Config::default();
-        config.base_dir = base.path().canonicalize().unwrap();
+        let config = Config {
+            base_dir: base.path().canonicalize().unwrap(),
+            ..Default::default()
+        };
         let bots = crate::config::load_bots_with_builtin(&config, &config.fleet.bots_dir).unwrap();
         let catalog = Arc::new(SkillCatalog::load_with_builtin(&config).unwrap());
         let store = Store::open_in_memory(384).unwrap();
