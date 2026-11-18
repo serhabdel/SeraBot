@@ -1,6 +1,7 @@
 # WhatsApp as a linked device (proposal, 0.58)
 
-Status: proposal. Approved by the owner on 2026-11-18 ("go ahead, I'll use a
+Status: implemented in 0.58 (server, API, desktop card). Not verified on a
+live WhatsApp account. Approved by the owner on 2026-11-18 ("go ahead, I'll use a
 spare number"). Nothing here is verified against a live WhatsApp account.
 
 ## Why
@@ -34,8 +35,8 @@ In:
   bot as turns in a `whatsapp:<chat>` conversation.
 - Voice notes are downloaded and transcribed with the existing audio pipeline
   (`audio_transcribe`); the transcript is the turn text.
-- Documents and images are downloaded into the member's inbox
-  (`<inbox>/<user>/whatsapp/<chat>/`) with the chat-attachment checks (size,
+- Documents and images are saved as chat attachments of the WhatsApp
+  conversation (`<inbox>/<user>/chat/<conversation>/`) with the chat-attachment checks (size,
   extension allowlist, content sniff, filename blocklist), so every bot reads
   them with the usual tools and can file them into a project.
 - Replies: text, and documents from the artifact store.
@@ -46,11 +47,13 @@ without approval.
 
 ## Security
 
-- **Session keys**: never in plain SQLite. The library's store goes in its own
-  database file under `/var/lib/serabot/whatsapp/<user>.db`, mode 0600, owned
-  by the service user. The file is encrypted at rest with the member's
-  envelope key from `user_secrets` (decrypted into memory at start, or via a
-  `Backend` wrapper, see Storage). The admin cannot read it.
+- **Session keys**: the library's own SQLite store, one file per member at
+  `[whatsapp_link] dir/<user>.db` (production: `/var/lib/serabot/whatsapp`),
+  folder 0700 and file 0600, owned by the service user, never in the main
+  database. It is **not** envelope-encrypted: the library opens it directly.
+  It has the same protection as the main database file; encrypting it needs a
+  custom `Backend` (option 2 below) and is left for later. The admin API never
+  returns it.
 - **Sign out** removes the device on WhatsApp's side (logout), then deletes the
   file.
 - **Allowlist**: messages from chats not on the member's allowlist are dropped
@@ -58,10 +61,14 @@ without approval.
   number ("note to self").
 - **Untrusted input**: message text, transcripts and file content are untrusted
   data, never instructions (same labelling as chat attachments).
-- **Outbound**: `whatsapp_link_send` goes through the gateway and is on
-  `DESTRUCTIVE_TOOLS`. Approval binds user, chat JID (destination), canonical
-  text and artifact hash. A reply in the same chat the message came from can
-  use a per-chat standing grant the member turns on; nothing else can.
+- **Replies**: the bot's answer to a message from an allowed chat goes back to
+  that chat (the `WhatsappLink` notifier), like Telegram. Allowing a chat is
+  the member's consent for replies there.
+- **Outbound**: a message the bot starts itself goes through
+  `whatsapp_link_send`, which is on `DESTRUCTIVE_TOOLS`. Approval binds the
+  user, the chat (destination `whatsapp:<jid>`) and the canonical text. An
+  approval notice in a WhatsApp chat only says an approval is waiting; it is
+  decided in SeraBot, never over WhatsApp.
 - **Blocklist** scan on every outgoing text, filename and document.
 - **Rate limits**: at most N sends per chat per minute (default 6) to keep
   the number from looking like spam.
@@ -116,3 +123,9 @@ Allowlist drop, media size/type refusal, voice note to transcript to turn (mock
 transcriber), approval binding for sends, sign-out deletes the store, a
 member's session never visible to another member. Nothing is reported as
 working on WhatsApp until the owner pairs a spare number and runs it.
+
+## Build note
+
+`whatsapp-rust` is used with `default-features = false` and
+`sqlite-storage, tokio-transport, tokio-runtime, ureq-client, tokio-native`:
+its default `simd` feature needs nightly Rust (`portable_simd`).

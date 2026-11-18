@@ -26,6 +26,10 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 webbrowser = "1"
 zeroize = "1"
+# Linked-device WhatsApp card: the pairing QR drawn locally as SVG, and a
+# oneshot channel to hand an API result back to the UI.
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+tokio = { version = "1", default-features = false, features = ["sync"] }
 
 [target.'cfg(windows)'.dependencies]
 dioxus = { version = "0.7", features = ["desktop"] }

@@ -55,6 +55,7 @@ pub mod ui_highlight;
 pub mod ui_tick;
 pub mod updater;
 pub mod vault_import;
+pub mod whatsapp_link;
 pub mod worker;
 pub mod workflows;
 pub mod working;

@@ -518,3 +518,11 @@
 .mp-section-title + p.tiny {
   margin: -8px 0 0;
 }
+
+/* Linked-device WhatsApp card (0.58). */
+.wa-link-card .wa-pairing { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
+.wa-link-card .wa-qr { background: #fff; padding: 8px; border-radius: 8px; line-height: 0; }
+.wa-link-card .wa-qr svg { width: 220px; height: 220px; }
+.wa-link-card .wa-code { font-size: 1.4rem; letter-spacing: 0.2em; }
+.wa-link-card .wa-allowlist { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.wa-link-card textarea { width: 100%; resize: vertical; }

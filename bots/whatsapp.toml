@@ -27,6 +27,7 @@ tools = [
   "whatsapp_list_templates",
   "whatsapp_send_message",
   "whatsapp_send_template",
+  "whatsapp_link_send",
   "conversation_library",
   "telegram_send_document",
   "tavily_search",
@@ -39,5 +40,6 @@ require_approval = [
   "composio_execute",
   "whatsapp_send_message",
   "whatsapp_send_template",
+  "whatsapp_link_send",
 ]
 enabled = true

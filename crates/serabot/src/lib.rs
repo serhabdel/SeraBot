@@ -105,5 +105,6 @@ pub mod vault;
 pub mod vault_providers;
 pub mod watcher;
 pub mod web;
+pub mod whatsapp_link;
 pub mod wire;
 pub mod workbooks;

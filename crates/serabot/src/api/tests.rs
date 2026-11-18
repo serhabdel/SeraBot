@@ -39,6 +39,7 @@ mod task_contract_api;
 mod vault_http;
 mod wave_a_visibility_api;
 mod wave_b_routines_api;
+mod whatsapp_link_api;
 
 /// The one log directory every test shares. The tracing subscriber is
 /// process-wide, so only the first installer's file writer is live; giving each

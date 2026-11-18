@@ -10,7 +10,7 @@ name = "serabot"
 path = "src/main.rs"
 
 [features]
-default = ["pptx", "docx"]
+default = ["pptx", "docx", "whatsapp-link"]
 # PPTX support (`deck_pptx` writes generated decks, `pptx_ops` round-trips
 # owner-supplied ones). `deckcraft-model` is the document model both consume; it
 # re-exports the colour and geometry crates, so those stay transitive.
@@ -20,6 +20,9 @@ pptx = ["dep:deckcraft-pptx", "dep:deckcraft-model", "dep:deckcraft-pdf"]
 # the reader/writer crate only partially re-exports. `wordcraft-pdf` renders a
 # document to PDF.
 docx = ["dep:wordcraft-docx", "dep:wordcraft-doc", "dep:wordcraft-pdf"]
+# WhatsApp as a linked device (docs/specs/whatsapp-linked-device.md). Unofficial
+# client; still off at run time until [whatsapp_link] enabled = true.
+whatsapp-link = ["dep:whatsapp-rust"]
 
 [dependencies]
 age = { version = "0.11", features = ["armor"] }
@@ -65,6 +68,7 @@ rss = "2"
 rusqlite = { version = "0.39", features = ["bundled", "chrono", "serde_json"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.34"
+whatsapp-rust = { version = "0.7", optional = true, default-features = false, features = ["sqlite-storage", "tokio-transport", "tokio-runtime", "ureq-client", "tokio-native"] }
 rust_decimal = { version = "1", features = ["serde"] }
 scraper = "0.20"
 secrecy = "0.8"

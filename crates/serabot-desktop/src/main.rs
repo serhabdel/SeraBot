@@ -39,6 +39,8 @@ mod ui_usage;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_vault;
 #[cfg(any(windows, feature = "ui-check"))]
+mod ui_whatsapp_link;
+#[cfg(any(windows, feature = "ui-check"))]
 mod ui_widgets;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_workflows;

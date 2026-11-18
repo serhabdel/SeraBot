@@ -42,6 +42,8 @@ pub struct Config {
     #[serde(default)]
     pub logging: LoggingConfig,
     #[serde(default)]
+    pub whatsapp_link: WhatsappLinkConfig,
+    #[serde(default)]
     pub policy: PolicyConfig,
     #[serde(default)]
     pub watcher: WatcherConfig,
@@ -113,6 +115,7 @@ impl Default for Config {
             auth: AuthConfig::default(),
             users: UsersConfig::default(),
             logging: LoggingConfig::default(),
+            whatsapp_link: WhatsappLinkConfig::default(),
             policy: PolicyConfig::default(),
             watcher: WatcherConfig::default(),
             onedrive: OneDriveConfig::default(),
@@ -4155,4 +4158,54 @@ tasks_per_user_per_day = 500
             load_bots_with_builtin(&empty_config, &empty_config.fleet.bots_dir).unwrap();
         assert_eq!(all_builtin.len(), 20);
     }
+}
+
+/// WhatsApp as a linked device of a member's own (spare) number
+/// (`docs/specs/whatsapp-linked-device.md`). Off by default: the client is
+/// unofficial and the number can be banned.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhatsappLinkConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Folder for the per-member session stores. Must be writable by the
+    /// service (under `ProtectSystem=strict`, only `/var/lib/serabot` is).
+    #[serde(default = "default_whatsapp_link_dir")]
+    pub dir: String,
+    /// The bot that answers WhatsApp messages.
+    #[serde(default = "default_whatsapp_link_bot")]
+    pub bot: String,
+    /// Largest voice note or file downloaded from WhatsApp.
+    #[serde(default = "default_whatsapp_link_max_bytes")]
+    pub max_media_bytes: u64,
+    /// Messages sent per chat per minute, at most.
+    #[serde(default = "default_whatsapp_link_rate")]
+    pub sends_per_minute: u32,
+}
+
+impl Default for WhatsappLinkConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dir: default_whatsapp_link_dir(),
+            bot: default_whatsapp_link_bot(),
+            max_media_bytes: default_whatsapp_link_max_bytes(),
+            sends_per_minute: default_whatsapp_link_rate(),
+        }
+    }
+}
+
+fn default_whatsapp_link_dir() -> String {
+    "data/whatsapp".into()
+}
+
+fn default_whatsapp_link_bot() -> String {
+    "whatsapp".into()
+}
+
+fn default_whatsapp_link_max_bytes() -> u64 {
+    20 * 1024 * 1024
+}
+
+fn default_whatsapp_link_rate() -> u32 {
+    6
 }

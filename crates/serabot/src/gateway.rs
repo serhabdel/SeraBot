@@ -57,6 +57,7 @@ pub const DESTRUCTIVE_TOOLS: &[&str] = &[
     "slack_post_message",
     "whatsapp_send_message",
     "whatsapp_send_template",
+    "whatsapp_link_send",
 ];
 
 /// Audit reason recorded when the owner's YOLO setting approved a call.

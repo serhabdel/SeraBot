@@ -103,15 +103,19 @@ fn state_of(fixture: &Fixture, account: &str) -> (String, Option<String>) {
     (row.state, row.last_error)
 }
 
-fn signed_in(fixture: &Fixture, server: &MockServer, account: &str) {
+/// Signs `account` in and returns the exact record that was saved (its
+/// `expires_at` is relative to now, so a second `record_for` can differ).
+fn signed_in(fixture: &Fixture, server: &MockServer, account: &str) -> OauthRecord {
     fixture
         .store
         .marketplace_account_upsert(&fixture.user, "canva", account, "Work")
         .unwrap();
+    let record = record_for(server);
     fixture
         .accounts
-        .save_signed_in(&fixture.user, "canva", account, &record_for(server))
+        .save_signed_in(&fixture.user, "canva", account, &record)
         .unwrap();
+    record
 }
 
 #[tokio::test]
@@ -425,7 +429,7 @@ async fn a_server_error_or_dead_network_keeps_everything() {
         .mount(&server)
         .await;
     let fixture = fixture();
-    signed_in(&fixture, &server, "a1");
+    let saved = signed_in(&fixture, &server, "a1");
     let outcome = fixture
         .accounts
         .refresh_account(&fixture.user, "canva", "a1")
@@ -437,7 +441,7 @@ async fn a_server_error_or_dead_network_keeps_everything() {
         .load(&fixture.user, "canva", "a1")
         .unwrap()
         .unwrap();
-    assert_eq!(kept, record_for(&server));
+    assert_eq!(kept, saved);
     assert_eq!(state_of(&fixture, "a1").0, "unreachable");
 
     // Nothing listens on port 1: a network failure behaves the same.

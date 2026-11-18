@@ -15,6 +15,7 @@ use crate::ui_composio::ComposioCard;
 use crate::ui_connectors::{ConnectorCard, GoogleSetupCard};
 use crate::ui_marketplace::{MarketplaceTab, PluginSheet};
 use crate::ui_mcp_accounts::GithubCard;
+use crate::ui_whatsapp_link::WhatsappLinkCard;
 use crate::ui_widgets::StatusChip;
 use dioxus::prelude::*;
 use serabot_desktop::connector_card::{
@@ -500,6 +501,10 @@ fn ConnectorSheet(session: Signal<Session>, id: String) -> Element {
                             if is_github {
                                 GithubCard { session }
                                 p { class: "tiny github-or", "Or connect with a personal access token." }
+                            }
+                            if connector.id == "whatsapp" {
+                                WhatsappLinkCard { session }
+                                p { class: "tiny github-or", "Or use the official WhatsApp Business (Meta Cloud) API below." }
                             }
                             ConnectorCard { session, connector }
                         }

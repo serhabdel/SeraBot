@@ -813,6 +813,21 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         ))?;
         telegram = Some(client);
     }
+    // WhatsApp linked devices (off unless [whatsapp_link] enabled): replies in
+    // a WhatsApp conversation go back over WhatsApp; the send tool is
+    // approval-gated.
+    #[cfg(feature = "whatsapp-link")]
+    let whatsapp_link = config
+        .whatsapp_link
+        .enabled
+        .then(|| serabot::whatsapp_link::client::WhatsappLink::new(config.clone(), store.clone()));
+    #[cfg(feature = "whatsapp-link")]
+    if let Some(link) = &whatsapp_link {
+        notifiers.push(link.clone());
+        registry.register(serabot::whatsapp_link::client::WhatsappLinkSendTool::new(
+            link.clone(),
+        ))?;
+    }
     if config.firecrawl.enabled {
         let api_key = secrets
             .require(&config.firecrawl.api_key_secret)
@@ -1045,6 +1060,13 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         shutdown.clone(),
     )?;
 
+    #[cfg(feature = "whatsapp-link")]
+    if let Some(link) = &whatsapp_link {
+        link.set_runtime(runtime.clone());
+        let link = link.clone();
+        tokio::spawn(async move { link.start_linked().await });
+    }
+
     let worker = tokio::spawn(runtime.clone().run_worker());
     // Background media jobs (0.24): polls provider renders until they finish.
     let media_jobs = tokio::spawn(serabot::media_jobs::run_media_jobs(
@@ -1070,6 +1092,8 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         .with_local_relay(local_relay.clone())
         .with_elevenlabs(elevenlabs.clone())
         .with_browser(browser_manager.clone());
+        #[cfg(feature = "whatsapp-link")]
+        let state = state.with_whatsapp_link(whatsapp_link.clone());
         if let Some(manager) = &browser_manager {
             // Closes idle sessions, and every session on shutdown.
             let _reaper = manager.spawn_reaper(shutdown.clone());
