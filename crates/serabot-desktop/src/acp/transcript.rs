@@ -2,11 +2,14 @@
 //! messages, tool calls updated in place, the latest plan, and notices.
 
 use super::protocol::{PlanEntry, Update};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 /// Total characters kept across the transcript; the oldest items go first.
 const MAX_CHARS: usize = 2_000_000;
+const TRANSCRIPTS_DIR: &str = "acp-transcripts";
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Item {
     User(String),
     Agent(String),
@@ -35,12 +38,53 @@ impl Item {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Transcript {
     pub items: Vec<Item>,
 }
 
+fn transcript_path(dir: &Path, bot_id: &str) -> Option<PathBuf> {
+    if !crate::valid_speaker(bot_id) {
+        return None;
+    }
+    Some(dir.join(TRANSCRIPTS_DIR).join(format!("{bot_id}.json")))
+}
+
 impl Transcript {
+    pub fn load_for_bot(dir: &Path, bot_id: &str) -> Self {
+        let Some(path) = transcript_path(dir, bot_id) else {
+            return Self::default();
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Self::default();
+        };
+        serde_json::from_str::<Self>(&text)
+            .map(|mut loaded| {
+                loaded.trim();
+                loaded
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn save_for_bot(&self, dir: &Path, bot_id: &str) -> Result<(), String> {
+        let Some(path) = transcript_path(dir, bot_id) else {
+            return Err("Invalid bot id for transcript.".to_owned());
+        };
+        let parent = path
+            .parent()
+            .ok_or_else(|| "Invalid transcript directory.".to_owned())?;
+        std::fs::create_dir_all(parent)
+            .map_err(|_| "Could not create transcript folder.".to_owned())?;
+        let text =
+            serde_json::to_string(self).map_err(|_| "Could not encode transcript.".to_owned())?;
+        let temp = parent.join(format!(".{bot_id}.json.tmp"));
+        std::fs::write(&temp, text).map_err(|_| "Could not write transcript.".to_owned())?;
+        std::fs::rename(&temp, &path).map_err(|_| {
+            let _ = std::fs::remove_file(&temp);
+            "Could not save transcript.".to_owned()
+        })
+    }
     pub fn push_user(&mut self, text: &str) {
         self.items.push(Item::User(text.to_owned()));
         self.trim();
@@ -202,5 +246,30 @@ mod tests {
         transcript.push_user("again");
         transcript.apply(Update::Plan(vec![entry("pending")]));
         assert_eq!(transcript.items.len(), 4);
+    }
+
+    #[test]
+    fn per_bot_transcript_round_trips_and_rejects_bad_bot_ids() {
+        let dir = std::env::temp_dir().join(format!(
+            "serabot-acp-transcript-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut transcript = Transcript::default();
+        transcript.push_user("Explain Cargo.toml");
+        transcript.apply(Update::AgentText("It defines the workspace.".into()));
+        transcript.save_for_bot(&dir, "analyst").unwrap();
+
+        let loaded = Transcript::load_for_bot(&dir, "analyst");
+        assert_eq!(loaded, transcript);
+        assert!(Transcript::load_for_bot(&dir, "../escape").items.is_empty());
+        assert!(transcript.save_for_bot(&dir, "../escape").is_err());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

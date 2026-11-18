@@ -372,3 +372,254 @@
   backdrop-filter: blur(12px);
 }
 
+/* Grouped navigation rail with compact rhythm and overflow safety. */
+.rail {
+  gap: 3px;
+  padding: 8px 0;
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+
+.rail::-webkit-scrollbar {
+  display: none;
+}
+
+.rail-btn.labeled {
+  min-height: 41px;
+  padding: 5px 2px 4px;
+  gap: 2px;
+}
+
+.rail-btn.labeled.on {
+  position: relative;
+}
+
+.rail-btn.labeled.rail-jump {
+  background: color-mix(in srgb, var(--surface-2) 85%, var(--accent-soft));
+  border: 1px solid var(--hairline);
+  color: var(--label-2);
+}
+
+.rail-btn.labeled.rail-jump:hover,
+.rail-btn.labeled.rail-jump.on {
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--hairline));
+  color: var(--label-1);
+}
+
+.rail-divider {
+  width: 28px;
+  height: 1px;
+  margin: 2px 0;
+  background: var(--hairline);
+  flex: 0 0 auto;
+}
+
+/* Studio workspace headers & subtle gradient title accent. */
+.pane-head {
+  border-bottom: 1px solid var(--hairline);
+  background: color-mix(in srgb, var(--surface) 64%, transparent);
+  backdrop-filter: blur(12px);
+}
+
+.pane-title {
+  letter-spacing: -0.025em;
+}
+
+/* Sign-in / Connect hero surface. */
+.connect {
+  background:
+    radial-gradient(760px 420px at 50% 12%, color-mix(in srgb, var(--accent) 16%, transparent), transparent 65%),
+    radial-gradient(560px 360px at 80% 85%, color-mix(in srgb, var(--accent-2, #5aa8ff) 10%, transparent), transparent 60%),
+    var(--bg);
+}
+
+.connect-card {
+  border-radius: 22px;
+  border: 1px solid var(--glass-edge, var(--hairline-strong));
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  backdrop-filter: blur(22px);
+  box-shadow: var(--shadow-2), inset 0 1px 0 var(--glass-highlight);
+}
+
+.connect-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  align-self: flex-start;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  color: var(--label-2);
+  background: color-mix(in srgb, var(--accent-soft) 65%, var(--surface-2));
+  border: 1px solid var(--hairline);
+}
+
+/* Studio Command Palette (Ctrl+K). */
+.sheet.sheet-palette {
+  top: min(12vh, 96px);
+  bottom: auto;
+  left: 50%;
+  right: auto;
+  width: min(620px, calc(100vw - 32px));
+  max-height: min(560px, 76vh);
+  transform: translateX(-50%) translateY(-8px) scale(0.985);
+  padding: 0;
+  gap: 0;
+  overflow: hidden;
+  border-radius: 18px;
+  border: 1px solid var(--glass-edge, var(--hairline-strong));
+  background: color-mix(in srgb, var(--glass-sheet, var(--surface)) 94%, transparent);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.36), inset 0 1px 0 var(--glass-highlight);
+}
+
+.sheet.sheet-palette.open {
+  transform: translateX(-50%) translateY(0) scale(1);
+}
+
+.palette-search-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--hairline);
+  color: var(--label-2);
+}
+
+.palette-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--label-1);
+  font: inherit;
+  font-size: 15px;
+}
+
+.palette-input::placeholder {
+  color: var(--label-3);
+}
+
+.palette-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.palette-group {
+  padding: 8px 10px 4px;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--label-3);
+}
+
+.palette-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--label-1);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease);
+}
+
+.palette-item:hover,
+.palette-item.active {
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--accent) 16%, transparent),
+    color-mix(in srgb, var(--accent-2, #5aa8ff) 8%, transparent)
+  );
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--hairline));
+}
+
+.palette-item-icon {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--label-2);
+  flex: 0 0 auto;
+}
+
+.palette-item.active .palette-item-icon {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  color: var(--accent-ink, var(--accent));
+}
+
+.palette-item-copy {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.palette-item-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.palette-item-sub {
+  font-size: 12px;
+  color: var(--label-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.palette-kbd {
+  padding: 2px 7px;
+  border-radius: 6px;
+  border: 1px solid var(--hairline);
+  background: var(--surface-2);
+  color: var(--label-2);
+  font-size: 11px;
+  font-family: inherit;
+}
+
+.palette-empty {
+  padding: 28px 16px;
+  text-align: center;
+  font-size: 13px;
+}
+
+.palette-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--hairline);
+  background: color-mix(in srgb, var(--surface-2) 60%, transparent);
+}
+
+html[data-reduce-transparency="true"] .rail,
+html[data-reduce-transparency="true"] .sidebar,
+html[data-reduce-transparency="true"] .topbar.chat-header,
+html[data-reduce-transparency="true"] .pane-head,
+html[data-reduce-transparency="true"] .connect-card,
+html[data-reduce-transparency="true"] .composer,
+html[data-reduce-transparency="true"] .sheet.sheet-palette {
+  backdrop-filter: none;
+  background: var(--surface);
+}
+
+

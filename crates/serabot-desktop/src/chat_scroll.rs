@@ -137,11 +137,12 @@ pub const CHAT_SCROLL_BRIDGE_JS: &str = r#"
   // Scroll position taken just before older rows were added in front.
   let anchor = null;
 
+  let activeConv = '';
   const box = () => document.getElementById('messages');
   const convOf = (b) => (b && b.dataset && b.dataset.conv) || '';
 
-  // Put a remembered position back once the page is tall enough; give up
-  // after a short while so an empty or short chat never waits.
+  // Put a remembered position back once the page is tall enough; wait while the
+  // transcript is still empty so network history arrival has time to render.
   const tryRestore = () => {
     const b = box();
     if (!b || !pending) return;
@@ -149,9 +150,11 @@ pub const CHAT_SCROLL_BRIDGE_JS: &str = r#"
       pending = null;
       return;
     }
-    pending.tries += 1;
+    const hasRows = b.querySelector(':scope > .msg') !== null;
+    if (hasRows) pending.tries += 1;
+    else pending.waitTries = (pending.waitTries || 0) + 1;
     const room = b.scrollHeight - b.clientHeight;
-    if (room >= pending.top || pending.tries > 40) {
+    if ((hasRows && room >= pending.top) || pending.tries > 40 || pending.waitTries > 180) {
       b.scrollTop = Math.min(pending.top, Math.max(0, room));
       lastTop = b.scrollTop;
       lastHeight = b.scrollHeight;
@@ -180,11 +183,35 @@ pub const CHAT_SCROLL_BRIDGE_JS: &str = r#"
     report();
   };
 
+  const syncConv = (b, forcedConv) => {
+    if (!b) return false;
+    const nextConv = typeof forcedConv === 'string' ? forcedConv : convOf(b);
+    if (nextConv === activeConv) return false;
+    activeConv = nextConv;
+    anchor = null;
+    lastTop = 0;
+    lastHeight = b.scrollHeight;
+    const memory = saved[nextConv];
+    if (memory && memory.stick === false) {
+      pending = { conv: nextConv, top: memory.top, tries: 0, waitTries: 0 };
+      follow = false;
+    } else {
+      pending = null;
+      follow = true;
+      snap();
+    }
+    reported = null;
+    report();
+    return true;
+  };
+
   const schedule = () => {
     if (raf) return;
     raf = requestAnimationFrame(() => {
       raf = 0;
       rove();
+      const b = box();
+      if (b) syncConv(b);
       if (pending) {
         tryRestore();
         return;
@@ -240,6 +267,14 @@ pub const CHAT_SCROLL_BRIDGE_JS: &str = r#"
     anchor = null;
   };
 
+  window.__serabotOnConvSwitch = (conv) => {
+    const b = box();
+    if (b) {
+      syncConv(b, conv);
+      schedule();
+    }
+  };
+
   window.__serabotResync = () => {
     reported = null;
     report();
@@ -274,15 +309,8 @@ pub const CHAT_SCROLL_BRIDGE_JS: &str = r#"
     if (!b) return;
     if (!b.__serabotHooked) {
       b.__serabotHooked = true;
-      lastTop = b.scrollTop;
-      lastHeight = b.scrollHeight;
-      // A chat the reader left scrolled up comes back at the same place.
-      const memory = saved[convOf(b)];
-      if (memory && memory.stick === false) {
-        pending = { conv: convOf(b), top: memory.top, tries: 0 };
-        follow = false;
-        report();
-      }
+      activeConv = '';
+      syncConv(b);
       b.addEventListener('wheel', (e) => { if (e.deltaY < 0) away(); }, { passive: true });
       b.addEventListener('touchmove', away, { passive: true });
       b.addEventListener('keydown', (e) => {
@@ -320,6 +348,8 @@ pub const CHAT_SCROLL_BRIDGE_JS: &str = r#"
         }
       }, { root: b, rootMargin: '0px 0px ' + BOTTOM + 'px 0px' });
       b.__serabotIo = io;
+    } else {
+      syncConv(b);
     }
     const sentinel = document.getElementById('messages-end');
     if (sentinel && !seen.has(sentinel)) {
@@ -327,6 +357,7 @@ pub const CHAT_SCROLL_BRIDGE_JS: &str = r#"
       b.__serabotIo.observe(sentinel);
     }
     for (const child of b.children) {
+      if (child.id === 'feed-spacer-top' || child.id === 'feed-spacer-bottom') continue;
       if (!seen.has(child)) {
         seen.add(child);
         ro.observe(child);
@@ -343,7 +374,13 @@ pub const CHAT_SCROLL_BRIDGE_JS: &str = r#"
     const b = box();
     if (!b || b.__serabotWatched) return;
     b.__serabotWatched = true;
-    mo.observe(b, { childList: true, subtree: true, characterData: true });
+    mo.observe(b, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ['data-conv']
+    });
     ro.observe(b);
     hook();
     schedule();

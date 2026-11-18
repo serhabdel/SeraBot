@@ -97,11 +97,17 @@ pub fn feed_window_js() -> String {
   const EST = {est};
   const STEP = {step};
   let last = -1;
+  let lastConv = '';
   let raf = 0;
   const compute = () => {{
     raf = 0;
     const b = document.getElementById('messages');
     if (!b) return;
+    const conv = b.dataset ? (b.dataset.conv || '') : '';
+    if (conv !== lastConv) {{
+      lastConv = conv;
+      last = -1;
+    }}
     const sp = document.getElementById('feed-spacer-top');
     const start = sp ? Number(sp.dataset.start) || 0 : 0;
     const spacer = sp ? sp.offsetHeight : 0;
@@ -125,10 +131,22 @@ pub fn feed_window_js() -> String {
   const hook = () => {{
     const b = document.getElementById('messages');
     if (!b) return;
+    const conv = b.dataset ? (b.dataset.conv || '') : '';
     if (!b.__serabotFeedHooked) {{
       b.__serabotFeedHooked = true;
+      lastConv = conv;
       last = -1;
       b.addEventListener('scroll', schedule, {{ passive: true }});
+      new MutationObserver(() => {{
+        const c = b.dataset ? (b.dataset.conv || '') : '';
+        if (c !== lastConv) {{
+          lastConv = c;
+          last = -1;
+        }}
+      }}).observe(b, {{ attributes: true, attributeFilter: ['data-conv'] }});
+    }} else if (conv !== lastConv) {{
+      lastConv = conv;
+      last = -1;
     }}
   }};
   new MutationObserver(hook).observe(document.body, {{ childList: true, subtree: true }});

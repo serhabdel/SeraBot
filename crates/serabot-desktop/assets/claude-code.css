@@ -47,10 +47,12 @@
 .cc-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent, #6b5cff); animation: cc-pulse 1s ease-in-out infinite; }
 .cc-ask { border-color: var(--accent, #6b5cff); display: flex; flex-direction: column; gap: 10px; }
 .cc-ask-head { display: flex; align-items: center; gap: 8px; }
-.cc-composer { position: sticky; bottom: 0; display: flex; flex-direction: column; gap: 8px; padding: 10px; border-radius: 12px; border: 1px solid var(--border, rgba(127,127,127,.25)); background: var(--surface, var(--bg, #fff)); }
+.cc-composer { position: sticky; bottom: 0; display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; border-radius: 16px; border: 1px solid var(--hairline-strong, var(--border, rgba(127,127,127,.25))); background: color-mix(in srgb, var(--surface, var(--bg, #fff)) 92%, transparent); backdrop-filter: blur(18px); box-shadow: 0 8px 28px rgba(0, 0, 0, 0.14), inset 0 1px 0 var(--glass-highlight, rgba(255,255,255,.08)); }
+.cc-composer:focus-within { border-color: color-mix(in srgb, var(--accent, #6b5cff) 65%, var(--hairline-strong, rgba(127,127,127,.3))); box-shadow: var(--ring, 0 0 0 2px rgba(107,92,255,.2)), 0 12px 32px color-mix(in srgb, var(--accent, #6b5cff) 14%, transparent); }
 .cc-input { width: 100%; resize: vertical; min-height: 64px; border: 0; outline: none; background: transparent; color: inherit; font: inherit; }
 .cc-composer-actions { display: flex; justify-content: flex-end; gap: 8px; }
 @keyframes cc-rise { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 @keyframes cc-pulse { 50% { opacity: .35; } }
 @media (prefers-reduced-motion: reduce) { .cc-row, .cc-dot { animation: none; } }
 [data-motion="reduce"] .cc-row, [data-motion="reduce"] .cc-dot { animation: none; }
+html[data-reduce-transparency="true"] .cc-inline-bar, html[data-reduce-transparency="true"] .cc-composer { backdrop-filter: none; background: var(--surface, var(--bg, #fff)); }

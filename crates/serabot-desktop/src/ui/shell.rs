@@ -32,7 +32,7 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
     rsx! {
         style { "{avatar_css}" }
         div { class: "app-shell",
-            IconRail { session, toast }
+            IconRail { session, overlay, toast }
             if chat {
                 Sidebar { session, overlay, drawer_open, toast, undo }
                 div {
@@ -51,10 +51,10 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
                 } else {
                 div { class: "pane",
                     {match section {
-                        // Keyed by conversation: switching chats remounts the
-                        // view, so scroll position and unseen counts start fresh.
+                        // Kept mounted across conversation switches so the DOM,
+                        // observers, and WebView bridges stay warm and instant.
                         Section::Chat => rsx! {
-                            ChatView { key: "{session.read().conversation}", session, overlay }
+                            ChatView { session, overlay }
                         },
                         Section::Conversations => rsx! { ConversationsView { session } },
                         Section::Memory => rsx! { MemoryView { session } },
@@ -118,6 +118,9 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
                 Overlay::Shortcuts => rsx! {
                     ShortcutsSheet { session, overlay }
                 },
+                Overlay::CommandPalette => rsx! {
+                    CommandPaletteSheet { session, overlay }
+                },
                 Overlay::None => rsx! {},
             }}
             UndoBar { session, undo }
@@ -137,38 +140,69 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
     }
 }
 
-/// The 58 px icon rail: primary destinations on top, Settings and the account
-/// at the bottom. Labels live in tooltips that show on hover and on keyboard
-/// focus.
+/// The 58 px studio navigation rail: quick command jump on top, grouped
+/// destinations (Work, Data, Connect, System), Settings and the account below.
 #[component]
-pub(super) fn IconRail(session: Signal<Session>, toast: Signal<Option<(String, bool)>>) -> Element {
+pub(super) fn IconRail(
+    session: Signal<Session>,
+    overlay: Signal<Overlay>,
+    toast: Signal<Option<(String, bool)>>,
+) -> Element {
     let mut session = session;
+    let mut overlay = overlay;
     let section = session.read().section;
-    let destinations: [(Section, &str, &str); 10] = [
+    let work: [(Section, &str, &str); 3] = [
         (Section::Chat, "chat", "Chats"),
-        (Section::Browser, "globe", "Browser"),
-        (Section::Tasks, "list", "Tasks"),
-        (Section::Memory, "memory", "Memory"),
-        (Section::Integrations, "connectors", "Integrations"),
-        (Section::Vault, "lock", "Vault"),
-        (Section::Usage, "usage", "Usage"),
         (Section::Workflows, "workflows", "Workflows"),
+        (Section::Tasks, "list", "Tasks"),
+    ];
+    let data: [(Section, &str, &str); 3] = [
+        (Section::Browser, "globe", "Browser"),
+        (Section::Memory, "memory", "Memory"),
+        (Section::Vault, "lock", "Vault"),
+    ];
+    let connect: [(Section, &str, &str); 2] = [
+        (Section::Integrations, "connectors", "Integrations"),
         (Section::Providers, "providers", "AI providers"),
+    ];
+    let system: [(Section, &str, &str); 2] = [
+        (Section::Usage, "usage", "Usage"),
         (Section::Logs, "logs", "Logs"),
     ];
     rsx! {
         nav { class: "rail", "aria-label": "Main navigation",
-            for (target, icon, label) in destinations {
-                button {
-                    key: "{label}",
-                    class: if section == target { "rail-btn labeled on" } else { "rail-btn labeled" },
-                    title: "{label}",
-                    "aria-label": "{label}",
-                    "aria-current": if section == target { "page" } else { "false" },
-                    onclick: move |_| session.write().open_section(target),
-                    Icon { name: icon, size: 18 }
-                    span { class: "rail-label", "{label}" }
+            button {
+                id: "cmd-palette-trigger",
+                class: if overlay() == Overlay::CommandPalette { "rail-btn labeled rail-jump on" } else { "rail-btn labeled rail-jump" },
+                r#type: "button",
+                title: "Command palette (Ctrl+K)",
+                "aria-label": "Command palette",
+                onclick: move |_| {
+                    let next = if overlay() == Overlay::CommandPalette {
+                        Overlay::None
+                    } else {
+                        Overlay::CommandPalette
+                    };
+                    overlay.set(next);
+                },
+                Icon { name: "search", size: 17 }
+                span { class: "rail-label", "Jump" }
+            }
+            div { class: "rail-divider", "aria-hidden": "true" }
+            for group in [work.as_slice(), data.as_slice(), connect.as_slice(), system.as_slice()] {
+                for (target, icon, label) in group.iter().copied() {
+                    button {
+                        key: "{label}",
+                        class: if section == target { "rail-btn labeled on" } else { "rail-btn labeled" },
+                        title: "{label}",
+                        "aria-label": "{label}",
+                        "aria-current": if section == target { "page" } else { "false" },
+                        onclick: move |_| session.write().open_section(target),
+                        Icon { name: icon, size: 18 }
+                        span { class: "rail-label", "{label}" }
+                    }
                 }
+                div { class: "rail-divider", "aria-hidden": "true" }
             }
             div { class: "rail-spacer" }
             button {

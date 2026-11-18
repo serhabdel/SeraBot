@@ -215,6 +215,7 @@ pub struct ChatTarget {
     pub generate: String,
 }
 
+#[derive(Debug, Clone)]
 pub struct CloudCodeToolCall {
     pub id: String,
     pub name: String,
@@ -223,6 +224,7 @@ pub struct CloudCodeToolCall {
     pub signature: Option<String>,
 }
 
+#[derive(Debug, Default)]
 pub struct CloudCodeCompletion {
     pub text: String,
     /// Text of the `thought: true` parts: untrusted display data.
@@ -503,54 +505,145 @@ pub fn parse_cloud_code_completion(bytes: &[u8]) -> Result<CloudCodeCompletion> 
     Ok(completion)
 }
 
+/// Streaming parser mode for Cloud Code 200 responses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum StreamMode {
+    #[default]
+    Undecided,
+    Sse,
+    RawJson,
+}
+
+/// Incremental SSE / JSON accumulator for Cloud Code responses.
+/// Reads chunks up to 4 MiB and parses complete `data:` lines immediately instead
+/// of buffering a full multi-megabyte SSE stream in memory.
+#[derive(Debug, Default)]
+pub struct CloudCodeStreamReader {
+    completion: CloudCodeCompletion,
+    total_bytes: usize,
+    line_buf: Vec<u8>,
+    raw_json: Vec<u8>,
+    mode: StreamMode,
+    saw_event: bool,
+}
+
+impl CloudCodeStreamReader {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push_chunk(&mut self, chunk: &[u8]) -> Result<()> {
+        self.total_bytes = self.total_bytes.saturating_add(chunk.len());
+        if self.total_bytes > 4_194_304 {
+            return Err(SeraError::External(
+                "Cloud Code response is too large".into(),
+            ));
+        }
+        if self.mode == StreamMode::RawJson {
+            self.raw_json.extend_from_slice(chunk);
+            return Ok(());
+        }
+        let mut start = 0usize;
+        while let Some(pos) = chunk[start..].iter().position(|&b| b == b'\n') {
+            let end = start + pos;
+            self.line_buf.extend_from_slice(&chunk[start..end]);
+            let line = std::mem::take(&mut self.line_buf);
+            self.process_line(&line)?;
+            if self.mode == StreamMode::RawJson {
+                self.raw_json.extend_from_slice(&chunk[end + 1..]);
+                return Ok(());
+            }
+            start = end + 1;
+        }
+        if start < chunk.len() {
+            self.line_buf.extend_from_slice(&chunk[start..]);
+        }
+        Ok(())
+    }
+
+    fn process_line(&mut self, raw_line: &[u8]) -> Result<()> {
+        let line = std::str::from_utf8(raw_line)
+            .map_err(|_| SeraError::External("malformed Cloud Code response".into()))?;
+        let trimmed = line.trim();
+        if self.mode == StreamMode::Undecided {
+            if trimmed.is_empty()
+                || trimmed.starts_with(':')
+                || trimmed.starts_with("id:")
+                || trimmed.starts_with("retry:")
+            {
+                return Ok(());
+            }
+            if trimmed.starts_with("event:") || trimmed.starts_with("data:") {
+                self.mode = StreamMode::Sse;
+            } else if trimmed.starts_with('{') {
+                if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+                    self.mode = StreamMode::Sse;
+                    absorb_completion(&mut self.completion, &value)?;
+                    self.saw_event = true;
+                    return Ok(());
+                }
+                // Pretty-printed multi-line JSON body rather than NDJSON/SSE.
+                self.mode = StreamMode::RawJson;
+                self.raw_json.extend_from_slice(raw_line);
+                self.raw_json.push(b'\n');
+                return Ok(());
+            } else {
+                self.mode = StreamMode::Sse;
+            }
+        }
+        let payload = if let Some(data) = trimmed.strip_prefix("data:") {
+            data.trim()
+        } else if trimmed.starts_with('{') {
+            trimmed
+        } else {
+            return Ok(());
+        };
+        if payload.is_empty() || payload == "[DONE]" {
+            return Ok(());
+        }
+        let Ok(value) = serde_json::from_str::<Value>(payload) else {
+            return Ok(());
+        };
+        absorb_completion(&mut self.completion, &value)?;
+        self.saw_event = true;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<CloudCodeCompletion> {
+        if self.mode == StreamMode::RawJson {
+            self.raw_json.extend_from_slice(&self.line_buf);
+            let text = std::str::from_utf8(&self.raw_json)
+                .map_err(|_| SeraError::External("malformed Cloud Code response".into()))?;
+            let value: Value = serde_json::from_str(text.trim())
+                .map_err(|_| SeraError::External("malformed Cloud Code response".into()))?;
+            absorb_completion(&mut self.completion, &value)?;
+            return Ok(self.completion);
+        }
+        if !self.line_buf.is_empty() {
+            let line = std::mem::take(&mut self.line_buf);
+            self.process_line(&line)?;
+            if self.mode == StreamMode::RawJson {
+                let text = std::str::from_utf8(&self.raw_json)
+                    .map_err(|_| SeraError::External("malformed Cloud Code response".into()))?;
+                let value: Value = serde_json::from_str(text.trim())
+                    .map_err(|_| SeraError::External("malformed Cloud Code response".into()))?;
+                absorb_completion(&mut self.completion, &value)?;
+                return Ok(self.completion);
+            }
+        }
+        if !self.saw_event {
+            return Err(SeraError::External("malformed Cloud Code response".into()));
+        }
+        Ok(self.completion)
+    }
+}
+
 /// Read a Cloud Code answer (an SSE stream or one JSON body) without judging
 /// whether it said anything; see [`CloudCodeCompletion::is_malformed_call`].
 pub fn parse_cloud_code_stream(bytes: &[u8]) -> Result<CloudCodeCompletion> {
-    if bytes.len() > 4_194_304 {
-        return Err(SeraError::External(
-            "Cloud Code response is too large".into(),
-        ));
-    }
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| SeraError::External("malformed Cloud Code response".into()))?;
-    let trimmed = text.trim();
-    let mut completion = CloudCodeCompletion {
-        text: String::new(),
-        reasoning: String::new(),
-        tool_calls: Vec::new(),
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        finish_reason: None,
-    };
-    if trimmed.starts_with('{') {
-        let value: Value = serde_json::from_str(trimmed)
-            .map_err(|_| SeraError::External("malformed Cloud Code response".into()))?;
-        absorb_completion(&mut completion, &value)?;
-    } else {
-        let mut saw = false;
-        for line in text.lines() {
-            let trimmed_line = line.trim();
-            let payload = if let Some(data) = trimmed_line.strip_prefix("data:") {
-                data.trim()
-            } else if trimmed_line.starts_with('{') {
-                trimmed_line
-            } else {
-                continue;
-            };
-            if payload.is_empty() || payload == "[DONE]" {
-                continue;
-            }
-            let Ok(value) = serde_json::from_str::<Value>(payload) else {
-                continue;
-            };
-            absorb_completion(&mut completion, &value)?;
-            saw = true;
-        }
-        if !saw {
-            return Err(SeraError::External("malformed Cloud Code response".into()));
-        }
-    }
-    Ok(completion)
+    let mut reader = CloudCodeStreamReader::new();
+    reader.push_chunk(bytes)?;
+    reader.finish()
 }
 
 pub fn sanitize_schema(value: &Value) -> Value {
@@ -1168,6 +1261,9 @@ fn json_u64(value: &Value) -> Option<u64> {
 }
 
 fn clean_finish(value: &str) -> Option<String> {
+    if value.eq_ignore_ascii_case("FINISH_REASON_UNSPECIFIED") {
+        return None;
+    }
     if (1..=64).contains(&value.len())
         && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
     {
@@ -2819,5 +2915,37 @@ mod tests {
         assert_eq!(contents.len(), 1);
         assert_eq!(contents[0]["role"], "user");
         assert_eq!(contents[0]["parts"][0]["text"], "Hello");
+    }
+
+    #[test]
+    fn incremental_reader_handles_split_utf8_chunks_and_ignores_unspecified_finish() {
+        let sse = concat!(
+            ": keepalive\n",
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"Plan \"}]},\"finishReason\":\"STOP\"}]}}\n",
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Caf\\u00e9 — ready\"}]},\"finishReason\":\"FINISH_REASON_UNSPECIFIED\"}],\"usageMetadata\":{\"promptTokenCount\":20,\"candidatesTokenCount\":4}}}\n",
+            "data: [DONE]\n"
+        );
+        // Feed small odd-sized byte chunks, splitting multi-byte UTF-8 em-dash across chunks.
+        let mut reader = CloudCodeStreamReader::new();
+        for chunk in sse.as_bytes().chunks(7) {
+            reader.push_chunk(chunk).expect("chunk accepted");
+        }
+        let parsed = reader.finish().expect("incremental sse succeeds");
+        assert_eq!(parsed.reasoning, "Plan ");
+        assert_eq!(parsed.text, "Café — ready");
+        assert_eq!(parsed.finish_reason.as_deref(), Some("STOP"));
+        assert_eq!(parsed.prompt_tokens, 20);
+        assert_eq!(parsed.completion_tokens, 4);
+    }
+
+    #[test]
+    fn incremental_reader_rejects_oversized_stream_immediately() {
+        let mut reader = CloudCodeStreamReader::new();
+        let chunk = vec![b' '; 1_048_576];
+        for _ in 0..4 {
+            reader.push_chunk(&chunk).unwrap();
+        }
+        let err = reader.push_chunk(b"x").unwrap_err();
+        assert!(err.to_string().contains("too large"));
     }
 }

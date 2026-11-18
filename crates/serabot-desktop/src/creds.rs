@@ -248,6 +248,70 @@ pub fn save_settings_to(dir: &Path, settings: &Settings) -> Result<(), String> {
     })
 }
 
+const CLAUDE_AGENT_FILE: &str = "claude_agent_bots.json";
+const TEMP_CLAUDE_AGENT_FILE: &str = "claude_agent_bots.json.tmp";
+
+/// Device-local Claude Code (ACP) toggle and preferred folder per bot.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ClaudeAgentPrefs {
+    pub bots: std::collections::BTreeSet<String>,
+    pub folders: std::collections::BTreeMap<String, String>,
+}
+
+impl ClaudeAgentPrefs {
+    pub fn sanitized(self) -> Self {
+        Self {
+            bots: self
+                .bots
+                .into_iter()
+                .filter(|bot| valid_speaker(bot))
+                .take(64)
+                .collect(),
+            folders: self
+                .folders
+                .into_iter()
+                .filter(|(bot, folder)| valid_speaker(bot) && valid_id(folder))
+                .take(64)
+                .collect(),
+        }
+    }
+}
+
+pub fn load_claude_agent() -> ClaudeAgentPrefs {
+    settings_dir()
+        .map(|dir| load_claude_agent_from(&dir))
+        .unwrap_or_default()
+}
+
+pub fn load_claude_agent_from(dir: &Path) -> ClaudeAgentPrefs {
+    let Ok(text) = fs::read_to_string(dir.join(CLAUDE_AGENT_FILE)) else {
+        return ClaudeAgentPrefs::default();
+    };
+    serde_json::from_str::<ClaudeAgentPrefs>(&text)
+        .map(ClaudeAgentPrefs::sanitized)
+        .unwrap_or_default()
+}
+
+pub fn save_claude_agent(prefs: &ClaudeAgentPrefs) -> Result<(), String> {
+    let dir = settings_dir()
+        .ok_or_else(|| "No application settings directory is available.".to_owned())?;
+    save_claude_agent_to(&dir, prefs)
+}
+
+pub fn save_claude_agent_to(dir: &Path, prefs: &ClaudeAgentPrefs) -> Result<(), String> {
+    let clean = prefs.clone().sanitized();
+    let text = serde_json::to_string_pretty(&clean)
+        .map_err(|_| "Could not encode Claude Agent preferences.".to_owned())?;
+    fs::create_dir_all(dir).map_err(|_| "Could not create the settings directory.".to_owned())?;
+    let temp = dir.join(TEMP_CLAUDE_AGENT_FILE);
+    fs::write(&temp, text).map_err(|_| "Could not write Claude Agent preferences.".to_owned())?;
+    fs::rename(&temp, dir.join(CLAUDE_AGENT_FILE)).map_err(|_| {
+        let _ = fs::remove_file(&temp);
+        "Could not replace Claude Agent preferences.".to_owned()
+    })
+}
+
 /// Load the stored session token from the platform credential store.
 pub fn load_token() -> Option<SecretString> {
     stored_token()
@@ -757,5 +821,30 @@ mod tests {
         assert_eq!(CREDENTIAL_SERVICE, "SeraBot");
         assert_eq!(CREDENTIAL_ACCOUNT, "owner-api-token");
         assert!(!valid_token(CREDENTIAL_SERVICE));
+    }
+
+    #[test]
+    fn claude_agent_prefs_round_trip_and_sanitizes_invalid_entries() {
+        let dir = temp_dir("claude-agent-prefs");
+        assert_eq!(load_claude_agent_from(&dir), ClaudeAgentPrefs::default());
+
+        let mut prefs = ClaudeAgentPrefs::default();
+        prefs.bots.insert("main".into());
+        prefs.bots.insert("../bad".into());
+        prefs.bots.insert("analyst".into());
+        prefs.folders.insert("main".into(), "root-1".into());
+        prefs.folders.insert("bad bot".into(), "root-2".into());
+        save_claude_agent_to(&dir, &prefs).unwrap();
+
+        let loaded = load_claude_agent_from(&dir);
+        assert!(loaded.bots.contains("main"));
+        assert!(loaded.bots.contains("analyst"));
+        assert!(!loaded.bots.contains("../bad"));
+        assert_eq!(
+            loaded.folders.get("main").map(String::as_str),
+            Some("root-1")
+        );
+        assert!(!loaded.folders.contains_key("bad bot"));
+        fs::remove_dir_all(dir).unwrap();
     }
 }

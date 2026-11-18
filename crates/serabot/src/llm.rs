@@ -2,13 +2,16 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures::StreamExt;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeroize::Zeroize;
 
 use crate::accounts::{AccountRefresher, CredentialStamp, RefreshError, RefreshGrant, Refreshed};
-use crate::cloud_code::{self, CLOUD_CODE_API_CLIENT, CloudCodeCompletion, Discovery};
+use crate::cloud_code::{
+    self, CLOUD_CODE_API_CLIENT, CloudCodeCompletion, CloudCodeStreamReader, Discovery,
+};
 use crate::providers::{
     ModelCatalog, OAuthMaterial, OAuthStyle, USER_AGENT, enforce_oauth_target, muse_mint_api_key,
     parse_model_catalog, refresh_token_exchange, refresh_token_grant,
@@ -1049,7 +1052,15 @@ impl LlmClient {
     /// Read a finished Cloud Code answer. `None` means Google returned a
     /// malformed tool call and nothing else: send the request again.
     fn cloud_answer(&self, bytes: &[u8], tools: &[ToolSpec]) -> Result<Option<LlmResponse>> {
-        let mut parsed = cloud_code::parse_cloud_code_stream(bytes)?;
+        let parsed = cloud_code::parse_cloud_code_stream(bytes)?;
+        self.finish_cloud_answer(parsed, tools)
+    }
+
+    fn finish_cloud_answer(
+        &self,
+        mut parsed: CloudCodeCompletion,
+        tools: &[ToolSpec],
+    ) -> Result<Option<LlmResponse>> {
         if parsed.is_malformed_call() {
             return Ok(None);
         }
@@ -1134,6 +1145,21 @@ impl LlmClient {
                                 continue;
                             }
                         },
+                        CloudPost::Parsed(parsed) => {
+                            match self.finish_cloud_answer(parsed, tools)? {
+                                Some(response) => return Ok(response),
+                                None => {
+                                    malformed += 1;
+                                    if malformed >= cloud_code::MALFORMED_CALL_ATTEMPTS {
+                                        return Err(SeraError::External(
+                                        "The model repeatedly emitted a malformed tool call (MALFORMED_FUNCTION_CALL)."
+                                            .into(),
+                                    ));
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
                         CloudPost::Unauthorized if !refreshed && self.oauth.is_some() => {
                             refreshed = true;
                             self.refresh_oauth(&used).await?;
@@ -1196,6 +1222,7 @@ impl LlmClient {
                     CloudPost::Ready(bytes) => {
                         return cloud_code::parse_cloud_code_models(&bytes);
                     }
+                    CloudPost::Parsed(_) => return Ok(ModelCatalog::new()),
                     CloudPost::Unauthorized if !refreshed && self.oauth.is_some() => {
                         refreshed = true;
                         self.refresh_oauth(&used).await?;
@@ -1314,6 +1341,7 @@ async fn exchange_for_grant(
 
 enum CloudPost {
     Ready(Vec<u8>),
+    Parsed(CloudCodeCompletion),
     Unauthorized,
     NotFound,
     SessionLimited,
@@ -1373,21 +1401,62 @@ async fn cloud_error_body(response: reqwest::Response) -> String {
     llm_failure::bounded_body(&response.bytes().await.unwrap_or_default())
 }
 
-async fn classify_cloud(response: reqwest::Response, allow_session: bool) -> CloudPost {
-    let status = response.status().as_u16();
-    if status == 200 {
-        if response.content_length().is_some_and(|len| len > 4_194_304) {
+const CLOUD_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const CLOUD_MAX_BYTES: usize = 4_194_304;
+
+async fn read_cloud_sse(response: reqwest::Response) -> CloudPost {
+    let mut reader = CloudCodeStreamReader::new();
+    let mut stream = response.bytes_stream();
+    loop {
+        let next = match tokio::time::timeout(CLOUD_IDLE_TIMEOUT, stream.next()).await {
+            Ok(Some(Ok(chunk))) => chunk,
+            Ok(Some(Err(_))) | Err(_) => return CloudPost::Transport,
+            Ok(None) => break,
+        };
+        if let Err(error) = reader.push_chunk(&next) {
+            return CloudPost::Failed(error);
+        }
+    }
+    match reader.finish() {
+        Ok(completion) => CloudPost::Parsed(completion),
+        Err(error) => CloudPost::Failed(error),
+    }
+}
+
+async fn read_cloud_bytes(response: reqwest::Response) -> CloudPost {
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    loop {
+        let next = match tokio::time::timeout(CLOUD_IDLE_TIMEOUT, stream.next()).await {
+            Ok(Some(Ok(chunk))) => chunk,
+            Ok(Some(Err(_))) | Err(_) => return CloudPost::Transport,
+            Ok(None) => break,
+        };
+        if bytes.len().saturating_add(next.len()) > CLOUD_MAX_BYTES {
             return CloudPost::Failed(SeraError::External(
                 "Cloud Code response is too large".into(),
             ));
         }
-        return match response.bytes().await {
-            Ok(bytes) if bytes.len() > 4_194_304 => CloudPost::Failed(SeraError::External(
+        bytes.extend_from_slice(&next);
+    }
+    CloudPost::Ready(bytes)
+}
+
+async fn classify_cloud(response: reqwest::Response, allow_session: bool) -> CloudPost {
+    let status = response.status().as_u16();
+    if status == 200 {
+        if response
+            .content_length()
+            .is_some_and(|len| len > CLOUD_MAX_BYTES as u64)
+        {
+            return CloudPost::Failed(SeraError::External(
                 "Cloud Code response is too large".into(),
-            )),
-            Ok(bytes) => CloudPost::Ready(bytes.to_vec()),
-            Err(_) => CloudPost::Transport,
-        };
+            ));
+        }
+        if allow_session {
+            return read_cloud_sse(response).await;
+        }
+        return read_cloud_bytes(response).await;
     }
     if status == 401 {
         return CloudPost::Unauthorized;

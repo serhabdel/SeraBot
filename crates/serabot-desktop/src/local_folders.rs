@@ -544,7 +544,8 @@ impl Drop for LocalAgent {
 }
 
 impl LocalAgent {
-    /// Start polling for these folders. Nothing runs for an empty list.
+    /// Start polling for these folders using an already-built client. Nothing
+    /// runs for an empty list.
     pub fn start(client: ApiClient, folders: Vec<LocalFolder>) -> Option<Self> {
         if folders.is_empty() {
             return None;
@@ -555,72 +556,107 @@ impl LocalAgent {
         let list = shared.clone();
         std::thread::Builder::new()
             .name("serabot-local-folders".into())
+            .spawn(move || Self::run_loop(client, flag, list))
+            .ok()?;
+        Some(Self {
+            stop,
+            folders: shared,
+        })
+    }
+
+    /// Start polling for these folders, constructing the TLS HTTP client on
+    /// the background thread so the UI thread never blocks on client setup.
+    pub fn start_with_credentials(
+        endpoint: url::Url,
+        token: secrecy::SecretString,
+        folders: Vec<LocalFolder>,
+    ) -> Option<Self> {
+        if folders.is_empty() {
+            return None;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let shared = Arc::new(std::sync::RwLock::new(folders));
+        let flag = stop.clone();
+        let list = shared.clone();
+        std::thread::Builder::new()
+            .name("serabot-local-folders".into())
             .spawn(move || {
-                let mut backoff = Duration::from_secs(2);
-                let mut denied = 0u32;
-                while !flag.load(Ordering::SeqCst) {
-                    let current = list.read().map(|guard| guard.clone()).unwrap_or_default();
-                    let views: Vec<(String, String, &'static str, BotScope)> = current
-                        .iter()
-                        .map(|folder| {
-                            let label = Path::new(&folder.path)
-                                .file_name()
-                                .and_then(|name| name.to_str())
-                                .unwrap_or("folder")
-                                .to_owned();
-                            (
-                                folder.id.clone(),
-                                label,
-                                folder.mode.as_str(),
-                                folder.bots.clone(),
-                            )
-                        })
-                        .collect();
-                    let roots: Vec<RootView<'_>> = views
-                        .iter()
-                        .map(|(id, label, mode, bots)| RootView {
-                            id,
-                            label,
-                            mode,
-                            bots,
-                        })
-                        .collect();
-                    match client.local_poll(&roots_json(&roots), LOCAL_POLL_WAIT_SECS) {
-                        Ok(Some(request)) => {
-                            backoff = Duration::from_secs(2);
-                            denied = 0;
-                            // Re-read the allowlist: a folder removed while the
-                            // poll was open must not be served.
-                            let live = list.read().map(|guard| guard.clone()).unwrap_or_default();
-                            let outcome = if flag.load(Ordering::SeqCst) || live.is_empty() {
-                                Err("local folders are switched off on this PC".to_string())
-                            } else {
-                                handle_in_worker(live, request.clone())
-                            };
-                            let _ = client.local_result(&request.id, outcome);
-                        }
-                        Ok(None) => {
-                            backoff = Duration::from_secs(2);
-                            denied = 0;
-                        }
-                        Err(ApiError::Http(401)) | Err(ApiError::Http(403)) => {
-                            // Signed out: back off harder each time and wait
-                            // for the session to restart us.
-                            sleep_unless_stopped(&flag, denied_delay(denied));
-                            denied = denied.saturating_add(1);
-                        }
-                        Err(_) => {
-                            sleep_unless_stopped(&flag, crate::net_policy::jitter(backoff));
-                            backoff = (backoff * 2).min(Duration::from_secs(30));
-                        }
-                    }
-                }
+                let Ok(client) = ApiClient::new(endpoint, token) else {
+                    return;
+                };
+                Self::run_loop(client, flag, list);
             })
             .ok()?;
         Some(Self {
             stop,
             folders: shared,
         })
+    }
+
+    fn run_loop(
+        client: ApiClient,
+        flag: Arc<AtomicBool>,
+        list: Arc<std::sync::RwLock<Vec<LocalFolder>>>,
+    ) {
+        let mut backoff = Duration::from_secs(2);
+        let mut denied = 0u32;
+        while !flag.load(Ordering::SeqCst) {
+            let current = list.read().map(|guard| guard.clone()).unwrap_or_default();
+            let views: Vec<(String, String, &'static str, BotScope)> = current
+                .iter()
+                .map(|folder| {
+                    let label = Path::new(&folder.path)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("folder")
+                        .to_owned();
+                    (
+                        folder.id.clone(),
+                        label,
+                        folder.mode.as_str(),
+                        folder.bots.clone(),
+                    )
+                })
+                .collect();
+            let roots: Vec<RootView<'_>> = views
+                .iter()
+                .map(|(id, label, mode, bots)| RootView {
+                    id,
+                    label,
+                    mode,
+                    bots,
+                })
+                .collect();
+            match client.local_poll(&roots_json(&roots), LOCAL_POLL_WAIT_SECS) {
+                Ok(Some(request)) => {
+                    backoff = Duration::from_secs(2);
+                    denied = 0;
+                    // Re-read the allowlist: a folder removed while the
+                    // poll was open must not be served.
+                    let live = list.read().map(|guard| guard.clone()).unwrap_or_default();
+                    let outcome = if flag.load(Ordering::SeqCst) || live.is_empty() {
+                        Err("local folders are switched off on this PC".to_string())
+                    } else {
+                        handle_in_worker(live, request.clone())
+                    };
+                    let _ = client.local_result(&request.id, outcome);
+                }
+                Ok(None) => {
+                    backoff = Duration::from_secs(2);
+                    denied = 0;
+                }
+                Err(ApiError::Http(401)) | Err(ApiError::Http(403)) => {
+                    // Signed out: back off harder each time and wait
+                    // for the session to restart us.
+                    sleep_unless_stopped(&flag, denied_delay(denied));
+                    denied = denied.saturating_add(1);
+                }
+                Err(_) => {
+                    sleep_unless_stopped(&flag, crate::net_policy::jitter(backoff));
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                }
+            }
+        }
     }
 
     /// Replace the allowlist the running thread serves.

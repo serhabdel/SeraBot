@@ -226,6 +226,29 @@ const GLOBAL_KEYS_JS: &str = r#"(function () {
   window.addEventListener('keydown', function (event) {
     var mod = event.ctrlKey || event.metaKey;
     if (mod && (event.key === 'k' || event.key === 'K')) {
+      var trigger = document.getElementById('cmd-palette-trigger');
+      var paletteInput = document.getElementById('cmd-palette-input');
+      if (trigger && (!paletteInput || document.activeElement !== paletteInput)) {
+        event.preventDefault();
+        trigger.click();
+        requestAnimationFrame(function () {
+          var input = document.getElementById('cmd-palette-input');
+          if (input) {
+            input.focus();
+            if (input.select) { input.select(); }
+          }
+        });
+        return;
+      }
+      var search = findPrimarySearch();
+      if (search) {
+        event.preventDefault();
+        search.focus();
+        if (search.select) { search.select(); }
+      }
+      return;
+    }
+    if (mod && event.shiftKey && (event.key === 'f' || event.key === 'F')) {
       var search = findPrimarySearch();
       if (search) {
         event.preventDefault();
@@ -344,6 +367,8 @@ pub(crate) enum Overlay {
     MeetTeam,
     /// The keyboard shortcuts sheet (F1).
     Shortcuts,
+    /// Studio command palette (Ctrl+K).
+    CommandPalette,
 }
 
 fn avatar_hue(id: &str) -> u16 {

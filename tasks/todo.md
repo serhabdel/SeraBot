@@ -181,7 +181,7 @@ never merge without the owner's OK.
 - [x] Page polish: Tasks, Workflows, Logs, Memory, Vault, Usage, Settings, Integrations, Marketplace, Browser, sheets.
 - [ ] Visual review on a Windows device (light and dark), including Kanban and Calendar views.
 - [ ] Settings panes beyond Account and Appearance, the Vault form and import picker: markup polish.
-- [ ] Marketplace "Coming soon" filter label now that live plugins run.
+- [x] Marketplace "Coming soon" filter label updated to "Available" now that live plugins run.
 
 ## Release 0.53.1 — Antigravity parity with HielCowork
 
@@ -207,8 +207,8 @@ never merge without the owner's OK.
 
 ## Release 0.55.0 (next) — bot-integrated Claude Agent, Antigravity parity, chat responsiveness, visual polish
 
-- [x] Remove standalone `Section::ClaudeCode` tab from `IconRail` and `Shell`; integrate local Claude Code ACP mode directly into bot chats (`ClaudeAgentBotView`, Topbar toggle, and Bot Settings).
-- [x] Antigravity provider parity with Hiel-Cowork: attach runtime `loadCodeAssist`/`onboardUser` project discovery for default/non-member accounts when `project_id` is empty, continue catalog fallback on HTTP 400, use `AGY_CLIENT_ID` consistently in `authorize_url`/`exchange_code`, make SSE parsing resilient to non-JSON/bare lines, add empty-turns fallback, and subtract `cachedContentTokenCount`.
-- [x] Chat UI freeze & speed fixes: skip `session.with_mut` on idle ticks via `Session::has_tick_work()`, decouple composer typing from root `Session` signal, expand `Worker` queue to 64 slots with `0ms` request gap, move render-time signal resets to `use_effect`, and wrap `MarkdownCache` entries in `Arc`.
-- [x] Visual & creative design upgrade in `assets/system.css` and `assets/claude-code.css`.
+- [x] Remove standalone `Section::ClaudeCode` tab from `IconRail` and `Shell`; integrate local Claude Code ACP mode directly into bot chats (`ClaudeAgentBotView`, Topbar toggle, `ModelBar`, and `RouteEditor`), with per-bot persisted transcripts (`acp-transcripts/<bot_id>.json`), per-bot preferred desktop folders, cached Node probe, and one-time persona context injection.
+- [x] Antigravity provider parity with Hiel-Cowork: incremental `CloudCodeStreamReader` SSE streaming via `response.bytes_stream()`, runtime `loadCodeAssist`/`onboardUser` project discovery when `project_id` is empty, catalog fallback on HTTP 400, consistent `AGY_CLIENT_ID`, empty-turns fallback, and `cachedContentTokenCount` subtraction.
+- [x] Chat UI freeze & speed fixes: keep `ChatView` mounted across conversation switches (no destructive key remount), coordinate `CHAT_SCROLL_BRIDGE_JS` and `feed_window_js` resets on `data-conv` changes, replace owner-scoped clones with `std::mem::take` in `State::new_scope`, and offload blocking disk/keyring writes + `LocalAgent::start_with_credentials` construction onto background `PersistWorker`.
+- [x] Studio workspace redesign: grouped `IconRail` (Work / Data / Connect / System), `Ctrl+K` `CommandPaletteSheet`, updated `Marketplace` `Available` filter + `"Not live yet"` copy, and elevated glassmorphic surfaces in `assets/system.css`, `assets/claude-code.css`, and `ConnectView`.
 - [ ] Owner: live verification of Antigravity provider and bot-integrated Claude Agent (ACP) on Windows.

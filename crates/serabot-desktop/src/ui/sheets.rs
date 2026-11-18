@@ -663,3 +663,320 @@ pub(super) fn TeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> E
         }
     }
 }
+
+#[derive(Clone, PartialEq)]
+enum PaletteAction {
+    Section(Section),
+    Bot(String),
+    Conversation(String),
+    Overlay(Overlay),
+    ToggleTheme,
+}
+
+#[derive(Clone)]
+struct PaletteEntry {
+    group: &'static str,
+    title: String,
+    subtitle: String,
+    icon: &'static str,
+    shortcut: &'static str,
+    action: PaletteAction,
+}
+
+fn run_palette_action(
+    action: PaletteAction,
+    mut session: Signal<Session>,
+    mut overlay: Signal<Overlay>,
+) {
+    overlay.set(Overlay::None);
+    match action {
+        PaletteAction::Section(section) => session.write().open_section(section),
+        PaletteAction::Bot(id) => session.write().open_bot_chat(id),
+        PaletteAction::Conversation(id) => session.write().open_conversation(id),
+        PaletteAction::Overlay(next) => overlay.set(next),
+        PaletteAction::ToggleTheme => {
+            let next = match session.read().theme {
+                Theme::Dark => Theme::Light,
+                Theme::Light | Theme::System => Theme::Dark,
+            };
+            session.write().set_theme(next);
+        }
+    }
+}
+
+/// Studio command palette (`Ctrl+K`): quick jump to any workspace page, bot,
+/// conversation, or action without touching the mouse.
+#[component]
+pub(super) fn CommandPaletteSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
+    let mut query = use_signal(String::new);
+    let mut active_idx = use_signal(|| 0usize);
+
+    let entries: Vec<PaletteEntry> = {
+        let s = session.read();
+        let mut out = Vec::new();
+        for (section, icon, label, sub) in [
+            (
+                Section::Chat,
+                "chat",
+                "Chats",
+                "Conversations & live agents",
+            ),
+            (
+                Section::Workflows,
+                "workflows",
+                "Workflows",
+                "Multi-step plans & schedules",
+            ),
+            (
+                Section::Tasks,
+                "list",
+                "Tasks",
+                "Approvals, deadlines & runs",
+            ),
+            (
+                Section::Browser,
+                "globe",
+                "Browser",
+                "Managed profiles & pages",
+            ),
+            (
+                Section::Memory,
+                "memory",
+                "Memory",
+                "Saved facts & retrieval",
+            ),
+            (Section::Vault, "lock", "Vault", "Sealed secrets & autofill"),
+            (
+                Section::Integrations,
+                "connectors",
+                "Integrations",
+                "Plugins, MCP apps & bots",
+            ),
+            (
+                Section::Providers,
+                "providers",
+                "AI providers",
+                "Models, keys & sign-in accounts",
+            ),
+            (Section::Usage, "usage", "Usage", "Tokens, quotas & latency"),
+            (Section::Logs, "logs", "Logs", "Runtime & audit logs"),
+            (
+                Section::Settings,
+                "settings",
+                "Settings",
+                "Appearance, folders & server",
+            ),
+        ] {
+            out.push(PaletteEntry {
+                group: "Workspace",
+                title: label.to_owned(),
+                subtitle: sub.to_owned(),
+                icon,
+                shortcut: "",
+                action: PaletteAction::Section(section),
+            });
+        }
+        out.push(PaletteEntry {
+            group: "Actions",
+            title: "New conversation".to_owned(),
+            subtitle: "Start a fresh thread or room".to_owned(),
+            icon: "plus",
+            shortcut: "",
+            action: PaletteAction::Overlay(Overlay::NewConversation),
+        });
+        out.push(PaletteEntry {
+            group: "Actions",
+            title: "New bot".to_owned(),
+            subtitle: "Create a custom specialist bot".to_owned(),
+            icon: "bot",
+            shortcut: "",
+            action: PaletteAction::Overlay(Overlay::NewBot),
+        });
+        out.push(PaletteEntry {
+            group: "Actions",
+            title: "New group".to_owned(),
+            subtitle: "Assemble bots into a room".to_owned(),
+            icon: "group",
+            shortcut: "",
+            action: PaletteAction::Overlay(Overlay::NewGroup),
+        });
+        out.push(PaletteEntry {
+            group: "Actions",
+            title: "Toggle Light / Dark theme".to_owned(),
+            subtitle: "Switch studio appearance".to_owned(),
+            icon: "spark",
+            shortcut: "",
+            action: PaletteAction::ToggleTheme,
+        });
+        out.push(PaletteEntry {
+            group: "Actions",
+            title: "Keyboard shortcuts".to_owned(),
+            subtitle: "View all keyboard shortcuts".to_owned(),
+            icon: "sliders",
+            shortcut: "F1",
+            action: PaletteAction::Overlay(Overlay::Shortcuts),
+        });
+        for bot in s.state.listed_bots.iter().filter(|b| b.enabled) {
+            let name = s.bot_display_name(&bot.id);
+            let acp = s.bot_uses_claude_agent(&bot.id);
+            let sub = if acp {
+                format!("{} · Local Claude Code (ACP)", bot.role)
+            } else {
+                format!("{} · Server route", bot.role)
+            };
+            out.push(PaletteEntry {
+                group: "Bots",
+                title: name,
+                subtitle: sub,
+                icon: if acp { "code" } else { "bot" },
+                shortcut: "",
+                action: PaletteAction::Bot(bot.id.clone()),
+            });
+        }
+        for conv in s
+            .state
+            .conversations
+            .iter()
+            .filter(|c| c.archived_at.is_none())
+            .take(24)
+        {
+            let label = s.conversation_label(conv);
+            let kind = conv.normalized_kind();
+            out.push(PaletteEntry {
+                group: "Conversations",
+                title: label,
+                subtitle: kind.to_owned(),
+                icon: "chat",
+                shortcut: "",
+                action: PaletteAction::Conversation(conv.id.clone()),
+            });
+        }
+        out
+    };
+
+    let needle = query().trim().to_lowercase();
+    let filtered: Vec<PaletteEntry> = entries
+        .into_iter()
+        .filter(|entry| {
+            needle.is_empty()
+                || entry.title.to_lowercase().contains(&needle)
+                || entry.subtitle.to_lowercase().contains(&needle)
+                || entry.group.to_lowercase().contains(&needle)
+        })
+        .take(36)
+        .collect();
+    let count = filtered.len();
+    let active = if count == 0 {
+        0
+    } else {
+        active_idx().min(count - 1)
+    };
+    let keyed = filtered.clone();
+
+    rsx! {
+        div {
+            class: "scrim open",
+            onclick: move |_| overlay.set(Overlay::None),
+        }
+        div {
+            class: "sheet sheet-palette open",
+            role: "dialog",
+            "aria-modal": "true",
+            "aria-label": "Command palette",
+            onkeydown: move |event: KeyboardEvent| {
+                match event.key() {
+                    Key::ArrowDown => {
+                        event.prevent_default();
+                        if count > 0 {
+                            active_idx.set((active_idx() + 1).min(count - 1));
+                        }
+                    }
+                    Key::ArrowUp => {
+                        event.prevent_default();
+                        active_idx.set(active_idx().saturating_sub(1));
+                    }
+                    Key::Enter => {
+                        event.prevent_default();
+                        if let Some(item) = keyed.get(active) {
+                            run_palette_action(item.action.clone(), session, overlay);
+                        }
+                    }
+                    Key::Escape => {
+                        event.prevent_default();
+                        overlay.set(Overlay::None);
+                    }
+                    _ => {}
+                }
+            },
+            div { class: "palette-search-row",
+                Icon { name: "search", size: 17 }
+                input {
+                    id: "cmd-palette-input",
+                    class: "palette-input",
+                    r#type: "search",
+                    autofocus: true,
+                    placeholder: "Jump to a screen, bot, conversation, or action\u{2026}",
+                    value: "{query}",
+                    oninput: move |event| {
+                        query.set(event.value());
+                        active_idx.set(0);
+                    },
+                }
+                button {
+                    class: "icon-btn escape-close",
+                    r#type: "button",
+                    title: "Close (Esc)",
+                    "aria-label": "Close command palette",
+                    onclick: move |_| overlay.set(Overlay::None),
+                    Icon { name: "x", size: 15 }
+                }
+            }
+            div { class: "palette-list", role: "listbox", "aria-label": "Command results",
+                if filtered.is_empty() {
+                    div { class: "palette-empty muted", "No matching screens, bots, or actions." }
+                } else {
+                    {
+                        let mut prev_group = "";
+                        rsx! {
+                            for (idx, item) in filtered.into_iter().enumerate() {
+                                {
+                                    let show_group = item.group != prev_group;
+                                    prev_group = item.group;
+                                    let action = item.action.clone();
+                                    rsx! {
+                                        div { key: "{item.group}-{idx}-{item.title}",
+                                            if show_group {
+                                                div { class: "palette-group", "{item.group}" }
+                                            }
+                                            button {
+                                                class: if idx == active { "palette-item active" } else { "palette-item" },
+                                                r#type: "button",
+                                                role: "option",
+                                                "aria-selected": if idx == active { "true" } else { "false" },
+                                                onclick: move |_| run_palette_action(action.clone(), session, overlay),
+                                                span { class: "palette-item-icon",
+                                                    Icon { name: item.icon, size: 16 }
+                                                }
+                                                span { class: "palette-item-copy",
+                                                    span { class: "palette-item-title", "{item.title}" }
+                                                    span { class: "palette-item-sub", "{item.subtitle}" }
+                                                }
+                                                if !item.shortcut.is_empty() {
+                                                    kbd { class: "palette-kbd", "{item.shortcut}" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            div { class: "palette-foot",
+                span { class: "tiny muted", "Arrow keys to move · Enter to open · Esc to close" }
+                span { class: "tiny muted", "Ctrl+Shift+F searches current page" }
+            }
+        }
+    }
+}
