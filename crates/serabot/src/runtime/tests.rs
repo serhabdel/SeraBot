@@ -2713,6 +2713,14 @@ async fn stop_during_model_call_discards_the_answer() {
     let task = store.claim_task("test", 30).unwrap().unwrap();
     runtime.process_task(task.clone()).await.unwrap();
 
+    // The stop cancels the turn at once, so `process_task` can return before
+    // the mock server's thread has stored what `request_stop` returned.
+    for _ in 0..200 {
+        if marked.load(std::sync::atomic::Ordering::SeqCst) != usize::MAX {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     assert_eq!(marked.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(
         notifier.texts.lock().unwrap().as_slice(),
