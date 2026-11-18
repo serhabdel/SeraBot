@@ -85,6 +85,7 @@ mod tasks;
 mod tests;
 mod traces;
 mod vault;
+mod whatsapp_link;
 mod workflows;
 
 use accounts::*;
@@ -208,6 +209,9 @@ pub struct ApiState {
     /// Providers with a device sign-in still running in the background.
     /// Per-user server browser; None while [browser] is off.
     browser: Option<Arc<crate::browser::BrowserManager>>,
+    /// WhatsApp linked devices; None while the feature is off.
+    #[cfg(feature = "whatsapp-link")]
+    whatsapp_link: Option<Arc<crate::whatsapp_link::client::WhatsappLink>>,
     /// Model call behind the onboarding interview; None uses the runtime.
     /// Tests script it so no request leaves the process.
     onboarding_drafter: Option<Arc<dyn crate::onboarding::Drafter>>,
@@ -322,6 +326,8 @@ impl ApiState {
             admin: AdminStore::open(&config).ok(),
             auth,
             browser: None,
+            #[cfg(feature = "whatsapp-link")]
+            whatsapp_link: None,
             onboarding_drafter: None,
             local: crate::local_relay::LocalRelay::new(),
             sys_status: Arc::new(crate::sysstatus::StatusMonitor::new()),
@@ -399,6 +405,15 @@ impl ApiState {
     /// Attach the per-user browser manager (owner live-view routes).
     pub fn with_browser(mut self, browser: Option<Arc<crate::browser::BrowserManager>>) -> Self {
         self.browser = browser;
+        self
+    }
+
+    #[cfg(feature = "whatsapp-link")]
+    pub fn with_whatsapp_link(
+        mut self,
+        link: Option<Arc<crate::whatsapp_link::client::WhatsappLink>>,
+    ) -> Self {
+        self.whatsapp_link = link;
         self
     }
 }
@@ -613,6 +628,18 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/v1/connectors/composio/toolkits", get(composio_toolkits))
         .route("/v1/connectors/composio/connect", post(composio_connect))
+        .route(
+            "/v1/whatsapp-link",
+            get(whatsapp_link::whatsapp_link_status).delete(whatsapp_link::whatsapp_link_sign_out),
+        )
+        .route(
+            "/v1/whatsapp-link/pair",
+            post(whatsapp_link::whatsapp_link_pair),
+        )
+        .route(
+            "/v1/whatsapp-link/allowlist",
+            put(whatsapp_link::whatsapp_link_allowlist),
+        )
         .route(
             "/v1/connectors/github/device/start",
             post(github_device_start),

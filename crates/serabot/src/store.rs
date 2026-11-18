@@ -79,6 +79,7 @@ const MIGRATION_37: &str = include_str!("../migrations/0037_provider_accounts.sq
 const MIGRATION_38: &str = include_str!("../migrations/0038_handoffs.sql");
 const MIGRATION_39: &str = include_str!("../migrations/0039_marketplace_accounts.sql");
 const MIGRATION_40: &str = include_str!("../migrations/0040_marketplace_tool_policy.sql");
+const MIGRATION_41: &str = include_str!("../migrations/0041_whatsapp_link.sql");
 
 /// One member's account for a marketplace plugin (no secret).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -765,6 +766,11 @@ impl Store {
         if version < 40 {
             connection.execute_batch(MIGRATION_40)?;
             connection.pragma_update(None, "user_version", 40)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 41 {
+            connection.execute_batch(MIGRATION_41)?;
+            connection.pragma_update(None, "user_version", 41)?;
         }
         // VACUUM INTO (backups) may renumber rowids; rebuild the external-content
         // FTS index only when its row count no longer matches `memories`.
@@ -2410,7 +2416,7 @@ impl Store {
     /// conversation lazily (same rules as turns) and only ever changes the
     /// acting user's own row.
     pub fn set_conversation_origin(&self, user_id: &str, id: &str, origin: &str) -> Result<()> {
-        if !matches!(origin, "app" | "telegram") {
+        if !matches!(origin, "app" | "telegram" | "whatsapp_link") {
             return Err(SeraError::Validation("unknown conversation origin".into()));
         }
         self.ensure_conversation_accepts_turns(user_id, id)?;
@@ -6627,7 +6633,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 40);
+        assert_eq!(version, 41);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
@@ -6692,7 +6698,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 40);
+        assert_eq!(version, 41);
         assert!(store.list_device_tokens().unwrap().is_empty());
         // The team table arrives with the same migration batch.
         assert!(
@@ -6766,7 +6772,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 40);
+        assert_eq!(version, 41);
         let admin = admin(&store);
         let memory = crate::memory::get(&store, &admin, "mem-legacy").unwrap();
         assert_eq!(memory.origin, "explicit");
@@ -6855,7 +6861,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 40);
+        assert_eq!(version, 41);
 
         let admin = store.admin_user().unwrap().unwrap();
         assert_eq!(admin.id, ADMIN_USER_ID);
@@ -6986,7 +6992,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 40);
+        assert_eq!(version, 41);
 
         // Every scoped table carries user_id = the admin, and the column is
         // NOT NULL with a real foreign key.
@@ -7141,7 +7147,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 40);
+        assert_eq!(version, 41);
 
         // The old row is now the admin's, with the empty prompt the migration
         // header documents; startup seeding fills it from the template.

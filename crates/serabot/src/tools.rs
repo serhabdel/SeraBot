@@ -895,6 +895,7 @@ pub fn known_tool_names() -> Vec<&'static str> {
         "project_list",
         "project_create",
         "project_file",
+        "whatsapp_link_send",
         "deck_build",
         "xlsx_analyze",
         "timesheet_analyze",

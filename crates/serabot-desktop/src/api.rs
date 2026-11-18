@@ -4138,6 +4138,37 @@ impl ApiClient {
         Ok(())
     }
 
+    /// `GET /v1/whatsapp-link`: the member's linked WhatsApp number.
+    pub fn whatsapp_link_status(&self) -> Result<serde_json::Value, ApiError> {
+        self.get(&["v1", "whatsapp-link"], &[])
+    }
+
+    /// `POST /v1/whatsapp-link/pair`: start linking; a QR code (and a pairing
+    /// code when a number is given) shows up in the status.
+    pub fn whatsapp_link_pair(&self, phone: Option<&str>) -> Result<serde_json::Value, ApiError> {
+        self.request(
+            Method::POST,
+            &["v1", "whatsapp-link", "pair"],
+            &[],
+            Some(&serde_json::json!({ "phone": phone })),
+        )
+    }
+
+    /// `PUT /v1/whatsapp-link/allowlist`: the chats that reach the bot.
+    pub fn whatsapp_link_allowlist(&self, chats: &[String]) -> Result<serde_json::Value, ApiError> {
+        self.request(
+            Method::PUT,
+            &["v1", "whatsapp-link", "allowlist"],
+            &[],
+            Some(&serde_json::json!({ "chats": chats })),
+        )
+    }
+
+    /// `DELETE /v1/whatsapp-link`: sign the device out and delete the session.
+    pub fn whatsapp_link_sign_out(&self) -> Result<serde_json::Value, ApiError> {
+        self.request::<_, ()>(Method::DELETE, &["v1", "whatsapp-link"], &[], None)
+    }
+
     /// `GET /v1/connectors/github/native`: the member's GitHub sign-in.
     pub fn github_native(&self) -> Result<crate::marketplace::GithubView, ApiError> {
         self.get(&["v1", "connectors", "github", "native"], &[])

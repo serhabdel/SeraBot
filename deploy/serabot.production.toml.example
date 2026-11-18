@@ -14,6 +14,12 @@ allow_non_loopback = false
 # Must be writable under ProtectSystem=strict (only /var/lib/serabot is).
 dir = "/var/lib/serabot/logs"
 
+[whatsapp_link]
+# Unofficial linked-device WhatsApp client (docs/specs/whatsapp-linked-device.md).
+# The number can be banned: link a spare number only.
+enabled = false
+dir = "/var/lib/serabot/whatsapp"
+
 [database]
 path = "/var/lib/serabot/serabot.db"
 max_connections = 4
