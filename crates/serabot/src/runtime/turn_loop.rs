@@ -229,11 +229,55 @@ impl Runtime {
                 model_text.push_str(&block);
             }
         }
+        if let Some(handoff) = &payload.handoff {
+            // A handoff (ask_teammate, delegate) gets the files the owner
+            // attached to the turn it came from, so the teammate reads them
+            // from the inbox instead of searching other sources.
+            let attachments = self.handoff_attachments(&user, &handoff.parent_turn_id);
+            let block = crate::attachments::render_for_model(&self.config, &user, &attachments);
+            if !block.is_empty() && self.scan_owner_output(&user, &block).is_ok() {
+                model_text.push_str(&block);
+            }
+        }
         state.messages.push(LlmMessage::user(model_text));
         self.store
             .update_turn(&user, &turn.id, "active", &serde_json::to_value(&state)?)?;
         self.advance(task, &turn, state, &payload.conversation_id)
             .await
+    }
+
+    /// Attachments of the owner turn a handoff chain started from: walks up
+    /// through parent handoffs (at most a few hops) and stops at the first
+    /// turn that has attachments. Read errors give no attachments.
+    pub(super) fn handoff_attachments(
+        &self,
+        user: &str,
+        parent_turn_id: &str,
+    ) -> Vec<crate::attachments::StoredAttachment> {
+        let mut turn_id = parent_turn_id.to_string();
+        for _ in 0..6 {
+            match self
+                .store
+                .chat_attachments_for_turns(user, &[turn_id.clone()])
+            {
+                Ok(found) if !found.is_empty() => return found,
+                Ok(_) => {}
+                Err(_) => return Vec::new(),
+            }
+            let Ok(turn) = self.store.get_turn(user, &turn_id) else {
+                return Vec::new();
+            };
+            let Some(parent) = turn
+                .state
+                .get("handoff")
+                .and_then(|handoff| handoff.get("parent_turn_id"))
+                .and_then(serde_json::Value::as_str)
+            else {
+                return Vec::new();
+            };
+            turn_id = parent.to_string();
+        }
+        Vec::new()
     }
 
     pub(super) async fn resume_turn(&self, task: &Task) -> Result<TurnOutcome> {

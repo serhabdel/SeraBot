@@ -10,6 +10,10 @@ rate_limit_per_minute = 60
 event_retention_days = 30
 allow_non_loopback = false
 
+[logging]
+# Must be writable under ProtectSystem=strict (only /var/lib/serabot is).
+dir = "/var/lib/serabot/logs"
+
 [database]
 path = "/var/lib/serabot/serabot.db"
 max_connections = 4
