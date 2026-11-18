@@ -4121,7 +4121,7 @@ tasks_per_user_per_day = 500
         // install that also edited one local bot file.
         let custom_main = std::fs::read_to_string(repo.join("bots/main.toml"))
             .unwrap()
-            .replace("title = \"SeraBot\"", "title = \"Custom Main\"");
+            .replace("title = \"Main\"", "title = \"Custom Main\"");
         std::fs::write(bots_dir.join("main.toml"), custom_main).unwrap();
         std::fs::copy(repo.join("prompts/main.txt"), prompts_dir.join("main.txt")).unwrap();
 
