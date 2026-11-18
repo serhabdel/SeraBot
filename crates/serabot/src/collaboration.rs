@@ -10,8 +10,10 @@
 //! Destructive actions stay on the gateway approval list. Tool and page
 //! content stays untrusted data. Secrets still never travel through chat.
 
-/// Web search, page fetch, memory, and asking the owner. Injected into every
-/// bot's turn when the server has the tool registered.
+/// The baseline every bot gets: web search and fetch, memory, asking the
+/// owner, documents (read, OCR index, build), audio, images, local files and
+/// the user's connected connectors. Injected into every bot's turn when the
+/// server has the tool registered; destructive tools still need approval.
 pub const SHARED_TOOLS: &[&str] = &[
     "tavily_search",
     "firecrawl_search",
@@ -29,6 +31,79 @@ pub const SHARED_TOOLS: &[&str] = &[
     "calendar_events",
     "tasks_list",
     "tasks_create",
+    // 0.58: every bot reads, indexes (with the OCR fallback) and produces
+    // documents, whatever its stored list says.
+    "document_index",
+    "rag_search",
+    "project_list",
+    "project_create",
+    "project_file",
+    "conversation_library",
+    "pdf_inspect",
+    "pdf_edit",
+    "pdf_merge",
+    "docx_inspect",
+    "docx_read",
+    "docx_build",
+    "docx_edit",
+    "docx_import",
+    "docx_pdf",
+    "xlsx_inspect",
+    "xlsx_read",
+    "xlsx_analyze",
+    "xlsx_build",
+    "xlsx_edit",
+    "xlsx_import",
+    "pptx_inspect",
+    "pptx_edit",
+    "pptx_import",
+    "pptx_pdf",
+    "deck_build",
+    "image_inspect",
+    "image_resize",
+    "image_convert",
+    "audio_transcribe",
+    "audio_understand",
+    "exa_search",
+    "exa_get_contents",
+    "firecrawl_map",
+    "firecrawl_extract",
+    // Files on the owner's computer (the desktop relay) and the inbox.
+    "local_list",
+    "local_search",
+    "local_stat",
+    "local_read",
+    "local_read_many",
+    "local_extract",
+    "local_brief",
+    "local_import",
+    "local_write",
+    "local_export",
+    // The user's connected connectors. A connector that is not connected is
+    // not registered and is skipped. Sends and writes stay on the gateway's
+    // approval list.
+    "gmail_list_messages",
+    "outlook_list_messages",
+    "outlook_calendar_list_events",
+    "google_drive_list",
+    "google_sheets_read",
+    "google_calendar_list_events",
+    "notion_query_database",
+    "github_search_repos",
+    "github_list_issues",
+    "github_get_issue",
+    "github_get_file",
+    "github_create_issue",
+    "github_comment_issue",
+    "todoist_list_tasks",
+    "todoist_add_task",
+    "todoist_complete_task",
+    "slack_list_channels",
+    "slack_read_channel",
+    "slack_post_message",
+    "agentmail_inboxes_list",
+    "agentmail_send",
+    "onedrive_upload",
 ];
 
 /// A specialist (or a handoff that has not already been handed on) asks main

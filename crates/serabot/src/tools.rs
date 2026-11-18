@@ -305,8 +305,8 @@ impl Tool for DocumentIndexTool {
             description:
                 "Index a PDF, Word, Excel, text, or Markdown file (or one directory level) from the \
                  configured inbox into the citation-preserving vector store. Word and Excel text is \
-                 extracted without evaluating formulas. Scanned/empty/encrypted PDFs fail \
-                 explicitly; no OCR is performed."
+                 extracted without evaluating formulas. A scanned PDF or an image is read \
+                 with OCR when the server has OCR enabled; otherwise it fails explicitly."
                     .into(),
             parameters: json!({
                 "type": "object",
@@ -892,6 +892,9 @@ pub fn known_tool_names() -> Vec<&'static str> {
     let mut names = vec![
         // Always registered.
         "rag_search",
+        "project_list",
+        "project_create",
+        "project_file",
         "deck_build",
         "xlsx_analyze",
         "timesheet_analyze",
