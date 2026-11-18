@@ -179,6 +179,19 @@ failure and wait cards, plus a motion/accessibility pass. No live provider was
 used and the desktop was not visually verified on a device. B7 worker counts
 above 2 are gated on running the load fixture on the target host.
 
+## Status after 0.55.0 (bot-integrated Claude Agent, Antigravity SSE, chat stability & Studio UI)
+
+0.55.0 removes the standalone Claude Code rail tab and integrates local Claude
+Code (ACP) directly into per-bot chat and route configuration with per-bot
+persisted transcripts, folder preferences, and persona context; adds incremental
+SSE streaming (`CloudCodeStreamReader`), `loadCodeAssist`/`onboardUser` project
+discovery, and parity fixes for `google-antigravity`; stabilizes chat switching
+by keeping `ChatView` mounted with `data-conv`-coordinated scroll/feed resets and
+background `PersistWorker` writes; and introduces the grouped `IconRail`,
+`Ctrl+K` `CommandPaletteSheet`, Marketplace `Available` filter, and Studio
+surface styling. Tested against synthetic fixtures and `ui-check`; live Windows
+ACP and live Antigravity verification stay pending owner testing.
+
 ## Status after 0.54.0 (Claude Code through ACP)
 
 0.54.0 adds a desktop Claude Code page that runs the real Claude Code through
