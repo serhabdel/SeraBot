@@ -1345,8 +1345,10 @@ enum CloudPost {
     Unauthorized,
     NotFound,
     SessionLimited,
-    /// A chat 400 that is not the session wall: the model id may only be
-    /// unknown on this cluster (HielCowork retries its wire id once).
+    /// A chat 400 that is not the session wall. When the body names the model
+    /// as unknown or unavailable the typed code is `model_unavailable` and the
+    /// route chain moves to the next candidate; HielCowork additionally retries
+    /// its one wire id once, which the caller does before giving up.
     BadRequest(SeraError),
     /// A status worth trying the next endpoint for, already typed.
     Retryable(SeraError),

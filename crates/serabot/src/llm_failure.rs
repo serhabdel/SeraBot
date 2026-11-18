@@ -194,6 +194,22 @@ pub fn code_for(status: u16, body: &str) -> &'static str {
             "model_decommissioned",
             "not_found_error",
         ])
+        // Cloud Code answers 400 INVALID_ARGUMENT (not 404) when the cluster
+        // does not serve the model id for this account or project; the words
+        // in the message are the only tell.
+        || signals.message_has(&[
+            "unknown model",
+            "unrecognized model",
+            "invalid model",
+            "unsupported model",
+            "no such model",
+            "not a valid model",
+            "model not found",
+            "model not available",
+            "model does not exist",
+            "model is not supported",
+            "model not supported",
+        ])
     {
         return CODE_MODEL_UNAVAILABLE;
     }
@@ -458,6 +474,24 @@ mod tests {
             ("context code", 400, context, Ok(CODE_CONTEXT_TOO_LONG)),
             ("cloud code forbidden", 403, "", Ok(CODE_ACCOUNT_FORBIDDEN)),
             ("cloud code missing", 404, "", Ok(CODE_MODEL_UNAVAILABLE)),
+            (
+                "cloud code 400 model not served",
+                400,
+                r#"{"error":{"code":400,"message":"model not available for this project tier","status":"INVALID_ARGUMENT"}}"#,
+                Ok(CODE_MODEL_UNAVAILABLE),
+            ),
+            (
+                "cloud code 400 unknown model",
+                400,
+                r#"{"error":{"code":400,"message":"unknown model id in request","status":"INVALID_ARGUMENT"}}"#,
+                Ok(CODE_MODEL_UNAVAILABLE),
+            ),
+            (
+                "cloud code 400 bad schema stays invalid",
+                400,
+                r#"{"error":{"code":400,"message":"Invalid value at 'request.tools[0].parameters'","status":"INVALID_ARGUMENT"}}"#,
+                Err(NoSwitch::InvalidRequest),
+            ),
             ("cloud code 429 no body", 429, "", Ok(CODE_RATE_LIMITED)),
             (
                 "cloud code unauthorized",
