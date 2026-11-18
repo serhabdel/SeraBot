@@ -254,6 +254,7 @@ pub(super) fn NewMenu(
             if labelled {
                 button {
                     class: "btn primary sm new-chat-btn menu-trigger",
+                    r#type: "button",
                     "aria-haspopup": "menu",
                     "aria-expanded": if open() { "true" } else { "false" },
                     onclick: move |_| open.set(!open()),
@@ -263,6 +264,7 @@ pub(super) fn NewMenu(
             } else {
                 button {
                     class: "icon-btn primary menu-trigger",
+                    r#type: "button",
                     title: "New chat, group or bot",
                     "aria-label": "New chat, group or bot",
                     "aria-haspopup": "menu",
@@ -287,6 +289,7 @@ pub(super) fn NewMenu(
                         button {
                             key: "{id}",
                             class: "menu-item menu-bot",
+                            r#type: "button",
                             onclick: {
                                 let id = id.clone();
                                 move |_| {
@@ -309,6 +312,7 @@ pub(super) fn NewMenu(
                 // §3.8).
                 button {
                     class: "menu-item",
+                    r#type: "button",
                     onclick: move |_| {
                         open.set(false);
                         overlay.set(Overlay::NewGroup);
@@ -318,6 +322,7 @@ pub(super) fn NewMenu(
                 }
                 button {
                     class: "menu-item",
+                    r#type: "button",
                     onclick: move |_| {
                         open.set(false);
                         session.write().fleet.conv_kind = ConversationKind::Group;
@@ -328,6 +333,7 @@ pub(super) fn NewMenu(
                 }
                 button {
                     class: "menu-item",
+                    r#type: "button",
                     onclick: move |_| {
                         open.set(false);
                         session.write().fleet.conv_kind = ConversationKind::Section;
@@ -338,6 +344,7 @@ pub(super) fn NewMenu(
                 }
                 button {
                     class: "menu-item",
+                    r#type: "button",
                     onclick: move |_| {
                         open.set(false);
                         overlay.set(Overlay::NewBot);
@@ -347,6 +354,7 @@ pub(super) fn NewMenu(
                 }
                 button {
                     class: "menu-item",
+                    r#type: "button",
                     onclick: move |_| {
                         open.set(false);
                         session.write().open_meet_team();
@@ -667,7 +675,7 @@ pub(super) fn Sidebar(
             "aria-label": "Conversations",
             div { class: "sidebar-head",
                 h2 { class: "list-title", "Chats" }
-                NewMenu { session, overlay, labelled: true }
+                NewMenu { session, overlay, right: true, labelled: true }
             }
             div { class: "sidebar-search",
                 span { class: "search-glyph", Icon { name: "search", size: 15 } }

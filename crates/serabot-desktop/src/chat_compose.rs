@@ -149,6 +149,27 @@ pub fn sync_composer_from_session(
     !composer_focused || session_composer_empty || local_empty
 }
 
+/// Whether an external update to `session.composer` should overwrite the
+/// local textarea draft. When `external == prev_external`, nothing in
+/// `session.composer` actually changed since the last check (so typing in the
+/// local draft before `onblur` syncs, or unrelated `session.write()` updates
+/// like streaming tokens and polls, never erase in-progress input).
+pub fn should_sync_external_composer(
+    external: &str,
+    prev_external: &str,
+    composer_focused: bool,
+    local_draft: &str,
+) -> bool {
+    if external == prev_external {
+        return false;
+    }
+    sync_composer_from_session(
+        composer_focused,
+        external.is_empty(),
+        local_draft.trim().is_empty(),
+    )
+}
+
 /// True when the draft can go out: text or files, under the length limit,
 /// and no upload still in flight.
 pub fn can_submit(text: &str, files: usize, busy: bool) -> bool {
@@ -1154,6 +1175,27 @@ mod tests {
         assert!(sync_composer_from_session(true, true, false));
         assert!(sync_composer_from_session(false, false, false));
         assert!(sync_composer_from_session(false, true, false));
+    }
+
+    #[test]
+    fn typing_and_background_session_updates_never_erase_local_draft() {
+        // Every keystroke while `session.composer` is still "" must keep the
+        // in-progress local draft intact rather than resetting to "".
+        assert!(!should_sync_external_composer("", "", true, "h"));
+        assert!(!should_sync_external_composer("", "", true, "hello world"));
+        // Unrelated session ticks after a prior blur (`session.composer == "old"`)
+        // must not overwrite a cleared or edited local draft either.
+        assert!(!should_sync_external_composer("old", "old", true, ""));
+        assert!(!should_sync_external_composer(
+            "old", "old", true, "new text"
+        ));
+        // External transitions still take effect as expected:
+        // 1) Failed send asynchronously restores `session.composer`.
+        assert!(should_sync_external_composer("failed text", "", true, ""));
+        // 2) Submit/queue clears `session.composer` from a previously synced draft.
+        assert!(should_sync_external_composer("", "old", true, "old"));
+        // 3) Blur sync while unfocused updates cleanly.
+        assert!(should_sync_external_composer("typed", "", false, "typed"));
     }
 
     #[test]

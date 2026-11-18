@@ -1787,4 +1787,44 @@ mod tests {
         assert_eq!(registry.seed(&admin).unwrap(), 0);
         assert!(registry.upgraded.lock().unwrap().contains(&admin));
     }
+
+    #[test]
+    fn partial_disk_install_still_serves_all_twenty_shipped_bots() {
+        let base = tempfile::tempdir().unwrap();
+        let bots_dir = base.path().join("bots");
+        let prompts_dir = base.path().join("prompts");
+        std::fs::create_dir_all(&bots_dir).unwrap();
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        // Simulate an upgraded server whose /etc/serabot only holds the original 5 bots.
+        for name in ["main", "analyst", "maker", "legal", "watcher"] {
+            std::fs::copy(
+                repo.join("bots").join(format!("{name}.toml")),
+                bots_dir.join(format!("{name}.toml")),
+            )
+            .unwrap();
+            std::fs::copy(
+                repo.join("prompts").join(format!("{name}.txt")),
+                prompts_dir.join(format!("{name}.txt")),
+            )
+            .unwrap();
+        }
+        let config = Config {
+            base_dir: base.path().canonicalize().unwrap(),
+            ..Default::default()
+        };
+        let bots = crate::config::load_bots_with_builtin(&config, &config.fleet.bots_dir).unwrap();
+        let catalog = Arc::new(SkillCatalog::load_with_builtin(&config).unwrap());
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let registry = FleetRegistry::new(Arc::new(config), store, bots, catalog).unwrap();
+        let entries = registry.template_catalog(&admin).unwrap();
+        assert_eq!(entries.len(), 20);
+        assert!(entries.iter().any(|entry| entry.name == "comptable"));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.name == "writer" && entry.catalog_only)
+        );
+    }
 }

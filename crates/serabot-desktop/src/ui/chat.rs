@@ -438,22 +438,29 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let mut dismissed_transcript_err = use_signal(|| Option::<String>::None);
     let enter_sends_pref = session.read().prefs.enter_sends;
     let mut composer_room = use_signal(|| session.read().conversation.clone());
+    let mut prev_external = use_signal(|| session.read().composer.clone());
     use_effect(move || {
-        let conversation = session.read().conversation.clone();
-        if composer_room() == conversation {
+        let (conversation, external) = {
+            let state = session.read();
+            (state.conversation.clone(), state.composer.clone())
+        };
+        if *composer_room.peek() != conversation {
+            composer_room.set(conversation);
+            prev_external.set(external.clone());
+            composer_draft.set(external);
             return;
         }
-        composer_room.set(conversation);
-        composer_draft.set(session.read().composer.clone());
-    });
-    use_effect(move || {
-        let external = session.read().composer.clone();
-        if chat_compose::sync_composer_from_session(
-            composer_focused(),
-            external.is_empty(),
-            composer_draft().trim().is_empty(),
+        let prev = prev_external.peek().clone();
+        if chat_compose::should_sync_external_composer(
+            &external,
+            &prev,
+            *composer_focused.peek(),
+            &composer_draft.peek(),
         ) {
-            composer_draft.set(external);
+            composer_draft.set(external.clone());
+        }
+        if external != prev {
+            prev_external.set(external);
         }
     });
     // Files pasted into the composer arrive through the JS bridge.

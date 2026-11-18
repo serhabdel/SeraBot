@@ -11,7 +11,7 @@ use serabot::audio::{
     AudioTranscribeTool, AudioUnderstandTool, MistralAudioClient, resolve_audio_provider,
 };
 use serabot::browser::{BrowserToolDeps, VaultResolver, register_browser_tools};
-use serabot::config::{Config, load_bots};
+use serabot::config::{Config, load_bots_with_builtin};
 use serabot::connectors::register_connector_tools;
 use serabot::deck::Brand;
 use serabot::documents::index_directory;
@@ -308,7 +308,7 @@ async fn main() -> anyhow::Result<()> {
                     anyhow::bail!("no user with id {user_id}");
                 }
                 // Catalog-only bots are opt-in installs, not part of a reseed.
-                let templates = load_bots(&config, config.path(&config.fleet.bots_dir))?
+                let templates = load_bots_with_builtin(&config, &config.fleet.bots_dir)?
                     .into_iter()
                     .filter(|bot| !bot.config.catalog_only)
                     .collect::<Vec<_>>();
@@ -357,7 +357,7 @@ async fn main() -> anyhow::Result<()> {
             }
             SkillCommand::List => {
                 let config = Config::load(&cli.config)?;
-                let catalog = SkillCatalog::load(&config)?;
+                let catalog = SkillCatalog::load_with_builtin(&config)?;
                 for summary in catalog.summaries() {
                     if let Some(pack) = &summary.pack {
                         println!(
@@ -464,14 +464,14 @@ fn load(
     config_path: &std::path::Path,
 ) -> anyhow::Result<(Arc<Config>, Vec<serabot::config::LoadedBot>)> {
     let config = Arc::new(Config::load(config_path)?);
-    let bots = load_bots(&config, &config.fleet.bots_dir)?;
+    let bots = load_bots_with_builtin(&config, &config.fleet.bots_dir)?;
     if !bots
         .iter()
         .any(|bot| bot.config.name == "main" && bot.config.enabled)
     {
         anyhow::bail!("an enabled 'main' bot is required");
     }
-    SkillCatalog::load(&config)?.validate_bot_skills(&bots)?;
+    SkillCatalog::load_with_builtin(&config)?.validate_bot_skills(&bots)?;
     serabot::config::validate_bot_tools(&bots, &serabot::tools::known_tool_names())?;
     Ok((config, bots))
 }
@@ -521,7 +521,7 @@ fn check(config_path: &std::path::Path) -> anyhow::Result<()> {
         config.database.busy_timeout_ms,
     )?;
     store.health()?;
-    let catalog = Arc::new(SkillCatalog::load(&config)?);
+    let catalog = Arc::new(SkillCatalog::load_with_builtin(&config)?);
     let fleet = FleetRegistry::new(config.clone(), store.clone(), bots, catalog.clone())?;
     let admin_user_id = store.admin_user_id()?;
     fleet.seed(&admin_user_id)?;
@@ -590,7 +590,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     }
     // The repository fleet is the seed source. The admin gets its rows now;
     // members are seeded at account creation and lazily on first fleet use.
-    let catalog = Arc::new(SkillCatalog::load(&config)?);
+    let catalog = Arc::new(SkillCatalog::load_with_builtin(&config)?);
     let fleet = Arc::new(FleetRegistry::new(
         config.clone(),
         store.clone(),

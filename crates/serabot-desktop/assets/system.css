@@ -278,57 +278,48 @@
   transform: none;
 }
 
-/* ---- v0.55 Visual & Creative Polish ---- */
+/* ---- v0.55–v0.56 Crisp Surface & Chrome Polish ---- */
 
-/* Subtle ambient canvas behind the shell so surfaces feel layered rather than flat. */
+/* Subtle ambient canvas behind the shell without muddying text layers. */
 .app-shell {
-  background:
-    radial-gradient(900px 520px at 14% -8%, color-mix(in srgb, var(--accent) 11%, transparent), transparent 65%),
-    radial-gradient(720px 440px at 92% 4%, color-mix(in srgb, var(--accent-2, #5aa8ff) 8%, transparent), transparent 60%),
-    var(--bg);
+  background: var(--bg);
 }
 
-/* Crisp glass rail with an active accent indicator bar. */
+/* Crisp rail & active accent indicator without backdrop-filter raster blur. */
 .rail {
-  background: color-mix(in srgb, var(--surface) 88%, transparent);
-  backdrop-filter: blur(18px);
+  background: var(--surface);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   border-right: 1px solid var(--hairline);
 }
 
 .rail-btn.labeled.on {
-  background: linear-gradient(
-    135deg,
-    color-mix(in srgb, var(--accent) 20%, transparent),
-    color-mix(in srgb, var(--accent-2, #5aa8ff) 10%, transparent)
-  );
+  background: color-mix(in srgb, var(--accent) 16%, var(--surface-2));
   color: var(--accent-ink, var(--accent));
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 32%, transparent),
-    0 4px 14px color-mix(in srgb, var(--accent) 16%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 32%, transparent);
 }
 
-/* Sidebar & topbar elevation. */
+/* Sidebar stays opaque & crisp on Windows WebView2 and floats menus cleanly above .main. */
 .sidebar {
-  background: color-mix(in srgb, var(--surface) 82%, transparent);
-  backdrop-filter: blur(16px);
+  position: relative;
+  z-index: 30;
+  background: var(--list-bg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   border-right: 1px solid var(--hairline);
 }
 
 .topbar.chat-header {
-  background: color-mix(in srgb, var(--surface) 78%, transparent);
-  backdrop-filter: blur(16px);
+  background: var(--surface);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   border-bottom: 1px solid var(--hairline);
 }
 
-/* Chat feed & message polish: airy spacing, crisp user glass bubble, refined code blocks. */
-.msg.me .bubble,
-.msg-row.me .msg-bubble {
-  background: linear-gradient(
-    135deg,
-    color-mix(in srgb, var(--accent) 22%, var(--surface-2)),
-    color-mix(in srgb, var(--accent) 12%, var(--surface))
-  );
-  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--hairline));
-  box-shadow: 0 4px 18px color-mix(in srgb, var(--accent) 10%, transparent);
+/* Crisp user message bubble and refined code blocks. */
+.msg.user .msg-body {
+  background: color-mix(in srgb, var(--accent) 14%, var(--surface-2));
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, var(--hairline));
 }
 
 .md-code {
@@ -337,39 +328,48 @@
   box-shadow: var(--shadow-1);
 }
 
-/* Floating glassmorphic composer with tactile focus glow. */
+/* Crisp composer container with clean focus ring (no backdrop blur). */
 .composer {
   border-radius: 18px;
   border: 1px solid var(--hairline-strong);
-  background: color-mix(in srgb, var(--surface) 90%, transparent);
-  backdrop-filter: blur(20px);
-  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.14), inset 0 1px 0 var(--glass-highlight);
+  background: var(--surface);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  box-shadow: var(--shadow-1);
   transition: border-color var(--dur-1) var(--ease), box-shadow var(--dur-2) var(--ease);
 }
 
 .composer:focus-within {
   border-color: color-mix(in srgb, var(--accent) 65%, var(--hairline-strong));
-  box-shadow: var(--ring), 0 12px 34px color-mix(in srgb, var(--accent) 14%, transparent);
+  box-shadow: var(--ring), var(--shadow-2);
 }
 
 .btn.primary {
-  background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 82%, #4f46e5));
-  box-shadow: 0 2px 10px color-mix(in srgb, var(--accent) 28%, transparent);
+  background: var(--accent);
+  box-shadow: none;
 }
 
 .btn.primary:hover:not(:disabled) {
-  background: linear-gradient(135deg, var(--accent-hover), color-mix(in srgb, var(--accent-hover) 82%, #4338ca));
-  box-shadow: 0 4px 16px color-mix(in srgb, var(--accent) 36%, transparent);
+  background: var(--accent-hover);
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--accent) 28%, transparent);
 }
 
-/* Cards & sheets: subtle top highlight and cleaner depth. */
+/* Crisp dropdown menus (including .new-chat-menu) with opaque sheet background. */
+.menu {
+  background: var(--glass-sheet, var(--surface));
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+/* Cards & sheets: crisp planes, zero backdrop-filter blur. */
 .card,
 .prov-card,
 .integration-card,
 .mp-card,
 .settings-card {
   box-shadow: var(--card-shadow);
-  backdrop-filter: blur(12px);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
 /* Grouped navigation rail with compact rhythm and overflow safety. */
@@ -414,11 +414,12 @@
   flex: 0 0 auto;
 }
 
-/* Studio workspace headers & subtle gradient title accent. */
+/* Studio workspace headers. */
 .pane-head {
   border-bottom: 1px solid var(--hairline);
-  background: color-mix(in srgb, var(--surface) 64%, transparent);
-  backdrop-filter: blur(12px);
+  background: var(--surface);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
 .pane-title {
@@ -428,16 +429,17 @@
 /* Sign-in / Connect hero surface. */
 .connect {
   background:
-    radial-gradient(760px 420px at 50% 12%, color-mix(in srgb, var(--accent) 16%, transparent), transparent 65%),
-    radial-gradient(560px 360px at 80% 85%, color-mix(in srgb, var(--accent-2, #5aa8ff) 10%, transparent), transparent 60%),
+    radial-gradient(760px 420px at 50% 12%, color-mix(in srgb, var(--accent) 14%, transparent), transparent 65%),
+    radial-gradient(560px 360px at 80% 85%, color-mix(in srgb, var(--accent-2, #5aa8ff) 8%, transparent), transparent 60%),
     var(--bg);
 }
 
 .connect-card {
   border-radius: 22px;
   border: 1px solid var(--glass-edge, var(--hairline-strong));
-  background: color-mix(in srgb, var(--surface) 88%, transparent);
-  backdrop-filter: blur(22px);
+  background: var(--surface);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   box-shadow: var(--shadow-2), inset 0 1px 0 var(--glass-highlight);
 }
 
@@ -469,7 +471,9 @@
   overflow: hidden;
   border-radius: 18px;
   border: 1px solid var(--glass-edge, var(--hairline-strong));
-  background: color-mix(in srgb, var(--glass-sheet, var(--surface)) 94%, transparent);
+  background: var(--glass-sheet, var(--surface));
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   box-shadow: 0 24px 64px rgba(0, 0, 0, 0.36), inset 0 1px 0 var(--glass-highlight);
 }
 

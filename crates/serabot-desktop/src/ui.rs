@@ -1450,4 +1450,27 @@ break
         let fallback = GLOBAL_KEYS_JS.rfind("#global-search").unwrap();
         assert!(approvals < fallback);
     }
+
+    #[test]
+    fn system_css_avoids_backdrop_filter_blur_and_stacks_sidebar_above_main() {
+        let css = include_str!("../assets/system.css");
+        assert!(
+            !css.contains("backdrop-filter: blur("),
+            "system.css must not blur static chrome or create WebView2 stacking traps"
+        );
+        assert!(css.contains("z-index: 30;"));
+        assert!(css.contains(".msg.user .msg-body"));
+        assert!(!css.contains(".msg.me .bubble"));
+    }
+
+    #[test]
+    fn sidebar_new_menu_opens_right_aligned_and_caret_bridge_tracks_generation() {
+        let shell = include_str!("ui/shell.rs");
+        assert!(
+            shell.contains("NewMenu { session, overlay, right: true, labelled: true }"),
+            "sidebar NewMenu must set right: true so the menu stays inside the sidebar"
+        );
+        assert!(COMPOSER_CARET_SETUP_JS.contains("__serabotComposerGen"));
+        assert!(COMPOSER_CARET_BRIDGE_JS.contains("__serabotComposerGen"));
+    }
 }
