@@ -205,7 +205,7 @@ never merge without the owner's OK.
 - [ ] Owner: run it once on Windows against the real adapter (none claimed).
 - [ ] Later: keep transcripts across restarts; images and @-file mentions in prompts.
 
-## Release 0.55.0 (next) — bot-integrated Claude Agent, Antigravity parity, chat responsiveness, visual polish
+## Release 0.55.0 — bot-integrated Claude Agent, Antigravity parity, chat responsiveness, visual polish
 
 - [x] Remove standalone `Section::ClaudeCode` tab from `IconRail` and `Shell`; integrate local Claude Code ACP mode directly into bot chats (`ClaudeAgentBotView`, Topbar toggle, `ModelBar`, and `RouteEditor`), with per-bot persisted transcripts (`acp-transcripts/<bot_id>.json`), per-bot preferred desktop folders, cached Node probe, and one-time persona context injection.
 - [x] Antigravity provider parity with Hiel-Cowork: incremental `CloudCodeStreamReader` SSE streaming via `response.bytes_stream()`, runtime `loadCodeAssist`/`onboardUser` project discovery when `project_id` is empty, catalog fallback on HTTP 400, consistent `AGY_CLIENT_ID`, empty-turns fallback, and `cachedContentTokenCount` subtraction.
