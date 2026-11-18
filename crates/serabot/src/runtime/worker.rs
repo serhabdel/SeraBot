@@ -296,16 +296,7 @@ impl Runtime {
                     None,
                     Some(&json!({"error": error.to_string()})),
                 )?;
-                let permanent = matches!(
-                    &error,
-                    SeraError::Forbidden(_)
-                        | SeraError::Rejected { .. }
-                        | SeraError::Validation(_)
-                        | SeraError::Config(_)
-                        | SeraError::PolicyViolation
-                        | SeraError::NotFound(_)
-                        | SeraError::InvalidState(_)
-                );
+                let permanent = is_permanent_failure(&error);
                 if permanent {
                     self.store.fail_task_final(
                         &user,
@@ -396,6 +387,26 @@ mod tests {
     }
 }
 
+/// Whether a failed task must not run again. A 400 `invalid_request` that
+/// reached here already exhausted the model layer's own 400 recoveries
+/// (session rotation, the wire-id alias): the rebuilt request would be
+/// identical, so retrying the task only repeats the same refusal.
+fn is_permanent_failure(error: &SeraError) -> bool {
+    match error {
+        SeraError::Forbidden(_)
+        | SeraError::Rejected { .. }
+        | SeraError::Validation(_)
+        | SeraError::Config(_)
+        | SeraError::PolicyViolation
+        | SeraError::NotFound(_)
+        | SeraError::InvalidState(_) => true,
+        SeraError::Upstream { status, code, .. } => {
+            *status == 400 && *code == crate::llm_failure::CODE_INVALID_REQUEST
+        }
+        _ => false,
+    }
+}
+
 /// What the chat says when a turn fails: the status and failure type of a
 /// model call (never the provider's body), and whether the turn runs again.
 pub(super) fn failure_notice(error: &SeraError, retrying: bool) -> String {
@@ -412,6 +423,38 @@ pub(super) fn failure_notice(error: &SeraError, retrying: bool) -> String {
         format!("{reason} Trying again shortly; press Stop to give up.")
     } else {
         format!("{reason} The details are available in the audit log.")
+    }
+}
+
+#[cfg(test)]
+mod permanent_failure_tests {
+    use super::is_permanent_failure;
+    use crate::error::SeraError;
+
+    #[test]
+    fn an_exhausted_400_is_permanent_but_other_model_failures_are_not() {
+        let exhausted_400 = SeraError::upstream(
+            400,
+            crate::llm_failure::CODE_INVALID_REQUEST,
+            "Cloud Code request failed with status 400",
+        );
+        assert!(is_permanent_failure(&exhausted_400));
+        let wall_400 = SeraError::upstream(
+            400,
+            crate::llm_failure::CODE_CONTEXT_TOO_LONG,
+            "Cloud Code request failed with status 400",
+        );
+        assert!(!is_permanent_failure(&wall_400));
+        let rate_limited = SeraError::upstream(
+            429,
+            crate::llm_failure::CODE_RATE_LIMITED,
+            "Cloud Code request failed with status 429",
+        );
+        assert!(!is_permanent_failure(&rate_limited));
+        assert!(is_permanent_failure(&SeraError::Rejected {
+            code: "all_routes_failed",
+            message: "no route".into(),
+        }));
     }
 }
 

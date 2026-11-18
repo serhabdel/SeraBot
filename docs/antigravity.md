@@ -97,6 +97,8 @@ The request is a Cloud Code envelope: `model`, optional `project`, `request.cont
 
 Function-call parts send the `thoughtSignature` Google gave that call, or `skip_thought_signature_validator` when there is none (see Wire details). Since 0.53.1 no `anthropic-beta` header is sent, as in HielCowork. A model id is sent as configured. Since 0.53.1, when Google answers plain `claude-opus-5-5` with a 400 or 404, the request is sent once more as `claude-opus-5-5-thinking` (the id Cloud Code serves it under), as HielCowork does; no other id is rewritten, and a second refusal is reported as it is.
 
+A chat 400 whose body names the model as unknown, unsupported or unavailable for the account or project is classified `model_unavailable`, not `invalid_request`: the route chain then moves to the next candidate model or account instead of failing the turn on a bad model id. A 400 that survives the session rotation and the wire alias is `invalid_request` and fails the task once, without retries — the rebuilt request would be identical.
+
 ## Deferred
 
 - Image generation, image edit and `googleSearch` grounding.
