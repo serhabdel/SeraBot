@@ -73,6 +73,7 @@ mod messages;
 mod monitoring;
 mod preview;
 mod profiles;
+mod projects;
 mod provider_accounts;
 mod provider_quota;
 mod routines;
@@ -835,6 +836,7 @@ pub fn router(state: ApiState) -> Router {
         .merge(audio)
         .merge(profiles::routes())
         .merge(files::routes())
+        .merge(projects::routes())
         .merge(local::routes())
         .layer(middleware::from_fn_with_state(shared.clone(), rate_limit))
         .layer(middleware::from_fn_with_state(shared.clone(), authorize));

@@ -200,9 +200,17 @@ impl AcpClient {
 
     /// Send one message. One prompt runs at a time.
     pub fn prompt(&self, text: &str) -> Result<(), String> {
+        self.prompt_with_images(text, &[])
+    }
+
+    pub fn prompt_with_images(
+        &self,
+        text: &str,
+        images: &[protocol::PromptImage],
+    ) -> Result<(), String> {
         let text = text.trim();
-        if text.is_empty() {
-            return Err("Type a message first.".into());
+        if text.is_empty() && images.is_empty() {
+            return Err("Type a message or attach an image first.".into());
         }
         let session = self
             .shared
@@ -213,7 +221,7 @@ impl AcpClient {
         }
         if self.shared.send_request(
             "session/prompt",
-            protocol::prompt_params(&session, text),
+            protocol::prompt_params_with_images(&session, text, images),
             Pending::Prompt,
         ) {
             Ok(())

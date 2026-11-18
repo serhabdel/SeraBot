@@ -726,8 +726,20 @@ pub fn build_cloud_code_envelope_with(
         match message.role {
             Role::System => {}
             Role::User => {
+                let mut parts = Vec::new();
                 if let Some(text) = non_empty(message.content.as_deref()) {
-                    push_turn(&mut turns, "user", vec![json!({"text": text})], false);
+                    parts.push(json!({"text": text}));
+                }
+                for img in &message.images {
+                    parts.push(json!({
+                        "inlineData": {
+                            "mimeType": img.mime,
+                            "data": img.data_base64,
+                        }
+                    }));
+                }
+                if !parts.is_empty() {
+                    push_turn(&mut turns, "user", parts, false);
                 }
             }
             Role::Assistant => {

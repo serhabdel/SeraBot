@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use crate::ui::{BrandLogo, Icon, MarkdownBody};
 use dioxus::prelude::*;
 use serabot_desktop::acp::controller::{Ask, Inbound, folder_label};
+use serabot_desktop::acp::protocol::PromptImage;
 use serabot_desktop::acp::setup::NodeCheck;
 use serabot_desktop::acp::{Controller, Item, Status};
 use serabot_desktop::local_folders::FolderMode;
@@ -95,6 +96,7 @@ fn ensure_bot_controller<'a>(
 pub fn ClaudeAgentBotView(session: Signal<Session>, bot_id: String) -> Element {
     let ClaudeCode(mut store) = use_context::<ClaudeCode>();
     let mut draft = use_signal(String::new);
+    let mut attached_images: Signal<Vec<(String, PromptImage)>> = use_signal(Vec::new);
     let bot_for_effect = use_signal(|| bot_id.clone());
     // Keep signal synced with the latest bot_id prop when switching bot chats
     // without unmounting.
@@ -102,6 +104,7 @@ pub fn ClaudeAgentBotView(session: Signal<Session>, bot_id: String) -> Element {
         let mut tracked = bot_for_effect;
         tracked.set(bot_id.clone());
         draft.set(String::new());
+        attached_images.set(Vec::new());
     }
     use_effect(move || {
         let current_bot = bot_for_effect();
@@ -196,7 +199,27 @@ pub fn ClaudeAgentBotView(session: Signal<Session>, bot_id: String) -> Element {
         Status::NeedsSignIn | Status::Stopped(_) => "cc-status warn",
         Status::Idle => "cc-status",
     };
-    let can_send = status == Status::Ready && !draft().trim().is_empty();
+    let current_draft = draft();
+    let current_images = attached_images();
+    let active_folder_path = selected
+        .as_deref()
+        .and_then(|id| folders.iter().find(|f| f.id == id))
+        .map(|f| f.path.clone());
+    let mention_match = if running {
+        active_mention_query(&current_draft).and_then(|(start, query)| {
+            let root = active_folder_path.as_deref()?;
+            let matches = Controller::list_folder_files(std::path::Path::new(root), query);
+            if matches.is_empty() {
+                None
+            } else {
+                Some((start, matches))
+            }
+        })
+    } else {
+        None
+    };
+    let can_send =
+        status == Status::Ready && (!current_draft.trim().is_empty() || !current_images.is_empty());
     let bot_for_toggle = bot_id.clone();
 
     rsx! {
@@ -524,17 +547,67 @@ pub fn ClaudeAgentBotView(session: Signal<Session>, bot_id: String) -> Element {
                             move |event| {
                                 event.prevent_default();
                                 let text = draft();
+                                let imgs: Vec<PromptImage> = attached_images()
+                                    .into_iter()
+                                    .map(|(_, img)| img)
+                                    .collect();
                                 let s = session.read();
                                 let mut st = store.write();
-                                if ensure_bot_controller(&mut st, &s, &bot_id).send(&text) {
+                                if ensure_bot_controller(&mut st, &s, &bot_id)
+                                    .send_with_images(&text, &imgs)
+                                {
                                     draft.set(String::new());
+                                    attached_images.set(Vec::new());
                                 }
                             }
                         },
+                        if let Some((mention_start, candidates)) = mention_match {
+                            div { class: "cc-mentions", role: "listbox", "aria-label": "Folder files",
+                                for rel in candidates {
+                                    {
+                                        let rel_for_click = rel.clone();
+                                        rsx! {
+                                            button {
+                                                key: "{rel}",
+                                                class: "btn ghost sm",
+                                                r#type: "button",
+                                                onclick: move |_| {
+                                                    let cur = draft();
+                                                    let prefix = &cur[..mention_start.min(cur.len())];
+                                                    draft.set(format!("{prefix}@{rel_for_click} "));
+                                                },
+                                                "@{rel}"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !current_images.is_empty() {
+                            div { class: "cc-attachments",
+                                for (idx, (name, _)) in current_images.iter().enumerate() {
+                                    span { key: "{idx}-{name}", class: "chip",
+                                        "{name}"
+                                        button {
+                                            class: "btn ghost sm",
+                                            r#type: "button",
+                                            "aria-label": "Remove image",
+                                            onclick: move |_| {
+                                                let mut list = attached_images.write();
+                                                if idx < list.len() {
+                                                    list.remove(idx);
+                                                }
+                                            },
+                                            "\u{00d7}"
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         textarea {
                             class: "cc-input",
                             rows: "3",
-                            placeholder: if status == Status::Ready { "Message Claude Code (Ctrl+Enter to send)" } else { "Claude Code is busy\u{2026}" },
+                            placeholder: if status == Status::Ready { "Message Claude Code (@file to mention, Ctrl+Enter to send)" } else { "Claude Code is busy\u{2026}" },
                             "aria-label": "Message Claude Code",
                             value: "{draft}",
                             oninput: move |event| draft.set(event.value()),
@@ -544,16 +617,36 @@ pub fn ClaudeAgentBotView(session: Signal<Session>, bot_id: String) -> Element {
                                     if event.key() == Key::Enter && event.modifiers().ctrl() {
                                         event.prevent_default();
                                         let text = draft();
+                                        let imgs: Vec<PromptImage> = attached_images()
+                                            .into_iter()
+                                            .map(|(_, img)| img)
+                                            .collect();
                                         let s = session.read();
                                         let mut st = store.write();
-                                        if ensure_bot_controller(&mut st, &s, &bot_id).send(&text) {
+                                        if ensure_bot_controller(&mut st, &s, &bot_id)
+                                            .send_with_images(&text, &imgs)
+                                        {
                                             draft.set(String::new());
+                                            attached_images.set(Vec::new());
                                         }
                                     }
                                 }
                             },
                         }
                         div { class: "cc-composer-actions",
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                disabled: current_images.len() >= 4,
+                                onclick: move |_| {
+                                    let picked = pick_acp_images(4usize.saturating_sub(attached_images().len()));
+                                    if !picked.is_empty() {
+                                        attached_images.write().extend(picked);
+                                    }
+                                },
+                                Icon { name: "paperclip", size: 14 }
+                                "Image"
+                            }
                             if working {
                                 button {
                                     class: "btn sm",
@@ -648,4 +741,75 @@ fn TranscriptRow(index: usize, item: Item) -> Element {
             p { class: if error { "cc-row cc-note err" } else { "cc-row cc-note" }, "{text}" }
         },
     }
+}
+
+/// If the draft currently ends with an `@query` token (preceded by start-of-text
+/// or whitespace, with no whitespace after `@`), return `(byte_offset_of_at, query)`.
+fn active_mention_query(text: &str) -> Option<(usize, &str)> {
+    let at = text.rfind('@')?;
+    if at > 0 {
+        let prev = text[..at].chars().next_back()?;
+        if !prev.is_whitespace() {
+            return None;
+        }
+    }
+    let tail = &text[at + 1..];
+    if tail.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some((at, tail))
+}
+
+#[cfg(windows)]
+fn pick_acp_images(max_count: usize) -> Vec<(String, PromptImage)> {
+    use base64::Engine as _;
+    const MAX_BYTES: usize = 4 * 1024 * 1024;
+    if max_count == 0 {
+        return Vec::new();
+    }
+    let Some(paths) = rfd::FileDialog::new()
+        .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp"])
+        .pick_files()
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for path in paths.into_iter().take(max_count) {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if bytes.is_empty() || bytes.len() > MAX_BYTES {
+            continue;
+        }
+        let mime_type = match path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("png") => "image/png",
+            Some("jpg" | "jpeg") => "image/jpeg",
+            Some("gif") => "image/gif",
+            Some("webp") => "image/webp",
+            _ => continue,
+        };
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("image")
+            .to_owned();
+        out.push((
+            name,
+            PromptImage {
+                mime_type: mime_type.to_owned(),
+                data_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            },
+        ));
+    }
+    out
+}
+
+#[cfg(not(windows))]
+fn pick_acp_images(_max_count: usize) -> Vec<(String, PromptImage)> {
+    Vec::new()
 }

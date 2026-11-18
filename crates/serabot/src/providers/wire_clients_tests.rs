@@ -1901,7 +1901,7 @@ async fn a_copilot_account_chats_and_lists_models_with_the_editor_headers() {
         .unwrap();
     assert_eq!(
         catalog.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["cp-chat"]
+        ["auto", "cp-chat"]
     );
     // Exactly one user agent went out on the catalog call.
     let requests = server.received_requests().await.unwrap();

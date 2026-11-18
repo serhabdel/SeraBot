@@ -626,4 +626,29 @@ html[data-reduce-transparency="true"] .sheet.sheet-palette {
   background: var(--surface);
 }
 
+.chat.drop-active {
+  outline: 2px dashed var(--accent);
+  outline-offset: -8px;
+  background: color-mix(in srgb, var(--accent) 6%, var(--bg));
+}
+
+.cc-mentions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  background: var(--surface-2);
+  margin-bottom: 6px;
+}
+
+.cc-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+
 

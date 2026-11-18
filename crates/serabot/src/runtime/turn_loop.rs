@@ -215,6 +215,7 @@ impl Runtime {
         state.messages.push(LlmMessage::system(system));
         state.messages.extend(history);
         let mut model_text = payload.text.clone();
+        let mut model_images = Vec::new();
         if !payload.attachments.is_empty() {
             let attachments = self.store.pending_chat_attachments(
                 &user,
@@ -228,6 +229,11 @@ impl Runtime {
             if !block.is_empty() && self.scan_owner_output(&user, &block).is_ok() {
                 model_text.push_str(&block);
             }
+            model_images.extend(crate::attachments::load_images_for_model(
+                &self.config,
+                &user,
+                &attachments,
+            ));
         }
         if let Some(handoff) = &payload.handoff {
             // A handoff (ask_teammate, delegate) gets the files the owner
@@ -238,8 +244,17 @@ impl Runtime {
             if !block.is_empty() && self.scan_owner_output(&user, &block).is_ok() {
                 model_text.push_str(&block);
             }
+            if model_images.is_empty() {
+                model_images.extend(crate::attachments::load_images_for_model(
+                    &self.config,
+                    &user,
+                    &attachments,
+                ));
+            }
         }
-        state.messages.push(LlmMessage::user(model_text));
+        state
+            .messages
+            .push(LlmMessage::user_with_images(model_text, model_images));
         self.store
             .update_turn(&user, &turn.id, "active", &serde_json::to_value(&state)?)?;
         self.advance(task, &turn, state, &payload.conversation_id)
@@ -362,6 +377,7 @@ impl Runtime {
                         tool_call_id: Some(pending.call.id.clone()),
                         name: Some(pending.call.name.clone()),
                         is_error: true,
+                        images: Vec::new(),
                     });
                 }
             }
@@ -385,6 +401,7 @@ impl Runtime {
                 tool_call_id: Some(pending.call.id.clone()),
                 name: Some(pending.call.name.clone()),
                 is_error: true,
+                images: Vec::new(),
             });
         }
         state.pending = None;
@@ -397,6 +414,7 @@ impl Runtime {
                     tool_call_id: Some(call.id.clone()),
                     name: Some(call.name.clone()),
                     is_error: true,
+                    images: Vec::new(),
                 });
             }
         } else if !pending.remaining.is_empty()
@@ -1379,6 +1397,7 @@ impl Runtime {
                         tool_call_id: Some(call.id.clone()),
                         name: Some(call.name.clone()),
                         is_error: true,
+                        images: Vec::new(),
                     });
                 }
                 Err(error) => {
@@ -1406,6 +1425,7 @@ impl Runtime {
                         tool_call_id: Some(call.id.clone()),
                         name: Some(call.name.clone()),
                         is_error: true,
+                        images: Vec::new(),
                     });
                 }
             }
@@ -1440,6 +1460,7 @@ impl Runtime {
             tool_call_id: Some(call.id.clone()),
             name: Some(call.name.clone()),
             is_error: false,
+            images: Vec::new(),
         });
     }
 

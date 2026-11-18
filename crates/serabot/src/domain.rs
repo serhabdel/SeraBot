@@ -104,6 +104,17 @@ pub struct ToolCall {
     pub reasoning_signature: Option<String>,
 }
 
+/// One inline image attached to a user turn for vision-capable models.
+/// Untrusted user data, never instructions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlmImage {
+    pub mime: String,
+    /// Standard base64-encoded image bytes.
+    pub data_base64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LlmMessage {
     pub role: Role,
@@ -117,6 +128,9 @@ pub struct LlmMessage {
     /// True on a tool message whose tool failed, was denied or was blocked.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_error: bool,
+    /// Inline images attached to a user message for multimodal models.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<LlmImage>,
 }
 
 impl LlmMessage {
@@ -132,6 +146,15 @@ impl LlmMessage {
         Self {
             role: Role::User,
             content: Some(content.into()),
+            ..Self::default()
+        }
+    }
+
+    pub fn user_with_images(content: impl Into<String>, images: Vec<LlmImage>) -> Self {
+        Self {
+            role: Role::User,
+            content: Some(content.into()),
+            images,
             ..Self::default()
         }
     }

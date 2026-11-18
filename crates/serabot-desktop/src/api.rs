@@ -4169,6 +4169,139 @@ impl ApiClient {
         self.request::<_, ()>(Method::DELETE, &["v1", "whatsapp-link"], &[], None)
     }
 
+    /// `GET /v1/projects`: list the member's project folders with file counts.
+    pub fn projects_list(&self) -> Result<serde_json::Value, ApiError> {
+        self.get(&["v1", "projects"], &[])
+    }
+
+    /// `POST /v1/projects`: create a new project folder.
+    pub fn projects_create(&self, name: &str) -> Result<serde_json::Value, ApiError> {
+        self.request(
+            Method::POST,
+            &["v1", "projects"],
+            &[],
+            Some(&serde_json::json!({ "name": name })),
+        )
+    }
+
+    /// `GET /v1/projects/{slug}/files`: list files inside one project.
+    pub fn projects_files(&self, slug: &str) -> Result<serde_json::Value, ApiError> {
+        check_id(slug)?;
+        self.get(&["v1", "projects", slug, "files"], &[])
+    }
+
+    /// `POST /v1/projects/{slug}/upload`: upload a file directly into a project.
+    pub fn projects_upload(
+        &self,
+        slug: &str,
+        filename: &str,
+        subfolder: Option<&str>,
+        bytes: &[u8],
+    ) -> Result<serde_json::Value, ApiError> {
+        check_id(slug)?;
+        if !valid_attachment_name(filename) {
+            return Err(ApiError::Validation(
+                "Upload an image, PDF, DOCX, XLSX, PPTX, TXT, MD or CSV file.",
+            ));
+        }
+        if bytes.is_empty() {
+            return Err(ApiError::Validation("That file is empty."));
+        }
+        if bytes.len() > MAX_ATTACHMENT_BYTES {
+            return Err(ApiError::Validation("Files must be 25 MB or smaller."));
+        }
+        let mut url = self.endpoint.clone();
+        url.path_segments_mut()
+            .map_err(|_| ApiError::InvalidResponse)?
+            .clear()
+            .extend(["v1", "projects", slug, "upload"]);
+        let mut req = self
+            .client
+            .post(url)
+            .bearer_auth(self.token.expose_secret())
+            .timeout(crate::net_policy::SLOW_TIMEOUT)
+            .header("X-Filename", filename)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream");
+        if let Some(sub) = subfolder.map(str::trim).filter(|s| !s.is_empty()) {
+            req = req.header("X-Subfolder", sub);
+        }
+        let response = req
+            .body(bytes.to_vec())
+            .send()
+            .map_err(|_| ApiError::Transport)?;
+        let status = response.status();
+        let mut body = Zeroizing::new(Vec::new());
+        response
+            .take(MAX_RESPONSE + 1)
+            .read_to_end(&mut body)
+            .map_err(|_| ApiError::Transport)?;
+        if body.len() as u64 > MAX_RESPONSE {
+            return Err(ApiError::TooLarge);
+        }
+        if !status.is_success() {
+            if matches!(status.as_u16(), 400 | 413 | 422)
+                && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body)
+                && let Some(message) = value.get("error").and_then(|value| value.as_str())
+                && !message.is_empty()
+                && message.len() <= 512
+                && !message.chars().any(char::is_control)
+            {
+                return Err(ApiError::Rejected(message.to_owned()));
+            }
+            return Err(ApiError::Http(status.as_u16()));
+        }
+        serde_json::from_slice(&body).map_err(|_| ApiError::InvalidResponse)
+    }
+
+    /// `GET /v1/projects/{slug}/files/{*path}`: download one file from a project.
+    pub fn projects_download(&self, slug: &str, rel_path: &str) -> Result<Vec<u8>, ApiError> {
+        check_id(slug)?;
+        let mut url = self.endpoint.clone();
+        {
+            let mut segs = url
+                .path_segments_mut()
+                .map_err(|_| ApiError::InvalidResponse)?;
+            segs.clear();
+            segs.extend(["v1", "projects", slug, "files"]);
+            for part in rel_path.split('/').filter(|p| !p.is_empty()) {
+                segs.push(part);
+            }
+        }
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(self.token.expose_secret())
+            .timeout(crate::net_policy::SLOW_TIMEOUT)
+            .send()
+            .map_err(|_| ApiError::Transport)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ApiError::Http(status.as_u16()));
+        }
+        let mut out = Vec::new();
+        response
+            .take(MAX_ATTACHMENT_BYTES as u64 + 1)
+            .read_to_end(&mut out)
+            .map_err(|_| ApiError::Transport)?;
+        if out.len() > MAX_ATTACHMENT_BYTES {
+            return Err(ApiError::TooLarge);
+        }
+        Ok(out)
+    }
+
+    /// `DELETE /v1/projects/{slug}/files/{*path}`: delete a file from a project.
+    pub fn projects_delete_file(
+        &self,
+        slug: &str,
+        rel_path: &str,
+    ) -> Result<serde_json::Value, ApiError> {
+        check_id(slug)?;
+        let mut segments = vec!["v1", "projects", slug, "files"];
+        let parts: Vec<&str> = rel_path.split('/').filter(|p| !p.is_empty()).collect();
+        segments.extend(parts);
+        self.request::<_, ()>(Method::DELETE, &segments, &[], None)
+    }
+
     /// `GET /v1/connectors/github/native`: the member's GitHub sign-in.
     pub fn github_native(&self) -> Result<crate::marketplace::GithubView, ApiError> {
         self.get(&["v1", "connectors", "github", "native"], &[])

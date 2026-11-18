@@ -17,7 +17,7 @@ dir = "/var/lib/serabot/logs"
 [whatsapp_link]
 # Unofficial linked-device WhatsApp client (docs/specs/whatsapp-linked-device.md).
 # The number can be banned: link a spare number only.
-enabled = false
+enabled = true
 dir = "/var/lib/serabot/whatsapp"
 
 [database]

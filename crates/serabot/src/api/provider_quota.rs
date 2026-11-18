@@ -23,6 +23,11 @@ const MUSE_QUOTA_URL: &str = "https://api.meta.ai/muse-code/key";
 /// Where OpenCode Go reports the subscription's usage meters.
 const OPENCODE_GO_USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
 
+/// Where GitHub Copilot reports the subscription's quota snapshots.
+const COPILOT_QUOTA_URL: &str = "https://api.github.com/copilot_internal/user";
+/// Where ChatGPT (Codex) reports the plan's rate-limit windows.
+const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+
 /// The readers every server has, by provider kind.
 pub(super) fn standard_readers() -> HashMap<String, Arc<dyn QuotaReader>> {
     let mut readers: HashMap<String, Arc<dyn QuotaReader>> = HashMap::new();
@@ -39,6 +44,20 @@ pub(super) fn standard_readers() -> HashMap<String, Arc<dyn QuotaReader>> {
             Arc::new(OpenCodeGoQuota {
                 http: http.clone(),
                 url: OPENCODE_GO_USAGE_URL.into(),
+            }),
+        );
+        readers.insert(
+            "github-copilot".into(),
+            Arc::new(CopilotQuota {
+                http: http.clone(),
+                url: COPILOT_QUOTA_URL.into(),
+            }),
+        );
+        readers.insert(
+            "openai-codex".into(),
+            Arc::new(CodexQuota {
+                http: http.clone(),
+                url: CODEX_USAGE_URL.into(),
             }),
         );
         if let Ok(origins) =
@@ -303,6 +322,186 @@ impl QuotaReader for AntigravityQuota {
         )
         .await)
     }
+}
+
+/// GitHub Copilot: the long-lived GitHub token (`refresh_token`) reads
+/// `/copilot_internal/user` for `quota_snapshots`.
+pub(super) struct CopilotQuota {
+    http: reqwest::Client,
+    url: String,
+}
+
+#[async_trait::async_trait]
+impl QuotaReader for CopilotQuota {
+    async fn read(
+        &self,
+        credential: &ProviderCredential,
+        _identity: &Value,
+    ) -> Result<Option<Value>> {
+        let token = credential.refresh_token.trim();
+        if token.is_empty() {
+            return Ok(None);
+        }
+        let mut req = self
+            .http
+            .get(&self.url)
+            .header("accept", "application/json")
+            .timeout(Duration::from_secs(20))
+            .bearer_auth(token);
+        for (name, value) in crate::auth_flows::copilot::EDITOR_HEADERS {
+            req = req.header(name, value);
+        }
+        let response = req
+            .send()
+            .await
+            .map_err(|_| SeraError::External("quota could not be read".into()))?;
+        let status = response.status();
+        let body = crate::auth_flows::read_capped(response).await?;
+        if !status.is_success() {
+            return Ok(None);
+        }
+        Ok(serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|value| parse_copilot_quota(&value)))
+    }
+}
+
+/// Parse GitHub Copilot's `/copilot_internal/user` payload into a quota snapshot.
+pub(super) fn parse_copilot_quota(value: &Value) -> Option<Value> {
+    let snapshots = value.get("quota_snapshots")?.as_object()?;
+    let reset = value
+        .get("quota_reset_date_utc")
+        .or_else(|| value.get("quota_reset_date"))
+        .and_then(reset_time);
+    let mut windows = Vec::new();
+    for (key, label) in [
+        ("premium_interactions", "premium"),
+        ("chat", "chat"),
+        ("completions", "completions"),
+    ] {
+        let Some(entry) = snapshots.get(key) else {
+            continue;
+        };
+        if entry.get("unlimited").and_then(Value::as_bool) == Some(true) {
+            windows.push(json!({
+                "scope": key,
+                "label": label,
+                "used_percent": 0.0,
+                "remaining": 1.0,
+                "resets_at": reset,
+            }));
+            continue;
+        }
+        let pct_rem = entry
+            .get("percent_remaining")
+            .and_then(number)
+            .or_else(|| {
+                let rem = entry.get("remaining").and_then(number)?;
+                let ent = entry.get("entitlement").and_then(number)?;
+                (ent > 0.0).then(|| (rem / ent) * 100.0)
+            })?
+            .clamp(0.0, 100.0);
+        let used = ((100.0 - pct_rem) * 10.0).round() / 10.0;
+        let remaining = (pct_rem / 100.0 * 1000.0).round() / 1000.0;
+        windows.push(json!({
+            "scope": key,
+            "label": label,
+            "used_percent": used,
+            "remaining": remaining,
+            "resets_at": reset,
+        }));
+    }
+    (!windows.is_empty()).then(|| {
+        json!({
+            "sampled_at": sampled_at(),
+            "source": "copilot",
+            "state": "ok",
+            "windows": windows,
+        })
+    })
+}
+
+/// OpenAI Codex (ChatGPT plan): reads `/backend-api/wham/usage` with the
+/// member's access token and `ChatGPT-Account-Id`.
+pub(super) struct CodexQuota {
+    http: reqwest::Client,
+    url: String,
+}
+
+#[async_trait::async_trait]
+impl QuotaReader for CodexQuota {
+    async fn read(
+        &self,
+        credential: &ProviderCredential,
+        identity: &Value,
+    ) -> Result<Option<Value>> {
+        let token = credential.api_key.trim();
+        if token.is_empty() {
+            return Ok(None);
+        }
+        let mut req = self
+            .http
+            .get(&self.url)
+            .header("accept", "application/json")
+            .header("originator", crate::auth_flows::codex::ORIGINATOR)
+            .timeout(Duration::from_secs(20))
+            .bearer_auth(token);
+        if let Some(account_id) = identity
+            .get("account_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            req = req.header("chatgpt-account-id", account_id);
+        }
+        let response = req
+            .send()
+            .await
+            .map_err(|_| SeraError::External("quota could not be read".into()))?;
+        let status = response.status();
+        let body = crate::auth_flows::read_capped(response).await?;
+        if !status.is_success() {
+            return Ok(None);
+        }
+        Ok(serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|value| parse_codex_usage(&value)))
+    }
+}
+
+/// Parse ChatGPT Codex's `/wham/usage` payload into a quota snapshot.
+pub(super) fn parse_codex_usage(value: &Value) -> Option<Value> {
+    let rate = value.get("rate_limit")?;
+    let mut windows = Vec::new();
+    for (key, fallback_label) in [("primary_window", "5h"), ("secondary_window", "week")] {
+        let Some(entry) = rate.get(key) else {
+            continue;
+        };
+        let Some(used) = entry.get("used_percent").and_then(number) else {
+            continue;
+        };
+        let used = used.clamp(0.0, 100.0);
+        let label = entry
+            .get("limit_window_seconds")
+            .and_then(number)
+            .map(|secs| duration_label(Some(secs / 60.0)))
+            .unwrap_or_else(|| fallback_label.to_owned());
+        windows.push(json!({
+            "scope": key,
+            "label": label,
+            "used_percent": used,
+            "remaining": ((100.0 - used) / 100.0 * 1000.0).round() / 1000.0,
+            "resets_at": entry.get("reset_at").and_then(reset_time),
+        }));
+    }
+    (!windows.is_empty()).then(|| {
+        json!({
+            "sampled_at": sampled_at(),
+            "source": "codex",
+            "state": "ok",
+            "windows": windows,
+        })
+    })
 }
 
 #[cfg(test)]
@@ -606,7 +805,56 @@ mod tests {
         assert!(readers.contains_key("muse-code"));
         assert!(readers.contains_key("google-antigravity"));
         assert!(readers.contains_key("opencode-go"));
+        assert!(readers.contains_key("github-copilot"));
+        assert!(readers.contains_key("openai-codex"));
         assert!(!readers.contains_key("opencode-zen"));
         assert!(!readers.contains_key("openai"));
+    }
+
+    #[test]
+    fn copilot_and_codex_quota_parsers_read_windows() {
+        let copilot = parse_copilot_quota(&json!({
+            "quota_reset_date_utc": "2026-12-01T00:00:00Z",
+            "quota_snapshots": {
+                "premium_interactions": {
+                    "entitlement": 300,
+                    "remaining": 150,
+                    "percent_remaining": 50.0,
+                    "unlimited": false
+                },
+                "chat": {
+                    "unlimited": true
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(copilot["source"], "copilot");
+        let windows = copilot["windows"].as_array().unwrap();
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0]["label"], "premium");
+        assert!((windows[0]["remaining"].as_f64().unwrap() - 0.5).abs() < 1e-6);
+        assert_eq!(windows[1]["label"], "chat");
+        assert!((windows[1]["remaining"].as_f64().unwrap() - 1.0).abs() < 1e-6);
+
+        let codex = parse_codex_usage(&json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 25.0,
+                    "limit_window_seconds": 18000,
+                    "reset_at": 1_800_000_000
+                },
+                "secondary_window": {
+                    "used_percent": 60.0,
+                    "limit_window_seconds": 604800,
+                    "reset_at": 1_800_500_000
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(codex["source"], "codex");
+        let windows = codex["windows"].as_array().unwrap();
+        assert_eq!(windows.len(), 2);
+        assert!((windows[0]["remaining"].as_f64().unwrap() - 0.75).abs() < 1e-6);
+        assert!((windows[1]["remaining"].as_f64().unwrap() - 0.40).abs() < 1e-6);
     }
 }

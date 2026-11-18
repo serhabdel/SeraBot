@@ -128,9 +128,32 @@ pub fn new_session_params(cwd: &str) -> Value {
     json!({"cwd": cwd, "mcpServers": []})
 }
 
+/// An image block attached to an ACP `session/prompt`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromptImage {
+    pub mime_type: String,
+    pub data_base64: String,
+}
+
 /// `session/prompt` with one text block.
 pub fn prompt_params(session_id: &str, text: &str) -> Value {
-    json!({"sessionId": session_id, "prompt": [{"type": "text", "text": text}]})
+    prompt_params_with_images(session_id, text, &[])
+}
+
+/// `session/prompt` with a text block and optional base64 image blocks.
+pub fn prompt_params_with_images(session_id: &str, text: &str, images: &[PromptImage]) -> Value {
+    let mut blocks = Vec::with_capacity(images.len() + 1);
+    if !text.trim().is_empty() {
+        blocks.push(json!({"type": "text", "text": text}));
+    }
+    for img in images {
+        blocks.push(json!({
+            "type": "image",
+            "mimeType": img.mime_type,
+            "data": img.data_base64,
+        }));
+    }
+    json!({"sessionId": session_id, "prompt": blocks})
 }
 
 /// `session/cancel`.
@@ -422,5 +445,23 @@ mod tests {
         let value: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(value["params"]["clientCapabilities"]["terminal"], false);
         assert_eq!(value["params"]["protocolVersion"], 1);
+    }
+
+    #[test]
+    fn prompt_params_with_images_emits_text_and_image_blocks() {
+        let params = prompt_params_with_images(
+            "sess-1",
+            "Explain this screenshot",
+            &[PromptImage {
+                mime_type: "image/png".into(),
+                data_base64: "iVBORw0KGgo=".into(),
+            }],
+        );
+        let blocks = params["prompt"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["mimeType"], "image/png");
+        assert_eq!(blocks[1]["data"], "iVBORw0KGgo=");
     }
 }

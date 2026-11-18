@@ -31,6 +31,7 @@ mod memory_settings_api;
 mod personal_api;
 mod preview_api;
 mod profiles_api;
+mod projects_api;
 mod provider_accounts_api;
 mod signin_agy_muse_api;
 mod standing_grants_api;

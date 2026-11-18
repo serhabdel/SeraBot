@@ -40,10 +40,11 @@ server-side use) without a new design.
 
 WhatsApp as a linked device (0.58, `docs/specs/whatsapp-linked-device.md`)
 uses the unofficial `whatsapp-rust` client with the owner's approval and a
-spare number. It is off unless `[whatsapp_link] enabled = true`, serves
-one-to-one chats on the member's allowlist only, and sends anything the bot
-starts itself through the approval-gated `whatsapp_link_send`. Do not widen
-it (groups, contacts, history, unapproved sends) without a new design.
+spare number. It is on by default in 0.59 (`[whatsapp_link] enabled = false`
+turns it off), serves one-to-one chats on the member's allowlist only, and
+sends anything the bot starts itself through the approval-gated
+`whatsapp_link_send`. Do not widen it (groups, contacts, history, unapproved
+sends) without a new design.
 
 Everything user-owned is UID-scoped — bots, skills, memory, documents,
 conversations, tasks, approvals, credentials, quotas. Store methods for
@@ -117,6 +118,6 @@ OVH is read-only unless the owner explicitly authorizes an additive installation
 - `crates/serabot/src/model_router.rs` `RouterHandle` — the live, swappable model router shared by the runtime and the delegation, team and bot tools; console provider saves rebuild it (0.53).
 - `crates/serabot-desktop/src/runs.rs`, `chat_compose.rs`, `chat_failure.rs`, `chat_cards.rs`, `ui/chat_feed_view.rs`, `assets/runs.css` — runs sidebar, composer queue, failed and wait cards, virtualized feed (0.50).
 - `crates/serabot-desktop/src/acp/` (protocol, client, setup, transcript, controller), `ui_claude_code.rs`, `assets/claude-code.css` — Claude Code on this computer over ACP (0.54; integrated per-bot with persisted transcripts and folder choice in 0.55).
-- `crates/serabot/src/whatsapp_link/`, `api/whatsapp_link.rs`, `crates/serabot-desktop/src/ui_whatsapp_link.rs` — WhatsApp linked device: allowlist, chat mapping, per-member client, approval-gated send, desktop card (0.58).
-- `crates/serabot/src/projects.rs` — per-user project folders in the server inbox (0.58).
-- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.58.0.
+- `crates/serabot/src/whatsapp_link/`, `api/whatsapp_link.rs`, `crates/serabot-desktop/src/ui_whatsapp_link.rs` — WhatsApp linked device: allowlist, chat mapping, per-member client, approval-gated send, desktop card (0.58; enabled by default in 0.59).
+- `crates/serabot/src/projects.rs`, `api/projects.rs`, `crates/serabot-desktop/src/projects.rs`, `ui_projects.rs` — per-user project folders in the server inbox, HTTP API, and desktop workspace (0.58–0.59).
+- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.59.0.

@@ -194,6 +194,63 @@ pub fn save_upload(
     Ok(record)
 }
 
+/// Per-image and per-turn byte caps for inline vision payloads.
+pub const MAX_VISION_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_VISION_TOTAL_BYTES: usize = 12 * 1024 * 1024;
+const MAX_VISION_IMAGES: usize = 4;
+
+fn is_safe_user_rel_path(user_id: &str, rel_path: &str) -> bool {
+    let in_chat = rel_path.starts_with(&format!("{user_id}/chat/"));
+    let in_projects = rel_path.starts_with(&format!("{user_id}/projects/"));
+    (in_chat || in_projects) && !rel_path.contains("..")
+}
+
+/// Load bounded inline image payloads for vision-capable models from the
+/// user's own inbox attachments. Images over `MAX_VISION_IMAGE_BYTES` or beyond
+/// the per-turn budget are skipped safely (their inbox path is still in the
+/// text block so `document_index` / OCR can read them).
+pub fn load_images_for_model(
+    config: &Config,
+    user_id: &str,
+    attachments: &[StoredAttachment],
+) -> Vec<crate::domain::LlmImage> {
+    use base64::Engine;
+    if attachments.is_empty() {
+        return Vec::new();
+    }
+    let root = config.path(&config.documents.watch_dir);
+    let mut out = Vec::new();
+    let mut total_bytes = 0usize;
+    for attachment in attachments {
+        if out.len() >= MAX_VISION_IMAGES {
+            break;
+        }
+        let extension = allowed_extension(&attachment.filename).unwrap_or_default();
+        if !IMAGE_EXTENSIONS.contains(&extension.as_str()) {
+            continue;
+        }
+        if !is_safe_user_rel_path(user_id, &attachment.rel_path) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(root.join(&attachment.rel_path)) else {
+            continue;
+        };
+        if bytes.is_empty() || bytes.len() > MAX_VISION_IMAGE_BYTES {
+            continue;
+        }
+        if total_bytes.saturating_add(bytes.len()) > MAX_VISION_TOTAL_BYTES {
+            continue;
+        }
+        total_bytes += bytes.len();
+        out.push(crate::domain::LlmImage {
+            mime: attachment.mime.clone(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            filename: Some(attachment.filename.clone()),
+        });
+    }
+    out
+}
+
 /// Prompt block describing the attachments of one message. File content is
 /// untrusted data and is labelled that way.
 pub fn render_for_model(
@@ -221,15 +278,23 @@ pub fn render_for_model(
         ));
         let extension = allowed_extension(&attachment.filename).unwrap_or_default();
         if IMAGE_EXTENSIONS.contains(&extension.as_str()) {
-            out.push_str(
-                "  (image: not viewable by this model path; ask the user to describe it)\n",
-            );
+            if attachment.size_bytes as usize > MAX_VISION_IMAGE_BYTES {
+                out.push_str(
+                    "  (image exceeds inline vision limit; call document_index on this inbox \
+                     path if it contains text to read via OCR)\n",
+                );
+            } else {
+                out.push_str(
+                    "  (image attached inline for vision-capable models; if this is a photographed \
+                     document or your model cannot view images, call document_index on this inbox \
+                     path to read text via OCR)\n",
+                );
+            }
             continue;
         }
-        // Defence in depth: the stored path must stay under this user's inbox.
-        if !attachment.rel_path.starts_with(&format!("{user_id}/chat/"))
-            || attachment.rel_path.contains("..")
-        {
+        // Defence in depth: the stored path must stay under this user's inbox
+        // (either in chat/ or after project_file moved it into projects/).
+        if !is_safe_user_rel_path(user_id, &attachment.rel_path) {
             continue;
         }
         let excerpt_limit = EXCERPT_CHARS_PER_FILE.min(remaining);
@@ -243,11 +308,43 @@ pub fn render_for_model(
             Some(String::from_utf8_lossy(&bytes).into_owned())
         } else if extension == "pdf" {
             crate::documents::extract_pdf_text(bytes).ok()
+        } else if extension == "xlsx" {
+            crate::workbooks::plain_text(&bytes, excerpt_limit).ok()
         } else {
-            None
+            #[cfg(feature = "docx")]
+            if extension == "docx" {
+                crate::docx_ops::plain_text(&bytes, excerpt_limit).ok()
+            } else {
+                #[cfg(feature = "pptx")]
+                if extension == "pptx" {
+                    crate::pptx_ops::slide_plain_text(&bytes, excerpt_limit).ok()
+                } else {
+                    None
+                }
+                #[cfg(not(feature = "pptx"))]
+                None
+            }
+            #[cfg(not(feature = "docx"))]
+            {
+                #[cfg(feature = "pptx")]
+                if extension == "pptx" {
+                    crate::pptx_ops::slide_plain_text(&bytes, excerpt_limit).ok()
+                } else {
+                    None
+                }
+                #[cfg(not(feature = "pptx"))]
+                None
+            }
         };
         let is_pdf = extension == "pdf";
-        let text = text.filter(|text| !is_pdf || text.trim().chars().count() >= MIN_PDF_TEXT_CHARS);
+        let text = text.filter(|text| {
+            let trimmed = text.trim();
+            if is_pdf {
+                trimmed.chars().count() >= MIN_PDF_TEXT_CHARS
+            } else {
+                !trimmed.is_empty()
+            }
+        });
         if text.is_none() && is_pdf {
             out.push_str(
                 "  (no text layer: this PDF looks scanned. Call document_index with this inbox \
@@ -325,6 +422,24 @@ impl Store {
             )
             .optional()?;
         Ok(record)
+    }
+
+    /// Update the stored relative path when `project_file` moves an uploaded
+    /// attachment from `<user>/chat/...` into `<user>/projects/...`, so
+    /// downloads and follow-up handoffs keep resolving the moved file.
+    pub fn relocate_chat_attachment(
+        &self,
+        user_id: &str,
+        old_rel_path: &str,
+        new_rel_path: &str,
+    ) -> Result<usize> {
+        let connection = self.connection()?;
+        let updated = connection.execute(
+            "UPDATE chat_attachments SET rel_path = ?1
+             WHERE user_id = ?2 AND rel_path = ?3",
+            params![new_rel_path, user_id, old_rel_path],
+        )?;
+        Ok(updated)
     }
 
     /// True when `hash` is an artifact produced inside one of the acting

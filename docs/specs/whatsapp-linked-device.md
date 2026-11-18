@@ -28,8 +28,8 @@ WhatsApp Web.
 ## Scope
 
 In:
-- One linked WhatsApp account per member, opt-in, off by default
-  (`[whatsapp_link] enabled = false`).
+- One linked WhatsApp account per member, opt-in per member; enabled by default
+  on the server in 0.59 (`[whatsapp_link] enabled = true`, set `false` to turn off).
 - Pairing from the desktop console: QR code, or pair code by phone number.
 - Incoming messages from **allowed chats only** go to the member's `whatsapp`
   bot as turns in a `whatsapp:<chat>` conversation.

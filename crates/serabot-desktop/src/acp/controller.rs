@@ -211,19 +211,39 @@ impl Controller {
 
     /// Send a message. Returns false (with a notice) when it cannot go.
     pub fn send(&mut self, text: &str) -> bool {
+        self.send_with_images(text, &[])
+    }
+
+    /// Send a prompt with optional base64 image blocks (ACP `session/prompt`).
+    pub fn send_with_images(
+        &mut self,
+        text: &str,
+        images: &[super::protocol::PromptImage],
+    ) -> bool {
         let trimmed = text.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() && images.is_empty() {
             return false;
         }
-        let wire_prompt = self.format_prompt(trimmed);
+        let wire_prompt = if trimmed.is_empty() {
+            String::new()
+        } else {
+            self.format_prompt(trimmed)
+        };
         let Some(client) = &self.client else {
             self.notice = Some("Start Claude Code first.".into());
             return false;
         };
-        match client.prompt(&wire_prompt) {
+        match client.prompt_with_images(&wire_prompt, images) {
             Ok(()) => {
                 self.persona_sent = true;
-                self.transcript.push_user(trimmed);
+                let display = if images.is_empty() {
+                    trimmed.to_owned()
+                } else if trimmed.is_empty() {
+                    format!("[{} image(s) attached]", images.len())
+                } else {
+                    format!("{trimmed}\n\n[{} image(s) attached]", images.len())
+                };
+                self.transcript.push_user(&display);
                 self.save_transcript();
                 self.status = Status::Working;
                 self.notice = None;
@@ -234,6 +254,64 @@ impl Controller {
                 false
             }
         }
+    }
+
+    /// List relative file paths inside `root` matching `query` for `@`-file
+    /// mentions in the ACP composer. Bounded in depth and count; skips
+    /// symlinks and common build/VCS directories.
+    pub fn list_folder_files(root: &std::path::Path, query: &str) -> Vec<String> {
+        let needle = query.trim().to_ascii_lowercase();
+        let mut out = Vec::new();
+        fn walk(
+            dir: &std::path::Path,
+            prefix: &str,
+            needle: &str,
+            out: &mut Vec<String>,
+            depth: usize,
+        ) {
+            if depth > 4 || out.len() >= 12 {
+                return;
+            }
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            let mut items: Vec<_> = entries.flatten().collect();
+            items.sort_by_key(|e| e.file_name());
+            for entry in items {
+                if out.len() >= 12 {
+                    break;
+                }
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
+                if ft.is_symlink() {
+                    continue;
+                }
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if matches!(
+                    name.as_str(),
+                    ".git" | "node_modules" | "target" | ".next" | "dist" | "__pycache__"
+                ) {
+                    continue;
+                }
+                let rel = if prefix.is_empty() {
+                    name
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                if ft.is_dir() {
+                    walk(&entry.path(), &rel, needle, out, depth + 1);
+                } else if ft.is_file()
+                    && (needle.is_empty() || rel.to_ascii_lowercase().contains(needle))
+                {
+                    out.push(rel);
+                }
+            }
+        }
+        walk(root, "", &needle, &mut out, 0);
+        out
     }
 
     /// Stop the running message (the agent keeps running).
@@ -556,5 +634,25 @@ mod tests {
         controller.persona_sent = true;
         let second = controller.format_prompt("Next question");
         assert_eq!(second, "Next question");
+    }
+
+    #[test]
+    fn list_folder_files_filters_and_skips_build_dirs() {
+        let root = std::env::temp_dir().join(format!("serabot-acp-files-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join("README.md"), "# hi").unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(root.join(".git/config"), "ignored").unwrap();
+        std::fs::write(root.join("target/out.rs"), "ignored").unwrap();
+
+        let all = Controller::list_folder_files(&root, "");
+        assert_eq!(all, vec!["README.md", "src/main.rs"]);
+
+        let filtered = Controller::list_folder_files(&root, "main");
+        assert_eq!(filtered, vec!["src/main.rs"]);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

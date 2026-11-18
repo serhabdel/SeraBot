@@ -190,13 +190,31 @@ fn build_turns(messages: &[LlmMessage]) -> Vec<Turn> {
         match message.role {
             Role::System => {}
             Role::User => {
+                let mut blocks = Vec::new();
+                let has_text = message
+                    .content
+                    .as_deref()
+                    .is_some_and(|t| !t.trim().is_empty());
                 if let Some(text) = message.content.as_deref().filter(|t| !t.trim().is_empty()) {
+                    blocks.push(json!({"type": "text", "text": text}));
+                }
+                for img in &message.images {
+                    blocks.push(json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": img.mime,
+                            "data": img.data_base64,
+                        }
+                    }));
+                }
+                if !blocks.is_empty() {
                     raw.push(Turn {
                         user: true,
-                        blocks: vec![json!({"type": "text", "text": text})],
+                        blocks,
                         calls: Vec::new(),
                         unsigned_calls: false,
-                        has_text: true,
+                        has_text,
                     });
                 }
             }
@@ -970,6 +988,26 @@ mod tests {
         // Never an empty conversation.
         let empty = build_request(&[LlmMessage::system("s")], &[], &options(None, 4096));
         assert_eq!(empty["messages"][0]["content"][0]["text"], "...");
+    }
+
+    #[test]
+    fn user_images_serialize_as_anthropic_image_blocks() {
+        let messages = vec![LlmMessage::user_with_images(
+            "Inspect this chart",
+            vec![crate::domain::LlmImage {
+                mime: "image/png".into(),
+                data_base64: "iVBORw0KGgo=".into(),
+                filename: Some("chart.png".into()),
+            }],
+        )];
+        let body = build_request(&messages, &[], &options(None, 4096));
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["source"]["data"], "iVBORw0KGgo=");
     }
 
     #[test]

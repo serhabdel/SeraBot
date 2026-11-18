@@ -239,6 +239,17 @@ loopback listeners, adds `AGY_CLIENT_ID`, presents the live Hub version, retries
 plain Claude Opus once under its wire id, and keeps configured models in the
 verified live list. Synthetic fixtures only; the owner signs in once to verify.
 
+## Status after 0.59.0 (Projects UI, vision, drag-and-drop, Copilot/Codex, ACP, WhatsApp enabled)
+
+0.59.0 completes Projects end-to-end (relocation fix, `/v1/projects/*` API,
+desktop `ProjectsView`), adds real multimodal image vision across all four wire
+transports plus inline Office excerpts, adds chat drag-and-drop uploads,
+session-expiry warnings, conversation Markdown export, Copilot/Codex quota
+readers & Responses reasoning replay, ACP `@`-file mentions & image blocks, and
+enables `[whatsapp_link]` by default per owner approval (`enabled = false`
+turns it off). Synthetic fixtures only; no live provider or WhatsApp account
+was used.
+
 ## Status after 0.53.0 (consistency, motion, live providers)
 
 0.53.0 shares one swappable model router across the runtime and the tools that

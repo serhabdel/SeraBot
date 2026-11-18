@@ -4165,7 +4165,7 @@ tasks_per_user_per_day = 500
 /// unofficial and the number can be banned.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WhatsappLinkConfig {
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Folder for the per-member session stores. Must be writable by the
     /// service (under `ProtectSystem=strict`, only `/var/lib/serabot` is).
@@ -4185,7 +4185,7 @@ pub struct WhatsappLinkConfig {
 impl Default for WhatsappLinkConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             dir: default_whatsapp_link_dir(),
             bot: default_whatsapp_link_bot(),
             max_media_bytes: default_whatsapp_link_max_bytes(),

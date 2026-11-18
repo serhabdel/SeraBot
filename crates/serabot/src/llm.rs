@@ -471,6 +471,11 @@ impl LlmClient {
                 .complete_cloud_code(messages, tools, &model, temperature, level)
                 .await;
         }
+        if self.copilot && copilot_uses_responses(&model) {
+            return self
+                .complete_responses(messages, tools, &model, extra)
+                .await;
+        }
         match self.wire {
             Wire::Responses => {
                 return self
@@ -489,6 +494,15 @@ impl LlmClient {
             "messages": messages.iter().map(message_to_json).collect::<Vec<_>>(),
             "max_tokens": self.max_output_tokens,
         });
+        if self.copilot
+            && let Some(effort) = extra
+                .and_then(|fields| fields.get("reasoning"))
+                .and_then(|r| r.get("effort"))
+                .and_then(Value::as_str)
+            && matches!(effort, "low" | "medium" | "high")
+        {
+            body["reasoning_effort"] = json!(effort);
+        }
         if !tools.is_empty() {
             body["tools"] = Value::Array(
                 tools
@@ -667,7 +681,11 @@ impl LlmClient {
                             .bytes()
                             .await
                             .map_err(|_| SeraError::External("model catalog read failed".into()))?;
-                        return parse_model_catalog(&bytes, strict);
+                        let mut catalog = parse_model_catalog(&bytes, strict)?;
+                        if self.copilot {
+                            catalog.entry("auto".into()).or_default();
+                        }
+                        return Ok(catalog);
                     }
                     // Drop the body. Provider errors can echo credentials; the status is enough.
                     let hint = retry::retry_after(response.headers());
@@ -1528,6 +1546,7 @@ fn cloud_completion(parsed: CloudCodeCompletion) -> Result<LlmResponse> {
             tool_call_id: None,
             name: None,
             is_error: false,
+            images: Vec::new(),
         },
         usage: Usage {
             prompt_tokens: parsed.prompt_tokens,
@@ -1581,10 +1600,36 @@ pub(crate) fn validate_base_url(value: &str) -> Result<String> {
     Ok(url.as_str().trim_end_matches('/').to_owned())
 }
 
+/// Copilot models that are only served on `/responses` (not `/chat/completions`).
+pub(crate) fn copilot_uses_responses(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower.contains("codex")
+        || lower.starts_with("gpt-5.3-")
+        || lower.starts_with("gpt-5.4-")
+        || lower.starts_with("gpt-6")
+}
+
 fn message_to_json(message: &LlmMessage) -> Value {
+    let content = if message.role == Role::User && !message.images.is_empty() {
+        let mut parts = Vec::with_capacity(message.images.len() + 1);
+        if let Some(text) = message.content.as_deref().filter(|t| !t.is_empty()) {
+            parts.push(json!({"type": "text", "text": text}));
+        }
+        for img in &message.images {
+            parts.push(json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:{};base64,{}", img.mime, img.data_base64),
+                }
+            }));
+        }
+        Value::Array(parts)
+    } else {
+        json!(message.content)
+    };
     let mut value = json!({
         "role": message.role.as_str(),
-        "content": message.content,
+        "content": content,
     });
     if !message.tool_calls.is_empty() {
         value["tool_calls"] = Value::Array(
@@ -1691,6 +1736,7 @@ fn parse_response(bytes: &[u8]) -> Result<LlmResponse> {
             tool_call_id: None,
             name: None,
             is_error: false,
+            images: Vec::new(),
         },
         usage,
         finish_reason,
@@ -1742,6 +1788,7 @@ mod tests {
             tool_call_id: None,
             name: Some("sera-bot".into()),
             is_error: false,
+            images: Vec::new(),
         };
         let value = message_to_json(&assistant);
         assert!(value.get("name").is_none());
@@ -1760,6 +1807,7 @@ mod tests {
             tool_call_id: Some("call_1".into()),
             name: Some("rag_search".into()),
             is_error: false,
+            images: Vec::new(),
         };
         assert_eq!(message_to_json(&tool)["name"], json!("rag_search"));
     }

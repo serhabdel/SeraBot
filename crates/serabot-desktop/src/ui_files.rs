@@ -25,16 +25,11 @@ pub const PASTE_BRIDGE_JS: &str = r#"
 window.__serabotDx = dioxus;
 if (!window.__serabotPasteBridge) {
   window.__serabotPasteBridge = true;
-  document.addEventListener('paste', async (event) => {
-    const target = event.target;
-    if (!target || target.id !== 'composer-input') return;
-    const files = Array.from((event.clipboardData && event.clipboardData.files) || []);
-    if (files.length === 0) return;
-    event.preventDefault();
+  async function forwardFiles(files) {
     for (const file of files) {
       // Oversized files are not read; an empty payload is refused in Rust.
       if (file.size > 25 * 1024 * 1024) {
-        window.__serabotDx.send({ name: file.name || 'pasted', data: '' });
+        window.__serabotDx.send({ name: file.name || 'file', data: '' });
         continue;
       }
       const bytes = new Uint8Array(await file.arrayBuffer());
@@ -44,6 +39,42 @@ if (!window.__serabotPasteBridge) {
       }
       window.__serabotDx.send({ name: file.name || 'pasted-image.png', data: btoa(binary) });
     }
+  }
+  document.addEventListener('paste', async (event) => {
+    const target = event.target;
+    if (!target || target.id !== 'composer-input') return;
+    const files = Array.from((event.clipboardData && event.clipboardData.files) || []);
+    if (files.length === 0) return;
+    event.preventDefault();
+    await forwardFiles(files);
+  });
+  let dragDepth = 0;
+  function setDropActive(on) {
+    const chat = document.querySelector('.chat');
+    if (chat) chat.classList.toggle('drop-active', on);
+  }
+  document.addEventListener('dragenter', (event) => {
+    if (!event.dataTransfer || !Array.from(event.dataTransfer.types || []).includes('Files')) return;
+    dragDepth += 1;
+    setDropActive(true);
+  });
+  document.addEventListener('dragover', (event) => {
+    if (!event.dataTransfer || !Array.from(event.dataTransfer.types || []).includes('Files')) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+  });
+  document.addEventListener('dragleave', () => {
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) setDropActive(false);
+  });
+  document.addEventListener('drop', async (event) => {
+    dragDepth = 0;
+    setDropActive(false);
+    const files = Array.from((event.dataTransfer && event.dataTransfer.files) || []);
+    if (files.length === 0) return;
+    if (!document.getElementById('composer-input')) return;
+    event.preventDefault();
+    await forwardFiles(files);
   });
 }
 "#;

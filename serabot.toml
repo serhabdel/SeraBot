@@ -387,3 +387,9 @@ api_base = "https://api.agentmail.to/v0"
 api_key_secret = "agentmail_api_key"
 timeout_secs = 60
 default_inbox_id = ""
+
+[whatsapp_link]
+# Unofficial linked-device WhatsApp client (docs/specs/whatsapp-linked-device.md).
+# The number can be banned: link a spare number only. Set enabled = false to turn off.
+enabled = true
+dir = "data/whatsapp"
