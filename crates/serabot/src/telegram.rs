@@ -8,9 +8,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::audio::{
-    AudioProviderState, audio_provider_state, save_telegram_audio_bytes, transcribe_audio_bytes,
-};
+use crate::audio::{AudioProviderState, audio_provider_state, save_telegram_audio_bytes};
 use crate::error::{Result, SeraError};
 use crate::gateway::Decision;
 use crate::maker::ArtifactStore;
@@ -668,11 +666,15 @@ impl TelegramClient {
         if message.voice.is_none() && message.audio.is_none() {
             return Ok(OwnerAudioOutcome::NotAudio);
         }
-        if !config.audio.enabled || !config.audio.telegram_intake {
+        if !config.audio.telegram_intake {
             return Ok(OwnerAudioOutcome::Unavailable);
         }
-        if let AudioProviderState::Unavailable(reason) = audio_provider_state(config) {
-            warn!(reason = %reason, "owner voice transcription is not configured");
+        // 0.64: the member's own Mistral account works too when the server
+        // has no audio provider.
+        if !crate::audio::user_can_transcribe(config, store, user_id) {
+            if let AudioProviderState::Unavailable(reason) = audio_provider_state(config) {
+                warn!(reason = %reason, "owner voice transcription is not configured");
+            }
             return Ok(OwnerAudioOutcome::Unavailable);
         }
         let attachment = message
@@ -726,7 +728,11 @@ impl TelegramClient {
             }
         }
         let filename = format!("{}.{extension}", message.message_id);
-        match transcribe_audio_bytes(config, &bytes, &filename).await {
+        match crate::audio::transcribe_audio_bytes_for_user(
+            config, store, user_id, &bytes, &filename,
+        )
+        .await
+        {
             Ok(transcript) => {
                 let transcript = transcript.trim();
                 if transcript.is_empty() {

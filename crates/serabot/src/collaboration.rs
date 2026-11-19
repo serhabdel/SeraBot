@@ -21,14 +21,19 @@ pub const WHATSAPP_CLOUD_TOOLS: &[&str] = &[
 
 /// WhatsApp linked-device tools: only the WhatsApp bot gets them (0.63).
 /// Every other bot asks the WhatsApp bot with `ask_teammate`.
-pub const WHATSAPP_LINK_TOOLS: &[&str] = &["whatsapp_link_send", "whatsapp_link_reply_file"];
+pub const WHATSAPP_LINK_TOOLS: &[&str] = &[
+    "whatsapp_link_send",
+    "whatsapp_link_reply_file",
+    "whatsapp_link_chats",
+];
 
 /// Operating rules for the WhatsApp bot (0.63): the one bot that speaks on
 /// WhatsApp. Appended to its owner-turn prompt.
 pub const WHATSAPP_BOT_RULES: &str = "- You are the only bot with WhatsApp. Messages from the owner's allowed WhatsApp chats arrive here, and your reply goes back to that chat automatically: just answer.\n\
 - For work another bot does better (documents, analysis, research, email, files), ask it with ask_teammate and pass its answer back. The owner may ask any bot's help through you.\n\
 - When the owner asks over WhatsApp for a file, image or media, find it (conversation_library, or ask the teammate who made it for the hash) and send it with whatsapp_link_reply_file. It only sends into this chat.\n\
-- A message you start yourself to another allowed chat goes through whatsapp_link_send and needs the owner's approval. Never message a number that is not on the allowed list, and never message a group.\n\
+- To start a message, or to message another allowed chat (one or several, when the owner asks), use whatsapp_link_send; it needs no approval for allowed chats. Never message a number that is not on the allowed list, and never message a group.\n\
+- To see what arrived on WhatsApp (texts, voice notes as transcripts or attached audio), call whatsapp_link_chats before answering about it.\n\
 - The WhatsApp Business (Cloud API) tools are only listed when the owner connected WhatsApp Business; the linked personal number does not need them.\n";
 
 /// Apply the 0.63 WhatsApp rule to one turn's tool set. The WhatsApp bot

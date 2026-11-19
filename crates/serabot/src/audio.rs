@@ -172,6 +172,78 @@ pub async fn transcribe_audio_bytes(
     client.transcribe_bytes(bytes, filename, None).await
 }
 
+/// The member's own Mistral key (a connected provider account), for
+/// transcription when the server has no audio provider (0.64). Same rule as
+/// the per-user OCR fallback: the member connected the account, so its use
+/// for their own audio is their consent. Returns `(base_url, key)`.
+fn user_mistral_audio_credential(
+    config: &Config,
+    store: &crate::store::Store,
+    user_id: &str,
+) -> Option<(String, String)> {
+    let secrets = crate::user_secrets::UserSecrets::open(config, store.clone()).ok()?;
+    let accounts = crate::accounts::Accounts::new(store.clone(), std::sync::Arc::new(secrets));
+    let mut ids = store
+        .usable_account_ids(user_id, "mistral")
+        .unwrap_or_default();
+    if !ids.iter().any(|id| id == crate::accounts::DEFAULT_ACCOUNT) {
+        ids.push(crate::accounts::DEFAULT_ACCOUNT.to_owned());
+    }
+    for account_id in ids {
+        let Ok(Some(credential)) = accounts.credential(user_id, "mistral", &account_id) else {
+            continue;
+        };
+        let key = credential.api_key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let base_url = config
+            .llm
+            .providers
+            .get("mistral")
+            .map(|profile| profile.base_url.clone())
+            .unwrap_or_else(|| "https://api.mistral.ai/v1".to_owned());
+        return Some((base_url, key.to_owned()));
+    }
+    None
+}
+
+/// Whether the member can have audio transcribed: the server's audio
+/// provider is ready, or they connected their own Mistral account (0.64).
+pub fn user_can_transcribe(config: &Config, store: &crate::store::Store, user_id: &str) -> bool {
+    matches!(audio_provider_state(config), AudioProviderState::Ready)
+        || user_mistral_audio_credential(config, store, user_id).is_some()
+}
+
+/// Transcribe for one member (0.64): the server's audio provider when it is
+/// set up, otherwise the member's own Mistral account. A bad file is refused
+/// either way; only "not configured" falls through to the member's key.
+pub async fn transcribe_audio_bytes_for_user(
+    config: &Config,
+    store: &crate::store::Store,
+    user_id: &str,
+    bytes: &[u8],
+    filename: &str,
+) -> Result<String> {
+    match transcribe_audio_bytes(config, bytes, filename).await {
+        Err(SeraError::Config(server_error)) => {
+            let Some((base_url, key)) = user_mistral_audio_credential(config, store, user_id)
+            else {
+                return Err(SeraError::Config(server_error));
+            };
+            let client = MistralAudioClient::new(
+                base_url,
+                key,
+                config.llm.timeout_secs,
+                &config.audio,
+                true,
+            )?;
+            client.transcribe_bytes(bytes, filename, None).await
+        }
+        other => other,
+    }
+}
+
 /// Whether voice replies can be produced right now.
 ///
 /// Ready means: audio enabled, provider resolvable, key stored, egress
@@ -1157,6 +1229,60 @@ mod tests {
         assert!(message.contains("test_audio_key"), "{message}");
         assert!(!message.contains(TEST_SECRET), "{message}");
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// 0.64: with server audio off, a member's own Mistral account
+    /// transcribes their voice note; without one, "not configured" stays.
+    #[tokio::test]
+    async fn a_members_mistral_account_transcribes_when_server_audio_is_off() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/transcriptions"))
+            .and(header("authorization", "Bearer sk-member-mistral"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"text": "ciao"})))
+            .mount(&server)
+            .await;
+        let dir = TempDir::new().unwrap();
+        let mut config = provider_config(&dir, &server.uri(), None);
+        config.audio.enabled = false;
+        config.llm.providers.insert(
+            "mistral".into(),
+            serde_json::from_value(json!({
+                "base_url": server.uri(),
+                "api_key_secret": "mistral_key",
+                "models": ["mistral-small-latest"],
+                "data_egress_approved": true
+            }))
+            .unwrap(),
+        );
+        let store = crate::store::Store::open_in_memory(8).unwrap();
+        let member = store
+            .create_user("microsoft:voice-member", "v@example.example", "V")
+            .unwrap()
+            .id;
+        let other = store.admin_user_id().unwrap();
+        assert!(!user_can_transcribe(&config, &store, &member));
+        let none = transcribe_audio_bytes_for_user(&config, &store, &member, b"RIFF", "v.ogg")
+            .await
+            .unwrap_err();
+        assert!(matches!(none, SeraError::Config(_)), "{none:?}");
+
+        let secrets = crate::user_secrets::UserSecrets::open(&config, store.clone()).unwrap();
+        crate::accounts::Accounts::new(store.clone(), std::sync::Arc::new(secrets))
+            .add_api_key(&member, "mistral", "Mine", "sk-member-mistral")
+            .unwrap();
+        assert!(user_can_transcribe(&config, &store, &member));
+        let text = transcribe_audio_bytes_for_user(&config, &store, &member, b"RIFFfake", "v.ogg")
+            .await
+            .unwrap();
+        assert_eq!(text, "ciao");
+        // Another member never borrows that key.
+        assert!(!user_can_transcribe(&config, &store, &other));
+        // A bad file is still refused before any request.
+        let bad = transcribe_audio_bytes_for_user(&config, &store, &member, b"x", "v.txt")
+            .await
+            .unwrap_err();
+        assert!(matches!(bad, SeraError::Validation(_)), "{bad:?}");
     }
 
     #[tokio::test]

@@ -166,3 +166,22 @@ Approved by the owner on 2026-11-19.
   at pairing: sign out and link again to change it. It only changes the
   Linked devices label; it does not lower the ban risk of an unofficial
   client.
+
+
+## 0.64: allowed chats without approval, voice notes, visibility
+
+Approved by the owner on 2026-11-19.
+
+- **No approval for allowed chats.** `whatsapp_link_send` is off
+  `DESTRUCTIVE_TOOLS`. It still refuses any number that is not on the member's
+  allowlist, never reaches groups, and counts toward the per-minute and daily
+  caps. The bot may send to several allowed chats when the owner asks.
+- **Voice notes.** A voice note is transcribed by the server's audio provider,
+  or by the member's own Mistral account when the server has none. If neither
+  works, the audio is kept as an attachment and the bot is told why, instead
+  of the message being dropped. Telegram voice notes and the console's
+  dictation use the same fallback.
+- **Visibility.** Each WhatsApp chat is listed under the WhatsApp bot in the
+  console, titled "WhatsApp · +number". The WhatsApp bot can read its chats'
+  latest messages with `whatsapp_link_chats` (read-only, the acting member's
+  allowed chats only), so it can answer from the console about what arrived.

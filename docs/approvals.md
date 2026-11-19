@@ -25,7 +25,10 @@ or sends something to a third party that cannot be recalled. The list lives in
 | `slack_post_message` | Posts a message that everyone in a Slack channel can read. The approval names the channel. |
 | `whatsapp_send_message` | Sends a WhatsApp message to an external contact via WhatsApp Business Cloud API. The approval names the recipient and exact text. |
 | `whatsapp_send_template` | Sends an approved WhatsApp template message to an external contact. The approval names the recipient and template. |
-| `whatsapp_link_send` | Sends a message from the member's linked WhatsApp number to one of their allowed chats. The approval names the chat and binds the text. |
+
+Not approval-gated (0.64, owner decision): `whatsapp_link_send` to the member's
+own allowed WhatsApp chats (it refuses any other number), under the per-minute
+and daily caps.
 
 Not approval-gated (0.63): `whatsapp_link_reply_file` and `telegram_reply_file`
 send a file the member asked for back into the same WhatsApp or Telegram chat
