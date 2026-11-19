@@ -372,6 +372,7 @@ impl WhatsappLink {
             .ensure_conversation_accepts_turns(user_id, &conversation_id)?;
         self.store
             .bind_whatsapp_link_chat(user_id, &conversation_id, &jid)?;
+        self.show_under_whatsapp_bot(user_id, &conversation_id, &jid);
 
         let message = ctx.message.get_base_message();
         let max = self.config.whatsapp_link.max_media_bytes;
@@ -388,9 +389,43 @@ impl WhatsappLink {
                 ctx.client.download(audio).await.map_err(|error| {
                     SeraError::External(format!("voice note download: {error}"))
                 })?;
-            let transcript =
-                crate::audio::transcribe_audio_bytes(&self.config, &bytes, "voice.ogg").await?;
-            text = format!("[voice note] {}", transcript.trim());
+            // 0.64: transcribe with the server's audio provider or the
+            // member's own Mistral account. If neither works, the voice note
+            // is still kept and the bot is told, instead of being dropped.
+            match crate::audio::transcribe_audio_bytes_for_user(
+                &self.config,
+                &self.store,
+                user_id,
+                &bytes,
+                "voice.ogg",
+            )
+            .await
+            {
+                Ok(transcript) if !transcript.trim().is_empty() => {
+                    text = format!("[voice note] {}", transcript.trim());
+                }
+                outcome => {
+                    let reason = match outcome {
+                        Err(SeraError::Config(_)) => {
+                            "no transcription is set up (connect a Mistral account under AI providers, or turn on audio)"
+                        }
+                        Err(_) => "the transcription service failed",
+                        Ok(_) => "it had no speech",
+                    };
+                    let saved = crate::attachments::save_upload(
+                        &self.config,
+                        &self.store,
+                        user_id,
+                        &conversation_id,
+                        "voice-note.ogg",
+                        &bytes,
+                    )?;
+                    attachments.push(saved.id);
+                    text = format!(
+                        "[voice note received; it could not be transcribed: {reason}. The audio is attached to this message.]"
+                    );
+                }
+            }
         } else if let Some(document) = message.document_message.as_option() {
             check_size(document.file_length, max)?;
             let bytes = ctx
@@ -450,6 +485,34 @@ impl WhatsappLink {
             &attachments,
         )?;
         Ok(())
+    }
+
+    /// Show a WhatsApp chat as one of the WhatsApp bot's chats in the
+    /// console, titled with the number (0.64). Best effort: a failure only
+    /// leaves the chat where it was.
+    fn show_under_whatsapp_bot(&self, user_id: &str, conversation_id: &str, jid: &str) {
+        let bot = &self.config.whatsapp_link.bot;
+        if matches!(self.store.bot_for_chat(user_id, conversation_id), Ok(None))
+            && let Err(error) = self
+                .store
+                .bind_bot_chat(user_id, conversation_id, bot, None)
+        {
+            tracing::warn!(%error, "whatsapp link: chat not listed under the bot");
+        }
+        let untitled = self
+            .store
+            .get_conversation(user_id, conversation_id)
+            .ok()
+            .flatten()
+            .is_some_and(|row| row.title.as_deref().is_none_or(|t| t.trim().is_empty()));
+        if untitled {
+            let number = jid.split('@').next().unwrap_or_default();
+            let _ = self.store.rename_conversation(
+                user_id,
+                conversation_id,
+                &format!("WhatsApp \u{b7} +{number}"),
+            );
+        }
     }
 
     /// Send text to one of the member's allowed chats, rate limited.
@@ -656,6 +719,83 @@ impl Notifier for WhatsappLink {
     }
 }
 
+/// `whatsapp_link_chats` (0.64): the WhatsApp bot looks at its WhatsApp
+/// chats: each allowed chat with its latest messages (voice notes appear as
+/// their transcript, or a note that the audio is attached). Read-only and
+/// scoped to the acting member.
+pub struct WhatsappLinkChatsTool {
+    link: Arc<WhatsappLink>,
+}
+
+impl WhatsappLinkChatsTool {
+    pub fn new(link: Arc<WhatsappLink>) -> Self {
+        Self { link }
+    }
+}
+
+/// Messages shown per chat, and characters per message.
+const CHATS_TOOL_MESSAGES: usize = 8;
+const CHATS_TOOL_CHARS: usize = 400;
+
+#[async_trait]
+impl crate::gateway::Tool for WhatsappLinkChatsTool {
+    fn spec(&self) -> crate::gateway::ToolSpec {
+        crate::gateway::ToolSpec {
+            name: super::CHATS_TOOL.into(),
+            description: "List the owner's WhatsApp chats (allowed numbers) with their latest \
+                          messages, including voice notes. Use it to see what arrived on \
+                          WhatsApp before answering about it."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            external_effect: false,
+        }
+    }
+
+    async fn execute(
+        &self,
+        _args: serde_json::Value,
+        context: &crate::gateway::ToolContext,
+    ) -> Result<crate::gateway::ToolOutput> {
+        let store = &self.link.store;
+        let account = store.whatsapp_link_account(&context.user_id)?;
+        let linked = account
+            .as_ref()
+            .is_some_and(|account| account.status == "linked");
+        let allowlist = account.map(|account| account.allowlist).unwrap_or_default();
+        let mut chats = Vec::new();
+        for jid in allowlist.iter().take(20) {
+            let conversation = super::conversation_id_for(&context.user_id, jid);
+            let messages = store
+                .list_visible_messages(&context.user_id, &conversation, CHATS_TOOL_MESSAGES)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|message| {
+                    serde_json::json!({
+                        "from": if message.role == crate::domain::Role::User { "owner" } else { "bot" },
+                        "at": message.created_at,
+                        "text": crate::util::truncate_chars(&message.content, CHATS_TOOL_CHARS),
+                    })
+                })
+                .collect::<Vec<_>>();
+            chats.push(serde_json::json!({
+                "number": format!("+{}", jid.split('@').next().unwrap_or_default()),
+                "conversation_id": conversation,
+                "messages": messages,
+            }));
+        }
+        let data = serde_json::json!({"linked": linked, "chats": chats});
+        Ok(crate::gateway::ToolOutput {
+            content: serde_json::to_string(&data)?,
+            data: Some(data),
+            ..Default::default()
+        })
+    }
+}
+
 /// `whatsapp_link_reply_file` (0.63): send one of the member's files into the
 /// WhatsApp chat the current conversation came from. Only that chat: the
 /// tool takes no recipient, so it is a reply the member asked for (like the
@@ -797,8 +937,9 @@ impl crate::gateway::Tool for WhatsappLinkSendTool {
         crate::gateway::ToolSpec {
             name: super::SEND_TOOL.into(),
             description: "Send a WhatsApp message from the user's linked number to one of their \
-                          allowed chats. Needs the user's approval. Replies to a WhatsApp \
-                          conversation go back automatically; use this only to start a message."
+                          allowed chats (only those). No approval is needed; sends are rate \
+                          limited. Replies to a WhatsApp conversation go back automatically; \
+                          use this to start a message or to message another allowed chat."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -987,6 +1128,49 @@ mod tests {
         );
     }
 
+    /// 0.64: the WhatsApp bot sees its allowed chats and their latest
+    /// messages, and a chat is listed under the WhatsApp bot with its number.
+    #[tokio::test]
+    async fn the_bot_sees_its_whatsapp_chats() {
+        let (_dir, link, admin) = link();
+        let jid = "33612345678@s.whatsapp.net";
+        link.store
+            .set_whatsapp_link_allowlist(&admin, &[jid.to_string()])
+            .unwrap();
+        let conversation = super::super::conversation_id_for(&admin, jid);
+        link.store
+            .ensure_conversation_accepts_turns(&admin, &conversation)
+            .unwrap();
+        link.store
+            .bind_whatsapp_link_chat(&admin, &conversation, jid)
+            .unwrap();
+        link.show_under_whatsapp_bot(&admin, &conversation, jid);
+        assert_eq!(
+            link.store
+                .bot_for_chat(&admin, &conversation)
+                .unwrap()
+                .as_deref(),
+            Some("whatsapp")
+        );
+        let title = link
+            .store
+            .get_conversation(&admin, &conversation)
+            .unwrap()
+            .and_then(|row| row.title)
+            .unwrap();
+        assert_eq!(title, "WhatsApp \u{b7} +33612345678");
+        let tool = WhatsappLinkChatsTool::new(link.clone());
+        let mut context = reply_context(&admin, "dir:whatsapp");
+        context.allowed_tools = [super::super::CHATS_TOOL.to_string()].into_iter().collect();
+        let output = tool.execute(serde_json::json!({}), &context).await.unwrap();
+        let data = output.data.unwrap();
+        assert_eq!(data["chats"][0]["number"], "+33612345678");
+        assert_eq!(data["chats"][0]["conversation_id"], conversation);
+        assert!(!crate::gateway::is_destructive_tool(
+            super::super::CHATS_TOOL
+        ));
+    }
+
     #[tokio::test]
     async fn the_notifier_ignores_conversations_that_are_not_whatsapp_chats() {
         let (_dir, link, admin) = link();
@@ -994,10 +1178,11 @@ mod tests {
     }
 
     #[test]
-    fn send_approval_binds_the_chat_and_the_text() {
+    fn sends_to_allowed_chats_need_no_approval_but_keep_their_destination() {
         let (_dir, link, _admin) = link();
         let tool = WhatsappLinkSendTool::new(link);
-        assert!(crate::gateway::is_destructive_tool(&tool.spec().name));
+        // 0.64 (owner decision): allowlist and caps, no approval prompt.
+        assert!(!crate::gateway::is_destructive_tool(&tool.spec().name));
         let details = tool
             .approval_details(&serde_json::json!({"to": "+33 6 12 34 56 78", "text": "On my way"}))
             .unwrap();

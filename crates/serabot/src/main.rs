@@ -851,6 +851,9 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         registry.register(serabot::whatsapp_link::client::WhatsappLinkSendTool::new(
             link.clone(),
         ))?;
+        registry.register(serabot::whatsapp_link::client::WhatsappLinkChatsTool::new(
+            link.clone(),
+        ))?;
         registry.register(
             serabot::whatsapp_link::client::WhatsappLinkReplyFileTool::new(
                 link.clone(),

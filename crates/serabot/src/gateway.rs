@@ -57,7 +57,8 @@ pub const DESTRUCTIVE_TOOLS: &[&str] = &[
     "slack_post_message",
     "whatsapp_send_message",
     "whatsapp_send_template",
-    "whatsapp_link_send",
+    // 0.64: `whatsapp_link_send` is not here. It only reaches the member's own
+    // allowed chats, under per-minute and daily caps (owner decision).
 ];
 
 /// Audit reason recorded when the owner's YOLO setting approved a call.

@@ -202,6 +202,7 @@ pub(super) async fn transcribe_audio(
     }
     if let crate::audio::AudioProviderState::Unavailable(message) =
         crate::audio::audio_provider_state(&state.config)
+        && !crate::audio::user_can_transcribe(&state.config, &state.store, &user.id)
     {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -209,7 +210,15 @@ pub(super) async fn transcribe_audio(
         )
             .into_response();
     }
-    match crate::audio::transcribe_audio_bytes(&state.config, &body, &filename).await {
+    match crate::audio::transcribe_audio_bytes_for_user(
+        &state.config,
+        &state.store,
+        &user.id,
+        &body,
+        &filename,
+    )
+    .await
+    {
         Ok(text) => {
             if let Err(error) = state.runtime.scan_owner_output(&user.id, &text) {
                 return error.into_response();

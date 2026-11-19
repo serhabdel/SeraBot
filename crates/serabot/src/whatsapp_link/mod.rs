@@ -26,6 +26,8 @@ pub const SEND_TOOL: &str = "whatsapp_link_send";
 /// Sends a file into the WhatsApp chat this conversation came from (0.63).
 /// A reply the member asked for, like the text reply: not approval-gated.
 pub const REPLY_FILE_TOOL: &str = "whatsapp_link_reply_file";
+/// Lists the member's WhatsApp chats with their latest messages (0.64).
+pub const CHATS_TOOL: &str = "whatsapp_link_chats";
 const MAX_ALLOWLIST: usize = 50;
 const PERSONAL_SERVER: &str = "s.whatsapp.net";
 

@@ -41,14 +41,14 @@ server-side use) without a new design.
 WhatsApp as a linked device (0.58, `docs/specs/whatsapp-linked-device.md`)
 uses the unofficial `whatsapp-rust` client with the owner's approval and a
 spare number. It is on by default in 0.59 (`[whatsapp_link] enabled = false`
-turns it off), serves one-to-one chats on the member's allowlist only, and
-sends anything the bot starts itself through the approval-gated
-`whatsapp_link_send`. Since 0.63 only the WhatsApp bot has WhatsApp tools; it
+turns it off), serves one-to-one chats on the member's allowlist only. Since 0.64
+`whatsapp_link_send` needs no approval (owner decision): it only reaches the
+member's allowed chats, under per-minute and daily caps. Since 0.63 only the WhatsApp bot has WhatsApp tools; it
 asks other bots with `ask_teammate`, and a file the member asked for goes back
 into the same chat with `whatsapp_link_reply_file` (no recipient argument, not
 approval-gated, per-minute and daily caps). Telegram has the same rule with
-`telegram_reply_file`. Do not widen it (groups, contacts, history, unapproved
-sends to other chats) without a new design.
+`telegram_reply_file`. Do not widen it (groups, contacts, history, sends to numbers outside the
+allowlist) without a new design.
 
 Everything user-owned is UID-scoped — bots, skills, memory, documents,
 conversations, tasks, approvals, credentials, quotas. Store methods for
@@ -127,4 +127,4 @@ OVH is read-only unless the owner explicitly authorizes an additive installation
 - `crates/serabot-desktop/src/acp/` (protocol, client, setup, transcript, controller), `ui_claude_code.rs`, `assets/claude-code.css` — Claude Code on this computer over ACP (0.54; integrated per-bot with persisted transcripts and folder choice in 0.55).
 - `crates/serabot/src/whatsapp_link/`, `api/whatsapp_link.rs`, `crates/serabot-desktop/src/ui_whatsapp_link.rs` — WhatsApp linked device: allowlist, chat mapping, per-member client, approval-gated send, desktop card (0.58; enabled by default in 0.59).
 - `crates/serabot/src/projects.rs`, `api/projects.rs`, `crates/serabot-desktop/src/projects.rs`, `ui_projects.rs` — per-user project folders in the server inbox, HTTP API, and desktop workspace (0.58–0.59).
-- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.63.0.
+- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.64.0.

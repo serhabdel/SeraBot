@@ -284,3 +284,10 @@ never merge without the owner's OK.
 - [x] `whatsapp_link_reply_file` and `telegram_reply_file` (requested files back into the same chat, not approval-gated); daily WhatsApp cap; device shows as Chrome on Windows.
 - [x] Model picker moved to the chat header; Memory section inside bot settings; sidebar Pinned/Recent/All; bot Library with filters and item dialog.
 - [ ] Owner: sign out and re-link WhatsApp (new device name); from WhatsApp, ask for a file another bot made; check the Library and the header chip on Windows.
+
+## Release 0.64.0 — WhatsApp voice notes, visibility, no approval for allowed chats
+
+- [x] Per-user transcription fallback (member's Mistral account) for WhatsApp, Telegram and console dictation; WhatsApp keeps an untranscribed voice note as an attachment and tells the bot.
+- [x] WhatsApp chats listed under the WhatsApp bot ("WhatsApp · +number"); read-only `whatsapp_link_chats` tool.
+- [x] `whatsapp_link_send` off the approval list (allowlist + per-minute/daily caps); spec, approvals doc, AGENTS.md updated.
+- [ ] Owner: send a voice note on WhatsApp (with a Mistral account connected if server audio is off) and check the bot's answer.
