@@ -80,12 +80,17 @@ pub const SUITES: [(&str, &[&str]); 7] = [
     ),
     ("Notes and email", &["notion", "agentmail"]),
     ("Code and tasks", &["github", "todoist"]),
-    ("Messages", &["slack", "whatsapp"]),
+    ("Messages", &["slack", WHATSAPP_PERSONAL_ID, "whatsapp"]),
     ("Web search", &["tavily", "firecrawl", "exa"]),
     ("Voice", &["elevenlabs"]),
 ];
 
 pub const MORE_SUITE: &str = "More";
+
+/// The personal (linked device) WhatsApp card (0.63). Not a server
+/// connector: it opens the linked-device card, while `whatsapp` is the
+/// separate WhatsApp Business (Cloud API) connector.
+pub const WHATSAPP_PERSONAL_ID: &str = "whatsapp_personal";
 
 /// The suite a connector belongs to in the "Available to set up" list.
 pub fn suite_of(id: &str) -> &'static str {
@@ -108,7 +113,8 @@ pub fn connector_title(id: &str) -> String {
         "github" => "GitHub",
         "todoist" => "Todoist",
         "slack" => "Slack",
-        "whatsapp" => "WhatsApp",
+        "whatsapp" => "WhatsApp Business",
+        WHATSAPP_PERSONAL_ID => "WhatsApp",
         "exa" => "Exa Search",
         "agentmail" => "AgentMail",
         "tavily" => "Tavily Search",
@@ -146,7 +152,12 @@ pub fn connector_blurb(id: &str) -> &'static str {
         }
         "todoist" => "Your to-do list.",
         "slack" => "Read channels and post with your approval.",
-        "whatsapp" => "Connect WhatsApp Business Cloud API and send approved messages.",
+        "whatsapp" => {
+            "The official Business API (Meta Cloud): approved templates and business sends."
+        }
+        WHATSAPP_PERSONAL_ID => {
+            "Link a spare personal number: talk to your WhatsApp bot from your phone."
+        }
         "agentmail" => "A mailbox for your bots.",
         "tavily" | "firecrawl" | "exa" => "Let bots search and read the web.",
         "elevenlabs" => {
@@ -296,6 +307,44 @@ pub fn apply_github(list: &mut Installed, github: &GithubView) {
         }
     }
     list.available.retain(|(_, cards)| !cards.is_empty());
+}
+
+/// Add the personal WhatsApp card (0.63) to the Messages suite, just before
+/// WhatsApp Business. Its own sheet shows the link state, so the card stays
+/// in "Available" with a neutral pill.
+pub fn add_whatsapp_personal(list: &mut Installed) {
+    let entry = Entry {
+        source: Source::Connector(WHATSAPP_PERSONAL_ID.into()),
+        brand_key: "whatsapp".into(),
+        name: connector_title(WHATSAPP_PERSONAL_ID),
+        suite_label: "Messaging".into(),
+        blurb: connector_blurb(WHATSAPP_PERSONAL_ID).to_owned(),
+        pill: "Personal number".into(),
+        tone: Tone::Muted,
+        set_up: false,
+        meta: "Linked device".into(),
+    };
+    let already = list
+        .set_up
+        .iter()
+        .chain(list.available.iter().flat_map(|(_, cards)| cards.iter()))
+        .any(|card| card.source == entry.source);
+    if already {
+        return;
+    }
+    if let Some((_, cards)) = list
+        .available
+        .iter_mut()
+        .find(|(title, _)| *title == "Messages")
+    {
+        let at = cards
+            .iter()
+            .position(|card| card.source == Source::Connector("whatsapp".into()))
+            .unwrap_or(cards.len());
+        cards.insert(at, entry);
+    } else {
+        list.available.push(("Messages", vec![entry]));
+    }
 }
 
 /// The card for one marketplace plugin. A plugin counts as set up once it is
@@ -601,5 +650,31 @@ mod tests {
             !source.contains("\u{00e2}\u{20ac}"),
             "mojibake in ui_connectors.rs"
         );
+    }
+
+    #[test]
+    fn personal_whatsapp_sits_before_business_and_is_added_once() {
+        let mut list = Installed {
+            set_up: Vec::new(),
+            available: vec![(
+                "Messages",
+                vec![Entry {
+                    source: Source::Connector("whatsapp".into()),
+                    brand_key: "whatsapp".into(),
+                    name: connector_title("whatsapp"),
+                    suite_label: String::new(),
+                    blurb: String::new(),
+                    pill: "Not connected".into(),
+                    tone: Tone::Muted,
+                    set_up: false,
+                    meta: String::new(),
+                }],
+            )],
+        };
+        add_whatsapp_personal(&mut list);
+        add_whatsapp_personal(&mut list);
+        let names: Vec<String> = list.available[0].1.iter().map(|e| e.name.clone()).collect();
+        assert_eq!(names, vec!["WhatsApp", "WhatsApp Business"]);
+        assert_eq!(suite_of(WHATSAPP_PERSONAL_ID), "Messages");
     }
 }

@@ -277,3 +277,10 @@ never merge without the owner's OK.
 - [x] Chat polish: no duplicate "Running" label; transcript padding clears the composer fade.
 - [ ] Owner: run with the real E5 cache — check a paraphrase recall and one changed decision in a live turn.
 - [ ] Later: private per-bot memory scope; a contradiction check for facts added from the console.
+
+## Release 0.63.0 — WhatsApp bot, requested files, model chip, grouped sidebar, bot Library
+
+- [x] WhatsApp tools scoped to the WhatsApp bot; Business tools only when connected; separate WhatsApp / WhatsApp Business cards.
+- [x] `whatsapp_link_reply_file` and `telegram_reply_file` (requested files back into the same chat, not approval-gated); daily WhatsApp cap; device shows as Chrome on Windows.
+- [x] Model picker moved to the chat header; Memory section inside bot settings; sidebar Pinned/Recent/All; bot Library with filters and item dialog.
+- [ ] Owner: sign out and re-link WhatsApp (new device name); from WhatsApp, ask for a file another bot made; check the Library and the header chip on Windows.

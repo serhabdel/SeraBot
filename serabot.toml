@@ -401,3 +401,7 @@ default_inbox_id = ""
 # The number can be banned: link a spare number only. Set enabled = false to turn off.
 enabled = true
 dir = "data/whatsapp"
+# 0.63: at most this many WhatsApp messages per member per day (all chats).
+# sends_per_day = 100
+# Operating system shown in WhatsApp's Linked devices list (set at pairing).
+# device_os = "Windows"

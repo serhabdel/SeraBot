@@ -524,6 +524,53 @@ impl Store {
     }
 
     /// Attachments of the given turns, for the acting user only.
+    /// The acting user's uploads in these conversations, newest first
+    /// (the bot library, 0.63). Another user's conversation id matches
+    /// nothing.
+    pub fn chat_attachments_in(
+        &self,
+        user_id: &str,
+        conversation_ids: &[String],
+        limit: usize,
+    ) -> Result<Vec<StoredAttachment>> {
+        if conversation_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection()?;
+        let placeholders = vec!["?"; conversation_ids.len()].join(", ");
+        let mut statement = connection.prepare(&format!(
+            "SELECT id, conversation_id, filename, rel_path, mime, size_bytes, sha256,
+                    turn_id, created_at
+             FROM chat_attachments WHERE user_id = ? AND conversation_id IN ({placeholders})
+             ORDER BY created_at DESC, id DESC LIMIT {}",
+            limit.clamp(1, 500)
+        ))?;
+        let mut values: Vec<&str> = Vec::with_capacity(conversation_ids.len() + 1);
+        values.push(user_id);
+        values.extend(conversation_ids.iter().map(String::as_str));
+        let rows = statement.query_map(rusqlite::params_from_iter(values), row_to_attachment)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Conversations of the acting user where `bot` answered, newest
+    /// activity first (the bot library, 0.63).
+    pub fn bot_conversation_ids(
+        &self,
+        user_id: &str,
+        bot: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT conversation_id FROM turns WHERE user_id = ?1 AND bot = ?2
+             GROUP BY conversation_id ORDER BY MAX(created_at) DESC LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![user_id, bot, limit as i64], |row| {
+            row.get::<_, String>(0)
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn chat_attachments_for_turns(
         &self,
         user_id: &str,

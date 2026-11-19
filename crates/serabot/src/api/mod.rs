@@ -505,6 +505,7 @@ pub fn router(state: ApiState) -> Router {
             "/v1/bots/{bot}/chats",
             get(list_bot_chats).post(create_bot_chat),
         )
+        .route("/v1/bots/{bot}/library", get(bot_library))
         .route("/v1/bots/{bot}/chat-settings", put(put_bot_chat_settings))
         .route("/v1/bots/catalog", get(bot_catalog))
         .route("/v1/bots/catalog/{name}/install", post(install_catalog_bot))

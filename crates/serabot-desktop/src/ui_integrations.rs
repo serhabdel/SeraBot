@@ -260,6 +260,7 @@ fn InstalledTab(session: Signal<Session>, query: Signal<String>, tab: Signal<Tab
     if let Some(github) = &github {
         integrations::apply_github(&mut view, github);
     }
+    integrations::add_whatsapp_personal(&mut view);
     let set_up: Vec<Entry> = view
         .set_up
         .into_iter()
@@ -484,6 +485,11 @@ fn ConnectorSheet(session: Signal<Session>, id: String) -> Element {
             }
             div { class: "mp-sheet-body",
                 match connector {
+                    // 0.63: the personal number has its own card, apart from
+                    // WhatsApp Business.
+                    None if id == integrations::WHATSAPP_PERSONAL_ID => rsx! {
+                        WhatsappLinkCard { session }
+                    },
                     None => rsx! { p { class: "muted", "This connector is no longer listed." } },
                     Some(connector) if connector.id == COMPOSIO_ID => rsx! {
                         ComposioCard { session, connector }
@@ -503,8 +509,7 @@ fn ConnectorSheet(session: Signal<Session>, id: String) -> Element {
                                 p { class: "tiny github-or", "Or connect with a personal access token." }
                             }
                             if connector.id == "whatsapp" {
-                                WhatsappLinkCard { session }
-                                p { class: "tiny github-or", "Or use the official WhatsApp Business (Meta Cloud) API below." }
+                                p { class: "tiny github-or", "For a personal number, use the WhatsApp card instead. Business sends always ask you first." }
                             }
                             ConnectorCard { session, connector }
                         }

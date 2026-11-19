@@ -2548,6 +2548,30 @@ impl Session {
     }
 
     /// Read a bot's chat list.
+    /// Read one bot's library (0.63).
+    pub fn load_bot_library(&mut self, bot: String) {
+        if valid_id(&bot) && self.state.connected {
+            self.state.bot_library_loading = true;
+            self.start_request(Operation::BotLibrary { bot });
+        }
+    }
+
+    /// Save one of the member's uploads to Downloads (0.63 library).
+    pub fn download_attachment(&mut self, id: String) {
+        if self.downloading {
+            self.toast = Some("A download is already running.".into());
+            return;
+        }
+        if !self.ready() {
+            self.toast = Some("Wait for the current request, then retry.".into());
+            return;
+        }
+        if valid_id(&id) {
+            self.pending_open = None;
+            self.start_request(Operation::FetchAttachment { id });
+        }
+    }
+
     pub fn load_bot_chats(&mut self, bot: String) {
         if valid_id(&bot) && self.state.connected {
             self.start_request(Operation::ListBotChats { bot });
@@ -4619,6 +4643,11 @@ impl Session {
                         }
                         OperationKind::TurnTraces => {
                             // Traces are optional: replies just show none.
+                            self.state.error = None;
+                        }
+                        OperationKind::BotLibrary => {
+                            self.state.bot_library_loading = false;
+                            self.toast = Some(format!("The library did not load: {message}"));
                             self.state.error = None;
                         }
                         OperationKind::ChatAutoApprove => {

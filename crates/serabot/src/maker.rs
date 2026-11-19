@@ -600,6 +600,112 @@ impl Tool for TelegramDocumentTool {
     }
 }
 
+pub const TELEGRAM_REPLY_FILE_TOOL: &str = "telegram_reply_file";
+
+/// `telegram_reply_file` (0.63): send one of the member's files into their
+/// own Telegram chat, as the reply to a conversation that came from
+/// Telegram. The member asked for it in that chat, so it is not
+/// approval-gated (the approval-gated `telegram_send_document` stays for
+/// deliveries from any other conversation). Checks artifact ownership, the
+/// Telegram size cap and the blocklist on the filename and caption.
+pub struct TelegramReplyFileTool {
+    client: Arc<TelegramClient>,
+    artifacts: Arc<ArtifactStore>,
+    policy: Arc<crate::policy::Policy>,
+    store: crate::store::Store,
+}
+
+impl TelegramReplyFileTool {
+    pub fn new(
+        client: Arc<TelegramClient>,
+        artifacts: Arc<ArtifactStore>,
+        policy: Arc<crate::policy::Policy>,
+        store: crate::store::Store,
+    ) -> Self {
+        Self {
+            client,
+            artifacts,
+            policy,
+            store,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for TelegramReplyFileTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: TELEGRAM_REPLY_FILE_TOOL.into(),
+            description: "Send a file (a document, image or media made by the user's bots or \
+                          uploaded by the user) back into this Telegram chat, when the user \
+                          asked for it over Telegram. Find the hash with conversation_library."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "artifact_hash": {"type": "string"},
+                    "caption": {"type": "string"}
+                },
+                "required": ["artifact_hash"],
+                "additionalProperties": false
+            }),
+            external_effect: true,
+        }
+    }
+
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        let hash = args
+            .get("artifact_hash")
+            .and_then(Value::as_str)
+            .ok_or_else(|| SeraError::Validation("artifact_hash is required".into()))?;
+        let caption = args
+            .get("caption")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .unwrap_or("");
+        let conversation = context.conversation_id.as_deref().unwrap_or_default();
+        let from_telegram = !conversation.is_empty()
+            && self
+                .store
+                .conversation_origin(&context.user_id, conversation)?
+                .as_deref()
+                == Some(crate::telegram::ORIGIN_TELEGRAM);
+        if !from_telegram {
+            return Err(SeraError::Validation(
+                "this conversation did not come from Telegram; use telegram_send_document \
+                 (it asks the user first)"
+                    .into(),
+            ));
+        }
+        if !self.store.user_owns_artifact(&context.user_id, hash)? {
+            return Err(SeraError::NotFound("artifact".into()));
+        }
+        let artifact = self.artifacts.load(hash)?;
+        if !self.policy.is_allowed(caption) || !self.policy.is_allowed(&artifact.filename) {
+            return Err(SeraError::PolicyViolation);
+        }
+        const TELEGRAM_MAX_DOCUMENT_BYTES: usize = 50 * 1024 * 1024;
+        if artifact.bytes.len() > TELEGRAM_MAX_DOCUMENT_BYTES {
+            return Err(SeraError::Validation(format!(
+                "'{}' is larger than Telegram's 50 MB limit",
+                artifact.filename
+            )));
+        }
+        let chat_id = self.client.chat_for(&context.user_id)?;
+        self.client
+            .send_document(chat_id, &artifact.filename, artifact.bytes, caption)
+            .await?;
+        Ok(ToolOutput {
+            content: format!("Sent {} on Telegram.", artifact.filename),
+            artifact_hash: Some(artifact.hash),
+            filename: Some(artifact.filename),
+            destination: Some("telegram:user".into()),
+            ..ToolOutput::default()
+        })
+    }
+}
+
 pub struct OneDriveUploadTool {
     registry: Arc<OneDriveRegistry>,
     artifacts: Arc<ArtifactStore>,
