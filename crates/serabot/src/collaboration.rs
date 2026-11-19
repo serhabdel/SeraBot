@@ -10,6 +10,59 @@
 //! Destructive actions stay on the gateway approval list. Tool and page
 //! content stays untrusted data. Secrets still never travel through chat.
 
+/// WhatsApp Business (Meta Cloud API) tools: only the WhatsApp bot gets
+/// them, and only once the member connected the Business API (0.63).
+pub const WHATSAPP_CLOUD_TOOLS: &[&str] = &[
+    "whatsapp_phone_info",
+    "whatsapp_list_templates",
+    "whatsapp_send_message",
+    "whatsapp_send_template",
+];
+
+/// WhatsApp linked-device tools: only the WhatsApp bot gets them (0.63).
+/// Every other bot asks the WhatsApp bot with `ask_teammate`.
+pub const WHATSAPP_LINK_TOOLS: &[&str] = &["whatsapp_link_send", "whatsapp_link_reply_file"];
+
+/// Operating rules for the WhatsApp bot (0.63): the one bot that speaks on
+/// WhatsApp. Appended to its owner-turn prompt.
+pub const WHATSAPP_BOT_RULES: &str = "- You are the only bot with WhatsApp. Messages from the owner's allowed WhatsApp chats arrive here, and your reply goes back to that chat automatically: just answer.\n\
+- For work another bot does better (documents, analysis, research, email, files), ask it with ask_teammate and pass its answer back. The owner may ask any bot's help through you.\n\
+- When the owner asks over WhatsApp for a file, image or media, find it (conversation_library, or ask the teammate who made it for the hash) and send it with whatsapp_link_reply_file. It only sends into this chat.\n\
+- A message you start yourself to another allowed chat goes through whatsapp_link_send and needs the owner's approval. Never message a number that is not on the allowed list, and never message a group.\n\
+- The WhatsApp Business (Cloud API) tools are only listed when the owner connected WhatsApp Business; the linked personal number does not need them.\n";
+
+/// Apply the 0.63 WhatsApp rule to one turn's tool set. The WhatsApp bot
+/// gets the linked-device tools (injected, so a fleet seeded before 0.63
+/// gets them without a re-seed) and the Business tools only when the member
+/// connected WhatsApp Business. Every other bot loses all WhatsApp tools,
+/// whatever its stored list says (main's `tools = ["all"]` included).
+pub fn scope_whatsapp_tools(
+    allowed: &mut std::collections::HashSet<String>,
+    is_whatsapp_bot: bool,
+    cloud_connected: bool,
+    registered: impl Fn(&str) -> bool,
+) {
+    if is_whatsapp_bot {
+        for tool in WHATSAPP_LINK_TOOLS {
+            if registered(tool) {
+                allowed.insert((*tool).to_string());
+            }
+        }
+        if !cloud_connected {
+            for tool in WHATSAPP_CLOUD_TOOLS {
+                allowed.remove(*tool);
+            }
+        }
+    } else {
+        for tool in WHATSAPP_CLOUD_TOOLS.iter().chain(WHATSAPP_LINK_TOOLS) {
+            allowed.remove(*tool);
+        }
+    }
+}
+
+/// Credential row of the WhatsApp Business connector (`conn.<id>`).
+pub const WHATSAPP_CLOUD_CREDENTIAL: &str = "conn.whatsapp";
+
 /// The baseline every bot gets: web search and fetch, memory, asking the
 /// owner, documents (read, OCR index, build), audio, images, local files and
 /// the user's connected connectors. Injected into every bot's turn when the
@@ -300,5 +353,34 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn whatsapp_tools_belong_to_the_whatsapp_bot() {
+        let all = || {
+            WHATSAPP_CLOUD_TOOLS
+                .iter()
+                .chain(WHATSAPP_LINK_TOOLS)
+                .map(|tool| tool.to_string())
+                .chain(["fetch_url".to_string()])
+                .collect::<std::collections::HashSet<_>>()
+        };
+        // Main (tools = ["all"]) and every other bot lose every WhatsApp tool.
+        let mut main = all();
+        scope_whatsapp_tools(&mut main, false, true, |_| true);
+        assert_eq!(main, ["fetch_url".to_string()].into_iter().collect());
+        // The WhatsApp bot keeps the linked tools; Business only when connected.
+        let mut personal = std::collections::HashSet::new();
+        scope_whatsapp_tools(&mut personal, true, false, |_| true);
+        assert!(personal.contains("whatsapp_link_reply_file"));
+        assert!(personal.contains("whatsapp_link_send"));
+        assert!(!personal.contains("whatsapp_list_templates"));
+        let mut business = all();
+        scope_whatsapp_tools(&mut business, true, true, |_| true);
+        assert!(business.contains("whatsapp_list_templates"));
+        // An unregistered tool (feature off) is never injected.
+        let mut off = std::collections::HashSet::new();
+        scope_whatsapp_tools(&mut off, true, false, |_| false);
+        assert!(off.is_empty());
     }
 }

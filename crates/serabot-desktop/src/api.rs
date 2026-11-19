@@ -4354,6 +4354,31 @@ impl ApiClient {
     }
 
     /// `GET /v1/bots/{bot}/chats`: the bot's chats, primary chat first.
+    /// `GET /v1/bots/{bot}/library` (0.63): every file in the bot's chats.
+    pub fn bot_library(&self, bot: &str) -> Result<crate::bot_library::BotLibrary, ApiError> {
+        check_id(bot)?;
+        let library: crate::bot_library::BotLibrary =
+            self.get(&["v1", "bots", bot, "library"], &[])?;
+        if library.items.len() > crate::bot_library::MAX_ITEMS
+            || library.items.iter().any(|item| {
+                !matches!(item.kind.as_str(), "generated" | "uploaded")
+                    || !bounded_text(&item.id, 128)
+                    || !bounded_text(&item.created_at, 64)
+                    || item
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| !bounded_text(name, 256))
+                    || item
+                        .filename
+                        .as_deref()
+                        .is_some_and(|name| !bounded_text(name, 256))
+            })
+        {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(library)
+    }
+
     pub fn list_bot_chats(&self, bot: &str) -> Result<crate::bot_chats::BotChatList, ApiError> {
         check_id(bot)?;
         let list: crate::bot_chats::BotChatList = self.get(

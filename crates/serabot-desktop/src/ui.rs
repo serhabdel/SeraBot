@@ -318,6 +318,11 @@ fn msg_stamp(raw: &str) -> String {
 }
 
 /// Today's date as `YYYY-MM-DD` in UTC, without pulling in a date crate.
+/// Today as `YYYY-MM-DD` (UTC), for views outside this module (0.63).
+pub(crate) fn today_date() -> String {
+    today_utc_date()
+}
+
 fn today_utc_date() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -7,6 +7,8 @@ mod api;
 pub mod audio_capture;
 pub mod avatars;
 pub mod bot_chats;
+pub mod bot_groups;
+pub mod bot_library;
 pub mod branding;
 pub mod capabilities;
 pub mod chat_cards;

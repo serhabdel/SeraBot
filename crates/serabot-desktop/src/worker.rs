@@ -66,6 +66,8 @@ pub enum OperationKind {
     Library,
     ChatPlan,
     TurnTraces,
+    BotLibrary,
+    FetchAttachment,
     ChatAutoApprove,
     /// Set the open conversation's thinking level.
     Thinking,
@@ -307,6 +309,14 @@ pub enum Operation {
     ChatPlan,
     /// Per-turn steps and memories of the open conversation (0.61).
     TurnTraces,
+    /// Every file in one bot's chats (0.63).
+    BotLibrary {
+        bot: String,
+    },
+    /// Download one of the member's uploads (0.63 library).
+    FetchAttachment {
+        id: String,
+    },
     SetAutoApprove {
         enabled: bool,
     },
@@ -641,6 +651,8 @@ impl Operation {
             Self::Library => OperationKind::Library,
             Self::ChatPlan => OperationKind::ChatPlan,
             Self::TurnTraces => OperationKind::TurnTraces,
+            Self::BotLibrary { .. } => OperationKind::BotLibrary,
+            Self::FetchAttachment { .. } => OperationKind::FetchAttachment,
             Self::SetAutoApprove { .. } => OperationKind::ChatAutoApprove,
             Self::SetThinking { .. } => OperationKind::Thinking,
             Self::StopTurn => OperationKind::StopTurn,
@@ -771,6 +783,7 @@ pub enum Reply {
         conversation: String,
         body: serde_json::Value,
     },
+    BotLibrary(crate::bot_library::BotLibrary),
     ChatPlan {
         plan: Option<crate::chat_plan::ChatPlan>,
         auto_approve: bool,
@@ -1222,6 +1235,16 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
             .set_team(conversation, members, *mode, rules)
             .map(Reply::Team),
         Operation::Library => client.library(conversation).map(Reply::Library),
+        Operation::BotLibrary { bot } => client.bot_library(bot).map(Reply::BotLibrary),
+        Operation::FetchAttachment { id } => {
+            client
+                .attachment_bytes(id)
+                .map(|(filename, bytes)| Reply::Artifact {
+                    hash: id.clone(),
+                    filename,
+                    bytes,
+                })
+        }
         Operation::TurnTraces => {
             client
                 .conversation_activity(conversation)

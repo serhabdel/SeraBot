@@ -19,6 +19,10 @@ dir = "/var/lib/serabot/logs"
 # The number can be banned: link a spare number only.
 enabled = true
 dir = "/var/lib/serabot/whatsapp"
+# 0.63: at most this many WhatsApp messages per member per day (all chats).
+# sends_per_day = 100
+# Operating system shown in WhatsApp's Linked devices list (set at pairing).
+# device_os = "Windows"
 
 [database]
 path = "/var/lib/serabot/serabot.db"
