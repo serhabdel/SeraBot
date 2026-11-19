@@ -395,11 +395,6 @@ fn BotForm(session: Signal<Session>, id: String) -> Element {
                     }
                     span { class: "hint", "Each profile keeps its own logins. Add more on the Browser page." }
                 }
-                div { class: "field",
-                    span { class: "field-label", "What it can do" }
-                    CapabilityToggles { session, bot: id.clone() }
-                    span { class: "hint", "Press Save to apply. The bot uses the new abilities from its next message." }
-                }
                 SkillsSection { session, id: id.clone() }
                 AdvancedSection { session, id: id.clone() }
                 LifecycleSection { session, id: id.clone() }
@@ -764,6 +759,11 @@ fn AdvancedSection(session: Signal<Session>, id: String) -> Element {
                         span { class: "kv-key", "Files made" }
                         span { class: "kv-val", "{detail.artifact_count}" }
                     }
+                }
+                div { class: "field",
+                    span { class: "field-label", "Tool overrides" }
+                    span { class: "hint", "All built-in tools are enabled by default for every bot. Expand or toggle individual abilities here if you want to customize." }
+                    CapabilityToggles { session, bot: id.clone() }
                 }
                 div { class: "row",
                     if !enabled && !is_main {

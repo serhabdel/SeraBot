@@ -184,9 +184,11 @@ pub async fn ingest_file(
     }
 
     // OCR is only worth a network call for formats that can lack a text layer,
-    // and only when the operator enabled it.
+    // and runs when either the operator enabled [ocr] or the acting member has
+    // a connected OCR-capable provider account (such as Mistral).
     let ocr_config = ocr.filter(|full| {
-        full.ocr.enabled && matches!(kind, DocumentKind::Pdf | DocumentKind::Image(_))
+        matches!(kind, DocumentKind::Pdf | DocumentKind::Image(_))
+            && (full.ocr.enabled || crate::ocr::user_has_ocr_credential(full, store, user_id))
     });
     let ocr_bytes = ocr_config.map(|_| bytes.clone());
 
@@ -202,7 +204,7 @@ pub async fn ingest_file(
     if let (Some(full), Some(bytes)) = (ocr_config, ocr_bytes.as_deref())
         && extracted_chars(&pages) < full.ocr.min_text_chars
     {
-        match crate::ocr::recognize_bytes(full, bytes, kind.mime()).await {
+        match crate::ocr::recognize_bytes_for_user(full, store, user_id, bytes, kind.mime()).await {
             Ok(recognized) => {
                 pages = ocr_pages_to_page_texts(recognized)?;
             }
@@ -556,11 +558,94 @@ fn extract_pdf_pages_bounded(
 
     if pages.iter().all(|page| page.text.trim().is_empty()) {
         return Err(SeraError::Validation(
-            "PDF contains no extractable text; it may be scanned or image-only. OCR is not supported; provide a text-based PDF."
+            "PDF contains no extractable text; it may be scanned or image-only. Connect a Mistral account or enable [ocr] in Settings to read scanned PDFs via OCR."
                 .into(),
         ));
     }
     Ok((pages, more))
+}
+
+/// Extract bounded embedded JPEG/PNG page images from a PDF in pure Rust so
+/// vision-capable models can inspect scanned/image-only PDFs directly in chat.
+pub fn extract_pdf_images(
+    bytes: &[u8],
+    max_images: usize,
+    max_image_bytes: usize,
+) -> Vec<(String, Vec<u8>)> {
+    if max_images == 0 || max_image_bytes == 0 {
+        return Vec::new();
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        let Ok(document) = lopdf::Document::load_mem(bytes) else {
+            return Vec::new();
+        };
+        if document.is_encrypted() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for page_id in document.get_pages().values().copied().take(20) {
+            if out.len() >= max_images {
+                break;
+            }
+            let Ok(page_dict) = document.get_dictionary(page_id) else {
+                continue;
+            };
+            let resources = match page_dict.get(b"Resources") {
+                Ok(lopdf::Object::Dictionary(dict)) => Some(dict),
+                Ok(lopdf::Object::Reference(id)) => document.get_dictionary(*id).ok(),
+                _ => None,
+            };
+            let Some(resources) = resources else {
+                continue;
+            };
+            let xobjects = match resources.get(b"XObject") {
+                Ok(lopdf::Object::Dictionary(dict)) => Some(dict),
+                Ok(lopdf::Object::Reference(id)) => document.get_dictionary(*id).ok(),
+                _ => None,
+            };
+            let Some(xobjects) = xobjects else {
+                continue;
+            };
+            for (_, value) in xobjects.iter() {
+                if out.len() >= max_images {
+                    break;
+                }
+                let Ok(obj_id) = value.as_reference() else {
+                    continue;
+                };
+                if !seen.insert(obj_id) {
+                    continue;
+                }
+                let Ok(lopdf::Object::Stream(stream)) = document.get_object(obj_id) else {
+                    continue;
+                };
+                let is_image = stream
+                    .dict
+                    .get(b"Subtype")
+                    .ok()
+                    .and_then(|o| o.as_name().ok())
+                    == Some(b"Image".as_slice());
+                if !is_image {
+                    continue;
+                }
+                let raw = &stream.content;
+                if raw.is_empty() || raw.len() > max_image_bytes {
+                    continue;
+                }
+                let mime = if raw.starts_with(&[0xFF, 0xD8, 0xFF]) {
+                    "image/jpeg"
+                } else if raw.starts_with(&[0x89, b'P', b'N', b'G']) {
+                    "image/png"
+                } else {
+                    continue;
+                };
+                out.push((mime.to_owned(), raw.clone()));
+            }
+        }
+        out
+    }))
+    .unwrap_or_default()
 }
 
 fn clean_extracted_text(text: &str) -> String {
@@ -1436,5 +1521,53 @@ mod tests {
         assert_eq!(pages.len(), 2);
         assert_eq!(pages[0].text, "abcdef");
         assert_eq!(pages[1].text, "ghi");
+    }
+
+    #[test]
+    fn extract_pdf_images_reads_embedded_jpeg_from_scanned_pdf() {
+        use lopdf::{Dictionary, Document, Object, Stream};
+
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let fake_jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
+        let mut img_dict = Dictionary::new();
+        img_dict.set("Type", Object::Name(b"XObject".to_vec()));
+        img_dict.set("Subtype", Object::Name(b"Image".to_vec()));
+        img_dict.set("Width", 1);
+        img_dict.set("Height", 1);
+        img_dict.set("Filter", Object::Name(b"DCTDecode".to_vec()));
+        let img_id = doc.add_object(Stream::new(img_dict, fake_jpeg.clone()));
+
+        let mut xobjects = Dictionary::new();
+        xobjects.set("Im0", img_id);
+        let mut resources = Dictionary::new();
+        resources.set("XObject", xobjects);
+        let resources_id = doc.add_object(resources);
+
+        let mut page = Dictionary::new();
+        page.set("Type", Object::Name(b"Page".to_vec()));
+        page.set("Parent", pages_id);
+        page.set("Resources", resources_id);
+        let page_id = doc.add_object(page);
+
+        let mut pages = Dictionary::new();
+        pages.set("Type", Object::Name(b"Pages".to_vec()));
+        pages.set("Kids", vec![page_id.into()]);
+        pages.set("Count", 1);
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", Object::Name(b"Catalog".to_vec()));
+        catalog.set("Pages", pages_id);
+        let catalog_id = doc.add_object(catalog);
+        doc.trailer.set("Root", catalog_id);
+
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+
+        let extracted = extract_pdf_images(&bytes, 4, 1024 * 1024);
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].0, "image/jpeg");
+        assert_eq!(extracted[0].1, fake_jpeg);
     }
 }

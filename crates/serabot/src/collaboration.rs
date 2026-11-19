@@ -104,6 +104,21 @@ pub const SHARED_TOOLS: &[&str] = &[
     "agentmail_inboxes_list",
     "agentmail_send",
     "onedrive_upload",
+    // 0.60: allow browser, source watching, web crawl and timesheet tools by
+    // default across all bots (destructive actions stay approval-gated).
+    "browser_navigate",
+    "browser_snapshot",
+    "browser_click",
+    "browser_type",
+    "browser_press",
+    "browser_screenshot",
+    "browser_close",
+    "browser_tabs",
+    "browser_new_tab",
+    "browser_autofill",
+    "watch_now",
+    "firecrawl_crawl",
+    "timesheet_analyze",
 ];
 
 /// A specialist (or a handoff that has not already been handed on) asks main

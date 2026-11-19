@@ -932,7 +932,7 @@ pub fn extract_pdf_text(path: impl AsRef<Path>, max_bytes: u64) -> Result<PdfTex
 
     if total_chars == 0 {
         return Err(SeraError::Validation(format!(
-            "PDF {} contains no extractable text across {} page(s); it is probably a scanned image. OCR is not supported: run OCR first or provide a text-based PDF",
+            "PDF {} contains no extractable text across {} page(s); it is probably a scanned image. Call document_index (with a connected Mistral account or [ocr] enabled) to read it via OCR",
             path.display(),
             pages.len()
         )));

@@ -150,9 +150,16 @@ fn thinking_follows_the_hielcowork_table() {
         Some(json!({"thinkingBudget": 10_000, "includeThoughts": true}))
     );
     assert_eq!(t("claude-opus-5-5", None, 64_000), None);
+    // Pure Gemini with no explicit level omits thinkingConfig to avoid 400s on models
+    // that reject a forced default level; explicit levels still map cleanly.
+    assert_eq!(t("gemini-3.8-flash", None, 65_536), None);
     assert_eq!(
-        t("gemini-3.8-flash", None, 65_536),
+        t("gemini-3.8-flash", Some("medium"), 65_536),
         Some(json!({"thinkingLevel": "medium", "includeThoughts": true}))
+    );
+    assert_eq!(
+        t("gemini-2.5-pro", Some("low"), 65_536),
+        Some(json!({"thinkingBudget": 4_096, "includeThoughts": true}))
     );
 }
 

@@ -1108,6 +1108,8 @@ impl LlmClient {
         // alias when a cluster does not know the plain name.
         let mut wire_model = model;
         let mut tried_wire = false;
+        let mut effective_thinking = thinking_level;
+        let mut stripped_thinking = false;
         let mut last_error: Option<SeraError> = None;
         for _ in 0..2 {
             let mut restart = false;
@@ -1125,7 +1127,7 @@ impl LlmClient {
                         &cloud_code::EnvelopeOptions {
                             conversation: &conversation,
                             session_generation: generation,
-                            thinking_level,
+                            thinking_level: effective_thinking,
                         },
                     )?;
                     let mut used = zeroize::Zeroizing::new(self.bearer());
@@ -1190,10 +1192,19 @@ impl LlmClient {
                             continue;
                         }
                         CloudPost::Retryable(error) => {
-                            last_error = Some(error);
+                            if !target.stream.contains(".sandbox.googleapis.com")
+                                || last_error.is_none()
+                            {
+                                last_error = Some(error);
+                            }
                             break;
                         }
                         CloudPost::BadRequest(error) => {
+                            if !stripped_thinking && effective_thinking.is_some() {
+                                stripped_thinking = true;
+                                effective_thinking = None;
+                                continue;
+                            }
                             if !tried_wire
                                 && let Some(alias) = cloud_code::wire_fallback_model(wire_model)
                             {
@@ -1201,7 +1212,11 @@ impl LlmClient {
                                 wire_model = alias;
                                 continue;
                             }
-                            return Err(error);
+                            if !target.stream.contains(".sandbox.googleapis.com") {
+                                last_error = Some(error);
+                                break;
+                            }
+                            return Err(last_error.unwrap_or(error));
                         }
                         CloudPost::Failed(error) => return Err(error),
                         CloudPost::Unauthorized => return Err(cloud_status_error(401)),
@@ -1486,6 +1501,12 @@ async fn classify_cloud(response: reqwest::Response, allow_session: bool) -> Clo
     }
     let hold = llm_failure::retry_after_hold(response.headers());
     let text = cloud_error_body(response).await;
+    let detail = extract_cloud_error_detail(&text);
+    tracing::warn!(
+        status,
+        detail = detail.as_deref().unwrap_or(""),
+        "Cloud Code upstream error"
+    );
     let error = llm_failure::upstream_error(
         status,
         &text,
@@ -1505,6 +1526,26 @@ async fn classify_cloud(response: reqwest::Response, allow_session: bool) -> Clo
         return CloudPost::Retryable(error);
     }
     CloudPost::Failed(error)
+}
+
+fn extract_cloud_error_detail(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let err = value.get("error").unwrap_or(&value);
+    let status = err.get("status").and_then(Value::as_str).map(str::trim);
+    let msg = err.get("message").and_then(Value::as_str).map(str::trim);
+    let combined = match (status, msg) {
+        (Some(s), Some(m)) if !s.is_empty() && !m.is_empty() => format!("{s}: {m}"),
+        (_, Some(m)) if !m.is_empty() => m.to_owned(),
+        (Some(s), _) if !s.is_empty() => s.to_owned(),
+        _ => return None,
+    };
+    let clean: String = combined
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(220)
+        .collect();
+    let clean = clean.trim().to_owned();
+    (!clean.is_empty()).then_some(clean)
 }
 
 fn cloud_completion(parsed: CloudCodeCompletion) -> Result<LlmResponse> {

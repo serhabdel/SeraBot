@@ -457,28 +457,32 @@
   border: 1px solid var(--hairline);
 }
 
-/* Studio Command Palette (Ctrl+K). */
-.sheet.sheet-palette {
-  top: min(12vh, 96px);
+/* Studio Command Palette (Ctrl+K): transform-free centering so reduced-motion
+   rules can never shift it upward off the viewport. */
+.sheet.sheet-palette,
+.sheet.sheet-palette.open {
+  position: fixed;
+  top: min(10vh, 84px);
   bottom: auto;
-  left: 50%;
-  right: auto;
-  width: min(620px, calc(100vw - 32px));
-  max-height: min(560px, 76vh);
-  transform: translateX(-50%) translateY(-8px) scale(0.985);
+  left: 0;
+  right: 0;
+  margin: 0 auto;
+  width: min(600px, calc(100vw - 32px));
+  max-height: min(560px, 78vh);
+  transform: none !important;
+  z-index: 220;
   padding: 0;
   gap: 0;
   overflow: hidden;
-  border-radius: 18px;
-  border: 1px solid var(--glass-edge, var(--hairline-strong));
-  background: var(--glass-sheet, var(--surface));
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
-  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.36), inset 0 1px 0 var(--glass-highlight);
+  border-radius: 16px;
+  border: 1px solid var(--hairline-strong);
+  background: var(--surface);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.34);
 }
 
-.sheet.sheet-palette.open {
-  transform: translateX(-50%) translateY(0) scale(1);
+.scrim.open {
+  z-index: 210;
+  background: rgba(15, 23, 42, 0.45) !important;
 }
 
 .palette-search-row {
@@ -648,6 +652,89 @@ html[data-reduce-transparency="true"] .sheet.sheet-palette {
   flex-wrap: wrap;
   gap: 6px;
   margin-bottom: 6px;
+}
+
+/* 0.60 Chat & UX polish:
+   - Message actions stay cleanly in-flow below every message so older rows
+     never clip at the top edge and actions are always visible & clickable.
+   - User attachment chips stay crisp white-on-translucent inside accent bubbles.
+   - Jump-to-latest floats cleanly above the composer without overlapping text.
+   - Toasts stay compact floating pills and jobs panel aligns with chat width. */
+.msg .msg-actions {
+  position: static;
+  top: auto;
+  right: auto;
+  left: auto;
+  align-self: flex-start;
+  margin-top: 4px;
+  padding: 0;
+  gap: 2px;
+  background: transparent;
+  box-shadow: none;
+  opacity: 0.72;
+  pointer-events: auto;
+}
+
+.msg:hover .msg-actions,
+.msg:focus-within .msg-actions,
+.msg .msg-actions:focus-within,
+.msg.last-reply .msg-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.msg.user .msg-actions {
+  align-self: flex-end;
+  justify-content: flex-end;
+}
+
+.msg.user .file-chip {
+  background: rgba(255, 255, 255, 0.18);
+  border-color: rgba(255, 255, 255, 0.34);
+  color: #ffffff;
+}
+
+.msg.user .file-chip-name,
+.msg.user .file-chip-size {
+  color: #ffffff;
+}
+
+.composer-wrap > .scroll-bottom.jump-pill {
+  position: absolute;
+  top: -42px;
+  bottom: auto;
+  left: 50%;
+  margin: 0;
+  transform: translateX(-50%);
+  z-index: 12;
+  background: var(--surface);
+  border: 1px solid var(--hairline-strong);
+  box-shadow: var(--shadow-2);
+}
+
+.jobs-panel {
+  width: min(var(--chat-w), calc(100% - 36px));
+  margin: 8px auto 4px;
+  flex: 0 0 auto;
+}
+
+.toast {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  width: auto;
+  max-width: min(460px, calc(100vw - 48px));
+  bottom: 20px;
+  padding: 8px 12px 8px 16px;
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  border: 1px solid var(--hairline-strong);
+  box-shadow: var(--shadow-2);
+}
+
+.composer .pop {
+  min-width: min(340px, calc(100vw - 32px));
+  max-height: min(420px, 60vh);
 }
 
 

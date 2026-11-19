@@ -66,12 +66,16 @@ pub fn levels_for(kind: &str, model: &str, tags: &[String]) -> Vec<&'static str>
             }
         }
         "mistral" => {
-            if id.contains("mistral-small-2603") || id.contains("mistral-medium-3-5") {
+            if id.contains("mistral-small-26") || id.contains("mistral-medium-3") {
                 &["off", "high"]
             } else if id.contains("mistral-large-4") {
                 &["low", "medium", "high"]
-            } else if id.contains("zai-glm-5") {
+            } else if id.contains("zai-glm") {
                 &["low", "high", "max"]
+            } else if id.starts_with("deepseek-v4") || id == "deepseek-flash" {
+                &["off", "low", "high", "max"]
+            } else if has_reasoning_tag && !id.contains("magistral") {
+                &["low", "medium", "high"]
             } else {
                 &[]
             }
@@ -140,13 +144,37 @@ pub fn levels_for(kind: &str, model: &str, tags: &[String]) -> Vec<&'static str>
             } else if id.starts_with("claude") {
                 // `off` sends no thinking config; the rest are token budgets.
                 &["off", "low", "medium", "high", "max"]
-            } else if id.ends_with("-tiered") {
-                &["off", "low", "medium", "high", "max"]
             } else if id.ends_with("-low") || id.ends_with("-medium") || id.ends_with("-high") {
                 // The level is baked into the id; no thinking config is sent.
                 &[]
-            } else if id.starts_with("gemini-3") || id.starts_with("gemini-4") {
-                &["off", "low", "medium", "high", "max"]
+            } else if id.starts_with("gemini-2.5-pro") {
+                &["low", "medium", "high"]
+            } else if id.starts_with("gemini-2.5-flash")
+                || id.ends_with("-tiered")
+                || id.starts_with("gemini-3")
+                || id.starts_with("gemini-4")
+            {
+                &["off", "low", "medium", "high"]
+            } else {
+                &[]
+            }
+        }
+        "github-copilot" => {
+            if id.starts_with("o1") || id.starts_with("o3") || id.starts_with("o4") {
+                &["low", "medium", "high"]
+            } else if id.starts_with("gpt-5.") || id.starts_with("gpt-6") {
+                &["off", "low", "medium", "high"]
+            } else if id.starts_with("gpt-5") && !id.starts_with("gpt-5-chat") {
+                &["minimal", "low", "medium", "high"]
+            } else if id.starts_with("gemini-2.5-pro") {
+                &["low", "medium", "high"]
+            } else if id.starts_with("gemini-2.5-flash")
+                || id.starts_with("gemini-3")
+                || id.starts_with("gemini-4")
+            {
+                &["off", "low", "medium", "high"]
+            } else if anthropic_thinks(&id) || has_reasoning_tag {
+                &["low", "medium", "high"]
             } else {
                 &[]
             }
@@ -508,16 +536,22 @@ mod tests {
         );
 
         let agy = ["off", "low", "medium", "high", "max"];
+        for model in ["claude-sonnet-4-5-thinking", "claude-opus-4-6-thinking"] {
+            assert_eq!(
+                levels_for("google-antigravity", model, &none()),
+                agy,
+                "{model}"
+            );
+        }
         for model in [
             "gemini-3-pro",
             "gemini-4-flash",
             "gemini-3-pro-tiered",
-            "claude-sonnet-4-5-thinking",
-            "claude-opus-4-6-thinking",
+            "gemini-2.5-flash",
         ] {
             assert_eq!(
                 levels_for("google-antigravity", model, &none()),
-                agy,
+                ["off", "low", "medium", "high"],
                 "{model}"
             );
         }
@@ -526,7 +560,6 @@ mod tests {
             "gemini-3-pro-high",
             "gpt-oss-120b-medium",
             "gpt-oss-120b",
-            "gemini-2.5-flash",
         ] {
             assert!(
                 levels_for("google-antigravity", model, &none()).is_empty(),
@@ -580,9 +613,10 @@ mod tests {
             None
         );
         assert_eq!(
-            shape("google-antigravity", "gemini-3-pro", "max"),
-            Some(json!({"thinking_level": "max"}))
+            shape("google-antigravity", "gemini-3-pro", "high"),
+            Some(json!({"thinking_level": "high"}))
         );
+        assert_eq!(shape("google-antigravity", "gemini-3-pro", "max"), None);
         assert_eq!(
             shape("google-antigravity", "gemini-3-pro-high", "high"),
             None
@@ -697,6 +731,44 @@ mod tests {
         assert!(wire_fields("deepseek", "deepseek-reasoner", &[], "high").is_none());
         assert!(wire_fields("mistral", "mistral-large-latest", &[], "high").is_none());
         assert!(wire_fields("openai", "gpt-5.5", &[], "bogus").is_none());
+    }
+
+    #[test]
+    fn copilot_mistral_and_antigravity_thinking_levels_are_accurate() {
+        assert_eq!(
+            levels_for("github-copilot", "o3-mini", &[]),
+            vec!["low", "medium", "high"]
+        );
+        assert_eq!(
+            levels_for("github-copilot", "gpt-5.2", &[]),
+            vec!["off", "low", "medium", "high"]
+        );
+        assert_eq!(
+            levels_for("github-copilot", "gemini-2.5-pro", &[]),
+            vec!["low", "medium", "high"]
+        );
+        assert!(levels_for("github-copilot", "gpt-4o", &[]).is_empty());
+
+        assert_eq!(
+            levels_for("google-antigravity", "gemini-2.5-pro", &[]),
+            vec!["low", "medium", "high"]
+        );
+        assert_eq!(
+            levels_for("google-antigravity", "gemini-2.5-flash", &[]),
+            vec!["off", "low", "medium", "high"]
+        );
+        assert_eq!(
+            levels_for("google-antigravity", "gemini-3-pro", &[]),
+            vec!["off", "low", "medium", "high"]
+        );
+        assert_eq!(
+            levels_for("mistral", "deepseek-v4-flash", &[]),
+            vec!["off", "low", "high", "max"]
+        );
+        assert_eq!(
+            levels_for("mistral", "custom-reasoner", &["reasoning".into()]),
+            vec!["low", "medium", "high"]
+        );
     }
 
     #[test]

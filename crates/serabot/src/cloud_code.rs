@@ -1068,10 +1068,30 @@ pub fn antigravity_thinking(model: &str, level: Option<&str>, max_out: u32) -> O
             })
         });
     }
+    if lower.starts_with("gemini-2.5") {
+        let level = level?;
+        if level == "off" {
+            return (!lower.contains("pro")).then(|| json!({"thinkingBudget": 0}));
+        }
+        let budget = match level {
+            "low" => 4_096u32,
+            "high" | "max" | "xhigh" => 24_576,
+            _ => 10_240,
+        };
+        let ceiling = max_out.saturating_sub(1_024).max(1_024);
+        let budget = budget.clamp(1_024, ceiling);
+        return (max_out > budget).then(|| {
+            json!({
+                "thinkingBudget": budget,
+                "includeThoughts": true,
+            })
+        });
+    }
     if !level_thinking_model(&lower) {
         return None;
     }
-    Some(match level.unwrap_or("medium") {
+    let level = level?;
+    Some(match level {
         "off" => json!({"thinkingBudget": 0}),
         "low" => json!({"thinkingLevel": "low", "includeThoughts": true}),
         "high" | "max" | "xhigh" => json!({"thinkingLevel": "high", "includeThoughts": true}),

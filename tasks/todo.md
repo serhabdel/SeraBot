@@ -247,3 +247,14 @@ never merge without the owner's OK.
 - [x] Enable `[whatsapp_link] enabled = true` by default in `config.rs`, `serabot.toml`, and `deploy/serabot.production.toml.example` (still opt-out via `enabled = false`, no widening).
 - [ ] Owner: live verification of WhatsApp linked-device pairing, image vision, Copilot/Codex quotas, and ACP `@`-file / image prompts on Windows + upgraded server.
 
+## Release 0.60.0 — Read-only FS fallback, scanned PDF OCR/vision, Antigravity Gemini & thinking levels, default bot tools & Chat/Jump UX
+
+- [x] Writable runtime data-dir fallback (`Config::ensure_writable_dir`) beside `database_path` so WhatsApp Link (`/v1/whatsapp-link/pair`) and daily file logging work under systemd `ProtectSystem=strict` instead of failing with `os error 30` / HTTP 500.
+- [x] Per-user Mistral OCR credential resolution (`ocr::recognize_bytes_for_user`) for `document_index` plus pure-Rust embedded JPEG/PNG page extraction (`documents::extract_pdf_images`) for inline scanned-PDF vision in chat.
+- [x] Antigravity (Cloud Code) pure Gemini fix (`antigravity_thinking` omits forced `thinkingLevel` when `None`, adds `gemini-2.5-*` `thinkingBudget`, retries once without `thinkingConfig` on HTTP 400, preserves primary errors over sandbox 403s, and logs sanitized upstream error details at `warn`).
+- [x] Thinking levels per model/provider (`thinking::levels_for`: added `github-copilot`, expanded `mistral`, refined `google-antigravity` Gemini levels) + instant desktop composer thinking-level refresh on model switch.
+- [x] All built-in non-admin tools enabled by default for every bot (`SHARED_TOOLS` includes browser automation, `watch_now`, `firecrawl_crawl`, `timesheet_analyze`) and verbose bot ability toggles moved under collapsed `Advanced` in right-sidebar Bot Settings.
+- [x] Desktop UX fixes: Command Palette (`Ctrl+K`) transform-free centering & dark scrim under reduced-motion/transparency, unclipped in-flow `.msg-actions` on older messages, crisp user attachment pills, floating `Jump to latest`, aligned jobs panel, and compact toast pills.
+- [ ] Owner: live verification of WhatsApp pairing, scanned PDF OCR/vision, and Antigravity pure Gemini models against the upgraded server.
+
+
