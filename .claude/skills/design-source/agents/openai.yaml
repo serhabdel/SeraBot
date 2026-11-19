@@ -1,0 +1,4 @@
+interface:
+  display_name: "Design Source"
+  short_description: "DESIGN.md and three-layer tokens for every target"
+  default_prompt: "Use the design-source skill to create or document this product's DESIGN.md and token set and derive the theme for its targets."

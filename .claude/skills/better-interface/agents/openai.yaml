@@ -1,0 +1,4 @@
+interface:
+  display_name: "Better Interface"
+  short_description: "Five-domain interface review with Block or Approve verdict"
+  default_prompt: "Use the better-interface skill to review this interface across accessibility, layout, writing, typography and polish, and give a Block or Approve verdict."
