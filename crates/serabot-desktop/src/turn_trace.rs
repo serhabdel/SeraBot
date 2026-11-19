@@ -32,8 +32,11 @@ pub struct MemoryItem {
     pub origin: String,
     /// Empty when the server withheld the text.
     pub excerpt: String,
-    /// Saved but held for review (the turn read untrusted content).
+    /// Saved but held for review (the turn read untrusted content, or it
+    /// disagreed with something the owner saved).
     pub pending: bool,
+    /// Older facts this one replaced (0.62), at most 2.
+    pub replaces: Vec<String>,
 }
 
 /// The memory side of one turn.
@@ -83,6 +86,10 @@ impl TurnMemory {
         if self.saved_total > 0 {
             parts.push(format!("Remembered {}", self.saved_total));
         }
+        let replaced: usize = self.saved.iter().map(|item| item.replaces.len()).sum();
+        if replaced > 0 {
+            parts.push(format!("Replaced {replaced}"));
+        }
         (!parts.is_empty()).then(|| parts.join(" \u{b7} "))
     }
 }
@@ -113,6 +120,25 @@ fn items(value: Option<&Value>) -> Vec<MemoryItem> {
                         origin: text(row, "origin", 24),
                         excerpt: text(row, "excerpt", MAX_EXCERPT),
                         pending: row.get("pending").and_then(Value::as_bool) == Some(true),
+                        replaces: row
+                            .get("replaces")
+                            .and_then(Value::as_array)
+                            .map(|olds| {
+                                olds.iter()
+                                    .filter_map(Value::as_str)
+                                    .map(|old| {
+                                        old.chars()
+                                            .filter(|c| !c.is_control())
+                                            .take(MAX_EXCERPT)
+                                            .collect::<String>()
+                                            .trim()
+                                            .to_owned()
+                                    })
+                                    .filter(|old| !old.is_empty())
+                                    .take(2)
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                     })
                 })
                 .take(MAX_MEMORY_ITEMS)
@@ -314,7 +340,7 @@ mod tests {
         ]);
         recall["recalled_total"] = json!(2);
         let mut save = base;
-        save["saved"] = json!([{"id": "m3", "kind": "fact", "origin": "extracted", "excerpt": "Lives in Porto", "pending": true}]);
+        save["saved"] = json!([{"id": "m3", "kind": "fact", "origin": "extracted", "excerpt": "Lives in Porto", "pending": true, "replaces": ["Lives in Lisbon", "", 7]}]);
         save["saved_total"] = json!(1);
         ledger.apply("turn.memory", &recall);
         ledger.apply("turn.memory", &save);
@@ -322,7 +348,14 @@ mod tests {
         assert_eq!(trace.memory.recalled[0].excerpt, "Likes tea");
         assert!(trace.memory.recalled[1].excerpt.is_empty());
         assert!(trace.memory.saved[0].pending);
-        assert_eq!(trace.summary(), "Used 2 memories \u{b7} Remembered 1");
+        assert_eq!(
+            trace.memory.saved[0].replaces,
+            vec!["Lives in Lisbon".to_owned()]
+        );
+        assert_eq!(
+            trace.summary(),
+            "Used 2 memories \u{b7} Remembered 1 \u{b7} Replaced 1"
+        );
     }
 
     #[test]

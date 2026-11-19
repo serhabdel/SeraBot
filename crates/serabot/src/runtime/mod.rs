@@ -53,6 +53,7 @@ pub(crate) mod activity;
 mod auto_resume;
 mod compaction;
 use activity::StepPhase;
+mod conflicts;
 mod extract;
 mod failover;
 mod models;
@@ -257,6 +258,19 @@ impl Runtime {
             catalog,
         )?);
         Self::with_fleet(config, store, gateway, router, fleet, notifier, shutdown)
+    }
+
+    /// Turn on semantic memory recall with the shared local embedder
+    /// (0.62). A no-op when `[memory] semantic_recall = false`.
+    pub fn with_semantic_memory(mut self, embedder: Arc<dyn crate::embeddings::Embedder>) -> Self {
+        if self.config.memory.semantic_recall {
+            let index = crate::memory_vectors::SemanticIndex::new(
+                embedder,
+                self.config.memory.semantic_min_similarity,
+            );
+            self.memory = self.memory.clone().with_semantic(index);
+        }
+        self
     }
 
     /// Build a runtime around an existing per-user fleet registry.

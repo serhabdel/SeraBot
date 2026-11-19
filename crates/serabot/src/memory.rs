@@ -202,6 +202,18 @@ struct MemoryQuery {
     pinned: i64,
 }
 
+impl MemoryQuery {
+    /// The same rule as the SQL `WHERE` of `lexical_hits` and `recent_ids`,
+    /// for rows that were found by id (semantic hits).
+    fn admits(&self, memory: &Memory) -> bool {
+        (self.origin == "all" || memory.origin == self.origin)
+            && (self.status == "all" || memory.status == self.status)
+            && (self.bot.is_empty() || memory.bot.as_deref() == Some(self.bot.as_str()))
+            && (self.category.is_empty() || memory.kind == self.category)
+            && (self.pinned < 0 || i64::from(memory.pinned) == self.pinned)
+    }
+}
+
 impl MemoryFilter {
     /// Validated SQL parameters: origin, status, bot. `all` (or empty bot)
     /// disables that dimension.
@@ -450,7 +462,30 @@ pub fn search(
     filter: &MemoryFilter,
     limit: usize,
 ) -> Result<Vec<Recalled>> {
-    rank(store, user_id, query, filter, None, limit, Mode::Search)
+    search_hybrid(store, user_id, query, filter, limit, &HashMap::new())
+}
+
+/// [`search`] with semantic relevance (0.62): a row also matches when its
+/// meaning is close to the query (`semantic`, `id -> 0..=1`, from
+/// [`crate::memory_vectors::SemanticIndex::scores`]).
+pub fn search_hybrid(
+    store: &Store,
+    user_id: &str,
+    query: &str,
+    filter: &MemoryFilter,
+    limit: usize,
+    semantic: &HashMap<String, f64>,
+) -> Result<Vec<Recalled>> {
+    rank(
+        store,
+        user_id,
+        query,
+        filter,
+        None,
+        limit,
+        Mode::Search,
+        semantic,
+    )
 }
 
 /// The facts to put in front of the model for this turn. With a query, the
@@ -464,6 +499,20 @@ pub fn recall(
     k: usize,
     bot: Option<&str>,
 ) -> Result<Vec<Recalled>> {
+    recall_hybrid(store, user_id, query, k, bot, &HashMap::new())
+}
+
+/// [`recall`] with semantic relevance (0.62). A fact's relevance is the
+/// better of its lexical and its semantic match, so a paraphrase of a fact
+/// is recalled even when no word is shared.
+pub fn recall_hybrid(
+    store: &Store,
+    user_id: &str,
+    query: &str,
+    k: usize,
+    bot: Option<&str>,
+    semantic: &HashMap<String, f64>,
+) -> Result<Vec<Recalled>> {
     let filter = MemoryFilter::default();
     let ranked = if query_tokens(query).is_empty() {
         list_page(store, user_id, &filter, 0, k)?
@@ -471,7 +520,16 @@ pub fn recall(
             .map(|memory| Recalled { memory, score: 0.0 })
             .collect()
     } else {
-        rank(store, user_id, query, &filter, bot, k, Mode::Recall)?
+        rank(
+            store,
+            user_id,
+            query,
+            &filter,
+            bot,
+            k,
+            Mode::Recall,
+            semantic,
+        )?
     };
     let ids: Vec<String> = ranked.iter().map(|item| item.memory.id.clone()).collect();
     touch(store, user_id, &ids)?;
@@ -522,6 +580,71 @@ pub fn update(store: &Store, user_id: &str, id: &str, patch: &MemoryPatch) -> Re
     let memory = get_in(&tx, user_id, id)?;
     tx.commit()?;
     Ok(memory)
+}
+
+/// The acting user's facts written in one conversation since `since` (a
+/// turn's start), oldest first: what that turn saved, by any path.
+pub fn written_since(
+    store: &Store,
+    user_id: &str,
+    conversation_id: &str,
+    since: DateTime<Utc>,
+    limit: usize,
+) -> Result<Vec<Memory>> {
+    let connection = store.connection()?;
+    let mut statement = connection.prepare(&format!(
+        "SELECT {COLUMNS} FROM memories
+         WHERE user_id = ?1 AND conversation_id = ?2 AND created_at >= ?3
+           AND status IN ('active', 'pending')
+         ORDER BY created_at ASC, id ASC LIMIT ?4"
+    ))?;
+    let rows = statement.query_map(
+        params![user_id, conversation_id, now_string(since), limit as i64],
+        row_to_memory,
+    )?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Older facts of the acting user that `new_id` replaced.
+pub fn replaced_by(store: &Store, user_id: &str, new_id: &str) -> Result<Vec<Memory>> {
+    let connection = store.connection()?;
+    let mut statement = connection.prepare(&format!(
+        "SELECT {COLUMNS} FROM memories
+         WHERE user_id = ?1 AND superseded_by = ?2 AND status = 'superseded'
+         ORDER BY updated_at DESC LIMIT 8"
+    ))?;
+    let rows = statement.query_map(params![user_id, new_id], row_to_memory)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Retire `old_id` in favour of `new_id` (the contradiction check, 0.62).
+/// Both must be the acting user's; only an active old row changes. The old
+/// row stays readable as `superseded`, so the owner can restore it.
+pub fn supersede(store: &Store, user_id: &str, old_id: &str, new_id: &str) -> Result<bool> {
+    if old_id == new_id {
+        return Ok(false);
+    }
+    let connection = store.connection()?;
+    let changed = connection.execute(
+        "UPDATE memories SET status = 'superseded', superseded_by = ?2, updated_at = ?4
+         WHERE id = ?1 AND user_id = ?3 AND status = 'active'
+           AND EXISTS (SELECT 1 FROM memories WHERE id = ?2 AND user_id = ?3)",
+        params![old_id, new_id, user_id, now_string(Utc::now())],
+    )?;
+    Ok(changed == 1)
+}
+
+/// Hold one of the acting user's active facts for review (`pending`): an
+/// extracted fact that disagrees with something the owner saved never
+/// silently wins (0.62).
+pub fn hold_for_review(store: &Store, user_id: &str, id: &str) -> Result<bool> {
+    let connection = store.connection()?;
+    let changed = connection.execute(
+        "UPDATE memories SET status = 'pending', updated_at = ?3
+         WHERE id = ?1 AND user_id = ?2 AND status = 'active'",
+        params![id, user_id, now_string(Utc::now())],
+    )?;
+    Ok(changed == 1)
 }
 
 /// Update the content of one memory of the acting user, preserving kind,
@@ -880,6 +1003,8 @@ pub struct MemoryHub {
     local: SqliteMemory,
     remote: Option<Mem0Memory>,
     gateway: Gateway,
+    /// Local embeddings for semantic recall (0.62); `None` is keyword-only.
+    semantic: Option<crate::memory_vectors::SemanticIndex>,
 }
 
 impl MemoryHub {
@@ -903,7 +1028,55 @@ impl MemoryHub {
             local: SqliteMemory::new(gateway.store().clone()),
             remote,
             gateway,
+            semantic: None,
         })
+    }
+
+    /// Turn on semantic recall with this embedder (0.62).
+    pub fn with_semantic(mut self, index: crate::memory_vectors::SemanticIndex) -> Self {
+        self.semantic = Some(index);
+        self
+    }
+
+    pub fn semantic(&self) -> Option<&crate::memory_vectors::SemanticIndex> {
+        self.semantic.as_ref()
+    }
+
+    /// Semantic scores for `query`, after embedding a small batch of missing
+    /// vectors. Any failure (no model cache, a bad vector) is logged and
+    /// reads as no semantic match, so recall falls back to keywords.
+    async fn semantic_scores(
+        &self,
+        user_id: &str,
+        query: &str,
+        statuses: &[&str],
+    ) -> HashMap<String, f64> {
+        let Some(index) = &self.semantic else {
+            return HashMap::new();
+        };
+        if query_tokens(query).is_empty() {
+            return HashMap::new();
+        }
+        let store = self.gateway.store();
+        if let Err(error) = index.backfill(store, user_id).await {
+            warn!(%error, "memory vectors were not refreshed");
+        }
+        match index.scores(store, user_id, query, statuses).await {
+            Ok(scores) => scores,
+            Err(error) => {
+                warn!(%error, "semantic memory recall skipped");
+                HashMap::new()
+            }
+        }
+    }
+
+    /// Best-effort vector for a stored or edited memory.
+    async fn index_one(&self, user_id: &str, id: &str) {
+        if let Some(index) = &self.semantic
+            && let Err(error) = index.index(self.gateway.store(), user_id, id).await
+        {
+            warn!(%error, "memory vector was not written");
+        }
     }
 
     /// Whether a third-party recall source is configured (it may still be
@@ -926,7 +1099,8 @@ impl MemoryProvider for MemoryHub {
         k: usize,
         bot: Option<&str>,
     ) -> Result<Vec<Recalled>> {
-        let local = self.local.recall(user_id, query, k, bot).await?;
+        let semantic = self.semantic_scores(user_id, query, &[STATUS_ACTIVE]).await;
+        let local = recall_hybrid(self.gateway.store(), user_id, query, k, bot, &semantic)?;
         let Some(remote) = &self.remote else {
             return Ok(local);
         };
@@ -947,11 +1121,28 @@ impl MemoryProvider for MemoryHub {
         filter: &MemoryFilter,
         limit: usize,
     ) -> Result<Vec<Recalled>> {
-        self.local.search(user_id, query, filter, limit).await
+        let semantic = self
+            .semantic_scores(
+                user_id,
+                query,
+                &[STATUS_ACTIVE, STATUS_PENDING, STATUS_SUPERSEDED],
+            )
+            .await;
+        search_hybrid(
+            self.gateway.store(),
+            user_id,
+            query,
+            filter,
+            limit,
+            &semantic,
+        )
     }
 
     async fn write(&self, user_id: &str, candidate: &Candidate) -> Result<WriteOutcome> {
         let outcome = self.local.write(user_id, candidate).await?;
+        if !matches!(outcome, WriteOutcome::Duplicate(_)) {
+            self.index_one(user_id, &outcome.memory().id).await;
+        }
         // Pending facts stay local until the owner approves them.
         if let Some(remote) = &self.remote
             && candidate.status == STATUS_ACTIVE
@@ -964,7 +1155,9 @@ impl MemoryProvider for MemoryHub {
     }
 
     async fn update(&self, user_id: &str, id: &str, patch: &MemoryPatch) -> Result<Memory> {
-        self.local.update(user_id, id, patch).await
+        let memory = self.local.update(user_id, id, patch).await?;
+        self.index_one(user_id, &memory.id).await;
+        Ok(memory)
     }
 
     async fn forget(&self, user_id: &str, id: &str) -> Result<bool> {
@@ -1045,6 +1238,7 @@ enum Mode {
     Search,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rank(
     store: &Store,
     user_id: &str,
@@ -1053,6 +1247,7 @@ fn rank(
     bot: Option<&str>,
     limit: usize,
     mode: Mode,
+    semantic: &HashMap<String, f64>,
 ) -> Result<Vec<Recalled>> {
     let limit = limit.clamp(1, MAX_SEARCH_LIMIT);
     let values = filter.sql_values()?;
@@ -1076,6 +1271,7 @@ fn rank(
         lexical_scores.insert(id, normalized);
     }
     let mut ids: Vec<String> = lexical_scores.keys().cloned().collect();
+    ids.extend(semantic.keys().cloned());
     ids.extend(recent_ids(&connection, user_id, &values, POOL_RECENT)?);
     ids.sort();
     ids.dedup();
@@ -1084,11 +1280,18 @@ fn rank(
     let mut ranked: Vec<Recalled> = rows
         .into_iter()
         .filter_map(|memory| {
-            let lexical = lexical_scores.get(&memory.id).copied();
-            if mode == Mode::Search && lexical.is_none() {
+            // `load_rows` reads ids, so a semantic id must still pass the
+            // filter (status, origin, kind, bot, pin) to count.
+            if !values.admits(&memory) {
                 return None;
             }
-            let score = score_of(&memory, lexical.unwrap_or(0.0), bot, now);
+            let lexical = lexical_scores.get(&memory.id).copied();
+            let meaning = semantic.get(&memory.id).copied();
+            if mode == Mode::Search && lexical.is_none() && meaning.is_none() {
+                return None;
+            }
+            let relevance = lexical.unwrap_or(0.0).max(meaning.unwrap_or(0.0));
+            let score = score_of(&memory, relevance, bot, now);
             Some(Recalled { memory, score })
         })
         .collect();

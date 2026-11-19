@@ -267,4 +267,13 @@ never merge without the owner's OK.
 - [x] Chat transcript CSS merged into one block in `system.css`; light-theme user bubble contrast fixed (1.41:1 → 12.25:1).
 - [x] Reply measure capped at 72ch.
 - [ ] Owner: look at the chat on Windows (light and dark, Small/Large text) and run one turn that uses and saves a memory.
-- [ ] Next: embedding-based memory recall alongside FTS5 (keyword-only recall misses paraphrases).
+- [x] Next: embedding-based memory recall alongside FTS5 (done in 0.62.0).
+
+## Release 0.62.0 — Semantic memory recall, contradiction check
+
+- [x] `memory_vectors` (migration 0042): local E5 vector per fact; recall, `memory_search`/`memory_list` and console search use `max(lexical, semantic)`.
+- [x] `runtime/conflicts.rs`: post-turn contradiction check (bounded judge, ids validated); retire the older fact, or hold an extracted guess that disagrees with the owner.
+- [x] `turn.memory` saved covers `memory_save`; `replaces` shown in the reply trace.
+- [x] Chat polish: no duplicate "Running" label; transcript padding clears the composer fade.
+- [ ] Owner: run with the real E5 cache — check a paraphrase recall and one changed decision in a live turn.
+- [ ] Later: private per-bot memory scope; a contradiction check for facts added from the console.

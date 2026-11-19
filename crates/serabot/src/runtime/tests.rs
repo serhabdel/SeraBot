@@ -5013,3 +5013,143 @@ async fn extraction_returns_the_memories_it_saved() {
     assert_eq!(saved[0].excerpt, "Works from Lisbon on Fridays");
     assert!(!saved[0].pending);
 }
+
+fn conversation_fact(origin: &str, content: &str) -> crate::memory::Candidate {
+    crate::memory::Candidate {
+        kind: "fact".into(),
+        content: content.into(),
+        source: "operator:test".into(),
+        origin: origin.into(),
+        bot: Some("main".into()),
+        conversation_id: Some("dir:owner".into()),
+        importance: 0.6,
+        status: crate::memory::STATUS_ACTIVE.into(),
+    }
+}
+
+async fn judge_says(server: &MockServer, new: &str, old: &str) {
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(Sequence::new(vec![serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": format!("{{\"replaces\":[{{\"new\":\"{new}\",\"old\":\"{old}\"}}]}}")}, "finish_reason": "stop"}]
+        })]))
+        .mount(server)
+        .await;
+}
+
+/// 0.62: a changed decision retires the older fact, and the chat is told
+/// which fact it replaced.
+#[tokio::test]
+async fn a_changed_decision_retires_the_older_fact() {
+    let server = MockServer::start().await;
+    let (runtime, store) = setup(
+        &server.uri(),
+        Arc::new(Capture::default()),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    );
+    let admin_id = admin(&store);
+    let old = crate::memory::add(
+        &store,
+        &admin_id,
+        "fact",
+        "The weekly report is mandatory for the team",
+        "operator:test",
+    )
+    .unwrap();
+    let since = chrono::Utc::now();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let new = crate::memory::write(
+        &store,
+        &admin_id,
+        &conversation_fact("explicit", "The weekly report is optional from now on"),
+    )
+    .unwrap()
+    .memory()
+    .clone();
+    judge_says(&server, &new.id, &old.id).await;
+    let outcomes = runtime
+        .check_conflicts(&admin_id, "main", "dir:owner", since)
+        .await;
+    assert_eq!(outcomes[&new.id].retired, vec![old.id.clone()]);
+    let old_now = crate::memory::get(&store, &admin_id, &old.id).unwrap();
+    assert_eq!(old_now.status, "superseded");
+    assert_eq!(old_now.superseded_by.as_deref(), Some(new.id.as_str()));
+    let saved = runtime.turn_saved(&admin_id, "dir:owner", since);
+    assert_eq!(saved.len(), 1);
+    assert_eq!(
+        saved[0].replaces,
+        vec!["The weekly report is mandatory for the team".to_owned()]
+    );
+}
+
+/// 0.62: an extracted guess that disagrees with the owner's own words is held
+/// for review; the owner's fact stays.
+#[tokio::test]
+async fn an_extracted_guess_never_overrides_the_owner() {
+    let server = MockServer::start().await;
+    let (runtime, store) = setup(
+        &server.uri(),
+        Arc::new(Capture::default()),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    );
+    let admin_id = admin(&store);
+    let old = crate::memory::add(
+        &store,
+        &admin_id,
+        "fact",
+        "The weekly report is mandatory for the team",
+        "operator:test",
+    )
+    .unwrap();
+    let since = chrono::Utc::now();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let new = crate::memory::write(
+        &store,
+        &admin_id,
+        &conversation_fact("extracted", "The weekly report seems optional"),
+    )
+    .unwrap()
+    .memory()
+    .clone();
+    // The judge may only name ids it was shown: a foreign id is ignored.
+    judge_says(&server, &new.id, &old.id).await;
+    runtime
+        .check_conflicts(&admin_id, "main", "dir:owner", since)
+        .await;
+    assert_eq!(
+        crate::memory::get(&store, &admin_id, &old.id)
+            .unwrap()
+            .status,
+        "active"
+    );
+    assert_eq!(
+        crate::memory::get(&store, &admin_id, &new.id)
+            .unwrap()
+            .status,
+        "pending"
+    );
+}
+
+/// 0.62: nothing to compare means no model call and no change.
+#[tokio::test]
+async fn a_turn_without_new_facts_makes_no_conflict_call() {
+    let server = MockServer::start().await;
+    let (runtime, store) = setup(
+        &server.uri(),
+        Arc::new(Capture::default()),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    );
+    let admin_id = admin(&store);
+    crate::memory::add(&store, &admin_id, "fact", "Lives in Porto", "operator:test").unwrap();
+    let outcomes = runtime
+        .check_conflicts(&admin_id, "main", "dir:owner", chrono::Utc::now())
+        .await;
+    assert!(outcomes.is_empty());
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+    );
+}

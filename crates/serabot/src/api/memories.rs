@@ -64,7 +64,15 @@ pub(super) async fn list_memories(
                     "search text must be at most 200 characters without control characters".into(),
                 ));
             }
-            let hits = memory::search(&state.store, &user.id, needle, &filter, limit)?;
+            // The hub adds semantic matches when they are on (0.62).
+            let hits = crate::memory::MemoryProvider::search(
+                state.runtime.memory(),
+                &user.id,
+                needle,
+                &filter,
+                limit,
+            )
+            .await?;
             (
                 hits.into_iter().map(|hit| hit.memory).collect::<Vec<_>>(),
                 0,

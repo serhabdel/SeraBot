@@ -175,6 +175,14 @@ summary_every = 30
 # mem0_api_base = "https://api.mem0.ai"
 # mem0_timeout_secs = 8
 # extract_timeout_secs = 45
+# Semantic recall (0.62): local E5 embeddings per fact, blended with keyword
+# relevance. Uses the [embeddings] model; false keeps keyword-only recall.
+# semantic_recall = true
+# semantic_min_similarity = 0.82
+# Contradiction check (0.62): after a turn saves facts, one bounded model call
+# retires the older fact a new one makes untrue (or holds an extracted guess
+# that disagrees with the owner for review).
+# conflict_check = true
 
 [policy]
 blocklist_file = "private/blocklist.txt"

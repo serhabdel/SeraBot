@@ -506,11 +506,21 @@ impl Tool for MemorySaveTool {
 
 pub struct MemoryListTool {
     store: Store,
+    /// Semantic recall (0.62): a paraphrase finds the fact too.
+    semantic: Option<crate::memory_vectors::SemanticIndex>,
 }
 
 impl MemoryListTool {
     pub fn new(store: Store) -> Self {
-        Self { store }
+        Self {
+            store,
+            semantic: None,
+        }
+    }
+
+    pub fn with_semantic(mut self, semantic: Option<crate::memory_vectors::SemanticIndex>) -> Self {
+        self.semantic = semantic;
+        self
     }
 }
 
@@ -552,12 +562,13 @@ impl Tool for MemoryListTool {
             .filter(|s| !s.is_empty());
         // A query searches every active memory (not just the newest rows).
         let memories: Vec<crate::memory::Memory> = match query {
-            Some(q) => crate::memory::search(
+            Some(q) => crate::memory::search_hybrid(
                 &self.store,
                 &context.user_id,
                 q,
                 &crate::memory::MemoryFilter::default(),
                 limit,
+                &semantic_scores(self.semantic.as_ref(), &self.store, &context.user_id, q).await,
             )?
             .into_iter()
             .map(|item| item.memory)
@@ -645,11 +656,21 @@ impl Tool for MemoryDeleteTool {
 
 pub struct MemorySearchTool {
     store: Store,
+    /// Semantic recall (0.62): a paraphrase finds the fact too.
+    semantic: Option<crate::memory_vectors::SemanticIndex>,
 }
 
 impl MemorySearchTool {
     pub fn new(store: Store) -> Self {
-        Self { store }
+        Self {
+            store,
+            semantic: None,
+        }
+    }
+
+    pub fn with_semantic(mut self, semantic: Option<crate::memory_vectors::SemanticIndex>) -> Self {
+        self.semantic = semantic;
+        self
     }
 }
 
@@ -693,12 +714,15 @@ impl Tool for MemorySearchTool {
             .and_then(Value::as_u64)
             .unwrap_or(8)
             .clamp(1, 20) as usize;
-        let hits = crate::memory::search(
+        let semantic =
+            semantic_scores(self.semantic.as_ref(), &self.store, &context.user_id, query).await;
+        let hits = crate::memory::search_hybrid(
             &self.store,
             &context.user_id,
             query,
             &crate::memory::MemoryFilter::default(),
             limit,
+            &semantic,
         )?;
         let result = json!({
             "memories": hits.into_iter().map(|hit| json!({
@@ -795,13 +819,37 @@ impl Tool for MemoryUpdateTool {
     }
 }
 
+/// Semantic scores for a memory tool query; empty when semantic recall is off
+/// or the model is unavailable (keyword search still answers).
+async fn semantic_scores(
+    semantic: Option<&crate::memory_vectors::SemanticIndex>,
+    store: &Store,
+    user_id: &str,
+    query: &str,
+) -> std::collections::HashMap<String, f64> {
+    let Some(index) = semantic else {
+        return std::collections::HashMap::new();
+    };
+    if let Err(error) = index.backfill(store, user_id).await {
+        tracing::warn!(%error, "memory vectors were not refreshed");
+    }
+    index
+        .scores(store, user_id, query, &[crate::memory::STATUS_ACTIVE])
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "semantic memory search skipped");
+            std::collections::HashMap::new()
+        })
+}
+
 pub fn register_memory_tools(
     registry: &mut crate::gateway::ToolRegistry,
     store: Store,
+    semantic: Option<crate::memory_vectors::SemanticIndex>,
 ) -> Result<()> {
     registry.register(MemorySaveTool::new(store.clone()))?;
-    registry.register(MemoryListTool::new(store.clone()))?;
-    registry.register(MemorySearchTool::new(store.clone()))?;
+    registry.register(MemoryListTool::new(store.clone()).with_semantic(semantic.clone()))?;
+    registry.register(MemorySearchTool::new(store.clone()).with_semantic(semantic))?;
     registry.register(MemoryUpdateTool::new(store.clone()))?;
     registry.register(crate::plans::PlanUpdateTool::new(store.clone()))?;
     registry.register(MemoryDeleteTool::new(store.clone()))?;

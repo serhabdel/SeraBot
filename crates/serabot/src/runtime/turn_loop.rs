@@ -975,7 +975,7 @@ impl Runtime {
                     let untrusted = extract::turn_used_untrusted_source(&state.messages);
                     self.spawn_post_turn_memory(
                         &user,
-                        (&task.id, &turn.id),
+                        (&task.id, &turn.id, turn.created_at),
                         &turn.bot,
                         conversation_id,
                         owner,
