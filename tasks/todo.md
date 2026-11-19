@@ -291,3 +291,10 @@ never merge without the owner's OK.
 - [x] WhatsApp chats listed under the WhatsApp bot ("WhatsApp · +number"); read-only `whatsapp_link_chats` tool.
 - [x] `whatsapp_link_send` off the approval list (allowlist + per-minute/daily caps); spec, approvals doc, AGENTS.md updated.
 - [ ] Owner: send a voice note on WhatsApp (with a Mistral account connected if server audio is off) and check the bot's answer.
+
+## Release 0.65.0 — WhatsApp LID-addressed chats, desktop relay design
+
+- [x] Inbound WhatsApp accepts LID-addressed chats via sender_alt / recipient_alt / LID-to-phone map (messages were silently dropped).
+- [x] `docs/specs/desktop-network-relay.md`: proposed CONNECT-over-WebSocket relay through the desktop (TLS end to end, host allowlist, private-address refusal, opt-in).
+- [ ] Owner: write to the WhatsApp number from an allowed phone; the bot should answer within seconds.
+- [ ] Owner: answer the relay open questions; build in 0.66.

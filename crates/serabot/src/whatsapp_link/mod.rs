@@ -91,18 +91,49 @@ pub fn decide_inbound(
     is_from_me: bool,
     is_group: bool,
 ) -> InboundDecision {
+    decide_inbound_any(
+        user_id,
+        allowlist,
+        &[chat.to_string()],
+        is_from_me,
+        is_group,
+    )
+}
+
+/// [`decide_inbound`] over every address a message carries (0.65).
+/// WhatsApp now addresses most one-to-one chats by a private id
+/// (`…@lid`) and puts the phone number in an alternate field; the first
+/// candidate that is a phone JID on the allowlist decides. A LID alone never
+/// matches, so a chat whose number is unknown stays dropped.
+pub fn decide_inbound_any(
+    user_id: &str,
+    allowlist: &[String],
+    candidates: &[String],
+    is_from_me: bool,
+    is_group: bool,
+) -> InboundDecision {
     if is_from_me || is_group {
         return InboundDecision::Drop;
     }
-    let Ok(jid) = normalize_jid(chat) else {
-        return InboundDecision::Drop;
-    };
-    if !allowlist.iter().any(|allowed| allowed == &jid) {
-        return InboundDecision::Drop;
+    for candidate in candidates {
+        let Ok(jid) = normalize_jid(candidate) else {
+            continue;
+        };
+        if allowlist.iter().any(|allowed| allowed == &jid) {
+            return InboundDecision::Accept {
+                conversation_id: conversation_id_for(user_id, &jid),
+            };
+        }
     }
-    InboundDecision::Accept {
-        conversation_id: conversation_id_for(user_id, &jid),
-    }
+    InboundDecision::Drop
+}
+
+/// The phone JID an accepted message came from, among its candidates.
+pub fn allowed_phone_jid(allowlist: &[String], candidates: &[String]) -> Option<String> {
+    candidates
+        .iter()
+        .filter_map(|candidate| normalize_jid(candidate).ok())
+        .find(|jid| allowlist.iter().any(|allowed| allowed == jid))
 }
 
 impl Store {
@@ -345,6 +376,49 @@ mod tests {
                 .whatsapp_link_chat(&alice, &conversation)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// 0.65: WhatsApp addresses most one-to-one chats by a private id
+    /// (`…@lid`). The phone number in the alternate address decides; a LID
+    /// alone never matches the allowlist.
+    #[test]
+    fn lid_addressed_chats_are_matched_by_their_phone_number() {
+        let allow = vec!["212643597336@s.whatsapp.net".to_string()];
+        let lid_only = vec!["100000012345678@lid".to_string()];
+        assert_eq!(
+            decide_inbound_any("u", &allow, &lid_only, false, false),
+            InboundDecision::Drop
+        );
+        let with_alt = vec![
+            "100000012345678@lid".to_string(),
+            "100000012345678:3@lid".to_string(),
+            "212643597336@s.whatsapp.net".to_string(),
+        ];
+        assert_eq!(
+            decide_inbound_any("u", &allow, &with_alt, false, false),
+            InboundDecision::Accept {
+                conversation_id: conversation_id_for("u", "212643597336@s.whatsapp.net"),
+            }
+        );
+        assert_eq!(
+            allowed_phone_jid(&allow, &with_alt).as_deref(),
+            Some("212643597336@s.whatsapp.net")
+        );
+        // Own messages and groups stay out, whatever the addresses.
+        assert_eq!(
+            decide_inbound_any("u", &allow, &with_alt, true, false),
+            InboundDecision::Drop
+        );
+        assert_eq!(
+            decide_inbound_any("u", &allow, &with_alt, false, true),
+            InboundDecision::Drop
+        );
+        // A number that is not allowed stays out.
+        let stranger = vec!["33600000000@s.whatsapp.net".to_string()];
+        assert_eq!(
+            decide_inbound_any("u", &allow, &stranger, false, false),
+            InboundDecision::Drop
         );
     }
 }
