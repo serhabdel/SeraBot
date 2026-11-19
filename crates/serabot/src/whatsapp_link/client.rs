@@ -21,7 +21,7 @@ use whatsapp_rust::prelude::*;
 use whatsapp_rust::wacore::proto_helpers::MessageExt;
 use whatsapp_rust::waproto::whatsapp as wa;
 
-use super::{InboundDecision, decide_inbound, normalize_jid};
+use super::{InboundDecision, normalize_jid};
 use crate::config::Config;
 use crate::error::{Result, SeraError};
 use crate::runtime::{ApprovalNotice, Notifier, Runtime};
@@ -354,17 +354,48 @@ impl WhatsappLink {
             .map(|account| account.allowlist)
             .unwrap_or_default();
         let source = &ctx.info.source;
-        let chat = source.chat.to_string();
-        let InboundDecision::Accept { conversation_id } = decide_inbound(
+        // 0.65: every address the message carries. A LID-addressed chat
+        // (`…@lid`) has its phone number in `sender_alt`, or in the
+        // client's LID-to-phone map; before this, such messages were all
+        // dropped because only the chat id was checked.
+        let mut candidates: Vec<String> = [
+            Some(&source.chat),
+            Some(&source.sender),
+            source.sender_alt.as_ref(),
+            source.recipient_alt.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|jid| jid.to_non_ad_string())
+        .collect();
+        for jid in [Some(&source.chat), Some(&source.sender)]
+            .into_iter()
+            .flatten()
+        {
+            if jid.is_lid()
+                && let Ok(Some(entry)) = ctx.client.get_lid_pn_entry(jid).await
+            {
+                candidates.push(format!("{}@s.whatsapp.net", entry.phone_number));
+            }
+        }
+        let is_group = source.is_group || source.chat.to_string().ends_with("@g.us");
+        let InboundDecision::Accept { conversation_id } = super::decide_inbound_any(
             user_id,
             &allowlist,
-            &chat,
+            &candidates,
             source.is_from_me,
-            source.is_group,
+            is_group,
         ) else {
+            if !source.is_from_me && !is_group {
+                tracing::info!(
+                    "whatsapp link: a message from a chat that is not on the allowed list was ignored"
+                );
+            }
             return Ok(());
         };
-        let jid = normalize_jid(&chat)?;
+        let Some(jid) = super::allowed_phone_jid(&allowlist, &candidates) else {
+            return Ok(());
+        };
         let Some(runtime) = self.runtime.get() else {
             return Err(SeraError::Internal("runtime not ready".into()));
         };

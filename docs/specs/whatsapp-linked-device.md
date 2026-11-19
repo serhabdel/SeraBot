@@ -185,3 +185,14 @@ Approved by the owner on 2026-11-19.
   console, titled "WhatsApp · +number". The WhatsApp bot can read its chats'
   latest messages with `whatsapp_link_chats` (read-only, the acting member's
   allowed chats only), so it can answer from the console about what arrived.
+
+## 0.65: LID-addressed chats
+
+WhatsApp now addresses most one-to-one chats by a private id (`…@lid`)
+instead of the phone number. Until 0.65 the inbound check only accepted
+`…@s.whatsapp.net`, so those messages, texts and voice notes alike, were
+dropped before reaching the bot. The check now looks at every address the
+message carries: the chat, the sender, `sender_alt`, `recipient_alt`, and
+the client's LID-to-phone map. It accepts the message when one of them is a
+phone number on the allowlist. A LID alone never matches, groups and own
+messages stay out, and an ignored message is logged without any number.
