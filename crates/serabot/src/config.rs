@@ -459,6 +459,45 @@ impl Config {
     pub fn database_path(&self) -> PathBuf {
         self.path(&self.database.path)
     }
+
+    /// Resolve a writable runtime directory. Tries `self.path(configured)`
+    /// first; if creating or writing to it fails (for example when the config
+    /// folder `/etc/serabot` is read-only under systemd `ProtectSystem=strict`),
+    /// falls back to `<parent(database_path)>/<fallback_subdir>`.
+    pub fn ensure_writable_dir(
+        &self,
+        configured: impl AsRef<Path>,
+        fallback_subdir: &str,
+    ) -> std::io::Result<PathBuf> {
+        let primary = self.path(configured);
+        if dir_is_writable(&primary).is_ok() {
+            return Ok(primary);
+        }
+        if let Some(db_parent) = self.database_path().parent().map(Path::to_path_buf) {
+            let fallback = db_parent.join(fallback_subdir);
+            if fallback != primary && dir_is_writable(&fallback).is_ok() {
+                return Ok(fallback);
+            }
+        }
+        dir_is_writable(&primary).map(|()| primary)
+    }
+}
+
+fn dir_is_writable(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let probe = dir.join(format!(".serabot-write-probe-{}", std::process::id()));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Tool approval policy. Only destructive tools need approval by default.
@@ -4157,6 +4196,28 @@ tasks_per_user_per_day = 500
         let all_builtin =
             load_bots_with_builtin(&empty_config, &empty_config.fleet.bots_dir).unwrap();
         assert_eq!(all_builtin.len(), 20);
+    }
+
+    #[test]
+    fn ensure_writable_dir_falls_back_beside_database_when_primary_cannot_be_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("readonly_config_dir");
+        std::fs::write(&blocker, b"not a dir").unwrap();
+
+        let db_dir = dir.path().join("state");
+        std::fs::create_dir_all(&db_dir).unwrap();
+
+        let mut config = Config {
+            base_dir: blocker,
+            ..Default::default()
+        };
+        config.database.path = db_dir.join("serabot.db").to_string_lossy().into_owned();
+
+        let resolved = config
+            .ensure_writable_dir("data/whatsapp", "whatsapp")
+            .expect("should fall back to database parent");
+        assert_eq!(resolved, db_dir.join("whatsapp"));
+        assert!(resolved.is_dir());
     }
 }
 

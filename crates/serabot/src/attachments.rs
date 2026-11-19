@@ -225,28 +225,58 @@ pub fn load_images_for_model(
         if out.len() >= MAX_VISION_IMAGES {
             break;
         }
-        let extension = allowed_extension(&attachment.filename).unwrap_or_default();
-        if !IMAGE_EXTENSIONS.contains(&extension.as_str()) {
-            continue;
-        }
         if !is_safe_user_rel_path(user_id, &attachment.rel_path) {
             continue;
         }
-        let Ok(bytes) = std::fs::read(root.join(&attachment.rel_path)) else {
-            continue;
-        };
-        if bytes.is_empty() || bytes.len() > MAX_VISION_IMAGE_BYTES {
+        let extension = allowed_extension(&attachment.filename).unwrap_or_default();
+        if IMAGE_EXTENSIONS.contains(&extension.as_str()) {
+            let Ok(bytes) = std::fs::read(root.join(&attachment.rel_path)) else {
+                continue;
+            };
+            if bytes.is_empty() || bytes.len() > MAX_VISION_IMAGE_BYTES {
+                continue;
+            }
+            if total_bytes.saturating_add(bytes.len()) > MAX_VISION_TOTAL_BYTES {
+                continue;
+            }
+            total_bytes += bytes.len();
+            out.push(crate::domain::LlmImage {
+                mime: attachment.mime.clone(),
+                data_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                filename: Some(attachment.filename.clone()),
+            });
             continue;
         }
-        if total_bytes.saturating_add(bytes.len()) > MAX_VISION_TOTAL_BYTES {
-            continue;
+        if extension == "pdf" {
+            let Ok(bytes) = std::fs::read(root.join(&attachment.rel_path)) else {
+                continue;
+            };
+            let has_text = crate::documents::extract_pdf_text(bytes.clone())
+                .map(|t| t.trim().chars().count() >= MIN_PDF_TEXT_CHARS)
+                .unwrap_or(false);
+            if has_text {
+                continue;
+            }
+            let remaining_slots = MAX_VISION_IMAGES.saturating_sub(out.len());
+            for (index, (mime, img_bytes)) in crate::documents::extract_pdf_images(
+                &bytes,
+                remaining_slots,
+                MAX_VISION_IMAGE_BYTES,
+            )
+            .into_iter()
+            .enumerate()
+            {
+                if total_bytes.saturating_add(img_bytes.len()) > MAX_VISION_TOTAL_BYTES {
+                    break;
+                }
+                total_bytes += img_bytes.len();
+                out.push(crate::domain::LlmImage {
+                    mime,
+                    data_base64: base64::engine::general_purpose::STANDARD.encode(&img_bytes),
+                    filename: Some(format!("{} (page {})", attachment.filename, index + 1)),
+                });
+            }
         }
-        total_bytes += bytes.len();
-        out.push(crate::domain::LlmImage {
-            mime: attachment.mime.clone(),
-            data_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
-            filename: Some(attachment.filename.clone()),
-        });
     }
     out
 }
@@ -307,7 +337,7 @@ pub fn render_for_model(
         let text = if TEXT_EXTENSIONS.contains(&extension.as_str()) {
             Some(String::from_utf8_lossy(&bytes).into_owned())
         } else if extension == "pdf" {
-            crate::documents::extract_pdf_text(bytes).ok()
+            crate::documents::extract_pdf_text(bytes.clone()).ok()
         } else if extension == "xlsx" {
             crate::workbooks::plain_text(&bytes, excerpt_limit).ok()
         } else {
@@ -346,10 +376,20 @@ pub fn render_for_model(
             }
         });
         if text.is_none() && is_pdf {
-            out.push_str(
-                "  (no text layer: this PDF looks scanned. Call document_index with this inbox \
-                 path to read it with OCR, then rag_search it.)\n",
-            );
+            let has_inline_pages =
+                !crate::documents::extract_pdf_images(&bytes, 1, MAX_VISION_IMAGE_BYTES).is_empty();
+            if has_inline_pages {
+                out.push_str(
+                    "  (scanned PDF: embedded page image(s) attached inline for vision-capable \
+                     models; you can also call document_index with this inbox path to run OCR \
+                     and index the full text.)\n",
+                );
+            } else {
+                out.push_str(
+                    "  (no text layer: this PDF looks scanned. Call document_index with this inbox \
+                     path to read it with OCR, then rag_search it.)\n",
+                );
+            }
         }
         if let Some(text) = text {
             let excerpt: String = text.chars().take(excerpt_limit).collect();

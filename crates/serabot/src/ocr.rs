@@ -149,6 +149,74 @@ fn ocr_provider_credential(config: &Config) -> Result<(OcrProviderSettings, Stri
     Ok((provider, api_key))
 }
 
+/// Try to resolve an OCR API key from the acting user's own sealed provider
+/// accounts (e.g. a connected Mistral account) before falling back to the
+/// server-wide age secret store.
+fn resolve_user_ocr_credential(
+    config: &Config,
+    store: &crate::store::Store,
+    user_id: &str,
+) -> Option<(OcrProviderSettings, String)> {
+    let secrets = crate::user_secrets::UserSecrets::open(config, store.clone()).ok()?;
+    let accounts = crate::accounts::Accounts::new(store.clone(), std::sync::Arc::new(secrets));
+    let configured = config.ocr.provider.trim();
+    let mut providers: Vec<&str> = Vec::new();
+    if !configured.is_empty() && configured != "default" {
+        providers.push(configured);
+    }
+    if !providers.contains(&"mistral") {
+        providers.push("mistral");
+    }
+    for provider in providers {
+        let mut ids = store
+            .usable_account_ids(user_id, provider)
+            .unwrap_or_default();
+        if !ids.iter().any(|id| id == crate::accounts::DEFAULT_ACCOUNT) {
+            ids.push(crate::accounts::DEFAULT_ACCOUNT.to_owned());
+        }
+        for account_id in ids {
+            let Ok(Some(cred)) = accounts.credential(user_id, provider, &account_id) else {
+                continue;
+            };
+            let key = cred.api_key.trim();
+            if key.is_empty() {
+                continue;
+            }
+            let base_url = config
+                .ocr
+                .base_url
+                .clone()
+                .or_else(|| {
+                    config
+                        .llm
+                        .providers
+                        .get(provider)
+                        .map(|profile| profile.base_url.clone())
+                })
+                .unwrap_or_else(|| "https://api.mistral.ai/v1".to_owned());
+            return Some((
+                OcrProviderSettings {
+                    base_url,
+                    api_key_secret: String::new(),
+                    data_egress_approved: true,
+                },
+                key.to_owned(),
+            ));
+        }
+    }
+    None
+}
+
+/// Whether the acting user has a connected OCR-capable provider account
+/// (such as Mistral) that can be used for automatic scanned-PDF OCR.
+pub fn user_has_ocr_credential(
+    config: &Config,
+    store: &crate::store::Store,
+    user_id: &str,
+) -> bool {
+    resolve_user_ocr_credential(config, store, user_id).is_some()
+}
+
 /// Owner-facing readiness of the OCR provider.
 pub fn ocr_provider_state(config: &Config) -> OcrProviderState {
     match ocr_provider_credential(config) {
@@ -168,6 +236,32 @@ pub fn ocr_available(config: &Config) -> bool {
 /// `document_url`, an image becomes a base64 `image_url`. Everything else is
 /// rejected before any network call.
 pub async fn recognize_bytes(config: &Config, bytes: &[u8], mime: &str) -> Result<Vec<OcrPage>> {
+    recognize_bytes_with_provider(config, ocr_provider_credential(config)?, bytes, mime).await
+}
+
+/// Recognize text in a PDF or image for a specific user: prefers the user's
+/// own connected OCR provider account (e.g. Mistral) and falls back to the
+/// server-wide OCR configuration.
+pub async fn recognize_bytes_for_user(
+    config: &Config,
+    store: &crate::store::Store,
+    user_id: &str,
+    bytes: &[u8],
+    mime: &str,
+) -> Result<Vec<OcrPage>> {
+    let resolved = match resolve_user_ocr_credential(config, store, user_id) {
+        Some(pair) => pair,
+        None => ocr_provider_credential(config)?,
+    };
+    recognize_bytes_with_provider(config, resolved, bytes, mime).await
+}
+
+async fn recognize_bytes_with_provider(
+    config: &Config,
+    (provider, api_key): (OcrProviderSettings, String),
+    bytes: &[u8],
+    mime: &str,
+) -> Result<Vec<OcrPage>> {
     if bytes.is_empty() {
         return Err(SeraError::Validation("OCR payload is empty".into()));
     }
@@ -177,7 +271,6 @@ pub async fn recognize_bytes(config: &Config, bytes: &[u8], mime: &str) -> Resul
             config.ocr.max_bytes
         )));
     }
-    let (provider, api_key) = ocr_provider_credential(config)?;
     let client = OcrClient::new(
         provider.base_url,
         api_key,

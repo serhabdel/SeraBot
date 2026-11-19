@@ -82,8 +82,14 @@ impl WhatsappLink {
         if !crate::user_inbox::safe_user_segment(user_id) {
             return Err(SeraError::Forbidden("unsafe account id".into()));
         }
-        let dir = self.config.path(&self.config.whatsapp_link.dir);
-        std::fs::create_dir_all(&dir)?;
+        let dir = self
+            .config
+            .ensure_writable_dir(&self.config.whatsapp_link.dir, "whatsapp")
+            .map_err(|error| {
+                SeraError::Validation(format!(
+                    "WhatsApp session directory is not writable ({error}). Set [whatsapp_link] dir to a writable path."
+                ))
+            })?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

@@ -184,7 +184,12 @@ async fn main() -> anyhow::Result<()> {
     // cannot be created.
     let cli = Cli::parse();
     let (log_dir, log_level) = match Config::load(&cli.config) {
-        Ok(config) => (config.path(&config.logging.dir), config.logging.level),
+        Ok(config) => (
+            config
+                .ensure_writable_dir(&config.logging.dir, "logs")
+                .unwrap_or_else(|_| config.path(&config.logging.dir)),
+            config.logging.level,
+        ),
         Err(_) => {
             let parent = std::path::Path::new(&cli.config)
                 .parent()

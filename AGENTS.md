@@ -120,4 +120,4 @@ OVH is read-only unless the owner explicitly authorizes an additive installation
 - `crates/serabot-desktop/src/acp/` (protocol, client, setup, transcript, controller), `ui_claude_code.rs`, `assets/claude-code.css` — Claude Code on this computer over ACP (0.54; integrated per-bot with persisted transcripts and folder choice in 0.55).
 - `crates/serabot/src/whatsapp_link/`, `api/whatsapp_link.rs`, `crates/serabot-desktop/src/ui_whatsapp_link.rs` — WhatsApp linked device: allowlist, chat mapping, per-member client, approval-gated send, desktop card (0.58; enabled by default in 0.59).
 - `crates/serabot/src/projects.rs`, `api/projects.rs`, `crates/serabot-desktop/src/projects.rs`, `ui_projects.rs` — per-user project folders in the server inbox, HTTP API, and desktop workspace (0.58–0.59).
-- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.59.0.
+- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.60.0.

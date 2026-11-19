@@ -2360,11 +2360,19 @@ pub(super) fn ModelBar(
     // Only "auto" (plus local ACP in bot chat) left: the server offered no concrete model.
     let no_models = session.read().state.catalog.is_some()
         && items.len() <= if active_bot.is_some() { 2 } else { 1 };
-    // Thinking levels the saved model accepts, and the one in force. The
-    // picker is absent for a model with no thinking control.
+    // Thinking levels the active model accepts, and the one in force. Updates
+    // immediately when switching models instead of waiting on a catalog reload.
     let (thinking_levels, thinking_now) = {
         let session = session.read();
-        session
+        let draft = &session.state.draft;
+        let draft_levels = if !draft.provider.is_empty() && !draft.model.is_empty() {
+            session
+                .route_options()
+                .thinking_levels(&draft.provider, &draft.model)
+        } else {
+            Vec::new()
+        };
+        let (saved_levels, saved_level) = session
             .state
             .catalog
             .as_ref()
@@ -2374,7 +2382,20 @@ pub(super) fn ModelBar(
                     catalog.thinking.level.clone().unwrap_or_default(),
                 )
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let levels = if !draft_levels.is_empty() {
+            draft_levels
+        } else if !changed {
+            saved_levels
+        } else {
+            Vec::new()
+        };
+        let active_level = if levels.iter().any(|l| l == &saved_level) {
+            saved_level
+        } else {
+            String::new()
+        };
+        (levels, active_level)
     };
     // The chip: `provider/account · model · thinking`.
     let current_label = if acp_active {
