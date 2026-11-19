@@ -77,3 +77,24 @@
 
 ## Next step
 Highest leverage: finding 1 plus 2 together. Make each bot reply own its "what I did" block (steps + memories used/saved). That's one server event, one per-message store, and one component.
+
+---
+
+## 0.61.0 status
+
+Findings 1–5 are implemented (see `docs/release-0.61.0.md`). Merging the
+chat styles turned up one more problem, now fixed: in the light theme, user
+bubbles had white text on a pale accent tint, at 1.41:1 contrast (it is now
+12.25:1).
+
+## The Grok Bot memory article, compared with SeraBot
+
+| The article's point | SeraBot today |
+| --- | --- |
+| One memory pool shared by all of a user's bots, with a private scope per bot | Same shape. Memories are per user, every bot of that user recalls them, and a fact from the same bot gets a small boost. There is no private per-bot scope yet. |
+| Every note tagged with its date and the bot that saved it | **Added in 0.61** (`saved YYYY-MM-DD`, `via <bot>`). |
+| Limits applied when notes are read (500 characters per note, a cap on how many fit) | Same kind of limit: 300 characters per fact and a 1,200-character section. Memory refresh runs consolidation, but there is no write-time budget like Hermes has. |
+| Keyword-only recall misses paraphrases | **Same gap.** Recall is FTS5 BM25 plus importance and recency, and only the optional Mem0 adds semantic recall. Next candidate: embedding recall from `embeddings.rs` combined with BM25. |
+| Writes only ever append, so contradicting notes pile up | Partly handled. A near-duplicate (token Jaccard ≥ 0.8) supersedes the older note, but a rewritten decision ("hard rule" becoming "optional") is not caught. The new dates let the model pick the newer note. A contradiction check at write time is still open. |
+| Team writes go through a review queue | Similar. Facts extracted from a turn that read untrusted content are held as `pending` until the owner approves them. |
+| No way to list everything | Already covered: the Memory page and `/v1/memory` list everything for the acting user. |

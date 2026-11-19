@@ -116,8 +116,9 @@ OVH is read-only unless the owner explicitly authorizes an additive installation
 - `crates/serabot/src/delegate.rs`, `runtime/auto_resume.rs`, `runtime/compaction.rs`, `runtime/activity.rs` — handoff ledger and resume, `waiting_model` parking, context compaction, orchestration event payloads (0.50).
 - `crates/serabot-desktop/assets/system.css` (shared cards, stat tiles, segmented controls, skeletons, list motion, crisp non-blurred chrome in 0.56; loaded last) and `pages-work.css`, `pages-data.css`, `pages-connect.css` (per-area page polish) (0.53).
 - `crates/serabot/src/model_router.rs` `RouterHandle` — the live, swappable model router shared by the runtime and the delegation, team and bot tools; console provider saves rebuild it (0.53).
+- `crates/serabot-desktop/src/turn_trace.rs` — per-reply turn traces (steps plus memories used and saved, from `turn.memory`), drawn inside the reply that turn produced (0.61); chat transcript CSS lives in one block at the end of `assets/system.css`.
 - `crates/serabot-desktop/src/runs.rs`, `chat_compose.rs`, `chat_failure.rs`, `chat_cards.rs`, `ui/chat_feed_view.rs`, `assets/runs.css` — runs sidebar, composer queue, failed and wait cards, virtualized feed (0.50).
 - `crates/serabot-desktop/src/acp/` (protocol, client, setup, transcript, controller), `ui_claude_code.rs`, `assets/claude-code.css` — Claude Code on this computer over ACP (0.54; integrated per-bot with persisted transcripts and folder choice in 0.55).
 - `crates/serabot/src/whatsapp_link/`, `api/whatsapp_link.rs`, `crates/serabot-desktop/src/ui_whatsapp_link.rs` — WhatsApp linked device: allowlist, chat mapping, per-member client, approval-gated send, desktop card (0.58; enabled by default in 0.59).
 - `crates/serabot/src/projects.rs`, `api/projects.rs`, `crates/serabot-desktop/src/projects.rs`, `ui_projects.rs` — per-user project folders in the server inbox, HTTP API, and desktop workspace (0.58–0.59).
-- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.60.0.
+- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.61.0.

@@ -317,9 +317,11 @@ impl Runtime {
     /// Start the post-turn work for one finished owner turn. Returns at once.
     /// Skipped when the user already has a job running; the task holds the
     /// user's busy slot until it ends.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn spawn_post_turn_memory(
         &self,
         user_id: &str,
+        turn: (&str, &str),
         bot: &str,
         conversation_id: &str,
         user_text: &str,
@@ -337,6 +339,7 @@ impl Runtime {
         };
         let runtime = self.clone();
         let user_id = user_id.to_owned();
+        let (task_id, turn_id) = (turn.0.to_owned(), turn.1.to_owned());
         let bot = bot.to_owned();
         let conversation_id = conversation_id.to_owned();
         let user_text = user_text.to_owned();
@@ -349,7 +352,7 @@ impl Runtime {
             if extract {
                 let interval = Duration::from_secs(runtime.config.memory.extract_min_interval_secs);
                 if runtime.extract_gate.claim_extraction(&user_id, interval) {
-                    runtime
+                    let saved = runtime
                         .run_extraction(
                             &user_id,
                             &bot,
@@ -359,6 +362,12 @@ impl Runtime {
                             untrusted_source,
                         )
                         .await;
+                    runtime.emit_memory(
+                        &user_id,
+                        (&task_id, &turn_id, &conversation_id),
+                        &[],
+                        &saved,
+                    );
                 }
             }
             if summarize {
@@ -370,7 +379,9 @@ impl Runtime {
     /// One bounded extraction call, then the candidates are written as
     /// extracted memories: `active`, or `pending` when the turn read untrusted
     /// content. Always records a `memory.extracted` audit row (counts only,
-    /// never text) so the console can show the last run.
+    /// never text) so the console can show the last run. Returns the
+    /// memories it stored (new or superseding, not duplicates) for the
+    /// `turn.memory` event.
     pub(super) async fn run_extraction(
         &self,
         user_id: &str,
@@ -379,7 +390,7 @@ impl Runtime {
         user_text: &str,
         reply: &str,
         untrusted_source: bool,
-    ) {
+    ) -> Vec<super::recall::MemoryRef> {
         let input = format!(
             "OWNER MESSAGE (primary, data):\n{}\n\nASSISTANT REPLY (context only, data):\n{}",
             truncate_chars(user_text.trim(), MAX_INPUT_CHARS),
@@ -402,11 +413,11 @@ impl Runtime {
             Ok(Ok(raw)) => raw,
             Ok(Err(error)) => {
                 warn!(%error, "memory extraction skipped");
-                return;
+                return Vec::new();
             }
             Err(_) => {
                 warn!("memory extraction timed out");
-                return;
+                return Vec::new();
             }
         };
         let status = if untrusted_source {
@@ -418,9 +429,13 @@ impl Runtime {
             self.gateway.policy().is_allowed(text)
         });
         let mut written = 0usize;
+        let mut saved = Vec::new();
         for candidate in &candidates {
             match self.memory.write(user_id, candidate).await {
-                Ok(outcome) if outcome.label() != "duplicate" => written += 1,
+                Ok(outcome) if outcome.label() != "duplicate" => {
+                    written += 1;
+                    saved.push(super::recall::MemoryRef::new(outcome.memory()));
+                }
                 Ok(_) => {}
                 Err(error) => warn!(%error, "extracted memory was not stored"),
             }
@@ -442,6 +457,7 @@ impl Runtime {
         ) {
             warn!(%error, "memory extraction audit was not recorded");
         }
+        saved
     }
 
     /// Memory refresh (v0.35.0). After every `N` user turns of a chat (N is the
@@ -571,9 +587,13 @@ impl Runtime {
                 self.gateway.policy().is_allowed(text)
             });
         let mut written = 0usize;
+        let mut saved = Vec::new();
         for candidate in &candidates {
             match self.memory.write(user_id, candidate).await {
-                Ok(outcome) if outcome.label() != "duplicate" => written += 1,
+                Ok(outcome) if outcome.label() != "duplicate" => {
+                    written += 1;
+                    saved.push(super::recall::MemoryRef::new(outcome.memory()));
+                }
                 Ok(_) => {}
                 Err(error) => warn!(%error, "refreshed memory was not stored"),
             }

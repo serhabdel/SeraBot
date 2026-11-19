@@ -4931,3 +4931,85 @@ async fn handoff_turns_inherit_the_owner_turns_attachments() {
             .is_empty()
     );
 }
+
+/// 0.61: recalled facts carry their save date, and the turn publishes which
+/// memories it used and saved as `turn.memory`, bounded and scoped to the
+/// acting user.
+#[tokio::test]
+async fn memory_refs_are_dated_and_published_per_turn() {
+    let server = MockServer::start().await;
+    let (runtime, store) = setup(
+        &server.uri(),
+        Arc::new(Capture::default()),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    );
+    let admin_id = admin(&store);
+    crate::memory::add(
+        &store,
+        &admin_id,
+        "fact",
+        "Prefers the harbour ferry at 8",
+        "operator:test",
+    )
+    .unwrap();
+    let (block, refs) = runtime
+        .memory_context_with_refs(&admin_id, None, &bot(), "harbour ferry")
+        .await;
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    assert!(block.contains(&format!("saved {today}")), "{block}");
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].excerpt, "Prefers the harbour ferry at 8");
+
+    runtime.emit_memory(&admin_id, ("task-1", "turn-1", "dir:owner"), &refs, &[]);
+    runtime.emit_memory(&admin_id, ("task-2", "turn-2", "dir:owner"), &[], &[]);
+    let events = store
+        .conversation_steps(&admin_id, "dir:owner", 50)
+        .unwrap();
+    let memory: Vec<_> = events
+        .iter()
+        .filter(|event| event.kind == "turn.memory")
+        .collect();
+    assert_eq!(memory.len(), 1, "an empty turn publishes nothing");
+    assert_eq!(memory[0].payload["turn_id"], "turn-1");
+    assert_eq!(memory[0].payload["recalled_total"], 1);
+    assert_eq!(
+        memory[0].payload["recalled"][0]["excerpt"],
+        "Prefers the harbour ferry at 8"
+    );
+    let other = store
+        .conversation_steps("someone-else", "dir:owner", 50)
+        .unwrap();
+    assert!(other.is_empty(), "another user sees no memory events");
+}
+
+/// 0.61: extraction reports the memories it stored for the chat.
+#[tokio::test]
+async fn extraction_returns_the_memories_it_saved() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(Sequence::new(vec![serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "{\"facts\":[{\"content\":\"Works from Lisbon on Fridays\",\"kind\":\"fact\",\"importance\":0.6}]}"}, "finish_reason": "stop"}]
+        })]))
+        .mount(&server)
+        .await;
+    let (runtime, store) = setup(
+        &server.uri(),
+        Arc::new(Capture::default()),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    );
+    let admin_id = admin(&store);
+    let saved = runtime
+        .run_extraction(
+            &admin_id,
+            "main",
+            "dir:owner",
+            "remember that I work from Lisbon on Fridays",
+            "Noted.",
+            false,
+        )
+        .await;
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].excerpt, "Works from Lisbon on Fridays");
+    assert!(!saved[0].pending);
+}

@@ -93,3 +93,26 @@ coalesce a burst into one refresh and look the rest up by id.
 
 `handoff.queued` and `handoff.resumed` are unchanged. `route_switched` is still
 emitted next to `model.failover`.
+
+## Memory events (0.61)
+
+`turn.memory` says which memories a turn used and saved. It is sent at most
+twice per turn: once when the turn starts (`recalled`) and once after the
+post-turn extraction (`saved`). It is not sent when a side is empty, and it
+is returned by `/activity` together with `turn.step`.
+
+```json
+{
+  "task_id": "…",
+  "turn_id": "…",
+  "conversation_id": "dir:main",
+  "recalled": [{"id": "…", "kind": "fact", "origin": "explicit", "excerpt": "Prefers the 8am ferry"}],
+  "saved": [{"id": "…", "kind": "fact", "origin": "extracted", "excerpt": "…", "pending": true}],
+  "recalled_total": 1,
+  "saved_total": 0
+}
+```
+
+Each side lists at most 8 items, and each excerpt is at most 120 characters.
+`excerpt` is left out when the outgoing-text scan rejects it. The desktop
+draws these inside the reply with the same `turn_id`.

@@ -65,6 +65,7 @@ pub enum OperationKind {
     TeamWrite,
     Library,
     ChatPlan,
+    TurnTraces,
     ChatAutoApprove,
     /// Set the open conversation's thinking level.
     Thinking,
@@ -304,6 +305,8 @@ pub enum Operation {
     Library,
     /// Goal, todo list and auto-approve switch of the open conversation.
     ChatPlan,
+    /// Per-turn steps and memories of the open conversation (0.61).
+    TurnTraces,
     SetAutoApprove {
         enabled: bool,
     },
@@ -637,6 +640,7 @@ impl Operation {
             Self::SetTeam { .. } => OperationKind::TeamWrite,
             Self::Library => OperationKind::Library,
             Self::ChatPlan => OperationKind::ChatPlan,
+            Self::TurnTraces => OperationKind::TurnTraces,
             Self::SetAutoApprove { .. } => OperationKind::ChatAutoApprove,
             Self::SetThinking { .. } => OperationKind::Thinking,
             Self::StopTurn => OperationKind::StopTurn,
@@ -763,6 +767,10 @@ pub enum Reply {
     Connectors(Vec<ConnectorStatus>),
     Team(Team),
     Library(Vec<LibraryEntry>),
+    TurnTraces {
+        conversation: String,
+        body: serde_json::Value,
+    },
     ChatPlan {
         plan: Option<crate::chat_plan::ChatPlan>,
         auto_approve: bool,
@@ -1214,6 +1222,14 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
             .set_team(conversation, members, *mode, rules)
             .map(Reply::Team),
         Operation::Library => client.library(conversation).map(Reply::Library),
+        Operation::TurnTraces => {
+            client
+                .conversation_activity(conversation)
+                .map(|body| Reply::TurnTraces {
+                    conversation: conversation.to_owned(),
+                    body,
+                })
+        }
         Operation::ChatPlan => client
             .chat_state(conversation)
             .map(|(plan, auto_approve)| Reply::ChatPlan { plan, auto_approve }),

@@ -159,6 +159,7 @@ pub fn transcript_fingerprint(messages: &[crate::Message], context: impl std::ha
         message.name.hash(&mut hasher);
         message.bot.hash(&mut hasher);
         message.limit_reached.hash(&mut hasher);
+        message.turn_id.hash(&mut hasher);
         message.attachments.len().hash(&mut hasher);
     }
     hasher.finish()
@@ -488,6 +489,7 @@ mod tests {
             bot: None,
             attachments: Vec::new(),
             limit_reached: false,
+            turn_id: None,
         }
     }
 
@@ -689,6 +691,7 @@ mod tests {
             bot: None,
             attachments: Vec::new(),
             limit_reached: false,
+            turn_id: None,
         }
     }
 

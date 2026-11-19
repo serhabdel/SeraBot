@@ -85,6 +85,13 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     .iter()
                     .rposition(|m| m.role != Role::User);
                 let regen_text = last_user.map(|index| state.state.messages[index].content.clone());
+                let turn_anchors = serabot_desktop::turn_trace::anchors(
+                    state
+                        .state
+                        .messages
+                        .iter()
+                        .map(|m| (m.role == Role::User, m.turn_id.as_deref())),
+                );
                 let mut rows: Vec<Rc<MsgView>> = Vec::with_capacity(state.state.messages.len());
                 let mut prev_user: Option<bool> = None;
                 let mut prev_day: Option<String> = None;
@@ -144,6 +151,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                 &state.state.messages,
                                 index,
                             ),
+                        turn: turn_anchors.get(index).cloned().flatten(),
                     }));
                 }
                 let rows = Rc::new(rows);
@@ -265,6 +273,21 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             sending,
             state.state.history_loaded,
         )
+    };
+    // The finished turn's steps already sit inside its reply (0.61): the
+    // bottom summary stays only for a turn whose reply carries no turn id.
+    let steps_attached = {
+        let state = session.read();
+        let task = state.state.activity.task_id.as_str();
+        !task.is_empty()
+            && state.state.messages.iter().rev().any(|message| {
+                message.role != Role::User
+                    && message
+                        .turn_id
+                        .as_deref()
+                        .and_then(|turn| state.state.turns.get(turn))
+                        .is_some_and(|trace| trace.activity.task_id == task)
+            })
     };
     let chat_plan = session.read().state.plan.clone();
     let mut composer_draft = use_signal(|| session.read().composer.clone());
@@ -1180,6 +1203,11 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                             }
                             MessageRow {
                                 session,
+                                trace: view
+                                    .row
+                                    .turn
+                                    .as_deref()
+                                    .and_then(|turn| traced_turn(&session.read(), turn)),
                                 row: view.row,
                                 class: view.class,
                                 bot_meta: view.bot_meta,
@@ -1277,7 +1305,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                 }
                             }
                         }
-                    } else if !steps.is_empty() && history_ready {
+                    } else if !steps.is_empty() && history_ready && !steps_attached {
                         // The summary describes a reply: it waits for the
                         // transcript, and opens by itself when a step needs
                         // approval or failed, so it cannot hide either.
@@ -2025,6 +2053,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
 fn MessageRow(
     mut session: Signal<Session>,
     row: Rc<MsgView>,
+    trace: Option<serabot_desktop::turn_trace::TurnTrace>,
     class: String,
     bot_meta: Option<(String, bool)>,
     media: Vec<serabot_desktop::LibraryEntry>,
@@ -2061,6 +2090,9 @@ fn MessageRow(
                     if row.peer {
                         span { class: "team-chip", "peer bot" }
                     }
+                }
+                if let Some(trace) = trace {
+                    TurnTraceBlock { session, trace }
                 }
                 div { class: "msg-body", title: "{row.stamp}",
                     MarkdownBody { message_id: row.id.clone(), content: row.content.clone() }
@@ -2795,6 +2827,103 @@ fn RouteSwitchRow(text: String) -> Element {
         div { class: "route-switch", role: "status",
             Icon { name: "refresh", size: 12 }
             span { "{text}" }
+        }
+    }
+}
+
+/// The trace a finished reply shows, or `None` while its turn is still the
+/// live one (the live block at the foot of the feed draws it then).
+fn traced_turn(state: &Session, turn: &str) -> Option<serabot_desktop::turn_trace::TurnTrace> {
+    let trace = state.state.turns.get(turn)?;
+    let running = state
+        .state
+        .task
+        .as_ref()
+        .is_some_and(|task| !task.status.terminal());
+    if running
+        && !trace.activity.task_id.is_empty()
+        && trace.activity.task_id == state.state.activity.task_id
+    {
+        return None;
+    }
+    Some(trace.clone())
+}
+
+/// What one turn did, inside the reply it produced (0.61): its tool steps
+/// and the memories it used and saved, collapsed to one line. A step that
+/// failed or waits for approval opens it, so the trace cannot hide either.
+#[component]
+fn TurnTraceBlock(
+    mut session: Signal<Session>,
+    trace: serabot_desktop::turn_trace::TurnTrace,
+) -> Element {
+    let summary = trace.summary();
+    let attention = trace.activity.needs_attention();
+    let dropped = trace.activity.dropped_note();
+    let memory = trace.memory.clone();
+    rsx! {
+        details { class: "turn-trace", open: attention,
+            summary { class: "turn-trace-summary",
+                Icon { name: "chevron-right", size: 12 }
+                span { "{summary}" }
+            }
+            if !trace.activity.steps.is_empty() {
+                div { class: "activity-steps",
+                    for step in trace.activity.steps.iter().cloned() {
+                        ActivityRow { session, step, key: "{step.call_id}" }
+                    }
+                    if let Some(note) = dropped {
+                        p { class: "activity-more", "{note}" }
+                    }
+                }
+            }
+            if !memory.is_empty() {
+                div { class: "turn-memory", role: "group", "aria-label": "Memories this reply used and saved",
+                    if !memory.recalled.is_empty() {
+                        p { class: "turn-memory-head", "Used" }
+                        ul { class: "turn-memory-list",
+                            for item in memory.recalled.iter().cloned() {
+                                TurnMemoryItem { key: "u-{item.id}", item }
+                            }
+                        }
+                    }
+                    if !memory.saved.is_empty() {
+                        p { class: "turn-memory-head", "Remembered" }
+                        ul { class: "turn-memory-list",
+                            for item in memory.saved.iter().cloned() {
+                                TurnMemoryItem { key: "s-{item.id}", item }
+                            }
+                        }
+                    }
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        "aria-label": "Open memory to review, edit or forget these facts",
+                        onclick: move |_| session.write().open_section(Section::Memory),
+                        "Review in Memory"
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn TurnMemoryItem(item: serabot_desktop::turn_trace::MemoryItem) -> Element {
+    let text = if item.excerpt.is_empty() {
+        "A saved fact (text withheld by policy)".to_owned()
+    } else {
+        item.excerpt.clone()
+    };
+    rsx! {
+        li { class: "turn-memory-item",
+            Icon { name: "memory", size: 12 }
+            span { class: "turn-memory-text", "{text}" }
+            if item.pending {
+                span { class: "chip warn", "held for review" }
+            } else if item.origin == "explicit" {
+                span { class: "chip", "you saved" }
+            }
         }
     }
 }

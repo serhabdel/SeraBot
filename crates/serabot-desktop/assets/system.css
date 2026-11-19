@@ -315,13 +315,6 @@
   -webkit-backdrop-filter: none;
   border-bottom: 1px solid var(--hairline);
 }
-
-/* Crisp user message bubble and refined code blocks. */
-.msg.user .msg-body {
-  background: color-mix(in srgb, var(--accent) 14%, var(--surface-2));
-  border: 1px solid color-mix(in srgb, var(--accent) 26%, var(--hairline));
-}
-
 .md-code {
   border: 1px solid var(--hairline-strong);
   border-radius: 12px;
@@ -688,15 +681,19 @@ html[data-reduce-transparency="true"] .sheet.sheet-palette {
   justify-content: flex-end;
 }
 
+/* Files sit on the light bubble tint: normal labels, not white (0.61). */
 .msg.user .file-chip {
-  background: rgba(255, 255, 255, 0.18);
-  border-color: rgba(255, 255, 255, 0.34);
-  color: #ffffff;
+  background: var(--surface);
+  border-color: var(--hairline-strong);
+  color: var(--label-1);
 }
 
-.msg.user .file-chip-name,
+.msg.user .file-chip-name {
+  color: var(--label-1);
+}
+
 .msg.user .file-chip-size {
-  color: #ffffff;
+  color: var(--label-2);
 }
 
 .composer-wrap > .scroll-bottom.jump-pill {
@@ -739,3 +736,245 @@ html[data-reduce-transparency="true"] .sheet.sheet-palette {
 
 
 
+
+/* ------------------------------------------------ chat transcript ---
+   0.61: the one place for message rows. These rules used to be split over
+   app.css, foundation.css and system.css, where load order decided the
+   result; the values below are what that cascade produced, with font sizes
+   moved onto the --fs-* tokens so the text-size preference reaches them. */
+
+.msg {
+  display: flex;
+  padding: 0;
+  border-radius: 0;
+  position: relative;
+  gap: 10px;
+}
+
+.msg.speaker-change {
+  margin-top: 16px;
+}
+
+.msg.speaker-change:first-child {
+  margin-top: 0;
+}
+
+.msg-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+  gap: 2px;
+}
+
+.msg-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding-left: 2px;
+}
+
+.msg-name {
+  color: var(--label-1);
+  font-size: var(--fs-caption);
+  font-weight: 650;
+  letter-spacing: -0.005em;
+}
+
+.msg-time {
+  color: var(--label-3);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-micro);
+}
+
+.msg-body {
+  font-size: var(--fs-msg);
+  color: var(--label-1);
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  width: fit-content;
+  line-height: 1.55;
+  max-width: 72ch;
+}
+
+.msg-body p {
+  margin: 0 0 8px;
+}
+
+.msg-body > :first-child {
+  margin-top: 0;
+}
+
+.msg-body > :last-child {
+  margin-bottom: 0;
+}
+
+.msg-avatar.avatar {
+  margin-top: 0;
+  padding-top: 0;
+  font-weight: 650;
+  width: 28px;
+  height: 28px;
+  border-radius: 9px;
+  font-size: var(--fs-micro);
+}
+
+/* Replies: plain text on the page, no card, at a readable measure (66-75ch);
+   tables and code blocks scroll inside their own wrappers. */
+.msg.bot .msg-body {
+  max-width: 72ch;
+  width: 100%;
+  padding: 3px 0 0;
+  background: var(--clear);
+  border: 0;
+  border-radius: 0;
+  font-size: var(--fs-msg);
+  line-height: 1.6;
+}
+
+/* The bubble is a light accent tint in both themes, so its text is the
+   normal label colour: white on the light tint measured 1.41:1. */
+.msg.user .msg-body {
+  color: var(--label-1);
+  font-size: var(--fs-msg);
+  padding: 8px 14px;
+  border-radius: 16px 16px 4px 16px;
+  max-width: min(580px, 82%);
+  line-height: 1.5;
+  background: color-mix(in srgb, var(--accent) 14%, var(--surface-2));
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, var(--hairline));
+}
+
+.msg.bot .msg-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.msg-actions {
+  display: flex;
+  gap: 2px;
+  margin-top: 2px;
+  opacity: 0;
+  transition: opacity 120ms ease;
+  min-height: 24px;
+}
+
+.msg-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--label-3);
+  font: inherit;
+  font-size: var(--fs-micro);
+  cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+/* What one turn did, inside its reply (0.61): steps plus memories used and
+   saved, collapsed to one quiet line above the text. */
+.turn-trace {
+  margin: 2px 0 6px;
+  max-width: 72ch;
+  color: var(--label-2);
+  font-size: var(--fs-body-2);
+}
+
+.turn-trace-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  padding: 0 8px 0 4px;
+  border-radius: var(--r-sm);
+  color: var(--label-3);
+  font-size: var(--fs-caption);
+  cursor: pointer;
+  list-style: none;
+}
+
+.turn-trace-summary::-webkit-details-marker {
+  display: none;
+}
+
+.turn-trace-summary:hover {
+  background: var(--hover);
+  color: var(--label-2);
+}
+
+.turn-trace-summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.turn-trace[open] > .turn-trace-summary svg {
+  transform: rotate(90deg);
+}
+
+.turn-trace > .activity-steps,
+.turn-trace > .turn-memory {
+  margin-top: 6px;
+  padding: 8px 12px;
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+}
+
+.turn-memory {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.turn-memory-head {
+  margin: 4px 0 0;
+  color: var(--label-3);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.turn-memory-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.turn-memory-item {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  color: var(--label-1);
+  font-size: var(--fs-body-2);
+}
+
+.turn-memory-item svg {
+  flex: none;
+  color: var(--label-3);
+}
+
+.turn-memory-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .turn-trace-summary svg {
+    transition: none;
+  }
+}
+
+/* Touch screens have no hover: keep message actions visible. */
+@media (hover: none) {
+  .msg-actions {
+    opacity: 1;
+  }
+}

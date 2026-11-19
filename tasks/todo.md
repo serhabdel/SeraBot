@@ -258,3 +258,13 @@ never merge without the owner's OK.
 - [ ] Owner: live verification of WhatsApp pairing, scanned PDF OCR/vision, and Antigravity pure Gemini models against the upgraded server.
 
 
+
+## Release 0.61.0 — Chat window: per-reply turn traces, visible memory, token type, one chat stylesheet
+
+- [x] Per-reply turn traces: desktop `turn_trace.rs` ledger keyed by `turn_id`, fed live and from `/v1/conversations/{id}/activity`; collapsed steps + memory line inside the reply.
+- [x] `turn.memory` event (recalled at turn start, saved after extraction; bounded, scanned, user-scoped) and dated, sourced injected fact lines.
+- [x] Chat chrome font sizes on `--fs-*` tokens; Small floor 11px.
+- [x] Chat transcript CSS merged into one block in `system.css`; light-theme user bubble contrast fixed (1.41:1 → 12.25:1).
+- [x] Reply measure capped at 72ch.
+- [ ] Owner: look at the chat on Windows (light and dark, Small/Large text) and run one turn that uses and saves a memory.
+- [ ] Next: embedding-based memory recall alongside FTS5 (keyword-only recall misses paraphrases).
