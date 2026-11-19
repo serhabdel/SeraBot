@@ -1,0 +1,4 @@
+interface:
+  display_name: "Native UX"
+  short_description: "UI/UX orchestrator: routes build, redesign, review, motion, spacing, components and flows"
+  default_prompt: "Use the definitive-ux skill to classify this request, detect the stack and run the right specialist skills, then give one consolidated UX report."

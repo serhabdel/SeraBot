@@ -1,0 +1,4 @@
+interface:
+  display_name: "Laws of UX"
+  short_description: "The 30 Laws of UX as concrete interface decisions"
+  default_prompt: "Use the laws-of-ux skill to answer this UX question or audit this interface with evidence, the law that explains it and a specific fix."
