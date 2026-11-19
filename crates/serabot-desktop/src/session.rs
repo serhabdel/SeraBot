@@ -3016,6 +3016,7 @@ impl Session {
             bot: None,
             attachments: files.clone(),
             limit_reached: false,
+            turn_id: None,
         });
         if files.is_empty() {
             // A leading `@bot` sends the message to that bot (a delegate).
@@ -3057,6 +3058,7 @@ impl Session {
             bot: None,
             attachments: Vec::new(),
             limit_reached: false,
+            turn_id: None,
         });
         self.start_request(Operation::Submit(zeroize::Zeroizing::new(
             crate::media_view::CONTINUE_TEXT.into(),
@@ -4056,7 +4058,11 @@ impl Session {
             .apply_event(&kind, &payload, self.conversation.as_str());
         // Step events only feed the live view; the transcript
         // is not re-read for each one.
-        let stepped = self.state.activity.apply(&kind, &payload);
+        if self.state.turns.conversation() != self.conversation {
+            self.state.turns.reset(&self.conversation);
+        }
+        let traced = self.state.turns.apply(&kind, &payload);
+        let stepped = self.state.activity.apply(&kind, &payload) || traced;
         if kind == "turn.step"
             && payload
                 .get("conversation_id")
@@ -4178,6 +4184,7 @@ impl Session {
                 | Operation::MemoryStats
                 | Operation::JobsReliability
                 | Operation::ChatPlan
+                | Operation::TurnTraces
                 | Operation::GetTeam
                 | Operation::VoiceSettings
         );
@@ -4608,6 +4615,10 @@ impl Session {
                         OperationKind::ChatPlan => {
                             // The plan panel is optional; a failed read leaves
                             // it hidden instead of raising a banner.
+                            self.state.error = None;
+                        }
+                        OperationKind::TurnTraces => {
+                            // Traces are optional: replies just show none.
                             self.state.error = None;
                         }
                         OperationKind::ChatAutoApprove => {
@@ -5170,6 +5181,7 @@ impl Session {
                         OperationKind::MediaJobs => {
                             self.schedule(Operation::JobsReliability, Duration::ZERO);
                             self.queue_backlog(Operation::ChatPlan);
+                            self.queue_backlog(Operation::TurnTraces);
                         }
                         OperationKind::OAuthSignIn => {
                             self.admin_error = None;
@@ -7621,6 +7633,7 @@ mod backlog_tests {
             bot: None,
             attachments: Vec::new(),
             limit_reached: false,
+            turn_id: None,
         });
         assert_eq!(
             session.conversation_title(),
@@ -7843,6 +7856,7 @@ mod backlog_tests {
             bot: None,
             attachments: Vec::new(),
             limit_reached: false,
+            turn_id: None,
         });
         assert!(session.has_optimistic_pending());
         assert!(session.any_run_active());
@@ -7915,6 +7929,7 @@ mod backlog_tests {
             bot: None,
             attachments: Vec::new(),
             limit_reached: false,
+            turn_id: None,
         });
         session.state.messages.push(Message {
             id: "m-2".into(),
@@ -7925,6 +7940,7 @@ mod backlog_tests {
             bot: Some("main".into()),
             attachments: Vec::new(),
             limit_reached: false,
+            turn_id: None,
         });
         let md = session.conversation_markdown().expect("markdown expected");
         assert!(md.starts_with("# Q4 Review\n\n"));

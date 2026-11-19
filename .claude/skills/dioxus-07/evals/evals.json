@@ -1,0 +1,147 @@
+{
+  "skill_name": "dioxus-07",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "ok so i grabbed this dioxus snippet from an old blog post and cargo says `cannot find function use_state in this scope` and something about Scope. im on 0.7 can you just make it work\n\nfn app(cx: Scope) -> Element {\n    let count = use_state(cx, || 0);\n    let log = use_ref(cx, Vec::new);\n    let user = use_future(cx, (id,), |(id,)| async move { fetch_user(id).await });\n    cx.render(rsx! {\n        button { onclick: move |_| { log.write().push(1); count += 1 }, \"clicked {count}\" }\n    })\n}",
+      "expected_output": "A 0.7 component: no cx/Scope parameter, use_signal replacing use_state and use_ref, use_resource replacing the use_future dependency tuple, rsx! returned directly.",
+      "expectations": [
+        "The rewritten component signature takes no `cx: Scope` parameter and has the form `fn App() -> Element` (or `#[component] fn App() -> Element`).",
+        "State from `use_state` and `use_ref` is replaced with `use_signal` calls.",
+        "The component returns `rsx! { ... }` directly, with no `cx.render(...)` and no `render!` macro.",
+        "The `use_future` dependency-tuple call is replaced by `use_resource` with an `async` closure that reads the value it depends on.",
+        "The button handler still increments the count and pushes to the log using signal write syntax (for example `count += 1` and `log.write().push(1)`).",
+        "The answer says how the result was or should be verified (for example `cargo check`) or states it was not run."
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "my 0.7 port deleted every to_owned! because a blog said the macro is gone. now cargo says `borrow of moved value: name` where name is a String captured in two onclick closures. is to_owned! really removed?",
+      "expected_output": "to_owned! still exists in dioxus-hooks 0.7.10; Signals are Copy so they do not need it, but non-Copy values such as String still have to be cloned before being moved into each closure.",
+      "expectations": [
+        "The answer says `to_owned!` is not removed in Dioxus 0.7 (it still exists in `dioxus-hooks`).",
+        "The answer says `Signal`s are `Copy`, so closures can capture them without cloning or `to_owned!`.",
+        "The answer identifies that a `String` moved into the first `move` closure is the cause of the moved-value error.",
+        "The fix clones the `String` for each closure (with `.clone()` or `to_owned!`) or restructures to share it through a `Signal` or context."
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "dioxus fullstack app, 0.7. i want a contact form (name + message) that posts to the server and saves it. right now when i hit submit the whole page reloads and nothing saves. also i read somewhere you have to set protocol = Http<Json, Json> on server fns?? is that right",
+      "expected_output": "A form whose onsubmit calls prevent_default and then calls an async server function declared with #[post(...)] or #[server]; explains 0.7 forms submit by default and JSON is the default codec so the protocol argument is unnecessary.",
+      "expectations": [
+        "The `onsubmit` handler calls `prevent_default()` on the event, and the answer explains that forms submit by default in Dioxus 0.7.",
+        "The server function is declared with a Dioxus server-function attribute (`#[post(\"...\")]`, `#[get(...)]` or `#[server]`) on an `async fn` that returns a `Result`.",
+        "The answer says `#[server(protocol = Http<Json, Json>)]` is not needed because JSON is the default codec in 0.7.",
+        "Any server-only dependency or code is gated behind the `server` Cargo feature (optional dependency or `#[cfg(feature = \"server\")]`).",
+        "The client handler awaits the server function from an async closure."
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "todo list in dioxus: when i delete an item the checkbox state jumps to the wrong row, and clicking save sometimes panics with 'already borrowed'. code:\n\nfor (i, t) in todos.read().iter().enumerate() {\n  li { key: \"{i}\", input { r#type: \"checkbox\", checked: t.done } \"{t.title}\" }\n}\nbutton { onclick: move |_| async move {\n  let list = todos.write();\n  save_all(&list).await;\n}, \"save\" }",
+      "expected_output": "Diagnoses index keys as the cause of state jumping (use a stable id) and a write guard held across await as the cause of the borrow panic (clone or copy the data out, drop the guard, then await).",
+      "expectations": [
+        "The answer identifies using the list index as the `key` as the cause of state attaching to the wrong row.",
+        "The answer's fixed code uses a stable unique id of the item (not the index) as the `key`.",
+        "The answer identifies holding the `todos.write()` guard across `.await` as the cause of the 'already borrowed' panic.",
+        "The answer's fixed code releases the signal guard before awaiting (for example by cloning the data into a local first)."
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "can you start dx serve --hotpatch for my project in the background. fyi when i ran `dx --version` it printed deno 2.9.7 which is weird",
+      "expected_output": "Recognises that `dx` resolving to Deno's npx-style runner is not the Dioxus CLI, refuses to run dx subcommands until `dx --version` reports dioxus 0.7.x, explains why, and gives the PATH remedy. Notes --hot-patch is the canonical spelling and is experimental.",
+      "expectations": [
+        "The answer identifies that a `deno` version banner means `dx` is Deno's runner (an npx-like tool), not the Dioxus CLI.",
+        "The answer explains the risk: the Deno shim would offer to download and run an npm package named after the subcommand (and `-y` skips the confirmation).",
+        "[transcript-only] The agent does not run `dx serve` (or any other `dx` subcommand) while `dx --version` shows Deno.",
+        "The answer tells the user to install the Dioxus CLI (`cargo install dioxus-cli`) and put the cargo bin directory ahead of Deno's `dx` on PATH, or to call the Dioxus CLI by full path.",
+        "The answer states that hot-patching is experimental and says `dx serve` is something the user runs.",
+        "The answer gives `--hot-patch` as the flag spelling shown by `dx serve --help` and/or notes that `--hotpatch` is accepted as an alias."
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "need a CI step that fails the build if our rsx isnt formatted. we use dx fmt --check. someone also said to add --all-code so everything gets formatted. give me the github actions step",
+      "expected_output": "A step that does not rely on dx fmt --check being read-only: runs `dx fmt` then `git diff --exit-code`, with the caveat that as of 0.7.10 --check rewrote files and printed no diff, and advice against --all-code.",
+      "expectations": [
+        "The answer states that as of Dioxus CLI 0.7.10 `dx fmt --check` can rewrite files on disk instead of being read-only.",
+        "The proposed step runs `dx fmt` followed by `git diff --exit-code` (or an equivalent check that fails when files changed).",
+        "The answer does not claim that `dx fmt --check` alone prints a diff and leaves the tree untouched.",
+        "The answer advises against `--all-code` (it formats other Rust code with prettyplease, not rustfmt, and can discard comments) or says to use it only deliberately.",
+        "The answer includes a precondition that the `dx` on PATH is the Dioxus CLI (a `dx --version` check expecting `dioxus 0.7`)."
+      ]
+    },
+    {
+      "id": 7,
+      "prompt": "im building a custom renderer for dioxus that draws to a terminal grid, not using web or desktop. what do i actually have to implement? the guide mentions Template name and work_with_deadline but those dont exist for me",
+      "expected_output": "Explains WriteMutations (stack machine), the VirtualDom loop with wait_for_work and render_immediate, event feeding via handle_event, and that the guide's Template name and work_with_deadline text is stale versus 0.7.10.",
+      "expectations": [
+        "The answer says the renderer implements the `WriteMutations` trait to apply the VirtualDom's edits.",
+        "The answer describes the edit stream as a stack machine (nodes pushed by template/text/placeholder creation and consumed by append/insert/replace operations).",
+        "The answer's loop uses `VirtualDom::wait_for_work` and `render_immediate(&mut impl WriteMutations)` (not `work_with_deadline`).",
+        "The answer says platform events are fed back with `VirtualDom::handle_event` or via an `HtmlEventConverter`.",
+        "The answer confirms the `Template::name` field and `work_with_deadline` shown in the official guide are stale for 0.7.x.",
+        "The answer states which Dioxus version it is based on (0.7.x) or notes that 0.8 alpha changes core internals."
+      ]
+    },
+    {
+      "id": 8,
+      "prompt": "dioxus 0.7 router: cargo says cannot find derive macro `Routable` and type `Router` in this scope. i also want a navbar on every page plus a 404 page for anything unknown. how should i set it up",
+      "expected_output": "Enables the router feature, defines a Routable enum with a layout and Outlet, adds a catch-all route for 404, and renders Router::<Route> in the app.",
+      "expectations": [
+        "The answer says the `router` Cargo feature must be enabled on the `dioxus` dependency (`features = [\"router\"]`).",
+        "The answer defines an enum with `#[derive(Routable, Clone, PartialEq)]` and `#[route(\"/path\")]` attributes on its variants.",
+        "The navbar is a layout: `#[layout(NavBar)]` on the enum and `Outlet::<Route> {}` inside the `NavBar` component.",
+        "The 404 page is a catch-all route variant using a `:..` segment such as `#[route(\"/:..route\")]` with a `route: Vec<String>` field.",
+        "The answer renders the router with `Router::<Route> {}` inside the root component.",
+        "Route components take props matching every dynamic segment of their route variant."
+      ]
+    },
+    {
+      "id": 9,
+      "prompt": "i keep a Signal<Vec<User>> in dioxus 0.7 and every time i edit one users name the whole list re-renders and the inputs lose focus. how do i make only that row update",
+      "expected_output": "Use Stores: #[derive(Store)] on User with use_store, pass items as ReadStore<User> (or ReadSignal), with stable keys, so a field change re-renders only the affected component.",
+      "expectations": [
+        "The answer recommends Stores (`#[derive(Store)]` with `use_store`) for per-field or per-entry reactivity.",
+        "The child row component receives a `ReadStore<User>` (or a `ReadSignal`) for its own item rather than the whole `Vec`.",
+        "The list items use a stable unique id as `key`, not the index.",
+        "The answer explains that reading the whole `Vec` in the parent subscribes the parent to every change."
+      ]
+    },
+    {
+      "id": 10,
+      "prompt": "my image 404s after a release build with dx. i wrote img { src: asset!(\"assets/logo.png\") } and a hard-coded <link href=\"/assets/main.css\"> in index.html. works fine in dx serve",
+      "expected_output": "asset! paths start with a slash relative to the crate root; use document::Stylesheet with asset! for CSS because asset filenames are content-hashed; assets not referenced from code are dropped.",
+      "expectations": [
+        "The answer corrects the path to start with a slash relative to the crate root: `asset!(\"/assets/logo.png\")`.",
+        "The answer replaces the hard-coded stylesheet link with `document::Stylesheet { href: asset!(\"/assets/main.css\") }`.",
+        "The answer explains that bundled asset filenames are content-hashed, so hard-coded URLs break in release builds.",
+        "The answer says an asset that is not referenced from Rust code is not bundled."
+      ]
+    },
+    {
+      "id": 11,
+      "prompt": "fullstack dioxus 0.7: the page shows Loading then the data pops in, and the console warns about a hydration mismatch. separately my component reads window.localStorage and the server panics at startup",
+      "expected_output": "Use use_server_future for first-paint data so the client reads the server-serialised result; first client render must match server HTML; browser-only APIs go in use_effect.",
+      "expectations": [
+        "The answer recommends `use_server_future` instead of `use_resource` for data needed on first paint.",
+        "The answer explains that the first client render must match the HTML the server produced.",
+        "The answer moves the `localStorage` access into `use_effect` so it runs only after hydration in the browser.",
+        "The answer says server-only code and dependencies belong behind the `server` feature."
+      ]
+    },
+    {
+      "id": 12,
+      "prompt": "how do i test my dioxus 0.7 component, i want to check it shows the done and open items with the right css classes. is there a dioxus_test crate i should use",
+      "expected_output": "Routes the request to the rust-test-app skill for writing component tests with dioxus-ssr; does not invent a dioxus_test API; may state what the official page covers.",
+      "expectations": [
+        "The answer sends the request to the `rust-test-app` skill (names it) for writing the component tests instead of improvising a harness here.",
+        "The answer does not invent a `dioxus_test::` API and says `DioxusLabs/dioxus-test` is experimental with no stable harness.",
+        "The answer names rendering with `dioxus-ssr` and asserting on the rendered output as the supported way to check component markup.",
+        "The answer lists the supported approaches from the official page: SSR rendering for component output, a hand-driven `VirtualDom` for hooks, and Playwright against `dx serve` for end to end."
+      ]
+    }
+  ]
+}

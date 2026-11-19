@@ -2161,6 +2161,10 @@ pub struct Message {
     /// offers Continue under it.
     #[serde(default)]
     pub limit_reached: bool,
+    /// Opaque id of the turn that wrote this message (0.61): a reply shows the
+    /// steps and memories of its own turn.
+    #[serde(default)]
+    pub turn_id: Option<String>,
 }
 
 /// One uploaded chat attachment as the server reports it. No server path.
@@ -5225,6 +5229,23 @@ impl ApiClient {
         Ok((plan, auto))
     }
 
+    /// `GET /v1/conversations/{id}/activity`: the conversation's recent
+    /// `turn.step` and `turn.memory` events, oldest first (0.61 reads it to
+    /// rebuild per-reply traces). An older server without the route reads as
+    /// no events.
+    pub fn conversation_activity(&self, conversation: &str) -> Result<serde_json::Value, ApiError> {
+        check_id(conversation)?;
+        match self.get::<serde_json::Value>(
+            &["v1", "conversations", conversation, "activity"],
+            &[("limit", "200")],
+        ) {
+            Ok(body) if body.get("steps").is_none_or(serde_json::Value::is_array) => Ok(body),
+            Ok(_) => Err(ApiError::InvalidResponse),
+            Err(ApiError::Http(404)) => Ok(serde_json::json!({"steps": []})),
+            Err(error) => Err(error),
+        }
+    }
+
     /// `GET /v1/conversations/{id}/auto-approve`.
     pub fn auto_approve(&self, conversation: &str) -> Result<bool, ApiError> {
         check_id(conversation)?;
@@ -7477,6 +7498,7 @@ mod tests {
             bot: bot.map(str::to_owned),
             attachments: Vec::new(),
             limit_reached: false,
+            turn_id: None,
         }
     }
 

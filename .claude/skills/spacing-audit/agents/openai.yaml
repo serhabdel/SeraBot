@@ -1,0 +1,4 @@
+interface:
+  display_name: "Spacing Audit"
+  short_description: "4/8pt audit of padding, gaps and margins in code"
+  default_prompt: "Use the spacing-audit skill to list every off-grid spacing value in this scope as before/after, then snap them after I confirm."

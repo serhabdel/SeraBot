@@ -1,0 +1,4 @@
+interface:
+  display_name: "Stack Map"
+  short_description: "Detects the UI stack and loads its verified API map"
+  default_prompt: "Load the stack-map skill and tell me which framework and form factor this project targets and where its UI APIs live."

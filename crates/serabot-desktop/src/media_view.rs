@@ -230,6 +230,7 @@ mod tests {
             bot: None,
             attachments: Vec::new(),
             limit_reached,
+            turn_id: None,
         }
     }
 

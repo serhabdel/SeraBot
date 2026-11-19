@@ -1,0 +1,4 @@
+interface:
+  display_name: "Map User Flows"
+  short_description: "Screens to user stories, flow diagrams and action items"
+  default_prompt: "Use the map-user-flows skill to map the user journey through this app's screens and write user stories with action items."

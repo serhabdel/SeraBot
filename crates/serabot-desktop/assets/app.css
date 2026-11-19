@@ -1234,27 +1234,11 @@ body {
   flex: none;
   pointer-events: none;
 }
-
-.msg {
-  display: flex;
-  gap: 12px;
-  padding: 6px 10px;
-  border-radius: var(--r-md);
-}
-
 /* A full-width hover highlight makes the list read as a table of records.
    Hover affordances belong on the message actions, not the row. */
 .msg:hover {
   background: transparent;
 }
-
-/* A change of speaker starts a new visual block; consecutive messages from
-   the same speaker sit 2px apart, which is what makes a transcript read as
-   thoughts instead of rows. */
-.msg.speaker-change {
-  margin-top: 16px;
-}
-
 @keyframes msg-in {
   from {
     opacity: 0;
@@ -1270,52 +1254,6 @@ body {
   display: inline-flex;
   padding-top: 2px;
 }
-
-.msg-main {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  min-width: 0;
-  flex: 1;
-}
-
-.msg-head {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-}
-
-.msg-name {
-  font-size: var(--fs-body-2);
-  font-weight: 600;
-  color: var(--label-1);
-}
-
-.msg-time {
-  font-size: var(--fs-caption);
-  color: var(--label-3);
-  font-variant-numeric: tabular-nums;
-}
-
-.msg-body {
-  font-size: var(--fs-msg);
-  line-height: 1.55;
-  color: var(--label-1);
-  word-break: break-word;
-  overflow-wrap: anywhere;
-  /* 66ch is the readable measure (Apple guidance is 45–75ch); a wide column
-     alone would push long answers to ~95ch and lose the return sweep. */
-  max-width: 66ch;
-}
-
-.msg-body > :first-child {
-  margin-top: 0;
-}
-
-.msg-body p {
-  margin: 0 0 10px;
-}
-
 .msg-body h1,
 .msg-body h2,
 .msg-body h3 {
@@ -1338,17 +1276,6 @@ body {
 .msg.user .msg-main {
   align-items: flex-end;
 }
-
-/* Owner messages: a speech bubble, not a card. The tightened corner on the
-   tail side is what makes it read as speech; the 1px border made it a box. */
-.msg.user .msg-body {
-  background: var(--active);
-  border: 0;
-  border-radius: 18px 18px 4px 18px;
-  padding: 9px 14px;
-  max-width: 72%;
-}
-
 .msg.peer {
   border-left: 2px solid hsl(var(--avatar-hue, 210) var(--hue-sat) var(--hue-light));
   padding-left: 14px;
@@ -3295,59 +3222,17 @@ button:not(:disabled):active,
   margin-left: auto;
   margin-right: auto;
 }
-
-.msg {
-  gap: 10px;
-  padding: 0;
-  border-radius: 0;
-}
-
-.msg.speaker-change {
-  margin-top: 12px;
-}
-
-.msg-avatar.avatar {
-  width: 28px;
-  height: 28px;
-  margin-top: 0;
-  padding-top: 0;
-  font-size: var(--fs-caption);
-  font-weight: 650;
-}
-
 .msg.user .msg-avatar {
   display: none;
 }
-
-.msg-body {
-  max-width: min(640px, 100%);
-  width: fit-content;
-}
-
-.msg.bot .msg-body {
-  padding: 10px 13px;
-  border-radius: 14px;
-  background: var(--surface-2);
-  border: 1px solid var(--hairline);
-}
-
-.msg.user .msg-body {
-  padding: 10px 13px;
-  border: 0;
-  border-radius: 14px;
-  max-width: min(640px, 78%);
-  background: var(--accent);
-  color: var(--on-accent);
-}
-
 .msg.user .msg-body *,
 .msg.user .msg-body .md-link {
-  color: var(--on-accent);
+  color: inherit;
 }
 
 .msg.user .msg-body code,
 .msg.user .msg-body .md-inline-code {
-  background: var(--on-accent-soft);
+  background: var(--hover);
   border-color: transparent;
 }
 
@@ -3365,11 +3250,6 @@ button:not(:disabled):active,
 .messages:not(.group) .msg-head {
   display: none;
 }
-
-.msg-head {
-  padding-left: 2px;
-}
-
 /* Tool calls: compact rows under the bubbles, with a status pill. */
 .tool-row {
   display: flex;
@@ -6341,21 +6221,6 @@ html[data-reduce-transparency="true"] .chat-header {
 .messages > .msg.msg-enter {
   animation: chat-msg-in 200ms var(--spring);
 }
-
-.msg-body {
-  line-height: 1.55;
-  max-width: 72ch;
-}
-
-/* Message actions appear on hover or focus, and stay keyboard reachable. */
-.msg-actions {
-  display: flex;
-  gap: 2px;
-  margin-top: 2px;
-  opacity: 0;
-  transition: opacity 120ms ease;
-}
-
 .msg:hover .msg-actions,
 .msg:focus-within .msg-actions,
 .msg-actions:focus-within {
@@ -6365,23 +6230,6 @@ html[data-reduce-transparency="true"] .chat-header {
 .msg.user .msg-actions {
   justify-content: flex-end;
 }
-
-.msg-action {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  height: 24px;
-  padding: 0 6px;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--label-3);
-  font: inherit;
-  font-size: 12px;
-  cursor: pointer;
-  transition: background-color 120ms ease, color 120ms ease;
-}
-
 .msg-action:hover {
   background: var(--hover);
   color: var(--label-2);

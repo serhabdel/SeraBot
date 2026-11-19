@@ -171,7 +171,7 @@ impl Runtime {
             tokio::select! {
                 biased;
                 _ = stop_token.cancelled() => None,
-                block = self.memory_context(
+                block = self.memory_context_with_refs(
                     &user,
                     owner_turn.then_some(payload.conversation_id.as_str()),
                     bot,
@@ -179,11 +179,17 @@ impl Runtime {
                 ) => Some(block),
             }
         };
-        let Some(memory_block) = memory_block else {
+        let Some((memory_block, recalled)) = memory_block else {
             return self
                 .finish_stopped(task, &turn, &state, &payload.conversation_id)
                 .await;
         };
+        self.emit_memory(
+            &user,
+            (&task.id, &turn.id, &payload.conversation_id),
+            &recalled,
+            &[],
+        );
         let system = if let Some(ref handoff) = payload.handoff {
             self.handoff_system_prompt(
                 &user,
@@ -969,6 +975,7 @@ impl Runtime {
                     let untrusted = extract::turn_used_untrusted_source(&state.messages);
                     self.spawn_post_turn_memory(
                         &user,
+                        (&task.id, &turn.id),
                         &turn.bot,
                         conversation_id,
                         owner,

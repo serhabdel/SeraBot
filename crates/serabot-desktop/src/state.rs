@@ -152,6 +152,8 @@ pub struct State {
     pub stopping: bool,
     /// Live steps of the latest turn, from the event stream.
     pub activity: crate::activity::Activity,
+    /// Per-turn steps and memories of the open conversation (0.61).
+    pub turns: crate::turn_trace::TurnLedger,
     /// Which bots are working now (rail, header and room rings).
     pub working: crate::working::WorkingBots,
     pub approvals: Vec<Approval>,
@@ -340,6 +342,7 @@ impl Default for State {
             task: None,
             stopping: false,
             activity: Default::default(),
+            turns: Default::default(),
             working: Default::default(),
             approvals: Vec::new(),
             approvals_loaded: false,
@@ -977,6 +980,9 @@ impl State {
                 }
                 self.memory_settings_error = None;
             }
+            Reply::TurnTraces { conversation, body } => {
+                self.turns.load(&conversation, &body);
+            }
             Reply::ChatPlan { plan, auto_approve } => {
                 self.plan = plan;
                 self.auto_approve = auto_approve;
@@ -1286,6 +1292,7 @@ mod tests {
             bot: None,
             attachments: Vec::new(),
             limit_reached: false,
+            turn_id: None,
         };
         let bot = Message {
             id: "m-bot".into(),
@@ -1296,6 +1303,7 @@ mod tests {
             bot: Some("main".into()),
             attachments: Vec::new(),
             limit_reached: false,
+            turn_id: None,
         };
         let current = vec![opt.clone(), bot.clone()];
         let incoming = vec![
@@ -1308,6 +1316,7 @@ mod tests {
                 bot: None,
                 attachments: Vec::new(),
                 limit_reached: false,
+                turn_id: None,
             },
             Message {
                 id: "m-bot".into(),
@@ -1318,6 +1327,7 @@ mod tests {
                 bot: Some("main".into()),
                 attachments: Vec::new(),
                 limit_reached: false,
+                turn_id: None,
             },
         ];
         let merged = merge_transcript(&current, incoming);
@@ -1342,6 +1352,7 @@ mod tests {
             bot: Some("main".into()),
             attachments: Vec::new(),
             limit_reached: false,
+            turn_id: None,
         };
         let current = vec![live.clone()];
         let mut stale = live.clone();
@@ -1369,6 +1380,7 @@ mod tests {
             bot: Some("main".into()),
             attachments: Vec::new(),
             limit_reached: false,
+            turn_id: None,
         };
         let current = vec![live.clone()];
         let mut stale = live.clone();
@@ -1388,6 +1400,7 @@ mod tests {
             bot: None,
             attachments: Vec::new(),
             limit_reached: false,
+            turn_id: None,
         };
         let mut shorter = live.clone();
         shorter.content = "draft".into();
@@ -1406,6 +1419,7 @@ mod tests {
             bot: Some("main".into()),
             attachments: Vec::new(),
             limit_reached: false,
+            turn_id: None,
         };
         let current = vec![live.clone()];
         let mut stale = live.clone();
@@ -1427,6 +1441,7 @@ mod tests {
             bot: None,
             attachments: Vec::new(),
             limit_reached: false,
+            turn_id: None,
         };
         let merged = merge_transcript(std::slice::from_ref(&opt), Vec::new());
         assert_eq!(merged.len(), 1);
@@ -1445,6 +1460,7 @@ mod tests {
             bot: Some("analyst".into()),
             attachments: Vec::new(),
             limit_reached: false,
+            turn_id: None,
         });
         state.task = Some(Task {
             id: "t".into(),
@@ -2117,6 +2133,7 @@ mod tests {
             bot: None,
             attachments: Vec::new(),
             limit_reached: false,
+            turn_id: None,
         }
     }
 

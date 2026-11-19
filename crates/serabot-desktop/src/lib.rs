@@ -52,6 +52,7 @@ pub mod state;
 pub mod status_view;
 pub mod teams;
 pub mod theme;
+pub mod turn_trace;
 pub mod ui_highlight;
 pub mod ui_tick;
 pub mod updater;

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Break UI"
+  short_description: "Stress a component with realistic worst-case data"
+  default_prompt: "Use the break-ui skill to feed this component realistic worst-case data behind a toggle and report what breaks."

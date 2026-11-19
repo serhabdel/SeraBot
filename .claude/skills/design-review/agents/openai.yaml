@@ -1,0 +1,4 @@
+interface:
+  display_name: "Design Review"
+  short_description: "Prioritized craft critique: Blocking, Important, Polish"
+  default_prompt: "Use the design-review skill to critique this screen or component and rank findings from Blocking to Polish with concrete fixes."

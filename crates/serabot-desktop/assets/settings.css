@@ -48,7 +48,8 @@
 
 /* Text size preference: the root carries data-text. */
 .root[data-text="small"] {
-  --fs-micro: 10px;
+  /* 11px is the floor: 10px is not reliably readable with ClearType. */
+  --fs-micro: 11px;
   --fs-caption: 11px;
   --fs-body-2: 12px;
   --fs-body: 13px;

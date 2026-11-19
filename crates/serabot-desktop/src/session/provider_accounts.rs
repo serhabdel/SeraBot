@@ -1354,6 +1354,7 @@ mod tests {
             bot: None,
             attachments: Vec::new(),
             limit_reached: false,
+            turn_id: None,
         });
         // With no catalog the pick is refused, and nothing waits.
         session.retry_on_fallback(FallbackOffer {

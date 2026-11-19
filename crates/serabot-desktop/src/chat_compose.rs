@@ -1092,12 +1092,44 @@ mod tests {
             "bottom: 100%;",
             ".msg.last-reply .msg-actions {",
             ".msg-action-time {",
-            ".msg.bot .msg-body {\n  max-width: 100%;",
             ".chat-switcher-btn {",
             ".thread-group.new-chat-row {",
         ] {
             assert!(css.contains(needle), "missing chat rule: {needle}");
         }
+    }
+
+    #[test]
+    fn chat_transcript_rules_have_one_home() {
+        // 0.61: message rows are styled in one block of system.css, at a
+        // readable measure, with token font sizes and a readable user bubble.
+        let files = [
+            include_str!("../assets/app.css"),
+            include_str!("../assets/foundation.css"),
+            include_str!("../assets/system.css"),
+        ];
+        for selector in [
+            "\n.msg {",
+            "\n.msg-name {",
+            "\n.msg-time {",
+            "\n.msg-body {",
+            "\n.msg.bot .msg-body {",
+            "\n.msg.user .msg-body {",
+            "\n.msg-action {",
+        ] {
+            let count: usize = files.iter().map(|css| css.matches(selector).count()).sum();
+            assert_eq!(count, 1, "{selector:?} must be defined once");
+        }
+        let system = files[2];
+        let start = system.find("chat transcript ---").unwrap();
+        let block = &system[start..system[start..].find("\n/* What one turn did").unwrap() + start];
+        assert!(
+            !block.contains("font-size: 1"),
+            "chat rows use --fs-* tokens"
+        );
+        assert!(block.contains(".msg.bot .msg-body {\n  max-width: 72ch;"));
+        assert!(block.contains(".msg.user .msg-body {\n  color: var(--label-1);"));
+        assert!(include_str!("../assets/settings.css").contains("--fs-micro: 11px;"));
     }
 
     #[test]

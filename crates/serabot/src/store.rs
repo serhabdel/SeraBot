@@ -3961,8 +3961,9 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// `turn.step` events for one of the acting user's conversations, oldest
-    /// first. Another user's conversation id matches nothing.
+    /// `turn.step` and `turn.memory` events for one of the acting user's
+    /// conversations, oldest first. Another user's conversation id matches
+    /// nothing.
     pub fn conversation_steps(
         &self,
         user_id: &str,
@@ -3972,7 +3973,7 @@ impl Store {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT id, at, kind, payload_json FROM events
-             WHERE user_id = ?1 AND kind = 'turn.step'
+             WHERE user_id = ?1 AND kind IN ('turn.step', 'turn.memory')
                AND json_extract(payload_json, '$.conversation_id') = ?2
              ORDER BY id DESC LIMIT ?3",
         )?;

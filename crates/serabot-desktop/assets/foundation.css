@@ -983,53 +983,14 @@ details.activity.done {
 .messages {
   gap: 6px;
 }
-
-.msg.speaker-change {
-  margin-top: 22px;
-}
-
-.msg.speaker-change:first-child {
-  margin-top: 0;
-}
-
-/* Replies: plain text on the page, no card. */
-.msg.bot .msg-body {
-  max-width: 100%;
-  width: 100%;
-  padding: 2px 0 0;
-  background: var(--clear);
-  border: 0;
-  border-radius: 0;
-  font-size: var(--fs-msg);
-  line-height: 1.65;
-}
-
 /* Several bots can speak in a group, so groups keep an avatar on every row; a
    one-to-one chat shows it once per run. */
 .messages:not(.group) .msg.bot:not(.speaker-change) .msg-avatar {
   visibility: hidden;
 }
-
-/* Keep a reply's text clear of the avatar column but let it use the width. */
-.msg.bot .msg-main {
-  flex: 1 1 auto;
-  min-width: 0;
-}
-
 .msg.last-reply .msg-actions {
   opacity: 1;
 }
-
-.msg.user .msg-body {
-  font-size: var(--fs-msg);
-  line-height: 1.55;
-}
-
-/* Quieter, steadier rows. */
-.msg-actions {
-  min-height: 24px;
-}
-
 .day-sep {
   margin: 18px 0 6px;
 }
@@ -1852,56 +1813,9 @@ details.step-more[open] > summary.step-more-summary::before {
   gap: 4px;
   padding: 12px 18px 16px;
 }
-
-.msg {
-  position: relative;
-  gap: 10px;
-}
-
-.msg.speaker-change {
-  margin-top: 16px;
-}
-
-.msg.speaker-change:first-child {
-  margin-top: 0;
-}
-
 .day-sep {
   margin: 12px auto 4px;
 }
-
-.msg-main {
-  gap: 2px;
-}
-
-.msg-body > :last-child {
-  margin-bottom: 0;
-}
-
-.msg-body p {
-  margin: 0 0 8px;
-}
-
-.msg-avatar.avatar {
-  width: 28px;
-  height: 28px;
-  border-radius: 9px;
-  font-size: 12px;
-}
-
-.msg.bot .msg-body {
-  padding-top: 3px;
-  line-height: 1.6;
-}
-
-/* Owner bubble: a smaller corner on the sender side. */
-.msg.user .msg-body {
-  padding: 8px 14px;
-  border-radius: 16px 16px 4px 16px;
-  max-width: min(580px, 82%);
-  line-height: 1.5;
-}
-
 /* The speaker line, where several bots talk. */
 .messages.group .msg-head {
   align-items: center;
@@ -1909,24 +1823,13 @@ details.step-more[open] > summary.step-more-summary::before {
   min-height: 20px;
   padding-left: 0;
 }
-
-.msg-name {
-  font-size: 13px;
-  font-weight: 650;
-  letter-spacing: -0.005em;
-}
-
-.msg-time {
-  font-size: 11.5px;
-}
-
 .msg-head .team-chip,
 .msg-head .chip {
   padding: 0 7px;
   border-color: transparent;
   background: var(--hover);
   color: var(--label-3);
-  font-size: 11px;
+  font-size: var(--fs-micro);
   line-height: 18px;
 }
 

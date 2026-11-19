@@ -1,0 +1,4 @@
+interface:
+  display_name: "Art Direction"
+  short_description: "Decided, non-generic direction for persuade surfaces"
+  default_prompt: "Use the art-direction skill to build this page from an inventory of the subject, an argument per section and a committed direction, then judge the render."

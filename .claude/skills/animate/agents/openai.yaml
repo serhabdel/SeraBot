@@ -1,0 +1,4 @@
+interface:
+  display_name: "Animate"
+  short_description: "Build one animation that survives review"
+  default_prompt: "Use the animate skill to implement this motion in the project's own framework idiom, deciding first whether it should animate at all."

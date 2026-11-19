@@ -1,0 +1,4 @@
+interface:
+  display_name: "Find Animation Opportunities"
+  short_description: "Where motion is missing and where it must never be"
+  default_prompt: "Use the find-animation-opportunities skill to find the few places this interface should animate, with exact values, and list what you rejected."

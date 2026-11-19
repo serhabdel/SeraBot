@@ -249,6 +249,7 @@ impl Session {
             bot: None,
             attachments: Vec::new(),
             limit_reached: false,
+            turn_id: None,
         });
         match delegate {
             Some((bot, text)) => self.start_request(Operation::SubmitTo {

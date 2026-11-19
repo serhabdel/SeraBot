@@ -1,0 +1,4 @@
+interface:
+  display_name: "Improve Animations"
+  short_description: "Audit existing motion and write executable fix plans"
+  default_prompt: "Use the improve-animations skill to audit every animation in this codebase and write prioritized, self-contained plans to fix them."

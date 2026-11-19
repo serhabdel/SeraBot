@@ -1,0 +1,4 @@
+interface:
+  display_name: "Analyze Components"
+  short_description: "Component inventory: orphans, duplicates, drift, missing states"
+  default_prompt: "Use the analyze-components skill to inventory the UI components in this crate and write the audit document."

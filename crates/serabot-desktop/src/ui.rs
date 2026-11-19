@@ -132,6 +132,9 @@ struct MsgView {
     regen: Option<String>,
     /// The newest reply a tool limit ended, while idle: offers Continue (0.24).
     continue_offer: bool,
+    /// The turn whose steps and memories this reply shows (0.61): set on the
+    /// last reply of each turn only.
+    turn: Option<String>,
 }
 
 /// A roster row: bot id, display name, avatar, enabled, live, role.
