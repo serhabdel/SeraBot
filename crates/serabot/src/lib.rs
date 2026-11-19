@@ -56,6 +56,7 @@ pub mod mcp_oauth;
 pub mod media_jobs;
 pub mod mem0;
 pub mod memory;
+pub mod memory_vectors;
 pub mod model_router;
 pub mod ocr;
 pub mod onboarding;

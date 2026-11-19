@@ -978,3 +978,13 @@ html[data-reduce-transparency="true"] .sheet.sheet-palette {
     opacity: 1;
   }
 }
+
+.turn-memory-item.replaced {
+  padding-left: 18px;
+  color: var(--label-3);
+  font-size: var(--fs-caption);
+}
+
+.turn-memory-item.replaced .turn-memory-text {
+  text-decoration-color: var(--label-3);
+}

@@ -1809,9 +1809,10 @@ details.step-more[open] > summary.step-more-summary::before {
 
 /* ---------------------------------------------------------- transcript --- */
 
+/* The last line clears the 36px fade above the composer (0.62). */
 .messages {
   gap: 4px;
-  padding: 12px 18px 16px;
+  padding: 12px 18px 40px;
 }
 .day-sep {
   margin: 12px auto 4px;

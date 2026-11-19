@@ -1166,8 +1166,6 @@ pub(super) fn ActivityRow(mut session: Signal<Session>, step: Step) -> Element {
                 }
                 if let Some(duration) = duration.clone() {
                     span { class: "step-time", "{duration}" }
-                } else if step.phase.spinning() {
-                    span { class: "step-time", "Running" }
                 }
             }
             if step.phase == StepPhase::WaitingApproval {

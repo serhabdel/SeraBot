@@ -2925,5 +2925,11 @@ fn TurnMemoryItem(item: serabot_desktop::turn_trace::MemoryItem) -> Element {
                 span { class: "chip", "you saved" }
             }
         }
+        for old in item.replaces.iter() {
+            li { class: "turn-memory-item replaced",
+                span { class: "turn-memory-replaced", "Replaces: " }
+                s { class: "turn-memory-text", "{old}" }
+            }
+        }
     }
 }

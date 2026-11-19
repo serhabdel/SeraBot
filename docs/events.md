@@ -114,5 +114,7 @@ is returned by `/activity` together with `turn.step`.
 ```
 
 Each side lists at most 8 items, and each excerpt is at most 120 characters.
+Since 0.62, `saved` lists everything the turn saved by any path, and an item
+can carry `replaces`: excerpts of up to 2 older facts it retired.
 `excerpt` is left out when the outgoing-text scan rejects it. The desktop
 draws these inside the reply with the same `turn_id`.

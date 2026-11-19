@@ -41,7 +41,8 @@ score = (0.2 + 0.8 * lexical) * importance * recency * bot_boost
 ```
 
 - `lexical` is the FTS5 BM25 relevance of the query tokens, normalized to 0..1
-  over the best hit. Zero when the fact does not match.
+  over the best hit. Zero when the fact does not match. Since 0.62 this is
+  `relevance = max(lexical, semantic)`, see below.
 - `recency` decays with a 30-day half-life down to a floor of 0.6, so an old
   but relevant fact still wins against a recent unrelated one.
 - `bot_boost` is 1.15 when the fact was written by the bot answering the turn.
@@ -50,8 +51,50 @@ With an empty message the newest facts are returned. Recalled rows get their
 `recall_count` and `last_recalled_at` updated. A fact that fails the blocklist
 is left out of the block rather than failing the turn.
 
-`memory_search` and the console search use the lexical ranking only: a result
-must match a query token.
+`memory_search`, `memory_list` with a query, and the console search use the
+same relevance: a result must match a query token **or** be a semantic match.
+
+### Semantic recall (0.62)
+
+Keyword recall misses a paraphrase: "what is on my agenda" shares no word with
+"Keeps the team calendar in Outlook". With `[memory] semantic_recall = true`
+(the default), each fact also has one local embedding (`memory_vectors`,
+migration 0042) from the `[embeddings]` E5 model that document retrieval uses.
+
+- `semantic` is the cosine similarity between the query and the fact, scaled
+  so `semantic_min_similarity` (default 0.82) maps to 0 and an identical
+  meaning to 1. Facts below the floor are not semantic matches.
+- Vectors are written best effort after a save or an edit, and missing or
+  stale ones (content hash or model changed) are rebuilt 32 at a time at
+  recall. At most 5,000 vectors are compared per query, brute force in Rust.
+- Every read filters on the acting user; a vector is deleted with its fact.
+- No model cache, or any embedding error, means keyword recall for that turn.
+  It never fails the turn. The model loads on first use (`LazyEmbedder`).
+
+## Contradiction check (0.62)
+
+Near-duplicate supersession catches rewordings, not changed decisions
+("mandatory" became "optional"). With `[memory] conflict_check = true` (the
+default), after every owner turn:
+
+1. The facts the turn saved, by any path (extraction or `memory_save`), are
+   read back (`written_since`, at most 6 active facts).
+2. For each, the closest older active facts are found: semantic neighbours at
+   cosine ≥ 0.86 when vectors exist, otherwise keyword matches of the same kind
+   (at most 3 each).
+3. One bounded model call (`memory_conflict`, the extraction model and
+   timeout) answers `{"replaces":[{"new","old"}]}`. The answer is untrusted
+   data: only ids it was shown are acted on.
+4. For each pair, the older fact is retired (`superseded`, `superseded_by` the
+   new fact, still restorable from the console), **except** when the new fact
+   was extracted and the older one was saved by the owner. Then the new fact is
+   held as `pending` for review instead. An extracted guess never overrides the
+   owner's own words.
+5. A `memory.conflict` audit row records counts only.
+
+No call is made when the turn saved nothing or nothing similar exists. The
+chat's turn trace shows "Replaced N" and the replaced text (`turn.memory`
+`saved[].replaces`).
 
 ## Supersession and deduplication
 
@@ -205,10 +248,10 @@ equal counts is not detected.
 
 ## Shortcuts and known gaps
 
-- **No vector recall.** Ranking is lexical plus importance, recency, and bot
-  boost. The embedder is not wired into memory. Paraphrases with no shared
-  tokens are not found, and CJK text with single-character tokens is only matched
-  by the tokenizer's own rules.
+- Semantic recall needs the E5 model cache on the server. Without it, recall is
+  keyword-only, as before 0.62.
+- The contradiction check covers facts saved in a turn. Facts added from the
+  console or the API are not checked.
 - Query tokens shorter than two characters are ignored.
 - Facts from untrusted-source turns are the only pending rows. The untrusted
   tool list is a name-based heuristic, so a new reader tool must be added to it.

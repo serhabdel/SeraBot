@@ -159,6 +159,14 @@ impl Runtime {
                     if item.pending {
                         row["pending"] = json!(true);
                     }
+                    let replaces: Vec<&String> = item
+                        .replaces
+                        .iter()
+                        .filter(|text| self.gateway.scan_egress(user_id, text).is_ok())
+                        .collect();
+                    if !replaces.is_empty() {
+                        row["replaces"] = json!(replaces);
+                    }
                     row
                 })
                 .collect()
@@ -189,6 +197,8 @@ pub(super) struct MemoryRef {
     pub origin: String,
     pub excerpt: String,
     pub pending: bool,
+    /// Excerpts of the older facts this one replaced (0.62), at most 2.
+    pub replaces: Vec<String>,
 }
 
 impl MemoryRef {
@@ -200,6 +210,44 @@ impl MemoryRef {
             origin: memory.origin.clone(),
             excerpt: truncate_chars(excerpt.trim(), MEMORY_EXCERPT_CHARS),
             pending: memory.status == crate::memory::STATUS_PENDING,
+            replaces: Vec::new(),
         }
+    }
+}
+
+impl Runtime {
+    /// What a turn saved (by extraction or `memory_save`), with the older
+    /// facts each one replaced, for the `turn.memory` event.
+    pub(super) fn turn_saved(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        since: chrono::DateTime<Utc>,
+    ) -> Vec<MemoryRef> {
+        let rows = match crate::memory::written_since(
+            &self.store,
+            user_id,
+            conversation_id,
+            since,
+            MEMORY_EVENT_ITEMS,
+        ) {
+            Ok(rows) => rows,
+            Err(error) => {
+                warn!(%error, "saved memories were not listed");
+                return Vec::new();
+            }
+        };
+        rows.iter()
+            .map(|memory| {
+                let mut item = MemoryRef::new(memory);
+                item.replaces = crate::memory::replaced_by(&self.store, user_id, &memory.id)
+                    .unwrap_or_default()
+                    .iter()
+                    .take(2)
+                    .map(|old| MemoryRef::new(old).excerpt)
+                    .collect();
+                item
+            })
+            .collect()
     }
 }

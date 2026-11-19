@@ -1743,6 +1743,19 @@ pub struct MemoryConfig {
     /// Minimum seconds between two extraction runs for one user (0..=3600).
     #[serde(default = "default_extract_min_interval")]
     pub extract_min_interval_secs: u64,
+    /// Semantic recall (0.62): each memory also gets a local E5 embedding, and
+    /// recall blends meaning with keyword relevance. Uses the `[embeddings]`
+    /// model already used by document retrieval; `false` keeps keyword-only.
+    #[serde(default = "default_true")]
+    pub semantic_recall: bool,
+    /// Cosine floor for a semantic match (0.5..=0.99).
+    #[serde(default = "default_semantic_min_similarity")]
+    pub semantic_min_similarity: f32,
+    /// Contradiction check (0.62): after a turn saves facts, a bounded model
+    /// call compares each new fact with the closest older ones and retires the
+    /// one it replaces (or holds the new one for review). `false` turns it off.
+    #[serde(default = "default_true")]
+    pub conflict_check: bool,
 }
 
 impl Default for MemoryConfig {
@@ -1757,6 +1770,9 @@ impl Default for MemoryConfig {
             extract_timeout_secs: default_extract_timeout(),
             extract_model: None,
             extract_min_interval_secs: default_extract_min_interval(),
+            semantic_recall: true,
+            semantic_min_similarity: default_semantic_min_similarity(),
+            conflict_check: true,
         }
     }
 }
@@ -1798,6 +1814,11 @@ impl MemoryConfig {
                 "memory.extract_min_interval_secs must be 0..=3600".into(),
             ));
         }
+        if !(0.5..=0.99).contains(&self.semantic_min_similarity) {
+            return Err(SeraError::Config(
+                "memory.semantic_min_similarity must be 0.5..=0.99".into(),
+            ));
+        }
         if let Some(model) = &self.extract_model
             && (model.is_empty() || model.len() > 128 || model.chars().any(char::is_whitespace))
         {
@@ -1811,6 +1832,10 @@ impl MemoryConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_semantic_min_similarity() -> f32 {
+    crate::memory_vectors::DEFAULT_MIN_SIMILARITY
 }
 
 fn default_memory_provider() -> String {

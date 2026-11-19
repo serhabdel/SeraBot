@@ -321,7 +321,7 @@ impl Runtime {
     pub(super) fn spawn_post_turn_memory(
         &self,
         user_id: &str,
-        turn: (&str, &str),
+        turn: (&str, &str, chrono::DateTime<Utc>),
         bot: &str,
         conversation_id: &str,
         user_text: &str,
@@ -330,16 +330,15 @@ impl Runtime {
     ) {
         let extract = self.config.memory.auto_extract && should_extract(user_text);
         let summarize = self.config.memory.summary_every > 0;
-        if !extract && !summarize {
-            return;
-        }
+        // No early return (0.62): facts saved by `memory_save` during the
+        // turn are checked and shown even when extraction does not run.
         let Some(permit) = ExtractGate::try_busy(&self.extract_gate, user_id) else {
             info!("post-turn memory skipped: the previous job for this user is still running");
             return;
         };
         let runtime = self.clone();
         let user_id = user_id.to_owned();
-        let (task_id, turn_id) = (turn.0.to_owned(), turn.1.to_owned());
+        let (task_id, turn_id, since) = (turn.0.to_owned(), turn.1.to_owned(), turn.2);
         let bot = bot.to_owned();
         let conversation_id = conversation_id.to_owned();
         let user_text = user_text.to_owned();
@@ -352,7 +351,7 @@ impl Runtime {
             if extract {
                 let interval = Duration::from_secs(runtime.config.memory.extract_min_interval_secs);
                 if runtime.extract_gate.claim_extraction(&user_id, interval) {
-                    let saved = runtime
+                    runtime
                         .run_extraction(
                             &user_id,
                             &bot,
@@ -362,14 +361,20 @@ impl Runtime {
                             untrusted_source,
                         )
                         .await;
-                    runtime.emit_memory(
-                        &user_id,
-                        (&task_id, &turn_id, &conversation_id),
-                        &[],
-                        &saved,
-                    );
                 }
             }
+            // Retire what the new facts made untrue, then tell the chat what
+            // this turn saved and replaced, by any path.
+            runtime
+                .check_conflicts(&user_id, &bot, &conversation_id, since)
+                .await;
+            let saved = runtime.turn_saved(&user_id, &conversation_id, since);
+            runtime.emit_memory(
+                &user_id,
+                (&task_id, &turn_id, &conversation_id),
+                &[],
+                &saved,
+            );
             if summarize {
                 runtime.run_summary(&user_id, &bot, &conversation_id).await;
             }

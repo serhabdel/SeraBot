@@ -710,7 +710,16 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         config.clone(),
         Some(Arc::new(store.clone())),
     )?;
-    serabot::tools::register_memory_tools(&mut registry, store.clone())?;
+    serabot::tools::register_memory_tools(
+        &mut registry,
+        store.clone(),
+        config.memory.semantic_recall.then(|| {
+            serabot::memory_vectors::SemanticIndex::new(
+                embedder.clone(),
+                config.memory.semantic_min_similarity,
+            )
+        }),
+    )?;
     serabot::job_tools::register_job_tools(&mut registry, config.clone(), secrets.clone())?;
     serabot::job_tools::register_task_calendar_tools(
         &mut registry,
@@ -1067,7 +1076,9 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         fleet,
         notifier,
         shutdown.clone(),
-    )?;
+    )?
+    // Memory shares the lazy E5 embedder with document retrieval (0.62).
+    .with_semantic_memory(embedder.clone());
 
     #[cfg(feature = "whatsapp-link")]
     if let Some(link) = &whatsapp_link {
