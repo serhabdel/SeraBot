@@ -152,6 +152,71 @@ pub(super) async fn list_bot_chats(
     })))
 }
 
+/// `GET /v1/bots/{bot}/library` (0.63): everything in the bot's chats, in
+/// one list: files the bots made (`generated`) and files the member uploaded
+/// (`uploaded`), newest first. Per user; the desktop filters, searches and
+/// groups it. Bounded: the 30 most recent chats, 100 files made per chat,
+/// 300 uploads.
+pub(super) async fn bot_library(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(bot): Path<String>,
+) -> Result<Json<Value>> {
+    ensure_bot(&state, &user, &bot)?;
+    let mut conversations = state.store.bot_conversation_ids(&user.id, &bot, 30)?;
+    let primary = format!("dir:{bot}");
+    if !conversations.contains(&primary) {
+        conversations.insert(0, primary);
+    }
+    let mut items = Vec::new();
+    for conversation in &conversations {
+        let title = state
+            .store
+            .get_conversation(&user.id, conversation)?
+            .and_then(|row| row.title)
+            .unwrap_or_default();
+        for entry in state
+            .store
+            .list_conversation_artifacts(&user.id, conversation)?
+        {
+            let meta = state.artifacts.meta(&entry.hash).ok();
+            let filename = meta.as_ref().map(|meta| meta.filename.clone());
+            items.push(json!({
+                "kind": "generated",
+                "id": entry.hash,
+                "action_id": entry.action_id,
+                "tool": entry.tool,
+                "name": meta.as_ref().map(|meta| meta.title.clone()).or(filename.clone()),
+                "filename": filename,
+                "mime": filename.as_deref().map(crate::util::mime_for_filename),
+                "size_bytes": serde_json::Value::Null,
+                "conversation_id": conversation,
+                "conversation_title": title,
+                "created_at": entry.created_at,
+            }));
+        }
+    }
+    for upload in state
+        .store
+        .chat_attachments_in(&user.id, &conversations, 300)?
+    {
+        items.push(json!({
+            "kind": "uploaded",
+            "id": upload.id,
+            "action_id": serde_json::Value::Null,
+            "tool": "upload",
+            "name": upload.filename,
+            "filename": upload.filename,
+            "mime": upload.mime,
+            "size_bytes": upload.size_bytes,
+            "conversation_id": upload.conversation_id,
+            "conversation_title": serde_json::Value::Null,
+            "created_at": upload.created_at,
+        }));
+    }
+    Ok(Json(json!({"bot": bot, "items": items})))
+}
+
 /// `POST /v1/bots/{bot}/chats`: a new chat with the bot. It starts with the
 /// bot's latest summary (`carried_from` names the chat it came from).
 pub(super) async fn create_bot_chat(

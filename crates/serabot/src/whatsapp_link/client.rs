@@ -190,8 +190,28 @@ impl WhatsappLink {
             user.clone(),
             user.clone(),
         );
+        // How the device shows in WhatsApp's Linked devices list: a browser
+        // on a desktop, not the library default. Applied at pairing only.
+        let os: String = self
+            .config
+            .whatsapp_link
+            .device_os
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == ' ')
+            .take(24)
+            .collect();
+        let os = if os.trim().is_empty() {
+            "Windows".to_string()
+        } else {
+            os
+        };
         let mut builder = Bot::builder()
             .with_backend(backend)
+            .with_device_props(
+                whatsapp_rust::wacore::store::DevicePropsOverride::new()
+                    .with_os(os)
+                    .with_platform_type(wa::device_props::PlatformType::CHROME),
+            )
             .on_qr_code(move |code, ttl| {
                 let link = link_qr.clone();
                 let user = user_qr.clone();
@@ -461,6 +481,80 @@ impl WhatsappLink {
         Ok(())
     }
 
+    /// Send a file to one of the member's allowed chats, rate limited like
+    /// text. Images go as photos; everything else as a document.
+    pub async fn send_file_to(
+        &self,
+        user_id: &str,
+        jid: &str,
+        filename: &str,
+        bytes: Vec<u8>,
+        caption: Option<String>,
+    ) -> Result<()> {
+        let allowed = self
+            .store
+            .whatsapp_link_account(user_id)?
+            .is_some_and(|account| account.allowlist.iter().any(|entry| entry == jid));
+        if !allowed {
+            return Err(SeraError::Forbidden(
+                "that chat is not on your WhatsApp allowed list".into(),
+            ));
+        }
+        if bytes.len() as u64 > self.config.whatsapp_link.max_media_bytes {
+            return Err(SeraError::Validation(format!(
+                "'{filename}' is larger than {} MB",
+                self.config.whatsapp_link.max_media_bytes / (1024 * 1024)
+            )));
+        }
+        self.take_send_slot(user_id, jid)?;
+        let client = self
+            .live
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(user_id)
+            .map(|live| live.client.clone())
+            .ok_or_else(|| SeraError::External("your WhatsApp number is not connected".into()))?;
+        let to: Jid = jid
+            .parse()
+            .map_err(|_| SeraError::Validation("invalid WhatsApp chat".into()))?;
+        let mime = file_mime(filename);
+        let image = mime.starts_with("image/");
+        let kind = if image {
+            whatsapp_rust::download::MediaType::Image
+        } else {
+            whatsapp_rust::download::MediaType::Document
+        };
+        let upload = client
+            .upload(bytes, kind, Default::default())
+            .await
+            .map_err(|error| SeraError::External(format!("WhatsApp upload failed: {error}")))?;
+        let message = if image {
+            whatsapp_rust::media::image_message(
+                upload,
+                whatsapp_rust::media::ImageOptions {
+                    caption,
+                    mimetype: Some(mime.to_string()),
+                    ..Default::default()
+                },
+            )
+        } else {
+            whatsapp_rust::media::document_message(
+                upload,
+                whatsapp_rust::media::DocumentOptions {
+                    mimetype: Some(mime.to_string()),
+                    file_name: Some(filename.to_string()),
+                    caption,
+                    ..Default::default()
+                },
+            )
+        };
+        client
+            .send_message(to, message)
+            .await
+            .map_err(|error| SeraError::External(format!("WhatsApp send failed: {error}")))?;
+        Ok(())
+    }
+
     fn take_send_slot(&self, user_id: &str, jid: &str) -> Result<()> {
         let limit = self.config.whatsapp_link.sends_per_minute.max(1) as usize;
         let mut sends = self.sends.lock().unwrap_or_else(|p| p.into_inner());
@@ -473,8 +567,48 @@ impl WhatsappLink {
                 "too many WhatsApp messages to this chat in the last minute".into(),
             ));
         }
-        window.push(Instant::now());
+        // Daily cap per member across all chats (0.63), so requested replies
+        // and media can go out without a prompt and still stay bounded.
+        let daily = self.config.whatsapp_link.sends_per_day.max(1) as usize;
+        let day_key = (user_id.to_string(), String::new());
+        let today_len = {
+            let day = sends.entry(day_key.clone()).or_default();
+            day.retain(|at| at.elapsed() < Duration::from_secs(24 * 60 * 60));
+            day.len()
+        };
+        if today_len >= daily {
+            return Err(SeraError::Validation(
+                "the daily WhatsApp message limit is reached; try again tomorrow".into(),
+            ));
+        }
+        sends
+            .entry((user_id.to_string(), jid.to_string()))
+            .or_default()
+            .push(Instant::now());
+        sends.entry(day_key).or_default().push(Instant::now());
         Ok(())
+    }
+}
+
+/// MIME type from a file name, for the WhatsApp media message.
+fn file_mime(filename: &str) -> &'static str {
+    let lower = filename.to_ascii_lowercase();
+    let ext = lower.rsplit('.').next().unwrap_or_default();
+    match ext {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "csv" => "text/csv",
+        "txt" | "md" => "text/plain",
+        "mp3" => "audio/mpeg",
+        "ogg" => "audio/ogg",
+        "mp4" => "video/mp4",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
     }
 }
 
@@ -519,6 +653,109 @@ impl Notifier for WhatsappLink {
             notice.action.tool
         );
         self.send_text_to(user_id, &jid, &line).await
+    }
+}
+
+/// `whatsapp_link_reply_file` (0.63): send one of the member's files into the
+/// WhatsApp chat the current conversation came from. Only that chat: the
+/// tool takes no recipient, so it is a reply the member asked for (like the
+/// automatic text reply), not a new message to someone. Not approval-gated;
+/// bounded by the allowlist, the per-minute and daily send limits, the
+/// artifact ownership check and the blocklist on the filename and caption.
+pub struct WhatsappLinkReplyFileTool {
+    link: Arc<WhatsappLink>,
+    artifacts: Arc<crate::maker::ArtifactStore>,
+    policy: Arc<crate::policy::Policy>,
+}
+
+impl WhatsappLinkReplyFileTool {
+    pub fn new(
+        link: Arc<WhatsappLink>,
+        artifacts: Arc<crate::maker::ArtifactStore>,
+        policy: Arc<crate::policy::Policy>,
+    ) -> Self {
+        Self {
+            link,
+            artifacts,
+            policy,
+        }
+    }
+}
+
+#[async_trait]
+impl crate::gateway::Tool for WhatsappLinkReplyFileTool {
+    fn spec(&self) -> crate::gateway::ToolSpec {
+        crate::gateway::ToolSpec {
+            name: super::REPLY_FILE_TOOL.into(),
+            description: "Send a file (a document, image or media the user's bots made or \
+                          the user uploaded) back into this WhatsApp chat. Use it when the \
+                          user asks over WhatsApp for a file. Find the hash with \
+                          conversation_library, or ask the teammate who made it."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "artifact_hash": {"type": "string", "description": "SHA-256 of the file"},
+                    "caption": {"type": "string", "description": "Optional short caption"}
+                },
+                "required": ["artifact_hash"],
+                "additionalProperties": false
+            }),
+            external_effect: true,
+        }
+    }
+
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        context: &crate::gateway::ToolContext,
+    ) -> Result<crate::gateway::ToolOutput> {
+        let hash = args
+            .get("artifact_hash")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| SeraError::Validation("artifact_hash is required".into()))?;
+        let caption = args
+            .get("caption")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(|text| text.chars().take(1000).collect::<String>());
+        let conversation = context.conversation_id.as_deref().ok_or_else(|| {
+            SeraError::Validation("this only works inside a WhatsApp conversation".into())
+        })?;
+        let Some(jid) = self
+            .link
+            .store
+            .whatsapp_link_chat(&context.user_id, conversation)?
+        else {
+            return Err(SeraError::Validation(
+                "this conversation did not come from WhatsApp; the user can ask from \
+                 WhatsApp, or use another delivery"
+                    .into(),
+            ));
+        };
+        if !self.link.store.user_owns_artifact(&context.user_id, hash)? {
+            return Err(SeraError::NotFound("artifact".into()));
+        }
+        let artifact = self.artifacts.load(hash)?;
+        if !self.policy.is_allowed(&artifact.filename)
+            || caption
+                .as_deref()
+                .is_some_and(|text| !self.policy.is_allowed(text))
+        {
+            return Err(SeraError::PolicyViolation);
+        }
+        let filename = artifact.filename.clone();
+        self.link
+            .send_file_to(&context.user_id, &jid, &filename, artifact.bytes, caption)
+            .await?;
+        Ok(crate::gateway::ToolOutput {
+            content: format!("Sent {filename} on WhatsApp."),
+            artifact_hash: Some(artifact.hash),
+            filename: Some(filename),
+            destination: Some(format!("whatsapp:{jid}")),
+            ..Default::default()
+        })
     }
 }
 
@@ -642,6 +879,111 @@ mod tests {
         assert!(
             matches!(&limited, SeraError::Validation(m) if m.contains("too many")),
             "{limited:?}"
+        );
+    }
+
+    fn reply_context(admin: &str, conversation: &str) -> crate::gateway::ToolContext {
+        crate::gateway::ToolContext {
+            user_id: admin.to_string(),
+            actor: admin.to_string(),
+            bot: "whatsapp".into(),
+            task_id: None,
+            turn_id: None,
+            conversation_id: Some(conversation.to_string()),
+            allowed_tools: [super::super::REPLY_FILE_TOOL.to_string()]
+                .into_iter()
+                .collect(),
+            require_approval: Default::default(),
+        }
+    }
+
+    /// 0.63: a file goes back only into the WhatsApp chat the conversation
+    /// came from, only if the member owns it, and never past the blocklist.
+    #[tokio::test]
+    async fn reply_file_stays_in_its_own_chat_and_checks_ownership() {
+        let (dir, link, admin) = link();
+        let artifacts = Arc::new(crate::maker::ArtifactStore::new(dir.path().join("a")).unwrap());
+        let saved = artifacts
+            .save(
+                b"%PDF-1.4 test",
+                "report.pdf",
+                crate::maker::ArtifactMeta {
+                    title: "report".into(),
+                    filename: "report.pdf".into(),
+                    language: crate::domain::Language::En,
+                    source_artifact: None,
+                    created_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+        let tool = WhatsappLinkReplyFileTool::new(
+            link.clone(),
+            artifacts,
+            Arc::new(crate::policy::Policy::from_text("report")),
+        );
+        let args = serde_json::json!({"artifact_hash": saved.hash});
+        // Not a WhatsApp conversation: refused.
+        link.store
+            .ensure_conversation_accepts_turns(&admin, "dir:main")
+            .unwrap();
+        let elsewhere = tool
+            .execute(args.clone(), &reply_context(&admin, "dir:main"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(elsewhere, SeraError::Validation(_)),
+            "{elsewhere:?}"
+        );
+        // A WhatsApp conversation, but the file is not the member's.
+        let jid = "33612345678@s.whatsapp.net";
+        link.store
+            .set_whatsapp_link_allowlist(&admin, &[jid.to_string()])
+            .unwrap();
+        let conversation = super::super::conversation_id_for(&admin, jid);
+        link.store
+            .bind_whatsapp_link_chat(&admin, &conversation, jid)
+            .unwrap();
+        let foreign = tool
+            .execute(args.clone(), &reply_context(&admin, &conversation))
+            .await
+            .unwrap_err();
+        assert!(matches!(foreign, SeraError::NotFound(_)), "{foreign:?}");
+        // Owned, but the filename hits the blocklist.
+        link.store
+            .record_conversation_artifact(
+                &admin,
+                &conversation,
+                None,
+                "deck_build",
+                &saved.hash,
+                "report.pdf",
+                None,
+            )
+            .unwrap();
+        let blocked = tool
+            .execute(args, &reply_context(&admin, &conversation))
+            .await
+            .unwrap_err();
+        assert!(matches!(blocked, SeraError::PolicyViolation), "{blocked:?}");
+        // The tool is a reply, not a new message: never approval-gated.
+        assert!(!crate::gateway::is_destructive_tool(
+            super::super::REPLY_FILE_TOOL
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_daily_cap_spans_every_chat() {
+        let (_dir, link, admin) = link();
+        let mut config = (*link.config).clone();
+        config.whatsapp_link.sends_per_day = 2;
+        config.whatsapp_link.sends_per_minute = 10;
+        let link = WhatsappLink::new(Arc::new(config), link.store.clone());
+        link.take_send_slot(&admin, "a@s.whatsapp.net").unwrap();
+        link.take_send_slot(&admin, "b@s.whatsapp.net").unwrap();
+        let capped = link.take_send_slot(&admin, "c@s.whatsapp.net").unwrap_err();
+        assert!(
+            matches!(&capped, SeraError::Validation(m) if m.contains("daily")),
+            "{capped:?}"
         );
     }
 

@@ -829,6 +829,12 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
             artifacts.clone(),
             policy.clone(),
         ))?;
+        registry.register(serabot::maker::TelegramReplyFileTool::new(
+            client.clone(),
+            artifacts.clone(),
+            policy.clone(),
+            store.clone(),
+        ))?;
         telegram = Some(client);
     }
     // WhatsApp linked devices (off unless [whatsapp_link] enabled): replies in
@@ -845,6 +851,13 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         registry.register(serabot::whatsapp_link::client::WhatsappLinkSendTool::new(
             link.clone(),
         ))?;
+        registry.register(
+            serabot::whatsapp_link::client::WhatsappLinkReplyFileTool::new(
+                link.clone(),
+                artifacts.clone(),
+                policy.clone(),
+            ),
+        )?;
     }
     if config.firecrawl.enabled {
         let api_key = secrets

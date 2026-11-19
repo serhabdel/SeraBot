@@ -154,6 +154,9 @@ pub struct State {
     pub activity: crate::activity::Activity,
     /// Per-turn steps and memories of the open conversation (0.61).
     pub turns: crate::turn_trace::TurnLedger,
+    /// The library of the bot whose panel is open (0.63).
+    pub bot_library: Option<crate::bot_library::BotLibrary>,
+    pub bot_library_loading: bool,
     /// Which bots are working now (rail, header and room rings).
     pub working: crate::working::WorkingBots,
     pub approvals: Vec<Approval>,
@@ -343,6 +346,8 @@ impl Default for State {
             stopping: false,
             activity: Default::default(),
             turns: Default::default(),
+            bot_library: None,
+            bot_library_loading: false,
             working: Default::default(),
             approvals: Vec::new(),
             approvals_loaded: false,
@@ -979,6 +984,10 @@ impl State {
                     settings.mem0.configured = matches!(reply, Reply::Mem0KeySaved);
                 }
                 self.memory_settings_error = None;
+            }
+            Reply::BotLibrary(library) => {
+                self.bot_library_loading = false;
+                self.bot_library = Some(library);
             }
             Reply::TurnTraces { conversation, body } => {
                 self.turns.load(&conversation, &body);

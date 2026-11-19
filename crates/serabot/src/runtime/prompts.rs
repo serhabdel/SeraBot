@@ -105,6 +105,9 @@ impl Runtime {
             // globally), regardless of what its stored tool list says.
             crate::tools::CONVERSATION_LIBRARY_TOOL,
             crate::maker::TELEGRAM_SEND_DOCUMENT_TOOL,
+            // 0.63: a file the owner asked for over Telegram goes back to
+            // that chat without an approval (the tool refuses elsewhere).
+            crate::maker::TELEGRAM_REPLY_FILE_TOOL,
             // 0.28: every bot may flip its conversation's YOLO switch itself
             // (audited; destructive tools still always ask the owner).
             crate::plans::YOLO_TOOL,
@@ -127,6 +130,17 @@ impl Runtime {
         {
             allowed_tools.insert(crate::collaboration::ASK_TEAMMATE_TOOL.to_string());
         }
+        // 0.63: WhatsApp belongs to the WhatsApp bot. Every other bot (main's
+        // `tools = ["all"]` included) asks it instead, so a bot never tries
+        // the Business API on behalf of a linked personal number. The Business
+        // tools appear only once the member connected the Business API.
+        let is_whatsapp_bot = bot.config.name == self.config.whatsapp_link.bot;
+        crate::collaboration::scope_whatsapp_tools(
+            &mut allowed_tools,
+            is_whatsapp_bot,
+            is_whatsapp_bot && self.whatsapp_cloud_connected(&user),
+            |tool| self.gateway.is_registered(tool),
+        );
         Ok(ToolContext {
             user_id: user.clone(),
             actor: user,
@@ -136,6 +150,18 @@ impl Runtime {
             conversation_id: Some(turn.conversation_id.clone()),
             allowed_tools,
             require_approval: bot.config.require_approval.iter().cloned().collect(),
+        })
+    }
+
+    /// Whether the member saved WhatsApp Business (Cloud API) credentials.
+    /// Row existence only; nothing is decrypted.
+    fn whatsapp_cloud_connected(&self, user_id: &str) -> bool {
+        self.gateway.user_secrets().is_some_and(|secrets| {
+            secrets.providers_for(user_id).is_ok_and(|names| {
+                names
+                    .iter()
+                    .any(|name| name == crate::collaboration::WHATSAPP_CLOUD_CREDENTIAL)
+            })
         })
     }
 
@@ -287,6 +313,9 @@ impl Runtime {
         prompt.push_str("- Be concise and explicit about uncertainty.\n");
         prompt.push_str("- When the owner asks you to remember, save, change, or forget a fact or preference, call memory_save, memory_update, or memory_delete if available. Use memory_search to look up older facts.\n");
         prompt.push_str(&self.plan_clause(user_id, conversation_id));
+        if bot.config.name == self.config.whatsapp_link.bot {
+            prompt.push_str(crate::collaboration::WHATSAPP_BOT_RULES);
+        }
         if bot
             .config
             .tools

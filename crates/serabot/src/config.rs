@@ -4266,6 +4266,13 @@ pub struct WhatsappLinkConfig {
     /// Messages sent per chat per minute, at most.
     #[serde(default = "default_whatsapp_link_rate")]
     pub sends_per_minute: u32,
+    /// Messages sent per member per day, at most (0.63).
+    #[serde(default = "default_whatsapp_link_daily")]
+    pub sends_per_day: u32,
+    /// Operating system shown in WhatsApp's Linked devices list (0.63). Set
+    /// at pairing only: sign out and link again to change it.
+    #[serde(default = "default_whatsapp_link_os")]
+    pub device_os: String,
 }
 
 impl Default for WhatsappLinkConfig {
@@ -4276,6 +4283,8 @@ impl Default for WhatsappLinkConfig {
             bot: default_whatsapp_link_bot(),
             max_media_bytes: default_whatsapp_link_max_bytes(),
             sends_per_minute: default_whatsapp_link_rate(),
+            sends_per_day: default_whatsapp_link_daily(),
+            device_os: default_whatsapp_link_os(),
         }
     }
 }
@@ -4294,4 +4303,12 @@ fn default_whatsapp_link_max_bytes() -> u64 {
 
 fn default_whatsapp_link_rate() -> u32 {
     6
+}
+
+fn default_whatsapp_link_daily() -> u32 {
+    100
+}
+
+fn default_whatsapp_link_os() -> String {
+    "Windows".into()
 }

@@ -1718,13 +1718,9 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                         }
                         div { class: "composer-row",
                             NewMenu { session, overlay }
-                            // The model chip only applies to one-to-one bot
-                            // chats; rooms and the owner chat stay
-                            // auto-routed (the Providers page keeps the full
-                            // ModelBar).
-                            if is_one_to_one {
-                                ModelBar { session, compact: true }
-                            }
+                            // 0.63: the model and thinking picker moved to
+                            // the chat header (HeaderModelChip); the composer
+                            // keeps only writing, files, voice and send.
                             div { class: "team-row",
                                 if group_like {
                                     // Collapsed: one caption chip with a count.
@@ -2931,5 +2927,81 @@ fn TurnMemoryItem(item: serabot_desktop::turn_trace::MemoryItem) -> Element {
                 s { class: "turn-memory-text", "{old}" }
             }
         }
+    }
+}
+
+/// The model chip in a one-to-one chat's header (0.63): the current model at
+/// a glance; a click opens the full picker (model, account, thinking) in a
+/// popover, so the composer only holds what is being written.
+#[component]
+pub(super) fn HeaderModelChip(session: Signal<Session>) -> Element {
+    let mut open = use_signal(|| false);
+    let label = {
+        let state = session.read();
+        let bot = state.conversation_bot(&state.conversation);
+        if bot
+            .as_deref()
+            .is_some_and(|bot| state.bot_uses_claude_agent(bot))
+        {
+            "Claude Code (local)".to_owned()
+        } else {
+            match state.state.catalog.as_ref().map(|c| &c.selection) {
+                Some(selection) if !selection.is_auto() => short_model(&selection.model),
+                _ => "Auto".to_owned(),
+            }
+        }
+    };
+    rsx! {
+        div { class: "header-model",
+            button {
+                class: if open() { "btn ghost sm header-model-chip open" } else { "btn ghost sm header-model-chip" },
+                r#type: "button",
+                title: "Model and thinking for this chat",
+                "aria-haspopup": "dialog",
+                "aria-expanded": if open() { "true" } else { "false" },
+                onclick: move |_| open.set(!open()),
+                Icon { name: "sparkles", size: 14 }
+                span { class: "header-model-label", "{label}" }
+                Icon { name: "chevron-down", size: 12 }
+            }
+            if open() {
+                div {
+                    class: "header-model-scrim",
+                    onclick: move |_| open.set(false),
+                }
+                div {
+                    class: "header-model-pop",
+                    role: "dialog",
+                    "aria-label": "Model and thinking",
+                    onkeydown: move |event: KeyboardEvent| {
+                        if event.key() == Key::Escape {
+                            event.prevent_default();
+                            open.set(false);
+                        }
+                    },
+                    p { class: "header-model-title", "Model for this chat" }
+                    ModelBar { session, compact: true }
+                    p { class: "tiny muted", "Applies from your next message." }
+                }
+            }
+        }
+    }
+}
+
+/// "claude-sonnet-5-5" -> "claude-sonnet-5-5"; a long id keeps its tail.
+fn short_model(model: &str) -> String {
+    let name = model.rsplit('/').next().unwrap_or(model);
+    if name.chars().count() > 26 {
+        let tail: String = name
+            .chars()
+            .rev()
+            .take(24)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!("\u{2026}{tail}")
+    } else {
+        name.to_owned()
     }
 }

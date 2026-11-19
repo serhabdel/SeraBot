@@ -129,3 +129,40 @@ working on WhatsApp until the owner pairs a spare number and runs it.
 `whatsapp-rust` is used with `default-features = false` and
 `sqlite-storage, tokio-transport, tokio-runtime, ureq-client, tokio-native`:
 its default `simd` feature needs nightly Rust (`portable_simd`).
+
+
+## 0.63: the WhatsApp bot, requested files, and limits
+
+Approved by the owner on 2026-11-19.
+
+- **One bot speaks on WhatsApp.** Only the bot named by `[whatsapp_link] bot`
+  (default `whatsapp`) gets WhatsApp tools. Every other bot loses them on
+  every turn, whatever its stored tool list says (main's `tools = ["all"]`
+  included). Other bots reach WhatsApp by being asked by the WhatsApp bot
+  (`ask_teammate`), never directly.
+- **Business is separate.** The WhatsApp Business (Cloud API) tools are given
+  to the WhatsApp bot only when the member saved Business credentials
+  (`conn.whatsapp`). A linked personal number never needs them.
+- **Conversations stay with the WhatsApp bot.** Messages from an allowed chat
+  open or continue that chat's conversation with the WhatsApp bot. It may ask
+  any of the member's bots for help with `ask_teammate` (the existing
+  handoff ledger: one tracked request and one answer, not free chatter) and
+  passes the answer back.
+- **Requested files go back without a prompt.** `whatsapp_link_reply_file`
+  sends one of the member's own files (artifact ownership checked) into the
+  chat the current conversation came from. It takes no recipient, so it can
+  only answer the person who asked, like the automatic text reply. It is not
+  on `DESTRUCTIVE_TOOLS`. Telegram has the same rule with
+  `telegram_reply_file`, which refuses outside a Telegram-origin conversation.
+- **Bot-started messages still need approval.** `whatsapp_link_send` (to any
+  allowed chat, on the bot's own initiative) stays approval-gated, as do
+  `telegram_send_document` from other conversations and the Business sends.
+- **Limits.** Allowlist only; no groups. At most `sends_per_minute` (6) per
+  chat and `sends_per_day` (100) per member across all chats, counting text
+  replies and files. Filenames and captions pass the blocklist. Every tool
+  call is audited by the gateway.
+- **Device name.** The linked device registers as a Chrome browser on
+  `device_os` (default `Windows`) instead of the library default. It is set
+  at pairing: sign out and link again to change it. It only changes the
+  Linked devices label; it does not lower the ban risk of an unofficial
+  client.

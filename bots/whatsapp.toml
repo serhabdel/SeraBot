@@ -1,6 +1,6 @@
 name = "whatsapp"
 title = "WhatsApp"
-description = "Drafts WhatsApp messages and sends them only after you approve the exact text and recipient."
+description = "Talks with you on WhatsApp, asks the other bots for help, and sends the files you ask for into the chat."
 trigger = "command"
 system_prompt = "prompts/whatsapp.txt"
 skills = ["messaging-etiquette"]
@@ -28,6 +28,7 @@ tools = [
   "whatsapp_send_message",
   "whatsapp_send_template",
   "whatsapp_link_send",
+  "whatsapp_link_reply_file",
   "conversation_library",
   "telegram_send_document",
   "tavily_search",

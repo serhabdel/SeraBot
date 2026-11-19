@@ -27,6 +27,12 @@ or sends something to a third party that cannot be recalled. The list lives in
 | `whatsapp_send_template` | Sends an approved WhatsApp template message to an external contact. The approval names the recipient and template. |
 | `whatsapp_link_send` | Sends a message from the member's linked WhatsApp number to one of their allowed chats. The approval names the chat and binds the text. |
 
+Not approval-gated (0.63): `whatsapp_link_reply_file` and `telegram_reply_file`
+send a file the member asked for back into the same WhatsApp or Telegram chat
+the conversation came from. They take no recipient, check that the member owns
+the file, pass the blocklist, and count toward the WhatsApp per-minute and
+daily caps. See `docs/specs/whatsapp-linked-device.md`.
+
 ## Not destructive (no approval)
 
 - Browser: `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_press`, `browser_screenshot`, `browser_close`. Typing a vault secret into a page whose host is not in the entry's allowed domains still fails closed. Typing a vault secret always asks for approval bound to the entry name and the page host, on an https page only (see `docs/vault.md`). "Always" is never a standing grant for a vault secret: it acts as "once".

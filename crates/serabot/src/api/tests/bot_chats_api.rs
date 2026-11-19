@@ -257,3 +257,39 @@ async fn retroactive_smart_title_renames_untitled_extra_chat_on_list() {
     let stored = store.get_conversation(&uid, &chat_id).unwrap().unwrap();
     assert_eq!(stored.title.as_deref(), Some(title));
 }
+
+/// 0.63: the bot library lists the files in the bot's chats, per member.
+#[tokio::test]
+async fn the_bot_library_lists_files_and_stays_with_its_member() {
+    let (app, _, store) = app_with_root(true, Policy::empty(), temp_base());
+    let (user_id, token) = member_with_analyst(&app, &store, "v063-lib").await;
+    store
+        .ensure_conversation_accepts_turns(&user_id, "dir:analyst")
+        .unwrap();
+    let hash = "a".repeat(64);
+    store
+        .record_conversation_artifact(
+            &user_id,
+            "dir:analyst",
+            None,
+            "deck_build",
+            &hash,
+            "plan.pptx",
+            Some("Plan"),
+        )
+        .unwrap();
+    let listed = read_json(call(&app, &token, "GET", "/v1/bots/analyst/library", None).await).await;
+    let items = listed["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{listed}");
+    assert_eq!(items[0]["kind"], "generated", "{listed}");
+    assert_eq!(items[0]["id"], hash, "{listed}");
+    assert_eq!(items[0]["conversation_id"], "dir:analyst", "{listed}");
+
+    // Another member with their own Analyst sees none of it.
+    let (_, other) = member_with_analyst(&app, &store, "v063-lib-other").await;
+    let theirs = read_json(call(&app, &other, "GET", "/v1/bots/analyst/library", None).await).await;
+    assert_eq!(theirs["items"].as_array().unwrap().len(), 0, "{theirs}");
+    // A bot the member does not have is refused.
+    let missing = call(&app, &token, "GET", "/v1/bots/nobody/library", None).await;
+    assert_ne!(missing.status(), StatusCode::OK);
+}

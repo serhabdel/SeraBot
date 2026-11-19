@@ -140,16 +140,16 @@ pub fn SettingsPanel(session: Signal<Session>, overlay: Signal<Overlay>) -> Elem
                     button {
                         class: if tab == SettingsTab::Files { "tab active" } else { "tab" },
                         onclick: move |_| session.write().bot_settings.tab = SettingsTab::Files,
-                        "Files"
+                        if bot_id.is_some() { "Library" } else { "Files" }
                     }
                 }
             }
             if open {
                 {match (tab, bot_id) {
-                    (SettingsTab::Files, _) => rsx! { FilesTab { session } },
+                    (SettingsTab::Files, Some(id)) => rsx! { BotLibraryTab { key: "{id}", session, bot: id.clone() } },
+                    (SettingsTab::Files, None) => rsx! { FilesTab { session } },
                     (SettingsTab::Settings, Some(id)) => rsx! {
                         BotForm { session, id: id.clone() }
-                        MemoryRefreshCard { session, id }
                     },
                     (SettingsTab::Settings, None) => rsx! { MembersTab { session, overlay } },
                 }}
@@ -191,11 +191,9 @@ fn MemoryRefreshCard(session: Signal<Session>, id: String) -> Element {
     let invalid = !draft.read().trim().is_empty() && parsed.is_none();
     let save_id = id.clone();
     rsx! {
-        div { class: "card memory-card",
-            div { class: "card-head",
-                h3 { class: "card-title", "Memory refresh" }
-            }
-            p { class: "tiny",
+        details { class: "advanced memory-section",
+            summary { "Memory" }
+            p { class: "hint",
                 "Every so many of your messages, this bot summarises the recent turns and saves the lasting facts to its memory, in the background. It covers all of this bot\u{2019}s chats. Default 40."
             }
             label { class: "field",
@@ -225,7 +223,7 @@ fn MemoryRefreshCard(session: Signal<Session>, id: String) -> Element {
                             session.write().set_bot_refresh(save_id.clone(), every);
                         }
                     },
-                    "Save"
+                    "Save memory setting"
                 }
             }
         }
@@ -395,6 +393,9 @@ fn BotForm(session: Signal<Session>, id: String) -> Element {
                     }
                     span { class: "hint", "Each profile keeps its own logins. Add more on the Browser page." }
                 }
+                // 0.63: memory sits inside the scrolling form, above the
+                // pinned Save bar, instead of floating under it.
+                MemoryRefreshCard { session, id: id.clone() }
                 SkillsSection { session, id: id.clone() }
                 AdvancedSection { session, id: id.clone() }
                 LifecycleSection { session, id: id.clone() }
@@ -1091,6 +1092,272 @@ fn MembersTab(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                             if loading { "Saving\u{2026}" } else { "Save rules" }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+/// A bot's library (0.63): what its bots made and what you uploaded, across
+/// all of the bot's chats. Filter by kind and date, search, sort, and open
+/// one item for its details and actions.
+#[component]
+fn BotLibraryTab(session: Signal<Session>, bot: String) -> Element {
+    use serabot_desktop::bot_library::{self as lib, DateFilter, KindFilter, SortOrder};
+    let mut session = session;
+    let mut kind = use_signal(KindFilter::default);
+    let mut date = use_signal(DateFilter::default);
+    let mut sort = use_signal(SortOrder::default);
+    let mut query = use_signal(String::new);
+    let mut selected = use_signal(|| Option::<lib::LibraryItem>::None);
+    {
+        let bot = bot.clone();
+        use_hook(move || session.write().load_bot_library(bot));
+    }
+    let (library, loading, downloading) = {
+        let s = session.read();
+        (
+            s.state
+                .bot_library
+                .clone()
+                .filter(|library| library.bot == bot),
+            s.state.bot_library_loading,
+            s.downloading,
+        )
+    };
+    let today = crate::ui::today_date();
+    let items = library.map(|library| library.items).unwrap_or_default();
+    let shown: Vec<lib::LibraryItem> =
+        lib::view(&items, kind(), date(), &query.read(), sort(), &today)
+            .into_iter()
+            .cloned()
+            .collect();
+    // Rows with a heading where the date group changes (newest/oldest sort).
+    let grouped = sort() != SortOrder::Name;
+    let mut rows: Vec<(Option<String>, lib::LibraryItem)> = Vec::new();
+    let mut last = String::new();
+    for item in shown {
+        let group = lib::date_group(item.day(), &today);
+        let heading = (grouped && group != last).then(|| group.clone());
+        last = group;
+        rows.push((heading, item));
+    }
+    let reload_bot = bot.clone();
+    rsx! {
+        div { class: "settings-scroll library",
+            div { class: "library-toolbar",
+                div { class: "search-wrap",
+                    input {
+                        class: "input",
+                        r#type: "search",
+                        placeholder: "Search files\u{2026}",
+                        "aria-label": "Search this bot's files",
+                        value: "{query}",
+                        oninput: move |event| query.set(event.value()),
+                    }
+                }
+                select {
+                    class: "input library-sort",
+                    "aria-label": "Sort files",
+                    onchange: move |event| {
+                        let value = event.value();
+                        if let Some(order) = SortOrder::ALL.into_iter().find(|o| o.label() == value) {
+                            sort.set(order);
+                        }
+                    },
+                    for order in SortOrder::ALL {
+                        option { key: "{order.label()}", value: "{order.label()}", selected: sort() == order, "{order.label()}" }
+                    }
+                }
+                button {
+                    class: "btn icon",
+                    r#type: "button",
+                    title: "Refresh",
+                    "aria-label": "Refresh the library",
+                    onclick: move |_| session.write().load_bot_library(reload_bot.clone()),
+                    Icon { name: "refresh", size: 14 }
+                }
+            }
+            div { class: "library-chips", role: "group", "aria-label": "Kind",
+                for option in KindFilter::ALL {
+                    button {
+                        key: "{option.label()}",
+                        r#type: "button",
+                        class: if kind() == option { "chip-toggle on" } else { "chip-toggle" },
+                        "aria-pressed": if kind() == option { "true" } else { "false" },
+                        onclick: move |_| kind.set(option),
+                        "{option.label()}"
+                    }
+                }
+            }
+            div { class: "library-chips", role: "group", "aria-label": "Date",
+                for option in DateFilter::ALL {
+                    button {
+                        key: "{option.label()}",
+                        r#type: "button",
+                        class: if date() == option { "chip-toggle on" } else { "chip-toggle" },
+                        "aria-pressed": if date() == option { "true" } else { "false" },
+                        onclick: move |_| date.set(option),
+                        "{option.label()}"
+                    }
+                }
+            }
+            if loading && items.is_empty() {
+                p { class: "hint", role: "status", "Loading the library\u{2026}" }
+            } else if items.is_empty() {
+                p { class: "hint", "Nothing here yet. Files this bot makes and files you send it will show up here." }
+            } else if rows.is_empty() {
+                p { class: "hint", "No files match these filters." }
+            } else {
+                div { class: "library-list", role: "list",
+                    for (heading, item) in rows {
+                        div { key: "{item.kind}-{item.id}", class: "library-item",
+                        if let Some(heading) = heading {
+                            div { class: "library-day", "{heading}" }
+                        }
+                        button {
+                            class: "library-row",
+                            r#type: "button",
+                            role: "listitem",
+                            onclick: {
+                                let item = item.clone();
+                                move |_| selected.set(Some(item.clone()))
+                            },
+                            span { class: "library-ext", "{item.extension()}" }
+                            span { class: "library-copy",
+                                span { class: "library-name", "{item.label()}" }
+                                span { class: "library-meta",
+                                    if item.generated() { "Made by bots" } else { "Uploaded" }
+                                    " \u{b7} {item.day()}"
+                                }
+                            }
+                        }
+                        }
+                    }
+                }
+            }
+            if let Some(item) = selected() {
+                LibraryItemDialog { session, item, downloading, selected }
+            }
+        }
+    }
+}
+
+/// One library item: what it is, where it came from, and what to do with it.
+#[component]
+fn LibraryItemDialog(
+    session: Signal<Session>,
+    item: serabot_desktop::bot_library::LibraryItem,
+    downloading: bool,
+    selected: Signal<Option<serabot_desktop::bot_library::LibraryItem>>,
+) -> Element {
+    let mut session = session;
+    let mut selected = selected;
+    let size = serabot_desktop::bot_library::human_size(item.size_bytes);
+    let source = if item.generated() {
+        format!("Made by bots ({})", humanize_label(&item.tool))
+    } else {
+        "Uploaded by you".to_owned()
+    };
+    let chat = item
+        .conversation_title
+        .clone()
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| "Main chat".to_owned());
+    let generated = item.generated();
+    let id = item.id.clone();
+    let conversation = item.conversation_id.clone();
+    rsx! {
+        div { class: "library-scrim", onclick: move |_| selected.set(None) }
+        div {
+            class: "library-dialog",
+            role: "dialog",
+            "aria-modal": "true",
+            "aria-label": "{item.label()}",
+            tabindex: "0",
+            onkeydown: move |event: KeyboardEvent| {
+                if event.key() == Key::Escape {
+                    event.prevent_default();
+                    selected.set(None);
+                }
+            },
+            div { class: "library-dialog-head",
+                h3 { "{item.label()}" }
+                button {
+                    class: "btn icon",
+                    r#type: "button",
+                    "aria-label": "Close",
+                    onclick: move |_| selected.set(None),
+                    Icon { name: "x", size: 15 }
+                }
+            }
+            dl { class: "library-facts",
+                dt { "Date" }
+                dd { "{stamp(&item.created_at)}" }
+                dt { "Source" }
+                dd { "{source}" }
+                dt { "Chat" }
+                dd { "{chat}" }
+                if let Some(name) = item.filename.clone() {
+                    dt { "File" }
+                    dd { "{name}" }
+                }
+                if let Some(size) = size {
+                    dt { "Size" }
+                    dd { "{size}" }
+                }
+            }
+            div { class: "library-actions",
+                if generated {
+                    button {
+                        class: "btn primary sm",
+                        r#type: "button",
+                        disabled: downloading,
+                        onclick: {
+                            let id = id.clone();
+                            move |_| session.write().open_artifact(id.clone())
+                        },
+                        Icon { name: "external", size: 14 }
+                        "Open"
+                    }
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        disabled: downloading,
+                        onclick: {
+                            let id = id.clone();
+                            move |_| session.write().reveal_artifact(id.clone())
+                        },
+                        Icon { name: "folder", size: 14 }
+                        "Show in Explorer"
+                    }
+                }
+                button {
+                    class: "btn ghost sm",
+                    r#type: "button",
+                    disabled: downloading,
+                    onclick: {
+                        let id = id.clone();
+                        move |_| {
+                            if generated {
+                                session.write().download_artifact(id.clone());
+                            } else {
+                                session.write().download_attachment(id.clone());
+                            }
+                        }
+                    },
+                    Icon { name: "download", size: 14 }
+                    "Save to Downloads"
+                }
+                button {
+                    class: "btn ghost sm",
+                    r#type: "button",
+                    onclick: move |_| {
+                        selected.set(None);
+                        session.write().open_conversation(conversation.clone());
+                    },
+                    Icon { name: "chat", size: 14 }
+                    "Go to chat"
                 }
             }
         }

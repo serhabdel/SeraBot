@@ -456,7 +456,41 @@ pub(super) fn Sidebar(
                 collapsed: is_collapsed,
             });
             if !is_collapsed {
-                for bot in bot_rows {
+                // 0.63: pinned bots, then recent ones, then the rest A to Z,
+                // with a quiet sub-heading when more than one group shows.
+                let today = super::today_utc_date();
+                let keys: Vec<serabot_desktop::bot_groups::BotKey> = bot_rows
+                    .iter()
+                    .map(|bot| {
+                        let id = format!("dir:{}", bot.id);
+                        let main = conversations.iter().find(|c| c.id == id);
+                        serabot_desktop::bot_groups::BotKey {
+                            name: state.bot_display_name(&bot.id),
+                            pinned: pins.contains(&bot.id),
+                            unread: main.map(|c| c.unread_count).unwrap_or(0),
+                            last_at: main.and_then(|c| c.last_message_at.clone()),
+                        }
+                    })
+                    .collect();
+                let ordered = serabot_desktop::bot_groups::order(&keys, &today);
+                let groups_shown = ordered
+                    .iter()
+                    .map(|(_, group)| *group)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len();
+                let mut last_group = None;
+                let sorted_rows: Vec<_> = ordered
+                    .into_iter()
+                    .map(|(index, group)| (bot_rows[index], group))
+                    .collect();
+                for (bot, group) in sorted_rows {
+                    if needle.is_empty() && groups_shown > 1 && last_group != Some(group) {
+                        items.push(RailItem::SubHeader {
+                            key: format!("bots:{}", group.title()),
+                            title: group.title().to_owned(),
+                        });
+                    }
+                    last_group = Some(group);
                     let id = format!("dir:{}", bot.id);
                     let main_unread = conversations
                         .iter()
@@ -773,6 +807,9 @@ pub(super) fn Sidebar(
                                     }
                                 }
                             }
+                        },
+                        RailItem::SubHeader { key, title } => rsx! {
+                            div { key: "{key}", class: "rail-subhead", role: "presentation", "{title}" }
                         },
                         RailItem::AddBots => rsx! {
                             button {
@@ -1522,6 +1559,8 @@ pub(super) enum RailItem {
     },
     /// "Add more bots", the quiet last row of the Bots group.
     AddBots,
+    /// A quiet label inside the Bots group: Pinned, Recent, All bots (0.63).
+    SubHeader { key: String, title: String },
     Thread {
         id: String,
         label: String,
@@ -1822,6 +1861,10 @@ pub(super) fn Topbar(
                 span { class: "{pill_class}", role: "status", "{pill_label}" }
             }
             div { class: "chat-header-actions",
+                // 0.63: the model picker lives here, out of the composer.
+                if active_bot.is_some() && session.read().conversation.starts_with("dir:") {
+                    super::chat::HeaderModelChip { session }
+                }
                 if let Some(bot) = active_bot.clone() {
                     {
                         let acp_on = session.read().bot_uses_claude_agent(&bot);
