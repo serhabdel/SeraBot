@@ -59,6 +59,7 @@ pub mod turn_trace;
 pub mod ui_highlight;
 pub mod ui_tick;
 pub mod updater;
+pub mod usage_insights;
 pub mod vault_import;
 pub mod whatsapp_link;
 pub mod worker;

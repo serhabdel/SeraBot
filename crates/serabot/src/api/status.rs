@@ -106,6 +106,50 @@ pub(super) async fn usage(
     Ok(Json(body))
 }
 
+/// `GET /v1/usage/insights` (0.67): turns per channel, the desktop relay's
+/// traffic, model latency and failovers, and (admin only) the server's load
+/// over the last 24 hours. Same `days` and `scope` rules as `/v1/usage`.
+/// Counts and sizes only; never message text.
+pub(super) async fn usage_insights(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Query(query): Query<UsageQuery>,
+) -> Result<Json<Value>> {
+    let days = query.days.unwrap_or(7).clamp(1, 90);
+    let all_users = match query.scope.as_deref() {
+        None | Some("") | Some("me") => false,
+        Some("all") => {
+            require_admin(&user)?;
+            true
+        }
+        Some(_) => return Err(SeraError::Validation("scope must be me or all".into())),
+    };
+    let since = Utc::now() - chrono::Duration::days(days);
+    let scope_user = (!all_users).then_some(user.id.as_str());
+    let channels = state.store.channel_usage(scope_user, since)?;
+    let tunnel = state.store.tunnel_usage(scope_user, since)?;
+    let models = state.store.model_health(scope_user, since)?;
+    let relay_online = crate::relay_net::hub().is_some_and(|hub| hub.online(&user.id));
+    let resources = if user.role == UserRole::Admin {
+        json!(state.sys_status.history())
+    } else {
+        Value::Null
+    };
+    let body = json!({
+        "days": days,
+        "scope": if all_users { "all" } else { "me" },
+        "channels": channels,
+        "tunnel": tunnel,
+        "relay_online": relay_online,
+        "models": models,
+        "resources": resources,
+    });
+    state
+        .runtime
+        .scan_owner_output(&user.id, &body.to_string())?;
+    Ok(Json(body))
+}
+
 /// `GET /v1/admin/status` (admin only): server health for the owner's Usage
 /// tab. Numbers only: uptime, memory, CPU, disk, a storage breakdown of the
 /// data directory and per-member counts and sizes. It never returns message

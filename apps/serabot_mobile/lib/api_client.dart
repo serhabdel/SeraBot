@@ -214,6 +214,7 @@ class ApiClient {
           ..headers.addAll({
             'Authorization': 'Bearer $_token',
             'Accept': accept,
+            'X-SeraBot-Client': 'mobile',
             ...?extraHeaders,
           });
         if (bodyBytes != null) {

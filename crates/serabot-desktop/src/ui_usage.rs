@@ -15,6 +15,7 @@ use serabot_desktop::theme::{Level, Tone};
 use serabot_desktop::{UsageBucket, UsageModel, UsageReport};
 
 use crate::ui::{Icon, human_provider};
+use crate::ui_usage_insights::UsageInsights;
 use crate::ui_widgets::{LevelChip, StatusChip};
 
 /// How often the health cards refresh while the Usage page is open.
@@ -365,6 +366,7 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
                         }
                     }
                 }
+                UsageInsights { session, days: days.min(90) }
                 if report_ready && !empty {
                     section { class: "usage-section", "aria-labelledby": "usage-breakdown-title",
                         div { class: "page-section-head",

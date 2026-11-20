@@ -206,3 +206,114 @@
   color: var(--label-2);
   font-variant-numeric: tabular-nums;
 }
+
+/* Usage insights (0.67): channels, PC tunnel, model speed, server load. */
+.insights-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.insights-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.insights-card + .insights-card {
+  margin-top: 0;
+}
+
+.insights-stack {
+  display: flex;
+  height: 10px;
+  border-radius: 999px;
+  overflow: hidden;
+  gap: 2px;
+  background: var(--hairline);
+}
+
+.insights-stack-seg {
+  min-width: 4px;
+  flex-basis: 0;
+}
+
+.insights-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.insights-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  flex: none;
+}
+
+.ch-desktop { background: var(--accent); }
+.ch-mobile { background: #7c5cff; }
+.ch-telegram { background: #2aa3e0; }
+.ch-whatsapp { background: #25a35a; }
+.ch-app { background: var(--label-3, #8a8f98); }
+.ch-api { background: #c58b18; }
+.ch-automation { background: #d0557a; }
+
+.insights-kpis {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.insights-kpi {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.insights-mini-chart {
+  height: 64px;
+}
+
+.insights-table .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.insights-model {
+  color: var(--label-1);
+  font-weight: 600;
+}
+
+.warn-text {
+  color: var(--warn);
+}
+
+.insights-sparks {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 16px;
+}
+
+.insights-spark-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 6px;
+}
+
+.spark {
+  width: 100%;
+  height: 48px;
+  display: block;
+}
+
+.spark polyline {
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+  stroke-linejoin: round;
+}
+
+.spark-cpu polyline { stroke: var(--accent); }
+.spark-mem polyline { stroke: #7c5cff; }

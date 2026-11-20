@@ -305,3 +305,11 @@ never merge without the owner's OK.
 - [x] WhatsApp presence: offline when idle, online + "typing…" on a new message, back to offline after `presence_idle_secs`.
 - [ ] Owner: turn the relay on for Antigravity with the desktop open and run one chat; check the card shows traffic.
 - [ ] Owner: check the WhatsApp number shows offline when idle and "typing…" on a message.
+
+## Release 0.67.0 — Usage insights
+
+- [x] Turns tagged by client (`X-SeraBot-Client`, migration 0044); channels split desktop / phone / Telegram / WhatsApp / API / schedules.
+- [x] `model.used` audit records `latency_ms` and `relayed`; per-model average and p95 latency, share via PC, failovers.
+- [x] PC tunnel card: traffic per day and per host, share of model calls relayed, live status.
+- [x] Server load: CPU and memory sampled every 5 minutes, 24 hours in memory, owner only.
+- [ ] Owner: send a message from the desktop and the phone; check both channels appear on the Usage tab.
