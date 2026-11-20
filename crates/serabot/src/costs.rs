@@ -579,6 +579,90 @@ mod tests {
     }
 
     #[test]
+    fn cache_reads_and_plans_are_priced_apart() {
+        let store = Store::open_in_memory(8).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        // 1M uncached + 1M cached input, 1M output on a paid API model.
+        store
+            .record_audit(
+                &admin,
+                "model.used",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&json!({"provider": "default", "kind": "anthropic", "plan": false, "model": "claude-x",
+                    "usage": {"prompt_tokens": 1_000_000, "cached_tokens": 1_000_000, "completion_tokens": 1_000_000}})),
+            )
+            .unwrap();
+        // The same model through a plan sign-in (Antigravity serves Claude).
+        store
+            .record_audit(
+                &admin,
+                "model.used",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&json!({"provider": "ag", "kind": "google-antigravity", "plan": true, "model": "claude-x",
+                    "usage": {"prompt_tokens": 2_000_000, "cached_tokens": 0, "completion_tokens": 0}})),
+            )
+            .unwrap();
+        store
+            .set_model_prices(&[ModelPrice {
+                provider: "anthropic".into(),
+                model: "claude-x".into(),
+                input_per_m: 3.0,
+                output_per_m: 15.0,
+                cached_per_m: Some(0.3),
+            }])
+            .unwrap();
+        let since = Utc::now() - chrono::Duration::days(1);
+        let report = store.cost_report(Some(&admin), since).unwrap();
+        // 3 + 0.3 + 15 for the paid call; the plan call costs nothing.
+        assert!((report.usd - 18.3).abs() < 1e-9, "{report:?}");
+        let plan = report.lines.iter().find(|line| line.plan).unwrap();
+        assert_eq!(plan.usd, None);
+        assert!((plan.api_equivalent_usd.unwrap() - 6.0).abs() < 1e-9);
+        assert!((report.totals.input_m - 3.0).abs() < 1e-9);
+        assert!((report.totals.cached_m - 1.0).abs() < 1e-9);
+        assert!((report.totals.plan_api_equivalent_usd - 6.0).abs() < 1e-9);
+        store
+            .set_plan_prices(
+                &admin,
+                &[PlanPrice {
+                    provider: "google-antigravity".into(),
+                    monthly_usd: 20.0,
+                }],
+            )
+            .unwrap();
+        let savings = store.plan_savings(&admin, &report).unwrap();
+        assert_eq!(savings.len(), 1);
+        assert_eq!(savings[0].monthly_usd, Some(20.0));
+        assert!((savings[0].saving_usd.unwrap() + 14.0).abs() < 1e-9, "{savings:?}");
+        assert!(store
+            .set_plan_prices(
+                &admin,
+                &[PlanPrice {
+                    provider: "x".into(),
+                    monthly_usd: -1.0,
+                }],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn suggested_prices_ship_and_parse() {
+        let (researched, rows) = suggested_prices();
+        assert!(!researched.is_empty());
+        assert!(rows.len() >= 10);
+        assert!(rows.iter().all(|row| row.input_per_m >= 0.0 && row.output_per_m >= 0.0));
+        assert_eq!(millions(1_250_000.0 / 1_000_000.0), "1.25M");
+    }
+
+    #[test]
     fn costs_use_the_price_table_and_count_unpriced_tokens() {
         let store = Store::open_in_memory(8).unwrap();
         let admin = store.admin_user_id().unwrap();

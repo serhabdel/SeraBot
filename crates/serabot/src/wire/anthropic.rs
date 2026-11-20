@@ -1237,7 +1237,7 @@ mod tests {
         assert_eq!(parsed.text, "Hello");
         assert_eq!(parsed.usage.prompt_tokens, 10);
         assert_eq!(parsed.usage.cached_tokens, 90);
-        assert_eq!(parsed.usage.total_tokens, 101);
+        assert_eq!(parsed.usage.total_tokens, 112);
         assert_eq!(parsed.usage.completion_tokens, 12);
         assert_eq!(parsed.finish_reason.as_deref(), Some("stop"));
         assert!(parsed.tool_calls.is_empty());
