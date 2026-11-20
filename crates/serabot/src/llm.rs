@@ -30,12 +30,39 @@ pub(crate) use wire_calls::opencode_session_id;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Usage {
+    /// Input tokens billed at the normal rate (cache reads excluded).
     #[serde(default)]
     pub prompt_tokens: u64,
     #[serde(default)]
     pub completion_tokens: u64,
     #[serde(default)]
     pub total_tokens: u64,
+    /// Input tokens read from the provider's prompt cache (0.70), billed at
+    /// the cache price.
+    #[serde(default)]
+    pub cached_tokens: u64,
+}
+
+impl Usage {
+    /// Chat-completions usage (0.70): OpenAI-style `prompt_tokens` includes
+    /// cached tokens, reported in `prompt_tokens_details.cached_tokens`
+    /// (DeepSeek: `prompt_cache_hit_tokens`). Split them so `prompt_tokens`
+    /// is the uncached part, like the other transports.
+    pub fn from_chat_json(usage: &Value) -> Self {
+        let get = |pointer: &str| usage.pointer(pointer).and_then(Value::as_u64).unwrap_or(0);
+        let prompt = get("/prompt_tokens");
+        let completion = get("/completion_tokens");
+        let cached = get("/prompt_tokens_details/cached_tokens")
+            .max(get("/prompt_cache_hit_tokens"))
+            .min(prompt);
+        let total = get("/total_tokens").max(prompt.saturating_add(completion));
+        Self {
+            prompt_tokens: prompt - cached,
+            completion_tokens: completion,
+            total_tokens: total,
+            cached_tokens: cached,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1609,7 +1636,9 @@ fn cloud_completion(parsed: CloudCodeCompletion) -> Result<LlmResponse> {
             completion_tokens: parsed.completion_tokens,
             total_tokens: parsed
                 .prompt_tokens
+                .saturating_add(parsed.cached_tokens)
                 .saturating_add(parsed.completion_tokens),
+            cached_tokens: parsed.cached_tokens,
         },
         finish_reason: parsed.finish_reason,
         reasoning,
@@ -1778,7 +1807,7 @@ fn parse_response(bytes: &[u8]) -> Result<LlmResponse> {
     }
     let usage = value
         .get("usage")
-        .and_then(|usage| serde_json::from_value(usage.clone()).ok())
+        .map(Usage::from_chat_json)
         .unwrap_or_default();
     let finish_reason = choice
         .get("finish_reason")
@@ -1898,6 +1927,18 @@ mod tests {
             .unwrap();
         assert_eq!(response.message.content.as_deref(), Some("bonjour"));
         assert_eq!(response.usage.total_tokens, 5);
+        let split = Usage::from_chat_json(&json!({
+            "prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110,
+            "prompt_tokens_details": {"cached_tokens": 70}
+        }));
+        assert_eq!(
+            (split.prompt_tokens, split.cached_tokens, split.total_tokens),
+            (30, 70, 110)
+        );
+        let deepseek = Usage::from_chat_json(&json!({
+            "prompt_tokens": 50, "completion_tokens": 5, "prompt_cache_hit_tokens": 20
+        }));
+        assert_eq!((deepseek.prompt_tokens, deepseek.cached_tokens), (30, 20));
     }
 
     #[tokio::test]

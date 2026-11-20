@@ -149,15 +149,53 @@ fn cost_view(state: &ApiState, user_id: &str) -> Result<Value> {
     let month = state
         .store
         .cost_report(Some(user_id), crate::costs::month_start(now))?;
+    let all_time = state
+        .store
+        .cost_report(Some(user_id), DateTime::<Utc>::UNIX_EPOCH)?;
     let budget = state.store.monthly_budget(user_id)?;
+    let plans = state.store.plan_savings(user_id, &month)?;
     Ok(json!({
         "month_usd": month.usd,
         "month_unpriced_tokens": month.unpriced_tokens,
         "month_lines": month.lines,
+        "totals": {"month": month.totals, "all_time": all_time.totals},
+        "plans": plans,
+        "plan_kinds": crate::costs::PLAN_KINDS,
         "budget_usd": budget,
         "budget_level": budget.and_then(|budget| crate::costs::budget_level(month.usd, budget)),
         "prices": state.store.model_prices()?,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PlansRequest {
+    plans: Vec<crate::costs::PlanPrice>,
+}
+
+/// `PUT /v1/usage/plans` (0.70): what the caller pays per month for each
+/// plan sign-in, to compare with API prices.
+pub(super) async fn plans_put(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Json(request): Json<PlansRequest>,
+) -> Result<Json<Value>> {
+    state.store.set_plan_prices(&user.id, &request.plans)?;
+    Ok(Json(cost_view(&state, &user.id)?))
+}
+
+/// `GET /v1/admin/prices/suggested` (0.70, owner only): researched prices
+/// to review before saving. They are suggestions, not verified prices.
+pub(super) async fn prices_suggested(
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    require_admin(&user)?;
+    let (researched_at, prices) = crate::costs::suggested_prices();
+    Ok(Json(json!({
+        "researched_at": researched_at,
+        "verified": false,
+        "prices": prices,
+    })))
 }
 
 /// `GET /v1/usage/costs`: this month's estimated cost, the member's budget

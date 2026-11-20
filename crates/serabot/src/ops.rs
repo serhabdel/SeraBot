@@ -1106,6 +1106,7 @@ mod tests {
                 model: "*".into(),
                 input_per_m: 10.0,
                 output_per_m: 10.0,
+                cached_per_m: None,
             }])
             .unwrap();
         store.set_monthly_budget(&admin, Some(1.0)).unwrap();

@@ -532,6 +532,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/usage/costs", get(ops::costs_get))
         .route("/v1/usage/budget", put(ops::budget_put))
         .route("/v1/admin/prices", put(ops::prices_put))
+        .route("/v1/admin/prices/suggested", get(ops::prices_suggested))
+        .route("/v1/usage/plans", put(ops::plans_put))
         .route("/v1/admin/backups", get(ops::backups_get))
         .route("/v1/admin/backups/run", post(ops::backups_run))
         .route("/v1/relay/net/exchange", post(relay::relay_exchange))

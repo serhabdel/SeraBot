@@ -85,6 +85,7 @@ const MIGRATION_43: &str = include_str!("../migrations/0043_relay_settings.sql")
 const MIGRATION_44: &str = include_str!("../migrations/0044_client_turns.sql");
 const MIGRATION_45: &str = include_str!("../migrations/0045_alert_settings.sql");
 const MIGRATION_46: &str = include_str!("../migrations/0046_costs.sql");
+const MIGRATION_47: &str = include_str!("../migrations/0047_plan_prices.sql");
 
 /// One member's account for a marketplace plugin (no secret).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -809,6 +810,20 @@ impl Store {
                 )?;
             }
             connection.pragma_update(None, "user_version", 46)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 47 {
+            connection.execute_batch(MIGRATION_47)?;
+            let has_cached: bool = connection
+                .prepare(
+                    "SELECT 1 FROM pragma_table_info('model_prices') WHERE name = 'cached_per_m'",
+                )?
+                .exists([])?;
+            if !has_cached {
+                connection
+                    .execute_batch("ALTER TABLE model_prices ADD COLUMN cached_per_m REAL;")?;
+            }
+            connection.pragma_update(None, "user_version", 47)?;
         }
         // VACUUM INTO (backups) may renumber rowids; rebuild the external-content
         // FTS index only when its row count no longer matches `memories`.
@@ -6700,7 +6715,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 46);
+        assert_eq!(version, 47);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
@@ -6765,7 +6780,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 46);
+        assert_eq!(version, 47);
         assert!(store.list_device_tokens().unwrap().is_empty());
         // The team table arrives with the same migration batch.
         assert!(
@@ -6839,7 +6854,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 46);
+        assert_eq!(version, 47);
         let admin = admin(&store);
         let memory = crate::memory::get(&store, &admin, "mem-legacy").unwrap();
         assert_eq!(memory.origin, "explicit");
@@ -6928,7 +6943,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 46);
+        assert_eq!(version, 47);
 
         let admin = store.admin_user().unwrap().unwrap();
         assert_eq!(admin.id, ADMIN_USER_ID);
@@ -7059,7 +7074,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 46);
+        assert_eq!(version, 47);
 
         // Every scoped table carries user_id = the admin, and the column is
         // NOT NULL with a real foreign key.
@@ -7214,7 +7229,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 46);
+        assert_eq!(version, 47);
 
         // The old row is now the admin's, with the empty prompt the migration
         // header documents; startup seeding fills it from the template.

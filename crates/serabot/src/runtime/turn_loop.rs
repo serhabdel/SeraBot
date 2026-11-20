@@ -889,6 +889,15 @@ impl Runtime {
             if let Some(reasoning) = response.reasoning.as_deref() {
                 self.emit_thinking(&user, task, turn, reasoning);
             }
+            let provider_kind = self
+                .config
+                .llm
+                .providers
+                .get(&used.provider)
+                .and_then(|profile| crate::providers::canonical_kind(&profile.kind).ok())
+                .unwrap_or_else(|| used.provider.clone());
+            // 0.70: a plan sign-in (subscription) has no per-token cost.
+            let plan = crate::costs::is_plan_use(&self.store, &user, &provider_kind, &used.account);
             self.store.record_audit(
                 &user,
                 "model.used",
@@ -899,20 +908,12 @@ impl Runtime {
                 Some(self.gateway.policy().version()),
                 Some(&json!({
                     "provider": used.provider, "model": used.model, "account": used.account,
+                    "kind": provider_kind, "plan": plan,
                     "usage": response.usage,
                     "history_messages": state.history_messages,
                     "prompt_chars_est": estimate_prompt_chars(&state.messages),
                     "latency_ms": u64::try_from(call_started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    "relayed": crate::relay_net::relayed(
-                        &user,
-                        &self
-                            .config
-                            .llm
-                            .providers
-                            .get(&used.provider)
-                            .and_then(|profile| crate::providers::canonical_kind(&profile.kind).ok())
-                            .unwrap_or_else(|| used.provider.clone()),
-                    ),
+                    "relayed": crate::relay_net::relayed(&user, &provider_kind),
                 })),
             )?;
             let assistant = response.message;

@@ -1,0 +1,276 @@
+{
+  "researched_at": "2026-11-20",
+  "warning": "Suggested prices researched from public pages and search results, NOT verified against each provider's own pricing page. The owner reviews them in the console before saving.",
+  "prices": [
+    {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-6",
+      "input_per_m": 3.0,
+      "cached_input_per_m": null,
+      "output_per_m": 15.0,
+      "source_url": "https://platform.claude.com/en/docs/about-claude/pricing",
+      "notes": "UNVERIFIED: official page not fetched (docs.anthropic.com did not resolve); figure from several third-party search snippets that agree. Cache read/write not confirmed."
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-haiku-4-5",
+      "input_per_m": 1.0,
+      "cached_input_per_m": null,
+      "output_per_m": 5.0,
+      "source_url": "https://platform.claude.com/en/docs/about-claude/pricing",
+      "notes": "UNVERIFIED: third-party snippets agree; official page not fetched. Batch reported at 50% off ($0.50/$2.50). Cache read not confirmed."
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5",
+      "input_per_m": 5.0,
+      "cached_input_per_m": 0.5,
+      "output_per_m": 25.0,
+      "source_url": "https://eesel.ai/blog/claude-opus-5-pricing",
+      "notes": "UNVERIFIED: aggregator blog only; reported unchanged from Opus 4.8. Model id not confirmed. Single-source claims of a newer model at different prices were excluded."
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "input_per_m": 0.25,
+      "cached_input_per_m": 0.025,
+      "output_per_m": 2.0,
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "notes": "UNVERIFIED: official page only partly visible in search; three third-party trackers agree. Batch reported $0.125/$1.00."
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5-nano",
+      "input_per_m": 0.05,
+      "cached_input_per_m": 0.005,
+      "output_per_m": 0.4,
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "notes": "UNVERIFIED: official page only partly visible; trackers agree. Batch reported $0.025 input / $0.20 output."
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.4-mini",
+      "input_per_m": 0.75,
+      "cached_input_per_m": 0.075,
+      "output_per_m": 4.5,
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "notes": "UNVERIFIED: single search snippet attributed to the official page; not corroborated."
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.4-nano",
+      "input_per_m": 0.2,
+      "cached_input_per_m": 0.02,
+      "output_per_m": 1.25,
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "notes": "UNVERIFIED: single search snippet attributed to the official page; not corroborated."
+    },
+    {
+      "provider": "gemini",
+      "model": "gemini-3.7-flash",
+      "input_per_m": 0.75,
+      "cached_input_per_m": null,
+      "output_per_m": 3.75,
+      "source_url": "https://cloud.google.com/vertex-ai/generative-ai/pricing",
+      "notes": "Vertex AI listing snippet: introductory price through 2026-12-31; standard $1.50 input / $7.50 output from 2027-01-01. Gemini API page not reached (ai.google.dev did not resolve). Model id unconfirmed."
+    },
+    {
+      "provider": "mistral",
+      "model": "mistral-medium-3.5",
+      "input_per_m": 1.5,
+      "cached_input_per_m": null,
+      "output_per_m": 7.5,
+      "source_url": "https://mistral.ai/pricing/api/",
+      "notes": "UNVERIFIED: several third-party sources agree; official page not fetched. Cache price not found."
+    },
+    {
+      "provider": "mistral",
+      "model": "mistral-large-3",
+      "input_per_m": 0.5,
+      "cached_input_per_m": null,
+      "output_per_m": 1.5,
+      "source_url": "https://mistral.ai/pricing/api/",
+      "notes": "Figure cited on Mistral's pricing page per search snippet; not fetched directly."
+    },
+    {
+      "provider": "mistral",
+      "model": "mistral-nemo",
+      "input_per_m": 0.02,
+      "cached_input_per_m": null,
+      "output_per_m": 0.04,
+      "source_url": "https://cloudzero.com/blog/mistral-api-pricing",
+      "notes": "Single CostBench-derived figure; may predate the 2026 lineup. Not confirmed on the official page."
+    },
+    {
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
+      "input_per_m": 0.14,
+      "cached_input_per_m": null,
+      "output_per_m": 0.28,
+      "source_url": "https://api-docs.deepseek.com/quick_start/pricing",
+      "notes": "Cache-miss base rate seen in a pricing snapshot; cache-hit price disputed ($0.0028 vs $0.028), so left null. Reports of peak/off-peak pricing from Aug 2026 conflict, so these base figures are unverified. Official page not fetched."
+    },
+    {
+      "provider": "xai",
+      "model": "grok-4.7",
+      "input_per_m": 2.0,
+      "cached_input_per_m": 0.5,
+      "output_per_m": 6.0,
+      "source_url": "https://docs.x.ai/docs/pricing",
+      "notes": "UNVERIFIED: one aggregator says flagship; a second aggregator gives grok-4.6 the same $2/$6 in August. One source says prompts over 200k tokens bill at $4/$12 (cache $1). Official page not fetched."
+    },
+    {
+      "provider": "xai",
+      "model": "grok-4.3",
+      "input_per_m": 1.25,
+      "cached_input_per_m": null,
+      "output_per_m": 2.5,
+      "source_url": "https://docs.x.ai/docs/pricing",
+      "notes": "UNVERIFIED: single aggregator snippet; not corroborated."
+    },
+    {
+      "provider": "xai",
+      "model": "grok-4-fast",
+      "input_per_m": 0.2,
+      "cached_input_per_m": null,
+      "output_per_m": 0.5,
+      "source_url": "https://docs.x.ai/docs/pricing",
+      "notes": "Sources disagree on whether it is still listed; one reported it removed from the official pricing page by June 2026. Treat as possibly retired."
+    },
+    {
+      "provider": "groq",
+      "model": "openai/gpt-oss-120b",
+      "input_per_m": 0.15,
+      "cached_input_per_m": 0.075,
+      "output_per_m": 0.6,
+      "source_url": "https://groq.com/pricing",
+      "notes": "UNVERIFIED: official pricing table only partly visible; most third-party sources agree. Batch about 50% off. Model id as Groq lists it, not confirmed."
+    },
+    {
+      "provider": "groq",
+      "model": "openai/gpt-oss-20b",
+      "input_per_m": 0.075,
+      "cached_input_per_m": null,
+      "output_per_m": 0.3,
+      "source_url": "https://groq.com/pricing",
+      "notes": "UNVERIFIED: one listing says $0.07 input; output $0.30 consistent across sources."
+    },
+    {
+      "provider": "groq",
+      "model": "llama-3.3-70b-versatile",
+      "input_per_m": 0.59,
+      "cached_input_per_m": null,
+      "output_per_m": 0.79,
+      "source_url": "https://groq.com/pricing",
+      "notes": "UNVERIFIED: older third-party listing; model id not confirmed."
+    },
+    {
+      "provider": "groq",
+      "model": "llama-3.1-8b-instant",
+      "input_per_m": 0.05,
+      "cached_input_per_m": null,
+      "output_per_m": 0.08,
+      "source_url": "https://groq.com/pricing",
+      "notes": "UNVERIFIED: one third-party listing; model id not confirmed."
+    },
+    {
+      "provider": "together",
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "input_per_m": 0.14,
+      "cached_input_per_m": null,
+      "output_per_m": 0.28,
+      "source_url": "https://www.together.ai/pricing",
+      "notes": "UNVERIFIED: one October 2026 tracker snapshot (listed as 0731). Not checked on the official page."
+    },
+    {
+      "provider": "fireworks",
+      "model": "accounts/fireworks/models/gpt-oss-120b",
+      "input_per_m": 0.15,
+      "cached_input_per_m": 0.015,
+      "output_per_m": 0.6,
+      "source_url": "https://docs.fireworks.ai/serverless/pricing",
+      "notes": "UNVERIFIED: most third-party sources agree; official page not fetched. Batch 50% off per Fireworks docs as reported. Availability reportedly changing."
+    },
+    {
+      "provider": "fireworks",
+      "model": "accounts/fireworks/models/qwen3p6-plus",
+      "input_per_m": 0.5,
+      "cached_input_per_m": null,
+      "output_per_m": 3.0,
+      "source_url": "https://www.fireworks.ai/pricing",
+      "notes": "UNVERIFIED: model page figure seen in search; model id not confirmed. Another guide lists a different Qwen 3.7 Plus price."
+    },
+    {
+      "provider": "cerebras",
+      "model": "gpt-oss-120b",
+      "input_per_m": 0.35,
+      "cached_input_per_m": null,
+      "output_per_m": 0.75,
+      "source_url": "https://www.cerebras.ai/pricing",
+      "notes": "UNVERIFIED: most third-party sources agree; supersedes earlier $0.25/$0.69. Llama not found with a current public rate."
+    },
+    {
+      "provider": "moonshot",
+      "model": "kimi-k2-0905-preview",
+      "input_per_m": 0.6,
+      "cached_input_per_m": null,
+      "output_per_m": 2.5,
+      "source_url": "https://platform.moonshot.ai",
+      "notes": "UNVERIFIED: aggregators agree on $0.60/$2.50; one tracker gives $0.47/$2.00 for K2 Thinking-0905. Official page not fetched. Model id not confirmed."
+    },
+    {
+      "provider": "moonshot",
+      "model": "kimi-k2.6",
+      "input_per_m": 0.95,
+      "cached_input_per_m": 0.16,
+      "output_per_m": 4.0,
+      "source_url": "https://platform.moonshot.ai",
+      "notes": "UNVERIFIED: cites Moonshot's pricing page as of 2026-04-21 (dev post); another tracker says $0.745 / $0.146 / $3.50. Lifecycle reports of K2 series retirement at end of 2026 not confirmed."
+    },
+    {
+      "provider": "minimax",
+      "model": "MiniMax-M2",
+      "input_per_m": 0.3,
+      "cached_input_per_m": 0.03,
+      "output_per_m": 1.2,
+      "source_url": "https://platform.minimax.io/docs/pricing/pay-as-you-go",
+      "notes": "Pay-as-you-go page as seen in search snippet (not fetched). Cache write $0.375/M. Successor M2.5 reportedly retired 2026-11-18, so not listed."
+    },
+    {
+      "provider": "perplexity",
+      "model": "sonar",
+      "input_per_m": 1.0,
+      "cached_input_per_m": null,
+      "output_per_m": 1.0,
+      "source_url": "https://docs.perplexity.ai/getting-started/pricing",
+      "notes": "UNVERIFIED: third-party figures. Request fee of $5 / $8 / $12 per 1K requests by search context size (low/medium/high), charged separately from tokens. Some sources differ."
+    },
+    {
+      "provider": "perplexity",
+      "model": "sonar-pro",
+      "input_per_m": 3.0,
+      "cached_input_per_m": null,
+      "output_per_m": 15.0,
+      "source_url": "https://docs.perplexity.ai/getting-started/pricing",
+      "notes": "UNVERIFIED: third-party figures. Request fee about $6 to $14 per 1K requests, charged separately from tokens."
+    },
+    {
+      "provider": "perplexity",
+      "model": "sonar-reasoning-pro",
+      "input_per_m": 2.0,
+      "cached_input_per_m": null,
+      "output_per_m": 8.0,
+      "source_url": "https://docs.perplexity.ai/getting-started/pricing",
+      "notes": "UNVERIFIED: third-party figures. Request fee about $6 to $14 per 1K requests, charged separately from tokens. One tracker lists $1/$5 instead."
+    },
+    {
+      "provider": "perplexity",
+      "model": "sonar-deep-research",
+      "input_per_m": 2.0,
+      "cached_input_per_m": null,
+      "output_per_m": 8.0,
+      "source_url": "https://docs.perplexity.ai/getting-started/pricing",
+      "notes": "UNVERIFIED: third-party figures. Also $2 per 1M citation tokens, $3 per 1M reasoning tokens, $5 per 1K search queries."
+    }
+  ]
+}

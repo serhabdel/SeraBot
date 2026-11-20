@@ -6,6 +6,12 @@
 //! "unpriced" instead of guessed. Each member may set a monthly budget: the
 //! alert sweep warns at 80% and again at 100% of it, once per month each.
 //! Estimates only: the provider's own bill is the truth.
+//!
+//! 0.70: cache reads are priced apart (`cached_per_m`), and calls made
+//! through a plan sign-in (ChatGPT/Codex, Copilot, Antigravity, Claude plan,
+//! Muse, OpenCode) cost nothing per token: they are shown as "plan", with
+//! what the same tokens would have cost at API prices, so a member can
+//! compare their subscription with the API.
 
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use rusqlite::{OptionalExtension, params};
@@ -22,6 +28,87 @@ pub struct ModelPrice {
     pub input_per_m: f64,
     /// USD per million output (completion) tokens.
     pub output_per_m: f64,
+    /// USD per million cached (cache-read) input tokens; `None` prices them
+    /// as normal input.
+    #[serde(default)]
+    pub cached_per_m: Option<f64>,
+}
+
+impl ModelPrice {
+    /// USD for these token counts at this price.
+    pub fn usd(&self, prompt: i64, cached: i64, completion: i64) -> f64 {
+        let million = 1_000_000.0;
+        prompt.max(0) as f64 / million * self.input_per_m
+            + cached.max(0) as f64 / million * self.cached_per_m.unwrap_or(self.input_per_m)
+            + completion.max(0) as f64 / million * self.output_per_m
+    }
+}
+
+/// Provider kinds that are plan (subscription) sign-ins, not pay-per-token.
+pub const PLAN_KINDS: &[&str] = &[
+    "openai-codex",
+    "github-copilot",
+    "google-antigravity",
+    "muse-code",
+    "opencode-zen",
+    "opencode-go",
+];
+
+/// Whether a model call ran on a plan sign-in: a plan provider kind, or an
+/// Anthropic account signed in with a Claude plan (OAuth) rather than a key.
+pub fn is_plan_use(store: &Store, user_id: &str, kind: &str, account: &Option<String>) -> bool {
+    if PLAN_KINDS.contains(&kind) {
+        return true;
+    }
+    let Some(account) = account else {
+        return false;
+    };
+    let Ok(connection) = store.connection() else {
+        return false;
+    };
+    connection
+        .query_row(
+            "SELECT auth_kind FROM provider_accounts WHERE user_id = ?1 AND account_id = ?2 LIMIT 1",
+            params![user_id, account],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some_and(|auth| auth != "api_key")
+}
+
+/// What a member pays per month for one plan sign-in.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PlanPrice {
+    pub provider: String,
+    pub monthly_usd: f64,
+}
+
+/// One plan compared with the API (0.70).
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+pub struct PlanSaving {
+    pub provider: String,
+    /// What the member entered for the plan; `None` when not set.
+    pub monthly_usd: Option<f64>,
+    /// What this period's plan tokens would cost at API prices.
+    pub api_equivalent_usd: f64,
+    /// Tokens on this plan that have no API price to compare with.
+    pub unpriced_tokens: i64,
+    /// `api_equivalent_usd - monthly_usd` (negative: the plan cost more).
+    pub saving_usd: Option<f64>,
+}
+
+/// Token totals in millions and their cost.
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+pub struct Totals {
+    pub input_m: f64,
+    pub cached_m: f64,
+    pub output_m: f64,
+    /// Pay-per-token cost (plans excluded).
+    pub usd: f64,
+    /// What the plan tokens would have cost at API prices.
+    pub plan_api_equivalent_usd: f64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq)]
@@ -30,15 +117,23 @@ pub struct CostLine {
     pub model: String,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
-    /// `None` when the model has no price in the table.
+    /// Cache-read input tokens (0.70; 0 for calls recorded earlier).
+    pub cached_tokens: i64,
+    /// `None` when the model has no price, or ran on a plan.
     pub usd: Option<f64>,
+    /// Ran on a plan sign-in: no per-token cost.
+    pub plan: bool,
+    /// For plan rows: the same tokens at API prices, when a price is known.
+    pub api_equivalent_usd: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq)]
 pub struct CostReport {
+    /// Pay-per-token cost (plans excluded).
     pub usd: f64,
     pub unpriced_tokens: i64,
     pub lines: Vec<CostLine>,
+    pub totals: Totals,
 }
 
 /// The first instant of the month `now` is in (UTC).
@@ -59,7 +154,10 @@ fn valid_price(price: &ModelPrice) -> Result<()> {
             "provider and model must be 1-120 plain characters".into(),
         ));
     }
-    for value in [price.input_per_m, price.output_per_m] {
+    for value in [price.input_per_m, price.output_per_m]
+        .into_iter()
+        .chain(price.cached_per_m)
+    {
         if !value.is_finite() || !(0.0..=10_000.0).contains(&value) {
             return Err(SeraError::Validation(
                 "prices must be 0-10000 USD per million tokens".into(),
@@ -73,7 +171,7 @@ impl Store {
     pub fn model_prices(&self) -> Result<Vec<ModelPrice>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT provider, model, input_per_m, output_per_m FROM model_prices
+            "SELECT provider, model, input_per_m, output_per_m, cached_per_m FROM model_prices
              ORDER BY provider, model",
         )?;
         let rows = statement.query_map([], |row| {
@@ -82,6 +180,7 @@ impl Store {
                 model: row.get(1)?,
                 input_per_m: row.get(2)?,
                 output_per_m: row.get(3)?,
+                cached_per_m: row.get(4)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -101,13 +200,14 @@ impl Store {
         let now = Utc::now().to_rfc3339();
         for price in prices {
             tx.execute(
-                "INSERT OR REPLACE INTO model_prices(provider, model, input_per_m, output_per_m, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT OR REPLACE INTO model_prices(provider, model, input_per_m, output_per_m, cached_per_m, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     price.provider.trim(),
                     price.model.trim(),
                     price.input_per_m,
                     price.output_per_m,
+                    price.cached_per_m,
                     now
                 ],
             )?;
@@ -179,50 +279,231 @@ impl Store {
         Ok(())
     }
 
+    /// What the member pays for each plan sign-in.
+    pub fn plan_prices(&self, user_id: &str) -> Result<Vec<PlanPrice>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT provider, monthly_usd FROM plan_prices WHERE user_id = ?1 ORDER BY provider",
+        )?;
+        let rows = statement.query_map(params![user_id], |row| {
+            Ok(PlanPrice {
+                provider: row.get(0)?,
+                monthly_usd: row.get(1)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Replace the member's plan prices.
+    pub fn set_plan_prices(&self, user_id: &str, plans: &[PlanPrice]) -> Result<()> {
+        if plans.len() > 20 {
+            return Err(SeraError::Validation("at most 20 plans".into()));
+        }
+        for plan in plans {
+            if plan.provider.trim().is_empty()
+                || plan.provider.len() > 60
+                || plan.provider.chars().any(char::is_control)
+                || !plan.monthly_usd.is_finite()
+                || !(0.0..=10_000.0).contains(&plan.monthly_usd)
+            {
+                return Err(SeraError::Validation(
+                    "a plan needs a provider and a monthly price of 0-10000 USD".into(),
+                ));
+            }
+        }
+        let mut connection = self.connection()?;
+        let tx = connection.transaction()?;
+        tx.execute(
+            "DELETE FROM plan_prices WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        let now = Utc::now().to_rfc3339();
+        for plan in plans {
+            tx.execute(
+                "INSERT OR REPLACE INTO plan_prices(user_id, provider, monthly_usd, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![user_id, plan.provider.trim(), plan.monthly_usd, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Estimated cost of `user_id`'s model calls since `since` (`None` user:
     /// every member, admin only).
     pub fn cost_report(&self, user_id: Option<&str>, since: DateTime<Utc>) -> Result<CostReport> {
         let prices = self.model_prices()?;
-        let connection = self.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT COALESCE(json_extract(details_json, '$.provider'), ''),
-                    COALESCE(json_extract(details_json, '$.model'), ''),
-                    COALESCE(SUM(CAST(json_extract(details_json, '$.usage.prompt_tokens') AS INTEGER)), 0),
-                    COALESCE(SUM(CAST(json_extract(details_json, '$.usage.completion_tokens') AS INTEGER)), 0)
-             FROM audit_log
-             WHERE event = 'model.used' AND at >= ?1 AND (?2 IS NULL OR actor = ?2)
-             GROUP BY 1, 2 ORDER BY 3 DESC",
-        )?;
-        let rows = statement.query_map(params![since.to_rfc3339(), user_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
-        })?;
+        let rows: Vec<(String, String, String, bool, i64, i64, i64)> = {
+            let connection = self.connection()?;
+            let mut statement = connection.prepare(
+                "SELECT COALESCE(json_extract(details_json, '$.provider'), ''),
+                        COALESCE(json_extract(details_json, '$.model'), ''),
+                        COALESCE(json_extract(details_json, '$.kind'), json_extract(details_json, '$.provider'), ''),
+                        COALESCE(json_extract(details_json, '$.plan'), 0),
+                        COALESCE(SUM(CAST(json_extract(details_json, '$.usage.prompt_tokens') AS INTEGER)), 0),
+                        COALESCE(SUM(CAST(json_extract(details_json, '$.usage.cached_tokens') AS INTEGER)), 0),
+                        COALESCE(SUM(CAST(json_extract(details_json, '$.usage.completion_tokens') AS INTEGER)), 0)
+                 FROM audit_log
+                 WHERE event = 'model.used' AND at >= ?1 AND (?2 IS NULL OR actor = ?2)
+                 GROUP BY 1, 2, 3, 4 ORDER BY 5 DESC",
+            )?;
+            let mapped = statement.query_map(params![since.to_rfc3339(), user_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
         let mut report = CostReport::default();
-        for row in rows {
-            let (provider, model, prompt, completion) = row?;
-            let price = find_price(&prices, &provider, &model);
-            let usd = price.map(|price| {
-                prompt.max(0) as f64 / 1_000_000.0 * price.input_per_m
-                    + completion.max(0) as f64 / 1_000_000.0 * price.output_per_m
-            });
-            match usd {
-                Some(value) => report.usd += value,
-                None => report.unpriced_tokens += prompt.max(0) + completion.max(0),
-            }
+        for (provider, model, kind, plan_flag, prompt, cached, completion) in rows {
+            let plan = plan_flag || PLAN_KINDS.contains(&kind.as_str());
+            report.totals.input_m += prompt.max(0) as f64 / 1_000_000.0;
+            report.totals.cached_m += cached.max(0) as f64 / 1_000_000.0;
+            report.totals.output_m += completion.max(0) as f64 / 1_000_000.0;
+            let tokens = prompt.max(0) + cached.max(0) + completion.max(0);
+            let (usd, api_equivalent_usd) = if plan {
+                let equivalent = find_price(&prices, &kind, &model)
+                    .or_else(|| find_price(&prices, &provider, &model))
+                    .or_else(|| find_price_any_provider(&prices, &model))
+                    .map(|price| price.usd(prompt, cached, completion));
+                if let Some(value) = equivalent {
+                    report.totals.plan_api_equivalent_usd += value;
+                }
+                (None, equivalent)
+            } else {
+                let price = find_price(&prices, &provider, &model)
+                    .or_else(|| find_price(&prices, &kind, &model));
+                let usd = price.map(|price| price.usd(prompt, cached, completion));
+                match usd {
+                    Some(value) => report.usd += value,
+                    None => report.unpriced_tokens += tokens,
+                }
+                (usd, None)
+            };
             report.lines.push(CostLine {
-                provider,
+                provider: if kind.is_empty() { provider } else { kind },
                 model,
                 prompt_tokens: prompt,
                 completion_tokens: completion,
+                cached_tokens: cached,
                 usd,
+                plan,
+                api_equivalent_usd,
             });
         }
+        report.totals.usd = report.usd;
         Ok(report)
     }
+
+    /// Plans compared with the API for `user_id` over `report`'s period.
+    pub fn plan_savings(&self, user_id: &str, report: &CostReport) -> Result<Vec<PlanSaving>> {
+        let prices = self.plan_prices(user_id)?;
+        let mut out: Vec<PlanSaving> = Vec::new();
+        for line in report.lines.iter().filter(|line| line.plan) {
+            let entry = match out.iter_mut().find(|entry| entry.provider == line.provider) {
+                Some(entry) => entry,
+                None => {
+                    out.push(PlanSaving {
+                        provider: line.provider.clone(),
+                        ..PlanSaving::default()
+                    });
+                    out.last_mut().expect("just pushed")
+                }
+            };
+            match line.api_equivalent_usd {
+                Some(value) => entry.api_equivalent_usd += value,
+                None => {
+                    entry.unpriced_tokens +=
+                        line.prompt_tokens + line.cached_tokens + line.completion_tokens
+                }
+            }
+        }
+        for plan in &prices {
+            if !out.iter().any(|entry| entry.provider == plan.provider) {
+                out.push(PlanSaving {
+                    provider: plan.provider.clone(),
+                    ..PlanSaving::default()
+                });
+            }
+        }
+        for entry in &mut out {
+            entry.monthly_usd = prices
+                .iter()
+                .find(|plan| plan.provider == entry.provider)
+                .map(|plan| plan.monthly_usd);
+            entry.saving_usd = entry
+                .monthly_usd
+                .map(|monthly| entry.api_equivalent_usd - monthly);
+        }
+        Ok(out)
+    }
+}
+
+/// A price for `model` under any provider (plan sign-ins serve other
+/// providers' models, for example Claude or Gemini through Antigravity).
+/// A `vendor/model` id also matches `model`.
+pub fn find_price_any_provider<'a>(
+    prices: &'a [ModelPrice],
+    model: &str,
+) -> Option<&'a ModelPrice> {
+    let bare = model.rsplit('/').next().unwrap_or(model);
+    prices
+        .iter()
+        .find(|price| price.model.eq_ignore_ascii_case(model))
+        .or_else(|| {
+            prices.iter().find(|price| {
+                price
+                    .model
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("")
+                    .eq_ignore_ascii_case(bare)
+            })
+        })
+}
+
+/// One suggested price with where it came from (0.70). Researched from
+/// public pages and NOT verified: the owner checks before saving.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SuggestedPrice {
+    pub provider: String,
+    pub model: String,
+    pub input_per_m: f64,
+    #[serde(default)]
+    pub cached_input_per_m: Option<f64>,
+    pub output_per_m: f64,
+    #[serde(default)]
+    pub source_url: String,
+    #[serde(default)]
+    pub notes: String,
+}
+
+#[derive(Deserialize)]
+struct SuggestedFile {
+    researched_at: String,
+    prices: Vec<serde_json::Value>,
+}
+
+/// The shipped suggestion list: only rows with both prices.
+pub fn suggested_prices() -> (String, Vec<SuggestedPrice>) {
+    let Ok(file) = serde_json::from_str::<SuggestedFile>(include_str!(
+        "../../../config/suggested_prices.json"
+    )) else {
+        return (String::new(), Vec::new());
+    };
+    let rows = file
+        .prices
+        .into_iter()
+        .filter_map(|row| serde_json::from_value::<SuggestedPrice>(row).ok())
+        .filter(|row| row.input_per_m.is_finite() && row.output_per_m.is_finite())
+        .collect();
+    (file.researched_at, rows)
 }
 
 /// The price for a provider and model: an exact match first, then a row
@@ -255,6 +536,15 @@ pub fn budget_level(spent: f64, budget: f64) -> Option<u8> {
         Some(80)
     } else {
         None
+    }
+}
+
+/// Tokens as millions with two decimals ("1.25M"); small counts keep three.
+pub fn millions(tokens: f64) -> String {
+    if tokens < 0.01 && tokens > 0.0 {
+        format!("{tokens:.3}M")
+    } else {
+        format!("{tokens:.2}M")
     }
 }
 
@@ -300,6 +590,7 @@ mod tests {
                 model: "big".into(),
                 input_per_m: 3.0,
                 output_per_m: 15.0,
+                cached_per_m: None,
             }])
             .unwrap();
         let report = store
@@ -314,6 +605,7 @@ mod tests {
                 model: "*".into(),
                 input_per_m: 1.0,
                 output_per_m: 1.0,
+                cached_per_m: None,
             }])
             .unwrap();
         let report = store
@@ -345,6 +637,7 @@ mod tests {
                     model: "m".into(),
                     input_per_m: -1.0,
                     output_per_m: 1.0,
+                    cached_per_m: None,
                 }])
                 .is_err()
         );
