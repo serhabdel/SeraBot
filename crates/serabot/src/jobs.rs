@@ -664,10 +664,7 @@ pub fn matches_profile(profile: &JobProfile, item: &JobItem, source_sectors: &[S
         .iter()
         .chain(profile.keywords_include.iter())
         .collect();
-    if !wanted.is_empty() && !wanted.iter().any(|term| contains_term(&all, term)) {
-        return false;
-    }
-    true
+    wanted.is_empty() || wanted.iter().any(|term| contains_term(&all, term))
 }
 
 /// A posting kept in the member's history.
