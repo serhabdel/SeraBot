@@ -451,6 +451,10 @@ pub struct OpsWatch {
     /// scans outgoing text, and the members' own connectors for the brief.
     runtime: std::sync::OnceLock<crate::runtime::Runtime>,
     personal: std::sync::OnceLock<Arc<crate::personal::PersonalConnectors>>,
+    /// Fetcher for the members' job watches (0.70); `None` if it cannot be built.
+    job_fetcher: Option<crate::fetch::SafeFetcher>,
+    /// True while a job sweep runs in the background.
+    jobs_busy: std::sync::atomic::AtomicBool,
 }
 
 impl OpsWatch {
@@ -463,6 +467,8 @@ impl OpsWatch {
         let cooldown = config.ops.alert_cooldown_mins;
         Arc::new(Self {
             alerts: Alerts::new(store.clone(), notifier, cooldown),
+            job_fetcher: crate::job_watch::job_fetcher(&config).ok(),
+            jobs_busy: std::sync::atomic::AtomicBool::new(false),
             config,
             store,
             monitor: Arc::new(crate::sysstatus::StatusMonitor::new()),
@@ -491,6 +497,7 @@ impl OpsWatch {
             if self.config.ops.backup_enabled && self.backup_due(Utc::now()) {
                 let _ = self.run_backup("schedule").await;
             }
+            self.start_job_sweep(Utc::now());
             if let Some(week) = self.digest_due(Utc::now()) {
                 let _ = self.store.kv_set("ops.digest.week", &week);
                 if let Err(error) = self.send_digests(Utc::now()).await {
@@ -635,6 +642,72 @@ impl OpsWatch {
             sent += 1;
         }
         Ok(sent)
+    }
+
+    /// 0.70: start the job watches that are due, in the background (a watch
+    /// pauses a few seconds between sources, so it never blocks this loop).
+    fn start_job_sweep(self: &Arc<Self>, now: DateTime<Utc>) {
+        use std::sync::atomic::Ordering;
+        if self.job_fetcher.is_none() {
+            return;
+        }
+        let due = match crate::job_watch::due_members(&self.store, now) {
+            Ok(due) if !due.is_empty() => due,
+            _ => return,
+        };
+        if self.jobs_busy.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            for user_id in due {
+                if let Err(error) = this.watch_jobs_for(&user_id).await {
+                    tracing::warn!(%error, "job watch failed");
+                }
+            }
+            this.jobs_busy.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// Run one member's scheduled job watch and send what is new.
+    pub async fn watch_jobs_for(&self, user_id: &str) -> Result<usize> {
+        let Some(fetcher) = &self.job_fetcher else {
+            return Ok(0);
+        };
+        let report = match crate::job_watch::run_watch(
+            &self.store,
+            fetcher,
+            &self.config.watcher.user_agent,
+            user_id,
+            crate::job_watch::RunMode::Scheduled,
+            None,
+            crate::job_watch::SOURCE_DELAY,
+        )
+        .await
+        {
+            Ok(report) => report,
+            Err(error) => {
+                // Do not retry every minute.
+                let _ = self.store.set_job_watch_state(
+                    user_id,
+                    "scheduled",
+                    &json!({"error": error.to_string()}),
+                );
+                return Err(error);
+            }
+        };
+        if report.new_matches.is_empty() {
+            return Ok(0);
+        }
+        let text = crate::job_watch::format_matches(&report.new_matches);
+        let alert = Alert {
+            user_id: user_id.to_string(),
+            kind: "jobs",
+            key: report.checked_at.clone(),
+            text: text.clone(),
+        };
+        self.alerts.deliver(&alert, &text).await?;
+        Ok(report.new_matches.len())
     }
 
     /// One alert sweep.

@@ -804,6 +804,78 @@ impl Tool for OneDriveUploadTool {
     }
 }
 
+/// Largest file `onedrive_download` imports.
+const MAX_ONEDRIVE_DOWNLOAD_BYTES: usize = 25 * 1024 * 1024;
+
+/// Read-only: copy one file from the acting member's own OneDrive into an
+/// artifact (for example their Excel tracker, before `xlsx_edit`).
+pub struct OneDriveDownloadTool {
+    registry: Arc<OneDriveRegistry>,
+    artifacts: Arc<ArtifactStore>,
+}
+
+impl OneDriveDownloadTool {
+    pub fn new(registry: Arc<OneDriveRegistry>, artifacts: Arc<ArtifactStore>) -> Self {
+        Self {
+            registry,
+            artifacts,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for OneDriveDownloadTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "onedrive_download".into(),
+            description: "Import one file from the acting user's own OneDrive into an artifact (read-only; path from the drive root, as onedrive_list shows, e.g. Documents/Jobs/tracker.xlsx). Then use xlsx_import / xlsx_edit or docx_import on the artifact.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"path": {"type": "string", "maxLength": 300}},
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+            external_effect: false,
+        }
+    }
+
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| SeraError::Validation("path is required".into()))?
+            .trim()
+            .trim_matches('/')
+            .to_owned();
+        let client = self.registry.client_for(&context.user_id)?;
+        let client = client.lock().await;
+        let (name, bytes) = client.download(&path, MAX_ONEDRIVE_DOWNLOAD_BYTES).await?;
+        drop(client);
+        let stored = self.artifacts.save(
+            &bytes,
+            &name,
+            ArtifactMeta {
+                title: name.clone(),
+                filename: name.clone(),
+                language: Language::En,
+                source_artifact: None,
+                created_at: Utc::now(),
+            },
+        )?;
+        Ok(ToolOutput {
+            content: format!(
+                "Imported '{}' from your OneDrive ({} bytes) as artifact {}.",
+                stored.filename,
+                bytes.len(),
+                stored.hash
+            ),
+            artifact_hash: Some(stored.hash),
+            filename: Some(stored.filename),
+            ..ToolOutput::default()
+        })
+    }
+}
+
 pub struct OneDriveListTool {
     registry: Arc<OneDriveRegistry>,
     folder: String,

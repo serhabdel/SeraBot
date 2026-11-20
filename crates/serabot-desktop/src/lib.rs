@@ -27,6 +27,7 @@ pub mod file_icons;
 pub mod integrations;
 pub mod jobs;
 pub mod jobs_reliability;
+pub mod jobs_view;
 pub mod local_folders;
 pub mod local_fs;
 pub mod local_xfer;

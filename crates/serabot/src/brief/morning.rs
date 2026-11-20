@@ -166,27 +166,18 @@ pub async fn collect_feeds(
     feeds
 }
 
-/// New job matches since `since`, when the job watcher's table exists. The
-/// table comes from a later migration, so every failure means "none".
+/// New job matches since `since`: the job watcher's `job_seen` rows marked
+/// as matching the member's profile (migration 0048).
 fn job_matches_since(
     store: &Store,
     user_id: &str,
     since: DateTime<Utc>,
 ) -> Option<(i64, Vec<String>)> {
     let connection = store.connection().ok()?;
-    let has = |column: &str| -> bool {
-        connection
-            .prepare("SELECT 1 FROM pragma_table_info('job_matches') WHERE name = ?1")
-            .and_then(|mut statement| statement.exists([column]))
-            .unwrap_or(false)
-    };
-    if !has("user_id") || !has("created_at") {
-        return None;
-    }
-    let cutoff = utc_string(since);
+    let cutoff = since.to_rfc3339();
     let count: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM job_matches WHERE user_id = ?1 AND created_at >= ?2",
+            "SELECT COUNT(*) FROM job_seen WHERE user_id = ?1 AND matched = 1 AND first_seen >= ?2",
             params![user_id, cutoff],
             |row| row.get(0),
         )
@@ -195,15 +186,12 @@ fn job_matches_since(
         return None;
     }
     let mut titles = Vec::new();
-    if has("title")
-        && let Ok(mut statement) = connection.prepare(
-            "SELECT title FROM job_matches WHERE user_id = ?1 AND created_at >= ?2
-             ORDER BY created_at DESC LIMIT 3",
-        )
-        && let Ok(rows) = statement.query_map(params![user_id, cutoff], |row| {
-            row.get::<_, Option<String>>(0)
-        })
-    {
+    if let Ok(mut statement) = connection.prepare(
+        "SELECT title FROM job_seen WHERE user_id = ?1 AND matched = 1 AND first_seen >= ?2
+         ORDER BY first_seen DESC LIMIT 3",
+    ) && let Ok(rows) = statement.query_map(params![user_id, cutoff], |row| {
+        row.get::<_, Option<String>>(0)
+    }) {
         titles = rows
             .flatten()
             .flatten()
@@ -467,26 +455,29 @@ mod tests {
     }
 
     #[test]
-    fn job_matches_are_skipped_without_the_table_and_read_when_present() {
+    fn job_matches_come_from_the_job_watcher() {
         let (store, admin, _) = setup();
         let text =
             morning_brief_text(&store, &admin, now(), utc(), &BriefFeeds::default()).unwrap();
         assert!(!text.contains("job matches"));
         let connection = store.connection().unwrap();
         connection
-            .execute_batch("CREATE TABLE job_matches (user_id TEXT, title TEXT, created_at TEXT);")
-            .unwrap();
-        connection
             .execute(
-                "INSERT INTO job_matches VALUES (?1, 'Rust engineer', ?2)",
-                params![admin, utc_string(now() - Duration::hours(2))],
+                "INSERT INTO job_seen(user_id, url_hash, title_hash, source_key, title, employer,
+                                      city, deadline, url, matched, first_seen)
+                 VALUES (?1, 'u1', 't1', 'rekrute', 'Rust engineer', 'Acme', 'Rabat', NULL,
+                         'https://example.example/j1', 1, ?2),
+                        (?1, 'u2', 't2', 'rekrute', 'Not a match', 'Acme', 'Rabat', NULL,
+                         'https://example.example/j2', 0, ?2)",
+                params![admin, (now() - Duration::hours(2)).to_rfc3339()],
             )
             .unwrap();
         drop(connection);
         let text =
             morning_brief_text(&store, &admin, now(), utc(), &BriefFeeds::default()).unwrap();
-        assert!(text.contains("New job matches: 1"));
+        assert!(text.contains("New job matches: 1"), "{text}");
         assert!(text.contains("Rust engineer"));
+        assert!(!text.contains("Not a match"));
     }
 
     #[test]

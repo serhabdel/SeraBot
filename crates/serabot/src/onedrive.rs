@@ -393,6 +393,67 @@ impl OneDriveClient {
         Ok(ListFolderResult { items, truncated })
     }
 
+    /// Read one file from the member's own drive by its path from the drive
+    /// root (read-only). Returns the file name and at most `max_bytes` of
+    /// content. Graph answers with a redirect to a short-lived download
+    /// address; it is followed once, without the access token, and must be
+    /// https (or the same loopback host in tests).
+    pub async fn download(&self, path: &str, max_bytes: usize) -> Result<(String, Vec<u8>)> {
+        let segments =
+            validate_segments(path, MAX_FOLDER_DEPTH + 1, "path").map_err(SeraError::Validation)?;
+        let name = segments.last().cloned().unwrap_or_default();
+        let url = format!(
+            "{}/me/drive/root:/{}:/content",
+            self.graph_base,
+            encode_path(&segments)
+        );
+        let token = self.access_token().await?;
+        let mut response = self
+            .graph_get_with_retries(&url, &token, "download")
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Err(SeraError::NotFound(format!("OneDrive file {path}")));
+        }
+        if response.status().is_redirection() {
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| SeraError::External("OneDrive download had no location".into()))?
+                .to_owned();
+            let target = Url::parse(&location)
+                .map_err(|_| SeraError::External("invalid OneDrive download address".into()))?;
+            let graph = Url::parse(&self.graph_base)
+                .map_err(|_| SeraError::Config("graph_base is not a valid URL".into()))?;
+            let same_loopback = target.host_str() == graph.host_str()
+                && matches!(target.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
+            if target.scheme() != "https" && !same_loopback {
+                return Err(SeraError::External(
+                    "OneDrive download address is not https".into(),
+                ));
+            }
+            response = self
+                .http
+                .get(target)
+                .send()
+                .await
+                .map_err(|error| transport_error("download", error, false))?;
+            if !response.status().is_success() {
+                return Err(graph_error(response, "download").await);
+            }
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_bytes as u64)
+        {
+            return Err(SeraError::Validation(format!(
+                "the file is larger than {max_bytes} bytes"
+            )));
+        }
+        let bytes = read_limited(response, max_bytes).await?;
+        Ok((name, bytes))
+    }
+
     /// Upload `bytes` as `filename` below `base_folder` (and `subfolder`).
     ///
     /// `filename` is sanitized: directory components, control characters, and
@@ -1992,6 +2053,51 @@ mod tests {
             item["file"] = json!({"hashes": {"sha256Hash": sha256}});
         }
         item
+    }
+
+    #[tokio::test]
+    async fn download_follows_the_redirect_without_the_token_and_bounds_size() {
+        let server = MockServer::start().await;
+        mount_token(&server, "access-1", None, 3600).await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/v1.0/me/drive/root:/Documents/Jobs/tracker.xlsx:/content",
+            ))
+            .and(header("authorization", "Bearer access-1"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/dl/abc", server.uri())),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/dl/abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"xlsx-bytes".to_vec()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/drive/root:/Documents/missing.xlsx:/content"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let client = test_client(&server);
+        let (name, bytes) = client
+            .download("Documents/Jobs/tracker.xlsx", 1024)
+            .await
+            .unwrap();
+        assert_eq!(name, "tracker.xlsx");
+        assert_eq!(bytes, b"xlsx-bytes");
+        assert!(
+            client
+                .download("Documents/Jobs/tracker.xlsx", 4)
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            client.download("Documents/missing.xlsx", 1024).await,
+            Err(SeraError::NotFound(_))
+        ));
+        assert!(client.download("../etc/passwd", 1024).await.is_err());
     }
 
     #[tokio::test]

@@ -23,6 +23,8 @@ mod ui_files;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_integrations;
 #[cfg(any(windows, feature = "ui-check"))]
+mod ui_job_search;
+#[cfg(any(windows, feature = "ui-check"))]
 mod ui_jobs;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_logs;
