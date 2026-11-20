@@ -23,6 +23,9 @@ dir = "/var/lib/serabot/whatsapp"
 # sends_per_day = 100
 # Operating system shown in WhatsApp's Linked devices list (set at pairing).
 # device_os = "Windows"
+# 0.66: seconds without WhatsApp activity before the device shows "offline"
+# again (it stays connected, so new messages still arrive). 0 = always online.
+# presence_idle_secs = 120
 
 [database]
 path = "/var/lib/serabot/serabot.db"

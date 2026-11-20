@@ -4143,6 +4143,44 @@ impl ApiClient {
     }
 
     /// `GET /v1/whatsapp-link`: the member's linked WhatsApp number.
+    /// `GET /v1/relay/net` (0.66): relay settings, providers, live status.
+    pub fn relay_get(&self) -> Result<serde_json::Value, ApiError> {
+        self.get(&["v1", "relay", "net"], &[])
+    }
+
+    /// `PUT /v1/relay/net` (0.66): turn the relay on or off, choose providers.
+    pub fn relay_put(
+        &self,
+        enabled: bool,
+        providers: &[String],
+    ) -> Result<serde_json::Value, ApiError> {
+        self.request(
+            Method::PUT,
+            &["v1", "relay", "net"],
+            &[],
+            Some(&serde_json::json!({"enabled": enabled, "providers": providers})),
+        )
+    }
+
+    /// `POST /v1/relay/net/exchange` (0.66): hand over frames, get the
+    /// waiting ones (the server waits up to 20 s when `wait`).
+    pub fn relay_exchange(
+        &self,
+        frames: &[crate::net_relay::Frame],
+        wait: bool,
+    ) -> Result<crate::net_relay::Exchange, ApiError> {
+        let reply: crate::net_relay::Exchange = self.request(
+            Method::POST,
+            &["v1", "relay", "net", "exchange"],
+            &[],
+            Some(&serde_json::json!({"frames": frames, "wait": wait})),
+        )?;
+        if reply.frames.len() > 4096 {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(reply)
+    }
+
     pub fn whatsapp_link_status(&self) -> Result<serde_json::Value, ApiError> {
         self.get(&["v1", "whatsapp-link"], &[])
     }

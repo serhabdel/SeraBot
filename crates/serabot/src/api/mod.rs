@@ -76,6 +76,7 @@ mod profiles;
 mod projects;
 mod provider_accounts;
 mod provider_quota;
+mod relay;
 mod routines;
 mod settings;
 mod skills;
@@ -506,6 +507,8 @@ pub fn router(state: ApiState) -> Router {
             get(list_bot_chats).post(create_bot_chat),
         )
         .route("/v1/bots/{bot}/library", get(bot_library))
+        .route("/v1/relay/net", get(relay::relay_get).put(relay::relay_put))
+        .route("/v1/relay/net/exchange", post(relay::relay_exchange))
         .route("/v1/bots/{bot}/chat-settings", put(put_bot_chat_settings))
         .route("/v1/bots/catalog", get(bot_catalog))
         .route("/v1/bots/catalog/{name}/install", post(install_catalog_bot))
@@ -1111,7 +1114,9 @@ async fn rate_limit(State(state): State<Arc<ApiState>>, request: Request, next: 
 /// They get their own bucket so polling can never starve real actions.
 fn is_poll_request(method: &axum::http::Method, path: &str) -> bool {
     // The desktop's folder agent re-issues this long poll continuously.
-    if method == axum::http::Method::POST && path == "/v1/local/poll" {
+    if method == axum::http::Method::POST
+        && (path == "/v1/local/poll" || path == "/v1/relay/net/exchange")
+    {
         return true;
     }
     if method != axum::http::Method::GET {

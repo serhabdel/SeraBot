@@ -1,6 +1,12 @@
-# Desktop network relay (proposed, 0.66)
+# Desktop network relay (0.66)
 
-Status: **design for owner review**. Nothing here is built in 0.65.
+Status: **built in 0.66**, as designed below. The owner chose: opt-in per
+provider; while the desktop is offline the route simply fails over.
+
+The transport is a long-poll exchange over the desktop's existing
+authenticated API connection (`POST /v1/relay/net/exchange`) rather than a
+WebSocket, because the desktop already runs long-polls this way and needs no
+new dependency. Frames are `open`, `opened`, `data` (base64) and `close`.
 
 ## Goal
 
@@ -72,9 +78,14 @@ server (reqwest) ──HTTP CONNECT──▶ 127.0.0.1:<per-user port>  (server,
 4. Tests: frame codec, allowlist and private-address refusal, offline
    failover, and a loopback end-to-end test with a local TLS server.
 
-## Open questions for the owner
+## As built
 
-- Which providers should allow "via my desktop" at first? The proposal is
-  Antigravity and Gemini CLI plan sign-ins only.
-- When the desktop is offline: fail over to the next route (proposed), or
-  wait?
+- Server: `crates/serabot/src/relay_net.rs` (hub, loopback CONNECT listener,
+  settings, address rule), `api/relay.rs` (`GET/PUT /v1/relay/net`,
+  `POST /v1/relay/net/exchange`), migration `0043_relay_settings.sql`, and the
+  proxy hook in `providers::open_provider_client`.
+- Desktop: `crates/serabot-desktop/src/net_relay.rs` (two threads, host list,
+  public-address check), `ui_net_relay.rs` (card under Settings → Local
+  folders).
+- Relayable providers: Google Antigravity, Google Gemini API, Anthropic,
+  OpenAI. Each has a fixed host list on both sides.

@@ -155,6 +155,7 @@ pub(super) fn SettingsView(session: Signal<Session>) -> Element {
         }
         if sel == SettingsSection::LocalFolders {
             LocalFoldersCard { session }
+            crate::ui_net_relay::NetRelayCard { session }
         }
         if sel == SettingsSection::About {
             AboutCard { session }

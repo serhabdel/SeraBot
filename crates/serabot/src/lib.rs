@@ -74,6 +74,7 @@ pub mod pptx_ops;
 pub mod profiles;
 pub mod projects;
 pub mod providers;
+pub mod relay_net;
 pub mod reliability;
 pub mod render;
 pub mod result_cards;

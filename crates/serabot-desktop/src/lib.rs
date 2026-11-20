@@ -34,6 +34,7 @@ pub mod marketplace;
 pub mod marketplace_flow;
 pub mod media_view;
 pub mod net_policy;
+pub mod net_relay;
 pub mod oauth;
 pub mod panel;
 pub mod pc_stats;

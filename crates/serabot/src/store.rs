@@ -81,6 +81,7 @@ const MIGRATION_39: &str = include_str!("../migrations/0039_marketplace_accounts
 const MIGRATION_40: &str = include_str!("../migrations/0040_marketplace_tool_policy.sql");
 const MIGRATION_41: &str = include_str!("../migrations/0041_whatsapp_link.sql");
 const MIGRATION_42: &str = include_str!("../migrations/0042_memory_vectors.sql");
+const MIGRATION_43: &str = include_str!("../migrations/0043_relay_settings.sql");
 
 /// One member's account for a marketplace plugin (no secret).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -777,6 +778,11 @@ impl Store {
         if version < 42 {
             connection.execute_batch(MIGRATION_42)?;
             connection.pragma_update(None, "user_version", 42)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 43 {
+            connection.execute_batch(MIGRATION_43)?;
+            connection.pragma_update(None, "user_version", 43)?;
         }
         // VACUUM INTO (backups) may renumber rowids; rebuild the external-content
         // FTS index only when its row count no longer matches `memories`.
@@ -6641,7 +6647,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 42);
+        assert_eq!(version, 43);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
@@ -6706,7 +6712,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 42);
+        assert_eq!(version, 43);
         assert!(store.list_device_tokens().unwrap().is_empty());
         // The team table arrives with the same migration batch.
         assert!(
@@ -6780,7 +6786,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 42);
+        assert_eq!(version, 43);
         let admin = admin(&store);
         let memory = crate::memory::get(&store, &admin, "mem-legacy").unwrap();
         assert_eq!(memory.origin, "explicit");
@@ -6869,7 +6875,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 42);
+        assert_eq!(version, 43);
 
         let admin = store.admin_user().unwrap().unwrap();
         assert_eq!(admin.id, ADMIN_USER_ID);
@@ -7000,7 +7006,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 42);
+        assert_eq!(version, 43);
 
         // Every scoped table carries user_id = the admin, and the column is
         // NOT NULL with a real foreign key.
@@ -7155,7 +7161,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 42);
+        assert_eq!(version, 43);
 
         // The old row is now the admin's, with the empty prompt the migration
         // header documents; startup seeding fills it from the template.
