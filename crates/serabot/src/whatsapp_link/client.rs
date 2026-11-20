@@ -1334,9 +1334,11 @@ mod tests {
         batch.attachments.push("b".into());
         batch.captions.push(String::new());
         assert_eq!(batch.text(), "[2 photos sent together] crop this");
-        let mut plain = PhotoBatch::default();
-        plain.attachments = vec!["a".into(), "b".into(), "c".into()];
-        plain.captions = vec![String::new(); 3];
+        let plain = PhotoBatch {
+            attachments: vec!["a".into(), "b".into(), "c".into()],
+            captions: vec![String::new(); 3],
+            ..PhotoBatch::default()
+        };
         assert_eq!(plain.text(), "[3 photos sent together]");
     }
 
