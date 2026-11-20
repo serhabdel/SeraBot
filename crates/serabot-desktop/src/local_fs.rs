@@ -91,6 +91,35 @@ const RESERVED: [&str; 22] = [
 /// everything else), so listings never show what could not be opened:
 /// alternate-stream colons, reserved device names, trailing dot/space,
 /// control or wildcard characters.
+/// A file error the bot (and the person) can act on (0.68): the fallback
+/// phrase plus why, from the OS error kind. Never includes the path.
+pub fn io_reason(error: &std::io::Error, fallback: &str) -> String {
+    // Windows: ERROR_SHARING_VIOLATION (32), ERROR_LOCK_VIOLATION (33).
+    let locked = matches!(error.raw_os_error(), Some(32) | Some(33)) && cfg!(windows);
+    let why = if locked {
+        "it is open in another program such as Excel or Word; close it there and try again"
+    } else {
+        match error.kind() {
+            std::io::ErrorKind::NotFound => "it was moved, renamed or deleted",
+            std::io::ErrorKind::PermissionDenied => {
+                "Windows refused access; check the file is not read-only or owned by another user"
+            }
+            std::io::ErrorKind::StorageFull => "the disk is full",
+            std::io::ErrorKind::ReadOnlyFilesystem => "the drive is read-only",
+            std::io::ErrorKind::TimedOut => {
+                "the drive did not answer in time (a network or cloud drive?)"
+            }
+            std::io::ErrorKind::IsADirectory => "that is a folder, not a file",
+            std::io::ErrorKind::InvalidData => "the file is not readable as expected",
+            std::io::ErrorKind::Interrupted | std::io::ErrorKind::UnexpectedEof => {
+                "the file changed or was cut short while it was read"
+            }
+            _ => return fallback.to_string(),
+        }
+    };
+    format!("{fallback} ({why})")
+}
+
 pub fn name_addressable(name: &str) -> bool {
     if name.is_empty() || name.ends_with('.') || name.ends_with(' ') {
         return false;
@@ -626,7 +655,8 @@ pub fn list(root: &Path, rel: &str, args: &Value, budget: &Budget) -> Result<Str
     } else {
         resolve(root, rel, true)?
     };
-    let meta = std::fs::symlink_metadata(&dir).map_err(|_| "could not be opened".to_string())?;
+    let meta = std::fs::symlink_metadata(&dir)
+        .map_err(|error| crate::local_fs::io_reason(&error, "could not be opened"))?;
     if !meta.is_dir() || is_link(&meta) {
         return Err("not a folder".into());
     }
@@ -980,7 +1010,8 @@ pub fn search(root: &Path, rel: &str, args: &Value, budget: &Budget) -> Result<S
     } else {
         resolve(root, rel, true)?
     };
-    let meta = std::fs::symlink_metadata(&dir).map_err(|_| "could not be opened".to_string())?;
+    let meta = std::fs::symlink_metadata(&dir)
+        .map_err(|error| crate::local_fs::io_reason(&error, "could not be opened"))?;
     if !meta.is_dir() || is_link(&meta) {
         return Err("not a folder".into());
     }
@@ -1234,7 +1265,8 @@ pub fn read(root: &Path, rel: &str, args: &Value, budget: &Budget) -> Result<Str
     if sensitive_name(name) {
         return Err("credential-like files are never shared".into());
     }
-    let meta = std::fs::symlink_metadata(&path).map_err(|_| "could not be opened".to_string())?;
+    let meta = std::fs::symlink_metadata(&path)
+        .map_err(|error| crate::local_fs::io_reason(&error, "could not be opened"))?;
     if !meta.is_file() || is_link(&meta) {
         return Err("not a regular file".into());
     }
@@ -1257,14 +1289,15 @@ pub fn read(root: &Path, rel: &str, args: &Value, budget: &Budget) -> Result<Str
     if offset > size || (offset == size && size > 0) {
         return Err(format!("offset is past the end of the file ({size} bytes)"));
     }
-    let mut file = std::fs::File::open(&path).map_err(|_| "could not be opened".to_string())?;
+    let mut file = std::fs::File::open(&path)
+        .map_err(|error| crate::local_fs::io_reason(&error, "could not be opened"))?;
     file.seek(SeekFrom::Start(offset))
-        .map_err(|_| "could not be read".to_string())?;
+        .map_err(|error| crate::local_fs::io_reason(&error, "could not be read"))?;
     // Read a few extra bytes so a cut multi-byte character can be completed.
     let mut buf = Vec::new();
     file.take(limit as u64 + 4)
         .read_to_end(&mut buf)
-        .map_err(|_| "could not be read".to_string())?;
+        .map_err(|error| crate::local_fs::io_reason(&error, "could not be read"))?;
     // Start on a character boundary.
     let skip = buf
         .iter()
@@ -1315,7 +1348,8 @@ fn read_lines(
         return Err("end_line must not be before start_line".into());
     }
     let last_wanted = end_line.min(start.saturating_add(max_lines - 1));
-    let file = std::fs::File::open(path).map_err(|_| "could not be opened".to_string())?;
+    let file = std::fs::File::open(path)
+        .map_err(|error| crate::local_fs::io_reason(&error, "could not be opened"))?;
     let mut reader = BufReader::with_capacity(64 * 1024, file);
     let mut line_no = 0usize;
     let mut scanned = 0u64;
@@ -1330,7 +1364,7 @@ fn read_lines(
             .by_ref()
             .take(MAX_LINE_BYTES as u64)
             .read_until(b'\n', &mut buf)
-            .map_err(|_| "could not be read".to_string())?;
+            .map_err(|error| crate::local_fs::io_reason(&error, "could not be read"))?;
         if read == 0 {
             break;
         }
@@ -1341,7 +1375,7 @@ fn read_lines(
             let mut sink = Vec::new();
             let skipped = reader
                 .read_until(b'\n', &mut sink)
-                .map_err(|_| "could not be read".to_string())?;
+                .map_err(|error| crate::local_fs::io_reason(&error, "could not be read"))?;
             scanned += skipped as u64;
         }
         line_no += 1;
@@ -1385,6 +1419,19 @@ fn read_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn io_errors_say_why_without_the_path() {
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(
+            io_reason(&missing, "could not be opened"),
+            "could not be opened (it was moved, renamed or deleted)"
+        );
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(io_reason(&denied, "could not be read").contains("refused access"));
+        let other = std::io::Error::other("C:/secret/path.xlsx exploded");
+        assert_eq!(io_reason(&other, "could not be read"), "could not be read");
+    }
 
     fn tree(base: &Path, files: usize, per_dir: usize) {
         let mut made = 0;

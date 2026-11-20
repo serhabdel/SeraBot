@@ -62,6 +62,7 @@ pub mod ocr;
 pub mod onboarding;
 pub mod onedrive;
 pub mod openrouter;
+pub mod ops;
 pub mod orchestration;
 pub mod pdf_ops;
 pub mod personal;

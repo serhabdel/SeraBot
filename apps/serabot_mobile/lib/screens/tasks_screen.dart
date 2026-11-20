@@ -4,6 +4,7 @@ import '../api_client.dart';
 import '../app_state.dart';
 import '../models.dart';
 import '../widgets.dart';
+import 'approvals_screen.dart';
 
 /// Personal tasks and calendar agenda (`/v1/tasks`, `/v1/tasks/sync/run`,
 /// `/v1/tasks/calendar`).
@@ -204,6 +205,27 @@ class _TasksScreenState extends State<TasksScreen> {
       appBar: AppBar(
         title: const Text('Tasks'),
         actions: [
+          ListenableBuilder(
+            listenable: widget.app,
+            builder: (context, _) {
+              final pending = widget.app.pendingApprovals;
+              return IconButton(
+                tooltip: pending == 0
+                    ? 'Approvals'
+                    : 'Approvals, $pending waiting',
+                onPressed: () => Navigator.of(context).push(
+                  MaterialPageRoute<void>(
+                    builder: (_) => ApprovalsScreen(app: widget.app),
+                  ),
+                ),
+                icon: Badge(
+                  isLabelVisible: pending > 0,
+                  label: Text(pending > 99 ? '99+' : '$pending'),
+                  child: const Icon(Icons.how_to_reg_outlined),
+                ),
+              );
+            },
+          ),
           if (_data.sync.enabled)
             IconButton(
               tooltip: 'Sync tasks (${_data.sync.provider})',

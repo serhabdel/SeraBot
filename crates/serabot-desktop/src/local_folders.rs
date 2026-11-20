@@ -367,13 +367,13 @@ pub(crate) fn resolve(root: &Path, rel: &str, must_exist: bool) -> Result<PathBu
     let check = if current.exists() {
         current
             .canonicalize()
-            .map_err(|_| "could not be opened".to_string())?
+            .map_err(|error| crate::local_fs::io_reason(&error, "could not be opened"))?
     } else {
         current
             .parent()
             .ok_or_else(|| "invalid path".to_string())?
             .canonicalize()
-            .map_err(|_| "could not be opened".to_string())?
+            .map_err(|error| crate::local_fs::io_reason(&error, "could not be opened"))?
     };
     if !crate::local_fs::path_within(&root, &check) {
         return Err("the path leaves the allowed folder".into());
@@ -495,7 +495,8 @@ pub(crate) fn write(root: &Path, rel: &str, content: &str) -> Result<String, Str
     // Write next to the target, then move into place, so a half-written file
     // never replaces the original.
     let temp = parent.join(format!(".{name}.serabot-tmp"));
-    std::fs::write(&temp, content).map_err(|_| "could not be written".to_string())?;
+    std::fs::write(&temp, content)
+        .map_err(|error| crate::local_fs::io_reason(&error, "could not be written"))?;
     if let Err(error) = std::fs::rename(&temp, &path) {
         let _ = std::fs::remove_file(&temp);
         return Err(format!("could not be written: {}", error.kind()));

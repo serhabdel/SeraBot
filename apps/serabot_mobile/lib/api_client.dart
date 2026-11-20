@@ -4,8 +4,10 @@ import 'dart:math';
 
 import 'package:http/http.dart' as http;
 
+import 'bot_library_models.dart';
 import 'chat_models.dart';
 import 'models.dart';
+import 'usage_insights_models.dart';
 import 'validation.dart';
 import 'workflows_models.dart';
 
@@ -893,6 +895,54 @@ class ApiClient {
       query: {'days': '$days'},
     );
     return UsageReport.fromJson(json);
+  }
+
+  /// Channels, the PC tunnel, model speed and, for the admin, server load
+  /// (`GET /v1/usage/insights`, 0.67). Counts only, never message text.
+  Future<UsageInsights> usageInsights({int days = 7}) async {
+    if (days < 1 || days > 90) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Usage days must be 1\u201390.',
+      );
+    }
+    final json = await _request(
+      'GET',
+      ['v1', 'usage', 'insights'],
+      query: {'days': '$days'},
+    );
+    return UsageInsights.fromJson(json);
+  }
+
+  /// Files in a bot's chats: the ones its bots made and the member's uploads
+  /// (`GET /v1/bots/{bot}/library`, 0.63). Bad rows are skipped.
+  Future<List<BotLibraryItem>> botLibrary(String botId) async {
+    _checkId(botId);
+    final json = await _request('GET', ['v1', 'bots', botId, 'library']);
+    return parseBotLibrary(json);
+  }
+
+  /// Stored `turn.memory` events of one chat, oldest first (0.61), so a reply's
+  /// memories show after the chat is reopened. Empty on servers without it.
+  Future<List<ServerEvent>> conversationMemoryEvents(
+    String conversationId, {
+    int limit = 100,
+  }) async {
+    _checkId(conversationId);
+    final json = await _requestOptional(
+      'GET',
+      ['v1', 'conversations', conversationId, 'activity'],
+      query: {'limit': '$limit'},
+    );
+    final rows = json?['steps'];
+    if (rows is! List) {
+      return const [];
+    }
+    return [
+      for (final row in rows.whereType<Map<String, dynamic>>())
+        if (row['kind'] == 'turn.memory' && row['payload'] is Map<String, dynamic>)
+          ServerEvent(0, 'turn.memory', row['payload'] as Map<String, dynamic>),
+    ];
   }
 
   Future<List<ConnectorStatus>> connectors() async {

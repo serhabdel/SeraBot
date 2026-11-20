@@ -12,6 +12,7 @@ import '../models.dart';
 import '../preview_pane.dart';
 import '../widgets.dart';
 import 'trace_sheet.dart';
+import 'turn_memory_view.dart';
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({
@@ -367,7 +368,9 @@ class _ChatScreenState extends State<ChatScreen> {
       return const Center(child: CircularProgressIndicator());
     }
     final items = chat.messages.reversed.toList();
-    final showActivity = chat.running || !chat.activity.isEmpty;
+    final showActivity = chat.running ||
+        !chat.activity.isEmpty ||
+        !chat.currentMemory.isEmpty;
     return ListView.builder(
       controller: _scroll,
       reverse: true,
@@ -574,10 +577,11 @@ class ActivityPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final a = chat.activity;
+    final memory = chat.currentMemory;
     final waiting = a.steps.where((s) => s.phase == StepPhase.waitingApproval);
     final title = chat.running
         ? (a.isEmpty ? 'Working\u2026' : 'Working \u00b7 ${a.summary}')
-        : a.summary;
+        : (a.isEmpty ? 'Memories for the last reply' : a.summary);
     final reduced = MediaQuery.disableAnimationsOf(context);
     return Card(
       margin: const EdgeInsets.symmetric(vertical: 6),
@@ -598,6 +602,11 @@ class ActivityPanel extends StatelessWidget {
           initiallyExpanded: chat.running || waiting.isNotEmpty,
           children: [
             for (final s in a.steps) _StepCard(chat: chat, step: s),
+            if (!memory.isEmpty)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
+                child: TurnMemoryView(memory: memory),
+              ),
           ],
         ),
       ),

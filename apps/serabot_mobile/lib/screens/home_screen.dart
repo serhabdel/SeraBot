@@ -1,10 +1,14 @@
+import 'dart:async';
+
 import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 
 import '../app_state.dart';
 import '../device.dart';
 import '../session.dart';
 import '../theme.dart';
+import 'approvals_screen.dart';
 import 'bots_screen.dart';
 import 'chats_screen.dart';
 import 'settings_screen.dart';
@@ -38,6 +42,7 @@ class _HomeScreenState extends State<HomeScreen> {
   int _index = 0;
   late final AppState _app;
   late final DeviceActions _device;
+  StreamSubscription<int>? _alertSub;
 
   @override
   void initState() {
@@ -49,7 +54,32 @@ class _HomeScreenState extends State<HomeScreen> {
       networkChanges: widget.startEvents ? _networkChanges() : null,
     );
     _device = widget.device ?? PlatformDeviceActions();
+    _alertSub = _app.approvalAlerts.listen(_onApprovalAlert);
     _app.start(events: widget.startEvents);
+  }
+
+  /// A new approval arrived: a short buzz and a notice with a way to review it.
+  void _onApprovalAlert(int count) {
+    unawaited(HapticFeedback.mediumImpact());
+    if (!mounted) {
+      return;
+    }
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(count == 1
+            ? 'An approval is waiting for you.'
+            : '$count approvals are waiting for you.'),
+        action: SnackBarAction(label: 'Review', onPressed: _openApprovals),
+      ),
+    );
+  }
+
+  void _openApprovals() {
+    Navigator.of(context).push(MaterialPageRoute<void>(
+      builder: (_) => ApprovalsScreen(app: _app),
+    ));
   }
 
   /// Fires when the device comes back online or switches network.
@@ -62,6 +92,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    _alertSub?.cancel();
     _app.dispose();
     super.dispose();
   }
@@ -73,6 +104,7 @@ class _HomeScreenState extends State<HomeScreen> {
       listenable: _app,
       builder: (context, _) {
         final unread = _app.unread;
+        final pending = _app.pendingApprovals;
         return Scaffold(
           body: ListenableBuilder(
             listenable: widget.session,
@@ -153,10 +185,27 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                   label: 'Chats',
                 ),
-                const NavigationDestination(
-                  icon: _NavVectorIcon(glyph: _NavGlyph.tasks, selected: false),
-                  selectedIcon:
-                      _NavVectorIcon(glyph: _NavGlyph.tasks, selected: true),
+                NavigationDestination(
+                  icon: Badge(
+                    isLabelVisible: pending > 0,
+                    backgroundColor: scheme.primary,
+                    textColor: scheme.onPrimary,
+                    label: Text(pending > 99 ? '99+' : '$pending'),
+                    child: const _NavVectorIcon(
+                      glyph: _NavGlyph.tasks,
+                      selected: false,
+                    ),
+                  ),
+                  selectedIcon: Badge(
+                    isLabelVisible: pending > 0,
+                    backgroundColor: scheme.primary,
+                    textColor: scheme.onPrimary,
+                    label: Text(pending > 99 ? '99+' : '$pending'),
+                    child: const _NavVectorIcon(
+                      glyph: _NavGlyph.tasks,
+                      selected: true,
+                    ),
+                  ),
                   label: 'Tasks',
                 ),
                 const NavigationDestination(

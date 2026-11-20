@@ -244,6 +244,48 @@ pub async fn transcribe_audio_bytes_for_user(
     }
 }
 
+/// Synthesize a reply for one member (0.68): the server's audio provider
+/// when it is set up, otherwise the member's own Mistral account (same
+/// consent rule as transcription). A voice id is needed either way.
+pub async fn synthesize_speech_for_user(
+    config: &Config,
+    store: &crate::store::Store,
+    user_id: &str,
+    text: &str,
+) -> Result<Vec<u8>> {
+    match synthesize_speech(config, text).await {
+        Err(SeraError::Config(server_error)) => {
+            let Some((base_url, key)) = user_mistral_audio_credential(config, store, user_id)
+            else {
+                return Err(SeraError::Config(server_error));
+            };
+            let trimmed = text.trim();
+            let chars = trimmed.chars().count();
+            if chars > config.audio.max_speech_chars {
+                return Err(SeraError::Validation(format!(
+                    "reply is {chars} characters; voice replies are capped at {}",
+                    config.audio.max_speech_chars
+                )));
+            }
+            let client = MistralAudioClient::new(
+                base_url,
+                key,
+                config.llm.timeout_secs,
+                &config.audio,
+                true,
+            )?;
+            client
+                .synthesize_speech(
+                    trimmed,
+                    config.audio.voice_id.trim(),
+                    config.audio.speech_model.trim(),
+                )
+                .await
+        }
+        other => other,
+    }
+}
+
 /// Whether voice replies can be produced right now.
 ///
 /// Ready means: audio enabled, provider resolvable, key stored, egress

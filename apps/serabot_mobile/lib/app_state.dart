@@ -44,6 +44,13 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   final _events = StreamController<ServerEvent>.broadcast();
   Stream<ServerEvent> get events => _events.stream;
 
+  /// Emits the number of approvals that appeared since the last check. The
+  /// first load only learns what is already waiting and does not alert.
+  final _approvalAlerts = StreamController<int>.broadcast();
+  Stream<int> get approvalAlerts => _approvalAlerts.stream;
+  final Set<String> _knownApprovals = {};
+  bool _approvalsLoaded = false;
+
   int _cursor = 0;
   int get cursor => _cursor;
   bool _disposed = false;
@@ -172,11 +179,31 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
   Future<void> refreshApprovals() async {
     try {
-      approvals = await client.approvals();
-      pendingApprovals = approvals.length;
+      final next = await client.approvals();
+      approvals = next;
+      pendingApprovals = next.length;
+      _noteApprovals(next);
       _notify();
     } on ApiException {
       // Keep the last known count.
+    }
+  }
+
+  void _noteApprovals(List<ApprovalItem> items) {
+    final ids = {for (final item in items) item.id};
+    if (!_approvalsLoaded) {
+      _approvalsLoaded = true;
+      _knownApprovals
+        ..clear()
+        ..addAll(ids);
+      return;
+    }
+    final fresh = ids.difference(_knownApprovals).length;
+    _knownApprovals
+      ..clear()
+      ..addAll(ids);
+    if (fresh > 0 && !_approvalAlerts.isClosed) {
+      _approvalAlerts.add(fresh);
     }
   }
 
@@ -372,6 +399,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     _debounce?.cancel();
     _approvalDebounce?.cancel();
     _events.close();
+    _approvalAlerts.close();
     super.dispose();
   }
 }

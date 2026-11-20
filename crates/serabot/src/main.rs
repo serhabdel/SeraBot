@@ -1060,6 +1060,14 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         policy.clone(),
     ))?;
     let notifier = Arc::new(CompositeNotifier::new(notifiers));
+    // 0.68: alerts to members and the nightly encrypted backup.
+    let ops_watch = serabot::ops::OpsWatch::new(
+        config.clone(),
+        store.clone(),
+        notifier.clone(),
+        onedrive_registry.clone(),
+    );
+    let ops_task = tokio::spawn(ops_watch.clone().run(shutdown.clone()));
 
     let startup_policy = policy.clone();
     let media_policy = policy.clone();
@@ -1130,6 +1138,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         .with_refresher(account_refresher.clone())?
         .with_personal(personal_connectors.clone())
         .with_local_relay(local_relay.clone())
+        .with_ops(ops_watch.clone())
         .with_elevenlabs(elevenlabs.clone())
         .with_browser(browser_manager.clone());
         #[cfg(feature = "whatsapp-link")]
@@ -1331,6 +1340,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     shutdown.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(20), worker).await;
     let _ = tokio::time::timeout(Duration::from_secs(10), media_jobs).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), ops_task).await;
     for service in services {
         let _ = tokio::time::timeout(Duration::from_secs(10), service).await;
     }

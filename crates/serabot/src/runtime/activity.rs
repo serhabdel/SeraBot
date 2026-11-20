@@ -233,8 +233,228 @@ fn humanize(tool: &str) -> String {
     }
 }
 
+/// Office tool verbs (0.68): a specific label per document tool.
+fn office_label(tool: &str) -> Option<(&'static str, &'static str)> {
+    Some(match tool {
+        "xlsx_build" => ("file:excel", "Building a spreadsheet"),
+        "xlsx_read" => ("file:excel", "Reading a spreadsheet"),
+        "xlsx_inspect" => ("file:excel", "Looking through a spreadsheet"),
+        "xlsx_edit" => ("file:excel", "Editing a spreadsheet"),
+        "xlsx_import" => ("file:excel", "Opening a spreadsheet"),
+        "xlsx_analyze" | "timesheet_analyze" => ("file:excel", "Analyzing a spreadsheet"),
+        "docx_build" => ("file:word", "Writing a Word document"),
+        "docx_read" => ("file:word", "Reading a Word document"),
+        "docx_inspect" => ("file:word", "Looking through a Word document"),
+        "docx_edit" => ("file:word", "Editing a Word document"),
+        "docx_import" => ("file:word", "Opening a Word document"),
+        "docx_pdf" => ("file:pdf", "Converting a Word document to PDF"),
+        "pptx_edit" => ("file:powerpoint", "Editing a presentation"),
+        "pptx_inspect" | "pptx_slides" => ("file:powerpoint", "Looking through a presentation"),
+        "pptx_import" => ("file:powerpoint", "Opening a presentation"),
+        "pptx_pdf" => ("file:pdf", "Converting a presentation to PDF"),
+        "deck_build" => ("file:powerpoint", "Building a presentation"),
+        "pdf_edit" => ("file:pdf", "Editing a PDF"),
+        "pdf_inspect" => ("file:pdf", "Reading a PDF"),
+        "pdf_merge" => ("file:pdf", "Merging PDFs"),
+        _ => return None,
+    })
+}
+
+/// Edit operations a step card may name, with their plural wording. Only
+/// these fixed words and counts reach an event, never cell values or text.
+const OFFICE_OPS: &[(&str, &str)] = &[
+    ("set_value", "values"),
+    ("set_formula", "formulas"),
+    ("set_number_format", "number formats"),
+    ("set_column_width", "column widths"),
+    ("set_row_height", "row heights"),
+    ("set_cell_style", "styles"),
+    ("merge_cells", "merges"),
+    ("freeze_panes", "frozen panes"),
+    ("add_sheet", "new sheets"),
+    ("rename_sheet", "renamed sheets"),
+    ("delete_sheet", "deleted sheets"),
+    ("insert_rows", "row inserts"),
+    ("delete_rows", "row deletes"),
+    ("insert_columns", "column inserts"),
+    ("delete_columns", "column deletes"),
+    ("add_chart", "charts"),
+    ("replace_text", "text replacements"),
+    ("insert_paragraph", "new paragraphs"),
+    ("delete_paragraph", "deleted paragraphs"),
+    ("delete_block", "deleted blocks"),
+    ("set_style", "style changes"),
+    ("insert_table", "new tables"),
+    ("insert_image", "images"),
+    ("replace_slide_text", "slide text changes"),
+    ("add_slide", "new slides"),
+    ("delete_slide", "deleted slides"),
+];
+
+/// A spreadsheet range or cell such as `B2` or `A1:D20`, or `None`.
+fn safe_range(value: &str) -> Option<String> {
+    let value = value.trim();
+    let cell = |part: &str| {
+        let letters = part.chars().take_while(char::is_ascii_uppercase).count();
+        let digits = &part[letters..];
+        (1..=3).contains(&letters)
+            && !digits.is_empty()
+            && digits.len() <= 7
+            && digits.chars().all(|c| c.is_ascii_digit())
+    };
+    let ok = match value.split_once(':') {
+        Some((start, end)) => cell(start) && cell(end),
+        None => cell(value),
+    };
+    ok.then(|| value.to_string())
+}
+
+/// A short, secret-free line on what an office step is doing (0.68):
+/// operation counts by kind, a cell range, or a block span. Built only from
+/// fixed words, numbers and strictly checked ranges.
+pub(super) fn office_detail(tool: &str, args: &Value) -> Option<String> {
+    office_label(tool)?;
+    let ops = ["edits", "ops", "operations"]
+        .iter()
+        .find_map(|key| args.get(*key).and_then(Value::as_array));
+    if let Some(ops) = ops {
+        let mut counts: Vec<(&str, usize)> = Vec::new();
+        let mut other = 0usize;
+        for op in ops {
+            let name = op.get("op").and_then(Value::as_str).unwrap_or("set_value");
+            match OFFICE_OPS.iter().find(|(known, _)| *known == name) {
+                Some((_, plural)) => match counts.iter_mut().find(|(p, _)| p == plural) {
+                    Some(entry) => entry.1 += 1,
+                    None => counts.push((plural, 1)),
+                },
+                None => other += 1,
+            }
+        }
+        if other > 0 {
+            counts.push(("other changes", other));
+        }
+        counts.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+        let total = ops.len();
+        let parts = counts
+            .iter()
+            .take(4)
+            .map(|(plural, count)| format!("{count} {plural}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let noun = if total == 1 { "change" } else { "changes" };
+        return Some(truncate_chars(&format!("{total} {noun}: {parts}"), 140));
+    }
+    if let Some(range) = args
+        .get("range")
+        .and_then(Value::as_str)
+        .and_then(safe_range)
+    {
+        return Some(format!("Cells {range}"));
+    }
+    let number = |key: &str| args.get(key).and_then(Value::as_u64);
+    if let (Some(start), Some(end)) = (
+        number("start").or_else(|| number("from")),
+        number("end").or_else(|| number("to")),
+    ) {
+        return Some(format!("Blocks {start}\u{2013}{end}"));
+    }
+    if let Some(files) = args.get("artifacts").and_then(Value::as_array) {
+        return Some(format!("{} files", files.len()));
+    }
+    None
+}
+
+/// What to do next for a failed file step (0.68), from the error's wording.
+/// Fixed sentences only; `None` when the error is not about a file.
+pub(super) fn file_error_hint(tool: &str, error: &str) -> Option<&'static str> {
+    let file_tool = tool.starts_with("local_")
+        || tool.starts_with("onedrive_")
+        || office_label(tool).is_some()
+        || matches!(tool, "document_index" | "telegram_send_document");
+    if !file_tool {
+        return None;
+    }
+    let lower = error.to_ascii_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|needle| lower.contains(needle));
+    Some(
+        if has(&[
+            "resourcelocked",
+            "locked",
+            "being used by another",
+            "sharing violation",
+            "http 423",
+            "(423",
+        ]) {
+            "The file is open in another app (Excel, Word or OneDrive). Close it there, then try again."
+        } else if has(&[
+            "not found",
+            "no such file",
+            "cannot find",
+            "itemnotfound",
+            "http 404",
+            "(404",
+        ]) {
+            "The file was moved, renamed or deleted. List the folder again and use the current name."
+        } else if has(&[
+            "permission denied",
+            "access is denied",
+            "access denied",
+            "forbidden",
+            "http 403",
+            "(403",
+            "outside the allowed",
+        ]) {
+            "SeraBot may not use that location. Pick a file inside an allowed folder (Settings → Local folders) or reconnect OneDrive."
+        } else if has(&[
+            "namealreadyexists",
+            "already exists",
+            "http 409",
+            "(409",
+            "conflict",
+        ]) {
+            "A file with that name already exists. Choose another name or say to replace it."
+        } else if has(&["too large", "exceeds", "larger than", "over the", "limit"]) {
+            "The file is too big for this step. Work on part of it (one sheet or a range) or split it."
+        } else if has(&["encrypted", "password"]) {
+            "The file is password-protected. Save an unprotected copy and try again."
+        } else if has(&["macro"]) {
+            "Files with macros are refused. Save it as a plain .xlsx, .docx or .pptx first."
+        } else if has(&[
+            "invalid zip",
+            "not a zip",
+            "corrupt",
+            "malformed",
+            "invalid package",
+            "unexpected end",
+            "could not parse",
+            "invalid file",
+        ]) {
+            "The file looks damaged or is not the type its name says. Open and re-save it in Office, then try again."
+        } else if has(&[
+            "desktop is not connected",
+            "desktop offline",
+            "not connected",
+            "is offline",
+        ]) {
+            "Your PC is not connected. Open the SeraBot desktop app, then try again."
+        } else if has(&["timed out", "timeout"]) {
+            "The file took too long to reach. Try again; for a large file, work on part of it."
+        } else if has(&["unsupported", "not supported", "unknown extension"]) {
+            "That file type is not supported for this step. Convert it (for example to .xlsx or .pdf) first."
+        } else {
+            return None;
+        },
+    )
+}
+
 /// A plain label and icon name for a tool call.
 pub(super) fn describe_step(tool: &str, args: &Value, bot_label: Option<&str>) -> StepView {
+    if let Some((icon, label)) = office_label(tool) {
+        return StepView {
+            icon,
+            label: label.to_string(),
+        };
+    }
     let (icon, label): (&'static str, String) = match tool {
         "browser_navigate" => (
             "globe",
@@ -453,6 +673,12 @@ impl Runtime {
             "label": view.label,
             "input_summary": view.label,
         });
+        // 0.68: office steps say what they are changing (counts and ranges).
+        if let Some(detail) = office_detail(&call.name, &call.arguments)
+            && self.gateway.scan_egress(user_id, &detail).is_ok()
+        {
+            payload["input_summary"] = json!(detail);
+        }
         if let Some(id) = approval_id {
             payload["approval_id"] = json!(id);
         }
@@ -521,6 +747,65 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn office_steps_say_what_changes_without_content() {
+        let args = json!({"source_artifact": "abc", "edits": [
+            {"op": "set_value", "sheet": "Secret plan", "address": "A1", "value": {"type": "string", "value": "salary 9000"}},
+            {"op": "set_value", "sheet": "x", "address": "A2", "value": {"type": "number", "value": 1}},
+            {"op": "set_formula", "sheet": "x", "address": "B1", "formula": "=SUM(A1:A2)"},
+            {"op": "weird_new_op"}
+        ]});
+        let detail = office_detail("xlsx_edit", &args).unwrap();
+        assert_eq!(detail, "4 changes: 2 values, 1 formulas, 1 other changes");
+        assert!(!detail.contains("salary") && !detail.contains("Secret"));
+        assert_eq!(
+            office_detail("xlsx_read", &json!({"range": "A1:D20"})).unwrap(),
+            "Cells A1:D20"
+        );
+        assert!(office_detail("xlsx_read", &json!({"range": "A1; DROP"})).is_none());
+        assert!(office_detail("browser_navigate", &json!({"edits": []})).is_none());
+        assert_eq!(
+            describe_step("docx_edit", &json!({}), None).label,
+            "Editing a Word document"
+        );
+        assert_eq!(
+            describe_step("pdf_merge", &json!({}), None).icon,
+            "file:pdf"
+        );
+    }
+
+    #[test]
+    fn file_errors_name_the_next_step() {
+        assert!(
+            file_error_hint(
+                "local_read",
+                "The process cannot access the file because it is being used by another process"
+            )
+            .unwrap()
+            .contains("open in another app")
+        );
+        assert!(
+            file_error_hint(
+                "onedrive_upload",
+                "Graph returned HTTP 409: nameAlreadyExists"
+            )
+            .unwrap()
+            .contains("already exists")
+        );
+        assert!(
+            file_error_hint("xlsx_import", "invalid zip archive")
+                .unwrap()
+                .contains("damaged")
+        );
+        assert!(
+            file_error_hint("local_read", "path not found")
+                .unwrap()
+                .contains("moved")
+        );
+        assert!(file_error_hint("browser_click", "not found").is_none());
+        assert!(file_error_hint("local_read", "something odd").is_none());
+    }
 
     #[test]
     fn navigation_label_shows_only_the_host() {

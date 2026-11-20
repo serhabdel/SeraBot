@@ -7,6 +7,7 @@ import '../chat_models.dart';
 import '../device.dart';
 import '../models.dart';
 import '../widgets.dart';
+import 'bot_library_screen.dart';
 
 /// The user's bots (same `GET /v1/bots` as the desktop) and their settings.
 class BotsScreen extends StatelessWidget {
@@ -360,6 +361,25 @@ class _BotSettingsScreenState extends State<BotSettingsScreen> {
                       child: Text(
                         '${d.memoryCount} memories \u00b7 ${d.artifactCount} files',
                         style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                    ),
+                    ListTile(
+                      key: const Key('bot-library'),
+                      contentPadding: EdgeInsets.zero,
+                      leading: const Icon(Icons.collections_outlined),
+                      title: const Text('Library'),
+                      subtitle: const Text(
+                        'Files its bots made and files you uploaded',
+                      ),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: () => Navigator.of(context).push(
+                        MaterialPageRoute<void>(
+                          builder: (_) => BotLibraryScreen(
+                            app: widget.app,
+                            botId: d.id,
+                            botName: d.displayName,
+                          ),
+                        ),
                       ),
                     ),
                   ],

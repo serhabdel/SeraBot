@@ -6,6 +6,7 @@ import 'api_client.dart';
 import 'app_state.dart';
 import 'chat_models.dart';
 import 'models.dart';
+import 'turn_memory.dart';
 
 /// State of one open conversation: the message list, the running turn with
 /// its live steps, and the composer's pending attachments.
@@ -38,6 +39,26 @@ class ChatController extends ChangeNotifier {
 
   List<ChatMessage> messages = const [];
   final Activity activity = Activity();
+
+  /// Memories each turn used and saved (`turn.memory`), by task id. Bounded to
+  /// the most recent turns; a reply's memory shows next to its steps.
+  final Map<String, TurnMemory> _memoryByTask = {};
+  static const _maxMemoryTurns = 32;
+
+  /// The task of the last reply this screen started or replayed.
+  String? _lastTaskId;
+
+  /// Memory of one turn, or an empty memory when none was recorded.
+  TurnMemory memoryFor(String? taskId) {
+    if (taskId == null) {
+      return const TurnMemory();
+    }
+    return _memoryByTask[taskId] ?? const TurnMemory();
+  }
+
+  /// Memory of the running turn, or of the last reply when none is running.
+  TurnMemory get currentMemory => memoryFor(runningTaskId ?? _lastTaskId);
+
   final List<AttachmentInfo> attachments = [];
   List<LibraryEntry> library = const [];
   Catalog? catalog;
@@ -98,6 +119,41 @@ class ChatController extends ChangeNotifier {
     }
     unawaited(loadLibrary());
     unawaited(loadPlan());
+    unawaited(loadMemory());
+  }
+
+  /// Replays the stored memory of recent replies, so the last reply's memories
+  /// show after the chat is reopened. A live event for a turn always wins.
+  Future<void> loadMemory() async {
+    try {
+      final events = await client.conversationMemoryEvents(conversationId);
+      final replayed = <String, TurnMemory>{};
+      String? newest;
+      for (final e in events) {
+        final taskId = e.taskId;
+        if (taskId == null || taskId.isEmpty) {
+          continue;
+        }
+        replayed[taskId] = (replayed[taskId] ?? const TurnMemory()).applyEvent(e.payload);
+        newest = taskId;
+      }
+      for (final entry in replayed.entries) {
+        _memoryByTask.putIfAbsent(entry.key, () => entry.value);
+      }
+      _lastTaskId ??= newest;
+      _trimMemory();
+      if (events.isNotEmpty) {
+        _notify();
+      }
+    } on ApiException {
+      // The memory panel is optional; the chat works without it.
+    }
+  }
+
+  void _trimMemory() {
+    while (_memoryByTask.length > _maxMemoryTurns) {
+      _memoryByTask.remove(_memoryByTask.keys.first);
+    }
   }
 
   Future<void> loadPlan() async {
@@ -202,6 +258,7 @@ class ChatController extends ChangeNotifier {
       attachments.clear();
       activity.clear();
       runningTaskId = task.id;
+      _lastTaskId = task.id;
       acceptedSends++;
       draft = '';
       _startPoll();
@@ -261,6 +318,18 @@ class ChatController extends ChangeNotifier {
       case 'task.failed':
         if (runningTaskId == null || e.taskId == runningTaskId) {
           _finish(failed: e.kind == 'task.failed', detail: _errorOf(e));
+        }
+      case 'turn.memory':
+        final taskId = e.taskId;
+        if (taskId != null && taskId.isNotEmpty) {
+          // Re-insert so the map keeps the most recent turns last.
+          final next = memoryFor(taskId).applyEvent(e.payload);
+          _memoryByTask.remove(taskId);
+          _memoryByTask[taskId] = next;
+          _trimMemory();
+          if (taskId == (runningTaskId ?? _lastTaskId)) {
+            _notify();
+          }
         }
       case 'plan.updated':
         final next = ChatPlan.parse(e.payload);

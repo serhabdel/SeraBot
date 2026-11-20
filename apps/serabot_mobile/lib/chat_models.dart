@@ -574,11 +574,20 @@ class UsageReport {
     this.totals = const UsageTotals(),
     this.perModel = const [],
     this.quota = const UsageQuota(),
+    this.toolRuns = 0,
   });
   factory UsageReport.fromJson(Map<String, dynamic> json) {
     final models = json['per_model'];
+    final tools = json['tools'];
     return UsageReport(
       totals: UsageTotals.fromJson(json['totals']),
+      // Finished tool runs (completed plus failed) across every tool.
+      toolRuns: tools is List
+          ? tools.whereType<Map<String, dynamic>>().fold<int>(
+              0,
+              (sum, t) => sum + _int(t['completed']) + _int(t['failed']),
+            )
+          : 0,
       quota: UsageQuota.fromJson(
         json['quota'] is Map<String, dynamic>
             ? (json['quota'] as Map<String, dynamic>)['daily_tasks']
@@ -599,6 +608,7 @@ class UsageReport {
   final UsageTotals totals;
   final List<({String provider, String model, UsageTotals totals})> perModel;
   final UsageQuota quota;
+  final int toolRuns;
 }
 
 /// `GET /v1/connectors` row (read-only on the phone).

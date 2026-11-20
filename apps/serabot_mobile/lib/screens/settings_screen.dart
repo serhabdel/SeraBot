@@ -9,6 +9,7 @@ import '../theme.dart';
 import '../status.dart';
 import '../update_flow.dart';
 import '../widgets.dart';
+import 'usage_insights_screen.dart';
 
 /// Account, theme, read-only connector status, usage summary and About.
 class SettingsScreen extends StatefulWidget {
@@ -146,6 +147,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ],
           _section(context, 'Usage, last 30 days'),
           ..._usageTiles(context),
+          ListTile(
+            key: const Key('usage-insights'),
+            leading: const Icon(Icons.insights_outlined),
+            title: const Text('Usage insights'),
+            subtitle: const Text(
+              'Channels, the PC tunnel, model speed and server load',
+            ),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => UsageInsightsScreen(app: widget.app),
+              ),
+            ),
+          ),
           const Divider(),
           _section(context, 'About'),
           ListTile(
