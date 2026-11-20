@@ -123,3 +123,12 @@ preserves the computed cascade of the rules it replaces.
 
 Not done: a visual pass on a Windows device (owner), and the sidebar rename
 input has the same controlled-`value` caret pattern as the switcher had.
+
+## 0.72.0 follow-ups
+
+- Remaining chat/sidebar/composer/switcher hard-coded `font-size` px values in
+  `app.css` (23 rules) moved onto `--fs-*` tokens; Tasks/Kanban/Calendar
+  pages still carry their own px sizes (out of scope, noted).
+- Sidebar (`ui/shell.rs`) and All-chats (`ui/conversations.rs`) rename inputs
+  are now uncontrolled like the switcher — keystrokes no longer reset the caret.
+- Chat switcher rows show the unread badge when the chat has unread messages.

@@ -969,7 +969,12 @@ pub(super) fn Sidebar(
                                             input {
                                                 class: "input",
                                                 autofocus: true,
-                                                value: "{renaming().as_ref().map(|(_, text)| text.clone()).unwrap_or_default()}",
+                                                "data-rename-init": "{renaming().as_ref().map(|(_, text)| text.clone()).unwrap_or_default()}",
+                                                onmounted: move |_| {
+                                                    document::eval(
+                                                        "(() => { const el = document.querySelector('.thread-rename input[data-rename-init]'); if (!el) return; el.value = el.getAttribute('data-rename-init') || ''; el.removeAttribute('data-rename-init'); el.setSelectionRange(el.value.length, el.value.length); })()",
+                                                    );
+                                                },
                                                 oninput: move |event| {
                                                     if let Some((_, text)) = renaming.write().as_mut() {
                                                         *text = event.value();

@@ -260,7 +260,7 @@ pub(crate) fn ChatSwitcher(session: Signal<Session>, bot: String, title: String)
     let mut session = session;
     let mut open = use_signal(|| false);
     let mut renaming = use_signal(|| Option::<(String, String)>::None);
-    let (entries, enabled, active_conv, active_title) = {
+    let (entries, enabled, active_conv, active_title, unread) = {
         let state = session.read();
         let entries = serabot_desktop::bot_chats::switcher_entries(
             state.state.bot_chats.get(&bot),
@@ -273,11 +273,18 @@ pub(crate) fn ChatSwitcher(session: Signal<Session>, bot: String, title: String)
             .iter()
             .find(|item| item.id == bot)
             .is_none_or(|item| item.enabled);
+        let unread: std::collections::HashMap<String, i64> = state
+            .state
+            .conversations
+            .iter()
+            .map(|c| (c.id.clone(), c.unread_count))
+            .collect();
         (
             entries,
             enabled,
             state.conversation.clone(),
             state.conversation_title(),
+            unread,
         )
     };
     let count = entries.len();
@@ -356,6 +363,9 @@ pub(crate) fn ChatSwitcher(session: Signal<Session>, bot: String, title: String)
                                 }
                             }
                             let meta = meta_parts.join(" \u{00b7} ");
+                            let unread_n = unread.get(&entry_id).copied().unwrap_or(0);
+                            let badge = chat_feed::unread_badge(unread_n);
+                            let badge_label = chat_feed::unread_label(unread_n);
                             rsx! {
                                 div {
                                     key: "{entry_id}",
@@ -437,6 +447,9 @@ pub(crate) fn ChatSwitcher(session: Signal<Session>, bot: String, title: String)
                                                 if !meta.is_empty() {
                                                     span { class: "chat-switcher-meta", "{meta}" }
                                                 }
+                                            }
+                                            if let Some(b) = badge {
+                                                span { class: "unread-badge", role: "img", "aria-label": "{badge_label}", "{b}" }
                                             }
                                         }
                                         if !entry.primary {

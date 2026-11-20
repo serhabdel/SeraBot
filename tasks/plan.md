@@ -290,3 +290,12 @@ overflow flip, caret-stable rename), and polishes the Usage page (shared
 `stat-tile`, section anchors with an updated-ago stamp, chart day labels).
 Source-level audit only; no render was taken, so the owner does a visual pass
 on Windows. No server changes, no new dependencies.
+
+## Status after 0.71.0 (audit follow-ups, 0.72.0)
+
+0.72.0 finishes the 0.71.0 audit: the remaining hard-coded font sizes in the
+chat, sidebar, composer and chat-switcher chrome are on the `--fs-*` tokens,
+the sidebar and All-chats rename inputs are caret-stable (uncontrolled, like
+the switcher), and switcher rows show unread badges. Desktop-only, no server
+changes. Source-level only; owner visual pass pending. Tasks/Kanban/Calendar
+pages still carry px font sizes — noted for a later pass.
