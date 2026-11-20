@@ -2579,6 +2579,12 @@ const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
     "image_inspect",
     "image_resize",
     "image_convert",
+    "image_crop",
+    "image_rotate",
+    "image_adjust",
+    "image_compress",
+    "images_to_pdf",
+    "pdf_to_images",
     "telegram_send_document",
     "onedrive_upload",
     "onedrive_list",
@@ -4319,6 +4325,13 @@ pub struct OpsConfig {
     /// OneDrive subfolder (under the OneDrive base folder) for backups.
     #[serde(default = "default_ops_backup_folder")]
     pub backup_onedrive_folder: String,
+    /// Weekly digest (0.69): day (1 = Monday … 7 = Sunday) and hour (UTC).
+    #[serde(default = "default_true")]
+    pub digest_enabled: bool,
+    #[serde(default = "default_ops_digest_weekday")]
+    pub digest_weekday: u8,
+    #[serde(default = "default_ops_digest_hour")]
+    pub digest_hour_utc: u8,
 }
 
 impl Default for OpsConfig {
@@ -4335,6 +4348,9 @@ impl Default for OpsConfig {
             backup_dir: default_ops_backup_dir(),
             backup_onedrive: true,
             backup_onedrive_folder: default_ops_backup_folder(),
+            digest_enabled: true,
+            digest_weekday: default_ops_digest_weekday(),
+            digest_hour_utc: default_ops_digest_hour(),
         }
     }
 }
@@ -4365,6 +4381,14 @@ fn default_ops_backup_keep() -> u32 {
 
 fn default_ops_backup_dir() -> String {
     "data/backups".into()
+}
+
+fn default_ops_digest_weekday() -> u8 {
+    1
+}
+
+fn default_ops_digest_hour() -> u8 {
+    8
 }
 
 fn default_ops_backup_folder() -> String {

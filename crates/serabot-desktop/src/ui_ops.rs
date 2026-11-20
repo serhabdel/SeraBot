@@ -70,6 +70,36 @@ pub fn AlertsCard(session: Signal<Session>) -> Element {
             }
         });
     };
+    let mut update = move |body: Value| {
+        busy.set(true);
+        spawn(async move {
+            let result = call(session, move |credentials| {
+                ops::update_alerts(credentials, body)
+            })
+            .await;
+            busy.set(false);
+            match result {
+                Ok(value) => {
+                    error.set(None);
+                    view.set(Some(value));
+                }
+                Err(message) => error.set(Some(message)),
+            }
+        });
+    };
+    let mut note = use_signal(|| Option::<String>::None);
+    let preview = move |_| {
+        spawn(async move {
+            match call(session, ops::digest_now).await {
+                Ok(value) => note.set(Some(if value["delivered"].as_bool().unwrap_or(false) {
+                    "Sent. Check your Telegram or WhatsApp.".to_string()
+                } else {
+                    value["text"].as_str().unwrap_or_default().to_string()
+                })),
+                Err(message) => error.set(Some(message)),
+            }
+        });
+    };
     let Some(current) = view() else {
         return rsx! {
             div { class: "card insights-card",
@@ -118,6 +148,10 @@ pub fn AlertsCard(session: Signal<Session>) -> Element {
     let failovers = thresholds["failovers_in_15_min"].as_u64().unwrap_or(3);
     let enabled = current["enabled"].as_bool().unwrap_or(true);
     let whatsapp_for_toggle = whatsapp.clone();
+    let whatsapp_for_auto = whatsapp.clone();
+    let whatsapp_for_digest = whatsapp.clone();
+    let auto_send = current["auto_send_files"].as_bool().unwrap_or(true);
+    let digest_on = current["weekly_digest"].as_bool().unwrap_or(true);
     rsx! {
         div { class: "card insights-card",
             div { class: "card-head",
@@ -162,6 +196,30 @@ pub fn AlertsCard(session: Signal<Session>) -> Element {
             }
             if choices.is_empty() {
                 p { class: "tiny", "WhatsApp appears here once one of your allowed chats has talked to the WhatsApp bot." }
+            }
+            label { class: "insights-label",
+                input {
+                    r#type: "checkbox",
+                    checked: auto_send,
+                    disabled: busy(),
+                    onchange: move |event| update(serde_json::json!({"telegram": telegram, "whatsapp_conversation_id": whatsapp_for_auto.clone(), "auto_send_files": event.checked()})),
+                }
+                "Send files to my own chats without asking, when I ask for them"
+            }
+            label { class: "insights-label",
+                input {
+                    r#type: "checkbox",
+                    checked: digest_on,
+                    disabled: busy(),
+                    onchange: move |event| update(serde_json::json!({"telegram": telegram, "whatsapp_conversation_id": whatsapp_for_digest.clone(), "weekly_digest": event.checked()})),
+                }
+                "Weekly digest (usage, cost, failures, backups)"
+            }
+            div {
+                button { class: "btn ghost sm", r#type: "button", onclick: preview, "Send me the digest now" }
+            }
+            if let Some(message) = note() {
+                p { class: "tiny", style: "white-space: pre-line;", "{message}" }
             }
             if let Some(message) = error() {
                 p { class: "tiny", role: "alert", "{message}" }
@@ -327,6 +385,205 @@ pub fn BackupsCard(session: Signal<Session>) -> Element {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+#[component]
+pub fn CostsCard(session: Signal<Session>, is_admin: bool) -> Element {
+    let mut view = use_signal(|| Option::<Value>::None);
+    let mut error = use_signal(|| Option::<String>::None);
+    let mut budget_text = use_signal(String::new);
+    let mut prices_text = use_signal(String::new);
+    let mut editing = use_signal(|| false);
+    let mut apply = move |value: Value| {
+        budget_text.set(
+            value["budget_usd"]
+                .as_f64()
+                .map(|budget| format!("{budget}"))
+                .unwrap_or_default(),
+        );
+        let lines: Vec<String> = value["prices"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|price| {
+                format!(
+                    "{} {} {} {}",
+                    price["provider"].as_str().unwrap_or_default(),
+                    price["model"].as_str().unwrap_or_default(),
+                    price["input_per_m"].as_f64().unwrap_or(0.0),
+                    price["output_per_m"].as_f64().unwrap_or(0.0)
+                )
+            })
+            .collect();
+        prices_text.set(lines.join("\n"));
+        error.set(None);
+        view.set(Some(value));
+    };
+    use_hook(move || {
+        spawn(async move {
+            match call(session, ops::get_costs).await {
+                Ok(value) => apply(value),
+                Err(message) => error.set(Some(message)),
+            }
+        });
+    });
+    let save_budget = move |_| {
+        let parsed = ops::parse_budget(&budget_text.read());
+        match parsed {
+            Err(message) => error.set(Some(message)),
+            Ok(budget) => {
+                spawn(async move {
+                    match call(session, move |credentials| {
+                        ops::put_budget(credentials, budget)
+                    })
+                    .await
+                    {
+                        Ok(value) => apply(value),
+                        Err(message) => error.set(Some(message)),
+                    }
+                });
+            }
+        }
+    };
+    let save_prices = move |_| {
+        let text = prices_text.read().clone();
+        let mut rows = Vec::new();
+        for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            match ops::parse_price_line(line) {
+                Ok(row) => rows.push(row),
+                Err(message) => {
+                    error.set(Some(message));
+                    return;
+                }
+            }
+        }
+        spawn(async move {
+            match call(session, move |credentials| {
+                ops::put_prices(credentials, Value::Array(rows))
+            })
+            .await
+            {
+                Ok(value) => {
+                    editing.set(false);
+                    apply(value);
+                }
+                Err(message) => error.set(Some(message)),
+            }
+        });
+    };
+    let Some(current) = view() else {
+        return rsx! {
+            div { class: "card insights-card",
+                div { class: "card-head", h3 { class: "card-title", "Costs" } }
+                if let Some(message) = error() {
+                    p { class: "tiny", role: "alert", "{message}" }
+                } else {
+                    p { class: "tiny", "Loading\u{2026}" }
+                }
+            }
+        };
+    };
+    let month = current["month_usd"].as_f64().unwrap_or(0.0);
+    let unpriced = current["month_unpriced_tokens"].as_i64().unwrap_or(0);
+    let budget = current["budget_usd"].as_f64();
+    let level = current["budget_level"].as_u64();
+    let percent = budget
+        .filter(|budget| *budget > 0.0)
+        .map(|budget| ((month / budget) * 100.0).round().min(100.0) as u32);
+    let lines: Vec<(String, String)> = current["month_lines"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(6)
+        .map(|line| {
+            let name = line["model"].as_str().unwrap_or_default().to_string();
+            let cost = match line["usd"].as_f64() {
+                Some(value) => ops::usd(value),
+                None => "no price".to_string(),
+            };
+            (name, cost)
+        })
+        .collect();
+    let no_prices = current["prices"]
+        .as_array()
+        .is_none_or(|prices| prices.is_empty());
+    rsx! {
+        div { class: "card insights-card",
+            div { class: "card-head",
+                h3 { class: "card-title", "Costs this month" }
+                match level {
+                    Some(100) => rsx! { StatusChip { tone: Tone::Danger, text: "Over budget".to_string() } },
+                    Some(_) => rsx! { StatusChip { tone: Tone::Warn, text: "Near budget".to_string() } },
+                    None => rsx! { span { class: "page-count", "estimate" } },
+                }
+            }
+            div { class: "insights-kpis",
+                div { class: "insights-kpi",
+                    span { class: "stat-tile-value", "{ops::usd(month)}" }
+                    span { class: "stat-tile-label", "Estimated so far" }
+                    span { class: "stat-tile-sub",
+                        if unpriced > 0 { "{unpriced} tokens have no price yet" } else { "from your owner's price table" }
+                    }
+                }
+                div { class: "insights-kpi",
+                    span { class: "stat-tile-label", "Monthly budget (USD)" }
+                    div { class: "insights-label",
+                        input {
+                            class: "input",
+                            r#type: "text",
+                            inputmode: "decimal",
+                            placeholder: "none",
+                            "aria-label": "Monthly budget in dollars",
+                            value: "{budget_text}",
+                            oninput: move |event| budget_text.set(event.value()),
+                        }
+                        button { class: "btn sm", r#type: "button", onclick: save_budget, "Save" }
+                    }
+                    if let Some(percent) = percent {
+                        div { class: "meter", div { class: if level.is_some() { "meter-fill warn" } else { "meter-fill" }, style: "width: {percent}%;" } }
+                    }
+                    span { class: "stat-tile-sub", "Alerts at 80% and 100%. Bots keep working." }
+                }
+            }
+            if !lines.is_empty() {
+                div { class: "cat-list",
+                    for (index, (name, cost)) in lines.into_iter().enumerate() {
+                        div { key: "{index}-{name}", class: "cat-row",
+                            span { class: "cat-label", "{name}" }
+                            span { class: "tiny", "" }
+                            span { class: "cat-size", "{cost}" }
+                        }
+                    }
+                }
+            }
+            if no_prices {
+                p { class: "tiny", "No prices are set yet, so costs show as $0. The owner can add them below (USD per million tokens)." }
+            }
+            if is_admin {
+                if editing() {
+                    p { class: "tiny", "One model per line: provider model input output (USD per million tokens). Use * as the model for a provider-wide price." }
+                    textarea {
+                        class: "input",
+                        rows: "6",
+                        "aria-label": "Price table",
+                        value: "{prices_text}",
+                        oninput: move |event| prices_text.set(event.value()),
+                    }
+                    div {
+                        button { class: "btn primary sm", r#type: "button", onclick: save_prices, "Save prices" }
+                        button { class: "btn ghost sm", r#type: "button", onclick: move |_| editing.set(false), "Cancel" }
+                    }
+                } else {
+                    div {
+                        button { class: "btn ghost sm", r#type: "button", onclick: move |_| editing.set(true), "Edit prices" }
+                    }
+                }
+            }
+            if let Some(message) = error() {
+                p { class: "tiny", role: "alert", "{message}" }
             }
         }
     }

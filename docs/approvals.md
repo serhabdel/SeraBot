@@ -14,7 +14,7 @@ or sends something to a third party that cannot be recalled. The list lives in
 | --- | --- |
 | `memory_delete` | Deletes a stored memory. |
 | `agentmail_send` | Sends email to a third party. |
-| `telegram_send_document` | Sends a file into a chat. |
+| `telegram_send_document` | Sends a file into the member's own Telegram chat. Since 0.69 no card is shown while the member keeps "send files to my own chats without asking" on (default; 50 a day, audited as `delivery.own_chat`); with it off, approval is asked. |
 | `onedrive_upload` | Writes (and may overwrite) a file in the owner's OneDrive. |
 | `local_write` | Creates or overwrites a text file in a read-write local folder on the owner's PC (through the desktop). |
 | `local_export` | Saves an artifact into a read-write local folder on the owner's PC. Approval binds the destination and the artifact hash. |

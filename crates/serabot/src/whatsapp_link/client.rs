@@ -57,6 +57,37 @@ pub struct WhatsappLink {
     sends: Mutex<HashMap<(String, String), Vec<Instant>>>,
     /// Last WhatsApp activity per member, for going idle (0.66).
     activity: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Photos waiting to be sent to the bot together (0.69).
+    photo_batches: Arc<Mutex<HashMap<(String, String), PhotoBatch>>>,
+}
+
+/// Photos sent in a row: they reach the bot as one message, so "make a PDF
+/// of these" sees them all (0.69).
+#[derive(Default)]
+struct PhotoBatch {
+    attachments: Vec<String>,
+    captions: Vec<String>,
+    last: Option<Instant>,
+}
+
+/// How long to wait after the last photo before the batch goes to the bot.
+const PHOTO_BATCH_WAIT: Duration = Duration::from_secs(8);
+
+impl PhotoBatch {
+    fn text(&self) -> String {
+        let captions = self
+            .captions
+            .iter()
+            .map(|caption| caption.trim())
+            .filter(|caption| !caption.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        match (self.attachments.len(), captions.is_empty()) {
+            (0 | 1, _) => captions,
+            (count, true) => format!("[{count} photos sent together]"),
+            (count, false) => format!("[{count} photos sent together] {captions}"),
+        }
+    }
 }
 
 /// Presence a linked device shows (0.66): "online" while a conversation is
@@ -84,6 +115,7 @@ impl WhatsappLink {
             pairing: Mutex::new(HashMap::new()),
             sends: Mutex::new(HashMap::new()),
             activity: Arc::new(Mutex::new(HashMap::new())),
+            photo_batches: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -476,6 +508,7 @@ impl WhatsappLink {
             .to_string();
         let mut attachments = Vec::new();
         let voice_note = message.audio_message.as_option().is_some();
+        let mut is_photo = false;
 
         // 0.68: reply mode commands, answered here without a turn.
         if let Some(mode) = match text.as_str() {
@@ -563,6 +596,7 @@ impl WhatsappLink {
                 text = caption.trim().to_string();
             }
         } else if let Some(image) = message.image_message.as_option() {
+            is_photo = true;
             check_size(image.file_length, max)?;
             let bytes = ctx
                 .client
@@ -592,6 +626,95 @@ impl WhatsappLink {
         }
         self.store
             .note_inbound_voice(user_id, &conversation_id, voice_note)?;
+        let key = (user_id.to_string(), conversation_id.clone());
+        if is_photo {
+            // 0.69: hold the photo briefly so a burst of photos reaches the
+            // bot as one message.
+            let start_timer = {
+                let mut batches = self.photo_batches.lock().unwrap_or_else(|p| p.into_inner());
+                let batch = batches.entry(key.clone()).or_default();
+                let fresh = batch.last.is_none();
+                batch.attachments.extend(attachments);
+                batch.captions.push(text);
+                batch.last = Some(Instant::now());
+                fresh
+            };
+            if start_timer {
+                let batches = self.photo_batches.clone();
+                let runtime = runtime.clone();
+                let bot = self.config.whatsapp_link.bot.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(PHOTO_BATCH_WAIT).await;
+                        let ready = {
+                            let mut map = batches.lock().unwrap_or_else(|p| p.into_inner());
+                            let due = map.get(&key).is_some_and(|batch| {
+                                batch
+                                    .last
+                                    .is_none_or(|last| last.elapsed() >= PHOTO_BATCH_WAIT)
+                                    || batch.attachments.len()
+                                        >= crate::attachments::MAX_ATTACHMENTS_PER_MESSAGE
+                            });
+                            if due { map.remove(&key) } else { None }
+                        };
+                        if let Some(batch) = ready {
+                            let text = batch.text();
+                            if let Err(error) = runtime.submit_text_attached(
+                                &key.0,
+                                &key.1,
+                                &text,
+                                Some(&bot),
+                                &batch.attachments,
+                            ) {
+                                tracing::warn!(%error, "whatsapp link: photos not handed to the bot");
+                            }
+                            return;
+                        }
+                        if !batches
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .contains_key(&key)
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+            return Ok(());
+        }
+        // A message right after photos goes to the bot together with them.
+        let pending = self
+            .photo_batches
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&key);
+        let (text, attachments) = match pending {
+            Some(batch)
+                if batch.attachments.len() + attachments.len()
+                    <= crate::attachments::MAX_ATTACHMENTS_PER_MESSAGE =>
+            {
+                let mut all = batch.attachments.clone();
+                all.extend(attachments);
+                let lead = batch.text();
+                let text = if lead.is_empty() {
+                    text
+                } else {
+                    format!("{lead}\n{text}")
+                };
+                (text, all)
+            }
+            Some(batch) => {
+                runtime.submit_text_attached(
+                    user_id,
+                    &conversation_id,
+                    &batch.text(),
+                    Some(&self.config.whatsapp_link.bot),
+                    &batch.attachments,
+                )?;
+                (text, attachments)
+            }
+            None => (text, attachments),
+        };
         runtime.submit_text_attached(
             user_id,
             &conversation_id,
@@ -732,6 +855,16 @@ impl WhatsappLink {
             .await
             .map_err(|error| SeraError::External(format!("WhatsApp send failed: {error}")))?;
         Ok(())
+    }
+
+    /// The member's single allowed chat, when there is exactly one (0.69).
+    pub fn only_allowed_chat(&self, user_id: &str) -> Result<Option<String>> {
+        let allowlist = self
+            .store
+            .whatsapp_link_account(user_id)?
+            .map(|account| account.allowlist)
+            .unwrap_or_default();
+        Ok((allowlist.len() == 1).then(|| allowlist[0].clone()))
     }
 
     /// Send an mp3 reply as an audio message to an allowed chat (0.68).
@@ -1010,16 +1143,19 @@ impl crate::gateway::Tool for WhatsappLinkReplyFileTool {
     fn spec(&self) -> crate::gateway::ToolSpec {
         crate::gateway::ToolSpec {
             name: super::REPLY_FILE_TOOL.into(),
-            description: "Send a file (a document, image or media the user's bots made or \
-                          the user uploaded) back into this WhatsApp chat. Use it when the \
-                          user asks over WhatsApp for a file. Find the hash with \
-                          conversation_library, or ask the teammate who made it."
+            description: "Send a file (a PDF, image, document or media the user's bots made) \
+                          on WhatsApp: back into this WhatsApp chat, or, with `to`, to one of \
+                          the user's allowed chats when they ask (for example \"send it to my \
+                          WhatsApp\" from another conversation). No approval; rate limited. \
+                          Find the hash with conversation_library, or ask the teammate who \
+                          made it."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "artifact_hash": {"type": "string", "description": "SHA-256 of the file"},
-                    "caption": {"type": "string", "description": "Optional short caption"}
+                    "caption": {"type": "string", "description": "Optional short caption"},
+                    "to": {"type": "string", "description": "Optional: phone number of one of the user's allowed chats; default is this chat"}
                 },
                 "required": ["artifact_hash"],
                 "additionalProperties": false
@@ -1043,19 +1179,36 @@ impl crate::gateway::Tool for WhatsappLinkReplyFileTool {
             .map(str::trim)
             .filter(|text| !text.is_empty())
             .map(|text| text.chars().take(1000).collect::<String>());
-        let conversation = context.conversation_id.as_deref().ok_or_else(|| {
-            SeraError::Validation("this only works inside a WhatsApp conversation".into())
-        })?;
-        let Some(jid) = self
-            .link
-            .store
-            .whatsapp_link_chat(&context.user_id, conversation)?
-        else {
-            return Err(SeraError::Validation(
-                "this conversation did not come from WhatsApp; the user can ask from \
-                 WhatsApp, or use another delivery"
-                    .into(),
-            ));
+        let target = args
+            .get("to")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|to| !to.is_empty());
+        let jid = match target {
+            // Allowlist is enforced again by `send_file_to`.
+            Some(to) => normalize_jid(to)?,
+            None => {
+                let current = match context.conversation_id.as_deref() {
+                    Some(conversation) => self
+                        .link
+                        .store
+                        .whatsapp_link_chat(&context.user_id, conversation)?,
+                    None => None,
+                };
+                match current {
+                    Some(jid) => jid,
+                    None => self
+                        .link
+                        .only_allowed_chat(&context.user_id)?
+                        .ok_or_else(|| {
+                            SeraError::Validation(
+                                "this conversation did not come from WhatsApp; pass `to` with one \
+                             of the user's allowed numbers"
+                                    .into(),
+                            )
+                        })?,
+                }
+            }
         };
         if !self.link.store.user_owns_artifact(&context.user_id, hash)? {
             return Err(SeraError::NotFound("artifact".into()));
@@ -1171,6 +1324,23 @@ impl crate::gateway::Tool for WhatsappLinkSendTool {
 mod tests {
     use super::*;
     use crate::gateway::Tool;
+
+    #[test]
+    fn photo_batches_describe_themselves() {
+        let mut batch = PhotoBatch::default();
+        batch.attachments.push("a".into());
+        batch.captions.push("crop this".into());
+        assert_eq!(batch.text(), "crop this");
+        batch.attachments.push("b".into());
+        batch.captions.push(String::new());
+        assert_eq!(batch.text(), "[2 photos sent together] crop this");
+        let plain = PhotoBatch {
+            attachments: vec!["a".into(), "b".into(), "c".into()],
+            captions: vec![String::new(); 3],
+            ..PhotoBatch::default()
+        };
+        assert_eq!(plain.text(), "[3 photos sent together]");
+    }
 
     fn link() -> (tempfile::TempDir, Arc<WhatsappLink>, String) {
         let dir = tempfile::tempdir().unwrap();

@@ -28,7 +28,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, Timelike, Utc};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -138,6 +138,19 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Whether files may go to the member's own chats without an approval
+    /// card when they ask for them (default on).
+    pub fn auto_send_own(&self, user_id: &str) -> Result<bool> {
+        Ok(self.kv_get(&format!("auto_send_own:{user_id}"))?.as_deref() != Some("0"))
+    }
+
+    pub fn set_auto_send_own(&self, user_id: &str, on: bool) -> Result<()> {
+        self.kv_set(
+            &format!("auto_send_own:{user_id}"),
+            if on { "1" } else { "0" },
+        )
+    }
+
     /// The member's most recent alerts.
     pub fn recent_alerts(&self, user_id: &str, limit: u32) -> Result<Vec<SentAlert>> {
         let connection = self.connection()?;
@@ -199,8 +212,15 @@ impl Alerts {
             return Ok(false);
         }
         self.store.kv_set(&cooldown_key, &now.to_rfc3339())?;
+        self.deliver(alert, &format!("⚠️ SeraBot: {}", alert.text))
+            .await?;
+        Ok(true)
+    }
+
+    /// Deliver `text` on the member's alert channels and audit it.
+    pub async fn deliver(&self, alert: &Alert, text: &str) -> Result<()> {
+        let text = text.to_string();
         let settings = self.store.alert_settings(&alert.user_id)?;
-        let text = format!("⚠️ SeraBot: {}", alert.text);
         let mut channels = Vec::new();
         if settings.telegram {
             match self
@@ -237,7 +257,7 @@ impl Alerts {
                 "channels": channels,
             })),
         )?;
-        Ok(true)
+        Ok(())
     }
 }
 
@@ -347,6 +367,12 @@ impl OpsWatch {
             if self.config.ops.backup_enabled && self.backup_due(Utc::now()) {
                 let _ = self.run_backup("schedule").await;
             }
+            if let Some(week) = self.digest_due(Utc::now()) {
+                let _ = self.store.kv_set("ops.digest.week", &week);
+                if let Err(error) = self.send_digests(Utc::now()).await {
+                    tracing::warn!(%error, "weekly digest failed");
+                }
+            }
         }
     }
 
@@ -395,7 +421,100 @@ impl OpsWatch {
         self.store.kv_set(cursor_key, &last.to_string())?;
         self.sweep_tunnels().await?;
         self.sweep_host().await?;
+        self.sweep_budgets(now).await?;
         Ok(())
+    }
+
+    /// 0.69: warn a member at 80% and at 100% of their monthly budget, once
+    /// per month each.
+    async fn sweep_budgets(&self, now: DateTime<Utc>) -> Result<()> {
+        let month = now.format("%Y-%m").to_string();
+        for user in self.store.list_users()? {
+            let Some(budget) = self.store.monthly_budget(&user.id)? else {
+                continue;
+            };
+            let report = self
+                .store
+                .cost_report(Some(&user.id), crate::costs::month_start(now))?;
+            let Some(level) = crate::costs::budget_level(report.usd, budget) else {
+                continue;
+            };
+            let key = format!("ops.budget.{}.{month}.{level}", user.id);
+            if self.store.kv_get(&key)?.is_some() {
+                continue;
+            }
+            self.store.kv_set(&key, &now.to_rfc3339())?;
+            let text = if level >= 100 {
+                format!(
+                    "you have used your monthly budget: about {} of {} this month (estimate). \
+                     Bots keep working; change the budget or the models under Usage.",
+                    crate::costs::usd(report.usd),
+                    crate::costs::usd(budget)
+                )
+            } else {
+                format!(
+                    "you are at {}% of your monthly budget: about {} of {} (estimate).",
+                    level,
+                    crate::costs::usd(report.usd),
+                    crate::costs::usd(budget)
+                )
+            };
+            let alert = Alert {
+                user_id: user.id.clone(),
+                kind: "budget",
+                key: format!("{month}-{level}"),
+                text: text.clone(),
+            };
+            self.alerts
+                .deliver(&alert, &format!("⚠️ SeraBot: {text}"))
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn digest_due(&self, now: DateTime<Utc>) -> Option<String> {
+        let ops = &self.config.ops;
+        if !ops.digest_enabled
+            || now.weekday().number_from_monday() != u32::from(ops.digest_weekday.clamp(1, 7))
+            || now.hour() != u32::from(ops.digest_hour_utc.min(23))
+        {
+            return None;
+        }
+        let week = now.format("%G-W%V").to_string();
+        let sent = self.store.kv_get("ops.digest.week").ok().flatten();
+        (sent.as_deref() != Some(week.as_str())).then_some(week)
+    }
+
+    /// Send one digest text to one member now (the console's preview).
+    pub async fn send_digest_to(&self, user_id: &str, text: &str) -> Result<()> {
+        let alert = Alert {
+            user_id: user_id.to_string(),
+            kind: "digest",
+            key: "preview".into(),
+            text: text.to_string(),
+        };
+        self.alerts.deliver(&alert, text).await
+    }
+
+    /// Send the weekly digest to every member who keeps it on.
+    pub async fn send_digests(&self, now: DateTime<Utc>) -> Result<usize> {
+        let admin = self.store.admin_user_id()?;
+        let mut sent = 0;
+        for user in self.store.list_users()? {
+            if !self.store.weekly_digest(&user.id)? {
+                continue;
+            }
+            let text = weekly_digest_text(&self.store, &user.id, user.id == admin, now)?;
+            let alert = Alert {
+                user_id: user.id.clone(),
+                kind: "digest",
+                key: now.format("%G-W%V").to_string(),
+                text: text.clone(),
+            };
+            self.alerts.deliver(&alert, &text).await?;
+            sent += 1;
+        }
+        Ok(sent)
     }
 
     fn latest_audit_id(&self) -> Result<i64> {
@@ -650,6 +769,82 @@ pub struct BackupStatus {
     pub error: Option<String>,
 }
 
+/// The weekly digest for one member: their last 7 days in a few lines.
+/// Counts and sizes only, never message text.
+pub fn weekly_digest_text(
+    store: &Store,
+    user_id: &str,
+    owner: bool,
+    now: DateTime<Utc>,
+) -> Result<String> {
+    let since = now - chrono::Duration::days(7);
+    let usage = store.usage_rollup_for(Some(user_id), since, None, None)?;
+    let cost = store.cost_report(Some(user_id), since)?;
+    // One connection for the counts, released before the next store calls.
+    let (failovers, signins, failed) = {
+        let connection = store.connection()?;
+        let count =
+            |sql: &str| -> Result<i64> {
+                Ok(connection
+                    .query_row(sql, params![user_id, since.to_rfc3339()], |row| row.get(0))?)
+            };
+        (
+            count(
+                "SELECT COUNT(*) FROM audit_log WHERE actor = ?1 AND event = 'model.failover' AND at >= ?2",
+            )?,
+            count(
+                "SELECT COUNT(*) FROM audit_log WHERE actor = ?1 AND event = 'provider.account_needs_reauth' AND at >= ?2",
+            )?,
+            count(
+                "SELECT COUNT(*) FROM tasks WHERE user_id = ?1 AND status = 'failed' AND created_at >= ?2",
+            )?,
+        )
+    };
+    let mut lines = vec![
+        "📊 SeraBot — your week".to_string(),
+        format!(
+            "• {} replies, {} tokens",
+            usage.totals.calls, usage.totals.total_tokens
+        ),
+    ];
+    let mut cost_line = format!("• Estimated cost: {}", crate::costs::usd(cost.usd));
+    if cost.unpriced_tokens > 0 {
+        cost_line.push_str(&format!(
+            " (+{} tokens without a price)",
+            cost.unpriced_tokens
+        ));
+    }
+    if let Some(budget) = store.monthly_budget(user_id)? {
+        let month = store.cost_report(Some(user_id), crate::costs::month_start(now))?;
+        cost_line.push_str(&format!(
+            "; this month {} of {}",
+            crate::costs::usd(month.usd),
+            crate::costs::usd(budget)
+        ));
+    }
+    lines.push(cost_line);
+    if let Some(top) = usage.per_model.first() {
+        lines.push(format!("• Most used model: {}", top.model));
+    }
+    lines.push(format!(
+        "• {failed} failed tasks, {failovers} model failovers, {signins} expired sign-ins"
+    ));
+    if owner {
+        match backup_status(store)? {
+            Some(status) if status.ok => lines.push(format!(
+                "• Last backup {}: test restore passed",
+                status.at.get(..10).unwrap_or(&status.at)
+            )),
+            Some(status) => lines.push(format!(
+                "• Last backup failed: {}",
+                status.error.unwrap_or_default()
+            )),
+            None => lines.push("• No backup yet".into()),
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
 pub fn backup_status(store: &Store) -> Result<Option<BackupStatus>> {
     Ok(store
         .kv_get(BACKUP_STATUS_KEY)?
@@ -869,6 +1064,71 @@ mod tests {
         store.set_reply_mode(&admin, "chat-a", "voice").unwrap();
         assert!(store.speak_reply(&admin, "chat-a").unwrap());
         assert!(store.set_reply_mode(&admin, "chat-a", "shout").is_err());
+    }
+
+    #[test]
+    fn the_digest_counts_without_content() {
+        let store = Store::open_in_memory(8).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        store
+            .record_audit(
+                &admin,
+                "model.used",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&json!({"provider": "p", "model": "m",
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}})),
+            )
+            .unwrap();
+        failover(&store, &admin);
+        let text = weekly_digest_text(&store, &admin, true, Utc::now()).unwrap();
+        assert!(text.contains("1 replies, 150 tokens"), "{text}");
+        assert!(text.contains("1 model failovers"), "{text}");
+        assert!(text.contains("without a price"), "{text}");
+        assert!(text.contains("No backup yet"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn budget_alerts_fire_once_per_level_per_month() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(Config {
+            base_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        });
+        let store = Store::open_in_memory(8).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        store
+            .set_model_prices(&[crate::costs::ModelPrice {
+                provider: "p".into(),
+                model: "*".into(),
+                input_per_m: 10.0,
+                output_per_m: 10.0,
+            }])
+            .unwrap();
+        store.set_monthly_budget(&admin, Some(1.0)).unwrap();
+        store
+            .record_audit(
+                &admin,
+                "model.used",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&json!({"provider": "p", "model": "m",
+                    "usage": {"prompt_tokens": 90_000, "completion_tokens": 0, "total_tokens": 90_000}})),
+            )
+            .unwrap();
+        let capture = Arc::new(Capture::default());
+        let watch = OpsWatch::new(config, store.clone(), capture.clone(), None);
+        watch.sweep_budgets(Utc::now()).await.unwrap();
+        watch.sweep_budgets(Utc::now()).await.unwrap();
+        let sent = capture.0.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].2.contains("80%"));
     }
 
     #[test]

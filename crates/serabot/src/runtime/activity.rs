@@ -256,6 +256,14 @@ fn office_label(tool: &str) -> Option<(&'static str, &'static str)> {
         "pdf_edit" => ("file:pdf", "Editing a PDF"),
         "pdf_inspect" => ("file:pdf", "Reading a PDF"),
         "pdf_merge" => ("file:pdf", "Merging PDFs"),
+        "images_to_pdf" => ("file:pdf", "Making a PDF from images"),
+        "pdf_to_images" => ("file:pdf", "Taking the pages out of a PDF"),
+        "image_crop" => ("file:image", "Cropping an image"),
+        "image_rotate" => ("file:image", "Rotating an image"),
+        "image_adjust" => ("file:image", "Adjusting an image"),
+        "image_compress" => ("file:image", "Making an image smaller"),
+        "image_resize" => ("file:image", "Resizing an image"),
+        "image_convert" => ("file:image", "Converting an image"),
         _ => return None,
     })
 }

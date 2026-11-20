@@ -998,10 +998,17 @@ mod tests {
     #[test]
     fn count_limit_counts_files_already_held() {
         let incoming = [("a.txt", 1), ("b.txt", 1), ("c.txt", 1)];
-        let admission = admit_files(Held { count: 5, bytes: 5 }, &incoming);
+        let held = MAX_ATTACHMENTS - 1;
+        let admission = admit_files(
+            Held {
+                count: held,
+                bytes: held as u64,
+            },
+            &incoming,
+        );
         assert_eq!(admission.accepted, vec![0]);
         assert_eq!(admission.refused.len(), 2);
-        assert!(admission.refused[0].contains("at most 6 files"));
+        assert!(admission.refused[0].contains(&format!("at most {MAX_ATTACHMENTS} files")));
     }
 
     #[test]

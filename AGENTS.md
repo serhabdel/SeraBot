@@ -45,9 +45,13 @@ turns it off), serves one-to-one chats on the member's allowlist only. Since 0.6
 `whatsapp_link_send` needs no approval (owner decision): it only reaches the
 member's allowed chats, under per-minute and daily caps. Since 0.63 only the WhatsApp bot has WhatsApp tools; it
 asks other bots with `ask_teammate`, and a file the member asked for goes back
-into the same chat with `whatsapp_link_reply_file` (no recipient argument, not
-approval-gated, per-minute and daily caps). Telegram has the same rule with
-`telegram_reply_file`. Do not widen it (groups, contacts, history, sends to numbers outside the
+into the same chat with `whatsapp_link_reply_file` (not approval-gated,
+per-minute and daily caps; since 0.69 an optional `to` reaches another of the
+member's allowed chats, never anyone else). Telegram has the same rule with
+`telegram_reply_file`. Since 0.69 (owner decision) `telegram_send_document`, which only
+ever reaches the acting member's own linked chat, runs without an approval card while
+the member keeps "send files to my own chats without asking" on (default), under a
+daily cap (`OWN_CHAT_DELIVERY_TOOLS`, `OWN_CHAT_DAILY_CAP`), audited as `delivery.own_chat`. Do not widen it (groups, contacts, history, sends to numbers outside the
 allowlist) without a new design.
 
 The desktop network relay (0.66, `docs/specs/desktop-network-relay.md`) lets a
@@ -132,9 +136,11 @@ OVH is read-only unless the owner explicitly authorizes an additive installation
 - `crates/serabot/src/relay_net.rs`, `api/relay.rs`, `crates/serabot-desktop/src/net_relay.rs`, `ui_net_relay.rs` — desktop network relay (0.66).
 - `crates/serabot/src/usage_insights.rs`, `crates/serabot-desktop/src/usage_insights.rs`, `ui_usage_insights.rs` — Usage insights: turns per channel (migration 0044 `client_turns`), tunnel traffic, model latency and failovers, 24-hour server load in memory (0.67).
 - `crates/serabot/src/ops.rs`, `api/ops.rs`, `crates/serabot-desktop/src/ops_view.rs`, `ui_ops.rs` — alerts to members on Telegram or one chosen WhatsApp chat (failover streaks, expired sign-ins, PC tunnel drops mid-job, owner disk/memory/backup), and the nightly age-encrypted database backup with a test restore and optional OneDrive copy (`[ops]`, migration 0045) (0.68).
+- `crates/serabot/src/image_edit.rs` — crop, rotate/flip, adjust, compress, images_to_pdf, pdf_to_images on artifacts or inbox paths (chat photos included) (0.69); WhatsApp photo batching in `whatsapp_link/client.rs`.
+- `crates/serabot/src/costs.rs` — owner price table, member monthly budgets (alerts at 80/100%), cost estimates; weekly digest in `ops.rs` (migration 0046) (0.69).
 - `crates/serabot-desktop/src/turn_trace.rs` — per-reply turn traces (steps plus memories used and saved, from `turn.memory`), drawn inside the reply that turn produced (0.61); chat transcript CSS lives in one block at the end of `assets/system.css`.
 - `crates/serabot-desktop/src/runs.rs`, `chat_compose.rs`, `chat_failure.rs`, `chat_cards.rs`, `ui/chat_feed_view.rs`, `assets/runs.css` — runs sidebar, composer queue, failed and wait cards, virtualized feed (0.50).
 - `crates/serabot-desktop/src/acp/` (protocol, client, setup, transcript, controller), `ui_claude_code.rs`, `assets/claude-code.css` — Claude Code on this computer over ACP (0.54; integrated per-bot with persisted transcripts and folder choice in 0.55).
 - `crates/serabot/src/whatsapp_link/`, `api/whatsapp_link.rs`, `crates/serabot-desktop/src/ui_whatsapp_link.rs` — WhatsApp linked device: allowlist, chat mapping, per-member client, approval-gated send, desktop card (0.58; enabled by default in 0.59).
 - `crates/serabot/src/projects.rs`, `api/projects.rs`, `crates/serabot-desktop/src/projects.rs`, `ui_projects.rs` — per-user project folders in the server inbox, HTTP API, and desktop workspace (0.58–0.59).
-- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.68.0.
+- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.69.0.

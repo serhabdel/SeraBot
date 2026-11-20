@@ -88,6 +88,22 @@ impl StepAction {
     }
 }
 
+/// The message "Try another way" sends after a failed step (0.69): it asks
+/// the bot to change its approach once instead of repeating the same call.
+pub fn retry_another_way_message(step_title: &str) -> String {
+    let title: String = step_title
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(80)
+        .collect();
+    format!(
+        "The step \"{}\" failed. Try once in a different way (a smaller part, another format \
+         or another tool), following the error's hint. If it cannot work, tell me the one \
+         thing I need to do.",
+        title.trim()
+    )
+}
+
 /// Plain connector name from a tool id. Older events omit `tool`.
 pub fn tool_heading(tool: &str) -> String {
     let named = match tool {
@@ -602,6 +618,13 @@ fn parse_card_body(value: &Value, kind: ResultKind) -> Option<StepResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn another_way_message_names_the_step_only() {
+        let text = retry_another_way_message("Cropping an image\n\u{7}");
+        assert!(text.starts_with("The step \"Cropping an image\" failed."));
+        assert!(!text.contains('\u{7}'));
+    }
     use serde_json::json;
 
     fn ev(task: &str, call: &str, phase: &str) -> Value {

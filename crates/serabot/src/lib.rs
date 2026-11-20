@@ -19,6 +19,7 @@ pub mod composio;
 pub mod composio_mcp;
 pub mod config;
 pub mod connectors;
+pub mod costs;
 pub mod deck;
 #[cfg(feature = "pptx")]
 pub mod deck_pptx;
@@ -39,6 +40,7 @@ pub mod fleet;
 pub mod fleet_mutation;
 pub mod gateway;
 pub mod github_connector;
+pub mod image_edit;
 pub mod image_ops;
 pub mod job_tools;
 pub mod llm;

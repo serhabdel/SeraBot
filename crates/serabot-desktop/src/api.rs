@@ -2183,7 +2183,7 @@ pub struct AttachmentInfo {
 /// Upload ceiling shown in the picker and enforced before the request.
 pub const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 /// Attachments per message.
-pub const MAX_ATTACHMENTS: usize = 6;
+pub const MAX_ATTACHMENTS: usize = 10;
 /// Extensions the server accepts for chat attachments.
 pub const ATTACHMENT_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "pdf", "docx", "xlsx", "pptx", "txt", "md", "markdown",
@@ -4193,6 +4193,47 @@ impl ApiClient {
                 "telegram": telegram,
                 "whatsapp_conversation_id": whatsapp_conversation_id,
             })),
+        )
+    }
+
+    /// `PUT /v1/alerts` with any of telegram, whatsapp_conversation_id,
+    /// auto_send_files, weekly_digest (0.69).
+    pub fn alerts_update(&self, body: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
+        self.request(Method::PUT, &["v1", "alerts"], &[], Some(body))
+    }
+
+    /// `POST /v1/alerts/digest` (0.69): send me my weekly digest now.
+    pub fn digest_now(&self) -> Result<serde_json::Value, ApiError> {
+        self.request(
+            Method::POST,
+            &["v1", "alerts", "digest"],
+            &[],
+            Some(&serde_json::json!({})),
+        )
+    }
+
+    /// `GET /v1/usage/costs` (0.69): this month's estimate, budget, prices.
+    pub fn costs_get(&self) -> Result<serde_json::Value, ApiError> {
+        self.get(&["v1", "usage", "costs"], &[])
+    }
+
+    /// `PUT /v1/usage/budget` (0.69); `None` clears it.
+    pub fn budget_put(&self, monthly_usd: Option<f64>) -> Result<serde_json::Value, ApiError> {
+        self.request(
+            Method::PUT,
+            &["v1", "usage", "budget"],
+            &[],
+            Some(&serde_json::json!({"monthly_usd": monthly_usd})),
+        )
+    }
+
+    /// `PUT /v1/admin/prices` (0.69, owner only): replace the price table.
+    pub fn prices_put(&self, prices: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
+        self.request(
+            Method::PUT,
+            &["v1", "admin", "prices"],
+            &[],
+            Some(&serde_json::json!({"prices": prices})),
         )
     }
 
