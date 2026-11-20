@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -20,12 +20,18 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
+use super::actionability::Action;
+use super::banners::BannerCandidate;
 use super::cdp::{CdpConnection, CdpEvent};
 use super::guard::allow_subrequest;
-use super::manager::{BrowserBackend, BrowserLauncher, PageInfo, Pointer, TabInfo};
-use super::outline::{Outline, build_outline, key_def};
+use super::manager::{
+    BrowserBackend, BrowserLauncher, Download, LoadState, PageInfo, Pointer, ScrollState, TabInfo,
+};
+use super::outline::{Outline, RefTarget, build_outline, key_def};
 use crate::config::BrowserConfig;
 use crate::error::{Result, SeraError};
+
+pub mod actions;
 
 pub const VIEWPORT_WIDTH: u32 = 1280;
 pub const VIEWPORT_HEIGHT: u32 = 800;
@@ -344,6 +350,7 @@ pub struct ChromiumLauncher {
     base_dir: PathBuf,
     no_sandbox: bool,
     timeout: Duration,
+    block_heavy: bool,
 }
 
 impl ChromiumLauncher {
@@ -354,6 +361,7 @@ impl ChromiumLauncher {
             base_dir,
             no_sandbox: config.no_sandbox,
             timeout: Duration::from_secs(config.request_timeout_secs.clamp(5, 120)),
+            block_heavy: config.block_heavy_resources,
         })
     }
 }
@@ -398,7 +406,10 @@ impl BrowserLauncher for ChromiumLauncher {
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
         let outline: SharedOutline = Arc::default();
-        match ChromiumBackend::setup(port, &path, self.timeout, outline.clone()).await {
+        let heavy = Arc::new(AtomicBool::new(self.block_heavy));
+        match ChromiumBackend::setup(port, &path, self.timeout, outline.clone(), heavy.clone())
+            .await
+        {
             Ok((cdp, tabs, tasks)) => Ok(Arc::new(ChromiumBackend {
                 cdp,
                 tabs,
@@ -407,6 +418,8 @@ impl BrowserLauncher for ChromiumLauncher {
                 tasks: std::sync::Mutex::new(tasks),
                 pointer: std::sync::Mutex::new(None),
                 pointer_seq: AtomicU64::new(0),
+                block_heavy: heavy,
+                temp_root: self.base_dir.join(".tmp").join(user_id),
             })),
             Err(error) => {
                 let _ = child.kill().await;
@@ -428,6 +441,10 @@ pub struct ChromiumBackend {
     tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
     pointer: std::sync::Mutex<Option<Pointer>>,
     pointer_seq: AtomicU64,
+    /// Skip images, media and fonts (shared with the event loop).
+    block_heavy: Arc<AtomicBool>,
+    /// `<base>/.tmp/<user>`: where a download is saved before it is read.
+    temp_root: PathBuf,
 }
 
 impl ChromiumBackend {
@@ -436,6 +453,7 @@ impl ChromiumBackend {
         path: &str,
         timeout: Duration,
         outline: SharedOutline,
+        heavy: Arc<AtomicBool>,
     ) -> Result<(Arc<CdpConnection>, SharedTabs, Vec<JoinHandle<()>>)> {
         let cdp = Arc::new(CdpConnection::connect(port, path, timeout).await?);
         let targets = cdp.call(None, "Target.getTargets", json!({})).await?;
@@ -455,7 +473,7 @@ impl ChromiumBackend {
         };
         let tabs: SharedTabs = Arc::default();
         // Subscribe before enabling Fetch so no paused request is missed.
-        let events = spawn_event_loop(cdp.clone(), tabs.clone(), outline);
+        let events = spawn_event_loop(cdp.clone(), tabs.clone(), outline, heavy);
         if let Err(error) = Self::attach_tab(&cdp, &tabs, &target_id).await {
             events.abort();
             return Err(error);
@@ -564,30 +582,6 @@ impl ChromiumBackend {
         }
     }
 
-    async fn click_node(&self, backend_node_id: i64) -> Result<()> {
-        let _ = self
-            .call(
-                "DOM.scrollIntoViewIfNeeded",
-                json!({"backendNodeId": backend_node_id}),
-            )
-            .await;
-        let model = self
-            .call("DOM.getBoxModel", json!({"backendNodeId": backend_node_id}))
-            .await
-            .map_err(|_| browser_error("element is not visible; take a new browser_snapshot"))?;
-        let quad = model["model"]["content"]
-            .as_array()
-            .filter(|quad| quad.len() == 8)
-            .ok_or_else(|| browser_error("element has no box"))?;
-        let coords: Vec<f64> = quad.iter().filter_map(Value::as_f64).collect();
-        if coords.len() != 8 {
-            return Err(browser_error("element has no box"));
-        }
-        let x = (coords[0] + coords[2] + coords[4] + coords[6]) / 4.0;
-        let y = (coords[1] + coords[3] + coords[5] + coords[7]) / 4.0;
-        self.click_at(x, y).await
-    }
-
     /// Refs belong to the page they were taken on.
     fn reset_outline(&self) -> Result<()> {
         *self
@@ -601,13 +595,18 @@ impl ChromiumBackend {
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
 
-    fn target_backend_id(&self, reference: &str) -> Result<i64> {
+    fn target_ref(&self, reference: &str) -> Result<RefTarget> {
         let outline = self
             .outline
             .lock()
             .map_err(|_| browser_error("outline lock poisoned"))?;
-        Ok(outline.target(reference)?.backend_node_id)
+        Ok(outline.target(reference)?.clone())
     }
+}
+
+/// Resource types skipped when `block_heavy_resources` is on.
+pub fn is_heavy_resource(resource_type: &str) -> bool {
+    matches!(resource_type, "Image" | "Media" | "Font")
 }
 
 /// Wait (bounded) for the page session's load event.
@@ -633,6 +632,7 @@ fn spawn_event_loop(
     cdp: Arc<CdpConnection>,
     tabs: SharedTabs,
     outline: SharedOutline,
+    heavy: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     let mut events = cdp.subscribe();
     let verdicts: Arc<std::sync::Mutex<HashMap<String, (Instant, bool)>>> = Arc::default();
@@ -643,7 +643,7 @@ fn spawn_event_loop(
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => break,
             };
-            handle_event(&cdp, &tabs, &outline, &verdicts, event);
+            handle_event(&cdp, &tabs, &outline, &verdicts, &heavy, event);
         }
     })
 }
@@ -777,6 +777,7 @@ fn handle_event(
     tabs: &SharedTabs,
     outline: &SharedOutline,
     verdicts: &Arc<std::sync::Mutex<HashMap<String, (Instant, bool)>>>,
+    heavy: &Arc<AtomicBool>,
     event: CdpEvent,
 ) {
     let known_session = event
@@ -789,12 +790,24 @@ fn handle_event(
             let cdp = cdp.clone();
             let session_id = known_session.unwrap_or_default();
             let verdicts = verdicts.clone();
+            let skip_heavy = heavy.load(Ordering::Relaxed)
+                && is_heavy_resource(event.params["resourceType"].as_str().unwrap_or_default());
             tokio::spawn(async move {
                 let request_id = event.params["requestId"]
                     .as_str()
                     .unwrap_or_default()
                     .to_owned();
                 let url = event.params["request"]["url"].as_str().unwrap_or_default();
+                if skip_heavy {
+                    let _ = cdp
+                        .call(
+                            Some(&session_id),
+                            "Fetch.failRequest",
+                            json!({"requestId": request_id, "errorReason": "BlockedByClient"}),
+                        )
+                        .await;
+                    return;
+                }
                 let allowed = cached_verdict(&verdicts, url).await;
                 let (method, params) = if allowed {
                     ("Fetch.continueRequest", json!({"requestId": request_id}))
@@ -956,14 +969,17 @@ impl BrowserBackend for ChromiumBackend {
     }
 
     async fn click_ref(&self, reference: &str) -> Result<PageInfo> {
-        let id = self.target_backend_id(reference)?;
-        self.click_node(id).await?;
+        let target = self.target_ref(reference)?;
+        let (x, y) = self.actionable_point(&target, Action::Click).await?;
+        self.click_at(x, y).await?;
         self.settle().await;
         self.info().await
     }
 
     async fn type_ref(&self, reference: &str, text: &str, submit: bool) -> Result<()> {
-        let id = self.target_backend_id(reference)?;
+        let target = self.target_ref(reference)?;
+        self.check_ready(&target, Action::Edit).await?;
+        let id = target.backend_node_id;
         self.call("DOM.focus", json!({"backendNodeId": id}))
             .await
             .map_err(|_| browser_error("element cannot take focus; take a new browser_snapshot"))?;
@@ -1084,6 +1100,51 @@ impl BrowserBackend for ChromiumBackend {
 
     fn pointer(&self) -> Option<Pointer> {
         self.pointer.lock().ok().and_then(|slot| *slot)
+    }
+
+    async fn page_text(&self, max_chars: usize) -> Result<String> {
+        self.do_page_text(max_chars).await
+    }
+    async fn hover_ref(&self, reference: &str) -> Result<()> {
+        self.do_hover(reference).await
+    }
+    async fn select_ref(&self, reference: &str, option: &str) -> Result<String> {
+        self.do_select(reference, option).await
+    }
+    async fn set_checked(&self, reference: &str, checked: bool) -> Result<bool> {
+        self.do_set_checked(reference, checked).await
+    }
+    async fn scroll_by(&self, reference: Option<&str>, dx: f64, dy: f64) -> Result<ScrollState> {
+        self.do_scroll_by(reference, dx, dy).await
+    }
+    async fn scroll_to_ref(&self, reference: &str) -> Result<()> {
+        self.do_scroll_to(reference).await
+    }
+    async fn upload_ref(&self, reference: &str, path: &Path) -> Result<()> {
+        self.do_upload(reference, path).await
+    }
+    async fn wait_load_state(&self, state: LoadState, timeout: Duration) -> Result<bool> {
+        self.do_wait_load(state, timeout).await
+    }
+    async fn click_download(
+        &self,
+        reference: &str,
+        timeout: Duration,
+        max_bytes: u64,
+    ) -> Result<Download> {
+        self.do_download(reference, timeout, max_bytes).await
+    }
+    async fn print_pdf(&self, max_bytes: usize) -> Result<Vec<u8>> {
+        self.do_pdf(max_bytes).await
+    }
+    async fn banner_candidates(&self) -> Result<Vec<BannerCandidate>> {
+        self.do_banner_candidates().await
+    }
+    async fn click_banner(&self, index: usize) -> Result<()> {
+        self.do_click_banner(index).await
+    }
+    fn set_block_heavy(&self, on: bool) {
+        self.block_heavy.store(on, Ordering::Relaxed);
     }
 
     async fn tabs(&self) -> Result<Vec<TabInfo>> {
@@ -1275,8 +1336,50 @@ impl BrowserBackend for ChromiumBackend {
 }
 
 #[cfg(test)]
+impl ChromiumBackend {
+    /// A backend over a scripted DevTools connection, with one ready tab.
+    pub(crate) fn for_test(cdp: Arc<CdpConnection>, temp_root: PathBuf) -> Self {
+        let tabs: SharedTabs = Arc::default();
+        {
+            let mut set = lock_tabs(&tabs);
+            let label = set.reserve("T1".into(), "S1".into());
+            set.mark_ready(&label);
+        }
+        Self {
+            cdp,
+            tabs,
+            child: Mutex::new(None),
+            outline: Arc::default(),
+            tasks: std::sync::Mutex::new(Vec::new()),
+            pointer: std::sync::Mutex::new(None),
+            pointer_seq: AtomicU64::new(0),
+            block_heavy: Arc::default(),
+            temp_root,
+        }
+    }
+
+    /// Install refs as a snapshot would.
+    pub(crate) fn set_refs(&self, refs: Vec<RefTarget>) {
+        *self.outline.lock().unwrap() = Outline {
+            refs,
+            ..Default::default()
+        };
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_images_media_and_fonts_are_heavy() {
+        for heavy in ["Image", "Media", "Font"] {
+            assert!(is_heavy_resource(heavy));
+        }
+        for light in ["Document", "Script", "Stylesheet", "XHR", "Fetch", ""] {
+            assert!(!is_heavy_resource(light));
+        }
+    }
 
     #[test]
     fn args_are_loopback_headless_and_sandboxed_by_default() {

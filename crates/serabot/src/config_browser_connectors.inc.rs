@@ -26,6 +26,14 @@ pub struct BrowserConfig {
     /// service runs as root or on a host that blocks user namespaces.
     #[serde(default)]
     pub no_sandbox: bool,
+    /// After a navigation, look for a cookie or consent banner and dismiss it
+    /// (reject non-essential when offered). On by default.
+    #[serde(default = "default_true")]
+    pub auto_dismiss_banners: bool,
+    /// Skip images, media and fonts to load pages faster. Off by default; a
+    /// bot may also ask per session with `browser_navigate{light:true}`.
+    #[serde(default)]
+    pub block_heavy_resources: bool,
 }
 
 impl Default for BrowserConfig {
@@ -42,6 +50,8 @@ impl Default for BrowserConfig {
             max_sessions: default_browser_max_sessions(),
             idle_timeout_secs: default_browser_idle_timeout(),
             no_sandbox: false,
+            auto_dismiss_banners: true,
+            block_heavy_resources: false,
         }
     }
 }

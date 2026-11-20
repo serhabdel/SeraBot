@@ -49,6 +49,51 @@ when you must run as root.
 | `browser_tabs{action?, tab?}` | no | List tabs (`t1`, `t2`, ...) or `switch`/`close` one by id. The active tab is the one the other tools act on; switching clears the refs. |
 | `browser_new_tab{url}` | yes | Open a public http(s) URL in a new active tab (at most 8 tabs; same URL policy as `browser_navigate`). |
 
+## Smarter actions (0.70)
+
+Ideas borrowed from agent-browser, built into the Rust browser (no Node, no extra Chrome).
+
+| Tool | Approval | Purpose |
+| --- | --- | --- |
+| `browser_snapshot{mode}` | no | `interactive` (actionable elements only), `full` (default) or `text` (readable main text, bounded, no refs). |
+| `browser_find{role?, name?, text?, limit?}` | no | Fresh snapshot, then refs by ARIA role and accessible name, or lines by visible text. |
+| `browser_wait{text \| role/name \| state, timeout_secs?}` | no | Wait up to 30 s for text, an element, `load` or `networkidle`. A timeout is a normal answer, not an error. |
+| `browser_select{ref, option}` | yes | Choose a `<select>` option by label or value. |
+| `browser_check{ref, checked?}` | yes | Tick or untick a checkbox, radio or switch; verified after the click. |
+| `browser_scroll{direction?, amount?, ref? \| to_ref}` | no | Scroll the page or an element, or bring a ref into view. |
+| `browser_hover{ref}` | no | Pointer move only. |
+| `browser_upload{ref, artifact}` | **owner approval** | Sets a file input to a member-owned artifact through a temp file under `<browser dir>/.tmp/<user>`, deleted right after. The approval names the file and the site and binds the artifact hash and the page host. |
+| `browser_download{ref, timeout_secs?}` | yes | Click, wait for the download (25 MB cap), save it as an artifact. Downloads are refused again afterwards and the temp file is deleted. |
+| `browser_pdf{}` | no | `Page.printToPDF` saved as an artifact (25 MB cap). |
+| `browser_dismiss_banners{}` | yes | Cookie and consent banners. |
+| `browser_forget_logins{}` | **owner approval** | Closes the browser and deletes the member's profile directory (cookies, local storage). |
+
+**Actionability.** A click, hover, type, select, check or upload first resolves the node, then checks it is
+attached, visible (non-zero box, not `visibility:hidden` or `display:none`), enabled (`:disabled`,
+`aria-disabled`), editable (typing), scrolled into view and, for a click or hover, not covered:
+`elementFromPoint` at the box centre must land on the node, a descendant or its own label. A failure is
+an error such as "the button is covered by a cookie banner" or "the field is disabled", never a
+silent success. The point test is skipped inside iframes.
+
+**Banners.** After `browser_navigate` and `browser_new_tab` (when `[browser] auto_dismiss_banners = true`, the
+default) and on `browser_dismiss_banners`, buttons inside known consent containers (OneTrust, Cookiebot,
+Didomi, TrustArc, Usercentrics, Quantcast, and any dialog or fixed box that talks about cookies) are
+ranked in Rust: reject non-essential, then accept only necessary, then a plain accept (last resort).
+English, French, Arabic and Spanish texts are covered. Settings buttons, submit buttons in other forms
+and anything that looks like a payment, sign-up or login are never clicked.
+
+**Light pages.** `[browser] block_heavy_resources = false` (default) or `browser_navigate{light: true}` per
+session skips images, media and fonts through the same `Fetch.requestPaused` hook that runs the guard.
+
+**Logins stay.** Each member's profile directory (`<browser dir>/<user>/<profile>`) is kept between sessions,
+so cookies and local storage survive restarts and idle reaping. It is never shared between members;
+`browser_forget_logins` removes only the acting member's profile for the bot's assigned profile.
+
+CDP used: `DOM.resolveNode`, `DOM.getBoxModel`, `DOM.scrollIntoViewIfNeeded`, `DOM.setFileInputFiles`,
+`Runtime.callFunctionOn`, `Runtime.evaluate`, `Input.dispatchMouseEvent`, `Page.printToPDF`,
+`Browser.setDownloadBehavior`, `Browser.cancelDownload`, `Browser.downloadWillBegin`,
+`Browser.downloadProgress`, `Fetch.failRequest` (heavy resources).
+
 While the owner has taken over (`controller = user`) every bot tool, including
 `browser_close`, fails with "the user is in control of the browser".
 
