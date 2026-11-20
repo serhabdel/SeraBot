@@ -4237,6 +4237,22 @@ impl ApiClient {
         )
     }
 
+    /// `GET /v1/admin/prices/suggested` (0.70, owner only): researched,
+    /// unverified prices to review before saving.
+    pub fn prices_suggested(&self) -> Result<serde_json::Value, ApiError> {
+        self.get(&["v1", "admin", "prices", "suggested"], &[])
+    }
+
+    /// `PUT /v1/usage/plans` (0.70): what I pay per month for each plan.
+    pub fn plans_put(&self, plans: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
+        self.request(
+            Method::PUT,
+            &["v1", "usage", "plans"],
+            &[],
+            Some(&serde_json::json!({"plans": plans})),
+        )
+    }
+
     /// `GET /v1/admin/backups` (0.68, owner only).
     pub fn backups_get(&self) -> Result<serde_json::Value, ApiError> {
         self.get(&["v1", "admin", "backups"], &[])

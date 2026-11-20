@@ -641,16 +641,21 @@ mod tests {
         let savings = store.plan_savings(&admin, &report).unwrap();
         assert_eq!(savings.len(), 1);
         assert_eq!(savings[0].monthly_usd, Some(20.0));
-        assert!((savings[0].saving_usd.unwrap() + 14.0).abs() < 1e-9, "{savings:?}");
-        assert!(store
-            .set_plan_prices(
-                &admin,
-                &[PlanPrice {
-                    provider: "x".into(),
-                    monthly_usd: -1.0,
-                }],
-            )
-            .is_err());
+        assert!(
+            (savings[0].saving_usd.unwrap() + 14.0).abs() < 1e-9,
+            "{savings:?}"
+        );
+        assert!(
+            store
+                .set_plan_prices(
+                    &admin,
+                    &[PlanPrice {
+                        provider: "x".into(),
+                        monthly_usd: -1.0,
+                    }],
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -658,7 +663,10 @@ mod tests {
         let (researched, rows) = suggested_prices();
         assert!(!researched.is_empty());
         assert!(rows.len() >= 10);
-        assert!(rows.iter().all(|row| row.input_per_m >= 0.0 && row.output_per_m >= 0.0));
+        assert!(
+            rows.iter()
+                .all(|row| row.input_per_m >= 0.0 && row.output_per_m >= 0.0)
+        );
         assert_eq!(millions(1_250_000.0 / 1_000_000.0), "1.25M");
     }
 
