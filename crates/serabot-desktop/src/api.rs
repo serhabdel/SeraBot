@@ -4202,6 +4202,35 @@ impl ApiClient {
         self.request(Method::PUT, &["v1", "alerts"], &[], Some(body))
     }
 
+    /// `GET /v1/memory/review` (0.70): memories worth a look.
+    pub fn memory_review_get(&self) -> Result<serde_json::Value, ApiError> {
+        self.get(&["v1", "memory", "review"], &[])
+    }
+
+    /// `POST /v1/memory/review/{id}` (0.70): `keep`, `delete` or
+    /// `merge_into:<id>`.
+    pub fn memory_review_act(&self, id: &str, action: &str) -> Result<serde_json::Value, ApiError> {
+        if !valid_memory_id(id) {
+            return Err(ApiError::Validation("Invalid memory id."));
+        }
+        self.request(
+            Method::POST,
+            &["v1", "memory", "review", id],
+            &[],
+            Some(&serde_json::json!({"action": action})),
+        )
+    }
+
+    /// `POST /v1/brief/preview` (0.70): send me my morning brief now.
+    pub fn brief_preview(&self) -> Result<serde_json::Value, ApiError> {
+        self.request(
+            Method::POST,
+            &["v1", "brief", "preview"],
+            &[],
+            Some(&serde_json::json!({})),
+        )
+    }
+
     /// `POST /v1/alerts/digest` (0.69): send me my weekly digest now.
     pub fn digest_now(&self) -> Result<serde_json::Value, ApiError> {
         self.request(

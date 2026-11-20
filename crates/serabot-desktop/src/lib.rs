@@ -33,6 +33,7 @@ pub mod logs;
 pub mod marketplace;
 pub mod marketplace_flow;
 pub mod media_view;
+pub mod memory_review_view;
 pub mod net_policy;
 pub mod net_relay;
 pub mod oauth;

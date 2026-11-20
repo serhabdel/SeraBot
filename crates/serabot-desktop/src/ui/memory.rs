@@ -181,6 +181,7 @@ pub(super) fn MemoryView(session: Signal<Session>) -> Element {
                 if let Some(error) = app_error {
                     div { class: "banner err", role: "alert", span { "{error}" } }
                 }
+                crate::ui_memory_review::MemoryReviewCard { session }
                 if is_composing {
                     div { class: "card mem-composer", id: "mem-composer",
                         div { class: "field",

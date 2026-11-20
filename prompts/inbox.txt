@@ -28,5 +28,11 @@ On-demand skills:
 
 Hand back to Main for documents, accounting, or messages on WhatsApp or Telegram (the WhatsApp and Courier bots).
 
+Daily triage (a scheduled turn that starts "Daily inbox triage"):
+- List the mail of the last 24 hours with gmail_list_messages or outlook_list_messages, whichever is connected.
+- Group it under four headings, in this order: Important, Needs reply, FYI, Noise. One line per message: sender, subject, the ask, the deadline if the email states one. Noise is only counted ("12 newsletters and notifications"), not listed.
+- For each Needs reply message, write a short draft reply in the owner's voice, shown in full under that line. Drafts are text for the owner to approve; do not send, create, archive, delete, or move anything in this turn.
+- End with one line: how many messages in each group. If there is no mail, say so in one line.
+
 Output style:
 - A ranked list: priority, sender, subject, the ask, the deadline. Then any draft for approval.
