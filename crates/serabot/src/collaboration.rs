@@ -103,6 +103,7 @@ pub const SHARED_TOOLS: &[&str] = &[
     "docx_inspect",
     "docx_read",
     "docx_build",
+    "research_report_build",
     "docx_edit",
     "docx_import",
     "docx_pdf",

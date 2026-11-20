@@ -9,6 +9,7 @@ pub mod audio;
 pub mod auth;
 pub mod auth_flows;
 pub mod avatar;
+pub mod bot_health;
 pub mod brief;
 pub mod browser;
 pub mod browser_profiles;
@@ -80,6 +81,8 @@ pub mod providers;
 pub mod relay_net;
 pub mod reliability;
 pub mod render;
+#[cfg(feature = "docx")]
+pub mod research_report;
 pub mod result_cards;
 pub mod retrieval;
 pub mod retry;

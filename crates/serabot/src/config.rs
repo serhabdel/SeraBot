@@ -2559,6 +2559,7 @@ const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
     "openrouter_generate_image",
     "deck_build",
     "docx_build",
+    "research_report_build",
     "docx_import",
     "docx_pdf",
     "docx_inspect",

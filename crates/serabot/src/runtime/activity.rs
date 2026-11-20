@@ -243,6 +243,7 @@ fn office_label(tool: &str) -> Option<(&'static str, &'static str)> {
         "xlsx_import" => ("file:excel", "Opening a spreadsheet"),
         "xlsx_analyze" | "timesheet_analyze" => ("file:excel", "Analyzing a spreadsheet"),
         "docx_build" => ("file:word", "Writing a Word document"),
+        "research_report_build" => ("file:word", "Building the research report"),
         "docx_read" => ("file:word", "Reading a Word document"),
         "docx_inspect" => ("file:word", "Looking through a Word document"),
         "docx_edit" => ("file:word", "Editing a Word document"),

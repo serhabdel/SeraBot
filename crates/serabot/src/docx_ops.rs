@@ -271,7 +271,7 @@ fn write_error(error: wordcraft_docx::DocxError) -> SeraError {
 }
 
 /// Parse and validate a document. Nothing is mutated here.
-fn load(bytes: &[u8]) -> Result<Document> {
+pub(crate) fn load(bytes: &[u8]) -> Result<Document> {
     validate_package(bytes)?;
     let document = wordcraft_docx::read(bytes).map_err(read_error)?;
     if document.body.len() > MAX_BLOCKS {

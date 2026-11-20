@@ -8,6 +8,7 @@ pub mod audio_capture;
 pub mod avatars;
 pub mod bot_chats;
 pub mod bot_groups;
+pub mod bot_health_view;
 pub mod bot_library;
 pub mod branding;
 pub mod capabilities;

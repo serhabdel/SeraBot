@@ -1078,6 +1078,7 @@ pub fn known_tool_names() -> Vec<&'static str> {
         "docx_edit",
         "docx_inspect",
         "docx_read",
+        "research_report_build",
     ]);
     #[cfg(feature = "pptx")]
     names.extend(["pptx_import", "pptx_pdf", "pptx_inspect", "pptx_edit"]);
@@ -1174,9 +1175,14 @@ pub fn register_docx_tools(
         store.clone(),
         inbox,
     )?)?;
+    let store_for_report = store.clone();
     registry.register(crate::docx_ops::DocxEditTool::new(artifacts.clone(), store))?;
     registry.register(crate::docx_ops::DocxInspectTool::new(artifacts.clone()))?;
-    registry.register(crate::docx_ops::DocxReadTool::new(artifacts))?;
+    registry.register(crate::docx_ops::DocxReadTool::new(artifacts.clone()))?;
+    registry.register(crate::research_report::ResearchReportBuildTool::new(
+        artifacts,
+        store_for_report,
+    ))?;
     Ok(())
 }
 
