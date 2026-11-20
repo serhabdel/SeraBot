@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS usage_budgets (
     updated_at TEXT NOT NULL
 );
 
-ALTER TABLE alert_settings ADD COLUMN weekly_digest INTEGER NOT NULL DEFAULT 1;
+-- alert_settings.weekly_digest is added from Rust (store.rs) only when it is
+-- missing, so the migration can run again on a database that has it.
 
 COMMIT;

@@ -84,8 +84,8 @@ EXIF orientation first.
   asks the bot to change its approach once, following the error's hint,
   instead of repeating the same call.
 - **PC images:** the maker bot can edit an image on your PC. It imports it,
-  edits it, then saves the result next to the original with `local_export`,
-  which asks for approval.
+  edits it, and gives the new file back in the chat or on OneDrive. Bots
+  never write to your PC, so the original is never touched.
 
 ## API
 

@@ -800,6 +800,14 @@ impl Store {
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version < 46 {
             connection.execute_batch(MIGRATION_46)?;
+            let has_digest: bool = connection
+                .prepare("SELECT 1 FROM pragma_table_info('alert_settings') WHERE name = 'weekly_digest'")?
+                .exists([])?;
+            if !has_digest {
+                connection.execute_batch(
+                    "ALTER TABLE alert_settings ADD COLUMN weekly_digest INTEGER NOT NULL DEFAULT 1;",
+                )?;
+            }
             connection.pragma_update(None, "user_version", 46)?;
         }
         // VACUUM INTO (backups) may renumber rowids; rebuild the external-content

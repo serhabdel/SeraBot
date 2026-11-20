@@ -61,7 +61,6 @@ tools = [
   "local_stat",
   "local_read",
   "local_import",
-  "local_export",
   "tavily_search",
   "firecrawl_search",
   "firecrawl_scrape",
