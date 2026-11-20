@@ -345,3 +345,11 @@ never merge without the owner's OK.
 - [ ] Owner: check the built-in job source URLs on the server; run "Check now".
 - [ ] Owner: load suggested prices, verify, save; enter plan prices.
 - [ ] Owner: try browser find/wait/banners on a real site.
+
+## Release 0.71.0 — UI/UX audit: chat stylesheet consolidation, chat switcher, Usage page
+
+- [x] Chat CSS single-owner: `.messages` / `.composer-wrap`(+`::before`) / `.msg-actions` defined once in the system.css chat block; app.css duplicates removed; palette on `--fs-*` tokens; dead `backdrop-filter` removed for `.menu`/`.connect-card`/`.composer`.
+- [x] Chat switcher card: focus open chat on open, menu max-height+scroll, idempotent flip JS, caret-stable rename input.
+- [x] Usage page: `stat-tile` unified (old `usage-tile*` deleted), section anchor chips + "Updated Ns ago", chart day labels.
+- [x] Version bump 0.71.0, release notes, review-doc addendum.
+- [ ] Owner: visual pass on Windows (chat light/dark + text sizes, switcher with several chats, Usage page scroll).

@@ -1214,20 +1214,7 @@ body {
   padding: 12px 0 4px;
 }
 
-.messages {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 8px 0 20px;
-  /* No smooth scroll on the container: it hijacks wheel and anchor jumps.
-     Smooth scrolling is requested only for programmatic appends. */
-  scroll-behavior: auto;
-  /* Scroll anchoring fights stick-to-bottom while tokens stream in. */
-  overflow-anchor: none;
-}
+/* .messages is owned by the chat transcript block in system.css (0.71). */
 
 /* Stand-ins for the rows the virtualized feed does not draw (v0.50). */
 .messages > .feed-spacer {
@@ -1284,21 +1271,7 @@ body {
 
 /* ----------------------------------------------------------- composer --- */
 
-.composer-wrap {
-  position: relative;
-  padding: 8px 0 4px;
-}
-
-.composer-wrap::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: -32px;
-  height: 36px;
-  background: linear-gradient(to bottom, var(--clear), var(--bg));
-  pointer-events: none;
-}
+/* .composer-wrap and its ::before fade are owned by system.css (0.71). */
 
 .composer {
   position: relative;
@@ -1814,8 +1787,6 @@ body {
   padding: 4px;
   border-radius: var(--r-md);
   background: var(--glass);
-  backdrop-filter: blur(24px) saturate(180%);
-  -webkit-backdrop-filter: blur(24px) saturate(180%);
   border: 1px solid var(--glass-edge);
   box-shadow: inset 0 1px 0 var(--glass-highlight), var(--shadow-2);
   display: flex;
@@ -3211,11 +3182,6 @@ button:not(:disabled):active,
   padding: 10px 18px 0;
 }
 
-.messages {
-  gap: 6px;
-  padding: 16px 18px 108px;
-}
-
 .messages > * {
   width: 100%;
   max-width: 760px;
@@ -3298,19 +3264,6 @@ button:not(:disabled):active,
 }
 
 /* In-flow composer layout (surface tokens live in Chat 0.19). */
-.composer-wrap {
-  position: relative;
-  flex: 0 0 auto;
-  z-index: 2;
-  max-width: 760px;
-  margin: 0 auto;
-  padding: 0;
-}
-
-.composer-wrap::before {
-  display: none;
-}
-
 .composer {
   flex-direction: row;
   flex-wrap: wrap;
@@ -3588,8 +3541,6 @@ button:not(:disabled):active,
 
 .connect-card {
   background: var(--glass);
-  backdrop-filter: blur(24px) saturate(180%);
-  -webkit-backdrop-filter: blur(24px) saturate(180%);
   border-color: var(--glass-edge);
   box-shadow: var(--shadow-3), inset 0 1px 0 var(--glass-highlight);
   animation: pane-in var(--dur-3) var(--spring) both;
@@ -6042,19 +5993,11 @@ html[data-reduce-transparency="true"] .chat-header {
   color: var(--label-3);
 }
 
-/* Gradient fade removed so bottom messages and expanded steps stay unobstructed. */
-.composer-wrap::before {
-  display: none;
-  content: none;
-}
-
 .composer {
   position: relative;
   background: var(--composer-bg);
   border: 1px solid var(--composer-edge);
   box-shadow: var(--composer-shadow), inset 0 1px 0 var(--composer-top-edge);
-  backdrop-filter: blur(20px) saturate(180%);
-  -webkit-backdrop-filter: blur(20px) saturate(180%);
   border-radius: 20px;
   padding: 10px 10px 10px 14px;
   gap: 10px;
@@ -6221,15 +6164,7 @@ html[data-reduce-transparency="true"] .chat-header {
 .messages > .msg.msg-enter {
   animation: chat-msg-in 200ms var(--spring);
 }
-.msg:hover .msg-actions,
-.msg:focus-within .msg-actions,
-.msg-actions:focus-within {
-  opacity: 1;
-}
-
-.msg.user .msg-actions {
-  justify-content: flex-end;
-}
+/* .msg-actions visibility/alignment rules are owned by system.css (0.71). */
 .msg-action:hover {
   background: var(--hover);
   color: var(--label-2);
@@ -6242,12 +6177,6 @@ html[data-reduce-transparency="true"] .chat-header {
 .msg-action:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
-}
-
-@media (hover: none) {
-  .msg-actions {
-    opacity: 1;
-  }
 }
 
 /* Day separators between messages from different days. */
@@ -6874,6 +6803,8 @@ html[data-reduce-transparency="true"] .chat-header {
 .chat-switcher-menu {
   min-width: 280px;
   max-width: 360px;
+  max-height: min(420px, 60vh);
+  overflow-y: auto;
 }
 
 .chat-switcher-row {

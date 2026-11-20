@@ -278,3 +278,15 @@ Copilot plan sign-in (on by default with a risk banner, per owner decision;
 Mistral sign-in is not wanted). Canva is not shipped. Everything was checked
 against synthetic fixtures; no live host, GitHub App, ChatGPT or Copilot account
 was used, so the owner must run each before it is called working.
+
+## Status after 0.70.0 (UI/UX audit, 0.71.0)
+
+0.71.0 consolidates the desktop chat stylesheet into one owner per rule in
+the `system.css` chat block (feed container, composer wrap, message actions),
+moves the command palette onto the `--fs-*` text-size tokens, removes
+`backdrop-filter` rules that `system.css` already overrides, fixes the chat
+switcher card (focus on the open chat, capped scrollable menu, idempotent
+overflow flip, caret-stable rename), and polishes the Usage page (shared
+`stat-tile`, section anchors with an updated-ago stamp, chart day labels).
+Source-level audit only; no render was taken, so the owner does a visual pass
+on Windows. No server changes, no new dependencies.

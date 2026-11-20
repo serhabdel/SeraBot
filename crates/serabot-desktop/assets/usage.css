@@ -10,26 +10,8 @@
   gap: 12px;
 }
 
-.usage-tile {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 14px 16px;
-  border-radius: var(--r-md);
-  background: var(--card-bg);
-  border: 1px solid var(--glass-edge);
-}
-
-.usage-tile-label {
-  color: var(--label-2);
-  font-size: var(--fs-caption);
-}
-
-.usage-tile-value {
-  color: var(--label-1);
-  font-size: var(--fs-display);
-  font-weight: 600;
-}
+/* Tiles on this page are the shared .stat-tile (0.71); the old .usage-tile
+   classes are gone. */
 
 .usage-chart-wrap {
   display: flex;
@@ -53,6 +35,55 @@
   color: var(--label-3);
   font-size: var(--fs-caption);
   font-variant-numeric: tabular-nums;
+}
+
+/* Day labels under the bars (0.71): one cell per bar so they stay aligned. */
+.usage-chart-labels {
+  display: flex;
+  gap: 3px;
+}
+
+.usage-bar-label {
+  flex: 1;
+  min-width: 3px;
+  text-align: center;
+  font-size: var(--fs-micro);
+  color: var(--label-3);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+/* Section anchor chips under the page head (0.71). */
+.usage-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.usage-nav a {
+  text-decoration: none;
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+  padding: 3px 10px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-pill);
+  background: var(--surface);
+}
+
+.usage-nav a:hover {
+  background: var(--hover);
+  color: var(--label-1);
+}
+
+.usage-nav a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.usage-updated {
+  font-size: var(--fs-micro);
 }
 
 .usage-toolbar {
