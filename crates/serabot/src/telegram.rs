@@ -990,6 +990,7 @@ impl TelegramClient {
                 // The transcript is the user's message in this chat, so the
                 // normal turn pipeline answers it like any typed message. No
                 // status line is sent for a successful transcription.
+                store.note_inbound_voice(user_id, &chat_id.to_string(), true)?;
                 runtime.submit_text(user_id, &chat_id.to_string(), &transcript, None)?;
                 return Ok(());
             }
@@ -1022,20 +1023,28 @@ impl TelegramClient {
                 )
                 .await?;
             }
-            "/voice" | "/text" => {
-                let mode = if text == "/voice" { "voice" } else { "text" };
+            "/voice" | "/text" | "/auto" => {
+                let mode = match text {
+                    "/voice" => "voice",
+                    "/auto" => "auto",
+                    _ => "text",
+                };
                 store.set_reply_mode(user_id, &chat_id.to_string(), mode)?;
-                let reply = if mode == "voice" {
+                let reply = if mode != "text" {
                     match crate::audio::speech_provider_state(runtime.config()) {
+                        crate::audio::AudioProviderState::Ready if mode == "auto" => {
+                            "Voice replies when you send a voice note. Send /text for text only, /voice for always."
+                                .to_string()
+                        }
                         crate::audio::AudioProviderState::Ready => {
-                            "Voice replies on. Send /text to go back to text.".to_string()
+                            "Voice replies on. Send /text to go back to text, /auto to answer voice with voice.".to_string()
                         }
                         crate::audio::AudioProviderState::Unavailable(reason) => {
                             format!("Voice replies set, but they will fall back to text: {reason}")
                         }
                     }
                 } else {
-                    "Text replies on. Send /voice to switch to voice.".to_string()
+                    "Text replies on. Send /voice to switch to voice, or /auto to answer voice notes with voice.".to_string()
                 };
                 self.send_message(chat_id, &reply).await?;
             }
@@ -1189,6 +1198,7 @@ impl TelegramClient {
                 .await?;
             }
             _ => {
+                store.note_inbound_voice(user_id, &chat_id.to_string(), false)?;
                 runtime.submit_text(user_id, &chat_id.to_string(), text, None)?;
             }
         }

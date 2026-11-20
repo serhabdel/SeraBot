@@ -4174,6 +4174,44 @@ impl ApiClient {
     }
 
     /// `PUT /v1/relay/net` (0.66): turn the relay on or off, choose providers.
+    /// `GET /v1/alerts` (0.68): where the caller's alerts go, and recent ones.
+    pub fn alerts_get(&self) -> Result<serde_json::Value, ApiError> {
+        self.get(&["v1", "alerts"], &[])
+    }
+
+    /// `PUT /v1/alerts` (0.68).
+    pub fn alerts_put(
+        &self,
+        telegram: bool,
+        whatsapp_conversation_id: Option<&str>,
+    ) -> Result<serde_json::Value, ApiError> {
+        self.request(
+            Method::PUT,
+            &["v1", "alerts"],
+            &[],
+            Some(&serde_json::json!({
+                "telegram": telegram,
+                "whatsapp_conversation_id": whatsapp_conversation_id,
+            })),
+        )
+    }
+
+    /// `GET /v1/admin/backups` (0.68, owner only).
+    pub fn backups_get(&self) -> Result<serde_json::Value, ApiError> {
+        self.get(&["v1", "admin", "backups"], &[])
+    }
+
+    /// `POST /v1/admin/backups/run` (0.68, owner only): back up and test
+    /// restore now.
+    pub fn backups_run(&self) -> Result<serde_json::Value, ApiError> {
+        self.request(
+            Method::POST,
+            &["v1", "admin", "backups", "run"],
+            &[],
+            Some(&serde_json::json!({})),
+        )
+    }
+
     pub fn relay_put(
         &self,
         enabled: bool,

@@ -65,7 +65,8 @@ pub fn read_chunk(root: &Path, rel: &str, args: &Value) -> Result<String, String
             IMPORT_EXTENSIONS.join(", ")
         ));
     }
-    let meta = std::fs::symlink_metadata(&path).map_err(|_| "could not be opened".to_string())?;
+    let meta = std::fs::symlink_metadata(&path)
+        .map_err(|error| crate::local_fs::io_reason(&error, "could not be opened"))?;
     if !meta.is_file() || is_link(&meta) {
         return Err("not a regular file".into());
     }
@@ -86,9 +87,10 @@ pub fn read_chunk(root: &Path, rel: &str, args: &Value) -> Result<String, String
         .unwrap_or(CHUNK_BYTES as u64)
         .clamp(1, CHUNK_BYTES as u64)
         .min(size - offset);
-    let mut file = std::fs::File::open(&path).map_err(|_| "could not be opened".to_string())?;
+    let mut file = std::fs::File::open(&path)
+        .map_err(|error| crate::local_fs::io_reason(&error, "could not be opened"))?;
     file.seek(SeekFrom::Start(offset))
-        .map_err(|_| "could not be read".to_string())?;
+        .map_err(|error| crate::local_fs::io_reason(&error, "could not be read"))?;
     let mut buf = vec![0u8; length as usize];
     file.read_exact(&mut buf)
         .map_err(|_| "the file changed while it was read".to_string())?;
@@ -108,13 +110,14 @@ pub fn read_chunk(root: &Path, rel: &str, args: &Value) -> Result<String, String
 }
 
 fn hex_sha256(path: &Path) -> Result<String, String> {
-    let mut file = std::fs::File::open(path).map_err(|_| "could not be read".to_string())?;
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| crate::local_fs::io_reason(&error, "could not be read"))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let read = file
             .read(&mut buf)
-            .map_err(|_| "could not be read".to_string())?;
+            .map_err(|error| crate::local_fs::io_reason(&error, "could not be read"))?;
         if read == 0 {
             break;
         }
@@ -190,7 +193,7 @@ pub fn put_chunk(root: &Path, rel: &str, content: &str, args: &Value) -> Result<
         .create(true)
         .append(true)
         .open(&temp)
-        .map_err(|_| "could not be written".to_string())?;
+        .map_err(|error| crate::local_fs::io_reason(&error, "could not be written"))?;
     file.write_all(&bytes)
         .and_then(|()| file.flush())
         .map_err(|_| {

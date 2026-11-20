@@ -15,6 +15,7 @@ use serabot_desktop::theme::{Level, Tone};
 use serabot_desktop::{UsageBucket, UsageModel, UsageReport};
 
 use crate::ui::{Icon, human_provider};
+use crate::ui_ops::{AlertsCard, BackupsCard};
 use crate::ui_usage_insights::UsageInsights;
 use crate::ui_widgets::{LevelChip, StatusChip};
 
@@ -268,6 +269,20 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
                             }
                         }
                         ServerHealthCard { session }
+                    }
+                }
+                section { class: "usage-section", "aria-labelledby": "usage-ops-title",
+                    div { class: "page-section-head",
+                        div {
+                            h2 { class: "usage-section-title", id: "usage-ops-title", "Alerts and backups" }
+                            p { class: "usage-section-sub", "Where SeraBot warns you, and whether your data is safe." }
+                        }
+                    }
+                    div { class: "insights-grid",
+                        AlertsCard { session }
+                        if is_admin {
+                            BackupsCard { session }
+                        }
                     }
                 }
                 section { class: "usage-section", "aria-labelledby": "usage-activity-title",

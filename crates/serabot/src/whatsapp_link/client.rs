@@ -475,6 +475,26 @@ impl WhatsappLink {
             .trim()
             .to_string();
         let mut attachments = Vec::new();
+        let voice_note = message.audio_message.as_option().is_some();
+
+        // 0.68: reply mode commands, answered here without a turn.
+        if let Some(mode) = match text.as_str() {
+            "/voice" => Some("voice"),
+            "/text" => Some("text"),
+            "/auto" => Some("auto"),
+            _ => None,
+        } {
+            self.store.set_reply_mode(user_id, &conversation_id, mode)?;
+            let line = match mode {
+                "voice" => {
+                    "Voice replies on. Send /text for text, /auto to answer voice notes with voice."
+                }
+                "auto" => "I will answer your voice notes with voice. Send /text for text only.",
+                _ => "Text replies on. Send /voice or /auto for voice replies.",
+            };
+            self.send_text_to(user_id, &jid, line).await?;
+            return Ok(());
+        }
 
         if let Some(audio) = message.audio_message.as_option() {
             check_size(audio.file_length, max)?;
@@ -570,6 +590,8 @@ impl WhatsappLink {
         if text.is_empty() && attachments.is_empty() {
             return Ok(());
         }
+        self.store
+            .note_inbound_voice(user_id, &conversation_id, voice_note)?;
         runtime.submit_text_attached(
             user_id,
             &conversation_id,
@@ -712,6 +734,57 @@ impl WhatsappLink {
         Ok(())
     }
 
+    /// Send an mp3 reply as an audio message to an allowed chat (0.68).
+    pub async fn send_audio_to(&self, user_id: &str, jid: &str, bytes: Vec<u8>) -> Result<()> {
+        let allowed = self
+            .store
+            .whatsapp_link_account(user_id)?
+            .is_some_and(|account| account.allowlist.iter().any(|entry| entry == jid));
+        if !allowed {
+            return Err(SeraError::Forbidden(
+                "that chat is not on your WhatsApp allowed list".into(),
+            ));
+        }
+        if bytes.is_empty() || bytes.len() as u64 > self.config.whatsapp_link.max_media_bytes {
+            return Err(SeraError::Validation(
+                "the voice reply is empty or too large".into(),
+            ));
+        }
+        self.take_send_slot(user_id, jid)?;
+        let client = self
+            .live
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(user_id)
+            .map(|live| live.client.clone())
+            .ok_or_else(|| SeraError::External("your WhatsApp number is not connected".into()))?;
+        let to: Jid = jid
+            .parse()
+            .map_err(|_| SeraError::Validation("invalid WhatsApp chat".into()))?;
+        let upload = client
+            .upload(
+                bytes,
+                whatsapp_rust::download::MediaType::Audio,
+                Default::default(),
+            )
+            .await
+            .map_err(|error| SeraError::External(format!("WhatsApp upload failed: {error}")))?;
+        let message = whatsapp_rust::media::audio_message(
+            upload,
+            whatsapp_rust::media::AudioOptions {
+                mimetype: Some("audio/mpeg".into()),
+                ptt: Some(false),
+                ..Default::default()
+            },
+        );
+        client
+            .send_message(to, message)
+            .await
+            .map_err(|error| SeraError::External(format!("WhatsApp send failed: {error}")))?;
+        self.touch_presence(user_id, &client);
+        Ok(())
+    }
+
     fn take_send_slot(&self, user_id: &str, jid: &str) -> Result<()> {
         let limit = self.config.whatsapp_link.sends_per_minute.max(1) as usize;
         let mut sends = self.sends.lock().unwrap_or_else(|p| p.into_inner());
@@ -810,6 +883,22 @@ impl Notifier for WhatsappLink {
             notice.action.tool
         );
         self.send_text_to(user_id, &jid, &line).await
+    }
+
+    /// 0.68: a spoken reply as a WhatsApp audio message, then the text so it
+    /// can be read and searched. The default would send text only.
+    async fn send_voice(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        text: &str,
+        audio: &[u8],
+    ) -> Result<()> {
+        let Some(jid) = self.store.whatsapp_link_chat(user_id, conversation_id)? else {
+            return Ok(());
+        };
+        self.send_audio_to(user_id, &jid, audio.to_vec()).await?;
+        self.send_text_to(user_id, &jid, text).await
     }
 }
 

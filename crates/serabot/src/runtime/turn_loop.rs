@@ -363,7 +363,13 @@ impl Runtime {
                     ));
                 }
                 Err(error) => {
-                    let message = truncate_chars(&error.to_string(), 500);
+                    // 0.68: a file error names what to do next, for the card
+                    // and for the model's retry.
+                    let raw = error.to_string();
+                    let message = match super::activity::file_error_hint(&pending.call.name, &raw) {
+                        Some(hint) => format!("{} {hint}", truncate_chars(&raw, 400)),
+                        None => truncate_chars(&raw, 500),
+                    };
                     self.emit_step_detail(
                         &user,
                         task,
@@ -378,7 +384,7 @@ impl Runtime {
                     );
                     state.messages.push(LlmMessage {
                         role: Role::Tool,
-                        content: Some(format!("The approved tool failed: {error}")),
+                        content: Some(format!("The approved tool failed: {message}")),
                         tool_calls: Vec::new(),
                         tool_call_id: Some(pending.call.id.clone()),
                         name: Some(pending.call.name.clone()),
@@ -469,13 +475,15 @@ impl Runtime {
     /// that cannot carry audio all end with the same text the user would have
     /// received anyway, plus one line saying why.
     async fn deliver_reply(&self, user_id: &str, conversation_id: &str, text: &str) -> Result<()> {
-        if self.store.reply_mode(user_id, conversation_id)? != "voice" {
+        if !self.store.speak_reply(user_id, conversation_id)? {
             return self
                 .notifier
                 .send_text(user_id, conversation_id, text)
                 .await;
         }
-        match crate::audio::synthesize_speech(&self.config, text).await {
+        match crate::audio::synthesize_speech_for_user(&self.config, &self.store, user_id, text)
+            .await
+        {
             Ok(audio) => {
                 if self
                     .notifier
@@ -1421,7 +1429,13 @@ impl Runtime {
                     });
                 }
                 Err(error) => {
-                    let message = truncate_chars(&error.to_string(), 500);
+                    // 0.68: a file error names what to do next, for the card
+                    // and for the model's retry.
+                    let raw = error.to_string();
+                    let message = match super::activity::file_error_hint(&call.name, &raw) {
+                        Some(hint) => format!("{} {hint}", truncate_chars(&raw, 400)),
+                        None => truncate_chars(&raw, 500),
+                    };
                     self.emit_step_detail(
                         &task.user_id,
                         task,
@@ -1436,11 +1450,7 @@ impl Runtime {
                     );
                     state.messages.push(LlmMessage {
                         role: Role::Tool,
-                        content: Some(format!(
-                            "Tool '{}' failed: {}",
-                            call.name,
-                            truncate_chars(&error.to_string(), 500)
-                        )),
+                        content: Some(format!("Tool '{}' failed: {}", call.name, message)),
                         tool_calls: Vec::new(),
                         tool_call_id: Some(call.id.clone()),
                         name: Some(call.name.clone()),

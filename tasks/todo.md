@@ -313,3 +313,14 @@ never merge without the owner's OK.
 - [x] PC tunnel card: traffic per day and per host, share of model calls relayed, live status.
 - [x] Server load: CPU and memory sampled every 5 minutes, 24 hours in memory, owner only.
 - [ ] Owner: send a message from the desktop and the phone; check both channels appear on the Usage tab.
+
+## Release 0.68.0 — Alerts, backups, voice replies, office steps, phone app catch-up
+
+- [x] Alerts (`ops.rs`): failover streaks, expired sign-ins, PC tunnel drop during a turn, disk/memory (owner), failed backup (owner); cooldown, audited; Telegram and one chosen WhatsApp chat.
+- [x] Nightly backup: VACUUM INTO, age-encrypted with the server key, test restore (integrity check), optional OneDrive copy, pruned; Usage tab card with "Back up and test now".
+- [x] Voice replies: `/auto` mode (voice answer to a voice note), WhatsApp audio replies, member's own Mistral key as fallback.
+- [x] Office steps: specific labels per document tool and change counts / ranges on the step card; file errors carry a next step (locked, moved, not allowed, too big, protected, damaged) for the card and the model; desktop local file errors say why.
+- [x] Maker, analyst and comptable prompts: look before editing, report changes, act on file error hints.
+- [x] Phone app 0.68: Usage insights, bot Library, memories in reply traces, approval alerts and badge.
+- [ ] Owner: link Telegram, pick a WhatsApp alert chat, and run "Back up and test now" once; check the OneDrive copy.
+- [ ] Owner: send `/auto` on WhatsApp, then a voice note; the answer should come back as audio plus text.

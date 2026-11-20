@@ -83,6 +83,7 @@ const MIGRATION_41: &str = include_str!("../migrations/0041_whatsapp_link.sql");
 const MIGRATION_42: &str = include_str!("../migrations/0042_memory_vectors.sql");
 const MIGRATION_43: &str = include_str!("../migrations/0043_relay_settings.sql");
 const MIGRATION_44: &str = include_str!("../migrations/0044_client_turns.sql");
+const MIGRATION_45: &str = include_str!("../migrations/0045_alert_settings.sql");
 
 /// One member's account for a marketplace plugin (no secret).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -790,6 +791,11 @@ impl Store {
             connection.execute_batch(MIGRATION_44)?;
             connection.pragma_update(None, "user_version", 44)?;
         }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 45 {
+            connection.execute_batch(MIGRATION_45)?;
+            connection.pragma_update(None, "user_version", 45)?;
+        }
         // VACUUM INTO (backups) may renumber rowids; rebuild the external-content
         // FTS index only when its row count no longer matches `memories`.
         crate::memory::refresh_fts_if_stale(&connection);
@@ -1054,7 +1060,8 @@ impl Store {
         self.kv_set(&fleet_offerings_key(user_id), value)
     }
 
-    /// The reply mode selected for one conversation: `text` or `voice`.
+    /// The reply mode selected for one conversation: `text`, `voice`, or
+    /// `auto` (0.68: voice when the member's last message was a voice note).
     ///
     /// The key carries the user id because conversation ids such as `dir:main`
     /// are not globally unique across accounts. An unset or unrecognized value
@@ -1063,19 +1070,45 @@ impl Store {
         let key = format!("reply_mode:{user_id}:{conversation_id}");
         Ok(match self.kv_get(&key)? {
             Some(value) if value == "voice" => "voice".into(),
+            Some(value) if value == "auto" => "auto".into(),
             _ => "text".into(),
         })
     }
 
     /// Persist the reply mode for one conversation of one user.
     pub fn set_reply_mode(&self, user_id: &str, conversation_id: &str, mode: &str) -> Result<()> {
-        if !matches!(mode, "text" | "voice") {
+        if !matches!(mode, "text" | "voice" | "auto") {
             return Err(SeraError::Validation(
-                "reply mode must be 'text' or 'voice'".into(),
+                "reply mode must be 'text', 'voice' or 'auto'".into(),
             ));
         }
         let key = format!("reply_mode:{user_id}:{conversation_id}");
         self.kv_set(&key, mode)
+    }
+
+    /// Remember whether the member's latest message in a chat was a voice
+    /// note, for `auto` reply mode (0.68).
+    pub fn note_inbound_voice(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        voice: bool,
+    ) -> Result<()> {
+        let key = format!("inbound_voice:{user_id}:{conversation_id}");
+        self.kv_set(&key, if voice { "1" } else { "0" })
+    }
+
+    /// Whether this turn's reply should be spoken: `voice` mode, or `auto`
+    /// with a voice note as the member's latest message.
+    pub fn speak_reply(&self, user_id: &str, conversation_id: &str) -> Result<bool> {
+        Ok(match self.reply_mode(user_id, conversation_id)?.as_str() {
+            "voice" => true,
+            "auto" => {
+                let key = format!("inbound_voice:{user_id}:{conversation_id}");
+                self.kv_get(&key)?.as_deref() == Some("1")
+            }
+            _ => false,
+        })
     }
 
     /// Insert a device token row. Only the SHA-256 hash is ever stored; the
@@ -6653,7 +6686,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 44);
+        assert_eq!(version, 45);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
@@ -6718,7 +6751,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 44);
+        assert_eq!(version, 45);
         assert!(store.list_device_tokens().unwrap().is_empty());
         // The team table arrives with the same migration batch.
         assert!(
@@ -6792,7 +6825,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 44);
+        assert_eq!(version, 45);
         let admin = admin(&store);
         let memory = crate::memory::get(&store, &admin, "mem-legacy").unwrap();
         assert_eq!(memory.origin, "explicit");
@@ -6881,7 +6914,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 44);
+        assert_eq!(version, 45);
 
         let admin = store.admin_user().unwrap().unwrap();
         assert_eq!(admin.id, ADMIN_USER_ID);
@@ -7012,7 +7045,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 44);
+        assert_eq!(version, 45);
 
         // Every scoped table carries user_id = the admin, and the column is
         // NOT NULL with a real foreign key.
@@ -7167,7 +7200,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 44);
+        assert_eq!(version, 45);
 
         // The old row is now the admin's, with the empty prompt the migration
         // header documents; startup seeding fills it from the template.

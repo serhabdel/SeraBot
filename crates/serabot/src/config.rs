@@ -43,6 +43,9 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub whatsapp_link: WhatsappLinkConfig,
+    /// Alerts and scheduled backups (0.68).
+    #[serde(default)]
+    pub ops: OpsConfig,
     #[serde(default)]
     pub policy: PolicyConfig,
     #[serde(default)]
@@ -116,6 +119,7 @@ impl Default for Config {
             users: UsersConfig::default(),
             logging: LoggingConfig::default(),
             whatsapp_link: WhatsappLinkConfig::default(),
+            ops: OpsConfig::default(),
             policy: PolicyConfig::default(),
             watcher: WatcherConfig::default(),
             onedrive: OneDriveConfig::default(),
@@ -4278,6 +4282,93 @@ pub struct WhatsappLinkConfig {
     /// arrive at once. 0 keeps it "online" all the time.
     #[serde(default = "default_whatsapp_link_idle")]
     pub presence_idle_secs: u64,
+}
+
+/// `[ops]` (0.68): alerts to members on Telegram or WhatsApp, and the
+/// scheduled encrypted database backup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpsConfig {
+    #[serde(default = "default_true")]
+    pub alerts_enabled: bool,
+    /// Owner alert when the data disk is this full (percent).
+    #[serde(default = "default_ops_disk")]
+    pub disk_alert_percent: u8,
+    /// Owner alert when the server's memory is this full (percent).
+    #[serde(default = "default_ops_memory")]
+    pub memory_alert_percent: u8,
+    /// Alert a member when one model fails over this often in 15 minutes.
+    #[serde(default = "default_ops_failovers")]
+    pub failover_alert_count: u32,
+    /// The same alert is sent at most once per this many minutes.
+    #[serde(default = "default_ops_cooldown")]
+    pub alert_cooldown_mins: u32,
+    #[serde(default = "default_true")]
+    pub backup_enabled: bool,
+    /// Hour of the day (UTC) for the daily backup.
+    #[serde(default = "default_ops_backup_hour")]
+    pub backup_hour_utc: u8,
+    /// Backups kept in the backup folder; older ones are removed.
+    #[serde(default = "default_ops_backup_keep")]
+    pub backup_keep: u32,
+    /// Folder for encrypted backups (relative to the config directory).
+    #[serde(default = "default_ops_backup_dir")]
+    pub backup_dir: String,
+    /// Also copy each backup to the owner's OneDrive when it is connected.
+    #[serde(default = "default_true")]
+    pub backup_onedrive: bool,
+    /// OneDrive subfolder (under the OneDrive base folder) for backups.
+    #[serde(default = "default_ops_backup_folder")]
+    pub backup_onedrive_folder: String,
+}
+
+impl Default for OpsConfig {
+    fn default() -> Self {
+        Self {
+            alerts_enabled: true,
+            disk_alert_percent: default_ops_disk(),
+            memory_alert_percent: default_ops_memory(),
+            failover_alert_count: default_ops_failovers(),
+            alert_cooldown_mins: default_ops_cooldown(),
+            backup_enabled: true,
+            backup_hour_utc: default_ops_backup_hour(),
+            backup_keep: default_ops_backup_keep(),
+            backup_dir: default_ops_backup_dir(),
+            backup_onedrive: true,
+            backup_onedrive_folder: default_ops_backup_folder(),
+        }
+    }
+}
+
+fn default_ops_disk() -> u8 {
+    90
+}
+
+fn default_ops_memory() -> u8 {
+    92
+}
+
+fn default_ops_failovers() -> u32 {
+    3
+}
+
+fn default_ops_cooldown() -> u32 {
+    360
+}
+
+fn default_ops_backup_hour() -> u8 {
+    3
+}
+
+fn default_ops_backup_keep() -> u32 {
+    7
+}
+
+fn default_ops_backup_dir() -> String {
+    "data/backups".into()
+}
+
+fn default_ops_backup_folder() -> String {
+    "Backups".into()
 }
 
 impl Default for WhatsappLinkConfig {

@@ -71,6 +71,7 @@ mod media;
 mod memories;
 mod messages;
 mod monitoring;
+mod ops;
 mod preview;
 mod profiles;
 mod projects;
@@ -221,6 +222,8 @@ pub struct ApiState {
     local: Arc<crate::local_relay::LocalRelay>,
     /// Host sampler and cached storage scan behind GET /v1/admin/status.
     sys_status: Arc<crate::sysstatus::StatusMonitor>,
+    /// Alerts and backups (0.68); `None` when not started (tests).
+    ops: Option<Arc<crate::ops::OpsWatch>>,
     /// Card ids with an answer or decline in flight (see `cards::CardClaim`).
     card_claims: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Password manager CLIs for vault references (see `vault_providers`).
@@ -333,6 +336,7 @@ impl ApiState {
             onboarding_drafter: None,
             local: crate::local_relay::LocalRelay::new(),
             sys_status: Arc::new(crate::sysstatus::StatusMonitor::new()),
+            ops: None,
             card_claims: Arc::default(),
             vault_providers: Arc::new(crate::vault_providers::Providers::new(&config.vault)),
             accounts,
@@ -373,6 +377,11 @@ impl ApiState {
 
     /// Share the relay the local folder tools use, so the desktop's polls
     /// reach the same queue as the tools' calls.
+    pub fn with_ops(mut self, ops: Arc<crate::ops::OpsWatch>) -> Self {
+        self.ops = Some(ops);
+        self
+    }
+
     pub fn with_local_relay(mut self, local: Arc<crate::local_relay::LocalRelay>) -> Self {
         self.local = local;
         self
@@ -518,6 +527,9 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/v1/bots/{bot}/library", get(bot_library))
         .route("/v1/relay/net", get(relay::relay_get).put(relay::relay_put))
+        .route("/v1/alerts", get(ops::alerts_get).put(ops::alerts_put))
+        .route("/v1/admin/backups", get(ops::backups_get))
+        .route("/v1/admin/backups/run", post(ops::backups_run))
         .route("/v1/relay/net/exchange", post(relay::relay_exchange))
         .route("/v1/bots/{bot}/chat-settings", put(put_bot_chat_settings))
         .route("/v1/bots/catalog", get(bot_catalog))
