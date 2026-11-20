@@ -22,11 +22,13 @@ tools = [
   "rag_search",
   "tavily_search",
   "firecrawl_search",
+  "exa_search",
   "firecrawl_scrape",
   "fetch_url",
   "firecrawl_map",
   "firecrawl_extract",
   "docx_build",
+  "research_report_build",
   "conversation_library",
   "ask_teammate",
 ]

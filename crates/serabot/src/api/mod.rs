@@ -55,6 +55,7 @@ mod accounts;
 mod admin;
 mod approvals;
 mod bot_chats;
+mod bot_health_api;
 mod bots;
 mod browser;
 mod cards;
@@ -95,6 +96,7 @@ use accounts::*;
 use admin::*;
 use approvals::*;
 use bot_chats::*;
+use bot_health_api::*;
 use bots::*;
 use browser::*;
 use cards::*;
@@ -481,6 +483,7 @@ pub fn router(state: ApiState) -> Router {
             put(profile_rename).delete(profile_delete),
         )
         .route("/v1/messages", post(send_message))
+        .route("/v1/bots/health", get(bot_health_report))
         .route("/v1/bots", get(list_bots).post(create_bot))
         .route("/v1/marketplace/plugins", get(list_plugins))
         .route(

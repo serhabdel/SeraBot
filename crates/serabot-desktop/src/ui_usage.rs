@@ -15,6 +15,7 @@ use serabot_desktop::theme::{Level, Tone};
 use serabot_desktop::{UsageBucket, UsageModel, UsageReport};
 
 use crate::ui::{Icon, human_provider};
+use crate::ui_bot_health::BotHealthCard;
 use crate::ui_ops::{AlertsCard, BackupsCard, CostsCard};
 use crate::ui_usage_insights::UsageInsights;
 use crate::ui_widgets::{LevelChip, StatusChip};
@@ -383,6 +384,7 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
                     }
                 }
                 UsageInsights { session, days: days.min(90) }
+                BotHealthCard { session, days }
                 if report_ready && !empty {
                     section { class: "usage-section", "aria-labelledby": "usage-breakdown-title",
                         div { class: "page-section-head",

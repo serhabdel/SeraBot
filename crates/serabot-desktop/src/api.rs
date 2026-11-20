@@ -4169,6 +4169,16 @@ impl ApiClient {
         self.get(&["v1", "usage", "insights"], &query)
     }
 
+    /// `GET /v1/bots/health?days=7|30` (0.70): per-bot success rate, turn
+    /// times, failing tools and failovers.
+    pub fn bot_health(
+        &self,
+        days: u32,
+    ) -> Result<crate::bot_health_view::BotHealthReport, ApiError> {
+        let days_value = if days <= 7 { "7" } else { "30" };
+        self.get(&["v1", "bots", "health"], &[("days", days_value)])
+    }
+
     pub fn relay_get(&self) -> Result<serde_json::Value, ApiError> {
         self.get(&["v1", "relay", "net"], &[])
     }
