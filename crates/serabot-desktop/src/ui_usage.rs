@@ -15,7 +15,7 @@ use serabot_desktop::theme::{Level, Tone};
 use serabot_desktop::{UsageBucket, UsageModel, UsageReport};
 
 use crate::ui::{Icon, human_provider};
-use crate::ui_ops::{AlertsCard, BackupsCard};
+use crate::ui_ops::{AlertsCard, BackupsCard, CostsCard};
 use crate::ui_usage_insights::UsageInsights;
 use crate::ui_widgets::{LevelChip, StatusChip};
 
@@ -274,12 +274,13 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
                 section { class: "usage-section", "aria-labelledby": "usage-ops-title",
                     div { class: "page-section-head",
                         div {
-                            h2 { class: "usage-section-title", id: "usage-ops-title", "Alerts and backups" }
+                            h2 { class: "usage-section-title", id: "usage-ops-title", "Alerts, costs and backups" }
                             p { class: "usage-section-sub", "Where SeraBot warns you, and whether your data is safe." }
                         }
                     }
                     div { class: "insights-grid",
                         AlertsCard { session }
+                        CostsCard { session, is_admin }
                         if is_admin {
                             BackupsCard { session }
                         }
@@ -327,7 +328,7 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
                                 div { class: "stat-tile",
                                     span { class: "stat-tile-value muted-value", "\u{2014}" }
                                     span { class: "stat-tile-label", "Estimated cost" }
-                                    span { class: "stat-tile-sub", "Your server does not record prices." }
+                                    span { class: "stat-tile-sub", "See Costs this month below." }
                                 }
                             }
                             div { class: "card usage-chart-card",

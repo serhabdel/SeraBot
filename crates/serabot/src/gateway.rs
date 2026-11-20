@@ -61,6 +61,14 @@ pub const DESTRUCTIVE_TOOLS: &[&str] = &[
     // allowed chats, under per-minute and daily caps (owner decision).
 ];
 
+/// Tools that only deliver a file to the acting member's own chat (0.68+1:
+/// owner decision). When the member keeps "send files to my own chats
+/// without asking" on (the default), they run without an approval card,
+/// under a daily cap, and every send is audited.
+pub const OWN_CHAT_DELIVERY_TOOLS: &[&str] = &["telegram_send_document"];
+/// Own-chat deliveries per member per day before approval is asked again.
+pub const OWN_CHAT_DAILY_CAP: i64 = 50;
+
 /// Audit reason recorded when the owner's YOLO setting approved a call.
 pub const YOLO_AUDIT_REASON: &str = "auto-approved by user YOLO setting";
 /// Audit reason recorded when a YOLO setting approved a call (0.28: the
@@ -558,8 +566,22 @@ impl Gateway {
         let canonical = canonical_json(&args)?;
         let hash = canonical_hash(&args)?;
 
-        if tool.requires_approval(&args)
-            || (self.respect_bot_lists && context.require_approval.contains(name))
+        let own_chat = self.own_chat_delivery(name, context)?;
+        if own_chat {
+            self.store.record_audit(
+                &context.actor,
+                "delivery.own_chat",
+                Some(name),
+                context.task_id.as_deref(),
+                None,
+                None,
+                Some(self.policy.version()),
+                None,
+            )?;
+        }
+        if !own_chat
+            && (tool.requires_approval(&args)
+                || (self.respect_bot_lists && context.require_approval.contains(name)))
         {
             if let Some(output) = self
                 .check_standing_grant(tool.as_ref(), &args, &hash, context)
@@ -593,6 +615,27 @@ impl Gateway {
         }
         self.finish_tool_call(tool.as_ref(), &output, &listed, context, started.elapsed())?;
         output.map(ToolOutcome::Completed)
+    }
+
+    /// Whether this call is a delivery to the member's own chat that may run
+    /// without approval: the tool is on `OWN_CHAT_DELIVERY_TOOLS`, the member
+    /// keeps the switch on, no bot list requires approval for it, and the
+    /// daily cap is not reached.
+    fn own_chat_delivery(&self, name: &str, context: &ToolContext) -> Result<bool> {
+        if !OWN_CHAT_DELIVERY_TOOLS.contains(&name)
+            || (self.respect_bot_lists && context.require_approval.contains(name))
+            || !self.store.auto_send_own(&context.user_id)?
+        {
+            return Ok(false);
+        }
+        let connection = self.store.connection()?;
+        let since = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+        let sent: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM audit_log WHERE actor = ?1 AND event = 'delivery.own_chat' AND at >= ?2",
+            rusqlite::params![context.actor, since],
+            |row| row.get(0),
+        )?;
+        Ok(sent < OWN_CHAT_DAILY_CAP)
     }
 
     /// Per-conversation auto-approve ("YOLO"), set by the conversation's own
@@ -1459,6 +1502,74 @@ mod tests {
             require_approval: HashSet::new(),
         };
         (gateway, calls, context)
+    }
+
+    /// A stand-in for `telegram_send_document` (own-chat delivery, 0.69).
+    struct FakeOwnChat {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for FakeOwnChat {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "telegram_send_document".into(),
+                description: "fake own-chat delivery".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                external_effect: true,
+            }
+        }
+
+        async fn execute(&self, _args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolOutput {
+                content: "delivered".into(),
+                ..ToolOutput::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn own_chat_delivery_skips_approval_only_while_the_member_allows_it() {
+        let store = Store::open_in_memory(384).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(FakeOwnChat {
+                calls: calls.clone(),
+            })
+            .unwrap();
+        let gateway = Gateway::new(
+            store.clone(),
+            Arc::new(Policy::from_text("TopSecret")),
+            registry,
+            1,
+            false,
+        );
+        let admin = store.admin_user_id().unwrap();
+        let context = ToolContext {
+            user_id: admin.clone(),
+            actor: admin.clone(),
+            bot: "main".into(),
+            task_id: None,
+            turn_id: None,
+            conversation_id: None,
+            allowed_tools: ["telegram_send_document".to_string()].into_iter().collect(),
+            require_approval: HashSet::new(),
+        };
+        let outcome = gateway
+            .execute("telegram_send_document", serde_json::json!({}), &context)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ToolOutcome::Completed(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        store.set_auto_send_own(&admin, false).unwrap();
+        let outcome = gateway
+            .execute("telegram_send_document", serde_json::json!({}), &context)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ToolOutcome::PendingApproval { .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

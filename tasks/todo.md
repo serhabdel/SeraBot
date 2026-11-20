@@ -324,3 +324,14 @@ never merge without the owner's OK.
 - [x] Phone app 0.68: Usage insights, bot Library, memories in reply traces, approval alerts and badge.
 - [ ] Owner: link Telegram, pick a WhatsApp alert chat, and run "Back up and test now" once; check the OneDrive copy.
 - [ ] Owner: send `/auto` on WhatsApp, then a voice note; the answer should come back as audio plus text.
+
+## Release 0.69.0 — Image tools, WhatsApp photos, own-chat sends, costs, digest
+
+- [x] Image tools: image_crop (pixels, percent, aspect, trim), image_rotate/flip, image_adjust (brightness, contrast, grayscale, black-and-white), image_compress (target KB), images_to_pdf, pdf_to_images.
+- [x] WhatsApp bot has the image and PDF tools; photos sent in a row reach it as one message (up to 10); it describes photos and offers crop / PDF / read.
+- [x] `whatsapp_link_reply_file` takes an optional `to` (another allowed chat); `telegram_send_document` to the member's own chat runs without approval while "send files to my own chats without asking" is on (daily cap, audited).
+- [x] Maker: PC images round trip (local_import → edit → local_export).
+- [x] Costs: owner price table, member monthly budget with alerts at 80/100%, "Costs this month" card; weekly digest (Monday 08:00 UTC) with a "send me now" preview.
+- [x] Desktop: "Try another way" on failed steps.
+- [ ] Owner: send 3 photos on WhatsApp, ask "crop them and make one PDF"; check the PDF comes back.
+- [ ] Owner: add a few prices (Settings: Usage → Costs → Edit prices) and set a budget.

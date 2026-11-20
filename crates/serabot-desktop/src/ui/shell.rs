@@ -1273,6 +1273,18 @@ pub(super) fn ActivityRow(mut session: Signal<Session>, step: Step) -> Element {
                         },
                         StepAction::None => rsx! {},
                     }
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        disabled: !can_retry,
+                        "aria-label": "Ask the bot to try another way",
+                        title: if can_retry { "Ask the bot to change its approach once" } else { "Wait until this reply finishes" },
+                        onclick: {
+                            let text = serabot_desktop::activity::retry_another_way_message(&title);
+                            move |_| session.write().regenerate(text.clone())
+                        },
+                        "Try another way"
+                    }
                 }
             }
             if has_body {

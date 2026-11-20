@@ -23,7 +23,7 @@ use crate::util::{mime_for_filename, sha256_hex};
 /// Upload ceiling for one attachment.
 pub const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 /// Attachments per message.
-pub const MAX_ATTACHMENTS_PER_MESSAGE: usize = 6;
+pub const MAX_ATTACHMENTS_PER_MESSAGE: usize = 10;
 /// Text excerpt per file and per message that is placed in the model prompt.
 const EXCERPT_CHARS_PER_FILE: usize = 8_000;
 const EXCERPT_CHARS_PER_MESSAGE: usize = 20_000;

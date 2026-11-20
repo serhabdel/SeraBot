@@ -33,7 +33,7 @@ pub const MAX_PIXELS: u64 = 100_000_000;
 pub const MAX_SIDE: u32 = 8192;
 const MAX_ALLOC: u64 = 1024 * 1024 * 1024;
 
-fn invalid(message: impl Into<String>) -> SeraError {
+pub(crate) fn invalid(message: impl Into<String>) -> SeraError {
     SeraError::Validation(message.into())
 }
 
@@ -41,20 +41,20 @@ fn invalid(message: impl Into<String>) -> SeraError {
 // Source resolution
 // ---------------------------------------------------------------------------
 
-struct Source {
-    bytes: Vec<u8>,
-    filename: String,
-    artifact: Option<String>,
+pub(crate) struct Source {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) filename: String,
+    pub(crate) artifact: Option<String>,
 }
 
-struct Sources {
-    artifacts: Arc<ArtifactStore>,
-    store: Store,
-    inbox: PathBuf,
+pub(crate) struct Sources {
+    pub(crate) artifacts: Arc<ArtifactStore>,
+    pub(crate) store: Store,
+    pub(crate) inbox: PathBuf,
 }
 
 impl Sources {
-    fn resolve(&self, args: &Value, user_id: &str) -> Result<Source> {
+    pub(crate) fn resolve(&self, args: &Value, user_id: &str) -> Result<Source> {
         let text = |key: &str| {
             args.get(key)
                 .and_then(Value::as_str)
@@ -135,7 +135,7 @@ fn format_name(format: ImageFormat) -> &'static str {
 }
 
 /// Format and size without decoding the pixels.
-fn probe(bytes: &[u8]) -> Result<(ImageFormat, u32, u32)> {
+pub(crate) fn probe(bytes: &[u8]) -> Result<(ImageFormat, u32, u32)> {
     let reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|_| invalid("not a readable image"))?;
@@ -157,7 +157,7 @@ fn probe(bytes: &[u8]) -> Result<(ImageFormat, u32, u32)> {
     Ok((format, width, height))
 }
 
-fn decode_oriented(bytes: &[u8]) -> Result<DynamicImage> {
+pub(crate) fn decode_oriented(bytes: &[u8]) -> Result<DynamicImage> {
     probe(bytes)?;
     let mut reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
@@ -362,7 +362,7 @@ pub enum Output {
 }
 
 impl Output {
-    fn parse(text: &str) -> Result<Self> {
+    pub(crate) fn parse(text: &str) -> Result<Self> {
         match text.to_ascii_lowercase().as_str() {
             "png" => Ok(Self::Png),
             "jpg" | "jpeg" => Ok(Self::Jpeg),
@@ -371,7 +371,7 @@ impl Output {
         }
     }
 
-    fn extension(self) -> &'static str {
+    pub(crate) fn extension(self) -> &'static str {
         match self {
             Self::Png => "png",
             Self::Jpeg => "jpg",
@@ -379,7 +379,7 @@ impl Output {
         }
     }
 
-    fn of(format: ImageFormat) -> Self {
+    pub(crate) fn of(format: ImageFormat) -> Self {
         match format {
             ImageFormat::Jpeg => Self::Jpeg,
             ImageFormat::WebP => Self::WebP,
@@ -438,7 +438,7 @@ pub fn transform(
     Ok((out, width, height))
 }
 
-fn derive_name(source: &str, suffix: &str, extension: &str) -> String {
+pub(crate) fn derive_name(source: &str, suffix: &str, extension: &str) -> String {
     let stem = Path::new(source)
         .file_stem()
         .and_then(|value| value.to_str())
@@ -458,7 +458,7 @@ fn optional_dimension(args: &Value, key: &str) -> Result<Option<u32>> {
     }
 }
 
-fn reject_unknown(args: &Value, allowed: &[&str]) -> Result<()> {
+pub(crate) fn reject_unknown(args: &Value, allowed: &[&str]) -> Result<()> {
     let Some(object) = args.as_object() else {
         return Err(invalid("arguments must be a JSON object"));
     };
@@ -486,7 +486,7 @@ pub struct ImageTransformTool {
     name: &'static str,
 }
 
-fn source_properties() -> Value {
+pub(crate) fn source_properties() -> Value {
     json!({
         "artifact": {"type": "string", "description": "Artifact hash of the image (for example from local_import)"},
         "path": {"type": "string", "description": "Inbox path of the image (for example from local_import)"}
@@ -721,6 +721,7 @@ pub fn register_image_tools(
         inbox: inbox.clone(),
     };
     registry.register(ImageInspectTool { sources: sources() })?;
+    crate::image_edit::register_image_edit_tools(registry, &artifacts, &store, &inbox)?;
     for name in ["image_resize", "image_convert"] {
         registry.register(ImageTransformTool {
             sources: sources(),
