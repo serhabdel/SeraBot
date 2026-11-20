@@ -4,8 +4,11 @@ import 'dart:math';
 
 import 'package:http/http.dart' as http;
 
+import 'alerts_models.dart';
 import 'bot_library_models.dart';
 import 'chat_models.dart';
+import 'costs_models.dart';
+import 'jobs_models.dart';
 import 'models.dart';
 import 'usage_insights_models.dart';
 import 'validation.dart';
@@ -13,13 +16,7 @@ import 'workflows_models.dart';
 
 const _maxResponseBytes = 2 * 1024 * 1024;
 
-enum ApiErrorKind {
-  validation,
-  http,
-  transport,
-  invalidResponse,
-  tooLarge,
-}
+enum ApiErrorKind { validation, http, transport, invalidResponse, tooLarge }
 
 class ApiException implements Exception {
   ApiException(this.kind, {this.statusCode, this.detail, this.retryAfter});
@@ -109,7 +106,10 @@ String? serverErrorText(int status, List<int> body) {
 }
 
 /// Pauses before the second and third try of a read.
-const defaultGetRetryDelays = [Duration(milliseconds: 400), Duration(milliseconds: 1200)];
+const defaultGetRetryDelays = [
+  Duration(milliseconds: 400),
+  Duration(milliseconds: 1200),
+];
 
 /// A `Retry-After` longer than this is shown to the user, not waited out.
 const _maxAutoRetryWait = Duration(seconds: 5);
@@ -125,7 +125,9 @@ const eventIdleTimeout = Duration(seconds: 40);
 /// together do not return together.
 Duration jittered(Duration base, [double? unit]) {
   final u = (unit ?? Random().nextDouble()).clamp(0.0, 1.0);
-  return Duration(microseconds: (base.inMicroseconds * (0.8 + 0.4 * u)).round());
+  return Duration(
+    microseconds: (base.inMicroseconds * (0.8 + 0.4 * u)).round(),
+  );
 }
 
 /// Seconds from a `Retry-After` header, or null when absent or not a number.
@@ -166,8 +168,7 @@ class ApiClient {
     if (!validToken(token)) {
       throw ApiException(
         ApiErrorKind.validation,
-        detail:
-            'API token must contain 32–512 visible ASCII characters, without spaces.',
+        detail: 'API token must contain 32–512 visible ASCII characters, without spaces.',
       );
     }
     return ApiClient._(
@@ -232,7 +233,8 @@ class ApiClient {
         continue;
       }
       final code = response.statusCode;
-      if (attempt < retries.length && (code == 429 || code == 502 || code == 503 || code == 504)) {
+      if (attempt < retries.length &&
+          (code == 429 || code == 502 || code == 503 || code == 504)) {
         final hinted = parseRetryAfter(response.headers['retry-after']);
         if (hinted == null || hinted <= _maxAutoRetryWait) {
           await Future<void>.delayed(jittered(hinted ?? retries[attempt]));
@@ -252,11 +254,11 @@ class ApiClient {
   }) async {
     final uri = _uri(segments, query);
     Future<http.Response> send() => _send(
-          method,
-          uri,
-          bodyBytes: body == null ? null : utf8.encode(jsonEncode(body)),
-          extraHeaders: {if (body != null) 'Content-Type': 'application/json'},
-        );
+      method,
+      uri,
+      bodyBytes: body == null ? null : utf8.encode(jsonEncode(body)),
+      extraHeaders: {if (body != null) 'Content-Type': 'application/json'},
+    );
     var response = await send();
     if (response.statusCode == 401) {
       // The server rejects before running a handler, so asking again is safe
@@ -306,8 +308,7 @@ class ApiClient {
     if (!validId(id)) {
       throw ApiException(
         ApiErrorKind.validation,
-        detail:
-            'IDs must be 1–128 ASCII letters, digits, underscores, colons or hyphens.',
+        detail: 'IDs must be 1–128 ASCII letters, digits, underscores, colons or hyphens.',
       );
     }
   }
@@ -352,25 +353,33 @@ class ApiClient {
     String? ocrModel,
   }) async {
     if (replyMode != null && replyMode != 'text' && replyMode != 'voice') {
-      throw ApiException(ApiErrorKind.validation,
-          detail: 'Reply mode must be text or voice.');
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Reply mode must be text or voice.',
+      );
     }
-    await _request('PUT', ['v1', 'settings', 'voice'], body: {
-      'speech_model': ?speechModel,
-      'voice_id': ?voiceId,
-      'reply_mode': ?replyMode,
-      'ocr_enabled': ?ocrEnabled,
-      'ocr_model': ?ocrModel,
-    });
+    await _request(
+      'PUT',
+      ['v1', 'settings', 'voice'],
+      body: {
+        'speech_model': ?speechModel,
+        'voice_id': ?voiceId,
+        'reply_mode': ?replyMode,
+        'ocr_enabled': ?ocrEnabled,
+        'ocr_model': ?ocrModel,
+      },
+    );
   }
 
   /// The reply mode selected for one conversation.
   Future<ReplyMode> replyMode(String conversationId) async {
     _checkId(conversationId);
-    final json = await _request(
-      'GET',
-      ['v1', 'conversations', conversationId, 'reply-mode'],
-    );
+    final json = await _request('GET', [
+      'v1',
+      'conversations',
+      conversationId,
+      'reply-mode',
+    ]);
     return ReplyMode.fromJson(json);
   }
 
@@ -378,8 +387,10 @@ class ApiClient {
   Future<ReplyMode> setReplyMode(String conversationId, String mode) async {
     _checkId(conversationId);
     if (mode != 'text' && mode != 'voice') {
-      throw ApiException(ApiErrorKind.validation,
-          detail: 'Reply mode must be text or voice.');
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Reply mode must be text or voice.',
+      );
     }
     final json = await _request(
       'PUT',
@@ -403,7 +414,12 @@ class ApiClient {
   Future<ChatPlan?> conversationPlan(String conversationId) async {
     _checkId(conversationId);
     try {
-      final json = await _request('GET', ['v1', 'conversations', conversationId, 'plan']);
+      final json = await _request('GET', [
+        'v1',
+        'conversations',
+        conversationId,
+        'plan',
+      ]);
       final raw = json['plan'];
       if (raw is Map<String, dynamic>) {
         return ChatPlan.parse(raw);
@@ -433,7 +449,10 @@ class ApiClient {
         .toList();
   }
 
-  Future<Selection> selectModel(String conversationId, Selection selection) async {
+  Future<Selection> selectModel(
+    String conversationId,
+    Selection selection,
+  ) async {
     _checkId(conversationId);
     if (!selection.isAuto) {
       if (selection.provider.isEmpty ||
@@ -446,11 +465,12 @@ class ApiClient {
         );
       }
     }
-    final json = await _request(
-      'PUT',
-      ['v1', 'conversations', conversationId, 'model'],
-      body: selection.toJson(),
-    );
+    final json = await _request('PUT', [
+      'v1',
+      'conversations',
+      conversationId,
+      'model',
+    ], body: selection.toJson());
     return Selection.fromJson(json['selection'] as Map<String, dynamic>);
   }
 
@@ -483,9 +503,7 @@ class ApiClient {
         if (attachments.isNotEmpty) 'attachments': attachments,
       },
     );
-    return _checkTask(
-      TaskInfo.fromJson(json['task'] as Map<String, dynamic>),
-    );
+    return _checkTask(TaskInfo.fromJson(json['task'] as Map<String, dynamic>));
   }
 
   /// All of this user's conversations, in the server's order (the same
@@ -602,26 +620,33 @@ class ApiClient {
   /// Undo [archiveConversation].
   Future<void> unarchiveConversation(String id) async {
     _checkId(id);
-    await _request('POST', ['v1', 'conversations', id, 'unarchive'],
-        body: const {});
+    await _request('POST', [
+      'v1',
+      'conversations',
+      id,
+      'unarchive',
+    ], body: const {});
   }
 
   /// Stop the running turn of one conversation.
   Future<void> cancelTurn(String id) async {
     _checkId(id);
-    await _request(
-      'POST',
-      ['v1', 'conversations', id, 'cancel'],
-      body: const {},
-    );
+    await _request('POST', [
+      'v1',
+      'conversations',
+      id,
+      'cancel',
+    ], body: const {});
   }
 
   Future<List<LibraryEntry>> library(String conversationId) async {
     _checkId(conversationId);
-    final json = await _request(
-      'GET',
-      ['v1', 'conversations', conversationId, 'library'],
-    );
+    final json = await _request('GET', [
+      'v1',
+      'conversations',
+      conversationId,
+      'library',
+    ]);
     final list = json['artifacts'];
     if (list is! List || list.length > 100) {
       throw ApiException(ApiErrorKind.invalidResponse);
@@ -650,7 +675,10 @@ class ApiClient {
   ) async {
     _checkId(conversationId);
     if (bytes.isEmpty) {
-      throw ApiException(ApiErrorKind.validation, detail: 'That file is empty.');
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'That file is empty.',
+      );
     }
     if (bytes.length > maxAttachmentBytes) {
       throw ApiException(
@@ -661,8 +689,7 @@ class ApiClient {
     if (!validAttachmentName(filename)) {
       throw ApiException(
         ApiErrorKind.validation,
-        detail:
-            'That file type is not supported. Use images, PDF, Office, text, markdown or CSV files.',
+        detail: 'That file type is not supported. Use images, PDF, Office, text, markdown or CSV files.',
       );
     }
     final response = await _send(
@@ -914,6 +941,89 @@ class ApiClient {
     return UsageInsights.fromJson(json);
   }
 
+  /// Alerts and delivery settings for the caller (`GET /v1/alerts`, 0.68).
+  Future<AlertsView> alerts() async {
+    final json = await _request('GET', ['v1', 'alerts']);
+    return AlertsView.fromJson(json);
+  }
+
+  /// Saves delivery choices and returns the refreshed view (`PUT /v1/alerts`).
+  Future<AlertsView> saveAlerts(AlertsUpdate update) async {
+    final json = await _request('PUT', ['v1', 'alerts'], body: update.toJson());
+    return AlertsView.fromJson(json);
+  }
+
+  /// Sends the caller their weekly digest now (`POST /v1/alerts/digest`).
+  Future<DigestPreview> sendDigestNow() async {
+    final json = await _request('POST', ['v1', 'alerts', 'digest']);
+    return DigestPreview.fromJson(json);
+  }
+
+  /// The caller's brief as text, or null when this server has no brief route
+  /// (`POST /v1/brief/preview`, 0.70).
+  Future<String?> briefPreview() async {
+    final json = await _requestOptional('POST', ['v1', 'brief', 'preview']);
+    if (json == null) {
+      return null;
+    }
+    return alertText(json['text']);
+  }
+
+  /// This month's estimated model cost and the budget (`GET /v1/usage/costs`).
+  Future<CostsReport> usageCosts() async {
+    final json = await _request('GET', ['v1', 'usage', 'costs']);
+    return CostsReport.fromJson(json);
+  }
+
+  /// Sets or clears (null) the monthly budget and returns the refreshed costs
+  /// (`PUT /v1/usage/budget`).
+  Future<CostsReport> setMonthlyBudget(double? usd) async {
+    final json = await _request(
+      'PUT',
+      ['v1', 'usage', 'budget'],
+      body: {'monthly_usd': usd},
+    );
+    return CostsReport.fromJson(json);
+  }
+
+  /// Sets plan prices per provider, null to clear one, and returns the
+  /// refreshed costs (`PUT /v1/usage/plans`, 0.70).
+  Future<CostsReport> setPlanPrices(
+    Map<String, double?> monthlyByProvider,
+  ) async {
+    final json = await _request('PUT', [
+      'v1',
+      'usage',
+      'plans',
+    ], body: plansBody(monthlyByProvider));
+    return CostsReport.fromJson(json);
+  }
+
+  /// The job search profile (`GET /v1/jobs/profile`, 0.70). A 404 means the
+  /// server predates job search; the screen handles it.
+  Future<JobProfile> jobsProfile() async {
+    final json = await _request('GET', ['v1', 'jobs', 'profile']);
+    return JobProfile.fromJson(json);
+  }
+
+  /// Watched job sources, read-only (`GET /v1/jobs/sources`, 0.70).
+  Future<List<JobSource>> jobsSources() async {
+    final json = await _request('GET', ['v1', 'jobs', 'sources']);
+    return jobSourcesFrom(json);
+  }
+
+  /// Tracked applications (`GET /v1/jobs/applications`, 0.70).
+  Future<List<JobApplication>> jobsApplications() async {
+    final json = await _request('GET', ['v1', 'jobs', 'applications']);
+    return jobApplicationsFrom(json);
+  }
+
+  /// Checks the sources now and returns the matches (`POST /v1/jobs/watch`).
+  Future<JobWatchResult> jobsWatch() async {
+    final json = await _request('POST', ['v1', 'jobs', 'watch']);
+    return JobWatchResult.fromJson(json);
+  }
+
   /// Files in a bot's chats: the ones its bots made and the member's uploads
   /// (`GET /v1/bots/{bot}/library`, 0.63). Bad rows are skipped.
   Future<List<BotLibraryItem>> botLibrary(String botId) async {
@@ -940,7 +1050,8 @@ class ApiClient {
     }
     return [
       for (final row in rows.whereType<Map<String, dynamic>>())
-        if (row['kind'] == 'turn.memory' && row['payload'] is Map<String, dynamic>)
+        if (row['kind'] == 'turn.memory' &&
+            row['payload'] is Map<String, dynamic>)
           ServerEvent(0, 'turn.memory', row['payload'] as Map<String, dynamic>),
     ];
   }
@@ -975,18 +1086,19 @@ class ApiClient {
     Duration idleTimeout = eventIdleTimeout,
   }) async* {
     Future<http.StreamedResponse> open() async {
-      final req = http.Request(
-        'GET',
-        _uri(
-          ['v1', 'events'],
-          {'after': after > 0 ? '$after' : 'latest', 'limit': '100'},
-        ),
-      )
-        ..followRedirects = false
-        ..headers.addAll({
-          'Authorization': 'Bearer $_token',
-          'Accept': 'text/event-stream',
-        });
+      final req =
+          http.Request(
+              'GET',
+              _uri(
+                ['v1', 'events'],
+                {'after': after > 0 ? '$after' : 'latest', 'limit': '100'},
+              ),
+            )
+            ..followRedirects = false
+            ..headers.addAll({
+              'Authorization': 'Bearer $_token',
+              'Accept': 'text/event-stream',
+            });
       try {
         return await _http.send(req).timeout(const Duration(seconds: 20));
       } catch (_) {
@@ -1178,7 +1290,10 @@ class ApiClient {
     await _request('POST', ['v1', 'tasks', 'sync', 'run']);
   }
 
-  Future<List<CalendarEventItem>> calendarEvents({String? from, String? to}) async {
+  Future<List<CalendarEventItem>> calendarEvents({
+    String? from,
+    String? to,
+  }) async {
     final query = <String, String>{};
     if (from != null && from.isNotEmpty) query['from'] = from;
     if (to != null && to.isNotEmpty) query['to'] = to;
@@ -1208,15 +1323,13 @@ class ApiClient {
     if (!validBotId(id)) {
       throw ApiException(
         ApiErrorKind.validation,
-        detail:
-            'Bot id must be a lowercase slug of at most 32 characters, and cannot be main or a Windows device name.',
+        detail: 'Bot id must be a lowercase slug of at most 32 characters, and cannot be main or a Windows device name.',
       );
     }
     if (!validBotDescription(description)) {
       throw ApiException(
         ApiErrorKind.validation,
-        detail:
-            'Description must be at most 2,000 characters, without control characters.',
+        detail: 'Description must be at most 2,000 characters, without control characters.',
       );
     }
     try {
@@ -1278,11 +1391,7 @@ class ApiClient {
     final json = await _request(
       'POST',
       ['v1', 'conversations'],
-      body: {
-        'kind': kind.apiValue,
-        'slug': slug,
-        'parent_id': ?parent,
-      },
+      body: {'kind': kind.apiValue, 'slug': slug, 'parent_id': ?parent},
     );
     return _checkCreatedConversation(json, kind, slug, parent);
   }
@@ -1297,16 +1406,14 @@ class ApiClient {
     if (!validNewSkillId(id)) {
       throw ApiException(
         ApiErrorKind.validation,
-        detail:
-            'Skill id must be a lowercase slug of at most 64 characters, and cannot be a Windows device name.',
+        detail: 'Skill id must be a lowercase slug of at most 64 characters, and cannot be a Windows device name.',
       );
     }
     final summary = description.trim();
     if (!validSkillDescription(summary)) {
       throw ApiException(
         ApiErrorKind.validation,
-        detail:
-            'Description must be one line of at most 500 characters, without quotes or backslashes.',
+        detail: 'Description must be one line of at most 500 characters, without quotes or backslashes.',
       );
     }
     final markdown = body?.trim();
@@ -1314,18 +1421,13 @@ class ApiClient {
     if (text != null && !validSkillBody(text)) {
       throw ApiException(
         ApiErrorKind.validation,
-        detail:
-            'Body must be markdown of at most 96,000 bytes, without control characters.',
+        detail: 'Body must be markdown of at most 96,000 bytes, without control characters.',
       );
     }
     final json = await _request(
       'POST',
       ['v1', 'skills'],
-      body: {
-        'id': id,
-        'description': summary,
-        'body': ?text,
-      },
+      body: {'id': id, 'description': summary, 'body': ?text},
     );
     return _checkCreatedSkill(json, id);
   }
@@ -1365,8 +1467,11 @@ class ApiClient {
         activeSupported: snapshot.activeSupported,
       );
     }
-    final sourcesJson =
-        await _requestOptional('GET', ['v1', 'monitoring', 'sources']);
+    final sourcesJson = await _requestOptional('GET', [
+      'v1',
+      'monitoring',
+      'sources',
+    ]);
     if (sourcesJson != null) {
       final rows = parseSources(sourcesJson);
       if (rows == null) {
@@ -1381,8 +1486,11 @@ class ApiClient {
         activeSupported: snapshot.activeSupported,
       );
     }
-    final activeJson =
-        await _requestOptional('GET', ['v1', 'workflows', 'active']);
+    final activeJson = await _requestOptional('GET', [
+      'v1',
+      'workflows',
+      'active',
+    ]);
     if (activeJson != null) {
       final rows = parseActiveWorkflows(activeJson);
       if (rows == null) {
@@ -1416,10 +1524,7 @@ class ApiClient {
     final json = await _requestOptional(
       'GET',
       ['v1', 'traces'],
-      query: {
-        'conversation_id': conversationId,
-        'limit': '$limit',
-      },
+      query: {'conversation_id': conversationId, 'limit': '$limit'},
     );
     if (json == null) {
       return null;
@@ -1551,7 +1656,8 @@ bool _safeFleetFile(String path, String id, String ext) {
     return false;
   }
   for (final b in path.codeUnits) {
-    final ok = (b >= 0x30 && b <= 0x39) ||
+    final ok =
+        (b >= 0x30 && b <= 0x39) ||
         (b >= 0x41 && b <= 0x5a) ||
         (b >= 0x61 && b <= 0x7a) ||
         b == 0x2f ||
@@ -1598,7 +1704,8 @@ bool _safeSkillFile(String path, String id) {
     return false;
   }
   for (final b in path.codeUnits) {
-    final ok = (b >= 0x30 && b <= 0x39) ||
+    final ok =
+        (b >= 0x30 && b <= 0x39) ||
         (b >= 0x41 && b <= 0x5a) ||
         (b >= 0x61 && b <= 0x7a) ||
         b == 0x2f ||
