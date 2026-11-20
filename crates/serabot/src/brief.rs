@@ -20,6 +20,9 @@ use crate::error::Result;
 use crate::store::Store;
 use crate::util::{redact_url_queries, truncate_chars};
 
+mod morning;
+pub use morning::*;
+
 const MAX_GROUP_ITEMS: usize = 20;
 const MAX_SOURCE_WARNINGS: usize = 200;
 const MAX_BRIEF_CHARS: usize = 8000;
@@ -80,6 +83,106 @@ pub fn build_brief_report(
     tz: Tz,
     lookback_hours: u64,
 ) -> Result<BriefReport> {
+    let local_now = now.with_timezone(&tz);
+    let BriefParts {
+        overdue,
+        due_soon,
+        new_items,
+        changed_items,
+        warnings,
+    } = collect_parts(store, user_id, now, tz, lookback_hours)?;
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "Morning brief - {} ({})\n",
+        local_now.format("%Y-%m-%d %H:%M"),
+        tz.name()
+    ));
+
+    let mut sections = 0usize;
+    if !overdue.is_empty() {
+        sections += 1;
+        push_section(
+            &mut out,
+            "Overdue",
+            overdue.len(),
+            overdue.iter().map(|item| item.line.clone()),
+        );
+    }
+    if !due_soon.is_empty() {
+        sections += 1;
+        push_section(
+            &mut out,
+            "Due soon (next 7 days)",
+            due_soon.len(),
+            due_soon.iter().map(|item| item.line.clone()),
+        );
+    }
+    if !changed_items.is_empty() {
+        sections += 1;
+        push_section(
+            &mut out,
+            "Changed",
+            changed_items.len(),
+            changed_items.iter().map(opportunity_line),
+        );
+    }
+    if !new_items.is_empty() {
+        sections += 1;
+        push_section(
+            &mut out,
+            "New",
+            new_items.len(),
+            new_items.iter().map(opportunity_line),
+        );
+    }
+    if !warnings.is_empty() {
+        sections += 1;
+        push_section(
+            &mut out,
+            "Source warnings",
+            warnings.len(),
+            warnings.iter().cloned(),
+        );
+    }
+
+    let empty = sections == 0;
+    if empty {
+        out.push_str("\nNo new items, deadline changes, or source warnings.\n");
+    }
+
+    if out.chars().count() > MAX_BRIEF_CHARS {
+        let mut truncated = truncate_chars(&out, MAX_BRIEF_CHARS - 20);
+        if let Some(last_newline) = truncated.rfind('\n')
+            && last_newline > 0
+        {
+            truncated.truncate(last_newline);
+        }
+        truncated.push_str("\n[brief truncated]\n");
+        return Ok(BriefReport {
+            text: truncated,
+            empty: false,
+        });
+    }
+    Ok(BriefReport { text: out, empty })
+}
+
+/// The rows behind a brief, as printable lines.
+struct BriefParts {
+    overdue: Vec<DeadlineItem>,
+    due_soon: Vec<DeadlineItem>,
+    new_items: Vec<OpportunityItem>,
+    changed_items: Vec<OpportunityItem>,
+    warnings: Vec<String>,
+}
+
+fn collect_parts(
+    store: &Store,
+    user_id: &str,
+    now: DateTime<Utc>,
+    tz: Tz,
+    lookback_hours: u64,
+) -> Result<BriefParts> {
     let connection = store.connection()?;
     let local_now = now.with_timezone(&tz);
     let today = local_now.date_naive();
@@ -200,80 +303,13 @@ pub fn build_brief_report(
     }
 
     let warnings = source_warnings(&connection, user_id, now, tz)?;
-
-    let mut out = String::new();
-    out.push_str(&format!(
-        "Morning brief - {} ({})\n",
-        local_now.format("%Y-%m-%d %H:%M"),
-        tz.name()
-    ));
-
-    let mut sections = 0usize;
-    if !overdue.is_empty() {
-        sections += 1;
-        push_section(
-            &mut out,
-            "Overdue",
-            overdue.len(),
-            overdue.iter().map(|item| item.line.clone()),
-        );
-    }
-    if !due_soon.is_empty() {
-        sections += 1;
-        push_section(
-            &mut out,
-            "Due soon (next 7 days)",
-            due_soon.len(),
-            due_soon.iter().map(|item| item.line.clone()),
-        );
-    }
-    if !changed_items.is_empty() {
-        sections += 1;
-        push_section(
-            &mut out,
-            "Changed",
-            changed_items.len(),
-            changed_items.iter().map(opportunity_line),
-        );
-    }
-    if !new_items.is_empty() {
-        sections += 1;
-        push_section(
-            &mut out,
-            "New",
-            new_items.len(),
-            new_items.iter().map(opportunity_line),
-        );
-    }
-    if !warnings.is_empty() {
-        sections += 1;
-        push_section(
-            &mut out,
-            "Source warnings",
-            warnings.len(),
-            warnings.iter().cloned(),
-        );
-    }
-
-    let empty = sections == 0;
-    if empty {
-        out.push_str("\nNo new items, deadline changes, or source warnings.\n");
-    }
-
-    if out.chars().count() > MAX_BRIEF_CHARS {
-        let mut truncated = truncate_chars(&out, MAX_BRIEF_CHARS - 20);
-        if let Some(last_newline) = truncated.rfind('\n')
-            && last_newline > 0
-        {
-            truncated.truncate(last_newline);
-        }
-        truncated.push_str("\n[brief truncated]\n");
-        return Ok(BriefReport {
-            text: truncated,
-            empty: false,
-        });
-    }
-    Ok(BriefReport { text: out, empty })
+    Ok(BriefParts {
+        overdue,
+        due_soon,
+        new_items,
+        changed_items,
+        warnings,
+    })
 }
 
 fn deadline_item(

@@ -1021,6 +1021,17 @@ pub fn known_tool_names() -> Vec<&'static str> {
         "browser_close",
         "browser_tabs",
         "browser_new_tab",
+        "browser_find",
+        "browser_wait",
+        "browser_select",
+        "browser_check",
+        "browser_scroll",
+        "browser_hover",
+        "browser_upload",
+        "browser_download",
+        "browser_pdf",
+        "browser_dismiss_banners",
+        "browser_forget_logins",
         "google_drive_list",
         "google_sheets_read",
         "google_calendar_list_events",
@@ -1029,6 +1040,15 @@ pub fn known_tool_names() -> Vec<&'static str> {
         "tasks_create",
         "job_search",
         "job_dossier_checklist",
+        "job_profile_get",
+        "job_profile_set",
+        "job_watch_now",
+        "job_sources_list",
+        "job_sources_set",
+        "job_application_add",
+        "job_application_update",
+        "job_applications_list",
+        "onedrive_download",
         "gmail_list_messages",
         "outlook_list_messages",
         "outlook_calendar_list_events",
@@ -1078,6 +1098,7 @@ pub fn known_tool_names() -> Vec<&'static str> {
         "docx_edit",
         "docx_inspect",
         "docx_read",
+        "research_report_build",
     ]);
     #[cfg(feature = "pptx")]
     names.extend(["pptx_import", "pptx_pdf", "pptx_inspect", "pptx_edit"]);
@@ -1174,9 +1195,14 @@ pub fn register_docx_tools(
         store.clone(),
         inbox,
     )?)?;
+    let store_for_report = store.clone();
     registry.register(crate::docx_ops::DocxEditTool::new(artifacts.clone(), store))?;
     registry.register(crate::docx_ops::DocxInspectTool::new(artifacts.clone()))?;
-    registry.register(crate::docx_ops::DocxReadTool::new(artifacts))?;
+    registry.register(crate::docx_ops::DocxReadTool::new(artifacts.clone()))?;
+    registry.register(crate::research_report::ResearchReportBuildTool::new(
+        artifacts,
+        store_for_report,
+    ))?;
     Ok(())
 }
 

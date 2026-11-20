@@ -232,6 +232,8 @@ pub struct CloudCodeCompletion {
     pub tool_calls: Vec<CloudCodeToolCall>,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// Input tokens served from the prompt cache (0.70).
+    pub cached_tokens: u64,
     pub finish_reason: Option<String>,
 }
 
@@ -1193,6 +1195,7 @@ fn absorb_completion(completion: &mut CloudCodeCompletion, value: &Value) -> Res
                 .and_then(json_u64)
                 .unwrap_or(0);
             completion.prompt_tokens = prompt.saturating_sub(cached);
+            completion.cached_tokens = cached.min(prompt);
         }
         // Output counts what the model thought as well as what it said.
         let output = usage
@@ -2923,6 +2926,7 @@ mod tests {
         let parsed = parse_cloud_code_stream(sse).expect("sse parses");
         assert_eq!(parsed.text, "hello world");
         assert_eq!(parsed.prompt_tokens, 40);
+        assert_eq!(parsed.cached_tokens, 80);
         assert_eq!(parsed.completion_tokens, 5);
         assert_eq!(parsed.finish_reason.as_deref(), Some("STOP"));
     }

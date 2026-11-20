@@ -626,7 +626,7 @@ fn stop_reason_word(reason: &str) -> String {
 pub fn parse_stream(body: &[u8]) -> Result<ParsedMessage> {
     let mut blocks: BTreeMap<u64, Block> = BTreeMap::new();
     let mut parsed = ParsedMessage::default();
-    let (mut input_tokens, mut output_tokens) = (0u64, 0u64);
+    let (mut input_tokens, mut output_tokens, mut cached_tokens) = (0u64, 0u64, 0u64);
     for event in sse::events(body) {
         let Ok(data) = serde_json::from_str::<Value>(&event.data) else {
             continue;
@@ -642,9 +642,11 @@ pub fn parse_stream(body: &[u8]) -> Result<ParsedMessage> {
             "message_start" => {
                 if let Some(usage) = data.pointer("/message/usage") {
                     let count = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
-                    input_tokens = count("input_tokens")
-                        .saturating_add(count("cache_creation_input_tokens"))
-                        .saturating_add(count("cache_read_input_tokens"));
+                    // Cache writes bill near the input rate; cache reads
+                    // are counted apart at the cache price (0.70).
+                    input_tokens =
+                        count("input_tokens").saturating_add(count("cache_creation_input_tokens"));
+                    cached_tokens = count("cache_read_input_tokens");
                     output_tokens = output_tokens.max(count("output_tokens"));
                 }
             }
@@ -757,7 +759,10 @@ pub fn parse_stream(body: &[u8]) -> Result<ParsedMessage> {
     parsed.usage = Usage {
         prompt_tokens: input_tokens,
         completion_tokens: output_tokens,
-        total_tokens: input_tokens.saturating_add(output_tokens),
+        total_tokens: input_tokens
+            .saturating_add(cached_tokens)
+            .saturating_add(output_tokens),
+        cached_tokens,
     };
     if parsed.finish_reason.is_none() {
         parsed.finish_reason = Some(if parsed.tool_calls.is_empty() {
@@ -1230,7 +1235,9 @@ mod tests {
         ]);
         let parsed = parse_stream(&body).unwrap();
         assert_eq!(parsed.text, "Hello");
-        assert_eq!(parsed.usage.prompt_tokens, 100);
+        assert_eq!(parsed.usage.prompt_tokens, 10);
+        assert_eq!(parsed.usage.cached_tokens, 90);
+        assert_eq!(parsed.usage.total_tokens, 112);
         assert_eq!(parsed.usage.completion_tokens, 12);
         assert_eq!(parsed.finish_reason.as_deref(), Some("stop"));
         assert!(parsed.tool_calls.is_empty());

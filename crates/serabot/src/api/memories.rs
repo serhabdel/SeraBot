@@ -302,3 +302,54 @@ fn validate_memory_id(id: &str) -> Result<()> {
     }
     Ok(())
 }
+
+/// `GET /v1/memory/review`: up to ten of the caller's memories worth a look
+/// (contradicted, near-duplicate, long unconfirmed), each with the reason.
+pub(super) async fn review_get(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    let candidates = crate::memory_review::candidates(
+        &state.store,
+        &user.id,
+        chrono::Utc::now(),
+        crate::memory_review::MAX_CANDIDATES,
+    )?;
+    Ok(Json(json!({
+        "candidates": candidates,
+        "stale_days": crate::memory_review::STALE_DAYS,
+        "weekly": state.store.helper_settings(&user.id)?.memory_review,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ReviewRequest {
+    /// `keep`, `delete` or `merge_into:<id>`.
+    action: String,
+}
+
+/// `POST /v1/memory/review/{id}`: keep (confirm), delete, or merge the memory
+/// into another of the caller's. Another member's id is simply not found.
+pub(super) async fn review_post(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+    Json(request): Json<ReviewRequest>,
+) -> Result<Json<Value>> {
+    validate_memory_id(&id)?;
+    let action: crate::memory_review::ReviewAction = request.action.parse()?;
+    let outcome =
+        crate::memory_review::apply(&state.store, &user.id, &id, &action, chrono::Utc::now())?;
+    state.store.record_audit(
+        &user.id,
+        "memory.reviewed",
+        None,
+        None,
+        None,
+        None,
+        Some(state.runtime.policy_version()),
+        Some(&json!({"id": id, "action": outcome.action, "merged_into": outcome.merged_into})),
+    )?;
+    Ok(Json(json!({"result": outcome})))
+}

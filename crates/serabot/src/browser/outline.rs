@@ -22,6 +22,133 @@ pub struct Outline {
     pub text: String,
     /// `refs[0]` is `e1`.
     pub refs: Vec<RefTarget>,
+    /// Only the actionable elements (one line each, same `[eN]` refs): the
+    /// compact `interactive` snapshot mode.
+    pub interactive: String,
+}
+
+/// How much of the page `browser_snapshot` returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotMode {
+    /// Only actionable elements, compact.
+    Interactive,
+    /// The whole outline (default).
+    Full,
+    /// Readable main text, bounded; no refs.
+    Text,
+}
+
+impl SnapshotMode {
+    pub fn parse(raw: Option<&str>) -> Result<Self> {
+        match raw
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            None | Some("") | Some("full") => Ok(Self::Full),
+            Some("interactive") => Ok(Self::Interactive),
+            Some("text") => Ok(Self::Text),
+            Some(other) => Err(SeraError::Validation(format!(
+                "mode must be interactive, full or text (got '{other}')"
+            ))),
+        }
+    }
+}
+
+/// One element found by [`find_in_outline`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindHit {
+    /// The ref (`e3`), or `None` for plain text that is not an element.
+    pub reference: Option<String>,
+    pub line: String,
+}
+
+/// Find elements on a fresh outline by ARIA role and/or accessible name, or
+/// lines by visible text. Matching is case-insensitive; `name` and `text` match
+/// anywhere. Exact name matches come first. Pure so it is testable without a
+/// browser.
+pub fn find_in_outline(
+    outline: &Outline,
+    role: Option<&str>,
+    name: Option<&str>,
+    text: Option<&str>,
+    limit: usize,
+) -> Vec<FindHit> {
+    let role = role
+        .map(|value| value.trim().to_lowercase())
+        .filter(|v| !v.is_empty());
+    let name = name
+        .map(|value| value.trim().to_lowercase())
+        .filter(|v| !v.is_empty());
+    let text = text
+        .map(|value| value.trim().to_lowercase())
+        .filter(|v| !v.is_empty());
+    let mut exact: Vec<FindHit> = Vec::new();
+    let mut partial: Vec<FindHit> = Vec::new();
+    if role.is_some() || name.is_some() {
+        for (index, target) in outline.refs.iter().enumerate() {
+            if let Some(role) = &role
+                && target.role.to_lowercase() != *role
+            {
+                continue;
+            }
+            let target_name = target.name.to_lowercase();
+            let is_exact = match &name {
+                Some(wanted) => {
+                    if !target_name.contains(wanted.as_str()) {
+                        continue;
+                    }
+                    target_name == *wanted
+                }
+                None => true,
+            };
+            let hit = FindHit {
+                reference: Some(format!("e{}", index + 1)),
+                line: if target.name.is_empty() {
+                    target.role.clone()
+                } else {
+                    format!("{} \"{}\"", target.role, target.name)
+                },
+            };
+            if is_exact {
+                exact.push(hit);
+            } else {
+                partial.push(hit);
+            }
+        }
+    }
+    if let Some(text) = &text {
+        for line in outline.text.lines() {
+            if !line.to_lowercase().contains(text.as_str()) {
+                continue;
+            }
+            let reference = line
+                .strip_prefix("[e")
+                .and_then(|rest| rest.split_once("] "))
+                .filter(|(digits, _)| digits.bytes().all(|b| b.is_ascii_digit()))
+                .map(|(digits, _)| format!("e{digits}"));
+            let hit = FindHit {
+                reference,
+                line: line
+                    .split_once("] ")
+                    .filter(|_| line.starts_with("[e"))
+                    .map_or(line, |(_, rest)| rest)
+                    .to_owned(),
+            };
+            if hit.reference.is_some() {
+                exact.push(hit);
+            } else {
+                partial.push(hit);
+            }
+        }
+    }
+    exact.extend(partial);
+    let mut seen = std::collections::HashSet::new();
+    exact.retain(|hit| match &hit.reference {
+        Some(reference) => seen.insert(reference.clone()),
+        None => true,
+    });
+    exact.truncate(limit);
+    exact
 }
 
 impl Outline {
@@ -135,6 +262,7 @@ pub fn build_outline(nodes: &[Value], max_chars: usize, max_refs: usize) -> Outl
         .or_else(|| nodes.first());
     let mut out = Outline::default();
     let mut lines: Vec<String> = Vec::new();
+    let mut interactive_lines: Vec<String> = Vec::new();
     let mut used = 0usize;
     if let Some(root) = root {
         let mut stack: Vec<(&Value, usize)> = vec![(root, 0)];
@@ -176,6 +304,9 @@ pub fn build_outline(nodes: &[Value], max_chars: usize, max_refs: usize) -> Outl
                         line.push_str(&format!(" ({})", flags.join(", ")));
                     }
                     used += line.len();
+                    if line.starts_with("[e") {
+                        interactive_lines.push(line.clone());
+                    }
                     lines.push(line);
                     // The text children of a control repeat its name.
                     descend = false;
@@ -218,6 +349,11 @@ pub fn build_outline(nodes: &[Value], max_chars: usize, max_refs: usize) -> Outl
         lines.push("(empty page)".into());
     }
     out.text = lines.join("\n");
+    out.interactive = if interactive_lines.is_empty() {
+        "(no interactive elements)".to_owned()
+    } else {
+        interactive_lines.join("\n")
+    };
     out
 }
 
@@ -382,3 +518,6 @@ mod tests {
         assert!(key_def("").is_none());
     }
 }
+
+#[cfg(test)]
+mod mode_tests;

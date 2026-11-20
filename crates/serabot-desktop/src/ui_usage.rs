@@ -15,6 +15,8 @@ use serabot_desktop::theme::{Level, Tone};
 use serabot_desktop::{UsageBucket, UsageModel, UsageReport};
 
 use crate::ui::{Icon, human_provider};
+use crate::ui_bot_health::BotHealthCard;
+use crate::ui_job_search::JobSearchCard;
 use crate::ui_ops::{AlertsCard, BackupsCard, CostsCard};
 use crate::ui_usage_insights::UsageInsights;
 use crate::ui_widgets::{LevelChip, StatusChip};
@@ -286,6 +288,17 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
                         }
                     }
                 }
+                section { class: "usage-section", "aria-labelledby": "usage-jobs-title",
+                    div { class: "page-section-head",
+                        div {
+                            h2 { class: "usage-section-title", id: "usage-jobs-title", "Job search" }
+                            p { class: "usage-section-sub", "What JobFinder watches for you, and where your applications stand." }
+                        }
+                    }
+                    div { class: "insights-grid",
+                        JobSearchCard { session }
+                    }
+                }
                 section { class: "usage-section", "aria-labelledby": "usage-activity-title",
                     div { class: "page-section-head",
                         div {
@@ -383,6 +396,7 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
                     }
                 }
                 UsageInsights { session, days: days.min(90) }
+                BotHealthCard { session, days }
                 if report_ready && !empty {
                     section { class: "usage-section", "aria-labelledby": "usage-breakdown-title",
                         div { class: "page-section-head",

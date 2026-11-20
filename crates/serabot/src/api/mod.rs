@@ -55,6 +55,7 @@ mod accounts;
 mod admin;
 mod approvals;
 mod bot_chats;
+mod bot_health_api;
 mod bots;
 mod browser;
 mod cards;
@@ -63,6 +64,7 @@ mod connectors;
 mod conversations;
 mod files;
 mod handoffs;
+mod job_search;
 mod jobs;
 mod local;
 mod logs;
@@ -95,6 +97,7 @@ use accounts::*;
 use admin::*;
 use approvals::*;
 use bot_chats::*;
+use bot_health_api::*;
 use bots::*;
 use browser::*;
 use cards::*;
@@ -481,6 +484,7 @@ pub fn router(state: ApiState) -> Router {
             put(profile_rename).delete(profile_delete),
         )
         .route("/v1/messages", post(send_message))
+        .route("/v1/bots/health", get(bot_health_report))
         .route("/v1/bots", get(list_bots).post(create_bot))
         .route("/v1/marketplace/plugins", get(list_plugins))
         .route(
@@ -527,11 +531,28 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/v1/bots/{bot}/library", get(bot_library))
         .route("/v1/relay/net", get(relay::relay_get).put(relay::relay_put))
+        .route("/v1/jobs/overview", get(job_search::jobs_overview))
+        .route(
+            "/v1/jobs/profile",
+            get(job_search::jobs_profile_get).put(job_search::jobs_profile_put),
+        )
+        .route("/v1/jobs/sources", get(job_search::jobs_sources_get))
+        .route("/v1/jobs/sources/{key}", put(job_search::jobs_source_put))
+        .route(
+            "/v1/jobs/applications",
+            get(job_search::jobs_applications_get),
+        )
+        .route("/v1/jobs/watch", post(job_search::jobs_watch))
         .route("/v1/alerts", get(ops::alerts_get).put(ops::alerts_put))
         .route("/v1/alerts/digest", post(ops::digest_now))
+        .route("/v1/brief/preview", post(ops::brief_preview))
+        .route("/v1/memory/review", get(memories::review_get))
+        .route("/v1/memory/review/{id}", post(memories::review_post))
         .route("/v1/usage/costs", get(ops::costs_get))
         .route("/v1/usage/budget", put(ops::budget_put))
         .route("/v1/admin/prices", put(ops::prices_put))
+        .route("/v1/admin/prices/suggested", get(ops::prices_suggested))
+        .route("/v1/usage/plans", put(ops::plans_put))
         .route("/v1/admin/backups", get(ops::backups_get))
         .route("/v1/admin/backups/run", post(ops::backups_run))
         .route("/v1/relay/net/exchange", post(relay::relay_exchange))

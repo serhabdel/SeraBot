@@ -3,6 +3,8 @@
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui;
 #[cfg(any(windows, feature = "ui-check"))]
+mod ui_bot_health;
+#[cfg(any(windows, feature = "ui-check"))]
 mod ui_bots;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_browser;
@@ -21,6 +23,8 @@ mod ui_files;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_integrations;
 #[cfg(any(windows, feature = "ui-check"))]
+mod ui_job_search;
+#[cfg(any(windows, feature = "ui-check"))]
 mod ui_jobs;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_logs;
@@ -28,6 +32,8 @@ mod ui_logs;
 mod ui_marketplace;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_mcp_accounts;
+#[cfg(any(windows, feature = "ui-check"))]
+mod ui_memory_review;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_net_relay;
 #[cfg(any(windows, feature = "ui-check"))]

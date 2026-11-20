@@ -489,7 +489,8 @@ pub fn parse_stream(body: &[u8]) -> Result<ParsedResponse> {
             parsed.usage = Usage {
                 prompt_tokens: input.saturating_sub(cached),
                 completion_tokens: output,
-                total_tokens: input.saturating_sub(cached).saturating_add(output),
+                total_tokens: input.saturating_add(output),
+                cached_tokens: cached.min(input),
             };
         }
         if reasoning_items.is_empty()
@@ -836,8 +837,9 @@ mod tests {
         assert_eq!(parsed.text, "Bonjour");
         assert_eq!(parsed.reasoning, "thinking...");
         assert_eq!(parsed.usage.prompt_tokens, 60);
+        assert_eq!(parsed.usage.cached_tokens, 40);
         assert_eq!(parsed.usage.completion_tokens, 7);
-        assert_eq!(parsed.usage.total_tokens, 67);
+        assert_eq!(parsed.usage.total_tokens, 107);
         assert_eq!(parsed.finish_reason.as_deref(), Some("stop"));
     }
 

@@ -4169,6 +4169,16 @@ impl ApiClient {
         self.get(&["v1", "usage", "insights"], &query)
     }
 
+    /// `GET /v1/bots/health?days=7|30` (0.70): per-bot success rate, turn
+    /// times, failing tools and failovers.
+    pub fn bot_health(
+        &self,
+        days: u32,
+    ) -> Result<crate::bot_health_view::BotHealthReport, ApiError> {
+        let days_value = if days <= 7 { "7" } else { "30" };
+        self.get(&["v1", "bots", "health"], &[("days", days_value)])
+    }
+
     pub fn relay_get(&self) -> Result<serde_json::Value, ApiError> {
         self.get(&["v1", "relay", "net"], &[])
     }
@@ -4200,6 +4210,64 @@ impl ApiClient {
     /// auto_send_files, weekly_digest (0.69).
     pub fn alerts_update(&self, body: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
         self.request(Method::PUT, &["v1", "alerts"], &[], Some(body))
+    }
+
+    /// `GET /v1/memory/review` (0.70): memories worth a look.
+    pub fn memory_review_get(&self) -> Result<serde_json::Value, ApiError> {
+        self.get(&["v1", "memory", "review"], &[])
+    }
+
+    /// `POST /v1/memory/review/{id}` (0.70): `keep`, `delete` or
+    /// `merge_into:<id>`.
+    pub fn memory_review_act(&self, id: &str, action: &str) -> Result<serde_json::Value, ApiError> {
+        if !valid_memory_id(id) {
+            return Err(ApiError::Validation("Invalid memory id."));
+        }
+        self.request(
+            Method::POST,
+            &["v1", "memory", "review", id],
+            &[],
+            Some(&serde_json::json!({"action": action})),
+        )
+    }
+
+    /// `POST /v1/brief/preview` (0.70): send me my morning brief now.
+    pub fn brief_preview(&self) -> Result<serde_json::Value, ApiError> {
+        self.request(
+            Method::POST,
+            &["v1", "brief", "preview"],
+            &[],
+            Some(&serde_json::json!({})),
+        )
+    }
+
+    /// `GET /v1/jobs/overview` (0.70): profile, sources, matches, pipeline counts.
+    pub fn jobs_overview(&self) -> Result<serde_json::Value, ApiError> {
+        self.get(&["v1", "jobs", "overview"], &[])
+    }
+
+    /// `PUT /v1/jobs/sources/{key}` (0.70): switch a source's auto-watch.
+    pub fn jobs_source_auto_watch(
+        &self,
+        key: &str,
+        auto_watch: bool,
+    ) -> Result<serde_json::Value, ApiError> {
+        self.request(
+            Method::PUT,
+            &["v1", "jobs", "sources", key],
+            &[],
+            Some(&serde_json::json!({"auto_watch": auto_watch})),
+        )
+    }
+
+    /// `POST /v1/jobs/watch` (0.70): check the job sources now.
+    pub fn jobs_watch(&self) -> Result<serde_json::Value, ApiError> {
+        self.request(
+            Method::POST,
+            &["v1", "jobs", "watch"],
+            &[],
+            Some(&serde_json::json!({})),
+        )
     }
 
     /// `POST /v1/alerts/digest` (0.69): send me my weekly digest now.
@@ -4234,6 +4302,22 @@ impl ApiClient {
             &["v1", "admin", "prices"],
             &[],
             Some(&serde_json::json!({"prices": prices})),
+        )
+    }
+
+    /// `GET /v1/admin/prices/suggested` (0.70, owner only): researched,
+    /// unverified prices to review before saving.
+    pub fn prices_suggested(&self) -> Result<serde_json::Value, ApiError> {
+        self.get(&["v1", "admin", "prices", "suggested"], &[])
+    }
+
+    /// `PUT /v1/usage/plans` (0.70): what I pay per month for each plan.
+    pub fn plans_put(&self, plans: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
+        self.request(
+            Method::PUT,
+            &["v1", "usage", "plans"],
+            &[],
+            Some(&serde_json::json!({"plans": plans})),
         )
     }
 

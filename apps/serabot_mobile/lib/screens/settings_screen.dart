@@ -9,6 +9,9 @@ import '../theme.dart';
 import '../status.dart';
 import '../update_flow.dart';
 import '../widgets.dart';
+import 'alerts_screen.dart';
+import 'costs_screen.dart';
+import 'jobs_screen.dart';
 import 'usage_insights_screen.dart';
 
 /// Account, theme, read-only connector status, usage summary and About.
@@ -81,8 +84,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Future<void> _loadVersion() async {
     try {
-      final v = await (widget.versionLoader ??
-          () async => (await PackageInfo.fromPlatform()).version)();
+      final v =
+          await (widget.versionLoader ??
+              () async => (await PackageInfo.fromPlatform()).version)();
       if (mounted) {
         setState(() => _version = v);
       }
@@ -102,15 +106,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ListTile(
             leading: CircleAvatar(
               backgroundColor: scheme.primaryContainer,
-              child: Text((user?.label.isNotEmpty ?? false)
-                  ? user!.label.characters.first.toUpperCase()
-                  : '?'),
+              child: Text(
+                (user?.label.isNotEmpty ?? false)
+                    ? user!.label.characters.first.toUpperCase()
+                    : '?',
+              ),
             ),
             title: Text(user?.label ?? 'Signed in'),
-            subtitle: Text([
-              if (user != null && user.email.isNotEmpty) user.email,
-              if (user != null && user.role.isNotEmpty) user.role,
-            ].join(' \u00b7 ')),
+            subtitle: Text(
+              [
+                if (user != null && user.email.isNotEmpty) user.email,
+                if (user != null && user.role.isNotEmpty) user.role,
+              ].join(' \u00b7 '),
+            ),
           ),
           ListTile(
             leading: const Icon(Icons.dns_outlined),
@@ -127,8 +135,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
               child: SegmentedButton<ThemeMode>(
                 key: const Key('theme-toggle'),
                 segments: const [
-                  ButtonSegment(value: ThemeMode.light, label: Text('Light'), icon: Icon(Icons.light_mode_outlined)),
-                  ButtonSegment(value: ThemeMode.dark, label: Text('Dark'), icon: Icon(Icons.dark_mode_outlined)),
+                  ButtonSegment(
+                    value: ThemeMode.light,
+                    label: Text('Light'),
+                    icon: Icon(Icons.light_mode_outlined),
+                  ),
+                  ButtonSegment(
+                    value: ThemeMode.dark,
+                    label: Text('Dark'),
+                    icon: Icon(Icons.dark_mode_outlined),
+                  ),
                   ButtonSegment(value: ThemeMode.system, label: Text('System')),
                 ],
                 selected: {widget.theme.mode},
@@ -158,6 +174,46 @@ class _SettingsScreenState extends State<SettingsScreen> {
             onTap: () => Navigator.of(context).push(
               MaterialPageRoute<void>(
                 builder: (_) => UsageInsightsScreen(app: widget.app),
+              ),
+            ),
+          ),
+          ListTile(
+            key: const Key('usage-costs'),
+            leading: const Icon(Icons.payments_outlined),
+            title: const Text('Costs and budget'),
+            subtitle: const Text('Estimated cost this month, and plans vs API'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => CostsScreen(app: widget.app),
+              ),
+            ),
+          ),
+          const Divider(),
+          _section(context, 'Alerts and jobs'),
+          ListTile(
+            key: const Key('alerts-settings'),
+            leading: const Icon(Icons.notifications_outlined),
+            title: const Text('Alerts and delivery'),
+            subtitle: const Text('Telegram, WhatsApp, digests and the brief'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => AlertsScreen(app: widget.app),
+              ),
+            ),
+          ),
+          ListTile(
+            key: const Key('job-search'),
+            leading: const Icon(Icons.work_outline),
+            title: const Text('Job search'),
+            subtitle: const Text(
+              'Your profile, sources, applications and matches',
+            ),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => JobsScreen(app: widget.app),
               ),
             ),
           ),
@@ -199,9 +255,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Widget _errorTile(String message) => Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-        child: ErrorBanner(message, onRetry: _reload),
-      );
+    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+    child: ErrorBanner(message, onRetry: _reload),
+  );
 
   /// Daily task budget: a word, an icon and a bar, never colour alone.
   Widget _quotaTile(BuildContext context, UsageQuota q) {
@@ -211,8 +267,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
     final percent = quotaPercent(q.used, q.limit);
     final note = switch (level) {
-      StatusLevel.atLimit =>
-        'You reached today\'s task limit. New bot turns wait until UTC midnight.',
+      StatusLevel.atLimit => 'You reached today\'s task limit. New bot turns wait until UTC midnight.',
       StatusLevel.near => 'You are close to today\'s task limit.',
       StatusLevel.ok =>
         'Queued and completed tasks count toward this UTC-day budget.',
@@ -239,8 +294,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
           ),
           const SizedBox(height: 6),
-          Text('Tasks today (UTC): ${q.used} of ${q.limit}',
-              style: Theme.of(context).textTheme.bodySmall),
+          Text(
+            'Tasks today (UTC): ${q.used} of ${q.limit}',
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
           Text(note, style: Theme.of(context).textTheme.bodySmall),
         ],
       ),
@@ -248,9 +305,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Widget _section(BuildContext context, String t) => Padding(
-        padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-        child: Text(t, style: Theme.of(context).textTheme.titleSmall),
-      );
+    padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+    child: Text(t, style: Theme.of(context).textTheme.titleSmall),
+  );
 
   List<Widget> _connectorTiles(BuildContext context) {
     if (_connectorsError != null) {
@@ -272,14 +329,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
             color: c.isConnected ? Theme.of(context).colorScheme.primary : null,
           ),
           title: Text(c.id),
-          subtitle: Text(c.account != null && c.isConnected
-              ? '${c.statusLabel} \u00b7 ${c.account}'
-              : (c.needsDesktop ? 'Connect on desktop' : c.statusLabel)),
+          subtitle: Text(
+            c.account != null && c.isConnected
+                ? '${c.statusLabel} \u00b7 ${c.account}'
+                : (c.needsDesktop ? 'Connect on desktop' : c.statusLabel),
+          ),
         ),
       const Padding(
         padding: EdgeInsets.fromLTRB(16, 4, 16, 8),
-        child: Text('Connecting an account needs the sign-in page to return to '
-            'your PC. Do it in the desktop app; it shows here afterwards.'),
+        child: Text(
+          'Connecting an account needs the sign-in page to return to '
+          'your PC. Do it in the desktop app; it shows here afterwards.',
+        ),
       ),
     ];
   }
@@ -293,7 +354,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       return [const ListTile(title: Text('Loading\u2026'))];
     }
     String n(int v) => v.toString().replaceAllMapped(
-        RegExp(r'\B(?=(\d{3})+(?!\d))'), (_) => ',');
+      RegExp(r'\B(?=(\d{3})+(?!\d))'),
+      (_) => ',',
+    );
     return [
       ListTile(
         dense: true,

@@ -7,6 +7,7 @@ use crate::ops::{AlertSettings, backup_view};
 fn alerts_view(state: &ApiState, user_id: &str) -> Result<Value> {
     let settings = state.store.alert_settings(user_id)?;
     let telegram_linked = state.store.telegram_chat_for(user_id)?.is_some();
+    let helpers = state.store.helper_settings(user_id)?;
     let choices: Vec<Value> = state
         .store
         .alert_whatsapp_choices(user_id)?
@@ -21,6 +22,11 @@ fn alerts_view(state: &ApiState, user_id: &str) -> Result<Value> {
         "settings": settings,
         "auto_send_files": state.store.auto_send_own(user_id)?,
         "weekly_digest": state.store.weekly_digest(user_id)?,
+        "morning_brief": helpers.morning_brief,
+        "brief_hour_utc": helpers.brief_hour_utc.unwrap_or(state.config.ops.brief_hour_utc),
+        "email_triage": helpers.email_triage,
+        "triage_hour_utc": helpers.triage_hour_utc.unwrap_or(state.config.ops.triage_hour_utc),
+        "memory_review": helpers.memory_review,
         "digest": {
             "enabled": state.config.ops.digest_enabled,
             "weekday": state.config.ops.digest_weekday,
@@ -57,6 +63,19 @@ pub(super) struct AlertSettingsRequest {
     /// Weekly digest on or off (0.69).
     #[serde(default)]
     weekly_digest: Option<bool>,
+    /// Morning brief on or off, and the hour (UTC) it arrives (0.70).
+    #[serde(default)]
+    morning_brief: Option<bool>,
+    #[serde(default)]
+    brief_hour_utc: Option<u8>,
+    /// Daily email triage on or off, and its hour (UTC) (0.70).
+    #[serde(default)]
+    email_triage: Option<bool>,
+    #[serde(default)]
+    triage_hour_utc: Option<u8>,
+    /// Weekly memory review message on or off (0.70).
+    #[serde(default)]
+    memory_review: Option<bool>,
 }
 
 pub(super) async fn alerts_put(
@@ -84,6 +103,16 @@ pub(super) async fn alerts_put(
     if let Some(on) = request.weekly_digest {
         state.store.set_weekly_digest(&user.id, on)?;
     }
+    state.store.set_helper_settings(
+        &user.id,
+        &crate::ops::HelperPatch {
+            morning_brief: request.morning_brief,
+            brief_hour_utc: request.brief_hour_utc.map(Some),
+            email_triage: request.email_triage,
+            triage_hour_utc: request.triage_hour_utc.map(Some),
+            memory_review: request.memory_review,
+        },
+    )?;
     state.store.record_audit(
         &user.id,
         "alert.settings_changed",
@@ -149,15 +178,53 @@ fn cost_view(state: &ApiState, user_id: &str) -> Result<Value> {
     let month = state
         .store
         .cost_report(Some(user_id), crate::costs::month_start(now))?;
+    let all_time = state
+        .store
+        .cost_report(Some(user_id), DateTime::<Utc>::UNIX_EPOCH)?;
     let budget = state.store.monthly_budget(user_id)?;
+    let plans = state.store.plan_savings(user_id, &month)?;
     Ok(json!({
         "month_usd": month.usd,
         "month_unpriced_tokens": month.unpriced_tokens,
         "month_lines": month.lines,
+        "totals": {"month": month.totals, "all_time": all_time.totals},
+        "plans": plans,
+        "plan_kinds": crate::costs::PLAN_KINDS,
         "budget_usd": budget,
         "budget_level": budget.and_then(|budget| crate::costs::budget_level(month.usd, budget)),
         "prices": state.store.model_prices()?,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PlansRequest {
+    plans: Vec<crate::costs::PlanPrice>,
+}
+
+/// `PUT /v1/usage/plans` (0.70): what the caller pays per month for each
+/// plan sign-in, to compare with API prices.
+pub(super) async fn plans_put(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Json(request): Json<PlansRequest>,
+) -> Result<Json<Value>> {
+    state.store.set_plan_prices(&user.id, &request.plans)?;
+    Ok(Json(cost_view(&state, &user.id)?))
+}
+
+/// `GET /v1/admin/prices/suggested` (0.70, owner only): researched prices
+/// to review before saving. They are suggestions, not verified prices.
+pub(super) async fn prices_suggested(
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    require_admin(&user)?;
+    let (researched_at, prices) = crate::costs::suggested_prices();
+    Ok(Json(json!({
+        "researched_at": researched_at,
+        "verified": false,
+        "prices": prices,
+    })))
 }
 
 /// `GET /v1/usage/costs`: this month's estimated cost, the member's budget
@@ -240,6 +307,31 @@ pub(super) async fn digest_now(
             true
         }
         None => false,
+    };
+    Ok(Json(json!({"text": text, "delivered": delivered})))
+}
+
+/// `POST /v1/brief/preview`: build the caller's morning brief now and send it
+/// to their alert channels. Returns the text.
+pub(super) async fn brief_preview(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    let now = Utc::now();
+    let (text, delivered) = match &state.ops {
+        Some(ops) => (ops.send_brief_to(&user.id, now).await?, true),
+        None => (
+            crate::ops::member_brief(
+                &state.store,
+                &state.config,
+                Some(state.personal.as_ref()),
+                Some(&state.runtime),
+                &user.id,
+                now,
+            )
+            .await?,
+            false,
+        ),
     };
     Ok(Json(json!({"text": text, "delivered": delivered})))
 }

@@ -2559,6 +2559,7 @@ const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
     "openrouter_generate_image",
     "deck_build",
     "docx_build",
+    "research_report_build",
     "docx_import",
     "docx_pdf",
     "docx_inspect",
@@ -2598,6 +2599,17 @@ const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
     "browser_close",
     "browser_tabs",
     "browser_new_tab",
+    "browser_find",
+    "browser_wait",
+    "browser_select",
+    "browser_check",
+    "browser_scroll",
+    "browser_hover",
+    "browser_upload",
+    "browser_download",
+    "browser_pdf",
+    "browser_dismiss_banners",
+    "browser_forget_logins",
     "google_drive_list",
     "google_sheets_read",
     "google_calendar_list_events",
@@ -2606,6 +2618,15 @@ const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
     "tasks_create",
     "job_search",
     "job_dossier_checklist",
+    "job_profile_get",
+    "job_profile_set",
+    "job_watch_now",
+    "job_sources_list",
+    "job_sources_set",
+    "job_application_add",
+    "job_application_update",
+    "job_applications_list",
+    "onedrive_download",
     "gmail_list_messages",
     "outlook_list_messages",
     "outlook_calendar_list_events",
@@ -4332,6 +4353,23 @@ pub struct OpsConfig {
     pub digest_weekday: u8,
     #[serde(default = "default_ops_digest_hour")]
     pub digest_hour_utc: u8,
+    /// Morning brief (0.70): default hour (UTC); a member can pick their own.
+    #[serde(default = "default_true")]
+    pub brief_enabled: bool,
+    #[serde(default = "default_ops_brief_hour")]
+    pub brief_hour_utc: u8,
+    /// Email triage (0.70): default hour (UTC) for members who opt in.
+    #[serde(default = "default_true")]
+    pub triage_enabled: bool,
+    #[serde(default = "default_ops_triage_hour")]
+    pub triage_hour_utc: u8,
+    /// Weekly memory review (0.70): day (1 = Monday … 7 = Sunday) and hour (UTC).
+    #[serde(default = "default_true")]
+    pub memory_review_enabled: bool,
+    #[serde(default = "default_ops_review_weekday")]
+    pub memory_review_weekday: u8,
+    #[serde(default = "default_ops_review_hour")]
+    pub memory_review_hour_utc: u8,
 }
 
 impl Default for OpsConfig {
@@ -4351,6 +4389,13 @@ impl Default for OpsConfig {
             digest_enabled: true,
             digest_weekday: default_ops_digest_weekday(),
             digest_hour_utc: default_ops_digest_hour(),
+            brief_enabled: true,
+            brief_hour_utc: default_ops_brief_hour(),
+            triage_enabled: true,
+            triage_hour_utc: default_ops_triage_hour(),
+            memory_review_enabled: true,
+            memory_review_weekday: default_ops_review_weekday(),
+            memory_review_hour_utc: default_ops_review_hour(),
         }
     }
 }
@@ -4389,6 +4434,22 @@ fn default_ops_digest_weekday() -> u8 {
 
 fn default_ops_digest_hour() -> u8 {
     8
+}
+
+fn default_ops_brief_hour() -> u8 {
+    6
+}
+
+fn default_ops_triage_hour() -> u8 {
+    7
+}
+
+fn default_ops_review_weekday() -> u8 {
+    7
+}
+
+fn default_ops_review_hour() -> u8 {
+    17
 }
 
 fn default_ops_backup_folder() -> String {

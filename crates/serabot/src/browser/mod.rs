@@ -6,6 +6,8 @@
 //! tools), `signin` (identity-provider refusal pages). Page content returned
 //! to the model is untrusted data.
 
+pub mod actionability;
+pub mod banners;
 pub mod cdp;
 pub mod chromium;
 pub mod guard;
@@ -13,6 +15,7 @@ pub mod manager;
 pub mod outline;
 pub mod signin;
 pub mod tools;
+pub mod tools_ext;
 pub mod ws;
 
 #[cfg(test)]
