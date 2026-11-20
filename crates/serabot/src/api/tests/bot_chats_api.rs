@@ -293,3 +293,56 @@ async fn the_bot_library_lists_files_and_stays_with_its_member() {
     let missing = call(&app, &token, "GET", "/v1/bots/nobody/library", None).await;
     assert_ne!(missing.status(), StatusCode::OK);
 }
+
+/// 0.66: relay settings are per member, off by default, and the exchange
+/// returns at once while the relay is off.
+#[tokio::test]
+async fn the_desktop_relay_is_opt_in_and_per_member() {
+    let (app, _, store) = app_with_root(true, Policy::empty(), temp_base());
+    let (_, token) = member_with_analyst(&app, &store, "v066-relay").await;
+    let view = read_json(call(&app, &token, "GET", "/v1/relay/net", None).await).await;
+    assert_eq!(view["enabled"], false, "{view}");
+    assert!(
+        view["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["kind"] == "google-antigravity")
+    );
+    let off = read_json(
+        call(
+            &app,
+            &token,
+            "POST",
+            "/v1/relay/net/exchange",
+            Some(json!({"frames": [], "wait": true})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(off["enabled"], false, "{off}");
+    let saved = read_json(
+        call(
+            &app,
+            &token,
+            "PUT",
+            "/v1/relay/net",
+            Some(json!({"enabled": true, "providers": ["google-antigravity", "made-up"]})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(saved["enabled"], true, "{saved}");
+    let picked: Vec<&str> = saved["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["selected"] == true)
+        .filter_map(|p| p["kind"].as_str())
+        .collect();
+    assert_eq!(picked, vec!["google-antigravity"]);
+    // Another member is untouched.
+    let (_, other) = member_with_analyst(&app, &store, "v066-relay-other").await;
+    let theirs = read_json(call(&app, &other, "GET", "/v1/relay/net", None).await).await;
+    assert_eq!(theirs["enabled"], false, "{theirs}");
+}

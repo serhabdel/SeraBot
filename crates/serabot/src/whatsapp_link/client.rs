@@ -55,6 +55,23 @@ pub struct WhatsappLink {
     live: Mutex<HashMap<String, Live>>,
     pairing: Mutex<HashMap<String, Pairing>>,
     sends: Mutex<HashMap<(String, String), Vec<Instant>>>,
+    /// Last WhatsApp activity per member, for going idle (0.66).
+    activity: Arc<Mutex<HashMap<String, Instant>>>,
+}
+
+/// Presence a linked device shows (0.66): "online" while a conversation is
+/// active, "offline" otherwise. The connection stays open either way, so a
+/// new message still arrives (and starts the bot) at once.
+async fn set_presence(client: &Arc<Client>, available: bool) {
+    use whatsapp_rust::PresenceStatus;
+    let status = if available {
+        PresenceStatus::Available
+    } else {
+        PresenceStatus::Unavailable
+    };
+    if let Err(error) = client.presence().set(status).await {
+        tracing::debug!(%error, "whatsapp link: presence not sent");
+    }
 }
 
 impl WhatsappLink {
@@ -66,7 +83,38 @@ impl WhatsappLink {
             live: Mutex::new(HashMap::new()),
             pairing: Mutex::new(HashMap::new()),
             sends: Mutex::new(HashMap::new()),
+            activity: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Mark WhatsApp activity: show "online" now, and go back to "offline"
+    /// once `presence_idle_secs` pass without activity (0.66). With
+    /// `presence_idle_secs = 0` the device stays "online" all the time.
+    fn touch_presence(&self, user_id: &str, client: &Arc<Client>) {
+        let idle = self.config.whatsapp_link.presence_idle_secs;
+        let stamp = Instant::now();
+        self.activity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(user_id.to_string(), stamp);
+        let client = client.clone();
+        let activity = self.activity.clone();
+        let user = user_id.to_string();
+        tokio::spawn(async move {
+            set_presence(&client, true).await;
+            if idle == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(idle)).await;
+            let still_idle = activity
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&user)
+                .is_some_and(|last| *last == stamp);
+            if still_idle {
+                set_presence(&client, false).await;
+            }
+        });
     }
 
     pub fn enabled(&self) -> bool {
@@ -327,6 +375,11 @@ impl WhatsappLink {
             tracing::warn!(%error, "whatsapp link: status not saved");
         }
         tracing::info!("whatsapp link: member's device connected");
+        // 0.66: connected but shown "offline" until a conversation starts.
+        if self.config.whatsapp_link.presence_idle_secs > 0 {
+            let client = client.clone();
+            tokio::spawn(async move { set_presence(&client, false).await });
+        }
     }
 
     async fn logged_out(&self, user_id: &str) {
@@ -404,6 +457,15 @@ impl WhatsappLink {
         self.store
             .bind_whatsapp_link_chat(user_id, &conversation_id, &jid)?;
         self.show_under_whatsapp_bot(user_id, &conversation_id, &jid);
+        // 0.66: online and "typing…" right away, so the member sees the bot
+        // picked the message up while it works on the answer.
+        self.touch_presence(user_id, &ctx.client);
+        if let Ok(to) = jid.parse::<Jid>() {
+            let client = ctx.client.clone();
+            tokio::spawn(async move {
+                let _ = client.chatstate().send_composing(&to).await;
+            });
+        }
 
         let message = ctx.message.get_base_message();
         let max = self.config.whatsapp_link.max_media_bytes;
@@ -572,6 +634,7 @@ impl WhatsappLink {
             .send_message(to, wa::Message::text(text.to_string()))
             .await
             .map_err(|error| SeraError::External(format!("WhatsApp send failed: {error}")))?;
+        self.touch_presence(user_id, &client);
         Ok(())
     }
 

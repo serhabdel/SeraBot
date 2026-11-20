@@ -865,6 +865,9 @@ pub struct Session {
     /// "This PC" numbers for the Usage page, gathered on a worker thread.
     pub pc: crate::pc_stats::PcMonitor,
     local_agent: Option<(crate::local_folders::LocalAgent, usize)>,
+    /// The desktop network relay (0.66): runs while signed in; it only moves
+    /// traffic when the member turned the relay on.
+    net_relay: Option<(crate::net_relay::NetRelay, usize)>,
     /// Message under the Local folders card.
     pub local_notice: Option<String>,
     folder_pick_rx: Option<std::sync::mpsc::Receiver<Option<(std::path::PathBuf, bool)>>>,
@@ -1086,6 +1089,7 @@ impl Session {
             claude_agent_folders: std::collections::BTreeMap::new(),
             pc: crate::pc_stats::PcMonitor::new(),
             local_agent: None,
+            net_relay: None,
             local_notice: None,
             folder_pick_rx: None,
             folder_stats: std::collections::HashMap::new(),
@@ -3346,6 +3350,33 @@ impl Session {
         }
     }
 
+    /// Keep the network relay threads running only while signed in (0.66).
+    fn sync_net_relay(&mut self) {
+        let credentials = match (&self.credentials, self.state.connected) {
+            (Some(credentials), true) => Arc::clone(credentials),
+            _ => {
+                self.net_relay = None;
+                return;
+            }
+        };
+        let key = Arc::as_ptr(&credentials) as usize;
+        if self.net_relay.as_ref().is_some_and(|(_, k)| *k == key) {
+            return;
+        }
+        self.net_relay = None;
+        if let Some(relay) = crate::net_relay::NetRelay::start_with_credentials(
+            credentials.endpoint.clone(),
+            credentials.token.clone(),
+        ) {
+            self.net_relay = Some((relay, key));
+        }
+    }
+
+    /// Live relay counters, while the relay threads run (0.66).
+    pub fn net_relay_stats(&self) -> Option<Arc<crate::net_relay::RelayStats>> {
+        self.net_relay.as_ref().map(|(relay, _)| relay.stats())
+    }
+
     /// True while the relay agent is running for this session.
     pub fn local_agent_running(&self) -> bool {
         self.local_agent.is_some()
@@ -3921,6 +3952,7 @@ impl Session {
         self.poll_folder_pick();
         self.poll_folder_stats();
         self.sync_local_agent();
+        self.sync_net_relay();
         self.poll_launches();
         self.hydrate_bot_settings();
         self.hydrate_route_editor();

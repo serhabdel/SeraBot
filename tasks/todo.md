@@ -298,3 +298,10 @@ never merge without the owner's OK.
 - [x] `docs/specs/desktop-network-relay.md`: proposed CONNECT-over-WebSocket relay through the desktop (TLS end to end, host allowlist, private-address refusal, opt-in).
 - [ ] Owner: write to the WhatsApp number from an allowed phone; the bot should answer within seconds.
 - [ ] Owner: answer the relay open questions; build in 0.66.
+
+## Release 0.66.0 — Desktop network relay, WhatsApp idle presence
+
+- [x] Desktop network relay: loopback CONNECT + long-poll exchange, per-provider opt-in, host list on both sides, public addresses only, audited; Settings card.
+- [x] WhatsApp presence: offline when idle, online + "typing…" on a new message, back to offline after `presence_idle_secs`.
+- [ ] Owner: turn the relay on for Antigravity with the desktop open and run one chat; check the card shows traffic.
+- [ ] Owner: check the WhatsApp number shows offline when idle and "typing…" on a message.

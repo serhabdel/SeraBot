@@ -221,6 +221,21 @@ impl LlmClient {
         })
     }
 
+    /// Send this client's traffic through `proxy` (the desktop relay, 0.66),
+    /// with the same timeouts as [`Self::new`].
+    pub fn with_proxy(mut self, proxy: reqwest::Proxy, timeout_secs: u64) -> Result<Self> {
+        let idle = Duration::from_secs(timeout_secs.max(1));
+        self.http = reqwest::Client::builder()
+            .read_timeout(idle)
+            .connect_timeout(idle.min(Duration::from_secs(30)))
+            .timeout(idle.max(MAX_CALL))
+            .redirect(reqwest::redirect::Policy::none())
+            .proxy(proxy)
+            .build()
+            .map_err(|error| SeraError::External(error.to_string()))?;
+        Ok(self)
+    }
+
     /// Send the editor identity GitHub Copilot requires on every request
     /// (`User-Agent`, `Editor-Version`, `Editor-Plugin-Version`,
     /// `Copilot-Integration-Id`, `X-GitHub-Api-Version`), as the owner's

@@ -196,3 +196,12 @@ message carries: the chat, the sender, `sender_alt`, `recipient_alt`, and
 the client's LID-to-phone map. It accepts the message when one of them is a
 phone number on the allowlist. A LID alone never matches, groups and own
 messages stay out, and an ignored message is logged without any number.
+
+
+## 0.66: idle presence and "typing…"
+
+The linked device stays connected all the time (so new messages arrive and
+start the bot at once), but shows as "offline" when nothing is happening. On
+a new message from an allowed chat it shows "online" and "typing…" while the
+bot works, then goes back to "offline" after `presence_idle_secs` (default
+120) without WhatsApp activity. `presence_idle_secs = 0` keeps it "online".

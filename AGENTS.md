@@ -50,6 +50,13 @@ approval-gated, per-minute and daily caps). Telegram has the same rule with
 `telegram_reply_file`. Do not widen it (groups, contacts, history, sends to numbers outside the
 allowlist) without a new design.
 
+The desktop network relay (0.66, `docs/specs/desktop-network-relay.md`) lets a
+member send chosen providers' model traffic out through their own desktop:
+opt-in per provider, a fixed host list on both sides (port 443), public
+addresses only, TLS end to end (the desktop only moves encrypted bytes),
+loopback CONNECT with a per-member token, audited per tunnel. Do not widen it
+(other hosts, LAN access, non-model traffic) without a new design.
+
 Everything user-owned is UID-scoped — bots, skills, memory, documents,
 conversations, tasks, approvals, credentials, quotas. Store methods for
 user-owned rows always take the acting user's id; there is no unscoped path
@@ -122,9 +129,10 @@ OVH is read-only unless the owner explicitly authorizes an additive installation
 - `crates/serabot/src/model_router.rs` `RouterHandle` — the live, swappable model router shared by the runtime and the delegation, team and bot tools; console provider saves rebuild it (0.53).
 - `crates/serabot/src/memory_vectors.rs`, `runtime/conflicts.rs` — semantic memory recall (local E5 vector per fact, blended with BM25) and the write-time contradiction check (0.62).
 - `crates/serabot-desktop/src/bot_groups.rs`, `bot_library.rs` — sidebar bot order (pinned, recent, A–Z) and the per-bot Library tab (made by bots + uploads, filters, date groups, item dialog) over `GET /v1/bots/{bot}/library` (0.63).
+- `crates/serabot/src/relay_net.rs`, `api/relay.rs`, `crates/serabot-desktop/src/net_relay.rs`, `ui_net_relay.rs` — desktop network relay (0.66).
 - `crates/serabot-desktop/src/turn_trace.rs` — per-reply turn traces (steps plus memories used and saved, from `turn.memory`), drawn inside the reply that turn produced (0.61); chat transcript CSS lives in one block at the end of `assets/system.css`.
 - `crates/serabot-desktop/src/runs.rs`, `chat_compose.rs`, `chat_failure.rs`, `chat_cards.rs`, `ui/chat_feed_view.rs`, `assets/runs.css` — runs sidebar, composer queue, failed and wait cards, virtualized feed (0.50).
 - `crates/serabot-desktop/src/acp/` (protocol, client, setup, transcript, controller), `ui_claude_code.rs`, `assets/claude-code.css` — Claude Code on this computer over ACP (0.54; integrated per-bot with persisted transcripts and folder choice in 0.55).
 - `crates/serabot/src/whatsapp_link/`, `api/whatsapp_link.rs`, `crates/serabot-desktop/src/ui_whatsapp_link.rs` — WhatsApp linked device: allowlist, chat mapping, per-member client, approval-gated send, desktop card (0.58; enabled by default in 0.59).
 - `crates/serabot/src/projects.rs`, `api/projects.rs`, `crates/serabot-desktop/src/projects.rs`, `ui_projects.rs` — per-user project folders in the server inbox, HTTP API, and desktop workspace (0.58–0.59).
-- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.65.0.
+- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.66.0.

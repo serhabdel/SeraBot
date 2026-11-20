@@ -1084,6 +1084,10 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         &config.connectors.github.app_client_id,
     )?);
 
+    // 0.66: the desktop network relay's loopback tunnel listener. Provider
+    // clients use it only for members who turned the relay on.
+    serabot::relay_net::RelayHub::install(store.clone()).await?;
+
     let runtime = Runtime::with_fleet(
         config.clone(),
         store.clone(),

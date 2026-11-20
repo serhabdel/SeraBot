@@ -4273,6 +4273,11 @@ pub struct WhatsappLinkConfig {
     /// at pairing only: sign out and link again to change it.
     #[serde(default = "default_whatsapp_link_os")]
     pub device_os: String,
+    /// Seconds without WhatsApp activity before the linked device shows
+    /// "offline" again (0.66). It stays connected, so new messages still
+    /// arrive at once. 0 keeps it "online" all the time.
+    #[serde(default = "default_whatsapp_link_idle")]
+    pub presence_idle_secs: u64,
 }
 
 impl Default for WhatsappLinkConfig {
@@ -4285,6 +4290,7 @@ impl Default for WhatsappLinkConfig {
             sends_per_minute: default_whatsapp_link_rate(),
             sends_per_day: default_whatsapp_link_daily(),
             device_os: default_whatsapp_link_os(),
+            presence_idle_secs: default_whatsapp_link_idle(),
         }
     }
 }
@@ -4307,6 +4313,10 @@ fn default_whatsapp_link_rate() -> u32 {
 
 fn default_whatsapp_link_daily() -> u32 {
     100
+}
+
+fn default_whatsapp_link_idle() -> u64 {
+    120
 }
 
 fn default_whatsapp_link_os() -> String {

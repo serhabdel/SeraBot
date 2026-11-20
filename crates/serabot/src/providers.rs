@@ -1491,6 +1491,12 @@ pub fn open_provider_client(
         timeout_secs,
         max_output_tokens,
     )?;
+    // 0.66: the member chose to send this provider's traffic through their
+    // own desktop. When the desktop is offline the tunnel is refused at once
+    // and the route chain fails over.
+    if let Some(proxy) = crate::relay_net::proxy_for(owner.user_id, &kind) {
+        client = client.with_proxy(proxy, timeout_secs)?;
+    }
     let plan = auth_plan(&profile.kind, &profile.auth)?;
     let mut oauth_installed = false;
     // A member's own sign-in carries its refresh token in the account row; the
