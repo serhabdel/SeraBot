@@ -495,7 +495,7 @@
   background: transparent;
   color: var(--label-1);
   font: inherit;
-  font-size: 15px;
+  font-size: var(--fs-body);
 }
 
 .palette-input::placeholder {
@@ -513,7 +513,7 @@
 
 .palette-group {
   padding: 8px 10px 4px;
-  font-size: 11px;
+  font-size: var(--fs-micro);
   font-weight: 650;
   letter-spacing: 0.04em;
   text-transform: uppercase;
@@ -571,7 +571,7 @@
 }
 
 .palette-item-title {
-  font-size: 13.5px;
+  font-size: var(--fs-caption);
   font-weight: 600;
   white-space: nowrap;
   overflow: hidden;
@@ -579,7 +579,7 @@
 }
 
 .palette-item-sub {
-  font-size: 12px;
+  font-size: var(--fs-micro);
   color: var(--label-3);
   white-space: nowrap;
   overflow: hidden;
@@ -592,14 +592,14 @@
   border: 1px solid var(--hairline);
   background: var(--surface-2);
   color: var(--label-2);
-  font-size: 11px;
+  font-size: var(--fs-micro);
   font-family: inherit;
 }
 
 .palette-empty {
   padding: 28px 16px;
   text-align: center;
-  font-size: 13px;
+  font-size: var(--fs-caption);
 }
 
 .palette-foot {
@@ -647,39 +647,11 @@ html[data-reduce-transparency="true"] .sheet.sheet-palette {
   margin-bottom: 6px;
 }
 
-/* 0.60 Chat & UX polish:
-   - Message actions stay cleanly in-flow below every message so older rows
-     never clip at the top edge and actions are always visible & clickable.
-   - User attachment chips stay crisp white-on-translucent inside accent bubbles.
+/* 0.60 Chat & UX polish (kept; the .msg-actions rules they carried moved into
+   the chat transcript block below, which is the single owner since 0.71):
+   - User attachment chips stay crisp inside accent bubbles.
    - Jump-to-latest floats cleanly above the composer without overlapping text.
    - Toasts stay compact floating pills and jobs panel aligns with chat width. */
-.msg .msg-actions {
-  position: static;
-  top: auto;
-  right: auto;
-  left: auto;
-  align-self: flex-start;
-  margin-top: 4px;
-  padding: 0;
-  gap: 2px;
-  background: transparent;
-  box-shadow: none;
-  opacity: 0.72;
-  pointer-events: auto;
-}
-
-.msg:hover .msg-actions,
-.msg:focus-within .msg-actions,
-.msg .msg-actions:focus-within,
-.msg.last-reply .msg-actions {
-  opacity: 1;
-  pointer-events: auto;
-}
-
-.msg.user .msg-actions {
-  align-self: flex-end;
-  justify-content: flex-end;
-}
 
 /* Files sit on the light bubble tint: normal labels, not white (0.61). */
 .msg.user .file-chip {
@@ -738,10 +710,41 @@ html[data-reduce-transparency="true"] .sheet.sheet-palette {
 
 
 /* ------------------------------------------------ chat transcript ---
-   0.61: the one place for message rows. These rules used to be split over
-   app.css, foundation.css and system.css, where load order decided the
-   result; the values below are what that cascade produced, with font sizes
-   moved onto the --fs-* tokens so the text-size preference reaches them. */
+   0.61: the one place for message rows. 0.71: the feed container, composer
+   wrap and message actions are owned here too — the duplicate definitions
+   in app.css were removed. Values are what the old cascade produced, with
+   font sizes on the --fs-* tokens so the text-size preference reaches them. */
+
+.messages {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 16px 18px 108px;
+  /* No smooth scroll on the container: it hijacks wheel and anchor jumps.
+     Smooth scrolling is requested only for programmatic appends. */
+  scroll-behavior: auto;
+  /* Scroll anchoring fights stick-to-bottom while tokens stream in. */
+  overflow-anchor: none;
+}
+
+.composer-wrap {
+  position: relative;
+  flex: 0 0 auto;
+  z-index: 2;
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 0;
+}
+
+/* The gradient fade above the composer was killed by later rules; kept dead
+   (0.71) so the 108px bottom padding of .messages is the only clearance. */
+.composer-wrap::before {
+  display: none;
+  content: none;
+}
 
 .msg {
   display: flex;
@@ -850,13 +853,37 @@ html[data-reduce-transparency="true"] .sheet.sheet-palette {
   min-width: 0;
 }
 
+/* Message actions sit in-flow under the reply (0.60), quiet at rest, full
+   on hover/focus/last reply; this block is the single owner (0.71). */
 .msg-actions {
   display: flex;
+  position: static;
+  top: auto;
+  right: auto;
+  left: auto;
+  align-self: flex-start;
   gap: 2px;
-  margin-top: 2px;
-  opacity: 0;
-  transition: opacity 120ms ease;
+  margin-top: 4px;
+  padding: 0;
   min-height: 24px;
+  background: transparent;
+  box-shadow: none;
+  opacity: 0.72;
+  pointer-events: auto;
+  transition: opacity 120ms ease;
+}
+
+.msg:hover .msg-actions,
+.msg:focus-within .msg-actions,
+.msg .msg-actions:focus-within,
+.msg.last-reply .msg-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.msg.user .msg-actions {
+  align-self: flex-end;
+  justify-content: flex-end;
 }
 
 .msg-action {

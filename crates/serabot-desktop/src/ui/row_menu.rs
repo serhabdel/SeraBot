@@ -28,7 +28,7 @@ fn handle_menu_key(key: &Key) -> bool {
 }
 
 /// Keep a floating `.row-menu` inside the viewport if it overflows the bottom edge.
-const FLIP_OVERFLOW_MENU_JS: &str = "requestAnimationFrame(() => { for (const m of document.querySelectorAll('.row-menu[role=\"menu\"]')) { const r = m.getBoundingClientRect(); if (r.bottom > window.innerHeight - 8 && r.top > r.height + 16) { m.style.top = 'auto'; m.style.bottom = 'calc(100% - 4px)'; } } })";
+const FLIP_OVERFLOW_MENU_JS: &str = "requestAnimationFrame(() => { for (const m of document.querySelectorAll('.row-menu[role=\"menu\"]')) { m.style.top = ''; m.style.bottom = ''; const r = m.getBoundingClientRect(); if (r.bottom > window.innerHeight - 8 && r.top > r.height + 16) { m.style.top = 'auto'; m.style.bottom = 'calc(100% - 4px)'; } } })";
 
 /// Fires after five seconds; the undo bar listens for it.
 const UNDO_TIMER_JS: &str = "setTimeout(() => dioxus.send(true), 5000);";
@@ -281,6 +281,7 @@ pub(crate) fn ChatSwitcher(session: Signal<Session>, bot: String, title: String)
         )
     };
     let count = entries.len();
+    let active_pos = entries.iter().position(|entry| entry.active);
     rsx! {
         div { class: "chat-switcher",
             button {
@@ -366,7 +367,12 @@ pub(crate) fn ChatSwitcher(session: Signal<Session>, bot: String, title: String)
                                                 autofocus: true,
                                                 "aria-label": "Chat name",
                                                 maxlength: 120,
-                                                value: "{renaming().as_ref().map(|(_, t)| t.clone()).unwrap_or_default()}",
+                                                "data-rename-init": "{renaming().as_ref().map(|(_, t)| t.clone()).unwrap_or_default()}",
+                                                onmounted: move |_| {
+                                                    document::eval(
+                                                        "(() => { const el = document.querySelector('.chat-switcher-rename input[data-rename-init]'); if (!el) return; el.value = el.getAttribute('data-rename-init') || ''; el.removeAttribute('data-rename-init'); el.setSelectionRange(el.value.length, el.value.length); })()",
+                                                    );
+                                                },
                                                 oninput: move |event| {
                                                     if let Some((_, text)) = renaming.write().as_mut() {
                                                         *text = event.value();
@@ -416,7 +422,7 @@ pub(crate) fn ChatSwitcher(session: Signal<Session>, bot: String, title: String)
                                             class: if entry.active { "row-menu-item active chat-switcher-item" } else { "row-menu-item chat-switcher-item" },
                                             r#type: "button",
                                             role: "menuitemradio",
-                                            autofocus: idx == 0,
+                                            autofocus: idx == active_pos.unwrap_or(0),
                                             "aria-checked": if entry.active { "true" } else { "false" },
                                             onclick: {
                                                 let id = entry_id.clone();

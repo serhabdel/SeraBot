@@ -98,3 +98,28 @@ bubbles had white text on a pale accent tint, at 1.41:1 contrast (it is now
 | Writes only ever append, so contradicting notes pile up | Partly handled. A near-duplicate (token Jaccard ≥ 0.8) supersedes the older note, but a rewritten decision ("hard rule" becoming "optional") is not caught. The new dates let the model pick the newer note. A contradiction check at write time is still open. |
 | Team writes go through a review queue | Similar. Facts extracted from a turn that read untrusted content are held as `pending` until the owner approves them. |
 | No way to list everything | Already covered: the Memory page and `/v1/memory` list everything for the acting user. |
+
+## 0.71.0 audit (chat + Usage + chat switcher)
+
+Source-level, no render (WebView2 unavailable in the container); every change
+preserves the computed cascade of the rules it replaces.
+
+- **Duplicate chat selectors consolidated.** `.messages` (2 definitions),
+  `.composer-wrap` (2) and `.composer-wrap::before` (3) in `app.css` were
+  decided by load order; each now has one definition in the chat transcript
+  block at the end of `system.css`. `.msg-actions` had competing rules in two
+  `system.css` blocks (`opacity: 0` vs `0.72`); one rule now owns it
+  (in-flow, 0.72 at rest, full on hover/focus/last reply, visible on touch).
+- **Palette hard-coded px → `--fs-*` tokens** (the last fully hard-coded
+  component); dead `backdrop-filter` blur removed for `.menu`,
+  `.connect-card`, `.composer` (already `none` in `system.css`).
+- **Chat switcher card:** focus goes to the open chat on open (not row 0);
+  menu capped at `min(420px, 60vh)` with scroll; the overflow-flip JS resets
+  inline offsets before flipping (idempotent, no visible jump); rename input
+  is uncontrolled so keystrokes never move the caret.
+- **Usage page:** `usage-tile*` leftovers replaced by the shared `stat-tile`;
+  section anchor chips + "Updated Ns ago" in the page head; day labels under
+  the tokens-per-day bars.
+
+Not done: a visual pass on a Windows device (owner), and the sidebar rename
+input has the same controlled-`value` caret pattern as the switcher had.

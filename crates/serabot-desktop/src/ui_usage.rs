@@ -184,6 +184,13 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
     let mut session = session;
     let mut filter = use_signal(String::new);
     let mut sort_by = use_signal(|| UsageSort::TokensDesc);
+    let mut refreshed_at = use_signal(|| Option::<std::time::Instant>::None);
+    use_effect(move || {
+        let s = session.read();
+        if s.state.usage.is_some() && !s.usage_loading && s.state.error.is_none() {
+            refreshed_at.set(Some(std::time::Instant::now()));
+        }
+    });
     let (days, loading, report, error) = {
         let s = session.read();
         (
@@ -194,6 +201,8 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
         )
     };
     let bars = report.as_ref().map(chart_bars).unwrap_or_default();
+    let bar_count = bars.len();
+    let label_step = (bar_count / 6).max(1);
     let (axis_start, axis_peak, axis_end) = chart_axis_summary(&bars);
     let tool_runs: i64 = report
         .as_ref()
@@ -213,6 +222,11 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
         .map(|r| filter_sort_bots(&r.per_bot, &filter_text, sort_by()))
         .unwrap_or_default();
     let is_admin = session.read().is_admin();
+    let quota_shown = report
+        .as_ref()
+        .map(|r| r.quota.daily_tasks.limit > 0)
+        .unwrap_or(false);
+    let updated_secs = refreshed_at().map(|at| at.elapsed().as_secs());
     // Refresh the health cards every 30 s, only while this page is open
     // (the future ends when the page is left).
     use_future(move || async move {
@@ -231,6 +245,9 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
                 div {
                     h1 { class: "pane-title", "Usage" }
                     p { class: "muted", "What your bots used. Only your own activity is counted." }
+                    if let Some(secs) = updated_secs {
+                        p { class: "muted usage-updated", "Updated {secs}s ago" }
+                    }
                 }
                 div { class: "seg usage-range", role: "group", "aria-label": "Period",
                     for (value, label) in RANGES {
@@ -247,6 +264,22 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
                 }
             }
             div { class: "pane-body",
+                nav { class: "usage-nav", "aria-label": "Usage sections",
+                    if quota_shown {
+                        a { href: "#usage-quota-title", "Quota" }
+                    }
+                    if is_admin {
+                        a { href: "#usage-reliability-title", "Reliability" }
+                    }
+                    a { href: "#usage-ops-title", "Alerts & costs" }
+                    a { href: "#usage-jobs-title", "Job search" }
+                    a { href: "#usage-activity-title", "Activity" }
+                    a { href: "#usage-insights-title", "Insights" }
+                    a { href: "#usage-bot-health-title", "Bot health" }
+                    if report_ready && !empty {
+                        a { href: "#usage-breakdown-title", "Breakdown" }
+                    }
+                }
                 if let Some(quota) = report
                     .as_ref()
                     .map(|report| report.quota.daily_tasks.clone())
@@ -358,14 +391,28 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
                                 } else {
                                     div { class: "usage-chart-wrap",
                                         div { class: "usage-chart", role: "img", "aria-label": "Tokens used per day",
-                                            for (index, (day, tokens, height)) in bars.into_iter().enumerate() {
+                                            for (index, (day, tokens, height)) in bars.iter().enumerate() {
                                                 div {
                                                     key: "{day}",
                                                     class: "usage-bar-col",
-                                                    title: "{day}: {group_digits(tokens)} tokens",
+                                                    title: "{day}: {group_digits(*tokens)} tokens",
                                                     div {
                                                         class: "usage-bar",
                                                         style: "height: {height}%; --bar-delay: {index.min(40) * 12}ms;",
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        div { class: "usage-chart-labels", "aria-hidden": "true",
+                                            for (index, (day, _, _)) in bars.iter().enumerate() {
+                                                {
+                                                    let label = if index % label_step == 0 || index == bar_count - 1 {
+                                                        day.rsplit('-').next().unwrap_or("").to_owned()
+                                                    } else {
+                                                        String::new()
+                                                    };
+                                                    rsx! {
+                                                        span { key: "{index}", class: "usage-bar-label", "{label}" }
                                                     }
                                                 }
                                             }
@@ -572,7 +619,7 @@ fn DailyTaskQuotaCard(quota: serabot_desktop::UsageDailyTaskQuota) -> Element {
                 LevelChip { level }
             }
             div { class: "quota-body",
-                span { class: "usage-tile-label", "Tasks today (UTC)" }
+                span { class: "stat-tile-label", "Tasks today (UTC)" }
                 span { class: "health-value",
                     "{group_digits(quota.used)} of {group_digits(quota.limit as i64)}"
                 }
@@ -630,7 +677,7 @@ fn HealthItem(
 ) -> Element {
     rsx! {
         div { class: "health-item",
-            span { class: "usage-tile-label", "{label}" }
+            span { class: "stat-tile-label", "{label}" }
             span { class: "health-value", "{value}" }
             if let Some(level) = level {
                 LevelChip { level }
@@ -707,7 +754,7 @@ fn ServerHealthCard(session: Signal<Session>) -> Element {
             }
             div { class: "health-summary",
                 div { class: "health-item",
-                    span { class: "usage-tile-label", "Server" }
+                    span { class: "stat-tile-label", "Server" }
                     div { class: "health-status",
                         if level == Health::Ok {
                             StatusChip { tone: Tone::Ok, text: "OK".to_owned() }
