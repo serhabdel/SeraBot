@@ -353,3 +353,12 @@ never merge without the owner's OK.
 - [x] Usage page: `stat-tile` unified (old `usage-tile*` deleted), section anchor chips + "Updated Ns ago", chart day labels.
 - [x] Version bump 0.71.0, release notes, review-doc addendum.
 - [ ] Owner: visual pass on Windows (chat light/dark + text sizes, switcher with several chats, Usage page scroll).
+
+## Release 0.72.0 — audit follow-ups: font tokens, caret-stable renames, switcher unread badges
+
+- [x] 23 hard-coded chat/sidebar/composer/switcher font sizes in app.css onto `--fs-*` tokens.
+- [x] Sidebar + All-chats rename inputs uncontrolled (caret-stable), same pattern as the 0.71 switcher fix.
+- [x] Chat switcher rows show unread badges.
+- [x] Version bump 0.72.0, release notes, review-doc addendum.
+- [ ] Owner: visual pass on Windows (text sizes in chat/sidebar, rename in place, switcher badges).
+- [ ] Later: Tasks/Kanban/Calendar pages still have hard-coded px font sizes.
