@@ -335,3 +335,13 @@ never merge without the owner's OK.
 - [x] Desktop: "Try another way" on failed steps.
 - [ ] Owner: send 3 photos on WhatsApp, ask "crop them and make one PDF"; check the PDF comes back.
 - [ ] Owner: add a few prices (Settings: Usage → Costs → Edit prices) and set a budget.
+
+## Release 0.70.0 — Jobs, browser, brief/triage/review, research, bot health, costs, phone
+
+- [x] Costs: cached tokens, cache price, suggested (unverified) prices, M-token totals, plans vs API (0047).
+- [x] Job finder: interview, Moroccan site watching with robots.txt, matches to Telegram/WhatsApp, pipeline, OneDrive tracker via onedrive_download (0048).
+- [x] Browser: actionability checks, banner dismissal, find/wait/select/check/scroll/hover/download/pdf/upload, snapshot modes, persistent logins.
+- [x] Morning brief, email triage, memory review (0049); research reports; bot health; phone app 0.70.
+- [ ] Owner: check the built-in job source URLs on the server; run "Check now".
+- [ ] Owner: load suggested prices, verify, save; enter plan prices.
+- [ ] Owner: try browser find/wait/banners on a real site.

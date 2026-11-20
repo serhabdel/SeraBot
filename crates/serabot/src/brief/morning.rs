@@ -465,9 +465,9 @@ mod tests {
             .execute(
                 "INSERT INTO job_seen(user_id, url_hash, title_hash, source_key, title, employer,
                                       city, deadline, url, matched, first_seen)
-                 VALUES (?1, 'u1', 't1', 'rekrute', 'Rust engineer', 'Acme', 'Rabat', NULL,
+                 VALUES (?1, 'u1', 't1', 'rekrute', 'Rust engineer', 'Acme', 'Rabat', '',
                          'https://example.example/j1', 1, ?2),
-                        (?1, 'u2', 't2', 'rekrute', 'Not a match', 'Acme', 'Rabat', NULL,
+                        (?1, 'u2', 't2', 'rekrute', 'Not a match', 'Acme', 'Rabat', '',
                          'https://example.example/j2', 0, ?2)",
                 params![admin, (now() - Duration::hours(2)).to_rfc3339()],
             )
