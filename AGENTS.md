@@ -130,9 +130,10 @@ OVH is read-only unless the owner explicitly authorizes an additive installation
 - `crates/serabot/src/memory_vectors.rs`, `runtime/conflicts.rs` — semantic memory recall (local E5 vector per fact, blended with BM25) and the write-time contradiction check (0.62).
 - `crates/serabot-desktop/src/bot_groups.rs`, `bot_library.rs` — sidebar bot order (pinned, recent, A–Z) and the per-bot Library tab (made by bots + uploads, filters, date groups, item dialog) over `GET /v1/bots/{bot}/library` (0.63).
 - `crates/serabot/src/relay_net.rs`, `api/relay.rs`, `crates/serabot-desktop/src/net_relay.rs`, `ui_net_relay.rs` — desktop network relay (0.66).
+- `crates/serabot/src/usage_insights.rs`, `crates/serabot-desktop/src/usage_insights.rs`, `ui_usage_insights.rs` — Usage insights: turns per channel (migration 0044 `client_turns`), tunnel traffic, model latency and failovers, 24-hour server load in memory (0.67).
 - `crates/serabot-desktop/src/turn_trace.rs` — per-reply turn traces (steps plus memories used and saved, from `turn.memory`), drawn inside the reply that turn produced (0.61); chat transcript CSS lives in one block at the end of `assets/system.css`.
 - `crates/serabot-desktop/src/runs.rs`, `chat_compose.rs`, `chat_failure.rs`, `chat_cards.rs`, `ui/chat_feed_view.rs`, `assets/runs.css` — runs sidebar, composer queue, failed and wait cards, virtualized feed (0.50).
 - `crates/serabot-desktop/src/acp/` (protocol, client, setup, transcript, controller), `ui_claude_code.rs`, `assets/claude-code.css` — Claude Code on this computer over ACP (0.54; integrated per-bot with persisted transcripts and folder choice in 0.55).
 - `crates/serabot/src/whatsapp_link/`, `api/whatsapp_link.rs`, `crates/serabot-desktop/src/ui_whatsapp_link.rs` — WhatsApp linked device: allowlist, chat mapping, per-member client, approval-gated send, desktop card (0.58; enabled by default in 0.59).
 - `crates/serabot/src/projects.rs`, `api/projects.rs`, `crates/serabot-desktop/src/projects.rs`, `ui_projects.rs` — per-user project folders in the server inbox, HTTP API, and desktop workspace (0.58–0.59).
-- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.66.0.
+- `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status, updated through 0.67.0.

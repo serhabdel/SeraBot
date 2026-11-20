@@ -231,6 +231,19 @@ pub fn proxy_for(user_id: &str, kind: &str) -> Option<reqwest::Proxy> {
         .map(|proxy| proxy.basic_auth("serabot", &token))
 }
 
+/// Whether `kind`'s traffic for `user_id` goes through the desktop right
+/// now: the member turned it on and the desktop is connected (0.67, for the
+/// Usage tab).
+pub fn relayed(user_id: &str, kind: &str) -> bool {
+    hub().is_some_and(|hub| {
+        hub.online(user_id)
+            && hub
+                .store
+                .relay_settings(user_id)
+                .is_ok_and(|settings| settings.routes(kind))
+    })
+}
+
 fn random_token() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 32];

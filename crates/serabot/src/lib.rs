@@ -100,6 +100,7 @@ pub mod token_connectors;
 pub mod tools;
 pub mod tools_bots;
 pub mod turn_limits;
+pub mod usage_insights;
 pub mod user_inbox;
 pub mod user_secrets;
 pub mod util;

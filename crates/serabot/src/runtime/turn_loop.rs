@@ -782,6 +782,8 @@ impl Runtime {
             }
             let route = self.checked_route(&user, &state.route)?.clone();
             let thinking = self.turn_thinking(&user, conversation_id, &bot);
+            // 0.67: model latency for the Usage tab (includes failover).
+            let call_started = std::time::Instant::now();
             let routed = loop {
                 // Nearing the model's window: compact before the call, not
                 // after a refusal.
@@ -892,6 +894,17 @@ impl Runtime {
                     "usage": response.usage,
                     "history_messages": state.history_messages,
                     "prompt_chars_est": estimate_prompt_chars(&state.messages),
+                    "latency_ms": u64::try_from(call_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "relayed": crate::relay_net::relayed(
+                        &user,
+                        &self
+                            .config
+                            .llm
+                            .providers
+                            .get(&used.provider)
+                            .and_then(|profile| crate::providers::canonical_kind(&profile.kind).ok())
+                            .unwrap_or_else(|| used.provider.clone()),
+                    ),
                 })),
             )?;
             let assistant = response.message;

@@ -14,6 +14,7 @@ pub(super) struct MessageRequest {
 pub(super) async fn send_message(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
+    headers: HeaderMap,
     Json(request): Json<MessageRequest>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&request.conversation_id)?;
@@ -27,6 +28,11 @@ pub(super) async fn send_message(
         request.bot.as_deref(),
         &request.attachments,
     )?;
+    // Usage insights (0.67): which client started this turn. Best effort.
+    let client = crate::usage_insights::client_from_headers(&headers);
+    if let Err(error) = state.store.record_client_turn(&user.id, &task.id, client) {
+        tracing::debug!(%error, "client turn not recorded");
+    }
     Ok(Json(json!({"task": task_view(&task)})))
 }
 

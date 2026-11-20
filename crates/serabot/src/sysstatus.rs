@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -361,6 +361,9 @@ pub struct StatusMonitor {
     sampler: Mutex<Sampler>,
     scan: Mutex<Option<(Instant, StorageScan)>>,
     audited: Mutex<Option<Instant>>,
+    /// The last 24 hours of load, sampled every 5 minutes (0.67).
+    history: crate::usage_insights::ResourceHistory,
+    history_started: std::sync::atomic::AtomicBool,
 }
 
 impl Default for StatusMonitor {
@@ -385,7 +388,55 @@ impl StatusMonitor {
             }),
             scan: Mutex::new(None),
             audited: Mutex::new(None),
+            history: crate::usage_insights::ResourceHistory::default(),
+            history_started: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Start sampling load into the 24-hour history (once per monitor). The
+    /// thread stops when the monitor is dropped.
+    pub fn start_history(self: &Arc<Self>, data_dir: PathBuf) {
+        use std::sync::atomic::Ordering;
+        if self.history_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let spawned = std::thread::Builder::new()
+            .name("serabot-load-history".into())
+            .spawn(move || {
+                loop {
+                    let Some(monitor) = weak.upgrade() else {
+                        return;
+                    };
+                    monitor.sample_history(&data_dir);
+                    drop(monitor);
+                    std::thread::sleep(crate::usage_insights::SAMPLE_EVERY);
+                }
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "load history sampler did not start");
+        }
+    }
+
+    /// Take one load sample now.
+    pub fn sample_history(&self, data_dir: &Path) {
+        let snapshot = self.host_snapshot(data_dir);
+        let memory_percent = if snapshot.host_memory_total_bytes == 0 {
+            0.0
+        } else {
+            (snapshot.host_memory_used_bytes as f64 * 100.0
+                / snapshot.host_memory_total_bytes as f64) as f32
+        };
+        self.history.push(crate::usage_insights::ResourceSample {
+            at: chrono::Utc::now().to_rfc3339(),
+            cpu_percent: snapshot.host_cpu_percent,
+            memory_percent,
+            process_rss_bytes: snapshot.process_rss_bytes,
+        });
+    }
+
+    pub fn history(&self) -> Vec<crate::usage_insights::ResourceSample> {
+        self.history.snapshot()
     }
 
     pub fn uptime_secs(&self) -> u64 {

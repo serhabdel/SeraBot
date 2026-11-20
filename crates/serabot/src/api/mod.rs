@@ -422,10 +422,20 @@ impl ApiState {
 
 pub fn router(state: ApiState) -> Router {
     let shared = Arc::new(state);
+    if let Some(data_dir) = shared
+        .store
+        .path()
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .filter(|path| path.is_dir())
+    {
+        shared.sys_status.start_history(data_dir);
+    }
     let protected = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/status", get(status))
         .route("/v1/usage", get(usage))
+        .route("/v1/usage/insights", get(usage_insights))
         .route("/v1/admin/status", get(admin_status))
         .route("/v1/browser", get(browser_status))
         .route("/v1/browser/screenshot", get(browser_screenshot))

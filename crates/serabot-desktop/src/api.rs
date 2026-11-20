@@ -2572,7 +2572,14 @@ pub(crate) fn send_with_policy(
 /// clients use: no retries, cookies, redirects, environment proxies or
 /// persistent storage.
 fn build_http_client(endpoint: &Url) -> Result<Client, ApiError> {
+    // Usage insights (0.67): tells the server this turn came from the desktop.
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "x-serabot-client",
+        reqwest::header::HeaderValue::from_static("desktop"),
+    );
     let mut builder = Client::builder()
+        .default_headers(headers)
         .redirect(Policy::none())
         .no_proxy()
         .retry(reqwest::retry::never())
@@ -4144,6 +4151,24 @@ impl ApiClient {
 
     /// `GET /v1/whatsapp-link`: the member's linked WhatsApp number.
     /// `GET /v1/relay/net` (0.66): relay settings, providers, live status.
+    /// `GET /v1/usage/insights?days=&scope=` (0.67): channels, tunnel, model
+    /// latency and failovers, and (admin) the server's 24-hour load.
+    pub fn usage_insights(
+        &self,
+        days: u32,
+        everyone: bool,
+    ) -> Result<crate::usage_insights::Insights, ApiError> {
+        if !(1..=90).contains(&days) {
+            return Err(ApiError::Validation("Insights window must be 1–90 days."));
+        }
+        let days_value = days.to_string();
+        let mut query = vec![("days", days_value.as_str())];
+        if everyone {
+            query.push(("scope", "all"));
+        }
+        self.get(&["v1", "usage", "insights"], &query)
+    }
+
     pub fn relay_get(&self) -> Result<serde_json::Value, ApiError> {
         self.get(&["v1", "relay", "net"], &[])
     }
