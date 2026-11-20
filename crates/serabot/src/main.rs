@@ -1115,6 +1115,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         tokio::spawn(async move { link.start_linked().await });
     }
 
+    ops_watch.attach(runtime.clone(), personal_connectors.clone());
     let worker = tokio::spawn(runtime.clone().run_worker());
     // Background media jobs (0.24): polls provider renders until they finish.
     let media_jobs = tokio::spawn(serabot::media_jobs::run_media_jobs(

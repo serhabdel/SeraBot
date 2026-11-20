@@ -31,6 +31,8 @@ mod ui_marketplace;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_mcp_accounts;
 #[cfg(any(windows, feature = "ui-check"))]
+mod ui_memory_review;
+#[cfg(any(windows, feature = "ui-check"))]
 mod ui_net_relay;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_ops;

@@ -68,6 +68,42 @@ impl Default for AlertSettings {
     }
 }
 
+/// Switches for the scheduled helpers (0.70). Stored beside the alert
+/// settings; a member who never saved any gets the defaults: brief on,
+/// triage off, memory review on.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct HelperSettings {
+    pub morning_brief: bool,
+    /// The member's own hour (UTC); `None` follows `[ops] brief_hour_utc`.
+    pub brief_hour_utc: Option<u8>,
+    pub email_triage: bool,
+    pub triage_hour_utc: Option<u8>,
+    pub memory_review: bool,
+}
+
+impl Default for HelperSettings {
+    fn default() -> Self {
+        Self {
+            morning_brief: true,
+            brief_hour_utc: None,
+            email_triage: false,
+            triage_hour_utc: None,
+            memory_review: true,
+        }
+    }
+}
+
+/// A partial change to [`HelperSettings`]; absent fields stay as they are.
+/// An hour of `Some(None)` clears the member's own hour.
+#[derive(Clone, Debug, Default)]
+pub struct HelperPatch {
+    pub morning_brief: Option<bool>,
+    pub brief_hour_utc: Option<Option<u8>>,
+    pub email_triage: Option<bool>,
+    pub triage_hour_utc: Option<Option<u8>>,
+    pub memory_review: Option<bool>,
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct SentAlert {
     pub at: String,
@@ -122,6 +158,88 @@ impl Store {
                 i64::from(settings.telegram),
                 settings.whatsapp_conversation_id,
                 Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The member's scheduled-helper switches.
+    pub fn helper_settings(&self, user_id: &str) -> Result<HelperSettings> {
+        let connection = self.connection()?;
+        #[allow(clippy::type_complexity)]
+        let row: Option<(i64, Option<i64>, i64, Option<i64>, i64)> = connection
+            .query_row(
+                "SELECT morning_brief, brief_hour_utc, email_triage, triage_hour_utc, memory_review
+                 FROM alert_settings WHERE user_id = ?1",
+                params![user_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let hour = |value: Option<i64>| value.and_then(|hour| u8::try_from(hour).ok());
+        Ok(row
+            .map(
+                |(brief, brief_hour, triage, triage_hour, review)| HelperSettings {
+                    morning_brief: brief != 0,
+                    brief_hour_utc: hour(brief_hour),
+                    email_triage: triage != 0,
+                    triage_hour_utc: hour(triage_hour),
+                    memory_review: review != 0,
+                },
+            )
+            .unwrap_or_default())
+    }
+
+    pub fn set_helper_settings(&self, user_id: &str, patch: &HelperPatch) -> Result<()> {
+        for hour in [patch.brief_hour_utc, patch.triage_hour_utc]
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if hour > 23 {
+                return Err(SeraError::Validation("hour must be 0 to 23".into()));
+            }
+        }
+        let mut next = self.helper_settings(user_id)?;
+        if let Some(value) = patch.morning_brief {
+            next.morning_brief = value;
+        }
+        if let Some(value) = patch.brief_hour_utc {
+            next.brief_hour_utc = value;
+        }
+        if let Some(value) = patch.email_triage {
+            next.email_triage = value;
+        }
+        if let Some(value) = patch.triage_hour_utc {
+            next.triage_hour_utc = value;
+        }
+        if let Some(value) = patch.memory_review {
+            next.memory_review = value;
+        }
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO alert_settings(user_id, telegram, whatsapp_conversation_id, updated_at,
+                 morning_brief, brief_hour_utc, email_triage, triage_hour_utc, memory_review)
+             VALUES (?1, 1, NULL, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(user_id) DO UPDATE SET morning_brief = excluded.morning_brief,
+                brief_hour_utc = excluded.brief_hour_utc, email_triage = excluded.email_triage,
+                triage_hour_utc = excluded.triage_hour_utc, memory_review = excluded.memory_review,
+                updated_at = excluded.updated_at",
+            params![
+                user_id,
+                Utc::now().to_rfc3339(),
+                i64::from(next.morning_brief),
+                next.brief_hour_utc.map(i64::from),
+                i64::from(next.email_triage),
+                next.triage_hour_utc.map(i64::from),
+                i64::from(next.memory_review),
             ],
         )?;
         Ok(())
@@ -329,6 +447,10 @@ pub struct OpsWatch {
     /// Held while a backup runs, so a manual run and the nightly one never
     /// overlap.
     backup_lock: tokio::sync::Mutex<()>,
+    /// Set after start-up (0.70): the runtime that takes the triage turn and
+    /// scans outgoing text, and the members' own connectors for the brief.
+    runtime: std::sync::OnceLock<crate::runtime::Runtime>,
+    personal: std::sync::OnceLock<Arc<crate::personal::PersonalConnectors>>,
 }
 
 impl OpsWatch {
@@ -347,6 +469,8 @@ impl OpsWatch {
             onedrive,
             relay_online: Mutex::new(HashMap::new()),
             backup_lock: tokio::sync::Mutex::new(()),
+            runtime: std::sync::OnceLock::new(),
+            personal: std::sync::OnceLock::new(),
         })
     }
 
@@ -373,7 +497,144 @@ impl OpsWatch {
                     tracing::warn!(%error, "weekly digest failed");
                 }
             }
+            self.run_helpers(Utc::now()).await;
         }
+    }
+
+    /// Give the watch the runtime and the members' connectors (0.70).
+    pub fn attach(
+        &self,
+        runtime: crate::runtime::Runtime,
+        personal: Arc<crate::personal::PersonalConnectors>,
+    ) {
+        let _ = self.runtime.set(runtime);
+        let _ = self.personal.set(personal);
+    }
+
+    /// Morning brief, email triage and memory review for every member whose
+    /// hour has come. Each is claimed once per day (or week) before it runs,
+    /// so a restart or a slow send never repeats it.
+    pub async fn run_helpers(&self, now: DateTime<Utc>) {
+        if let Err(error) = self.send_due_briefs(now).await {
+            tracing::warn!(%error, "morning briefs failed");
+        }
+        if let Err(error) = self.submit_due_triage(now) {
+            tracing::warn!(%error, "email triage failed");
+        }
+        if let Err(error) = self.send_due_memory_reviews(now).await {
+            tracing::warn!(%error, "memory review failed");
+        }
+    }
+
+    async fn send_due_briefs(&self, now: DateTime<Utc>) -> Result<usize> {
+        let ops = &self.config.ops;
+        if !ops.brief_enabled {
+            return Ok(0);
+        }
+        let mut sent = 0;
+        for user in self.store.list_users()? {
+            let settings = self.store.helper_settings(&user.id)?;
+            if !settings.morning_brief
+                || !hour_due(settings.brief_hour_utc, ops.brief_hour_utc, now)
+                || !claim_daily(&self.store, "brief", &user.id, now)?
+            {
+                continue;
+            }
+            if let Err(error) = self.send_brief_to(&user.id, now).await {
+                tracing::warn!(%error, "morning brief not sent");
+            } else {
+                sent += 1;
+            }
+        }
+        Ok(sent)
+    }
+
+    /// Build and deliver one member's brief now. Returns the text.
+    pub async fn send_brief_to(&self, user_id: &str, now: DateTime<Utc>) -> Result<String> {
+        let text = member_brief(
+            &self.store,
+            &self.config,
+            self.personal.get().map(|p| p.as_ref()),
+            self.runtime.get(),
+            user_id,
+            now,
+        )
+        .await?;
+        let alert = Alert {
+            user_id: user_id.to_string(),
+            kind: "brief",
+            key: now.format("%Y-%m-%d").to_string(),
+            text: text.clone(),
+        };
+        self.alerts.deliver(&alert, &text).await?;
+        Ok(text)
+    }
+
+    fn submit_due_triage(&self, now: DateTime<Utc>) -> Result<usize> {
+        let Some(runtime) = self.runtime.get() else {
+            return Ok(0);
+        };
+        let personal = self.personal.get();
+        triage_sweep(
+            &self.store,
+            &self.config,
+            now,
+            &|user| {
+                personal.is_some_and(|personal| {
+                    use crate::connectors::ConnectorKind;
+                    [ConnectorKind::OutlookMail, ConnectorKind::Gmail]
+                        .into_iter()
+                        .any(|kind| personal.connected(user, kind).unwrap_or(false))
+                })
+            },
+            &mut |user| {
+                runtime
+                    .submit_text(user, TRIAGE_CONVERSATION, TRIAGE_PROMPT, Some(TRIAGE_BOT))
+                    .map(|_| ())
+            },
+        )
+    }
+
+    async fn send_due_memory_reviews(&self, now: DateTime<Utc>) -> Result<usize> {
+        let ops = &self.config.ops;
+        if !ops.memory_review_enabled
+            || now.weekday().number_from_monday()
+                != u32::from(ops.memory_review_weekday.clamp(1, 7))
+            || now.hour() != u32::from(ops.memory_review_hour_utc.min(23))
+        {
+            return Ok(0);
+        }
+        let week = now.format("%G-W%V").to_string();
+        let mut sent = 0;
+        for user in self.store.list_users()? {
+            if !self.store.helper_settings(&user.id)?.memory_review {
+                continue;
+            }
+            let key = format!("ops.memreview.{}", user.id);
+            if self.store.kv_get(&key)?.as_deref() == Some(week.as_str()) {
+                continue;
+            }
+            self.store.kv_set(&key, &week)?;
+            let found = crate::memory_review::candidates(
+                &self.store,
+                &user.id,
+                now,
+                crate::memory_review::MAX_CANDIDATES,
+            )?;
+            if found.is_empty() {
+                continue;
+            }
+            let text = crate::memory_review::review_text(&found);
+            let alert = Alert {
+                user_id: user.id.clone(),
+                kind: "memory_review",
+                key: week.clone(),
+                text: text.clone(),
+            };
+            self.alerts.deliver(&alert, &text).await?;
+            sent += 1;
+        }
+        Ok(sent)
     }
 
     /// One alert sweep.
@@ -769,6 +1030,112 @@ pub struct BackupStatus {
     pub error: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Scheduled helpers (0.70)
+// ---------------------------------------------------------------------------
+
+/// The inbox bot's primary chat; the triage turn lands here.
+pub const TRIAGE_CONVERSATION: &str = "dir:inbox";
+pub const TRIAGE_BOT: &str = "inbox";
+/// The scheduled turn. The normal gateway applies: drafts are shown, and
+/// sending anything stays approval-gated.
+pub const TRIAGE_PROMPT: &str = "Daily inbox triage: look at my mail from the last 24 hours. \
+Group it as Important, Needs reply, FYI and Noise, one line each (sender, subject, the ask). \
+For the Needs reply group, draft a short reply for each, shown in full for my approval. \
+Do not send, archive or delete anything.";
+
+/// Whether this hour is the member's (or the default) hour.
+pub fn hour_due(own: Option<u8>, default: u8, now: DateTime<Utc>) -> bool {
+    now.hour() == u32::from(own.unwrap_or(default).min(23))
+}
+
+/// Claim today's run of `kind` for a member: true the first time per UTC day.
+pub fn claim_daily(store: &Store, kind: &str, user_id: &str, now: DateTime<Utc>) -> Result<bool> {
+    let key = format!("ops.{kind}.day.{user_id}");
+    let day = now.format("%Y-%m-%d").to_string();
+    if store.kv_get(&key)?.as_deref() == Some(day.as_str()) {
+        return Ok(false);
+    }
+    store.kv_set(&key, &day)?;
+    Ok(true)
+}
+
+/// Submit the triage turn once per day for each member who turned it on, has
+/// a readable mailbox and whose hour it is. `submit` is the only effect.
+pub fn triage_sweep(
+    store: &Store,
+    config: &Config,
+    now: DateTime<Utc>,
+    mailbox: &dyn Fn(&str) -> bool,
+    submit: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<usize> {
+    let ops = &config.ops;
+    if !ops.triage_enabled {
+        return Ok(0);
+    }
+    let mut submitted = 0;
+    for user in store.list_users()? {
+        let settings = store.helper_settings(&user.id)?;
+        if !settings.email_triage
+            || !hour_due(settings.triage_hour_utc, ops.triage_hour_utc, now)
+            || !mailbox(&user.id)
+            || !claim_daily(store, "triage", &user.id, now)?
+        {
+            continue;
+        }
+        match submit(&user.id) {
+            Ok(()) => {
+                submitted += 1;
+                store.record_audit(
+                    &user.id,
+                    "triage.scheduled",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?;
+            }
+            Err(error) => tracing::warn!(%error, "triage turn not queued"),
+        }
+    }
+    Ok(submitted)
+}
+
+/// One member's morning brief text: their rows, plus calendar and mail from
+/// their own connectors when reachable. If the content policy blocks the
+/// text, the connector-fed lines are dropped and the rows alone are checked.
+pub async fn member_brief(
+    store: &Store,
+    config: &Config,
+    personal: Option<&crate::personal::PersonalConnectors>,
+    runtime: Option<&crate::runtime::Runtime>,
+    user_id: &str,
+    now: DateTime<Utc>,
+) -> Result<String> {
+    let tz: chrono_tz::Tz = config
+        .schedule
+        .timezone
+        .parse()
+        .map_err(|_| SeraError::Config("invalid schedule timezone".into()))?;
+    let feeds = match personal {
+        Some(personal) => crate::brief::collect_feeds(personal, user_id, now, tz).await,
+        None => crate::brief::BriefFeeds::default(),
+    };
+    let text = crate::brief::morning_brief_text(store, user_id, now, tz, &feeds)?;
+    if let Some(runtime) = runtime
+        && runtime.scan_owner_output(user_id, &text).is_err()
+    {
+        let bare = crate::brief::morning_brief_text(store, user_id, now, tz, &Default::default())?;
+        if runtime.scan_owner_output(user_id, &bare).is_ok() {
+            return Ok(bare);
+        }
+        return Ok("The morning brief was withheld because it violated the content policy.".into());
+    }
+    Ok(text)
+}
+
 /// The weekly digest for one member: their last 7 days in a few lines.
 /// Counts and sizes only, never message text.
 pub fn weekly_digest_text(
@@ -1130,6 +1497,203 @@ mod tests {
         let sent = capture.0.lock().unwrap().clone();
         assert_eq!(sent.len(), 1, "{sent:?}");
         assert!(sent[0].2.contains("80%"));
+    }
+
+    fn at(hour: u32) -> DateTime<Utc> {
+        use chrono::TimeZone;
+        Utc.with_ymd_and_hms(2026, 11, 20, hour, 5, 0).unwrap()
+    }
+
+    #[test]
+    fn helper_defaults_and_updates() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let defaults = store.helper_settings(&admin).unwrap();
+        assert!(defaults.morning_brief && defaults.memory_review && !defaults.email_triage);
+        store
+            .set_helper_settings(
+                &admin,
+                &HelperPatch {
+                    email_triage: Some(true),
+                    brief_hour_utc: Some(Some(9)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let saved = store.helper_settings(&admin).unwrap();
+        assert!(saved.email_triage && saved.morning_brief);
+        assert_eq!(saved.brief_hour_utc, Some(9));
+        // The alert channel settings are untouched by the helper switches.
+        assert!(store.alert_settings(&admin).unwrap().telegram);
+        store
+            .set_helper_settings(
+                &admin,
+                &HelperPatch {
+                    brief_hour_utc: Some(None),
+                    morning_brief: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let cleared = store.helper_settings(&admin).unwrap();
+        assert!(!cleared.morning_brief);
+        assert_eq!(cleared.brief_hour_utc, None);
+        assert!(
+            store
+                .set_helper_settings(
+                    &admin,
+                    &HelperPatch {
+                        triage_hour_utc: Some(Some(24)),
+                        ..Default::default()
+                    }
+                )
+                .is_err()
+        );
+        // Saving channels afterwards keeps the helper switches.
+        store
+            .set_alert_settings(
+                &admin,
+                &AlertSettings {
+                    telegram: false,
+                    whatsapp_conversation_id: None,
+                },
+            )
+            .unwrap();
+        assert!(!store.helper_settings(&admin).unwrap().morning_brief);
+    }
+
+    #[test]
+    fn triage_is_submitted_once_per_day_only_when_on_and_a_mailbox_exists() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let bob = store
+            .create_user("microsoft:bob", "bob@example.example", "Bob")
+            .unwrap()
+            .id;
+        let config = Config::default();
+        let mut submitted: Vec<String> = Vec::new();
+        let run = |store: &Store, now: DateTime<Utc>, mailbox: bool, out: &mut Vec<String>| {
+            triage_sweep(store, &config, now, &|_| mailbox, &mut |user| {
+                out.push(user.to_string());
+                Ok(())
+            })
+            .unwrap()
+        };
+        // Off by default: nothing.
+        assert_eq!(run(&store, at(7), true, &mut submitted), 0);
+        store
+            .set_helper_settings(
+                &admin,
+                &HelperPatch {
+                    email_triage: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // Wrong hour, then no mailbox: nothing, and no day is used up.
+        assert_eq!(run(&store, at(3), true, &mut submitted), 0);
+        assert_eq!(run(&store, at(7), false, &mut submitted), 0);
+        // Right hour with a mailbox: once, however often the minute sweep runs.
+        assert_eq!(run(&store, at(7), true, &mut submitted), 1);
+        assert_eq!(run(&store, at(7), true, &mut submitted), 0);
+        assert_eq!(submitted, vec![admin.clone()]);
+        // Next day it runs again; a member who stays off never does.
+        let tomorrow = at(7) + chrono::Duration::days(1);
+        assert_eq!(run(&store, tomorrow, true, &mut submitted), 1);
+        assert!(!submitted.contains(&bob));
+        // Switching off stops it.
+        store
+            .set_helper_settings(
+                &admin,
+                &HelperPatch {
+                    email_triage: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let later = tomorrow + chrono::Duration::days(1);
+        assert_eq!(run(&store, later, true, &mut submitted), 0);
+    }
+
+    #[test]
+    fn the_members_own_hour_overrides_the_default() {
+        assert!(hour_due(None, 6, at(6)));
+        assert!(!hour_due(None, 6, at(7)));
+        assert!(hour_due(Some(7), 6, at(7)));
+        assert!(!hour_due(Some(7), 6, at(6)));
+    }
+
+    #[tokio::test]
+    async fn briefs_go_to_members_with_the_switch_on_once_a_day() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let bob = store
+            .create_user("microsoft:bob", "bob@example.example", "Bob")
+            .unwrap()
+            .id;
+        store
+            .set_helper_settings(
+                &bob,
+                &HelperPatch {
+                    morning_brief: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let capture = Arc::new(Capture::default());
+        let watch = OpsWatch::new(
+            Arc::new(Config::default()),
+            store.clone(),
+            capture.clone(),
+            None,
+        );
+        assert_eq!(watch.send_due_briefs(at(5)).await.unwrap(), 0);
+        assert_eq!(watch.send_due_briefs(at(6)).await.unwrap(), 1);
+        assert_eq!(watch.send_due_briefs(at(6)).await.unwrap(), 0);
+        let sent = capture.0.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, admin);
+        assert!(sent[0].2.contains("morning brief"));
+    }
+
+    #[tokio::test]
+    async fn the_weekly_memory_review_lists_only_the_members_own_old_memories() {
+        use chrono::TimeZone;
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let bob = store
+            .create_user("microsoft:bob", "bob@example.example", "Bob")
+            .unwrap()
+            .id;
+        let mine =
+            crate::memory::add(&store, &admin, "fact", "alpha beta gamma delta mine", "t").unwrap();
+        crate::memory::add(&store, &bob, "fact", "bobs private note about travel", "t").unwrap();
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE memories SET updated_at = '2020-01-01T00:00:00Z'",
+                [],
+            )
+            .unwrap();
+        let capture = Arc::new(Capture::default());
+        let watch = OpsWatch::new(
+            Arc::new(Config::default()),
+            store.clone(),
+            capture.clone(),
+            None,
+        );
+        // Sunday 2026-11-22 17:00 UTC is the default slot.
+        let sunday = Utc.with_ymd_and_hms(2026, 11, 22, 17, 1, 0).unwrap();
+        assert_eq!(watch.send_due_memory_reviews(sunday).await.unwrap(), 2);
+        assert_eq!(watch.send_due_memory_reviews(sunday).await.unwrap(), 0);
+        // Wrong day: nothing.
+        assert_eq!(watch.send_due_memory_reviews(at(17)).await.unwrap(), 0);
+        let sent = capture.0.lock().unwrap();
+        let to_admin = sent.iter().find(|row| row.0 == admin).unwrap();
+        assert!(to_admin.2.contains("alpha beta gamma delta mine"));
+        assert!(!to_admin.2.contains("bobs private"));
+        assert!(!to_admin.2.contains(&mine.id));
     }
 
     #[test]
