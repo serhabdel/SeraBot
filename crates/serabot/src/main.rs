@@ -964,6 +964,8 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
                 resolver: Arc::new(VaultResolver::new(users.clone(), providers.clone())),
                 artifacts: Some(artifacts.clone()),
                 store: store.clone(),
+                policy: policy.clone(),
+                auto_dismiss_banners: config.browser.auto_dismiss_banners,
             },
         )?;
         browser_manager = Some(manager);

@@ -36,6 +36,11 @@ pub fn valid_profile_id(id: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
 }
 
+/// Whether `user_id` may become a directory name.
+pub fn valid_user_id(user_id: &str) -> bool {
+    valid_user_component(user_id)
+}
+
 fn valid_user_component(user_id: &str) -> bool {
     !user_id.is_empty()
         && user_id.len() <= 64

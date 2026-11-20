@@ -24,6 +24,7 @@ or sends something to a third party that cannot be recalled. The list lives in
 | `todoist_complete_task` | Completes a Todoist task (a recurring task moves on). |
 | `slack_post_message` | Posts a message that everyone in a Slack channel can read. The approval names the channel. |
 | `whatsapp_send_message` | Sends a WhatsApp message to an external contact via WhatsApp Business Cloud API. The approval names the recipient and exact text. |
+| `browser_upload` | Sends one of the member's files to a website through the server browser (a file field on the current page). The approval names the file and the site, and binds the artifact hash. |
 | `whatsapp_send_template` | Sends an approved WhatsApp template message to an external contact. The approval names the recipient and template. |
 
 Not approval-gated (0.64, owner decision): `whatsapp_link_send` to the member's

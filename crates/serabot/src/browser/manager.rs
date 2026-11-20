@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use zeroize::Zeroizing;
 
+use super::banners::BannerCandidate;
 use super::outline::Outline;
 use super::signin::{SigninBlock, signin_block_hint};
 use crate::error::{Result, SeraError};
@@ -57,6 +58,37 @@ fn tabs_unsupported() -> SeraError {
 
 fn history_unsupported() -> SeraError {
     SeraError::Validation("this browser does not support back, forward or reload".into())
+}
+
+fn unsupported(what: &str) -> SeraError {
+    SeraError::Validation(format!("this browser does not support {what}"))
+}
+
+/// What `browser_wait` can wait for on the page itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadState {
+    /// `document.readyState === "complete"`.
+    Load,
+    /// Loaded, and no new resource requests for a moment.
+    NetworkIdle,
+}
+
+/// Where a scroll ended, in CSS pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrollState {
+    pub x: f64,
+    pub y: f64,
+    /// Total scrollable height and the visible height.
+    pub height: f64,
+    pub view: f64,
+}
+
+/// A file the page offered for download, read from the browser's own temp
+/// directory (already deleted).
+#[derive(Debug, Clone)]
+pub struct Download {
+    pub filename: String,
+    pub bytes: Vec<u8>,
 }
 
 /// One live browser page. Implemented by the Chromium/CDP backend and by a
@@ -105,6 +137,62 @@ pub trait BrowserBackend: Send + Sync {
     fn pointer(&self) -> Option<Pointer> {
         None
     }
+    /// Readable main text of the page (no refs), at most `max_chars`.
+    async fn page_text(&self, _max_chars: usize) -> Result<String> {
+        Err(unsupported("reading page text"))
+    }
+    /// Move the pointer over an element (after the actionability checks).
+    async fn hover_ref(&self, _reference: &str) -> Result<()> {
+        Err(unsupported("hover"))
+    }
+    /// Choose an option of a `<select>` by label or value; returns the label chosen.
+    async fn select_ref(&self, _reference: &str, _option: &str) -> Result<String> {
+        Err(unsupported("selecting options"))
+    }
+    /// Make a checkbox or switch checked or unchecked; returns the state it ended in.
+    async fn set_checked(&self, _reference: &str, _checked: bool) -> Result<bool> {
+        Err(unsupported("checkboxes"))
+    }
+    /// Scroll the page, or the element behind `reference`, by `dx`/`dy` pixels.
+    async fn scroll_by(&self, _reference: Option<&str>, _dx: f64, _dy: f64) -> Result<ScrollState> {
+        Err(unsupported("scrolling"))
+    }
+    /// Scroll an element into the middle of the view.
+    async fn scroll_to_ref(&self, _reference: &str) -> Result<()> {
+        Err(unsupported("scrolling"))
+    }
+    /// Set a file input to one file. The caller owns the file and deletes it afterwards.
+    async fn upload_ref(&self, _reference: &str, _path: &Path) -> Result<()> {
+        Err(unsupported("file uploads"))
+    }
+    /// Wait for the page to load or go quiet; false when `timeout` ran out first.
+    async fn wait_load_state(&self, _state: LoadState, _timeout: Duration) -> Result<bool> {
+        Err(unsupported("waiting for the page to load"))
+    }
+    /// Click an element and wait for the download it starts; refuses files
+    /// above `max_bytes`.
+    async fn click_download(
+        &self,
+        _reference: &str,
+        _timeout: Duration,
+        _max_bytes: u64,
+    ) -> Result<Download> {
+        Err(unsupported("downloads"))
+    }
+    /// Print the page to PDF, at most `max_bytes`.
+    async fn print_pdf(&self, _max_bytes: usize) -> Result<Vec<u8>> {
+        Err(unsupported("printing to PDF"))
+    }
+    /// Buttons inside consent banners on the active page.
+    async fn banner_candidates(&self) -> Result<Vec<BannerCandidate>> {
+        Ok(Vec::new())
+    }
+    /// Click candidate `index` of the last [`BrowserBackend::banner_candidates`].
+    async fn click_banner(&self, _index: usize) -> Result<()> {
+        Err(unsupported("consent banners"))
+    }
+    /// Skip images, media and fonts for the rest of this session.
+    fn set_block_heavy(&self, _on: bool) {}
 }
 
 #[async_trait]
@@ -375,6 +463,42 @@ impl BrowserManager {
 
     pub fn base_dir(&self) -> Option<&Path> {
         self.base_dir.as_deref()
+    }
+
+    /// The browser's own scratch space for uploads and downloads:
+    /// `<base>/.tmp/<user>`. A dot cannot be part of a user id, so it never
+    /// collides with a profile directory. Falls back to the system temp dir
+    /// when no base is set (tests).
+    pub fn temp_dir(&self, user_id: &str) -> Result<PathBuf> {
+        if !crate::browser_profiles::valid_user_id(user_id) {
+            return Err(SeraError::Validation("invalid user id".into()));
+        }
+        let root = match &self.base_dir {
+            Some(base) => base.join(".tmp"),
+            None => std::env::temp_dir().join("serabot-browser-tmp"),
+        };
+        Ok(root.join(user_id))
+    }
+
+    /// Forget a profile's saved logins: close its browser and delete the
+    /// profile directory (cookies, local storage, everything Chrome kept).
+    /// Only this user's profile is touched. Refused while the user drives the
+    /// browser. Returns whether a profile directory existed.
+    pub async fn forget_logins(&self, user_id: &str, profile_id: &str) -> Result<bool> {
+        let base = self.base_dir.as_deref().ok_or_else(|| {
+            SeraError::Config("saved logins live in the browser directory, which is not set".into())
+        })?;
+        let _gate = self.launch_gate.lock().await;
+        if let Some(session) = self.existing(user_id, profile_id).await
+            && session.controller() == Controller::User
+        {
+            return Err(user_in_control());
+        }
+        let removed = self.sessions.lock().await.remove(&key(user_id, profile_id));
+        if let Some(session) = removed {
+            session.backend.shutdown().await;
+        }
+        crate::browser_profiles::remove_profile_dir(base, user_id, profile_id)
     }
 
     async fn existing(&self, user_id: &str, profile_id: &str) -> Option<Arc<Session>> {
