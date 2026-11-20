@@ -26,7 +26,8 @@ use serabot::firecrawl::{
 use serabot::fleet::FleetRegistry;
 use serabot::gateway::{Gateway, ToolRegistry};
 use serabot::maker::{
-    ArtifactStore, DeckBuildTool, OneDriveListTool, OneDriveUploadTool, TelegramDocumentTool,
+    ArtifactStore, DeckBuildTool, OneDriveDownloadTool, OneDriveListTool, OneDriveUploadTool,
+    TelegramDocumentTool,
 };
 use serabot::openrouter::OpenRouterGenerateImageTool;
 use serabot::policy::Policy;
@@ -721,6 +722,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         }),
     )?;
     serabot::job_tools::register_job_tools(&mut registry, config.clone(), secrets.clone())?;
+    serabot::job_watch::register_job_watch_tools(&mut registry, store.clone(), config.clone())?;
     serabot::job_tools::register_task_calendar_tools(
         &mut registry,
         store.clone(),
@@ -1021,6 +1023,10 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         registry.register(OneDriveListTool::new(
             onedrive_clients.clone(),
             config.onedrive.folder.clone(),
+        ))?;
+        registry.register(OneDriveDownloadTool::new(
+            onedrive_clients.clone(),
+            artifacts.clone(),
         ))?;
         onedrive_registry = Some(onedrive_clients);
     }

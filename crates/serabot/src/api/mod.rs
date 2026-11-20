@@ -63,6 +63,7 @@ mod connectors;
 mod conversations;
 mod files;
 mod handoffs;
+mod job_search;
 mod jobs;
 mod local;
 mod logs;
@@ -527,6 +528,18 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/v1/bots/{bot}/library", get(bot_library))
         .route("/v1/relay/net", get(relay::relay_get).put(relay::relay_put))
+        .route("/v1/jobs/overview", get(job_search::jobs_overview))
+        .route(
+            "/v1/jobs/profile",
+            get(job_search::jobs_profile_get).put(job_search::jobs_profile_put),
+        )
+        .route("/v1/jobs/sources", get(job_search::jobs_sources_get))
+        .route("/v1/jobs/sources/{key}", put(job_search::jobs_source_put))
+        .route(
+            "/v1/jobs/applications",
+            get(job_search::jobs_applications_get),
+        )
+        .route("/v1/jobs/watch", post(job_search::jobs_watch))
         .route("/v1/alerts", get(ops::alerts_get).put(ops::alerts_put))
         .route("/v1/alerts/digest", post(ops::digest_now))
         .route("/v1/usage/costs", get(ops::costs_get))

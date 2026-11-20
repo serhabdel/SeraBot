@@ -4202,6 +4202,35 @@ impl ApiClient {
         self.request(Method::PUT, &["v1", "alerts"], &[], Some(body))
     }
 
+    /// `GET /v1/jobs/overview` (0.70): profile, sources, matches, pipeline counts.
+    pub fn jobs_overview(&self) -> Result<serde_json::Value, ApiError> {
+        self.get(&["v1", "jobs", "overview"], &[])
+    }
+
+    /// `PUT /v1/jobs/sources/{key}` (0.70): switch a source's auto-watch.
+    pub fn jobs_source_auto_watch(
+        &self,
+        key: &str,
+        auto_watch: bool,
+    ) -> Result<serde_json::Value, ApiError> {
+        self.request(
+            Method::PUT,
+            &["v1", "jobs", "sources", key],
+            &[],
+            Some(&serde_json::json!({"auto_watch": auto_watch})),
+        )
+    }
+
+    /// `POST /v1/jobs/watch` (0.70): check the job sources now.
+    pub fn jobs_watch(&self) -> Result<serde_json::Value, ApiError> {
+        self.request(
+            Method::POST,
+            &["v1", "jobs", "watch"],
+            &[],
+            Some(&serde_json::json!({})),
+        )
+    }
+
     /// `POST /v1/alerts/digest` (0.69): send me my weekly digest now.
     pub fn digest_now(&self) -> Result<serde_json::Value, ApiError> {
         self.request(

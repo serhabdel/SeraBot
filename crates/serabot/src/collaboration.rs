@@ -89,6 +89,7 @@ pub const SHARED_TOOLS: &[&str] = &[
     "calendar_events",
     "tasks_list",
     "tasks_create",
+    "onedrive_download",
     // 0.58: every bot reads, indexes (with the OCR fallback) and produces
     // documents, whatever its stored list says.
     "document_index",
