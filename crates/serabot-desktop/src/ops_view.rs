@@ -42,6 +42,12 @@ pub fn digest_now(credentials: &crate::worker::Credentials) -> Result<Value, Str
         .map_err(|error| error.to_string())
 }
 
+pub fn brief_now(credentials: &crate::worker::Credentials) -> Result<Value, String> {
+    client(credentials)?
+        .brief_preview()
+        .map_err(|error| error.to_string())
+}
+
 pub fn get_costs(credentials: &crate::worker::Credentials) -> Result<Value, String> {
     client(credentials)?
         .costs_get()

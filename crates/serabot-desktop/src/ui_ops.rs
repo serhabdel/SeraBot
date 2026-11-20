@@ -152,6 +152,28 @@ pub fn AlertsCard(session: Signal<Session>) -> Element {
     let whatsapp_for_digest = whatsapp.clone();
     let auto_send = current["auto_send_files"].as_bool().unwrap_or(true);
     let digest_on = current["weekly_digest"].as_bool().unwrap_or(true);
+    let brief_on = current["morning_brief"].as_bool();
+    let triage_on = current["email_triage"].as_bool();
+    let review_on = current["memory_review"].as_bool();
+    let base =
+        serde_json::json!({"telegram": telegram, "whatsapp_conversation_id": whatsapp.clone()});
+    let with = move |key: &'static str, on: bool| {
+        let mut body = base.clone();
+        body[key] = serde_json::json!(on);
+        body
+    };
+    let brief_now = move |_| {
+        spawn(async move {
+            match call(session, ops::brief_now).await {
+                Ok(value) => note.set(Some(if value["delivered"].as_bool().unwrap_or(false) {
+                    "Brief sent. Check your Telegram or WhatsApp.".to_string()
+                } else {
+                    value["text"].as_str().unwrap_or_default().to_string()
+                })),
+                Err(message) => error.set(Some(message)),
+            }
+        });
+    };
     rsx! {
         div { class: "card insights-card",
             div { class: "card-head",
@@ -215,8 +237,53 @@ pub fn AlertsCard(session: Signal<Session>) -> Element {
                 }
                 "Weekly digest (usage, cost, failures, backups)"
             }
+            if let Some(on) = brief_on {
+                label { class: "insights-label",
+                    input {
+                        r#type: "checkbox",
+                        checked: on,
+                        disabled: busy(),
+                        onchange: {
+                            let with = with.clone();
+                            move |event: Event<FormData>| update(with("morning_brief", event.checked()))
+                        },
+                    }
+                    "Morning brief (deadlines, calendar, tasks, job matches, mail, budget)"
+                }
+            }
+            if let Some(on) = triage_on {
+                label { class: "insights-label",
+                    input {
+                        r#type: "checkbox",
+                        checked: on,
+                        disabled: busy(),
+                        onchange: {
+                            let with = with.clone();
+                            move |event: Event<FormData>| update(with("email_triage", event.checked()))
+                        },
+                    }
+                    "Daily email triage by the inbox bot (replies still need your approval)"
+                }
+            }
+            if let Some(on) = review_on {
+                label { class: "insights-label",
+                    input {
+                        r#type: "checkbox",
+                        checked: on,
+                        disabled: busy(),
+                        onchange: {
+                            let with = with.clone();
+                            move |event: Event<FormData>| update(with("memory_review", event.checked()))
+                        },
+                    }
+                    "Weekly memory review"
+                }
+            }
             div {
                 button { class: "btn ghost sm", r#type: "button", onclick: preview, "Send me the digest now" }
+                if brief_on.is_some() {
+                    button { class: "btn ghost sm", r#type: "button", onclick: brief_now, "Send me my brief now" }
+                }
             }
             if let Some(message) = note() {
                 p { class: "tiny", style: "white-space: pre-line;", "{message}" }
