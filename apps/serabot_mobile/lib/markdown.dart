@@ -6,7 +6,7 @@ import 'package:flutter/services.dart';
 /// numbered lists, quotes, fenced code, **bold**, *italic*, `code` and
 /// [links](https://...). Model output is untrusted: nothing is executed and a
 /// link is only copied to the clipboard on tap, never opened.
-enum MdBlockKind { paragraph, heading, bullet, number, quote, code }
+enum MdBlockKind { paragraph, heading, bullet, number, quote, code, hand }
 
 class MdBlock {
   const MdBlock(this.kind, this.text, {this.level = 0, this.index = 0});
@@ -30,6 +30,24 @@ List<MdBlock> parseMarkdownBlocks(String source) {
   var i = 0;
   while (i < lines.length) {
     final line = lines[i];
+    final trimmed = line.trimLeft();
+    if (trimmed.startsWith(':::hand') &&
+        (trimmed.length == 7 || trimmed[7].trim().isEmpty)) {
+      // Handwritten note block (0.74.3): `:::hand` … `:::` fences are
+      // stripped and the inner text renders as a paragraph in the Caveat
+      // handwriting font (see the `hand` case in `_block`). An unterminated
+      // block runs to the end of the message rather than leaking the fence.
+      flush();
+      final hand = <String>[];
+      i++;
+      while (i < lines.length && lines[i].trim() != ':::') {
+        hand.add(lines[i]);
+        i++;
+      }
+      out.add(MdBlock(MdBlockKind.hand, hand.join('\n').trim()));
+      i++;
+      continue;
+    }
     if (line.trimLeft().startsWith('```')) {
       flush();
       final code = <String>[];
@@ -177,6 +195,22 @@ class MarkdownText extends StatelessWidget {
         );
       case MdBlockKind.paragraph:
         return _rich(context, b.text, base);
+      case MdBlockKind.hand:
+        // Handwriting: Caveat when the font is bundled, otherwise the
+        // platform's default handwriting/cursive fallback — the fence is
+        // always stripped, so the text stays readable either way. The
+        // Caveat TTF itself is not bundled in 0.74.3: the GitHub MCP file
+        // tools accept text content only, so no font binary can be pushed
+        // through them. Bundle `assets/fonts/Caveat-Regular.ttf` and
+        // register it under `fonts:` in pubspec.yaml to get the real face.
+        return _rich(
+          context,
+          b.text,
+          base.copyWith(
+            fontFamily: 'Caveat',
+            fontSize: (base.fontSize ?? 16) + 6,
+          ),
+        );
     }
   }
 
