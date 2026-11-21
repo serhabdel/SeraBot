@@ -110,6 +110,28 @@ pub fn AppearanceCard(session: Signal<Session>) -> Element {
                 }
                 span { "Reduce motion" }
             }
+            label { class: "check",
+                input {
+                    r#type: "checkbox",
+                    checked: prefs.handwritten_notes,
+                    onchange: {
+                        let prefs = prefs.clone();
+                        move |event| {
+                            let mut next = prefs.clone();
+                            next.handwritten_notes = event.checked();
+                            session.write().set_prefs(next);
+                        }
+                    },
+                }
+                span { "Handwritten notes" }
+            }
+            p { class: "tiny",
+                if prefs.handwritten_notes {
+                    "Short notes and sign-offs from your bots render in a handwriting font."
+                } else {
+                    "Short notes and sign-offs from your bots render as plain text."
+                }
+            }
             p { class: "tiny", "These choices apply on this computer only." }
         }
     }
