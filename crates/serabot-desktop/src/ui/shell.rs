@@ -614,7 +614,10 @@ pub(super) fn Sidebar(
                             }
                             let total = chats.len();
                             if hidden > 0 || total > 1 {
-                                items.push(RailItem::BotAllChats { total });
+                                items.push(RailItem::BotAllChats {
+                                    bot_id: bot.id.clone(),
+                                    total,
+                                });
                             }
                         }
                     }

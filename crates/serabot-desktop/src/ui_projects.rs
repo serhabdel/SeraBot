@@ -26,7 +26,7 @@ use serabot_desktop::workflows::now_secs;
 async fn call<T, F>(session: Signal<Session>, job: F) -> Result<T, String>
 where
     T: Send + 'static,
-    F: FnOnce(Credentials) -> Result<T, String> + Send + 'static,
+    F: FnOnce(std::sync::Arc<Credentials>) -> Result<T, String> + Send + 'static,
 {
     let creds = session.read().credentials.clone();
     let Some(creds) = creds else {
@@ -490,7 +490,7 @@ pub fn ProjectsView(session: Signal<Session>) -> Element {
     let active_modified_label = active_slug
         .as_deref()
         .and_then(|s| modified_snapshot.get(s).and_then(|v| v.as_deref()))
-        .or_else(|| active_summary.finished_at.as_deref())
+        .or(active_summary.finished_at.as_deref())
         .map(|raw| format_relative_stamp(raw, now));
 
     rsx! {
@@ -845,7 +845,7 @@ pub fn ProjectsView(session: Signal<Session>) -> Element {
                                                                             let Some(dest) = save else { return; };
                                                                             busy.set(true);
                                                                             spawn(async move {
-                                                                                let res = call(session, move |creds| api::download(creds, &slug_c, &rel_c)).await;
+                                                                                let res = call(session, move |creds| api::download(&creds, &slug_c, &rel_c)).await;
                                                                                 busy.set(false);
                                                                                 match res {
                                                                                     Ok(bytes) => {
@@ -878,7 +878,8 @@ pub fn ProjectsView(session: Signal<Session>) -> Element {
                                                                             let p_del = path_for_del.clone();
                                                                             busy.set(true);
                                                                             spawn(async move {
-                                                                                let res = call(session, move |creds| api::delete_file(creds, &s_del, &p_del)).await;
+                                                                                let p_del_req = p_del.clone();
+                                                                                let res = call(session, move |creds| api::delete_file(&creds, &s_del, &p_del_req)).await;
                                                                                 busy.set(false);
                                                                                 match res {
                                                                                     Ok(_) => {
