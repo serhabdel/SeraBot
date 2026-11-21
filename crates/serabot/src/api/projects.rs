@@ -10,7 +10,7 @@ use super::*;
 use crate::attachments::MAX_ATTACHMENT_BYTES;
 use crate::projects::{
     create_project, delete_project_file, list_project_files, list_projects_with_stats,
-    read_project_file, save_project_upload, slugify,
+    read_project_file, save_project_upload, slugify, write_project_file,
 };
 
 pub(super) fn routes() -> Router<Arc<ApiState>> {
@@ -28,7 +28,9 @@ pub(super) fn routes() -> Router<Arc<ApiState>> {
         .route("/v1/projects/{slug}/files", get(list_files))
         .route(
             "/v1/projects/{slug}/files/{*path}",
-            get(download_project_file).delete(delete_file),
+            get(download_project_file)
+                .put(write_file)
+                .delete(delete_file),
         )
         .route("/v1/projects/{slug}/check", get(get_check).put(set_check))
         .route("/v1/projects/{slug}/check/run", post(run_check_route))
@@ -171,6 +173,35 @@ async fn download_project_file(
 ) -> Result<Response> {
     let (filename, bytes) = read_project_file(&state.config, &user.id, &slug, &path)?;
     Ok(files::download_response(&filename, bytes))
+}
+
+#[derive(Deserialize)]
+struct WriteFileRequest {
+    content: String,
+}
+
+/// `PUT /v1/projects/{slug}/files/{*path}` — save a text file from the
+/// workspace editor (0.74). Path containment and the 1 MiB cap are enforced in
+/// `projects::write_project_file`; every save is audit-logged.
+async fn write_file(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path((slug, path)): Path<(String, String)>,
+    Json(body): Json<WriteFileRequest>,
+) -> Result<Json<Value>> {
+    state.runtime.scan_owner_output(&user.id, &path)?;
+    let entry = write_project_file(&state.config, &user.id, &slug, &path, &body.content)?;
+    let _ = state.store.record_audit(
+        &user.id,
+        "project.file_write",
+        Some(&format!("{slug}/{path}")),
+        None,
+        None,
+        None,
+        None,
+        Some(&json!({ "bytes": entry.size_bytes })),
+    );
+    Ok(Json(json!({ "file": entry })))
 }
 
 async fn delete_file(

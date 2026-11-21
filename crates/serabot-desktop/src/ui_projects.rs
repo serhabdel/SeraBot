@@ -118,6 +118,24 @@ fn parse_diagnostics(value: &Value) -> (Option<Value>, Vec<DiagRow>) {
     (run, rows)
 }
 
+/// Whether a project file opens in the workspace editor (0.74).
+fn is_editable_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [
+        ".rs", ".toml", ".md", ".txt", ".json", ".csv", ".yaml", ".yml", ".py", ".js", ".ts",
+        ".tsx", ".jsx", ".html", ".css", ".xml", ".svg", ".log", ".sh", ".bat", ".sql", ".env",
+    ]
+    .iter()
+    .any(|ext| lower.ends_with(ext))
+}
+
+fn is_editable_file(mime: &str, name: &str) -> bool {
+    mime.starts_with("text/")
+        || mime.contains("json")
+        || mime.contains("xml")
+        || is_editable_name(name)
+}
+
 fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
@@ -354,6 +372,56 @@ pub fn ProjectsView(session: Signal<Session>) -> Element {
         }
     };
 
+    // 0.74: workspace editor state and actions.
+    let mut ws_path = use_signal(|| Option::<String>::None);
+    let mut ws_text = use_signal(String::new);
+    let mut ws_dirty = use_signal(|| false);
+    let mut ws_status = use_signal(|| Option::<String>::None);
+    let mut ws_jump_line = use_signal(|| Option::<u64>::None);
+
+    let mut open_file = move |slug: String, path: String, line: Option<u64>| {
+        ws_status.set(None);
+        let s = slug.clone();
+        let p2 = path.clone();
+        spawn(async move {
+            let result = call(session, move |creds| api::download(creds, &s, &p2)).await;
+            match result {
+                Ok(bytes) => {
+                    ws_text.set(String::from_utf8_lossy(&bytes).into_owned());
+                    ws_path.set(Some(path));
+                    ws_dirty.set(false);
+                    ws_jump_line.set(line);
+                }
+                Err(message) => error.set(Some(message)),
+            }
+        });
+    };
+
+    let save_file = move |_| {
+        let (Some(slug), Some(path)) = (selected.read().clone(), ws_path.read().clone()) else {
+            return;
+        };
+        let content = ws_text.read().clone();
+        ws_status.set(Some("Saving…".into()));
+        spawn(async move {
+            let result = call(session, move |creds| {
+                api::write_file(creds, &slug, &path, &content)
+            })
+            .await;
+            match result {
+                Ok(_) => {
+                    ws_dirty.set(false);
+                    ws_status.set(Some("Saved.".into()));
+                    refresh();
+                }
+                Err(message) => {
+                    ws_status.set(Some(format!("Save failed: {message}")));
+                    error.set(Some(message));
+                }
+            }
+        });
+    };
+
     let project_list = projects.read().clone();
     let file_list = files.read().clone();
     let active_slug = selected.read().clone();
@@ -365,6 +433,17 @@ pub fn ProjectsView(session: Signal<Session>) -> Element {
     let run_info = diag_run.read().clone();
     let check_text = check_cmd.read().clone();
     let checking = *check_busy.read();
+    let ws_open = ws_path.read().clone();
+    let ws_text_value = ws_text.read().clone();
+    let ws_dirty_flag = *ws_dirty.read();
+    let ws_status_text = ws_status.read().clone();
+    let ws_files = files.read().clone();
+    let ws_line_count = ws_text_value.lines().count().max(1);
+    let ws_jump = ws_jump_line
+        .read()
+        .as_ref()
+        .map(|l| l.to_string())
+        .unwrap_or_default();
 
     rsx! {
         div { class: "page-shell projects-page",
@@ -648,8 +727,21 @@ pub fn ProjectsView(session: Signal<Session>) -> Element {
                                                 "warning" => ("alert-circle", "diag-sev warning"),
                                                 _ => ("code", "diag-sev note"),
                                             };
+                                            let d_file = d.file.clone();
+                                            let d_line = d.line;
+                                            let d_editable = is_editable_name(&d_file);
+                                            let d_slug = slug.clone();
                                             rsx! {
-                                                div { key: "{key}", class: "diag-row",
+                                                div {
+                                                    key: "{key}",
+                                                    class: "diag-row",
+                                                    style: if d_editable { "cursor:pointer;" } else { "" },
+                                                    title: if d_editable { "Open in workspace editor" } else { "" },
+                                                    onclick: move |_| {
+                                                        if d_editable {
+                                                            open_file(d_slug.clone(), d_file.clone(), d_line);
+                                                        }
+                                                    },
                                                     span { class: "{sev_class}", Icon { name: icon, size: 14 } }
                                                     div { class: "diag-copy",
                                                         div { class: "diag-loc", "{loc}" }
@@ -667,6 +759,99 @@ pub fn ProjectsView(session: Signal<Session>) -> Element {
                         }
                     } else {
                         p { class: "muted", "Select or create a project to browse its files." }
+                    }
+                }
+            }
+            if let Some(ws_slug) = active_slug.clone() {
+                div { class: "surface-card", style: "margin-top:16px;",
+                    div { class: "section-head", style: "display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px;",
+                        h3 { "Workspace" }
+                        div { class: "field-row",
+                            if let Some(status) = ws_status_text.as_ref() {
+                                span { class: "muted", "{status}" }
+                            }
+                            button {
+                                r#type: "button",
+                                class: "btn btn-primary",
+                                disabled: !ws_dirty_flag || is_busy,
+                                onclick: save_file,
+                                Icon { name: "check", size: 14 }
+                                " Save"
+                            }
+                        }
+                    }
+                    div { class: "ws-grid",
+                        div { class: "ws-tree", role: "tree", "aria-label": "Project files",
+                            if ws_files.is_empty() {
+                                p { class: "muted", style: "padding:8px;", "No files yet." }
+                            }
+                            for file in ws_files.clone() {
+                                {
+                                    let depth = file.path.matches('/').count();
+                                    let pad = 8 + depth * 14;
+                                    let editable = is_editable_file(&file.mime, &file.name);
+                                    let active = ws_open.as_deref() == Some(file.path.as_str());
+                                    let p_click = file.path.clone();
+                                    let s_click = ws_slug.clone();
+                                    rsx! {
+                                        button {
+                                            key: "{file.path}",
+                                            r#type: "button",
+                                            class: if active { "ws-tree-item active" } else if editable { "ws-tree-item" } else { "ws-tree-item dim" },
+                                            style: "padding-left:{pad}px;",
+                                            disabled: !editable,
+                                            title: "{file.path}",
+                                            onclick: move |_| {
+                                                if editable {
+                                                    open_file(s_click.clone(), p_click.clone(), None);
+                                                }
+                                            },
+                                            "{file.path}"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        div { class: "ws-editor",
+                            if let Some(path) = ws_open.clone() {
+                                div { class: "ws-editor-head",
+                                    span { "{path}" }
+                                    span { class: "muted", if ws_dirty_flag { "unsaved changes" } else { "saved" } }
+                                }
+                                div { class: "ws-editor-body",
+                                    div { class: "ws-gutter", "aria-hidden": "true",
+                                        for n in 1..=ws_line_count {
+                                            div { key: "{n}", "{n}" }
+                                        }
+                                    }
+                                    textarea {
+                                        key: "{path}",
+                                        class: "ws-textarea",
+                                        spellcheck: false,
+                                        "aria-label": "Edit {path}",
+                                        "data-ws-init": "{ws_text_value}",
+                                        "data-ws-line": "{ws_jump}",
+                                        onmounted: move |_| {
+                                            document::eval(
+                                                "(() => { const ta = document.querySelector('.ws-textarea[data-ws-init]'); if (!ta) return; ta.value = ta.getAttribute('data-ws-init') || ''; const line = Number(ta.getAttribute('data-ws-line') || 0); const g = document.querySelector('.ws-gutter'); if (line > 0) { const lines = ta.value.split('\\n'); let off = 0; for (let i = 0; i < line - 1 && i < lines.length; i++) off += lines[i].length + 1; ta.focus(); ta.selectionStart = ta.selectionEnd = off; const lh = parseFloat(getComputedStyle(ta).lineHeight) || 21; ta.scrollTop = Math.max(0, (line - 1) * lh - ta.clientHeight / 3); if (g) g.scrollTop = ta.scrollTop; } })()",
+                                            );
+                                        },
+                                        onscroll: move |_| {
+                                            document::eval(
+                                                "(() => { const ta = document.querySelector('.ws-textarea'); const g = document.querySelector('.ws-gutter'); if (ta && g) g.scrollTop = ta.scrollTop; })()",
+                                            );
+                                        },
+                                        oninput: move |e| {
+                                            ws_text.set(e.value());
+                                            ws_dirty.set(true);
+                                            ws_status.set(None);
+                                        },
+                                    }
+                                }
+                            } else {
+                                p { class: "muted", style: "padding:12px;", "Select a text file on the left to edit it here. A problem below jumps straight to its line." }
+                            }
+                        }
                     }
                 }
             }

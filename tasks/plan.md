@@ -311,3 +311,13 @@ window, percent) at turn start, shown as a context meter in the model bar, and
 moves every remaining hard-coded px font-size in the desktop CSS onto the
 `--fs-*` tokens. Synthetic fixtures only; no real compiler ran and no render
 was taken — owner verification pending.
+
+## Status after 0.73.0 (code workspace, 0.74.0)
+
+0.74.0 adds a code workspace to the Projects page: file tree, caret-stable
+editor with line gutter, save through a new contained `PUT
+/v1/projects/{slug}/files/{*path}` endpoint (audit-logged), and Problems
+click-through that opens the file at the diagnostic's line. It also ships
+`docs/specs/lsp-workspace.md`, a proposed rust-analyzer LSP design for 0.75
+that widens the local-process exception and therefore waits for owner
+approval. Queued: 0.76 memory v2, 0.77 phone parity.
