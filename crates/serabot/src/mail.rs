@@ -763,7 +763,7 @@ fn parse_fetch_block(block: &str) -> (Vec<String>, Option<String>) {
     }
     let body = block
         .find("BODY[]")
-        .and_then(|pos| block[pos..].find('{'))
+        .and_then(|pos| block[pos..].find('{').map(|b| pos + b))
         .and_then(|brace| {
             let rest = &block[brace..];
             let close = rest.find('}')?;
@@ -1173,7 +1173,7 @@ mod tests {
 
     #[test]
     fn parses_rfc822_message() {
-        let raw = "From: Alice <alice@example.com>\r\nSubject: =?UTF-8?B?SMOpbGxv=?=\r\nDate: Mon, 1 Jan 2026 10:00:00 +0000\r\nX-Long: one\r\n two\r\n\r\nHello body\r\n";
+        let raw = "From: Alice <alice@example.com>\r\nSubject: =?UTF-8?B?SMOpbGxv?=\r\nDate: Mon, 1 Jan 2026 10:00:00 +0000\r\nX-Long: one\r\n two\r\n\r\nHello body\r\n";
         let msg = parse_message(42, vec!["\\Seen".into()], raw);
         assert_eq!(msg.uid, 42);
         assert_eq!(msg.subject, "Héllo");
