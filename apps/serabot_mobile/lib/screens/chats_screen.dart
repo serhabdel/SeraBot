@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:material_ui/material_ui.dart';
 
 import '../api_client.dart';
@@ -51,12 +53,89 @@ class _ChatsScreenState extends State<ChatsScreen> {
   bool _searching = false;
   ChatFilter _filter = ChatFilter.all;
 
+  /// Full-text message matches from `GET /v1/conversations/search` (0.74.2),
+  /// debounced while the member types. Title filtering stays instant and
+  /// local; this section is the server search underneath it.
+  Timer? _searchTimer;
+  List<ConversationSearchHit> _hits = const [];
+  bool _searchingServer = false;
+  String? _searchError;
+  int _searchGen = 0;
+
   AppState get app => widget.app;
 
   @override
   void dispose() {
+    _searchTimer?.cancel();
     _search.dispose();
     super.dispose();
+  }
+
+  void _onSearchChanged(String _) {
+    setState(() {});
+    _searchTimer?.cancel();
+    final q = _search.text.trim();
+    if (q.runes.length < 2) {
+      setState(() {
+        _hits = const [];
+        _searchError = null;
+        _searchingServer = false;
+      });
+      return;
+    }
+    setState(() => _searchingServer = true);
+    _searchTimer = Timer(const Duration(milliseconds: 350), () {
+      _runServerSearch(q);
+    });
+  }
+
+  Future<void> _runServerSearch(String q) async {
+    final gen = ++_searchGen;
+    try {
+      final hits = await app.client.searchConversations(q, limit: 15);
+      if (!mounted || gen != _searchGen) return;
+      setState(() {
+        _hits = hits;
+        _searchError = null;
+        _searchingServer = false;
+      });
+    } on ApiException catch (e) {
+      if (!mounted || gen != _searchGen) return;
+      setState(() {
+        _hits = const [];
+        _searchError = e.messageForUser();
+        _searchingServer = false;
+      });
+    }
+  }
+
+  /// Opens the chat a message match belongs to, refreshing the list first
+  /// when the conversation is not on screen (archived or beyond the page).
+  Future<void> _openHit(ConversationSearchHit hit) async {
+    ConversationSummary? found;
+    for (final c in app.conversations) {
+      if (c.id == hit.conversationId) {
+        found = c;
+        break;
+      }
+    }
+    found ??= await (() async {
+      await app.refreshConversations();
+      for (final c in app.conversations) {
+        if (c.id == hit.conversationId) return c;
+      }
+      return null;
+    })();
+    if (!mounted) return;
+    if (found == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('That chat is no longer in your list.'),
+        ),
+      );
+      return;
+    }
+    _open(found);
   }
 
   Future<void> _actions(ConversationSummary c) async {
@@ -271,7 +350,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                       hintText: 'Search chats',
                       border: InputBorder.none,
                     ),
-                    onChanged: (_) => setState(() {}),
+                    onChanged: _onSearchChanged,
                   )
                 : const Text('Chats'),
             actions: [
@@ -281,7 +360,11 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 onPressed: () => setState(() {
                   _searching = !_searching;
                   if (!_searching) {
+                    _searchTimer?.cancel();
                     _search.clear();
+                    _hits = const [];
+                    _searchError = null;
+                    _searchingServer = false;
                   }
                 }),
               ),
@@ -341,6 +424,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
           ),
         if (enabledBots.isNotEmpty) _botQuickStrip(context, enabledBots),
         _filterBar(context),
+        if (_searching && _search.text.trim().runes.length >= 2)
+          _messageMatches(context),
         if (buckets.isEmpty)
           Padding(
             key: const Key('chats-empty'),
@@ -394,6 +479,93 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 onLongPress: () => _actions(c),
               ),
           ],
+      ],
+    );
+  }
+
+  String _hitTitle(ConversationSearchHit hit) {
+    if (hit.title.isNotEmpty) return hit.title;
+    for (final c in app.conversations) {
+      if (c.id == hit.conversationId) return smartConversationTitle(c);
+    }
+    return 'Chat';
+  }
+
+  /// Message matches from the server full-text search (0.74.2): snippet
+  /// previews that jump straight to the matching chat, like the desktop
+  /// History popover. Shown under the instant title filter while searching.
+  Widget _messageMatches(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+          child: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  'Message matches',
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
+              ),
+              if (_searchingServer)
+                const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+            ],
+          ),
+        ),
+        if (_searchError != null)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: ErrorBanner(_searchError!),
+          )
+        else if (!_searchingServer && _hits.isEmpty)
+          const Padding(
+            padding: EdgeInsets.fromLTRB(16, 2, 16, 8),
+            child: Text('No messages match that search.'),
+          )
+        else
+          for (final hit in _hits)
+            Card(
+              key: Key('message-match-${hit.conversationId}'),
+              margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
+              elevation: 0,
+              color: scheme.surfaceContainerLow,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: ListTile(
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                leading: const Icon(Icons.message_outlined),
+                title: Text(
+                  _hitTitle(hit),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                subtitle: hit.snippet.isEmpty
+                    ? null
+                    : Text(
+                        hit.snippet,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                trailing: hit.role.isEmpty
+                    ? null
+                    : Text(
+                        hit.role == 'user' ? 'You' : 'Assistant',
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                onTap: () => _openHit(hit),
+              ),
+            ),
+        const SizedBox(height: 4),
+        const Divider(),
       ],
     );
   }
