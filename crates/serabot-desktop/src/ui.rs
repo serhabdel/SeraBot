@@ -16,7 +16,8 @@ use serabot_desktop::{
     chat_cards::{self, CardState, CardView},
     chat_compose,
     chat_failure::{self, ChatAction},
-    chat_feed, chat_links, chat_scroll, file_icons, provider_presets, provider_view, route_chip,
+    chat_feed, chat_links, chat_scroll, file_icons, fonts, provider_presets, provider_view,
+    route_chip,
     session::{Section, Session, SettingsSection, SignInPhase, Theme, humanize_label},
     teams, ui_highlight,
     working::BotActivity,
@@ -849,6 +850,9 @@ fn App() -> Element {
     };
     let _revision = revision();
     rsx! {
+        // The bundled handwriting face (0.74.3): its own style block beside
+        // the app CSS, so `--font-hand` resolves from the first paint.
+        style { {fonts::font_face_css()} }
         style { {CSS} }
         style { {CSS_PAGES} }
         div { class: "root", "data-theme": theme, "data-text": "{text_size}", "data-motion": motion,
@@ -1508,5 +1512,9 @@ break
         );
         assert!(COMPOSER_CARET_SETUP_JS.contains("__serabotComposerGen"));
         assert!(COMPOSER_CARET_BRIDGE_JS.contains("__serabotComposerGen"));
+        // The caret is remembered on focus/click too, not only on typing:
+        // a repaint right after placing the caret must still restore it.
+        assert!(COMPOSER_CARET_SETUP_JS.contains("focusin"));
+        assert!(COMPOSER_CARET_SETUP_JS.contains("selectionStart"));
     }
 }
