@@ -154,12 +154,21 @@ impl Runtime {
     /// The routed model's context window, when the catalog knows it (0.73:
     /// also feeds the `turn.context` event so clients can show a context meter).
     pub(super) fn window_for(&self, user: &str, route: &PinnedRoute) -> Option<u64> {
+        self.window_for_selection(user, &route.selection)
+    }
+
+    /// The same window for a bare selection (0.74.3): after failover the
+    /// turn's current route is the `ModelSelection` that actually answered,
+    /// not the pinned head, so the context meter needs its window.
+    pub(super) fn window_for_selection(
+        &self,
+        user: &str,
+        selection: &ModelSelection,
+    ) -> Option<u64> {
         self.router()
             .catalog_entries(user)
             .into_iter()
-            .find(|entry| {
-                entry.provider == route.selection.provider && entry.model == route.selection.model
-            })
+            .find(|entry| entry.provider == selection.provider && entry.model == selection.model)
             .and_then(|entry| entry.context_length)
     }
 
