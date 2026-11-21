@@ -102,6 +102,17 @@ pub fn working_line(bot_name: &str, step: Option<&str>) -> String {
     }
 }
 
+/// The working line with the single running step's live elapsed time
+/// (0.74.3): `Main is working: Searching the web · 4s`. Without an elapsed
+/// time it is the plain [`working_line`].
+pub fn working_line_elapsed(bot_name: &str, step: Option<&str>, elapsed: Option<&str>) -> String {
+    let line = working_line(bot_name, step);
+    match elapsed.map(str::trim).filter(|elapsed| !elapsed.is_empty()) {
+        Some(elapsed) => format!("{line} \u{b7} {elapsed}"),
+        None => line,
+    }
+}
+
 /// The badge on the scroll-to-bottom button: nothing at zero, `99+` past 99.
 pub fn unseen_badge(count: usize) -> Option<String> {
     match count {
@@ -146,7 +157,16 @@ const ENTERED_SLACK: usize = 64;
 /// A fingerprint of everything a transcript row is drawn from, so the view
 /// rebuilds its rows only when one of them changed. `context` carries what
 /// the rows depend on besides the messages (speaker names, group mode, ...).
-pub fn transcript_fingerprint(messages: &[crate::Message], context: impl std::hash::Hash) -> u64 {
+/// `ledger_revision` is the [`TurnLedger`](crate::turn_trace::TurnLedger)
+/// revision, and `activity` the live turn's steps: a finished turn's trace
+/// attaches to its reply, and a step starting, running or finishing changes
+/// what the rows show, so both must invalidate the cache (0.74.3).
+pub fn transcript_fingerprint(
+    messages: &[crate::Message],
+    context: impl std::hash::Hash,
+    ledger_revision: u64,
+    activity: &crate::activity::Activity,
+) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     context.hash(&mut hasher);
@@ -161,6 +181,28 @@ pub fn transcript_fingerprint(messages: &[crate::Message], context: impl std::ha
         message.limit_reached.hash(&mut hasher);
         message.turn_id.hash(&mut hasher);
         message.attachments.len().hash(&mut hasher);
+    }
+    ledger_revision.hash(&mut hasher);
+    activity.task_id.hash(&mut hasher);
+    activity.steps.len().hash(&mut hasher);
+    activity.dropped.hash(&mut hasher);
+    for step in &activity.steps {
+        step.call_id.hash(&mut hasher);
+        step.label.hash(&mut hasher);
+        step.icon.hash(&mut hasher);
+        // `StepPhase` has no `Hash`: its discriminant stands in.
+        (match step.phase {
+            crate::activity::StepPhase::Running => 0u8,
+            crate::activity::StepPhase::Progress => 1u8,
+            crate::activity::StepPhase::Done => 2u8,
+            crate::activity::StepPhase::Failed => 3u8,
+            crate::activity::StepPhase::WaitingApproval => 4u8,
+        })
+        .hash(&mut hasher);
+        step.duration_ms.hash(&mut hasher);
+        step.approval_id.hash(&mut hasher);
+        step.error.hash(&mut hasher);
+        step.cards.len().hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -496,21 +538,76 @@ mod tests {
     #[test]
     fn the_fingerprint_changes_with_content_rows_and_context_only() {
         let rows = vec![synthetic("m1", "hello"), synthetic("m2", "world")];
-        let base = transcript_fingerprint(&rows, ("dir:main", true));
+        let activity = crate::activity::Activity::default();
+        let base = transcript_fingerprint(&rows, ("dir:main", true), 7, &activity);
         assert_eq!(
             base,
-            transcript_fingerprint(&rows.clone(), ("dir:main", true))
+            transcript_fingerprint(&rows.clone(), ("dir:main", true), 7, &activity)
         );
         let mut grown = rows.clone();
         grown[1].content.push_str(" and more");
-        assert_ne!(base, transcript_fingerprint(&grown, ("dir:main", true)));
+        assert_ne!(
+            base,
+            transcript_fingerprint(&grown, ("dir:main", true), 7, &activity)
+        );
         let mut longer = rows.clone();
         longer.push(synthetic("m3", "x"));
-        assert_ne!(base, transcript_fingerprint(&longer, ("dir:main", true)));
-        assert_ne!(base, transcript_fingerprint(&rows, ("dir:main", false)));
+        assert_ne!(
+            base,
+            transcript_fingerprint(&longer, ("dir:main", true), 7, &activity)
+        );
+        assert_ne!(
+            base,
+            transcript_fingerprint(&rows, ("dir:main", false), 7, &activity)
+        );
         let mut limited = rows.clone();
         limited[0].limit_reached = true;
-        assert_ne!(base, transcript_fingerprint(&limited, ("dir:main", true)));
+        assert_ne!(
+            base,
+            transcript_fingerprint(&limited, ("dir:main", true), 7, &activity)
+        );
+        // A turn-ledger change (a finished turn's trace landing) and a step
+        // starting or changing phase both invalidate the rows.
+        assert_ne!(
+            base,
+            transcript_fingerprint(&rows, ("dir:main", true), 8, &activity)
+        );
+        let mut stepped = crate::activity::Activity::default();
+        stepped.apply(
+            "turn.step",
+            &serde_json::json!({"task_id": "t1", "call_id": "c1", "phase": "running",
+               "label": "Searching the web", "icon": "globe"}),
+        );
+        assert_ne!(
+            base,
+            transcript_fingerprint(&rows, ("dir:main", true), 7, &stepped)
+        );
+        stepped.apply(
+            "turn.step",
+            &serde_json::json!({"task_id": "t1", "call_id": "c1", "phase": "done",
+               "label": "Searching the web", "icon": "globe", "duration_ms": 1200}),
+        );
+        assert_ne!(
+            base,
+            transcript_fingerprint(&rows, ("dir:main", true), 7, &stepped)
+        );
+    }
+
+    #[test]
+    fn working_line_with_elapsed_keeps_the_plain_line_without_one() {
+        assert_eq!(
+            working_line_elapsed("Main", Some("Searching the web"), Some("4s")),
+            "Main is working: Searching the web \u{b7} 4s"
+        );
+        assert_eq!(
+            working_line_elapsed("Main", Some("Searching the web"), None),
+            "Main is working: Searching the web"
+        );
+        assert_eq!(
+            working_line_elapsed("Main", None, Some("4s")),
+            "Main is working \u{b7} 4s"
+        );
+        assert_eq!(working_line_elapsed("Main", None, None), "Main is working");
     }
 
     #[test]
