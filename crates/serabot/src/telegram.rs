@@ -201,7 +201,9 @@ impl TelegramClient {
     }
 
     pub async fn send_message(&self, chat_id: i64, text: &str) -> Result<()> {
-        for part in split_message(text) {
+        // 0.74.3: `:::hand` is desktop-only; Telegram gets the inner text.
+        let text = strip_hand_fences(text);
+        for part in split_message(&text) {
             let html = markdown_to_telegram_html(&part);
             match self.send_message_raw(chat_id, &html, Some("HTML")).await {
                 Ok(()) => {}
@@ -442,6 +444,8 @@ impl TelegramClient {
         bytes: Vec<u8>,
         caption: &str,
     ) -> Result<()> {
+        // 0.74.3: a caption can carry reply text; strip its fences too.
+        let caption = strip_hand_fences(caption);
         let safe_name: String = filename
             .chars()
             .filter(|c| !c.is_control() && !matches!(c, '/' | '\\'))
@@ -482,6 +486,8 @@ impl TelegramClient {
     /// caption carries the reply text, capped at Telegram's 1024-character
     /// caption limit; the full text is already in the conversation history.
     pub async fn send_voice_note(&self, chat_id: i64, audio: &[u8], caption: &str) -> Result<()> {
+        // 0.74.3: the caption carries the reply text; strip its fences too.
+        let caption = strip_hand_fences(caption);
         if audio.is_empty() {
             return Err(SeraError::Validation("voice note is empty".into()));
         }
@@ -1862,6 +1868,85 @@ fn parse_callback(data: &str) -> Option<(Decision, &str)> {
     Some((decision, approval_id))
 }
 
+/// Strip desktop-only `:::hand` fences (0.74.3): the desktop renders the
+/// fenced lines in a handwriting font, but a plain-text channel gets the inner
+/// text as-is, with the first line of each handwritten passage marked `✎ `.
+/// A fence never leaks literally: an unclosed block still sends its text, and
+/// a stray `:::` line is dropped. The newline ending a fence line goes with
+/// the fence, so no blank line is left behind.
+fn strip_hand_fences(text: &str) -> String {
+    // Split into (handwritten, chunk) spans at the fence markers.
+    let mut spans: Vec<(bool, &str)> = Vec::new();
+    let mut in_hand = false;
+    let mut rest = text;
+    while !rest.is_empty() {
+        if in_hand {
+            match rest.find(":::") {
+                Some(idx) => {
+                    spans.push((true, &rest[..idx]));
+                    rest = &rest[idx + 3..];
+                    if rest.starts_with('\n') {
+                        rest = &rest[1..];
+                    }
+                    in_hand = false;
+                }
+                None => {
+                    spans.push((true, rest));
+                    break;
+                }
+            }
+        } else {
+            let open = rest.find(":::hand");
+            let stray = rest.find(":::");
+            match (open, stray) {
+                (Some(open_idx), Some(stray_idx)) if stray_idx < open_idx => {
+                    spans.push((false, &rest[..stray_idx]));
+                    rest = &rest[stray_idx + 3..];
+                    if rest.starts_with('\n') {
+                        rest = &rest[1..];
+                    }
+                }
+                (Some(open_idx), _) => {
+                    spans.push((false, &rest[..open_idx]));
+                    rest = &rest[open_idx + ":::hand".len()..];
+                    if rest.starts_with('\n') {
+                        rest = &rest[1..];
+                    }
+                    in_hand = true;
+                }
+                (None, Some(stray_idx)) => {
+                    spans.push((false, &rest[..stray_idx]));
+                    rest = &rest[stray_idx + 3..];
+                    if rest.starts_with('\n') {
+                        rest = &rest[1..];
+                    }
+                }
+                (None, None) => {
+                    spans.push((false, rest));
+                    break;
+                }
+            }
+        }
+    }
+    let mut out = String::new();
+    for (hand, chunk) in spans {
+        if !hand {
+            out.push_str(chunk);
+            continue;
+        }
+        // Mark the first non-blank line of the passage.
+        let mut marked = false;
+        for line in chunk.split_inclusive('\n') {
+            if !marked && !line.trim().is_empty() {
+                out.push_str("\u{270e} ");
+                marked = true;
+            }
+            out.push_str(line);
+        }
+    }
+    out
+}
+
 fn split_message(text: &str) -> Vec<String> {
     if text.chars().count() <= MAX_MESSAGE_CHARS {
         return vec![text.to_owned()];
@@ -3188,6 +3273,31 @@ mod tests {
         assert_eq!(
             store.conversation_origin(&admin, "20").unwrap().as_deref(),
             Some("telegram")
+        );
+    }
+
+    #[test]
+    fn hand_fences_never_reach_plain_text_channels() {
+        assert_eq!(strip_hand_fences("plain text"), "plain text");
+        assert_eq!(
+            strip_hand_fences("Hello\n:::hand\nDear diary\n:::\nBye"),
+            "Hello\n\u{270e} Dear diary\nBye"
+        );
+        assert_eq!(
+            strip_hand_fences(":::hand\none\ntwo\n:::"),
+            "\u{270e} one\ntwo\n"
+        );
+        // Unclosed block still sends its text, without the fence.
+        assert_eq!(
+            strip_hand_fences(":::hand\nnever closed"),
+            "\u{270e} never closed"
+        );
+        // A stray fence line is dropped.
+        assert_eq!(strip_hand_fences("a\n:::\nb"), "a\nb");
+        // Two passages are each marked.
+        assert_eq!(
+            strip_hand_fences(":::hand\nfirst\n:::\nmiddle\n:::hand\nsecond\n:::"),
+            "\u{270e} first\nmiddle\n\u{270e} second\n"
         );
     }
 }
