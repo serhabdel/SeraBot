@@ -559,7 +559,6 @@ pub(super) fn Sidebar(
                         let recent_closed = collapsed().contains(&recent_key);
                         items.push(RailItem::RecentChatsToggle {
                             key: recent_key,
-                            bot_id: bot.id.clone(),
                             count: chats.len(),
                             collapsed: recent_closed,
                         });
@@ -602,7 +601,6 @@ pub(super) fn Sidebar(
                                 };
                                 items.push(RailItem::BotChatRow {
                                     id: chat.id.clone(),
-                                    bot_id: bot.id.clone(),
                                     title,
                                     primary: chat.primary,
                                     active: chat.id == current,
@@ -1019,7 +1017,7 @@ pub(super) fn Sidebar(
                                 }
                             }
                         },
-                        RailItem::RecentChatsToggle { key, bot_id: _, count, collapsed: closed } => {
+                        RailItem::RecentChatsToggle { key, count, collapsed: closed } => {
                             let toggle = key.clone();
                             rsx! {
                                 button {
@@ -1041,7 +1039,7 @@ pub(super) fn Sidebar(
                                 }
                             }
                         },
-                        RailItem::BotChatRow { id, bot_id: _, title, primary, active, unread, turns, rel_time, full_stamp } => {
+                        RailItem::BotChatRow { id, title, primary, active, unread, turns, rel_time, full_stamp } => {
                             let turns_text = if turns > 0 {
                                 serabot_desktop::bot_chats::format_turn_count(turns)
                             } else {
@@ -1748,14 +1746,12 @@ pub(super) enum RailItem {
     /// Collapsible sub-header for the active bot's recent chats in the sidebar.
     RecentChatsToggle {
         key: String,
-        bot_id: String,
         count: usize,
         collapsed: bool,
     },
     /// One recent chat nested under the active bot in the sidebar.
     BotChatRow {
         id: String,
-        bot_id: String,
         title: String,
         primary: bool,
         active: bool,
