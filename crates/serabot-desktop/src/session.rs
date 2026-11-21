@@ -799,6 +799,11 @@ pub struct Session {
     pub doc_previews_pending: std::collections::BTreeSet<String>,
     pub conversation: String,
     pub composer: String,
+    /// Generation of `composer` (0.74.3): bumped only when the composer is
+    /// intentionally replaced — a chip, a slash insert, a failed-send
+    /// restore, a conversation switch — so the chat view can tell a real
+    /// replacement from background session writes while the owner types.
+    pub composer_gen: u64,
     pub fleet: FleetDraft,
     pub memory: MemoryDraft,
     pub provider: ProviderDraft,
@@ -1047,6 +1052,7 @@ impl Session {
             doc_previews_pending: std::collections::BTreeSet::new(),
             conversation: "windows-owner".into(),
             composer: String::new(),
+            composer_gen: 0,
             fleet: FleetDraft::default(),
             memory: MemoryDraft::default(),
             provider: ProviderDraft::default(),
@@ -2610,6 +2616,16 @@ impl Session {
         self.start_request(Operation::SetBotRefresh { bot, every });
     }
 
+    /// Intentionally replace the composer text (0.74.3): a chip, a slash
+    /// insert, a failed-send restore or a conversation switch. Bumps
+    /// `composer_gen` so the chat view syncs the new text into the box.
+    /// Typing syncs (blur, Enter, Queue, Send) write `composer` directly
+    /// and must not bump the generation.
+    pub fn replace_composer(&mut self, text: String) {
+        self.composer = text;
+        self.composer_gen = self.composer_gen.wrapping_add(1);
+    }
+
     pub fn open_conversation(&mut self, id: String) {
         if !valid_id(&id) {
             return;
@@ -2637,7 +2653,7 @@ impl Session {
                 .as_ref()
                 .is_some_and(|c| !c.providers.is_empty());
         self.reset_scope(true);
-        self.composer = self.drafts.restore(&self.conversation);
+        self.replace_composer(self.drafts.restore(&self.conversation));
         self.auto_approve_confirming = false;
         self.state.error = None;
         // Opening a chat is reading it: its badge goes now, not when the
@@ -3031,6 +3047,12 @@ impl Session {
         self.state.held_draft = None;
         self.state.activity.clear();
         let text = std::mem::take(&mut self.composer);
+        // Sending consumes the draft: bump the generation so the view
+        // clears the box even from paths (Retry, Regenerate) that do not
+        // set the local draft themselves.
+        if !text.trim().is_empty() {
+            self.composer_gen = self.composer_gen.wrapping_add(1);
+        }
         self.drafts.clear(&self.conversation);
         self.attach_notice = None;
         self.regenerating = false;
@@ -3603,7 +3625,7 @@ impl Session {
         if let Some(text) =
             crate::chat_failure::restore_unsent_draft(&self.composer, optimistic.as_deref())
         {
-            self.composer = text.clone();
+            self.replace_composer(text.clone());
             self.drafts.store(&self.conversation, &self.composer);
             self.state.messages.pop();
             self.state.held_draft = Some(text);
@@ -3621,7 +3643,7 @@ impl Session {
             return;
         };
         if self.composer.trim().is_empty() {
-            self.composer = text;
+            self.replace_composer(text);
             self.drafts.store(&self.conversation, &self.composer);
         }
     }
@@ -3632,14 +3654,14 @@ impl Session {
         if self.composer.trim().is_empty()
             && let Some(text) = self.state.held_draft.clone()
         {
-            self.composer = text;
+            self.replace_composer(text);
         }
         self.submit();
     }
 
     /// Put a sent message back in the composer so it can be edited and sent.
     pub fn edit_text(&mut self, text: String) {
-        self.composer = text;
+        self.replace_composer(text);
     }
 
     /// Send the owner's last message again to the same bot. The new message
@@ -3878,6 +3900,17 @@ impl Session {
         self.state.runs.holds.len().hash(&mut h);
         self.state.runs.waiting.is_some().hash(&mut h);
         if self.state.runs.waiting.is_some() || !self.state.runs.holds.is_empty() {
+            crate::workflows::now_secs().hash(&mut h);
+        }
+        // A live turn ages once a second: the LiveCard elapsed and the
+        // running step's time move on the existing 1s repaint, which only
+        // repaints when this fingerprint moves.
+        if self
+            .state
+            .task
+            .as_ref()
+            .is_some_and(|task| !task.status.terminal())
+        {
             crate::workflows::now_secs().hash(&mut h);
         }
         self.queue.len().hash(&mut h);
@@ -5227,6 +5260,9 @@ impl Session {
                                     self.composer.push('\n');
                                 }
                                 self.composer.push_str(&text);
+                                // A transcription landing is an intentional
+                                // composer change: the view syncs it in.
+                                self.composer_gen = self.composer_gen.wrapping_add(1);
                             }
                         }
                         OperationKind::History => {
