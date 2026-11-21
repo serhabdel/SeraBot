@@ -4570,6 +4570,31 @@ impl ApiClient {
         self.request::<_, ()>(Method::DELETE, &segments, &[], None)
     }
 
+    /// `PUT /v1/projects/{slug}/files/{*path}`: save a text file from the
+    /// workspace editor (0.74).
+    pub fn projects_write_file(
+        &self,
+        slug: &str,
+        rel_path: &str,
+        content: &str,
+    ) -> Result<serde_json::Value, ApiError> {
+        check_id(slug)?;
+        if content.len() > 1024 * 1024 {
+            return Err(ApiError::Validation(
+                "Files must be 1 MiB or smaller to edit here.",
+            ));
+        }
+        let mut segments = vec!["v1", "projects", slug, "files"];
+        let parts: Vec<&str> = rel_path.split('/').filter(|p| !p.is_empty()).collect();
+        segments.extend(parts);
+        self.request(
+            Method::PUT,
+            &segments,
+            &[],
+            Some(&serde_json::json!({ "content": content })),
+        )
+    }
+
     /// `GET /v1/connectors/github/native`: the member's GitHub sign-in.
     pub fn github_native(&self) -> Result<crate::marketplace::GithubView, ApiError> {
         self.get(&["v1", "connectors", "github", "native"], &[])

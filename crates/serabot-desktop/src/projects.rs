@@ -85,3 +85,16 @@ pub fn diagnostics(credentials: &Credentials, slug: &str) -> Result<Value, Strin
         .projects_diagnostics(slug)
         .map_err(|error| error.to_string())
 }
+
+/// `PUT /v1/projects/{slug}/files/{*path}` (0.74): save a text file from the
+/// workspace editor.
+pub fn write_file(
+    credentials: &Credentials,
+    slug: &str,
+    rel_path: &str,
+    content: &str,
+) -> Result<Value, String> {
+    client(credentials)?
+        .projects_write_file(slug, rel_path, content)
+        .map_err(|error| error.to_string())
+}
