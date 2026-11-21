@@ -17,7 +17,7 @@ delegates = [
 ]
 trigger = "command"
 system_prompt = "prompts/main.txt"
-skills = ["triage", "ask", "firecrawl", "audio", "elevenlabs", "scheduler", "skill-creator", "onedrive"]
+skills = ["triage", "ask", "firecrawl", "audio", "elevenlabs", "scheduler", "skill-creator", "onedrive", "mail"]
 # "all" expands to every known tool, including the orchestrator-only fleet tools
 # (bot_list, bot_read, model_list, handoff_status, bot_set_route, bot_set_enabled,
 # bot_set_delegates, subagent_retry). They run only in an owner turn of main.

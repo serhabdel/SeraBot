@@ -25,12 +25,89 @@ use serabot_desktop::integrations::{self, COMPOSIO_ID, Entry, Source, Tab, conne
 use serabot_desktop::marketplace::PluginStatus;
 use serabot_desktop::session::Session;
 
+use serabot_desktop::theme::Tone;
+use serabot_desktop::worker::Credentials;
+use serabot_desktop::{ApiClient, MailStatus};
+use std::sync::Arc;
+
+const MAIL_CONNECTOR_ID: &str = "mail";
+
+async fn call_mail<T, F>(session: Signal<Session>, job: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(Arc<Credentials>) -> Result<T, String> + Send + 'static,
+{
+    let creds = session.read().credentials.clone();
+    let Some(creds) = creds else {
+        return Err("Not signed in.".into());
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if let Err(err) = std::thread::Builder::new()
+        .name("serabot-mail-status".into())
+        .spawn(move || {
+            let _ = tx.send(job(creds));
+        })
+    {
+        return Err(format!("Could not start request thread: {err}"));
+    }
+    rx.await
+        .map_err(|_| "Request thread exited unexpectedly.".to_owned())?
+}
+
+fn fetch_mail_status(creds: &Credentials) -> Result<MailStatus, String> {
+    ApiClient::new(creds.endpoint.clone(), creds.token.clone())
+        .and_then(|c| c.mail_status())
+        .map_err(|e| e.to_string())
+}
+
+fn mail_entry(status: Option<&MailStatus>) -> Entry {
+    let connected = status.is_some_and(|s| s.connected);
+    let (pill, tone, meta) = if let Some(st) = status.filter(|s| s.connected) {
+        let user = st
+            .username
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .unwrap_or("Your mailbox");
+        ("Connected".to_owned(), Tone::Ok, user.to_owned())
+    } else {
+        (
+            "Not connected".to_owned(),
+            Tone::Muted,
+            "Your mailbox".to_owned(),
+        )
+    };
+    Entry {
+        source: Source::Connector(MAIL_CONNECTOR_ID.to_owned()),
+        brand_key: "agentmail".to_owned(),
+        name: "Mail (SMTP / IMAP)".to_owned(),
+        suite_label: "Mail".to_owned(),
+        blurb: "Read and send email from any SMTP/IMAP mailbox (Hostinger, custom domain, etc.)."
+            .to_owned(),
+        pill,
+        tone,
+        set_up: connected,
+        meta,
+    }
+}
+
 /// The whole screen: header, tabs and search, the active tab, and the sheets.
 #[component]
 pub fn IntegrationsView(session: Signal<Session>) -> Element {
     let mut session = session;
+    let mut mail_status = use_signal(|| Option::<MailStatus>::None);
+    let load_mail = move || {
+        spawn(async move {
+            if let Ok(st) = call_mail(session, |creds| fetch_mail_status(&creds)).await {
+                mail_status.set(Some(st));
+            }
+        });
+    };
     // The GitHub card's badge follows the native sign-in, so read it once.
-    use_hook(move || session.write().load_github());
+    use_hook(move || {
+        session.write().load_github();
+        load_mail();
+    });
     let mut tab = use_signal(Tab::default);
     let mut query = use_signal(String::new);
     // The sidebar's Bots link asks for its tab; take the request once.
@@ -64,6 +141,8 @@ pub fn IntegrationsView(session: Signal<Session>) -> Element {
                             let mut s = session.write();
                             s.refresh_connectors();
                             s.load_github();
+                            drop(s);
+                            load_mail();
                         }
                         Tab::Marketplace => session.write().refresh_marketplace(),
                         Tab::Bots => session.write().open_meet_team(),
@@ -120,14 +199,14 @@ pub fn IntegrationsView(session: Signal<Session>) -> Element {
                     }
                 }
                 {match tab() {
-                    Tab::Installed => rsx! { InstalledTab { session, query, tab } },
+                    Tab::Installed => rsx! { InstalledTab { session, query, tab, mail_status } },
                     Tab::Marketplace => rsx! { MarketplaceTab { session, query } },
                     Tab::Bots => rsx! { BotsTab { session, query } },
                     Tab::Composio => rsx! { ComposioTab { session } },
                 }}
             }
             if let Some(id) = open_connector {
-                ConnectorSheet { key: "{id}", session, id }
+                ConnectorSheet { key: "{id}", session, id, on_mail_changed: move |next| mail_status.set(Some(next)) }
             }
             if has_plugin_sheet {
                 PluginSheet { session }
@@ -227,7 +306,12 @@ pub fn SkeletonGrid(label: String, count: usize) -> Element {
 /// The Installed tab: what is set up, then the connectors still open to set up,
 /// by suite. The search filters both.
 #[component]
-fn InstalledTab(session: Signal<Session>, query: Signal<String>, tab: Signal<Tab>) -> Element {
+fn InstalledTab(
+    session: Signal<Session>,
+    query: Signal<String>,
+    tab: Signal<Tab>,
+    mail_status: Signal<Option<MailStatus>>,
+) -> Element {
     let (
         connectors,
         plugins,
@@ -261,6 +345,18 @@ fn InstalledTab(session: Signal<Session>, query: Signal<String>, tab: Signal<Tab
         integrations::apply_github(&mut view, github);
     }
     integrations::add_whatsapp_personal(&mut view);
+    let mail_card = mail_entry(mail_status().as_ref());
+    if mail_card.set_up {
+        view.set_up.push(mail_card);
+    } else if let Some((_, cards)) = view
+        .available
+        .iter_mut()
+        .find(|(suite, _)| *suite == "Notes and email")
+    {
+        cards.push(mail_card);
+    } else {
+        view.available.push(("Notes and email", vec![mail_card]));
+    }
     let set_up: Vec<Entry> = view
         .set_up
         .into_iter()
@@ -429,7 +525,11 @@ fn close_connector_with_reset(mut session: Signal<Session>, id: &str, saved_enab
 /// connector's own screen. A Google connector also shows the Google setup card
 /// while an admin has yet to set it up.
 #[component]
-fn ConnectorSheet(session: Signal<Session>, id: String) -> Element {
+fn ConnectorSheet(
+    session: Signal<Session>,
+    id: String,
+    on_mail_changed: EventHandler<MailStatus>,
+) -> Element {
     let mut session = session;
     let (connector, connectors, is_admin) = {
         let state = session.read();
@@ -440,7 +540,11 @@ fn ConnectorSheet(session: Signal<Session>, id: String) -> Element {
         )
     };
     let saved_enabled = connector.as_ref().map(|c| c.enabled);
-    let title = connector_title(&id);
+    let title = if id == MAIL_CONNECTOR_ID {
+        "Mail (SMTP / IMAP)".to_owned()
+    } else {
+        connector_title(&id)
+    };
     let close_id = id.clone();
     let close_scrim_id = id.clone();
     let close_key_id = id.clone();
@@ -489,6 +593,9 @@ fn ConnectorSheet(session: Signal<Session>, id: String) -> Element {
                     // WhatsApp Business.
                     None if id == integrations::WHATSAPP_PERSONAL_ID => rsx! {
                         WhatsappLinkCard { session }
+                    },
+                    None if id == MAIL_CONNECTOR_ID => rsx! {
+                        crate::ui_connectors::MailConnectorCard { session, on_status: on_mail_changed }
                     },
                     None => rsx! { p { class: "muted", "This connector is no longer listed." } },
                     Some(connector) if connector.id == COMPOSIO_ID => rsx! {

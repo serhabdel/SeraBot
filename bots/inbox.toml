@@ -3,7 +3,7 @@ title = "Inbox"
 description = "Triages your Gmail or Outlook, summarises threads, and drafts replies in your voice. It never sends mail."
 trigger = "command"
 system_prompt = "prompts/inbox.txt"
-skills = ["email-triage", "messaging-etiquette"]
+skills = ["email-triage", "messaging-etiquette", "mail"]
 tools = [
   "local_list",
   "local_search",
@@ -27,6 +27,9 @@ tools = [
   "gmail_list_messages",
   "outlook_list_messages",
   "outlook_calendar_list_events",
+  "mail_list",
+  "mail_read",
+  "mail_send",
   "conversation_library",
   "telegram_send_document",
   "tavily_search",
@@ -35,5 +38,5 @@ tools = [
   "fetch_url",
   "ask_teammate",
 ]
-require_approval = ["composio_execute"]
+require_approval = ["composio_execute", "mail_send"]
 enabled = true

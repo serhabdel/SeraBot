@@ -11,7 +11,7 @@ Deterministic Rust around bounded LLM calls.</p>
 
 ## What it is
 
-SeraBot (`0.74.1`) is an invitation-only, multi-user self-hosted agent built as **one Rust binary** and **one SQLite/WAL database**. Each invited member signs in with Microsoft OIDC and gets an isolated, UID-scoped workspace—chats, bot fleet, skills, memory, documents, project folders, AI provider accounts, connectors, and an encrypted vault. Nobody can read another member's data or credentials.
+SeraBot (`0.74.2`) is an invitation-only, multi-user self-hosted agent built as **one Rust binary** and **one SQLite/WAL database**. Each invited member signs in with Microsoft OIDC and gets an isolated, UID-scoped workspace—chats, bot fleet, skills, memory, documents, project folders, AI provider accounts, connectors, and an encrypted vault. Nobody can read another member's data or credentials.
 
 | Part | Stack | What it does |
 | --- | --- | --- |
@@ -27,7 +27,7 @@ SeraBot (`0.74.1`) is an invitation-only, multi-user self-hosted agent built as 
 
 ### Bots, teamwork & model routing
 
-- **20-bot fleet with built-in fallback:** Seeds 13 default bots per user from [`bots/`](bots/) and [`prompts/`](prompts/) (`main`, `analyst`, `maker`, `watcher`, `legal`, `comptable`, `auditor`, `marketer`, `markets`, `courier`, `whatsapp`, `inbox`, `jobfinder`) plus 7 catalog-only marketplace bots (`researcher`, `writer`, `translator`, `planner`, `support`, `product`, `tutor`), with compiled-in fallback in [`shipped.rs`](crates/serabot/src/shipped.rs) and 34 shipped skills in [`skills/`](skills/).
+- **20-bot fleet with built-in fallback:** Seeds 13 default bots per user from [`bots/`](bots/) and [`prompts/`](prompts/) (`main`, `analyst`, `maker`, `watcher`, `legal`, `comptable`, `auditor`, `marketer`, `markets`, `courier`, `whatsapp`, `inbox`, `jobfinder`) plus 7 catalog-only marketplace bots (`researcher`, `writer`, `translator`, `planner`, `support`, `product`, `tutor`), with compiled-in fallback in [`shipped.rs`](crates/serabot/src/shipped.rs) and 35 shipped skills in [`skills/`](skills/).
 - **Bounded orchestration:** `main` is the only orchestrator and fans out up to 16 parallel `delegate` handoffs per turn (or bots collaborate via `ask_teammate`), tracked in an idempotent `handoffs` ledger with automatic `failed_resumable` resume, `waiting_model` parking, and context compaction.
 - **Fleet management tools:** `main` can inspect (`bot_list`, `bot_read`, `model_list`, `handoff_status`) and—with per-call owner approval—adjust routes, delegates, and retries (`bot_set_route`, `bot_set_enabled`, `bot_set_delegates`, `subagent_retry`) via one audited `fleet_mutation` path that never widens tool/egress permissions.
 - **Per-user provider accounts & route chains:** Multiple sealed accounts per member across OpenAI-compatible providers (`mistral`, `deepseek`, `minimax`, `minimax-cn`, `openai`, `groq`, `together`, `fireworks`, `openrouter`, `xai`, `cerebras`, `moonshot`, `perplexity`), `anthropic`, `muse-code`, `google-antigravity`, `openai-codex`, `github-copilot`, and `opencode-go`/`opencode-zen`. Each bot carries a head route + up to 2 fallbacks with single-flight token refresh, cooldown/quota holds, live router swaps (`RouterHandle`), and model-aware thinking levels (`off` to `max` in [`thinking.rs`](crates/serabot/src/thinking.rs)).
@@ -37,7 +37,7 @@ SeraBot (`0.74.1`) is an invitation-only, multi-user self-hosted agent built as 
 - **Per-reply turn traces & memory attribution:** Each assistant reply owns its collapsed step trace (`turn_trace.rs`), including recalled, saved, held, and superseded memories (`turn.memory`), auto-expanding on failures or pending approvals.
 - **Context meter & immediate cancellation:** `turn.context` events feed a live context-window meter in the chat header bar; Stop aborts in-flight HTTP model calls, compaction, and queued tasks immediately via `CancellationToken`.
 - **Desktop chat ergonomics:** Virtualized feed, runs sidebar, composer queue with steer and `@bot` mentions, multimodal image vision across all four wire transports + inline Office excerpts, drag-and-drop file uploads, Markdown export, `Ctrl+K` command palette, and per-bot Library tab.
-- **0.74.1 UI redesigns:** Redesigned **Conversation history** (searchable, grouped history), alongside redesigned **Workflows**, **Projects**, and **Memory** pages.
+- **0.74.1–0.74.2 UI redesigns:** Redesigned **Conversation history** (grouped history + full-text message search via `/v1/conversations/search`), alongside redesigned **Workflows**, **Projects**, **Memory**, and **Tasks / Kanban / Calendar** views.
 
 ### Memory
 

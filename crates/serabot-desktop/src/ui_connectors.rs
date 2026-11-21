@@ -726,9 +726,9 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
             if id == "onedrive" {
                 p { class: if connected { "tiny" } else { "tiny muted" }, role: "status",
                     if connected {
-                        "Signed in with your Microsoft OneDrive account. Cloud scope: /SeraBot (with root fallback access)."
+                        "Connected to your Microsoft OneDrive account. Bots can browse your full drive (list, search, recent, info, read) and upload with your approval."
                     } else {
-                        "Cloud scope: /SeraBot (with root fallback access) once connected."
+                        "Once connected, bots can browse your full Microsoft OneDrive (list, search, recent, info, read) and upload with your approval."
                     }
                 }
             }
@@ -798,7 +798,7 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
                     }
                 }
             }
-            if od_waiting && id == "onedrive" && !connected {
+            if od_waiting && id == "onedrive" {
                 div { class: "banner info", role: "status",
                     span { class: "spinner", title: "Waiting for Microsoft sign-in" }
                     span { class: "grow",
@@ -872,6 +872,15 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
                             }
                         },
                         Some(ConnectorAction::DisconnectOneDrive) => rsx! {
+                            button {
+                                class: "btn ghost",
+                                r#type: "button",
+                                title: "Sign in again with Microsoft if your OneDrive token expired",
+                                disabled: od_busy,
+                                onclick: move |_| session.write().panel.connect_onedrive(),
+                                Icon { name: "external", size: 14 }
+                                if od_busy { "Opening\u{2026}" } else { "Reconnect" }
+                            }
                             button {
                                 class: "btn ghost",
                                 r#type: "button",
@@ -1048,6 +1057,437 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
                                 }
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn run_mail_job<T, F>(session: Signal<Session>, job: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(&serabot_desktop::ApiClient) -> Result<T, serabot_desktop::ApiError> + Send + 'static,
+{
+    let Some(creds) = session.read().credentials.clone() else {
+        return Err("Not signed in.".to_owned());
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if let Err(err) = std::thread::Builder::new()
+        .name("serabot-mail".into())
+        .spawn(move || {
+            let res = serabot_desktop::ApiClient::new(creds.endpoint.clone(), creds.token.clone())
+                .and_then(|client| job(&client))
+                .map_err(|e| e.to_string());
+            let _ = tx.send(res);
+        })
+    {
+        return Err(format!("Could not start request thread: {err}"));
+    }
+    rx.await
+        .map_err(|_| "Request thread exited unexpectedly.".to_owned())?
+}
+
+/// Native per-user SMTP/IMAP Mail connector card (Hostinger preset + live test results).
+#[component]
+pub(crate) fn MailConnectorCard(
+    session: Signal<Session>,
+    on_status: EventHandler<serabot_desktop::MailStatus>,
+) -> Element {
+    use serabot_desktop::{
+        MailConnectRequest, MailConnectResponse, MailProbeOutcome, MailSecurity, MailStatus,
+        validate_mail_connect,
+    };
+    let mut status = use_signal(|| Option::<MailStatus>::None);
+    let mut loading = use_signal(|| true);
+    let mut busy = use_signal(|| false);
+    let mut error = use_signal(|| Option::<String>::None);
+    let mut test_result = use_signal(|| Option::<MailConnectResponse>::None);
+    let mut confirm_disconnect = use_signal(|| false);
+
+    let mut smtp_host = use_signal(String::new);
+    let mut smtp_port = use_signal(|| "587".to_owned());
+    let mut smtp_security = use_signal(|| MailSecurity::StartTls);
+    let mut imap_host = use_signal(String::new);
+    let mut imap_port = use_signal(|| "993".to_owned());
+    let mut imap_security = use_signal(|| MailSecurity::Ssl);
+    let mut username = use_signal(String::new);
+    let mut password = use_signal(String::new);
+    let mut from_addr = use_signal(String::new);
+
+    let load_status = move || {
+        loading.set(true);
+        error.set(None);
+        spawn(async move {
+            let res = run_mail_job(session, |c| c.mail_status()).await;
+            loading.set(false);
+            match res {
+                Ok(st) => {
+                    if let Some(h) = st.smtp_host.as_deref().filter(|s| !s.is_empty())
+                        && smtp_host.read().is_empty()
+                    {
+                        smtp_host.set(h.to_owned());
+                    }
+                    if let Some(h) = st.imap_host.as_deref().filter(|s| !s.is_empty())
+                        && imap_host.read().is_empty()
+                    {
+                        imap_host.set(h.to_owned());
+                    }
+                    if let Some(u) = st.username.as_deref().filter(|s| !s.is_empty())
+                        && username.read().is_empty()
+                    {
+                        username.set(u.to_owned());
+                    }
+                    on_status.call(st.clone());
+                    status.set(Some(st));
+                }
+                Err(msg) => error.set(Some(msg)),
+            }
+        });
+    };
+    use_hook(load_status);
+
+    let connected = status().as_ref().is_some_and(|s| s.connected);
+    let connected_user = status()
+        .as_ref()
+        .and_then(|s| s.username.clone())
+        .unwrap_or_default();
+    let connected_smtp = status()
+        .as_ref()
+        .and_then(|s| s.smtp_host.clone())
+        .unwrap_or_default();
+    let connected_imap = status()
+        .as_ref()
+        .and_then(|s| s.imap_host.clone())
+        .unwrap_or_default();
+
+    let submit_connect = move |_| {
+        if busy() {
+            return;
+        }
+        error.set(None);
+        test_result.set(None);
+        let Ok(sp) = smtp_port().trim().parse::<u16>() else {
+            error.set(Some("Enter a valid SMTP port (1–65535).".to_owned()));
+            return;
+        };
+        let Ok(ip) = imap_port().trim().parse::<u16>() else {
+            error.set(Some("Enter a valid IMAP port (1–65535).".to_owned()));
+            return;
+        };
+        let from_val = from_addr().trim().to_owned();
+        let req = MailConnectRequest {
+            smtp_host: smtp_host().trim().to_owned(),
+            smtp_port: sp,
+            smtp_security: smtp_security(),
+            username: username().trim().to_owned(),
+            password: password(),
+            imap_host: imap_host().trim().to_owned(),
+            imap_port: ip,
+            imap_security: imap_security(),
+            from: (!from_val.is_empty()).then_some(from_val),
+        };
+        if let Err(err) = validate_mail_connect(&req) {
+            error.set(Some(err.to_string()));
+            return;
+        }
+        busy.set(true);
+        spawn(async move {
+            let res = run_mail_job(session, move |c| c.mail_connect(&req)).await;
+            busy.set(false);
+            match res {
+                Ok(reply) => {
+                    password.set(String::new());
+                    let next = MailStatus {
+                        connected: reply.connected,
+                        smtp_host: reply.smtp_host.clone(),
+                        imap_host: reply.imap_host.clone(),
+                        username: reply.username.clone(),
+                    };
+                    on_status.call(next.clone());
+                    status.set(Some(next));
+                    test_result.set(Some(reply));
+                }
+                Err(msg) => error.set(Some(msg)),
+            }
+        });
+    };
+
+    let apply_hostinger = move |_| {
+        smtp_host.set("smtp.hostinger.com".to_owned());
+        smtp_port.set("587".to_owned());
+        smtp_security.set(MailSecurity::StartTls);
+        imap_host.set("imap.hostinger.com".to_owned());
+        imap_port.set("993".to_owned());
+        imap_security.set(MailSecurity::Ssl);
+        error.set(None);
+    };
+
+    let can_submit = !busy()
+        && !smtp_host().trim().is_empty()
+        && !imap_host().trim().is_empty()
+        && !username().trim().is_empty()
+        && !password().is_empty();
+
+    rsx! {
+        div { class: "card connector-card mail-connector-card",
+            div { class: "card-head",
+                div { class: "connector-id",
+                    BrandLogo { brand: "agentmail".to_owned(), size: 28 }
+                    div {
+                        h3 { class: "card-title", "Mail (SMTP / IMAP)" }
+                        span { class: "card-sub", "Personal mailbox for reading and sending email (writes ask you first)." }
+                    }
+                }
+                StatusChip {
+                    tone: if connected { Tone::Ok } else { Tone::Muted },
+                    text: if loading() && status().is_none() {
+                        "Checking\u{2026}".to_owned()
+                    } else if connected {
+                        "Connected".to_owned()
+                    } else {
+                        "Not connected".to_owned()
+                    },
+                }
+            }
+
+            if connected {
+                div { class: "mail-connected-summary", role: "status",
+                    if !connected_user.is_empty() {
+                        p { class: "tiny",
+                            strong { "Account: " }
+                            span { class: "mono", "{connected_user}" }
+                        }
+                    }
+                    if !connected_smtp.is_empty() || !connected_imap.is_empty() {
+                        p { class: "tiny muted",
+                            "SMTP: "
+                            span { class: "mono", "{connected_smtp}" }
+                            " · IMAP: "
+                            span { class: "mono", "{connected_imap}" }
+                        }
+                    }
+                }
+                if confirm_disconnect() {
+                    div { class: "mp-confirm", role: "alertdialog", "aria-label": "Confirm mail disconnect",
+                        span { class: "tiny", "Disconnect this mailbox and delete saved credentials?" }
+                        button {
+                            class: "btn danger sm",
+                            r#type: "button",
+                            disabled: busy(),
+                            onclick: move |_| {
+                                confirm_disconnect.set(false);
+                                busy.set(true);
+                                error.set(None);
+                                test_result.set(None);
+                                spawn(async move {
+                                    let res = run_mail_job(session, |c| c.mail_disconnect()).await;
+                                    busy.set(false);
+                                    match res {
+                                        Ok(_) => {
+                                            let next = MailStatus::default();
+                                            on_status.call(next.clone());
+                                            status.set(Some(next));
+                                        }
+                                        Err(msg) => error.set(Some(msg)),
+                                    }
+                                });
+                            },
+                            "Confirm disconnect"
+                        }
+                        button {
+                            class: "btn ghost sm",
+                            r#type: "button",
+                            disabled: busy(),
+                            onclick: move |_| confirm_disconnect.set(false),
+                            "Cancel"
+                        }
+                    }
+                } else {
+                    div { class: "card-actions",
+                        button {
+                            class: "btn ghost",
+                            r#type: "button",
+                            disabled: busy(),
+                            onclick: move |_| confirm_disconnect.set(true),
+                            "Disconnect"
+                        }
+                    }
+                }
+            }
+
+            if let Some(res) = test_result() {
+                div { class: "mail-probe-results", role: "status",
+                    div {
+                        class: match &res.smtp_test {
+                            MailProbeOutcome::Ok => "banner ok",
+                            MailProbeOutcome::Error(_) => "banner err",
+                        },
+                        span { class: "mail-probe-label", "SMTP" }
+                        span { class: "grow",
+                            match &res.smtp_test {
+                                MailProbeOutcome::Ok => "Login OK".to_owned(),
+                                MailProbeOutcome::Error(err) => err.clone(),
+                            }
+                        }
+                    }
+                    div {
+                        class: match &res.imap_test {
+                            MailProbeOutcome::Ok => "banner ok",
+                            MailProbeOutcome::Error(_) => "banner err",
+                        },
+                        span { class: "mail-probe-label", "IMAP" }
+                        span { class: "grow",
+                            match &res.imap_test {
+                                MailProbeOutcome::Ok => "Login OK".to_owned(),
+                                MailProbeOutcome::Error(err) => err.clone(),
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(msg) = error() {
+                div { class: "banner err", role: "alert", span { class: "grow", "{msg}" } }
+            }
+
+            div { class: "mail-preset-row",
+                span { class: "tiny muted", "Quick preset:" }
+                button {
+                    class: "btn ghost sm",
+                    r#type: "button",
+                    disabled: busy(),
+                    onclick: apply_hostinger,
+                    "Hostinger"
+                }
+            }
+
+            div { class: "form-grid mail-form-grid",
+                div { class: "field",
+                    label { class: "field-label", r#for: "mail-smtp-host", "SMTP host" }
+                    input {
+                        id: "mail-smtp-host",
+                        class: "input",
+                        r#type: "text",
+                        placeholder: "smtp.hostinger.com",
+                        disabled: busy(),
+                        value: "{smtp_host}",
+                        oninput: move |e| smtp_host.set(e.value()),
+                    }
+                }
+                div { class: "field",
+                    label { class: "field-label", r#for: "mail-smtp-port", "SMTP port" }
+                    input {
+                        id: "mail-smtp-port",
+                        class: "input",
+                        r#type: "text",
+                        placeholder: "587",
+                        disabled: busy(),
+                        value: "{smtp_port}",
+                        oninput: move |e| smtp_port.set(e.value()),
+                    }
+                }
+                div { class: "field",
+                    label { class: "field-label", r#for: "mail-smtp-sec", "SMTP security" }
+                    select {
+                        id: "mail-smtp-sec",
+                        class: "input",
+                        disabled: busy(),
+                        value: "{smtp_security().as_str()}",
+                        onchange: move |e| smtp_security.set(MailSecurity::parse(&e.value())),
+                        for sec in MailSecurity::ALL {
+                            option { key: "{sec.as_str()}", value: "{sec.as_str()}", "{sec.label()}" }
+                        }
+                    }
+                }
+                div { class: "field",
+                    label { class: "field-label", r#for: "mail-imap-host", "IMAP host" }
+                    input {
+                        id: "mail-imap-host",
+                        class: "input",
+                        r#type: "text",
+                        placeholder: "imap.hostinger.com",
+                        disabled: busy(),
+                        value: "{imap_host}",
+                        oninput: move |e| imap_host.set(e.value()),
+                    }
+                }
+                div { class: "field",
+                    label { class: "field-label", r#for: "mail-imap-port", "IMAP port" }
+                    input {
+                        id: "mail-imap-port",
+                        class: "input",
+                        r#type: "text",
+                        placeholder: "993",
+                        disabled: busy(),
+                        value: "{imap_port}",
+                        oninput: move |e| imap_port.set(e.value()),
+                    }
+                }
+                div { class: "field",
+                    label { class: "field-label", r#for: "mail-imap-sec", "IMAP security" }
+                    select {
+                        id: "mail-imap-sec",
+                        class: "input",
+                        disabled: busy(),
+                        value: "{imap_security().as_str()}",
+                        onchange: move |e| imap_security.set(MailSecurity::parse(&e.value())),
+                        for sec in MailSecurity::ALL {
+                            option { key: "{sec.as_str()}", value: "{sec.as_str()}", "{sec.label()}" }
+                        }
+                    }
+                }
+                div { class: "field",
+                    label { class: "field-label", r#for: "mail-username", "Username / Email" }
+                    input {
+                        id: "mail-username",
+                        class: "input",
+                        r#type: "text",
+                        placeholder: "you@domain.com",
+                        disabled: busy(),
+                        value: "{username}",
+                        oninput: move |e| username.set(e.value()),
+                    }
+                }
+                div { class: "field",
+                    label { class: "field-label", r#for: "mail-password", "Password (write-only)" }
+                    SecretField {
+                        value: password,
+                        label: "Mailbox password".to_owned(),
+                        placeholder: if connected { "Enter password to update".to_owned() } else { "Mailbox password".to_owned() },
+                        disabled: busy(),
+                    }
+                }
+                div { class: "field mail-from-field",
+                    label { class: "field-label", r#for: "mail-from", "From address (optional)" }
+                    input {
+                        id: "mail-from",
+                        class: "input",
+                        r#type: "text",
+                        placeholder: "Defaults to username",
+                        disabled: busy(),
+                        value: "{from_addr}",
+                        oninput: move |e| from_addr.set(e.value()),
+                    }
+                }
+            }
+
+            p { class: "tiny muted",
+                "Credentials are sealed per user on the server and never sent back to this app. Connecting tests both SMTP and IMAP login."
+            }
+
+            div { class: "card-actions",
+                button {
+                    class: "btn primary",
+                    r#type: "button",
+                    disabled: !can_submit,
+                    onclick: submit_connect,
+                    if busy() {
+                        "Testing & saving\u{2026}"
+                    } else if connected {
+                        "Update & test"
+                    } else {
+                        "Connect & test"
                     }
                 }
             }

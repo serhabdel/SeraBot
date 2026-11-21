@@ -574,6 +574,7 @@ pub fn router(state: ApiState) -> Router {
             "/v1/conversations",
             get(list_conversations).post(create_conversation),
         )
+        .route("/v1/conversations/search", get(search_conversations))
         .route(
             "/v1/conversations/{id}",
             patch(rename_conversation).delete(archive_conversation),

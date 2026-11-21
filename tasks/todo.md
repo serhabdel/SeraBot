@@ -394,6 +394,16 @@ never merge without the owner's OK.
 - [x] Native SMTP/IMAP mail connector integrated from PR #134 (`crates/serabot/src/mail.rs`, `api/mail.rs`): per-user credentials in `user_secrets` (`mail`), hand-rolled SMTP/IMAP over `tokio-rustls`, `mail_send` (approval-gated), `mail_list`, `mail_read`, `/v1/mail` connect/status/disconnect.
 - [x] Desktop UI redesigns: solid searchable/grouped Conversation history popover + header History button + sidebar Recent chats (`ui/row_menu.rs`, `ui/shell.rs`, `bot_chats.rs`), Workflows page (`ui_workflows.rs`, `workflows.rs`), Projects page (`ui_projects.rs`, `projects.rs`), Memory page (`ui/memory.rs`, `ui_memory_review.rs`).
 - [x] Comprehensive `README.md` update and `docs/release-0.74.1.md`.
-- [ ] Desktop Integrations card for mail connect/status/disconnect.
+- [x] Desktop Integrations card for mail connect/status/disconnect (shipped in `0.74.2`).
 - [ ] Owner: live verification on Windows (OneDrive root browse/search/upload, browser PDF download, Hostinger SMTP/IMAP connect/send/read, visual pass on History/Workflows/Projects/Memory).
+
+## Release 0.74.2 — Mail desktop card & skill, full-text conversation search, Tasks/Kanban/Calendar polish & cleanup
+
+- [x] Mail connector completion: desktop Integrations card with Hostinger preset + custom SMTP/IMAP form + live test badges + disconnect (`ui_connectors.rs`, `ui_integrations.rs`, `api.rs`), `skills/mail/SKILL.md` (`shipped.rs`), `mail_list`/`mail_read`/`mail_send` on `inbox` & `main`, activity labels, and OneDrive card reconnect polish.
+- [x] Full-text conversation search: UID-scoped `Store::search_conversations` + `GET /v1/conversations/search` (`store.rs`, `api/conversations.rs`, `api/tests/chat_api.rs`) wired into the desktop History popover (`ui/row_menu.rs`).
+- [x] Desktop Tasks / Kanban / Calendar UI polish (`ui_tasks.rs`, `assets/pages-work.css`): stat tiles, segmented filters, theme-aware cards, `--fs-*` font tokens.
+- [x] Scanned-PDF OCR hint in `browser_download`, reader-tool parity on download-capable bots, removed unused `text-splitter` dependency, closed superseded PR #134.
+- [x] `docs/release-0.74.2.md` and `README.md` updated for `0.74.2`.
+- [ ] Owner: live pass on Windows (Mail card connect/test with Hostinger, full-text History search, Tasks/Kanban/Calendar layout).
+
 

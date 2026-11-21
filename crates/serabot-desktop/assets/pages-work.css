@@ -9,34 +9,56 @@
   gap: 16px;
 }
 
+.tasks-hero-head {
+  flex-wrap: nowrap;
+  align-items: flex-end;
+  gap: 16px;
+}
+
+.tasks-hero-copy {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.tasks-hero-copy .muted {
+  margin: 2px 0 0;
+  font-size: var(--fs-body-2);
+}
+
+.tasks-head-actions {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
 .tasks-head-actions .tasks-view-seg .seg-btn {
-  min-width: 76px;
-  padding: 6px 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-width: 82px;
+  padding: 5px 12px;
   font-size: var(--fs-body-2);
 }
 
 .tasks-hero {
+  display: flex;
+  flex-direction: column;
   margin-bottom: 0;
-  gap: 14px;
-}
-
-.tasks-progress-bar {
-  height: 6px;
-}
-
-.tasks-progress-fill {
-  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  gap: 12px;
 }
 
 .tasks-stat-tiles {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 10px;
 }
 
 .tasks-tile {
-  min-width: 112px;
-  flex: 0 1 auto;
+  min-width: 0;
+  padding: 12px 14px;
 }
 
 .tasks-tile.doing .stat-tile-value {
@@ -51,55 +73,212 @@
   color: var(--accent-2);
 }
 
+.tasks-tile.events .stat-tile-value {
+  color: var(--accent-2);
+}
+
 .tasks-tile.overdue {
-  border-color: color-mix(in srgb, var(--danger) 40%, var(--glass-edge));
+  border-color: color-mix(in srgb, var(--danger) 42%, var(--glass-edge));
 }
 
 .tasks-tile.overdue .stat-tile-value {
   color: var(--danger);
 }
 
-/* Sync bar: controls on the left, search takes the rest. */
-.tasks-sync-bar {
-  justify-content: flex-start;
+.tasks-progress-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 14px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--hairline);
+  background: var(--card-bg);
   box-shadow: var(--card-shadow);
-  border-radius: var(--card-radius);
 }
 
-.tasks-sync-bar .tasks-search {
-  flex: 1 1 200px;
+.tasks-progress-label {
+  font-size: var(--fs-caption);
+  font-weight: 550;
+  color: var(--label-2);
+}
+
+.tasks-progress-bar {
+  height: 6px;
+}
+
+.tasks-progress-fill {
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+}
+
+/* Sync bar: controls on the left, search on the right. */
+.tasks-sync-bar {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 12px;
+  padding: 10px 14px;
+  border-radius: var(--card-radius);
+  box-shadow: var(--card-shadow);
+}
+
+.tasks-sync-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.tasks-provider-select {
+  width: auto;
+  min-width: 170px;
+}
+
+.tasks-health-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: var(--r-pill);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.tasks-health-badge.local {
+  background: var(--surface-2);
+  border: 1px solid var(--hairline);
+  color: var(--label-2);
+}
+
+.tasks-health-badge.ok {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.tasks-health-badge.warn {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.tasks-search-wrap {
+  flex: 1 1 220px;
+  max-width: 340px;
   margin-left: auto;
-  max-width: 320px;
+}
+
+.tasks-search-wrap .tasks-search {
+  width: 100%;
+}
+
+.tasks-notice {
+  margin: 0;
+  justify-content: space-between;
+  font-size: var(--fs-body-2);
 }
 
 .tasks-composer,
-.tasks-cal-sidebar {
+.tasks-cal-sidebar,
+.tasks-cal-board {
   border-radius: var(--card-radius);
   box-shadow: var(--card-shadow);
 }
 
 .tasks-composer {
   margin-bottom: 0;
+  padding: 14px 16px;
+  gap: 10px;
+  animation: item-in var(--enter-dur) var(--spring) both;
 }
 
 .tasks-composer-row > .input:not(.tasks-due) {
-  flex: 1 1 auto;
+  flex: 1 1 240px;
+}
+
+.tasks-date-chips {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tasks-date-label {
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  color: var(--label-3);
+  margin-right: 2px;
+}
+
+.tasks-date-chip {
+  padding: 3px 10px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--hairline);
+  background: var(--surface-2);
+  color: var(--label-2);
+  font: inherit;
+  font-size: var(--fs-micro);
+  font-weight: 500;
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease),
+    border-color var(--dur-1) var(--ease);
+}
+
+.tasks-date-chip:hover {
+  background: var(--hover);
+  border-color: var(--hairline-strong);
+  color: var(--label-1);
+}
+
+.tasks-date-chip.active {
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--hairline));
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+.tasks-date-chip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.tasks-composer-hide {
+  margin-left: auto;
+}
+
+.tasks-composer-notes-wrap {
+  display: flex;
+}
+
+.tasks-inline-err {
+  margin: 0;
+  padding: 6px 10px;
+  border-radius: var(--r-xs);
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: var(--fs-caption);
 }
 
 .tasks-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
   margin: 0;
 }
 
-.tasks-filters.seg {
+.tasks-filters.seg,
+.tasks-due-filters.seg {
   display: inline-flex;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   gap: 2px;
   padding: 2px;
 }
 
-.tasks-filters.seg .seg-btn {
+.tasks-filters.seg .seg-btn,
+.tasks-due-filters.seg .seg-btn {
   flex: 0 0 auto;
-  padding: 5px 14px;
+  padding: 5px 12px;
 }
 
 .tasks-section {
@@ -107,9 +286,27 @@
   gap: 8px;
 }
 
+.tasks-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+}
+
 .tasks-section-title {
+  margin: 0;
   font-size: var(--fs-body);
+  font-weight: 600;
   letter-spacing: -0.01em;
+}
+
+.tasks-section-count {
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  color: var(--label-2);
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
 }
 
 .tasks-list.card-grid {
@@ -119,7 +316,11 @@
 
 .tasks-card,
 .tasks-kanban-card {
+  gap: 10px;
+  padding: 12px 14px;
   border-radius: var(--r-md);
+  border: 1px solid var(--hairline);
+  background: var(--card-bg);
   box-shadow: var(--card-shadow);
   transition: border-color var(--dur-1) var(--ease), box-shadow var(--dur-2) var(--ease),
     transform var(--dur-2) var(--spring);
@@ -132,10 +333,35 @@
   transform: var(--lift);
 }
 
-/* The status button reads as a compact chip, not a raw grey box. */
+.tasks-card-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.tasks-card-title {
+  font-size: var(--fs-body);
+  font-weight: 600;
+  color: var(--label-1);
+  overflow-wrap: anywhere;
+}
+
+.tasks-card-notes {
+  font-size: var(--fs-caption);
+  line-height: 1.45;
+  color: var(--label-2);
+  overflow-wrap: anywhere;
+}
+
+/* The status button reads as a compact pill chip with clear hover/focus states. */
 .tasks-card-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
   flex: 0 0 auto;
-  min-width: 56px;
+  min-width: 62px;
+  margin-top: 1px;
   padding: 3px 10px;
   border: 1px solid var(--hairline);
   border-radius: var(--r-pill);
@@ -144,7 +370,7 @@
   font: inherit;
   font-size: var(--fs-micro);
   font-weight: 600;
-  text-transform: capitalize;
+  cursor: pointer;
   transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease),
     border-color var(--dur-1) var(--ease);
 }
@@ -156,18 +382,19 @@
 
 .tasks-card-check.doing {
   background: var(--accent-soft);
-  border-color: transparent;
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
   color: var(--accent-ink);
 }
 
 .tasks-card-check.done {
   background: var(--ok-soft);
-  border-color: transparent;
+  border-color: color-mix(in srgb, var(--ok) 35%, transparent);
   color: var(--ok);
 }
 
 .tasks-card-check:focus-visible,
-.tasks-cal-cell:focus-visible {
+.tasks-cal-cell:focus-visible,
+.tasks-kanban-move:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
@@ -178,6 +405,17 @@
   text-decoration-color: var(--label-3);
 }
 
+.tasks-due-badge {
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.tasks-source-tag {
+  font-size: var(--fs-micro);
+  border: 1px solid var(--hairline);
+}
+
 .tasks-card-actions {
   flex: 0 0 auto;
   align-self: flex-start;
@@ -185,24 +423,31 @@
 }
 
 .tasks-kanban-card .tasks-card-actions {
+  width: 100%;
   flex-wrap: wrap;
+  padding-top: 6px;
+  border-top: 1px solid var(--hairline);
 }
 
 .tasks-kanban-move {
   flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   width: 28px;
   height: 28px;
-  justify-content: center;
   border: 1px solid var(--hairline);
   border-radius: var(--r-sm);
-  background: transparent;
+  background: var(--surface-2);
   color: var(--label-2);
   cursor: pointer;
-  transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+  transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease),
+    border-color var(--dur-1) var(--ease);
 }
 
 .tasks-kanban-move:hover {
-  background: var(--surface-2);
+  background: var(--hover);
+  border-color: var(--hairline-strong);
   color: var(--label-1);
 }
 
@@ -266,21 +511,54 @@
 }
 
 .tasks-kanban-col {
+  padding: 12px;
   border-radius: var(--card-radius);
-  min-height: 200px;
+  border: 1px solid var(--hairline);
+  background: var(--surface-2);
+  box-shadow: var(--card-shadow);
+  min-height: 220px;
+  gap: 10px;
+}
+
+.tasks-kanban-head {
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.tasks-kanban-title-wrap {
+  display: inline-flex;
+  align-items: center;
   gap: 8px;
+}
+
+.tasks-kanban-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--label-3);
+  flex: none;
+}
+
+.tasks-kanban-dot.doing {
+  background: var(--accent);
+}
+
+.tasks-kanban-dot.done {
+  background: var(--ok);
 }
 
 .tasks-kanban-head h3 {
   margin: 0;
   font-size: var(--fs-body);
   font-weight: 650;
+  color: var(--label-1);
 }
 
 .kanban-count {
   padding: 2px 8px;
   border-radius: var(--r-pill);
   background: var(--surface);
+  border: 1px solid var(--hairline);
   color: var(--label-2);
   font-size: var(--fs-micro);
   font-variant-numeric: tabular-nums;
@@ -288,7 +566,7 @@
 
 .kanban-empty {
   margin: 0;
-  padding: 20px 8px;
+  padding: 24px 10px;
   border: 1px dashed var(--hairline-strong);
   border-radius: var(--r-md);
   color: var(--label-3);
@@ -297,24 +575,87 @@
 }
 
 /* Calendar */
+.tasks-cal-sync-strip {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 14px;
+  margin-bottom: 0;
+  border-radius: var(--card-radius);
+  box-shadow: var(--card-shadow);
+}
+
+.tasks-cal-layout {
+  align-items: start;
+  gap: 14px;
+}
+
+.tasks-cal-board {
+  padding: 14px;
+  gap: 10px;
+}
+
 .cal-head {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
+  justify-content: space-between;
   gap: 10px;
-  margin-bottom: 10px;
+  margin: 0;
+}
+
+.cal-nav {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .cal-head strong {
-  min-width: 9ch;
+  min-width: 11ch;
+  text-align: center;
   font-size: var(--fs-title);
   letter-spacing: -0.02em;
+  color: var(--label-1);
+}
+
+.tasks-cal-legend {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  font-size: var(--fs-micro);
+  color: var(--label-2);
+}
+
+.tasks-cal-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
 }
 
 .tasks-cal-grid {
   gap: 6px;
 }
 
+.cal-dow {
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  color: var(--label-3);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 4px 0;
+}
+
 .tasks-cal-cell {
+  min-height: 82px;
+  padding: 7px 8px;
+  gap: 4px;
+  justify-content: flex-start;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--hairline);
+  background: var(--surface);
   transition: border-color var(--dur-1) var(--ease), background var(--dur-1) var(--ease),
     box-shadow var(--dur-2) var(--ease);
 }
@@ -330,13 +671,143 @@
   cursor: default;
 }
 
+.tasks-cal-cell.today {
+  border-color: color-mix(in srgb, var(--accent-2) 55%, var(--hairline));
+  background: color-mix(in srgb, var(--accent-2-soft) 55%, var(--surface));
+}
+
+.tasks-cal-cell.selected {
+  border-color: var(--accent);
+  box-shadow: var(--ring);
+}
+
+.cal-day {
+  width: 100%;
+  margin-bottom: 2px;
+  font-size: var(--fs-caption);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--label-2);
+}
+
 .tasks-cal-cell.today .cal-day span:first-child {
   color: var(--accent-2);
   font-weight: 700;
 }
 
+.cal-items {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.cal-item {
+  font-size: var(--fs-micro);
+  font-weight: 500;
+  line-height: 1.35;
+  padding: 1px 6px;
+  border-radius: var(--r-xs);
+}
+
+.cal-item.event {
+  background: var(--accent-2-soft);
+  color: var(--accent-2);
+}
+
+.cal-more {
+  font-size: var(--fs-micro);
+  color: var(--label-3);
+}
+
 .tasks-cal-dot.event {
   background: var(--accent-2);
+}
+
+.tasks-cal-sidebar {
+  padding: 14px;
+  gap: 12px;
+}
+
+.tasks-cal-sidebar-head {
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.tasks-cal-sidebar-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.tasks-cal-sidebar-copy strong {
+  font-size: var(--fs-body);
+  color: var(--label-1);
+}
+
+.tasks-cal-sidebar-sub {
+  font-size: var(--fs-micro);
+  color: var(--label-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.tasks-cal-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tasks-cal-group-label {
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--label-3);
+}
+
+.tasks-cal-event-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--hairline);
+  border-left: 3px solid var(--accent-2);
+  background: var(--surface-2);
+  transition: border-color var(--dur-1) var(--ease), background var(--dur-1) var(--ease);
+}
+
+.tasks-cal-event-item:hover {
+  border-color: var(--hairline-strong);
+  border-left-color: var(--accent-2);
+}
+
+.tasks-cal-event-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.tasks-cal-event-title {
+  font-size: var(--fs-body-2);
+  font-weight: 600;
+  color: var(--label-1);
+  overflow-wrap: anywhere;
+}
+
+.tasks-cal-event-time {
+  font-size: var(--fs-caption);
+  color: var(--label-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.tasks-cal-empty {
+  border: 1px dashed var(--hairline-strong);
+  border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--surface-2) 45%, transparent);
 }
 
 /* Task editor: fade the scrim, rise the dialog. */
@@ -345,7 +816,15 @@
 }
 
 .tasks-editor-modal {
+  border-radius: var(--card-radius);
   animation: item-in var(--dur-3) var(--spring) both;
+}
+
+.tasks-editor-head h3 {
+  margin: 0;
+  font-size: var(--fs-title);
+  font-weight: 650;
+  color: var(--label-1);
 }
 
 @keyframes tasks-fade-in {
@@ -361,7 +840,12 @@
 .tasks-skeleton {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
+}
+
+.tasks-skeleton-tile {
+  height: 74px;
+  border-radius: var(--r-md);
 }
 
 .tasks-skeleton-row {
@@ -379,6 +863,33 @@
 
 .tasks-empty {
   padding: 40px 24px;
+}
+
+@media (max-width: 1040px) {
+  .tasks-stat-tiles {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 820px) {
+  .tasks-hero-head {
+    flex-wrap: wrap;
+  }
+
+  .tasks-stat-tiles {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .tasks-search-wrap {
+    max-width: none;
+    margin-left: 0;
+  }
+}
+
+@media (max-width: 560px) {
+  .tasks-stat-tiles {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 /* ===================== Workflows ===================== */

@@ -526,3 +526,53 @@
 .wa-link-card .wa-code { font-size: 1.4rem; letter-spacing: 0.2em; }
 .wa-link-card .wa-allowlist { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
 .wa-link-card textarea { width: 100%; resize: vertical; }
+
+/* Native SMTP/IMAP Mail connector card (0.74.2). */
+.mail-connector-card .mail-connected-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 10px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--hairline);
+  background: var(--surface-2);
+}
+
+.mail-connector-card .mail-connected-summary p {
+  margin: 0;
+}
+
+.mail-connector-card .mail-preset-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mail-connector-card .mail-form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 10px 12px;
+}
+
+.mail-connector-card .mail-from-field {
+  grid-column: 1 / -1;
+}
+
+.mail-connector-card .mail-probe-results {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.mail-connector-card .mail-probe-results .banner {
+  margin-bottom: 0;
+  gap: 8px;
+}
+
+.mail-connector-card .mail-probe-label {
+  font-weight: 600;
+  font-size: var(--fs-caption);
+  min-width: 40px;
+}
+

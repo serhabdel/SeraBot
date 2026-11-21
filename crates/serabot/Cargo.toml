@@ -80,7 +80,6 @@ sqlite-vec = "0.1.9"
 # Only the system and disk readers; no network, component or user lists.
 sysinfo = { version = "0.37", default-features = false, features = ["system", "disk"] }
 subtle = "2"
-text-splitter = "0.16"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net", "fs", "process"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }

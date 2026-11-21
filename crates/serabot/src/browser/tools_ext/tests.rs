@@ -679,6 +679,34 @@ async fn download_url_and_current_modes_validate_targets_and_save_artifacts() {
     assert_eq!(current.filename.as_deref(), Some("viewer.pdf"));
     assert!(current.content.contains("pdf_inspect"));
 
+    // A valid PDF with no extractable text (scanned/image-only) includes a clear hint.
+    let (empty_doc, _page, _layer) = printpdf::PdfDocument::new(
+        "Scanned PDF",
+        printpdf::Mm(210.0),
+        printpdf::Mm(297.0),
+        "Layer 1",
+    );
+    let empty_pdf_bytes = empty_doc.save_to_bytes().unwrap();
+    h.launcher
+        .set_fake_download("alice", "scanned.pdf", "application/pdf", empty_pdf_bytes);
+    let scanned = run(
+        &h,
+        "alice",
+        "browser_download",
+        json!({"url": "https://93.184.216.34/docs/scanned.pdf"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(scanned.filename.as_deref(), Some("scanned.pdf"));
+    assert!(
+        scanned.content.contains("scanned or image-only")
+            && scanned.content.contains("pdf_to_images")
+            && scanned.content.contains("OCR"),
+        "{}",
+        scanned.content
+    );
+    assert!(!scanned.content.contains("First page text preview:"));
+
     // Next-tool guidance for docx as well.
     h.launcher.set_fake_download(
         "alice",

@@ -91,6 +91,7 @@ pub const BUILTIN_SKILLS: &[BuiltinSkill] = &[
     builtin_skill!("legal-rag"),
     builtin_skill!("ma-payroll"),
     builtin_skill!("ma-tax-2026"),
+    builtin_skill!("mail"),
     builtin_skill!("messaging-etiquette"),
     builtin_skill!("monitoring-playbook"),
     builtin_skill!("onedrive"),
@@ -183,6 +184,6 @@ mod tests {
             "duplicate builtin skill"
         );
         assert_eq!(embedded, on_disk, "BUILTIN_SKILLS out of sync with skills/");
-        assert_eq!(BUILTIN_SKILLS.len(), 37);
+        assert_eq!(BUILTIN_SKILLS.len(), 38);
     }
 }

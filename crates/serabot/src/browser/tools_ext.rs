@@ -179,19 +179,33 @@ fn next_tool_hint(filename: &str, mime: &str, hash: &str) -> String {
     }
 }
 
-fn pdf_first_page_preview(bytes: &[u8], max_chars: usize) -> Option<String> {
-    let (pages, _) = crate::documents::extract_pdf_page_texts_bounded(bytes, 1, |_| true).ok()?;
-    let first = pages.into_iter().next()?.1;
+enum PdfPreview {
+    Text(String),
+    EmptyText,
+    Unreadable,
+}
+
+fn pdf_first_page_preview(bytes: &[u8], max_chars: usize) -> PdfPreview {
+    let pages = match crate::documents::extract_pdf_page_texts_bounded(bytes, 1, |_| true) {
+        Ok((pages, _)) => pages,
+        Err(SeraError::Validation(msg)) if msg.contains("no extractable text") => {
+            return PdfPreview::EmptyText;
+        }
+        Err(_) => return PdfPreview::Unreadable,
+    };
+    let Some(first) = pages.into_iter().next().map(|(_, text)| text) else {
+        return PdfPreview::EmptyText;
+    };
     let collapsed = first.split_whitespace().collect::<Vec<_>>().join(" ");
     let trimmed = collapsed.trim();
     if trimmed.is_empty() {
-        return None;
+        return PdfPreview::EmptyText;
     }
     let truncated = truncate_chars(trimmed, max_chars);
     if trimmed.chars().count() > max_chars {
-        Some(format!("{truncated}..."))
+        PdfPreview::Text(format!("{truncated}..."))
     } else {
-        Some(truncated)
+        PdfPreview::Text(truncated)
     }
 }
 
@@ -228,14 +242,23 @@ fn save_artifact(
         stored.hash,
         hint
     );
-    if (mime == "application/pdf" || bytes.starts_with(b"%PDF"))
-        && let Some(preview) = pdf_first_page_preview(bytes, PDF_PREVIEW_CHARS)
-    {
-        let safe_preview = lease.redact(&preview);
-        if deps.policy.is_allowed(&safe_preview) {
-            content.push_str(&format!(
-                "\n\n{UNTRUSTED_BANNER}\nFirst page text preview:\n{safe_preview}"
-            ));
+    if mime == "application/pdf" || bytes.starts_with(b"%PDF") {
+        match pdf_first_page_preview(bytes, PDF_PREVIEW_CHARS) {
+            PdfPreview::Text(preview) => {
+                let safe_preview = lease.redact(&preview);
+                if deps.policy.is_allowed(&safe_preview) {
+                    content.push_str(&format!(
+                        "\n\n{UNTRUSTED_BANNER}\nFirst page text preview:\n{safe_preview}"
+                    ));
+                }
+            }
+            PdfPreview::EmptyText => {
+                content.push_str(&format!(
+                    "\n\nNote: this PDF has no extractable text (it appears scanned or image-only). Use pdf_to_images{{artifact: \"{}\"}} to render pages as images, or document_index with OCR to read it.",
+                    stored.hash
+                ));
+            }
+            PdfPreview::Unreadable => {}
         }
     }
     Ok(ToolOutput {

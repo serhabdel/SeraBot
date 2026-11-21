@@ -2978,6 +2978,135 @@ impl Store {
         Ok(messages)
     }
 
+    /// Full-text search across the acting user's visible messages (`user` and
+    /// `assistant`) and conversation titles, deduplicated to the newest match
+    /// per conversation and ordered newest first.
+    pub fn search_conversations(
+        &self,
+        user_id: &str,
+        query: &str,
+        bot: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ConversationSearchHit>> {
+        let trimmed = query.trim();
+        if trimmed.chars().count() < 2 {
+            return Ok(Vec::new());
+        }
+        let limit = limit.clamp(1, 50);
+        let bot_filter = bot.map(str::trim).filter(|value| !value.is_empty());
+        let pattern = format!("%{}%", escape_like_pattern(&trimmed.to_lowercase()));
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "WITH matched AS (
+                SELECT
+                    c.id AS conversation_id,
+                    COALESCE(c.title, '') AS title,
+                    COALESCE(
+                        bc.bot_id,
+                        (SELECT t2.bot FROM turns t2
+                          WHERE t2.conversation_id = c.id AND t2.user_id = ?1
+                          ORDER BY t2.created_at DESC, t2.rowid DESC LIMIT 1),
+                        CASE
+                            WHEN c.id LIKE 'dir:%' AND c.id NOT LIKE 'dir:chat-%' THEN substr(c.id, 5)
+                            ELSE ''
+                        END
+                    ) AS resolved_bot,
+                    m.role AS role,
+                    m.content AS content,
+                    m.created_at AS sort_at,
+                    m.rowid AS sort_rowid,
+                    1 AS source_rank,
+                    CASE WHEN LOWER(m.content) LIKE ?2 ESCAPE '\\' THEN 1 ELSE 0 END AS content_hit
+                FROM messages m
+                JOIN conversations c ON c.id = m.conversation_id
+                LEFT JOIN bot_chats bc ON bc.conversation_id = c.id AND bc.user_id = ?1
+                WHERE c.user_id = ?1
+                  AND m.user_id = ?1
+                  AND m.role IN ('user', 'assistant')
+                  AND (
+                      LOWER(m.content) LIKE ?2 ESCAPE '\\'
+                      OR LOWER(COALESCE(c.title, '')) LIKE ?2 ESCAPE '\\'
+                  )
+                UNION ALL
+                SELECT
+                    c.id AS conversation_id,
+                    COALESCE(c.title, '') AS title,
+                    COALESCE(
+                        bc.bot_id,
+                        (SELECT t2.bot FROM turns t2
+                          WHERE t2.conversation_id = c.id AND t2.user_id = ?1
+                          ORDER BY t2.created_at DESC, t2.rowid DESC LIMIT 1),
+                        CASE
+                            WHEN c.id LIKE 'dir:%' AND c.id NOT LIKE 'dir:chat-%' THEN substr(c.id, 5)
+                            ELSE ''
+                        END
+                    ) AS resolved_bot,
+                    '' AS role,
+                    '' AS content,
+                    COALESCE(c.updated_at, c.created_at) AS sort_at,
+                    0 AS sort_rowid,
+                    0 AS source_rank,
+                    0 AS content_hit
+                FROM conversations c
+                LEFT JOIN bot_chats bc ON bc.conversation_id = c.id AND bc.user_id = ?1
+                WHERE c.user_id = ?1
+                  AND LOWER(COALESCE(c.title, '')) LIKE ?2 ESCAPE '\\'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM messages m2
+                       WHERE m2.conversation_id = c.id
+                         AND m2.user_id = ?1
+                         AND m2.role IN ('user', 'assistant')
+                  )
+            ),
+            ranked AS (
+                SELECT
+                    conversation_id,
+                    title,
+                    resolved_bot,
+                    role,
+                    content,
+                    sort_at,
+                    content_hit,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY conversation_id
+                        ORDER BY content_hit DESC, source_rank DESC, sort_at DESC, sort_rowid DESC
+                    ) AS rn
+                FROM matched
+                WHERE (?3 IS NULL OR resolved_bot = ?3)
+            )
+            SELECT conversation_id, resolved_bot, title, role, content, sort_at, content_hit
+            FROM ranked
+            WHERE rn = 1
+            ORDER BY sort_at DESC, conversation_id DESC
+            LIMIT ?4",
+        )?;
+        let rows =
+            statement.query_map(params![user_id, pattern, bot_filter, limit as i64], |row| {
+                let conversation_id: String = row.get(0)?;
+                let bot: String = row.get(1)?;
+                let title: String = row.get(2)?;
+                let role: String = row.get(3)?;
+                let content: String = row.get(4)?;
+                let created_at: String = row.get(5)?;
+                let content_hit: i64 = row.get(6)?;
+                let snippet_source = if content_hit != 0 || !content.is_empty() {
+                    content.as_str()
+                } else {
+                    title.as_str()
+                };
+                let snippet = build_search_snippet(snippet_source, trimmed);
+                Ok(ConversationSearchHit {
+                    conversation_id,
+                    bot,
+                    title,
+                    role,
+                    snippet,
+                    created_at,
+                })
+            })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn history_for_llm(
         &self,
         user_id: &str,
@@ -5748,6 +5877,17 @@ pub struct LocalFileDestination {
     pub created_at: DateTime<Utc>,
 }
 
+/// One matching conversation returned by [`Store::search_conversations`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConversationSearchHit {
+    pub conversation_id: String,
+    pub bot: String,
+    pub title: String,
+    pub role: String,
+    pub snippet: String,
+    pub created_at: String,
+}
+
 fn map_conversation_write(error: rusqlite::Error) -> SeraError {
     if let rusqlite::Error::SqliteFailure(err, _) = &error {
         if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
@@ -6080,6 +6220,95 @@ fn validate_user_fields(provider_subject: &str, email: &str, display_name: &str)
 
 fn truncate(value: &str, max: usize) -> String {
     value.chars().take(max).collect()
+}
+
+fn escape_like_pattern(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '\\' | '%' | '_' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn build_search_snippet(text: &str, query: &str) -> String {
+    const MAX_SNIPPET_CHARS: usize = 160;
+    const CONTEXT_BEFORE_CHARS: usize = 50;
+
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return String::new();
+    }
+    let total_chars = collapsed.chars().count();
+    if total_chars <= MAX_SNIPPET_CHARS {
+        return collapsed;
+    }
+
+    let needle = query.split_whitespace().collect::<Vec<_>>().join(" ");
+    let match_char_idx = if needle.is_empty() {
+        None
+    } else {
+        find_case_insensitive_char_offset(&collapsed, &needle)
+    };
+
+    let Some(match_idx) = match_char_idx else {
+        let mut head: String = collapsed.chars().take(MAX_SNIPPET_CHARS - 1).collect();
+        head.push('…');
+        return head;
+    };
+
+    let start_char = match_idx.saturating_sub(CONTEXT_BEFORE_CHARS);
+    let end_char = (start_char + MAX_SNIPPET_CHARS).min(total_chars);
+    let start_char = end_char.saturating_sub(MAX_SNIPPET_CHARS);
+
+    let start_byte = char_index_to_byte(&collapsed, start_char);
+    let end_byte = char_index_to_byte(&collapsed, end_char);
+    let slice = &collapsed[start_byte..end_byte];
+
+    let prefix = if start_char > 0 { "…" } else { "" };
+    let suffix = if end_char < total_chars { "…" } else { "" };
+    let mut snippet = format!("{prefix}{slice}{suffix}");
+    if snippet.chars().count() > MAX_SNIPPET_CHARS {
+        let keep =
+            MAX_SNIPPET_CHARS.saturating_sub(prefix.chars().count() + suffix.chars().count());
+        let trimmed_slice: String = slice.chars().take(keep).collect();
+        snippet = format!("{prefix}{trimmed_slice}{suffix}");
+    }
+    snippet
+}
+
+fn char_index_to_byte(text: &str, char_idx: usize) -> usize {
+    text.char_indices()
+        .nth(char_idx)
+        .map(|(byte_idx, _)| byte_idx)
+        .unwrap_or(text.len())
+}
+
+fn find_case_insensitive_char_offset(haystack: &str, needle: &str) -> Option<usize> {
+    let needle_chars: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
+    if needle_chars.is_empty() {
+        return None;
+    }
+    // Map each lowercase char back to the original char index in `haystack` so
+    // Unicode case folding that expands one char into multiple chars (e.g. 'ß'
+    // or 'İ') still yields a valid char offset into `haystack`.
+    let mut lower_chars: Vec<char> = Vec::new();
+    let mut orig_char_indices: Vec<usize> = Vec::new();
+    for (orig_idx, ch) in haystack.chars().enumerate() {
+        for lc in ch.to_lowercase() {
+            lower_chars.push(lc);
+            orig_char_indices.push(orig_idx);
+        }
+    }
+    lower_chars
+        .windows(needle_chars.len())
+        .position(|window| window == needle_chars.as_slice())
+        .map(|pos| orig_char_indices[pos])
 }
 
 /// Queue one outbox delivery for the acting user.
@@ -9209,5 +9438,227 @@ mod tests {
         assert_eq!(rest.len(), 2);
         // The unlimited wrapper keeps the old behavior for callers without limits.
         assert!(store.claim_task("w", 30).unwrap().is_some());
+    }
+
+    #[test]
+    fn search_conversations_matches_content_and_title_with_bounded_utf8_snippet() {
+        let store = store();
+        let alice = store
+            .create_user("sub-search-a", "sa@example.example", "Search Alice")
+            .unwrap();
+
+        // Conversation 1: matches message content inside a long multi-byte string.
+        store
+            .create_conversation_titled(
+                &alice.id,
+                "dir:main",
+                "direct",
+                None,
+                Some("Daily planning"),
+            )
+            .unwrap();
+        let prefix = "é".repeat(90);
+        let suffix = "🚀".repeat(90);
+        let long_msg = format!("{prefix}   quarterly\n\tINVOICE-42   summary   {suffix}");
+        store
+            .append_message(&alice.id, "dir:main", None, Role::Assistant, &long_msg)
+            .unwrap();
+        // Older matching message in the same conversation: deduplication keeps newest.
+        let older = store
+            .append_message(
+                &alice.id,
+                "dir:main",
+                None,
+                Role::User,
+                "earlier INVOICE-42 question",
+            )
+            .unwrap();
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE messages SET created_at = '2026-01-01T00:00:00.000Z' WHERE id = ?1",
+                params![older.id],
+            )
+            .unwrap();
+        // Tool/system messages must not be searched.
+        store
+            .append_message(
+                &alice.id,
+                "dir:main",
+                None,
+                Role::Tool,
+                "hidden tool INVOICE-42 payload",
+            )
+            .unwrap();
+
+        // Conversation 2: matches only by conversation title, no messages.
+        store
+            .create_conversation_titled(
+                &alice.id,
+                "room:tax",
+                "room",
+                None,
+                Some("Quarterly Invoice Archive"),
+            )
+            .unwrap();
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE conversations SET updated_at = '2026-01-02T00:00:00.000Z' WHERE id = 'room:tax'",
+                [],
+            )
+            .unwrap();
+
+        // Queries shorter than 2 characters return empty.
+        assert!(
+            store
+                .search_conversations(&alice.id, " ", None, 20)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .search_conversations(&alice.id, "a", None, 20)
+                .unwrap()
+                .is_empty()
+        );
+
+        let hits = store
+            .search_conversations(&alice.id, "invoice", None, 20)
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].conversation_id, "dir:main");
+        assert_eq!(hits[0].bot, "main");
+        assert_eq!(hits[0].title, "Daily planning");
+        assert_eq!(hits[0].role, "assistant");
+        assert!(hits[0].snippet.contains("INVOICE-42"));
+        assert!(!hits[0].snippet.contains('\n'));
+        assert!(!hits[0].snippet.contains('\t'));
+        assert!(hits[0].snippet.chars().count() <= 160);
+
+        assert_eq!(hits[1].conversation_id, "room:tax");
+        assert_eq!(hits[1].title, "Quarterly Invoice Archive");
+        assert_eq!(hits[1].snippet, "Quarterly Invoice Archive");
+    }
+
+    #[test]
+    fn search_conversations_filters_by_bot_isolates_users_and_escapes_like() {
+        let store = store();
+        let alice = store
+            .create_user("sub-search-iso-a", "iso-a@example.example", "Iso Alice")
+            .unwrap();
+        let bob = store
+            .create_user("sub-search-iso-b", "iso-b@example.example", "Iso Bob")
+            .unwrap();
+
+        store
+            .create_conversation_titled(&alice.id, "dir:analyst", "direct", None, Some("Budget"))
+            .unwrap();
+        store
+            .append_message(
+                &alice.id,
+                "dir:analyst",
+                None,
+                Role::Assistant,
+                "Progress is 100% done for Q_1\\2026",
+            )
+            .unwrap();
+
+        // Bound extra chat for writer bot.
+        store
+            .create_conversation_titled(
+                &alice.id,
+                "dir:chat-0123456789ab",
+                "direct",
+                None,
+                Some("Draft"),
+            )
+            .unwrap();
+        store
+            .bind_bot_chat(&alice.id, "dir:chat-0123456789ab", "writer", None)
+            .unwrap();
+        store
+            .append_message(
+                &alice.id,
+                "dir:chat-0123456789ab",
+                None,
+                Role::User,
+                "Progress note for writer",
+            )
+            .unwrap();
+
+        // Bob has a conversation with the same keyword; Alice must never see it.
+        store
+            .create_conversation_titled(&bob.id, "dir:bob-chat", "direct", None, Some("Bob Secret"))
+            .unwrap();
+        store
+            .append_message(
+                &bob.id,
+                "dir:bob-chat",
+                None,
+                Role::User,
+                "Progress 100% secret bob-only",
+            )
+            .unwrap();
+
+        // Bot filter restricts to matching bot.
+        let writer_hits = store
+            .search_conversations(&alice.id, "Progress", Some("writer"), 20)
+            .unwrap();
+        assert_eq!(writer_hits.len(), 1);
+        assert_eq!(writer_hits[0].conversation_id, "dir:chat-0123456789ab");
+        assert_eq!(writer_hits[0].bot, "writer");
+
+        let analyst_hits = store
+            .search_conversations(&alice.id, "Progress", Some("analyst"), 20)
+            .unwrap();
+        assert_eq!(analyst_hits.len(), 1);
+        assert_eq!(analyst_hits[0].conversation_id, "dir:analyst");
+
+        // Strict UID isolation.
+        let alice_hits = store
+            .search_conversations(&alice.id, "bob-only", None, 20)
+            .unwrap();
+        assert!(alice_hits.is_empty());
+        let bob_hits = store
+            .search_conversations(&bob.id, "writer", None, 20)
+            .unwrap();
+        assert!(bob_hits.is_empty());
+
+        // LIKE wildcards (`%`, `_`, `\`) are escaped and matched literally.
+        assert_eq!(
+            store
+                .search_conversations(&alice.id, "100%", None, 20)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .search_conversations(&alice.id, "%%", None, 20)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .search_conversations(&alice.id, "__", None, 20)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .search_conversations(&alice.id, "Q_1\\2026", None, 20)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .search_conversations(&alice.id, "Qx1\\2026", None, 20)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

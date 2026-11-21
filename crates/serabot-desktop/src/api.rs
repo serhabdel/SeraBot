@@ -1703,6 +1703,208 @@ pub struct ConnectorOauth {
     pub scope: Option<String>,
 }
 
+/// Security mode for native SMTP/IMAP mail connections.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MailSecurity {
+    #[default]
+    StartTls,
+    Ssl,
+    None,
+}
+
+impl MailSecurity {
+    pub const ALL: [Self; 3] = [Self::StartTls, Self::Ssl, Self::None];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StartTls => "starttls",
+            Self::Ssl => "ssl",
+            Self::None => "none",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::StartTls => "STARTTLS",
+            Self::Ssl => "SSL / TLS",
+            Self::None => "None (local only)",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "ssl" => Self::Ssl,
+            "none" => Self::None,
+            _ => Self::StartTls,
+        }
+    }
+}
+
+/// `GET /v1/mail`: per-user SMTP/IMAP connection status (never returns password).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct MailStatus {
+    #[serde(default)]
+    pub connected: bool,
+    #[serde(default)]
+    pub smtp_host: Option<String>,
+    #[serde(default)]
+    pub imap_host: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+}
+
+/// Body of `POST /v1/mail/connect`. Password is wiped when dropped.
+#[derive(Clone, Serialize)]
+pub struct MailConnectRequest {
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_security: MailSecurity,
+    pub username: String,
+    pub password: String,
+    pub imap_host: String,
+    pub imap_port: u16,
+    pub imap_security: MailSecurity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+}
+
+impl Drop for MailConnectRequest {
+    fn drop(&mut self) {
+        self.password.zeroize();
+    }
+}
+
+/// Outcome of the live SMTP or IMAP probe inside `POST /v1/mail/connect`.
+/// Server returns `"ok"` or `{"error": "..."}`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MailProbeOutcome {
+    Ok,
+    Error(String),
+}
+
+impl<'de> Deserialize<'de> for MailProbeOutcome {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.as_str() == Some("ok") {
+            return Ok(Self::Ok);
+        }
+        if let Some(err) = value.get("error").and_then(|v| v.as_str()) {
+            return Ok(Self::Error(err.to_owned()));
+        }
+        if let Some(s) = value.as_str() {
+            return Ok(Self::Error(s.to_owned()));
+        }
+        Ok(Self::Error("Test failed".to_owned()))
+    }
+}
+
+/// Reply of `POST /v1/mail/connect`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct MailConnectResponse {
+    #[serde(default)]
+    pub connected: bool,
+    #[serde(default)]
+    pub smtp_host: Option<String>,
+    #[serde(default)]
+    pub imap_host: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    pub smtp_test: MailProbeOutcome,
+    pub imap_test: MailProbeOutcome,
+}
+
+/// Reply of `DELETE /v1/mail`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct MailDisconnectResponse {
+    #[serde(default)]
+    pub connected: bool,
+}
+
+fn is_loopback_mail_host(host: &str) -> bool {
+    matches!(host.trim(), "127.0.0.1" | "::1" | "localhost")
+}
+
+/// Validate mail credentials locally before sending.
+pub fn validate_mail_connect(req: &MailConnectRequest) -> Result<(), ApiError> {
+    for (label, host) in [
+        ("SMTP host", req.smtp_host.trim()),
+        ("IMAP host", req.imap_host.trim()),
+    ] {
+        if host.is_empty()
+            || host.len() > 253
+            || host.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
+            return Err(ApiError::Validation(if label == "SMTP host" {
+                "Enter a valid SMTP host name."
+            } else {
+                "Enter a valid IMAP host name."
+            }));
+        }
+    }
+    if req.smtp_port == 0 || req.imap_port == 0 {
+        return Err(ApiError::Validation("Ports must be between 1 and 65535."));
+    }
+    if req.smtp_security == MailSecurity::None && !is_loopback_mail_host(&req.smtp_host) {
+        return Err(ApiError::Validation(
+            "Plain SMTP is only allowed for localhost; choose STARTTLS or SSL.",
+        ));
+    }
+    if req.imap_security == MailSecurity::None && !is_loopback_mail_host(&req.imap_host) {
+        return Err(ApiError::Validation(
+            "Plain IMAP is only allowed for localhost; choose SSL or STARTTLS.",
+        ));
+    }
+    let user = req.username.trim();
+    if user.is_empty() || user.len() > 256 || user.chars().any(char::is_control) {
+        return Err(ApiError::Validation(
+            "Enter your email address or mailbox username.",
+        ));
+    }
+    if req.password.is_empty() || req.password.len() > 1024 {
+        return Err(ApiError::Validation(
+            "Password must be 1 to 1024 characters.",
+        ));
+    }
+    if let Some(from) = &req.from {
+        let from = from.trim();
+        if !from.is_empty()
+            && (from.len() > 256
+                || from
+                    .chars()
+                    .any(|c| c == '\r' || c == '\n' || c.is_control()))
+        {
+            return Err(ApiError::Validation("Enter a valid From address."));
+        }
+    }
+    Ok(())
+}
+
+/// One hit from `GET /v1/conversations/search`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct ConversationSearchHit {
+    pub conversation_id: String,
+    #[serde(default)]
+    pub bot: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub snippet: String,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ConversationSearchResponse {
+    #[serde(default)]
+    hits: Vec<ConversationSearchHit>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct NewProvider {
     pub id: String,
@@ -4644,6 +4846,47 @@ impl ApiClient {
         Ok(done
             .manage_url
             .filter(|url| crate::marketplace::safe_link(url)))
+    }
+
+    /// `GET /v1/mail`: per-user SMTP/IMAP mail connector status (never returns password).
+    pub fn mail_status(&self) -> Result<MailStatus, ApiError> {
+        self.get(&["v1", "mail"], &[])
+    }
+
+    /// `POST /v1/mail/connect`: save per-user SMTP/IMAP credentials and run live SMTP + IMAP login tests.
+    pub fn mail_connect(&self, req: &MailConnectRequest) -> Result<MailConnectResponse, ApiError> {
+        validate_mail_connect(req)?;
+        self.request(Method::POST, &["v1", "mail", "connect"], &[], Some(req))
+    }
+
+    /// `DELETE /v1/mail`: disconnect and remove saved per-user SMTP/IMAP credentials.
+    pub fn mail_disconnect(&self) -> Result<MailDisconnectResponse, ApiError> {
+        self.request::<_, ()>(Method::DELETE, &["v1", "mail"], &[], None)
+    }
+
+    /// `GET /v1/conversations/search?q=...&bot=...&limit=15`: full-text message search.
+    /// Gracefully returns an empty hit list when an older server returns 404.
+    pub fn search_conversations(
+        &self,
+        query: &str,
+        bot: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ConversationSearchHit>, ApiError> {
+        let q = query.trim();
+        if q.chars().count() < 2 || q.chars().count() > 200 {
+            return Ok(Vec::new());
+        }
+        let limit_str = limit.clamp(1, 50).to_string();
+        let mut params = vec![("q", q), ("limit", limit_str.as_str())];
+        if let Some(bot_id) = bot.map(str::trim).filter(|b| !b.is_empty()) {
+            check_id(bot_id)?;
+            params.push(("bot", bot_id));
+        }
+        match self.get::<ConversationSearchResponse>(&["v1", "conversations", "search"], &params) {
+            Ok(resp) => Ok(resp.hits),
+            Err(ApiError::Http(404)) => Ok(Vec::new()),
+            Err(err) => Err(err),
+        }
     }
 
     /// `GET /v1/bots/{bot}/chats`: the bot's chats, primary chat first.
@@ -7864,5 +8107,94 @@ mod rejection_message_tests {
         assert!(rejection_message(br#"{"code":"validation"}"#).is_none());
         assert!(rejection_message(br#"{"error":""}"#).is_none());
         assert!(rejection_message(br#"{"error":"bad\nvalue"}"#).is_none());
+    }
+}
+
+#[cfg(test)]
+mod mail_and_search_tests {
+    use super::*;
+    use secrecy::SecretString;
+    use std::io::{Read, Write};
+
+    fn serve_once(response: Vec<u8>) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request);
+                let _ = stream.write_all(&response);
+            }
+        });
+        port
+    }
+
+    fn client_for(port: u16) -> ApiClient {
+        let endpoint = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        ApiClient::new(endpoint, SecretString::new("t".repeat(40))).unwrap()
+    }
+
+    #[test]
+    fn mail_probe_outcome_parses_ok_and_error_objects() {
+        let ok_json = r#"{
+            "connected": true,
+            "smtp_host": "smtp.hostinger.com",
+            "imap_host": "imap.hostinger.com",
+            "username": "user@example.test",
+            "smtp_test": "ok",
+            "imap_test": {"error": "authentication failed"}
+        }"#;
+        let parsed: MailConnectResponse = serde_json::from_str(ok_json).unwrap();
+        assert!(parsed.connected);
+        assert_eq!(parsed.smtp_test, MailProbeOutcome::Ok);
+        assert_eq!(
+            parsed.imap_test,
+            MailProbeOutcome::Error("authentication failed".into())
+        );
+    }
+
+    #[test]
+    fn mail_validation_refuses_plain_remote_hosts() {
+        let mut req = MailConnectRequest {
+            smtp_host: "smtp.hostinger.com".into(),
+            smtp_port: 587,
+            smtp_security: MailSecurity::None,
+            username: "me@example.test".into(),
+            password: "secret".into(),
+            imap_host: "imap.hostinger.com".into(),
+            imap_port: 993,
+            imap_security: MailSecurity::Ssl,
+            from: None,
+        };
+        assert!(matches!(
+            validate_mail_connect(&req),
+            Err(ApiError::Validation(_))
+        ));
+        req.smtp_security = MailSecurity::StartTls;
+        assert!(validate_mail_connect(&req).is_ok());
+    }
+
+    #[test]
+    fn conversation_search_parses_hits_and_ignores_404() {
+        let json = r#"{"hits":[{"conversation_id":"dir:main","bot":"main","title":"Main chat","role":"assistant","snippet":"Found **invoice** #42","created_at":"2026-11-20T10:00:00Z"}]}"#;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            json.len(),
+            json
+        )
+        .into_bytes();
+        let hits = client_for(serve_once(resp))
+            .search_conversations("invoice", Some("main"), 15)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].conversation_id, "dir:main");
+        assert_eq!(hits[0].snippet, "Found **invoice** #42");
+
+        let not_found =
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_vec();
+        let older = client_for(serve_once(not_found))
+            .search_conversations("invoice", Some("main"), 15)
+            .unwrap();
+        assert!(older.is_empty());
     }
 }
