@@ -1,20 +1,20 @@
-//! Microsoft Graph OneDrive delivery for approved artifacts.
+//! Microsoft Graph OneDrive access and delivery for the acting member's own drive.
 //!
-//! This client is intentionally small and auditable. It uploads a single byte
-//! buffer to a folder below a configured `base_folder` and never reads,
-//! enumerates, or deletes other drive content.
+//! Supports browsing from the drive root, searching, listing recent files,
+//! inspecting item metadata, downloading files (read-only), and uploading
+//! approved artifacts to either the configured dossier `base_folder` or a
+//! chosen drive-root folder (approval-gated).
 //!
 //! # Permissions
 //!
-//! The refresh-token flow requests `offline_access Files.ReadWrite.All User.Read`,
-//! matching the existing OneDrive MCP registration on the operator host. This is a
-//! broad delegated permission: it can write anywhere in the signed-in drive.
-//! `Files.ReadWrite.AppFolder` would be narrower, but this agent must deliver
-//! into the operator's existing dossier folder, which is not an app folder.
-//! The effective allowlist is therefore enforced here: every destination is
-//! `base_folder` plus validated relative segments, and `..`, absolute paths,
-//! and separator tricks are rejected. Keep the application registration and
-//! the signed-in account scoped accordingly.
+//! Per-user consent requests `offline_access Files.ReadWrite User.Read` (own
+//! drive only; see [`CONSENT_SCOPE`]). Legacy refresh-token clients use
+//! `offline_access Files.ReadWrite.All User.Read`.
+//! Every path is validated segment by segment (`..`, backslashes, control
+//! characters, and unsupported Graph characters are rejected) and operations
+//! never delete, move, or overwrite existing files (`conflict_behavior` is
+//! `rename` or `fail`). Keep the application registration and the signed-in
+//! account scoped accordingly.
 //!
 //! The registration is treated as a public client: the token request sends
 //! only `client_id`, `grant_type`, `refresh_token`, and `scope`, with no client
@@ -100,8 +100,14 @@ const MAX_FOLDER_DEPTH: usize = 8;
 const MAX_SUBFOLDER_DEPTH: usize = 4;
 const MAX_SEGMENT_CHARS: usize = 200;
 
-/// Maximum response body we will buffer from Graph or the token endpoint.
+/// Maximum response body we will buffer for JSON/listing Graph responses.
+const MAX_LIST_RESPONSE_BYTES: usize = 1024 * 1024;
+/// Maximum response body we will buffer from token endpoints or single-item responses.
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
+
+const MAX_BROWSE_DEPTH: usize = 12;
+const SEARCH_MAX_RESULTS_CAP: usize = 50;
+const RECENT_MAX_RESULTS_CAP: usize = 50;
 
 const GET_MAX_ATTEMPTS: usize = 3;
 
@@ -122,7 +128,7 @@ pub struct UploadResult {
     pub sha256: String,
 }
 
-/// One entry from a bounded folder listing below `base_folder`.
+/// One entry from a bounded folder listing, search, or recent listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriveListItem {
     pub id: String,
@@ -130,13 +136,32 @@ pub struct DriveListItem {
     pub folder: bool,
     pub size: u64,
     pub path: String,
+    pub last_modified: Option<String>,
+    pub web_url: Option<String>,
+    pub child_count: Option<u64>,
 }
 
-/// Result of listing a folder under the configured allowlist root.
+/// Result of listing a folder, searching, or fetching recent items.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListFolderResult {
     pub items: Vec<DriveListItem>,
     pub truncated: bool,
+}
+
+/// Detailed metadata for one item (file or folder) in the member's drive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriveItemInfo {
+    pub id: String,
+    pub name: String,
+    pub folder: bool,
+    pub size: u64,
+    pub path: String,
+    pub last_modified: Option<String>,
+    pub created_at: Option<String>,
+    pub web_url: Option<String>,
+    pub mime_type: Option<String>,
+    pub child_count: Option<u64>,
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,6 +284,11 @@ impl OneDriveClient {
         })
     }
 
+    /// The configured dossier base folder (relative to drive root).
+    pub fn base_folder(&self) -> &str {
+        &self.base_folder
+    }
+
     /// Write rotated refresh tokens back to the age store.
     ///
     /// `access_secret_name` is included in the same write when it is set.
@@ -315,19 +345,34 @@ impl OneDriveClient {
 
     /// List children of `base_folder` (or `base_folder/subfolder` when set).
     ///
-    /// Pagination is capped at `max_pages` (clamped to `LIST_MAX_PAGES_CAP`); each
-    /// page requests up to `LIST_PAGE_SIZE` items. Only GETs are retried.
+    /// Preserved for callers expecting dossier-relative listing; passing `/`,
+    /// `.`, or `root` lists the drive root.
     pub async fn list_folder(
         &self,
         subfolder: Option<&str>,
         max_pages: usize,
     ) -> Result<ListFolderResult> {
+        let trimmed = subfolder.map(str::trim);
+        if matches!(trimmed, Some("/") | Some(".") | Some("root")) {
+            return self.list_path(None, max_pages).await;
+        }
+        let folders = self.destination_folders(subfolder)?;
+        let joined = folders.join("/");
+        self.list_path(Some(&joined), max_pages).await
+    }
+
+    /// List children of any folder in the acting member's own drive by path
+    /// from the drive root. `None`, `""`, `/`, `.`, or `root` lists the drive
+    /// root; otherwise `path` is validated segment by segment (no `..` or
+    /// unsupported characters, depth up to `MAX_BROWSE_DEPTH`).
+    pub async fn list_path(
+        &self,
+        path: Option<&str>,
+        max_pages: usize,
+    ) -> Result<ListFolderResult> {
         let max_pages = max_pages.clamp(1, LIST_MAX_PAGES_CAP);
-        let list_root = matches!(
-            subfolder.map(str::trim),
-            Some("/") | Some(".") | Some("root")
-        );
-        let (mut url, parent_path) = if list_root {
+        let folders = normalize_browse_folder(path)?;
+        let (mut url, parent_path) = if folders.is_empty() {
             (
                 format!(
                     "{}/me/drive/root/children?$top={LIST_PAGE_SIZE}",
@@ -336,7 +381,6 @@ impl OneDriveClient {
                 "/".to_owned(),
             )
         } else {
-            let folders = self.destination_folders(subfolder)?;
             let encoded = encode_path(&folders);
             (
                 format!(
@@ -360,7 +404,7 @@ impl OneDriveClient {
             if response.status() == StatusCode::NOT_FOUND {
                 break;
             }
-            let body = read_limited(response, MAX_RESPONSE_BYTES).await?;
+            let body = read_limited(response, MAX_LIST_RESPONSE_BYTES).await?;
             let page: ListPageResponse = serde_json::from_slice(&body).map_err(|error| {
                 SeraError::External(format!("invalid OneDrive list response: {error}"))
             })?;
@@ -369,12 +413,17 @@ impl OneDriveClient {
                 if entry.id.is_empty() || entry.name.is_empty() {
                     continue;
                 }
+                let path =
+                    item_path_from_ref(entry.parent_reference.as_ref(), &entry.name, &parent_path);
                 items.push(DriveListItem {
                     id: entry.id,
-                    name: entry.name.clone(),
+                    name: entry.name,
                     folder: entry.folder.is_some(),
                     size: entry.size,
-                    path: format!("{}/{}", parent_path.trim_end_matches('/'), entry.name),
+                    path,
+                    last_modified: entry.last_modified_date_time,
+                    web_url: entry.web_url,
+                    child_count: entry.folder.and_then(|folder| folder.child_count),
                 });
             }
 
@@ -393,14 +442,207 @@ impl OneDriveClient {
         Ok(ListFolderResult { items, truncated })
     }
 
+    /// Search files and folders across the member's own drive via Microsoft
+    /// Graph `GET /me/drive/root/search(q='...')`.
+    pub async fn search(&self, query: &str, max_results: usize) -> Result<ListFolderResult> {
+        let query = validate_search_query(query)?;
+        let max_results = max_results.clamp(1, SEARCH_MAX_RESULTS_CAP);
+        let escaped = escape_odata_string(&query);
+        let mut url = format!(
+            "{}/me/drive/root/search(q='{}')?$top={max_results}",
+            self.graph_base, escaped
+        );
+
+        let mut items = Vec::new();
+        let mut pages = 0usize;
+        let mut truncated = false;
+
+        while pages < LIST_MAX_PAGES_CAP && items.len() < max_results {
+            pages += 1;
+            let token = self.access_token().await?;
+            let response = self.graph_get_with_retries(&url, &token, "search").await?;
+            if response.status() == StatusCode::NOT_FOUND {
+                break;
+            }
+            let body = read_limited(response, MAX_LIST_RESPONSE_BYTES).await?;
+            let page: ListPageResponse = serde_json::from_slice(&body).map_err(|error| {
+                SeraError::External(format!("invalid OneDrive search response: {error}"))
+            })?;
+
+            for entry in page.value {
+                if entry.id.is_empty() || entry.name.is_empty() {
+                    continue;
+                }
+                // Only include items belonging to the member's own drive.
+                if entry.remote_item.is_some() {
+                    continue;
+                }
+                if let Some(parent_path) = entry
+                    .parent_reference
+                    .as_ref()
+                    .and_then(|reference| reference.path.as_deref())
+                    && !is_own_drive_parent_path(parent_path)
+                {
+                    continue;
+                }
+                let path = item_path_from_ref(entry.parent_reference.as_ref(), &entry.name, "/");
+                items.push(DriveListItem {
+                    id: entry.id,
+                    name: entry.name,
+                    folder: entry.folder.is_some(),
+                    size: entry.size,
+                    path,
+                    last_modified: entry.last_modified_date_time,
+                    web_url: entry.web_url,
+                    child_count: entry.folder.and_then(|folder| folder.child_count),
+                });
+                if items.len() >= max_results {
+                    break;
+                }
+            }
+
+            if items.len() >= max_results {
+                if page.next_link.is_some() {
+                    truncated = true;
+                }
+                break;
+            }
+
+            match page.next_link.filter(|link| !link.is_empty()) {
+                Some(next) if pages < LIST_MAX_PAGES_CAP => {
+                    url = validate_pagination_url(&next, &self.graph_base)?;
+                }
+                Some(_) => {
+                    truncated = true;
+                    break;
+                }
+                None => break,
+            }
+        }
+
+        Ok(ListFolderResult { items, truncated })
+    }
+
+    /// List recently accessed files from the member's own drive via
+    /// `GET /me/drive/recent`. Items with `remoteItem` (shared/external drives)
+    /// are filtered out so only the member's own drive is exposed.
+    pub async fn recent(&self, max_results: usize) -> Result<ListFolderResult> {
+        let max_results = max_results.clamp(1, RECENT_MAX_RESULTS_CAP);
+        let url = format!("{}/me/drive/recent?$top={max_results}", self.graph_base);
+        let token = self.access_token().await?;
+        let response = self
+            .graph_get_with_retries(&url, &token, "recent files")
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(ListFolderResult {
+                items: Vec::new(),
+                truncated: false,
+            });
+        }
+        let body = read_limited(response, MAX_LIST_RESPONSE_BYTES).await?;
+        let page: ListPageResponse = serde_json::from_slice(&body).map_err(|error| {
+            SeraError::External(format!("invalid OneDrive recent response: {error}"))
+        })?;
+
+        let mut items = Vec::new();
+        let mut truncated = page.next_link.is_some();
+        for entry in page.value {
+            if entry.id.is_empty() || entry.name.is_empty() {
+                continue;
+            }
+            if entry.remote_item.is_some() {
+                continue;
+            }
+            if let Some(parent_path) = entry
+                .parent_reference
+                .as_ref()
+                .and_then(|reference| reference.path.as_deref())
+                && !is_own_drive_parent_path(parent_path)
+            {
+                continue;
+            }
+            let path = item_path_from_ref(entry.parent_reference.as_ref(), &entry.name, "/");
+            items.push(DriveListItem {
+                id: entry.id,
+                name: entry.name,
+                folder: entry.folder.is_some(),
+                size: entry.size,
+                path,
+                last_modified: entry.last_modified_date_time,
+                web_url: entry.web_url,
+                child_count: entry.folder.and_then(|folder| folder.child_count),
+            });
+            if items.len() >= max_results {
+                truncated = true;
+                break;
+            }
+        }
+
+        Ok(ListFolderResult { items, truncated })
+    }
+
+    /// Fetch metadata for one item (file or folder) by its path from the drive root.
+    pub async fn item_info(&self, path: &str) -> Result<DriveItemInfo> {
+        let segments = normalize_browse_folder(Some(path))?;
+        let url = if segments.is_empty() {
+            format!("{}/me/drive/root", self.graph_base)
+        } else {
+            format!(
+                "{}/me/drive/root:/{}",
+                self.graph_base,
+                encode_path(&segments)
+            )
+        };
+        let token = self.access_token().await?;
+        let response = self
+            .graph_get_with_retries(&url, &token, "item metadata")
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Err(SeraError::NotFound(format!("OneDrive item {path}")));
+        }
+        let body = read_limited(response, MAX_RESPONSE_BYTES).await?;
+        let item: DriveItemDetail = serde_json::from_slice(&body).map_err(|error| {
+            SeraError::External(format!("invalid OneDrive metadata response: {error}"))
+        })?;
+        let fallback_parent = if segments.len() <= 1 {
+            "/".to_owned()
+        } else {
+            display_folder_path(&segments[..segments.len() - 1])
+        };
+        let item_path = if segments.is_empty() {
+            "/".to_owned()
+        } else {
+            item_path_from_ref(item.parent_reference.as_ref(), &item.name, &fallback_parent)
+        };
+        let name = if item.name.is_empty() && segments.is_empty() {
+            "root".to_owned()
+        } else {
+            item.name
+        };
+        Ok(DriveItemInfo {
+            id: item.id,
+            name,
+            folder: item.folder.is_some(),
+            size: item.size,
+            path: item_path,
+            last_modified: item.last_modified_date_time,
+            created_at: item.created_date_time,
+            web_url: item.web_url,
+            mime_type: item.file.as_ref().and_then(|f| f.mime_type.clone()),
+            child_count: item.folder.and_then(|f| f.child_count),
+            sha256: item.file.and_then(|f| f.hashes).and_then(|h| h.sha256_hash),
+        })
+    }
+
     /// Read one file from the member's own drive by its path from the drive
     /// root (read-only). Returns the file name and at most `max_bytes` of
     /// content. Graph answers with a redirect to a short-lived download
     /// address; it is followed once, without the access token, and must be
     /// https (or the same loopback host in tests).
     pub async fn download(&self, path: &str, max_bytes: usize) -> Result<(String, Vec<u8>)> {
+        let trimmed = path.trim().trim_matches('/');
         let segments =
-            validate_segments(path, MAX_FOLDER_DEPTH + 1, "path").map_err(SeraError::Validation)?;
+            validate_segments(trimmed, MAX_BROWSE_DEPTH, "path").map_err(SeraError::Validation)?;
         let name = segments.last().cloned().unwrap_or_default();
         let url = format!(
             "{}/me/drive/root:/{}:/content",
@@ -475,6 +717,49 @@ impl OneDriveClient {
         mime: &str,
         subfolder: Option<&str>,
     ) -> Result<UploadResult> {
+        let folders = self.destination_folders(subfolder)?;
+        self.upload_segments(filename, bytes, mime, &folders).await
+    }
+
+    /// Upload `bytes` as `filename` to a drive-root folder path (or the drive
+    /// root itself when `folder` is empty / `/`). When `folder` is `None`,
+    /// `subfolder` relative to `base_folder` is used (via [`Self::upload`]).
+    /// Passing both `folder` and `subfolder` is rejected.
+    pub async fn upload_to_folder(
+        &mut self,
+        filename: &str,
+        bytes: Vec<u8>,
+        mime: &str,
+        folder: Option<&str>,
+        subfolder: Option<&str>,
+    ) -> Result<UploadResult> {
+        let folders = self.resolve_upload_folders(folder, subfolder)?;
+        self.upload_segments(filename, bytes, mime, &folders).await
+    }
+
+    /// Resolve the destination folder segments for an upload, matching what
+    /// approval details display.
+    pub fn resolve_upload_folders(
+        &self,
+        folder: Option<&str>,
+        subfolder: Option<&str>,
+    ) -> Result<Vec<String>> {
+        match (folder, subfolder) {
+            (Some(_), Some(_)) => Err(SeraError::Validation(
+                "provide either folder or subfolder, not both".into(),
+            )),
+            (Some(folder), None) => normalize_browse_folder(Some(folder)),
+            (None, sub) => self.destination_folders(sub),
+        }
+    }
+
+    async fn upload_segments(
+        &mut self,
+        filename: &str,
+        bytes: Vec<u8>,
+        mime: &str,
+        folders: &[String],
+    ) -> Result<UploadResult> {
         let filename = safe_filename(filename)?;
         let mime = validate_mime(mime)?;
         if bytes.len() > MAX_UPLOAD_BYTES {
@@ -483,14 +768,12 @@ impl OneDriveClient {
             )));
         }
 
-        let folders = self.destination_folders(subfolder)?;
-
-        self.ensure_folder(&folders).await?;
+        self.ensure_folder(folders).await?;
 
         if bytes.len() < SMALL_UPLOAD_LIMIT {
-            self.upload_single(&folders, &filename, mime, bytes).await
+            self.upload_single(folders, &filename, mime, bytes).await
         } else {
-            self.upload_chunked(&folders, &filename, &bytes).await
+            self.upload_chunked(folders, &filename, &bytes).await
         }
     }
 
@@ -853,6 +1136,7 @@ impl OneDriveClient {
             match self.http.get(url).bearer_auth(token).send().await {
                 Ok(response)
                     if response.status().is_success()
+                        || response.status().is_redirection()
                         || response.status() == StatusCode::NOT_FOUND =>
                 {
                     return Ok(response);
@@ -1408,10 +1692,45 @@ struct ListDriveItem {
     size: u64,
     #[serde(default)]
     folder: Option<FolderFacet>,
+    #[serde(default)]
+    last_modified_date_time: Option<String>,
+    #[serde(default)]
+    web_url: Option<String>,
+    #[serde(default)]
+    parent_reference: Option<ParentReference>,
+    #[serde(default)]
+    remote_item: Option<serde::de::IgnoredAny>,
 }
 
 #[derive(Deserialize)]
-struct FolderFacet {}
+#[serde(rename_all = "camelCase")]
+struct DriveItemDetail {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    folder: Option<FolderFacet>,
+    #[serde(default)]
+    file: Option<FileFacet>,
+    #[serde(default)]
+    last_modified_date_time: Option<String>,
+    #[serde(default)]
+    created_date_time: Option<String>,
+    #[serde(default)]
+    web_url: Option<String>,
+    #[serde(default)]
+    parent_reference: Option<ParentReference>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FolderFacet {
+    #[serde(default)]
+    child_count: Option<u64>,
+}
 
 #[derive(Deserialize)]
 struct TokenResponse {
@@ -1465,6 +1784,8 @@ struct ParentReference {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FileFacet {
+    #[serde(default)]
+    mime_type: Option<String>,
     #[serde(default)]
     hashes: Option<FileHashes>,
 }
@@ -1535,12 +1856,11 @@ fn finish_upload(
         name
     };
     let parent_path = parent_reference.and_then(|reference| reference.path);
-    let parent_path = parent_path
-        .as_deref()
-        .map(|path| path.strip_prefix("/drive/root:").unwrap_or(path));
+    let parent_path = parent_path.as_deref().and_then(strip_drive_root_prefix);
     let path = match parent_path {
         Some(path) if !path.is_empty() => format!("{}/{}", path.trim_end_matches('/'), name),
-        _ => display_path(folders, &name),
+        Some(_) => format!("/{name}"),
+        None => display_path(folders, &name),
     };
 
     Ok(UploadResult {
@@ -1741,6 +2061,99 @@ fn is_loopback_host(host: Option<&str>) -> bool {
     .unwrap_or(false)
 }
 
+/// Normalize a browse/upload folder path relative to the drive root.
+///
+/// `None`, `""`, `"/"`, `"."`, or `"root"` resolves to an empty segment vector
+/// (meaning the drive root). Leading/trailing slashes around a real path such as
+/// `"/Documents/Jobs/"` are accepted after trimming outer `/`, while `..`,
+/// internal `//`, backslashes, and control characters are rejected.
+fn normalize_browse_folder(path: Option<&str>) -> Result<Vec<String>> {
+    let Some(raw) = path else {
+        return Ok(Vec::new());
+    };
+    let trimmed = raw.trim();
+    if matches!(trimmed, "" | "/" | "." | "root") {
+        return Ok(Vec::new());
+    }
+    let inner = trimmed.strip_prefix('/').unwrap_or(trimmed);
+    let inner = inner.strip_suffix('/').unwrap_or(inner);
+    if inner.is_empty() || inner == "." || inner == "root" {
+        return Ok(Vec::new());
+    }
+    validate_segments(inner, MAX_BROWSE_DEPTH, "path").map_err(SeraError::Validation)
+}
+
+/// Strip Graph's `/drive/root:` (or `/drives/<id>/root:`) prefix from a
+/// `parentReference.path`, yielding a drive-root path like `"/Documents/Jobs"`
+/// or `""` for the root itself.
+fn strip_drive_root_prefix(raw: &str) -> Option<&str> {
+    if let Some(rest) = raw.strip_prefix("/drive/root:") {
+        Some(rest)
+    } else if raw == "/drive/root" {
+        Some("")
+    } else if let Some(after) = raw.strip_prefix("/drives/")
+        && let Some((_, rest)) = after.split_once("/root:")
+    {
+        Some(rest)
+    } else {
+        raw.strip_prefix("/drives/")
+            .and_then(|after| after.ends_with("/root").then_some(""))
+    }
+}
+
+/// Whether `parent_reference.path` points inside the user's own drive rather
+/// than a foreign shared drive (`/drives/<other>/root...`).
+fn is_own_drive_parent_path(raw: &str) -> bool {
+    raw == "/drive/root" || raw.starts_with("/drive/root:")
+}
+
+/// Build a drive-root display path such as `"/Documents/Jobs/cv.pdf"` from
+/// Graph's `parentReference.path` and `name`, falling back to `fallback_parent`.
+fn item_path_from_ref(
+    parent_ref: Option<&ParentReference>,
+    name: &str,
+    fallback_parent: &str,
+) -> String {
+    let parent = parent_ref
+        .and_then(|reference| reference.path.as_deref())
+        .and_then(strip_drive_root_prefix)
+        .unwrap_or(fallback_parent);
+    let base = parent.trim_end_matches('/');
+    if base.is_empty() {
+        format!("/{name}")
+    } else {
+        format!("{base}/{name}")
+    }
+}
+
+fn validate_search_query(query: &str) -> Result<String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err(SeraError::Validation(
+            "search query must not be empty".into(),
+        ));
+    }
+    if query.chars().count() > 200 {
+        return Err(SeraError::Validation(
+            "search query must be at most 200 characters".into(),
+        ));
+    }
+    if query.chars().any(char::is_control) {
+        return Err(SeraError::Validation(
+            "search query contains unsupported control characters".into(),
+        ));
+    }
+    Ok(query.to_owned())
+}
+
+/// Escape an OData single-quoted string literal (single quotes doubled) and
+/// percent-encode all non-unreserved bytes for safe inclusion inside
+/// `search(q='...')`.
+fn escape_odata_string(query: &str) -> String {
+    let doubled = query.replace('\'', "''");
+    encode_segment(&doubled)
+}
+
 /// Validate a relative folder path, returning its segments.
 fn validate_segments(
     value: &str,
@@ -1870,16 +2283,28 @@ fn encode_path(segments: &[String]) -> String {
 }
 
 fn encode_file_path(segments: &[String], filename: &str) -> String {
-    format!("{}/{}", encode_path(segments), encode_segment(filename))
+    if segments.is_empty() {
+        encode_segment(filename)
+    } else {
+        format!("{}/{}", encode_path(segments), encode_segment(filename))
+    }
 }
 
 /// Human-readable destination path for logs and results (not URL-encoded).
-fn display_path(folders: &[String], filename: &str) -> String {
-    format!("/{}/{}", folders.join("/"), filename)
+pub fn display_path(folders: &[String], filename: &str) -> String {
+    if folders.is_empty() {
+        format!("/{filename}")
+    } else {
+        format!("/{}/{}", folders.join("/"), filename)
+    }
 }
 
-fn display_folder_path(folders: &[String]) -> String {
-    format!("/{}", folders.join("/"))
+pub fn display_folder_path(folders: &[String]) -> String {
+    if folders.is_empty() {
+        "/".to_owned()
+    } else {
+        format!("/{}", folders.join("/"))
+    }
 }
 
 /// Graph pagination links must stay on the configured Graph host.
@@ -2179,6 +2604,371 @@ mod tests {
         let missing_res = client.list_folder(Some("Missing"), 5).await.unwrap();
         assert!(missing_res.items.is_empty());
         assert!(!missing_res.truncated);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn list_path_browses_root_and_nested_drive_paths_with_metadata() {
+        let server = MockServer::start().await;
+        mount_token(&server, "access-1", None, 3600).await;
+
+        let next_page = format!(
+            "{}/v1.0/me/drive/root/children?$skiptoken=page2",
+            server.uri()
+        );
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/drive/root/children"))
+            .and(query_param("$top", "200"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "value": [
+                    {
+                        "id": "root-docs",
+                        "name": "Documents",
+                        "folder": { "childCount": 4 },
+                        "lastModifiedDateTime": "2026-11-20T09:00:00Z",
+                        "webUrl": "https://contoso.example/drive/Documents"
+                    }
+                ],
+                "@odata.nextLink": next_page
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/drive/root/children"))
+            .and(query_param("$skiptoken", "page2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "value": [
+                    {
+                        "id": "root-note",
+                        "name": "notes.txt",
+                        "size": 18,
+                        "file": {},
+                        "lastModifiedDateTime": "2026-11-21T08:30:00Z"
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/drive/root:/Documents/Jobs:/children"))
+            .and(query_param("$top", "200"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "value": [
+                    {
+                        "id": "cv-1",
+                        "name": "cv.pdf",
+                        "size": 2048,
+                        "file": {},
+                        "parentReference": { "path": "/drive/root:/Documents/Jobs" },
+                        "lastModifiedDateTime": "2026-11-19T12:00:00Z",
+                        "webUrl": "https://contoso.example/drive/Documents/Jobs/cv.pdf"
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server);
+        let root_res = client.list_path(None, 5).await.unwrap();
+        assert_eq!(root_res.items.len(), 2);
+        assert!(!root_res.truncated);
+        assert_eq!(root_res.items[0].path, "/Documents");
+        assert!(root_res.items[0].folder);
+        assert_eq!(root_res.items[0].child_count, Some(4));
+        assert_eq!(
+            root_res.items[0].last_modified.as_deref(),
+            Some("2026-11-20T09:00:00Z")
+        );
+        assert_eq!(
+            root_res.items[0].web_url.as_deref(),
+            Some("https://contoso.example/drive/Documents")
+        );
+        assert_eq!(root_res.items[1].path, "/notes.txt");
+
+        let nested = client.list_path(Some("/Documents/Jobs/"), 5).await.unwrap();
+        assert_eq!(nested.items.len(), 1);
+        assert_eq!(nested.items[0].path, "/Documents/Jobs/cv.pdf");
+        assert_eq!(nested.items[0].size, 2048);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn browse_and_download_reject_traversal_and_excess_depth() {
+        let server = MockServer::start().await;
+        let mut client = test_client(&server);
+
+        let too_deep_folder = (1..=13)
+            .map(|n| format!("d{n}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        for bad in ["../secret", "Documents/../secret", &too_deep_folder] {
+            assert!(
+                client.list_path(Some(bad), 5).await.is_err(),
+                "accepted {bad}"
+            );
+            assert!(client.item_info(bad).await.is_err(), "accepted {bad}");
+            assert!(
+                client
+                    .upload_to_folder("out.txt", b"hi".to_vec(), "text/plain", Some(bad), None)
+                    .await
+                    .is_err(),
+                "accepted {bad}"
+            );
+        }
+
+        let too_deep_file = format!("{too_deep_folder}/file.txt");
+        assert!(client.download(&too_deep_file, 1024).await.is_err());
+        assert!(
+            client
+                .download("Documents/../secret.txt", 1024)
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .upload_to_folder(
+                    "out.txt",
+                    b"hi".to_vec(),
+                    "text/plain",
+                    Some("Documents"),
+                    Some("Sub")
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn search_escapes_odata_maps_paths_and_filters_remote_items() {
+        let server = MockServer::start().await;
+        mount_token(&server, "access-1", None, 3600).await;
+
+        let next_page = format!("{}/v1.0/me/drive/root/search?$skiptoken=2", server.uri());
+        Mock::given(method("GET"))
+            .and(path(
+                "/v1.0/me/drive/root/search(q='O%27%27Brien%20%26%20Q1')",
+            ))
+            .and(query_param("$top", "3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "value": [
+                    {
+                        "id": "own-1",
+                        "name": "Q1 report.pdf",
+                        "size": 1024,
+                        "file": {},
+                        "parentReference": { "path": "/drive/root:/Documents/Finance" },
+                        "lastModifiedDateTime": "2026-11-18T10:00:00Z",
+                        "webUrl": "https://contoso.example/drive/Documents/Finance/Q1"
+                    },
+                    {
+                        "id": "shared-remote",
+                        "name": "Shared.pdf",
+                        "size": 500,
+                        "remoteItem": { "id": "rem-1" },
+                        "parentReference": { "path": "/drives/other-drive/root:/Shared" }
+                    },
+                    {
+                        "id": "foreign-drive",
+                        "name": "External.xlsx",
+                        "size": 900,
+                        "file": {},
+                        "parentReference": { "path": "/drives/foreign/root:/Team" }
+                    }
+                ],
+                "@odata.nextLink": next_page
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/drive/root/search"))
+            .and(query_param("$skiptoken", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "value": [
+                    {
+                        "id": "own-2",
+                        "name": "Budget",
+                        "folder": { "childCount": 2 },
+                        "parentReference": { "path": "/drive/root:" }
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server);
+        assert!(client.search("   ", 10).await.is_err());
+
+        let result = client.search("O'Brien & Q1", 3).await.unwrap();
+        assert_eq!(result.items.len(), 2);
+        assert!(!result.truncated);
+        assert_eq!(result.items[0].name, "Q1 report.pdf");
+        assert_eq!(result.items[0].path, "/Documents/Finance/Q1 report.pdf");
+        assert_eq!(result.items[1].name, "Budget");
+        assert_eq!(result.items[1].path, "/Budget");
+        assert_eq!(result.items[1].child_count, Some(2));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn recent_filters_to_own_drive_and_respects_limit() {
+        let server = MockServer::start().await;
+        mount_token(&server, "access-1", None, 3600).await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/drive/recent"))
+            .and(query_param("$top", "5"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "value": [
+                    {
+                        "id": "rec-1",
+                        "name": "tracker.xlsx",
+                        "size": 4096,
+                        "file": {},
+                        "parentReference": { "path": "/drive/root:/Documents/Jobs" },
+                        "lastModifiedDateTime": "2026-11-21T07:00:00Z"
+                    },
+                    {
+                        "id": "rec-remote",
+                        "name": "SharedDeck.pptx",
+                        "size": 8192,
+                        "remoteItem": { "id": "rem-2" },
+                        "parentReference": { "path": "/drive/root:/Shared" }
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server);
+        let result = client.recent(5).await.unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert!(!result.truncated);
+        assert_eq!(result.items[0].path, "/Documents/Jobs/tracker.xlsx");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn item_info_returns_metadata_and_handles_root_and_not_found() {
+        let server = MockServer::start().await;
+        mount_token(&server, "access-1", None, 3600).await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/drive/root:/Documents/cv.pdf"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "file-9",
+                "name": "cv.pdf",
+                "size": 12345,
+                "createdDateTime": "2026-11-01T10:00:00Z",
+                "lastModifiedDateTime": "2026-11-20T11:00:00Z",
+                "webUrl": "https://contoso.example/drive/Documents/cv.pdf",
+                "parentReference": { "path": "/drive/root:/Documents" },
+                "file": {
+                    "mimeType": "application/pdf",
+                    "hashes": { "sha256Hash": "ABCD1234" }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/drive/root"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "root-id",
+                "name": "root",
+                "size": 0,
+                "folder": { "childCount": 6 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/drive/root:/Missing.pdf"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server);
+        let file_info = client.item_info("Documents/cv.pdf").await.unwrap();
+        assert_eq!(file_info.path, "/Documents/cv.pdf");
+        assert_eq!(file_info.mime_type.as_deref(), Some("application/pdf"));
+        assert_eq!(file_info.sha256.as_deref(), Some("ABCD1234"));
+        assert_eq!(
+            file_info.created_at.as_deref(),
+            Some("2026-11-01T10:00:00Z")
+        );
+
+        let root_info = client.item_info("/").await.unwrap();
+        assert!(root_info.folder);
+        assert_eq!(root_info.path, "/");
+        assert_eq!(root_info.child_count, Some(6));
+
+        assert!(matches!(
+            client.item_info("Missing.pdf").await,
+            Err(SeraError::NotFound(_))
+        ));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn upload_to_folder_targets_drive_root_paths() {
+        let server = MockServer::start().await;
+        mount_token(&server, "access-1", None, 3600).await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/drive/root:/Documents/Jobs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "jobs-dir",
+                "name": "Jobs",
+                "folder": {}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bytes = b"cover letter text".to_vec();
+        let sha256 = sha256_hex(&bytes);
+        Mock::given(method("PUT"))
+            .and(path(
+                "/v1.0/me/drive/root:/Documents/Jobs/letter.txt:/content",
+            ))
+            .and(query_param("@microsoft.graph.conflictBehavior", "rename"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id": "up-1",
+                "name": "letter.txt",
+                "size": bytes.len(),
+                "webUrl": "https://contoso.example/drive/Documents/Jobs/letter.txt",
+                "parentReference": { "path": "/drive/root:/Documents/Jobs" },
+                "file": { "hashes": { "sha256Hash": sha256 } }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut client = test_client(&server);
+        let result = client
+            .upload_to_folder(
+                "letter.txt",
+                bytes.clone(),
+                "text/plain",
+                Some("Documents/Jobs"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.path, "/Documents/Jobs/letter.txt");
+        assert_eq!(result.size, bytes.len() as u64);
         server.verify().await;
     }
 

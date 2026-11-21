@@ -474,6 +474,13 @@ impl ChromiumBackend {
         let tabs: SharedTabs = Arc::default();
         // Subscribe before enabling Fetch so no paused request is missed.
         let events = spawn_event_loop(cdp.clone(), tabs.clone(), outline, heavy);
+        let _ = cdp
+            .call(
+                None,
+                "Browser.setDownloadBehavior",
+                json!({"behavior": "deny"}),
+            )
+            .await;
         if let Err(error) = Self::attach_tab(&cdp, &tabs, &target_id).await {
             events.abort();
             return Err(error);
@@ -526,12 +533,6 @@ impl ChromiumBackend {
         let sid = Some(session_id);
         cdp.call(None, "Target.setDiscoverTargets", json!({"discover": true}))
             .await?;
-        cdp.call(
-            None,
-            "Browser.setDownloadBehavior",
-            json!({"behavior": "deny"}),
-        )
-        .await?;
         for method in ["Page.enable", "DOM.enable", "Accessibility.enable"] {
             cdp.call(sid, method, json!({})).await?;
         }
@@ -1133,6 +1134,12 @@ impl BrowserBackend for ChromiumBackend {
         max_bytes: u64,
     ) -> Result<Download> {
         self.do_download(reference, timeout, max_bytes).await
+    }
+    async fn download_url(&self, url: &str, timeout: Duration, max_bytes: u64) -> Result<Download> {
+        self.do_download_url(url, timeout, max_bytes).await
+    }
+    async fn download_current(&self, timeout: Duration, max_bytes: u64) -> Result<Download> {
+        self.do_download_current(timeout, max_bytes).await
     }
     async fn print_pdf(&self, max_bytes: usize) -> Result<Vec<u8>> {
         self.do_pdf(max_bytes).await

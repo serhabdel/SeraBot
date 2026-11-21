@@ -11,11 +11,11 @@ use chrono::Utc;
 use serde_json::{Value, json};
 
 use super::banners;
-use super::chromium::actions::clean_download_name;
-use super::guard::host_of;
-use super::manager::{Driver, LoadState};
+use super::chromium::actions::{clean_download_name, resolve_mime};
+use super::guard::{host_of, validate_navigation_url, validate_resolved};
+use super::manager::{Driver, Lease, LoadState};
 use super::outline::find_in_outline;
-use super::tools::{BrowserToolDeps, opt_str, page_lines, str_arg, text_output};
+use super::tools::{BrowserToolDeps, UNTRUSTED_BANNER, opt_str, page_lines, str_arg, text_output};
 use crate::domain::Language;
 use crate::error::{Result, SeraError};
 use crate::gateway::{ApprovalDetails, Tool, ToolContext, ToolOutput, ToolSpec};
@@ -29,6 +29,7 @@ const MAX_WAIT_SECS: u64 = 30;
 const FIND_LIMIT: usize = 20;
 const MAX_ARG_CHARS: usize = 200;
 const SCROLL_MAX_PIXELS: f64 = 20_000.0;
+const PDF_PREVIEW_CHARS: usize = 1500;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -103,10 +104,103 @@ fn ref_arg(args: &Value, key: &str) -> Result<String> {
     Ok(value.to_owned())
 }
 
+enum DownloadTarget {
+    Ref(String),
+    Url(String),
+    Current,
+}
+
+fn parse_download_target(args: &Value) -> Result<DownloadTarget> {
+    let reference = opt_str(args, "ref")
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let url = opt_str(args, "url")
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let current = match args.get("current") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => {
+            return Err(SeraError::Validation("current must be a boolean".into()));
+        }
+    };
+    let modes =
+        usize::from(reference.is_some()) + usize::from(url.is_some()) + usize::from(current);
+    if modes != 1 {
+        return Err(SeraError::Validation(
+            "give exactly one of ref, url, or current=true".into(),
+        ));
+    }
+    if let Some(reference) = reference {
+        super::outline::parse_ref(reference)?;
+        Ok(DownloadTarget::Ref(reference.to_owned()))
+    } else if let Some(url) = url {
+        validate_navigation_url(url)?;
+        Ok(DownloadTarget::Url(url.to_owned()))
+    } else {
+        Ok(DownloadTarget::Current)
+    }
+}
+
+fn next_tool_hint(filename: &str, mime: &str, hash: &str) -> String {
+    let ext = std::path::Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if ext == "pdf" || mime == "application/pdf" {
+        format!(
+            "Next: inspect pages and safety with pdf_inspect{{artifact: \"{hash}\"}}, or index it for cited search with document_index."
+        )
+    } else if ext == "docx"
+        || mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    {
+        format!(
+            "Next: open and read it with docx_import{{artifact: \"{hash}\"}} (then docx_read / docx_inspect)."
+        )
+    } else if ext == "xlsx"
+        || ext == "csv"
+        || mime == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        || mime == "text/csv"
+    {
+        format!(
+            "Next: open and analyze it with xlsx_import{{artifact: \"{hash}\"}} (then xlsx_read / xlsx_analyze)."
+        )
+    } else if ext == "pptx"
+        || mime == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    {
+        format!(
+            "Next: inspect it with pptx_inspect{{artifact: \"{hash}\"}} or pptx_import{{artifact: \"{hash}\"}}."
+        )
+    } else {
+        format!(
+            "Next: use artifact \"{hash}\" with a matching document tool or send it with telegram_send_document."
+        )
+    }
+}
+
+fn pdf_first_page_preview(bytes: &[u8], max_chars: usize) -> Option<String> {
+    let (pages, _) = crate::documents::extract_pdf_page_texts_bounded(bytes, 1, |_| true).ok()?;
+    let first = pages.into_iter().next()?.1;
+    let collapsed = first.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let truncated = truncate_chars(trimmed, max_chars);
+    if trimmed.chars().count() > max_chars {
+        Some(format!("{truncated}..."))
+    } else {
+        Some(truncated)
+    }
+}
+
 fn save_artifact(
     deps: &BrowserToolDeps,
+    lease: &Lease,
     bytes: &[u8],
     filename: &str,
+    mime_hint: Option<&str>,
     what: &str,
 ) -> Result<ToolOutput> {
     let store = deps
@@ -124,13 +218,34 @@ fn save_artifact(
             created_at: Utc::now(),
         },
     )?;
+    let mime = resolve_mime(mime_hint, &stored.filename, bytes);
+    let hint = next_tool_hint(&stored.filename, &mime, &stored.hash);
+    let mut content = format!(
+        "Saved as artifact {} ({} bytes, mime: {}, artifact_hash: {}).\n{}",
+        stored.filename,
+        bytes.len(),
+        mime,
+        stored.hash,
+        hint
+    );
+    if (mime == "application/pdf" || bytes.starts_with(b"%PDF"))
+        && let Some(preview) = pdf_first_page_preview(bytes, PDF_PREVIEW_CHARS)
+    {
+        let safe_preview = lease.redact(&preview);
+        if deps.policy.is_allowed(&safe_preview) {
+            content.push_str(&format!(
+                "\n\n{UNTRUSTED_BANNER}\nFirst page text preview:\n{safe_preview}"
+            ));
+        }
+    }
     Ok(ToolOutput {
-        content: format!(
-            "Saved as artifact {} ({} bytes). The file content is not shown to you.",
-            stored.filename,
-            bytes.len()
-        ),
-        data: Some(json!({"bytes": bytes.len(), "filename": stored.filename})),
+        content,
+        data: Some(json!({
+            "bytes": bytes.len(),
+            "filename": stored.filename,
+            "mime": mime,
+            "artifact_hash": stored.hash,
+        })),
         artifact_path: Some(format!("artifacts/{}", stored.filename)),
         artifact_hash: Some(stored.hash),
         filename: Some(stored.filename),
@@ -270,15 +385,17 @@ impl Tool for ExtTool {
                 true,
             ),
             Kind::Download => (
-                "Click a link or button that starts a file download, wait for it (at most 30 seconds, files up to 25 MB) and save it as an artifact for the owner.",
+                "Download a file (at most 30 seconds, up to 25 MB) into an artifact for the owner and return its hash and next reading tool. Give exactly one of: ref (click a link/button, also saves PDFs that open in a viewer), url (fetch a public http(s) URL in the current browser session with cookies), or current=true (save the PDF/document currently open in the active tab).",
                 json!({"type":"object","properties":{
                     "ref":reference,
+                    "url":{"type":"string","maxLength":2048},
+                    "current":{"type":"boolean"},
                     "timeout_secs":{"type":"integer","minimum":1,"maximum":MAX_WAIT_SECS}
-                },"required":["ref"],"additionalProperties":false}),
+                },"additionalProperties":false}),
                 true,
             ),
             Kind::Pdf => (
-                "Save the current page as a PDF artifact for the owner. The PDF is not returned to you.",
+                "Save the current page as a PDF artifact for the owner, returning its artifact hash and a short preview if text is extractable (use pdf_inspect on the hash for page details).",
                 json!({"type":"object","properties":{},"additionalProperties":false}),
                 false,
             ),
@@ -322,6 +439,26 @@ impl Tool for ExtTool {
                     artifact_hash: str_arg(args, "artifact").ok().map(str::to_owned),
                 })
             }
+            Kind::Download => match parse_download_target(args)? {
+                DownloadTarget::Ref(reference) => Ok(ApprovalDetails {
+                    summary: format!(
+                        "Download file from {} in the server browser",
+                        truncate_chars(&reference, 16)
+                    ),
+                    destination: None,
+                    artifact_hash: None,
+                }),
+                DownloadTarget::Url(url) => Ok(ApprovalDetails {
+                    summary: format!("Download {url} in the server browser"),
+                    destination: Some(url),
+                    artifact_hash: None,
+                }),
+                DownloadTarget::Current => Ok(ApprovalDetails {
+                    summary: "Save the current browser document as an artifact".into(),
+                    destination: None,
+                    artifact_hash: None,
+                }),
+            },
             _ => Ok(ApprovalDetails::default()),
         }
     }
@@ -649,11 +786,24 @@ impl Tool for ExtTool {
                 ))
             }
             Kind::Download => {
-                let reference = ref_arg(&args, "ref")?;
+                let target = parse_download_target(&args)?;
                 let limit = Duration::from_secs(timeout_secs(&args, 15)?);
-                let file = backend
-                    .click_download(&reference, limit, MAX_FILE_BYTES)
-                    .await?;
+                let file = match target {
+                    DownloadTarget::Ref(reference) => {
+                        backend
+                            .click_download(&reference, limit, MAX_FILE_BYTES)
+                            .await?
+                    }
+                    DownloadTarget::Url(url) => {
+                        let resolved = validate_resolved(&url).await?;
+                        backend
+                            .download_url(resolved.as_str(), limit, MAX_FILE_BYTES)
+                            .await?
+                    }
+                    DownloadTarget::Current => {
+                        backend.download_current(limit, MAX_FILE_BYTES).await?
+                    }
+                };
                 if file.bytes.is_empty() {
                     return Err(SeraError::Validation("the downloaded file is empty".into()));
                 }
@@ -661,12 +811,26 @@ impl Tool for ExtTool {
                 if !self.deps.policy.is_allowed(&filename) {
                     return Err(SeraError::PolicyViolation);
                 }
-                save_artifact(&self.deps, &file.bytes, &filename, "downloads")
+                save_artifact(
+                    &self.deps,
+                    &lease,
+                    &file.bytes,
+                    &filename,
+                    Some(&file.mime),
+                    "downloads",
+                )
             }
             Kind::Pdf => {
                 let bytes = backend.print_pdf(MAX_FILE_BYTES as usize).await?;
                 let filename = format!("page-{}.pdf", Utc::now().format("%Y%m%d-%H%M%S"));
-                save_artifact(&self.deps, &bytes, &filename, "PDFs")
+                save_artifact(
+                    &self.deps,
+                    &lease,
+                    &bytes,
+                    &filename,
+                    Some("application/pdf"),
+                    "PDFs",
+                )
             }
             Kind::DismissBanners => {
                 let outcome = banners::dismiss(backend.as_ref(), false).await?;

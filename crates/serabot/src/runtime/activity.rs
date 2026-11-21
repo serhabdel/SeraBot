@@ -497,8 +497,14 @@ pub(super) fn describe_step(tool: &str, args: &Value, bot_label: Option<&str>) -
         "browser_scroll" => ("pointer", "Scrolling the page".into()),
         "browser_hover" => ("pointer", "Hovering over an element".into()),
         "browser_upload" => ("pointer", "Attaching a file to a form".into()),
-        "browser_download" => ("globe", "Downloading a file".into()),
-        "browser_pdf" => ("image", "Saving the page as a PDF".into()),
+        "browser_download" => (
+            "file",
+            host_of(args).map_or_else(
+                || "Downloading a file".into(),
+                |h| format!("Downloading from {h}"),
+            ),
+        ),
+        "browser_pdf" => ("file:pdf", "Saving the page as a PDF".into()),
         "browser_dismiss_banners" => ("pointer", "Closing a cookie banner".into()),
         "browser_forget_logins" => ("key", "Signing out of all sites".into()),
         "browser_tabs" => ("globe", "Checking the browser tabs".into()),
@@ -551,7 +557,10 @@ pub(super) fn describe_step(tool: &str, args: &Value, bot_label: Option<&str>) -
             file_icon_of(args).unwrap_or("file"),
             "Sending a file".into(),
         ),
-        "onedrive_list" => ("file", "Listing files".into()),
+        "onedrive_list" => ("file", "Listing OneDrive files".into()),
+        "onedrive_search" => ("search", "Searching OneDrive".into()),
+        "onedrive_recent" => ("file", "Checking recent OneDrive files".into()),
+        "onedrive_info" => ("file", "Checking OneDrive file info".into()),
         "local_list" => ("file", "Looking at a folder on your PC".into()),
         "local_search" => ("search", "Searching a folder on your PC".into()),
         "local_stat" => (

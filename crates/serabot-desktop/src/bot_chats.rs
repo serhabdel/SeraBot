@@ -301,6 +301,383 @@ pub struct SwitcherEntry {
     pub last_activity: Option<String>,
 }
 
+/// Date bucket used by the chat history popover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HistoryDateGroup {
+    Today,
+    Yesterday,
+    ThisWeek,
+    Older,
+}
+
+impl HistoryDateGroup {
+    pub const ALL: [Self; 4] = [Self::Today, Self::Yesterday, Self::ThisWeek, Self::Older];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Today => "Today",
+            Self::Yesterday => "Yesterday",
+            Self::ThisWeek => "This week",
+            Self::Older => "Older",
+        }
+    }
+}
+
+/// Enriched entry ready to render inside the chat history popover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryEntryView {
+    pub id: String,
+    pub title: String,
+    pub primary: bool,
+    pub active: bool,
+    pub turns: u64,
+    pub last_activity: Option<String>,
+    pub relative_time: String,
+    pub group: HistoryDateGroup,
+}
+
+/// Date-grouped slice of [`HistoryEntryView`] items.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryGroup {
+    pub group: HistoryDateGroup,
+    pub label: &'static str,
+    pub entries: Vec<HistoryEntryView>,
+}
+
+/// Format a turn count concisely (`0 turns`, `1 turn`, `12 turns`).
+pub fn format_turn_count(turns: u64) -> String {
+    if turns == 1 {
+        "1 turn".to_string()
+    } else {
+        format!("{turns} turns")
+    }
+}
+
+fn parse_ymd(stamp: &str) -> Option<(i32, u32, u32)> {
+    let s = stamp.trim();
+    let bytes = s.as_bytes();
+    if bytes.len() < 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    let y: i32 = s[0..4].parse().ok()?;
+    let m: u32 = s[5..7].parse().ok()?;
+    let d: u32 = s[8..10].parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some((y, m, d))
+}
+
+fn civil_days(y: i32, m: u32, d: u32) -> i64 {
+    let y = i64::from(y) - if m <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let m = i64::from(m);
+    let d = i64::from(d);
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Parse an ISO-8601 / RFC-3339 timestamp or `YYYY-MM-DD` date into UTC Unix seconds.
+pub fn parse_timestamp_secs(stamp: &str) -> Option<i64> {
+    let s = stamp.trim();
+    let (y, m, d) = parse_ymd(s)?;
+    let days = civil_days(y, m, d);
+    let rest = s.get(10..).unwrap_or("");
+    if rest.is_empty() {
+        return Some(days * 86_400);
+    }
+    let rest = rest
+        .strip_prefix('T')
+        .or_else(|| rest.strip_prefix('t'))
+        .or_else(|| rest.strip_prefix(' '))?;
+    if rest.len() < 8 {
+        return None;
+    }
+    let rb = rest.as_bytes();
+    if rb[2] != b':' || rb[5] != b':' {
+        return None;
+    }
+    let hh: i64 = rest[0..2].parse().ok()?;
+    let mm: i64 = rest[3..5].parse().ok()?;
+    let ss: i64 = rest[6..8].parse().ok()?;
+    if !(0..=23).contains(&hh) || !(0..=59).contains(&mm) || !(0..=60).contains(&ss) {
+        return None;
+    }
+    let mut after = &rest[8..];
+    if let Some(frac) = after.strip_prefix('.') {
+        let digits = frac.bytes().take_while(|b| b.is_ascii_digit()).count();
+        after = &frac[digits..];
+    }
+    let offset_secs: i64 = if after.is_empty() || after.starts_with('Z') || after.starts_with('z') {
+        0
+    } else if after.starts_with('+') || after.starts_with('-') {
+        let sign = if after.starts_with('+') { 1 } else { -1 };
+        let tz = &after[1..];
+        if tz.len() >= 5 && tz.as_bytes()[2] == b':' {
+            let th: i64 = tz[0..2].parse().ok()?;
+            let tm: i64 = tz[3..5].parse().ok()?;
+            sign * (th * 3600 + tm * 60)
+        } else if tz.len() >= 4 && tz.as_bytes()[0..4].iter().all(|b| b.is_ascii_digit()) {
+            let th: i64 = tz[0..2].parse().ok()?;
+            let tm: i64 = tz[2..4].parse().ok()?;
+            sign * (th * 3600 + tm * 60)
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+    Some(days * 86_400 + hh * 3600 + mm * 60 + ss - offset_secs)
+}
+
+/// Bucket an activity timestamp into `Today`, `Yesterday`, `This week`, or `Older`.
+pub fn history_date_group(ts: &str, today: &str) -> HistoryDateGroup {
+    let Some((ty, tm, td)) = parse_ymd(today) else {
+        return HistoryDateGroup::Older;
+    };
+    let today_days = civil_days(ty, tm, td);
+    let ts_days = if let Some(secs) = parse_timestamp_secs(ts) {
+        secs.div_euclid(86_400)
+    } else if let Some((sy, sm, sd)) = parse_ymd(ts) {
+        civil_days(sy, sm, sd)
+    } else {
+        return HistoryDateGroup::Older;
+    };
+    let diff = today_days - ts_days;
+    if diff <= 0 {
+        HistoryDateGroup::Today
+    } else if diff == 1 {
+        HistoryDateGroup::Yesterday
+    } else if diff <= 6 {
+        HistoryDateGroup::ThisWeek
+    } else {
+        HistoryDateGroup::Older
+    }
+}
+
+/// Format an activity timestamp relative to `now_secs` (`Just now`, `5m ago`, `3h ago`, `2d ago`, `2w ago`, or `YYYY-MM-DD`).
+pub fn format_relative_time(ts: &str, now_secs: u64) -> String {
+    let trimmed = ts.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let Some(ts_secs) = parse_timestamp_secs(trimmed) else {
+        return trimmed.to_string();
+    };
+    let now = i64::try_from(now_secs).unwrap_or(i64::MAX);
+    let delta = now.saturating_sub(ts_secs);
+    if delta < 60 {
+        "Just now".to_string()
+    } else if delta < 3600 {
+        format!("{}m ago", delta / 60)
+    } else if delta < 86_400 {
+        format!("{}h ago", delta / 3600)
+    } else if delta < 86_400 * 7 {
+        format!("{}d ago", delta / 86_400)
+    } else if delta < 86_400 * 28 {
+        format!("{}w ago", delta / (86_400 * 7))
+    } else if let Some(date) = trimmed.get(0..10).filter(|d| parse_ymd(d).is_some()) {
+        date.to_string()
+    } else {
+        format!("{}d ago", delta / 86_400)
+    }
+}
+
+/// Filter `entries` case-insensitively by title, sort newest activity first, and group by date.
+pub fn filter_and_group_switcher_entries(
+    entries: Vec<SwitcherEntry>,
+    query: &str,
+    today: &str,
+    now_secs: u64,
+) -> Vec<HistoryGroup> {
+    let needle = query.trim().to_lowercase();
+    let mut ranked: Vec<(i64, usize, SwitcherEntry)> = entries
+        .into_iter()
+        .enumerate()
+        .filter(|(_, entry)| needle.is_empty() || entry.title.to_lowercase().contains(&needle))
+        .map(|(idx, entry)| {
+            let sort_ts = entry
+                .last_activity
+                .as_deref()
+                .and_then(parse_timestamp_secs)
+                .unwrap_or(i64::MIN);
+            (sort_ts, idx, entry)
+        })
+        .collect();
+
+    ranked.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.2.active.cmp(&a.2.active))
+            .then_with(|| b.2.primary.cmp(&a.2.primary))
+            .then_with(|| a.1.cmp(&b.1))
+    });
+
+    let mut buckets: [Vec<HistoryEntryView>; 4] = Default::default();
+    for (_, _, entry) in ranked {
+        let (group, relative_time) = match entry.last_activity.as_deref() {
+            Some(ts) if !ts.trim().is_empty() => (
+                history_date_group(ts, today),
+                format_relative_time(ts, now_secs),
+            ),
+            _ => (HistoryDateGroup::Older, String::new()),
+        };
+        let slot = match group {
+            HistoryDateGroup::Today => 0,
+            HistoryDateGroup::Yesterday => 1,
+            HistoryDateGroup::ThisWeek => 2,
+            HistoryDateGroup::Older => 3,
+        };
+        buckets[slot].push(HistoryEntryView {
+            id: entry.id,
+            title: entry.title,
+            primary: entry.primary,
+            active: entry.active,
+            turns: entry.turns,
+            last_activity: entry.last_activity,
+            relative_time,
+            group,
+        });
+    }
+
+    HistoryDateGroup::ALL
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, group)| {
+            if buckets[idx].is_empty() {
+                None
+            } else {
+                Some(HistoryGroup {
+                    group,
+                    label: group.label(),
+                    entries: std::mem::take(&mut buckets[idx]),
+                })
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    #[test]
+    fn date_grouping_handles_boundaries_and_year_wraps() {
+        let today = "2026-03-01";
+        assert_eq!(
+            history_date_group("2026-03-01T14:20:00Z", today),
+            HistoryDateGroup::Today
+        );
+        assert_eq!(
+            history_date_group("2026-02-28T23:59:59Z", today),
+            HistoryDateGroup::Yesterday
+        );
+        assert_eq!(
+            history_date_group("2026-02-23T08:00:00Z", today),
+            HistoryDateGroup::ThisWeek
+        );
+        assert_eq!(
+            history_date_group("2026-02-22T23:59:59Z", today),
+            HistoryDateGroup::Older
+        );
+        assert_eq!(
+            history_date_group("2025-12-31T23:00:00Z", "2026-01-01"),
+            HistoryDateGroup::Yesterday
+        );
+        // Timezone offset pushing local late evening into next UTC day
+        assert_eq!(
+            history_date_group("2026-03-01T00:30:00+02:00", today),
+            HistoryDateGroup::Yesterday
+        );
+        assert_eq!(history_date_group("", today), HistoryDateGroup::Older);
+    }
+
+    #[test]
+    fn relative_time_formats_ranges_cleanly() {
+        let now = parse_timestamp_secs("2026-03-10T12:00:00Z").unwrap() as u64;
+        assert_eq!(
+            format_relative_time("2026-03-10T11:59:30Z", now),
+            "Just now"
+        );
+        assert_eq!(format_relative_time("2026-03-10T11:45:00Z", now), "15m ago");
+        assert_eq!(format_relative_time("2026-03-10T09:00:00Z", now), "3h ago");
+        assert_eq!(format_relative_time("2026-03-07T12:00:00Z", now), "3d ago");
+        assert_eq!(format_relative_time("2026-02-24T12:00:00Z", now), "2w ago");
+        assert_eq!(
+            format_relative_time("2026-01-15T12:00:00Z", now),
+            "2026-01-15"
+        );
+        assert_eq!(format_relative_time("", now), "");
+    }
+
+    #[test]
+    fn filter_and_group_sorts_newest_first_and_filters_by_title() {
+        let now = parse_timestamp_secs("2026-03-10T12:00:00Z").unwrap() as u64;
+        let today = "2026-03-10";
+        let entries = vec![
+            SwitcherEntry {
+                id: "older".into(),
+                title: "Older plugin discussion".into(),
+                primary: false,
+                active: false,
+                turns: 3,
+                last_activity: Some("2026-02-01T10:00:00Z".into()),
+            },
+            SwitcherEntry {
+                id: "undated".into(),
+                title: "Main chat".into(),
+                primary: true,
+                active: false,
+                turns: 0,
+                last_activity: None,
+            },
+            SwitcherEntry {
+                id: "today-old".into(),
+                title: "Morning plugins check".into(),
+                primary: false,
+                active: false,
+                turns: 2,
+                last_activity: Some("2026-03-10T08:00:00Z".into()),
+            },
+            SwitcherEntry {
+                id: "today-new".into(),
+                title: "Oki, can we test some plugins".into(),
+                primary: false,
+                active: true,
+                turns: 8,
+                last_activity: Some("2026-03-10T11:50:00Z".into()),
+            },
+            SwitcherEntry {
+                id: "yesterday".into(),
+                title: "Release notes".into(),
+                primary: false,
+                active: false,
+                turns: 1,
+                last_activity: Some("2026-03-09T18:00:00Z".into()),
+            },
+        ];
+
+        let all = filter_and_group_switcher_entries(entries.clone(), "", today, now);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].group, HistoryDateGroup::Today);
+        assert_eq!(all[0].entries[0].id, "today-new");
+        assert_eq!(all[0].entries[0].relative_time, "10m ago");
+        assert_eq!(all[0].entries[1].id, "today-old");
+        assert_eq!(all[1].group, HistoryDateGroup::Yesterday);
+        assert_eq!(all[2].group, HistoryDateGroup::Older);
+        assert_eq!(all[2].entries[0].id, "older");
+        assert_eq!(all[2].entries[1].id, "undated");
+
+        let filtered = filter_and_group_switcher_entries(entries, "  PLUGINS ", today, now);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].group, HistoryDateGroup::Today);
+        assert_eq!(filtered[0].entries.len(), 2);
+        assert_eq!(format_turn_count(1), "1 turn");
+        assert_eq!(format_turn_count(8), "8 turns");
+    }
+}
+
 /// The chats to offer in the header switcher: the main chat first, then the
 /// others by recent activity. The main chat is always listed, even before the
 /// list has loaded, so the switcher is never empty and a bot with a single chat

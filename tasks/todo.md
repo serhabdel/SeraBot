@@ -385,3 +385,15 @@ never merge without the owner's OK.
 - [x] `docs/specs/lsp-workspace.md` (proposed; owner approval needed before 0.75 code).
 - [x] Version bump 0.74.0, release notes.
 - [ ] Owner: open a project on Windows, edit + save a file, run checks, click a problem to its line.
+
+## Release 0.74.1 — OneDrive full drive + skill, browser PDF downloads, mail connector (SMTP/IMAP), UI redesigns & README
+
+- [x] Release batch rule added to `AGENTS.md` (0.74.1, 0.74.2, … patch batches until owner is satisfied).
+- [x] OneDrive (`onedrive.rs`, `maker.rs`, `skills/onedrive/SKILL.md`, `bots/*.toml`): drive-root `onedrive_list` (`path`), `onedrive_search`, `onedrive_recent`, `onedrive_info`, `onedrive_download` reader hints, approval-gated `onedrive_upload` to drive-root `folder` or dossier `subfolder`, `OneDrive connection` skill, and read tools on `main`, `analyst`, `researcher`, `maker`, `jobfinder`.
+- [x] Browser downloads (`browser/chromium/actions.rs`, `browser/tools_ext.rs`, `docs/browser-downloads.md`): CDP `Network.loadNetworkResource` + `IO.read` fallback when clicks open Chromium's PDF viewer or a new tab, `url` and `current: true` modes on `browser_download`, reader hints + untrusted-fenced first-page PDF preview.
+- [x] Native SMTP/IMAP mail connector integrated from PR #134 (`crates/serabot/src/mail.rs`, `api/mail.rs`): per-user credentials in `user_secrets` (`mail`), hand-rolled SMTP/IMAP over `tokio-rustls`, `mail_send` (approval-gated), `mail_list`, `mail_read`, `/v1/mail` connect/status/disconnect.
+- [x] Desktop UI redesigns: solid searchable/grouped Conversation history popover + header History button + sidebar Recent chats (`ui/row_menu.rs`, `ui/shell.rs`, `bot_chats.rs`), Workflows page (`ui_workflows.rs`, `workflows.rs`), Projects page (`ui_projects.rs`, `projects.rs`), Memory page (`ui/memory.rs`, `ui_memory_review.rs`).
+- [x] Comprehensive `README.md` update and `docs/release-0.74.1.md`.
+- [ ] Desktop Integrations card for mail connect/status/disconnect.
+- [ ] Owner: live verification on Windows (OneDrive root browse/search/upload, browser PDF download, Hostinger SMTP/IMAP connect/send/read, visual pass on History/Workflows/Projects/Memory).
+

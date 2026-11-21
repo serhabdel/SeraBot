@@ -390,6 +390,300 @@ pub fn matches_workflow_filter(needle: &str, haystacks: &[&str]) -> bool {
         .any(|text| text.to_ascii_lowercase().contains(&needle))
 }
 
+/// Visual status tone for routine, source, and plan badges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkflowStatus {
+    Active,
+    Paused,
+    Failed,
+    Complete,
+}
+
+impl WorkflowStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Active => "Active",
+            Self::Paused => "Paused",
+            Self::Failed => "Failed",
+            Self::Complete => "Complete",
+        }
+    }
+
+    pub fn css_class(self) -> &'static str {
+        match self {
+            Self::Active => "wf-status-pill ok",
+            Self::Paused => "wf-status-pill muted",
+            Self::Failed => "wf-status-pill err",
+            Self::Complete => "wf-status-pill acc",
+        }
+    }
+}
+
+/// Format a routine's daily time and optional timezone in plain words.
+/// Examples: `"Daily at 08:00 · Europe/Paris"`, `"Daily at 07:30"`, `"Unscheduled"`.
+pub fn format_human_schedule(time: Option<&str>, timezone: Option<&str>) -> String {
+    let clean_time = time.map(str::trim).filter(|s| !s.is_empty());
+    let clean_tz = timezone.map(str::trim).filter(|s| !s.is_empty());
+    match (clean_time, clean_tz) {
+        (Some(t), Some(tz)) => format!("Daily at {t} \u{b7} {tz}"),
+        (Some(t), None) => format!("Daily at {t}"),
+        (None, Some(tz)) => format!("Unscheduled \u{b7} {tz}"),
+        (None, None) => "Unscheduled".into(),
+    }
+}
+
+/// Validate a 24-hour `HH:MM` routine time string.
+pub fn is_valid_routine_time(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    let Some((hh, mm)) = trimmed.split_once(':') else {
+        return false;
+    };
+    if hh.len() != 2 || mm.len() != 2 {
+        return false;
+    }
+    let (Ok(h), Ok(m)) = (hh.parse::<u32>(), mm.parse::<u32>()) else {
+        return false;
+    };
+    h < 24 && m < 60
+}
+
+/// Validate an IANA-like timezone string before sending it to the server.
+pub fn is_valid_timezone_name(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    !trimmed.is_empty()
+        && trimmed.chars().count() <= 64
+        && !trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// Human-friendly title for a routine slot (`morning_brief` / `watch_0` -> readable fallback).
+pub fn routine_display_title(routine: &Routine) -> String {
+    if let Some(lbl) = routine
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return lbl.to_owned();
+    }
+    if routine.name == "morning_brief" {
+        return "Morning Brief".into();
+    }
+    if let Some(num) = routine
+        .name
+        .strip_prefix("watch_")
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        return format!("Watch Schedule #{}", num + 1);
+    }
+    routine.name.clone()
+}
+
+/// Human-friendly label for a free slot in the routine creator picker.
+pub fn slot_display_label(slot: &str) -> String {
+    if slot == "morning_brief" {
+        "morning_brief (Daily Morning Brief)".into()
+    } else if let Some(num) = slot
+        .strip_prefix("watch_")
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        format!("{slot} (Watch slot #{})", num + 1)
+    } else {
+        slot.to_owned()
+    }
+}
+
+/// Which bot runs a given routine (`morning_brief` and `watch_*` both run under `watcher` on the server).
+pub fn routine_bot_id(_routine: &Routine) -> &'static str {
+    "watcher"
+}
+
+/// Status badge for a scheduled routine.
+pub fn routine_status(routine: &Routine, sources: &[MonitoringSource]) -> WorkflowStatus {
+    if !routine.enabled {
+        return WorkflowStatus::Paused;
+    }
+    if routine.name != "morning_brief"
+        && sources
+            .iter()
+            .any(|s| s.enabled && s.last_run.as_ref().is_some_and(|r| !r.ok))
+    {
+        return WorkflowStatus::Failed;
+    }
+    WorkflowStatus::Active
+}
+
+/// Status badge for a monitoring source.
+pub fn source_status(source: &MonitoringSource) -> WorkflowStatus {
+    if !source.enabled {
+        return WorkflowStatus::Paused;
+    }
+    if source.last_run.as_ref().is_some_and(|r| !r.ok) {
+        return WorkflowStatus::Failed;
+    }
+    WorkflowStatus::Active
+}
+
+/// Status badge for an active workflow plan.
+pub fn plan_status(plan: &ActiveWorkflow) -> WorkflowStatus {
+    let total = if plan.items.is_empty() {
+        plan.total
+    } else {
+        plan.items.len()
+    };
+    let done = if plan.items.is_empty() {
+        plan.done
+    } else {
+        plan.items.iter().filter(|s| s.done).count()
+    };
+    if total > 0 && done >= total {
+        WorkflowStatus::Complete
+    } else {
+        WorkflowStatus::Active
+    }
+}
+
+/// Summary metrics for the Workflows hero stat tiles.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkflowOverviewStats {
+    pub active_routines: usize,
+    pub total_routines: usize,
+    pub next_run_relative: String,
+    pub next_run_target: String,
+    pub failing_sources: usize,
+    pub healthy_sources: usize,
+    pub total_sources: usize,
+    pub active_plans: usize,
+}
+
+/// Compute hero stat values from the loaded snapshot and current epoch seconds.
+pub fn compute_overview_stats(
+    snapshot: &WorkflowsSnapshot,
+    now_secs: i64,
+) -> WorkflowOverviewStats {
+    let active_routines = snapshot.routines.iter().filter(|r| r.enabled).count();
+    let total_routines = snapshot.routines.len();
+    let failing_sources = snapshot
+        .sources
+        .iter()
+        .filter(|s| s.last_run.as_ref().is_some_and(|r| !r.ok))
+        .count();
+    let healthy_sources = snapshot
+        .sources
+        .iter()
+        .filter(|s| s.enabled && !s.last_run.as_ref().is_some_and(|r| !r.ok))
+        .count();
+    let total_sources = snapshot.sources.len();
+
+    let next_enabled = snapshot
+        .routines
+        .iter()
+        .filter(|r| r.enabled && !r.next_run_at.trim().is_empty())
+        .min_by_key(|r| epoch_secs(&r.next_run_at).unwrap_or(i64::MAX));
+
+    let (next_run_relative, next_run_target) = match next_enabled {
+        Some(r) => (
+            relative_time(&r.next_run_at, now_secs),
+            routine_display_title(r),
+        ),
+        None => ("\u{2014}".into(), "No active schedules".into()),
+    };
+
+    WorkflowOverviewStats {
+        active_routines,
+        total_routines,
+        next_run_relative,
+        next_run_target,
+        failing_sources,
+        healthy_sources,
+        total_sources,
+        active_plans: snapshot.active.len(),
+    }
+}
+
+/// One historical execution record derived from existing API fields
+/// (monitoring source `last_run` snapshots and routine `last_run_for` dates).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkflowHistoryEntry {
+    pub id: String,
+    pub kind_label: &'static str,
+    pub title: String,
+    pub status: WorkflowStatus,
+    pub summary: String,
+    pub when_label: String,
+    pub sort_secs: i64,
+}
+
+/// Collect available execution history entries from the snapshot without inventing server calls.
+pub fn collect_history_entries(
+    snapshot: &WorkflowsSnapshot,
+    now_secs: i64,
+) -> Vec<WorkflowHistoryEntry> {
+    let mut entries = Vec::new();
+    for source in &snapshot.sources {
+        let Some(run) = source.last_run.as_ref() else {
+            continue;
+        };
+        let stamp = run.finished_at.as_deref().or(run.started_at.as_deref());
+        let when_label = stamp
+            .map(|at| relative_time(at, now_secs))
+            .unwrap_or_else(|| "Recorded".into());
+        let sort_secs = stamp.and_then(epoch_secs).unwrap_or(0);
+        let status = if run.ok {
+            WorkflowStatus::Active
+        } else {
+            WorkflowStatus::Failed
+        };
+        let summary = if run.ok {
+            let count = run.items_seen.max(0);
+            format!(
+                "{} {} · {} item{} seen",
+                source.kind.to_ascii_uppercase(),
+                source.name,
+                count,
+                if count == 1 { "" } else { "s" }
+            )
+        } else {
+            run.error
+                .clone()
+                .unwrap_or_else(|| "Watcher check failed".into())
+        };
+        entries.push(WorkflowHistoryEntry {
+            id: format!("src:{}", source.name),
+            kind_label: "Source check",
+            title: source.name.clone(),
+            status,
+            summary,
+            when_label,
+            sort_secs,
+        });
+    }
+    for routine in &snapshot.routines {
+        let Some(last_for) = routine.last_run_for.as_deref() else {
+            continue;
+        };
+        let sort_secs = epoch_secs(&format!("{last_for}T00:00:00Z")).unwrap_or(0);
+        entries.push(WorkflowHistoryEntry {
+            id: format!("rtn:{}", routine.name),
+            kind_label: "Routine",
+            title: routine_display_title(routine),
+            status: if routine.enabled {
+                WorkflowStatus::Complete
+            } else {
+                WorkflowStatus::Paused
+            },
+            summary: format!("Completed occurrence for {last_for}"),
+            when_label: last_for.to_owned(),
+            sort_secs,
+        });
+    }
+    entries.sort_by(|a, b| {
+        b.sort_secs
+            .cmp(&a.sort_secs)
+            .then_with(|| a.title.cmp(&b.title))
+    });
+    entries
+}
+
 /// Kind of stage in a visual workflow node graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkflowNodeKind {
@@ -1076,5 +1370,176 @@ mod tests {
         assert_eq!(plan_graph.nodes[1].badge, "Done");
         assert_eq!(plan_graph.nodes[2].badge, "Pending");
         assert_eq!(plan_graph.nodes[3].title, "Next Action");
+    }
+
+    #[test]
+    fn formats_human_schedules_and_routine_titles() {
+        assert_eq!(
+            format_human_schedule(Some("08:00"), Some("Europe/Paris")),
+            "Daily at 08:00 \u{b7} Europe/Paris"
+        );
+        assert_eq!(format_human_schedule(Some("07:30"), None), "Daily at 07:30");
+        assert_eq!(
+            format_human_schedule(None, Some("UTC")),
+            "Unscheduled \u{b7} UTC"
+        );
+        assert_eq!(format_human_schedule(None, None), "Unscheduled");
+
+        assert!(is_valid_routine_time("08:00"));
+        assert!(is_valid_routine_time("23:59"));
+        assert!(!is_valid_routine_time("8:00"));
+        assert!(!is_valid_routine_time("24:00"));
+        assert!(!is_valid_routine_time("12:60"));
+        assert!(is_valid_timezone_name("Africa/Casablanca"));
+        assert!(!is_valid_timezone_name(""));
+        assert!(!is_valid_timezone_name("Europe / Paris"));
+
+        let brief = Routine {
+            name: "morning_brief".into(),
+            enabled: true,
+            next_run_at: String::new(),
+            last_run_for: None,
+            time: Some("07:30".into()),
+            timezone: None,
+            label: None,
+            prompt: None,
+        };
+        assert_eq!(routine_display_title(&brief), "Morning Brief");
+        assert_eq!(routine_bot_id(&brief), "watcher");
+
+        let watch = Routine {
+            name: "watch_0".into(),
+            enabled: true,
+            next_run_at: String::new(),
+            last_run_for: None,
+            time: None,
+            timezone: None,
+            label: None,
+            prompt: None,
+        };
+        assert_eq!(routine_display_title(&watch), "Watch Schedule #1");
+        assert_eq!(slot_display_label("watch_1"), "watch_1 (Watch slot #2)");
+    }
+
+    #[test]
+    fn maps_workflow_statuses_and_computes_overview_and_history() {
+        let now = epoch_secs("2026-11-10T06:00:00Z").unwrap();
+        let brief = Routine {
+            name: "morning_brief".into(),
+            enabled: true,
+            next_run_at: "2026-11-10T07:00:00Z".into(),
+            last_run_for: Some("2026-11-09".into()),
+            time: Some("07:00".into()),
+            timezone: Some("UTC".into()),
+            label: None,
+            prompt: None,
+        };
+        let watch = Routine {
+            name: "watch_0".into(),
+            enabled: true,
+            next_run_at: "2026-11-10T10:00:00Z".into(),
+            last_run_for: None,
+            time: Some("10:00".into()),
+            timezone: Some("UTC".into()),
+            label: Some("Tenders".into()),
+            prompt: None,
+        };
+        let paused = Routine {
+            name: "watch_1".into(),
+            enabled: false,
+            next_run_at: "2026-11-10T12:00:00Z".into(),
+            last_run_for: None,
+            time: None,
+            timezone: None,
+            label: None,
+            prompt: None,
+        };
+        let failing_src = MonitoringSource {
+            name: "eu-tenders".into(),
+            kind: "rss".into(),
+            enabled: true,
+            url: Some("https://tenders.example.invalid/rss".into()),
+            own: true,
+            last_run: Some(SourceLastRun {
+                ok: false,
+                error: Some("504 timeout".into()),
+                items_seen: 0,
+                started_at: Some("2026-11-10T05:30:00Z".into()),
+                finished_at: Some("2026-11-10T05:31:00Z".into()),
+            }),
+        };
+        let ok_src = MonitoringSource {
+            name: "news".into(),
+            kind: "rss".into(),
+            enabled: true,
+            url: Some("https://news.example.invalid/rss".into()),
+            own: false,
+            last_run: Some(SourceLastRun {
+                ok: true,
+                error: None,
+                items_seen: 4,
+                started_at: None,
+                finished_at: Some("2026-11-10T05:45:00Z".into()),
+            }),
+        };
+        let snap = WorkflowsSnapshot {
+            routines: vec![brief.clone(), watch.clone(), paused.clone()],
+            sources: vec![failing_src.clone(), ok_src.clone()],
+            active: vec![ActiveWorkflow {
+                conversation_id: "conv-1".into(),
+                goal: "Finish audit".into(),
+                done: 1,
+                total: 2,
+                updated_at: Some("2026-11-10T05:00:00Z".into()),
+                items: vec![
+                    WorkflowPlanStep {
+                        title: "Read ledger".into(),
+                        done: true,
+                    },
+                    WorkflowPlanStep {
+                        title: "Draft summary".into(),
+                        done: false,
+                    },
+                ],
+            }],
+            routines_supported: true,
+            sources_supported: true,
+            active_supported: true,
+        };
+
+        assert_eq!(
+            routine_status(&brief, &snap.sources),
+            WorkflowStatus::Active
+        );
+        assert_eq!(
+            routine_status(&watch, &snap.sources),
+            WorkflowStatus::Failed
+        );
+        assert_eq!(
+            routine_status(&paused, &snap.sources),
+            WorkflowStatus::Paused
+        );
+        assert_eq!(source_status(&failing_src), WorkflowStatus::Failed);
+        assert_eq!(source_status(&ok_src), WorkflowStatus::Active);
+        assert_eq!(plan_status(&snap.active[0]), WorkflowStatus::Active);
+
+        let stats = compute_overview_stats(&snap, now);
+        assert_eq!(stats.active_routines, 2);
+        assert_eq!(stats.total_routines, 3);
+        assert_eq!(stats.next_run_relative, "in 1h");
+        assert_eq!(stats.next_run_target, "Morning Brief");
+        assert_eq!(stats.failing_sources, 1);
+        assert_eq!(stats.healthy_sources, 1);
+        assert_eq!(stats.total_sources, 2);
+        assert_eq!(stats.active_plans, 1);
+
+        let history = collect_history_entries(&snap, now);
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].title, "news");
+        assert_eq!(history[0].status, WorkflowStatus::Active);
+        assert_eq!(history[1].title, "eu-tenders");
+        assert_eq!(history[1].status, WorkflowStatus::Failed);
+        assert_eq!(history[2].title, "Morning Brief");
+        assert_eq!(history[2].status, WorkflowStatus::Complete);
     }
 }

@@ -3,7 +3,7 @@ title = "Analyst"
 description = "Reads documents, transcripts, spreadsheets and timesheets, and cites the passage behind every figure."
 trigger = "file"
 system_prompt = "prompts/analyst.txt"
-skills = ["synthesis", "transcript", "xlsx", "docx", "pptx", "timesheets", "ask", "financial-analysis"]
+skills = ["synthesis", "transcript", "xlsx", "docx", "pptx", "timesheets", "ask", "financial-analysis", "onedrive"]
 tools = [
   "local_read_many",
   "local_extract",
@@ -62,6 +62,11 @@ tools = [
   "local_stat",
   "local_read",
   "local_import",
+  "onedrive_list",
+  "onedrive_search",
+  "onedrive_recent",
+  "onedrive_info",
+  "onedrive_download",
   "conversation_library",
   "telegram_send_document",
   "fetch_url",

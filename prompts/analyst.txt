@@ -16,7 +16,8 @@ Document tools (built-in, no external effect):
 - pdf_inspect, pdf_edit, and pdf_merge inspect and change PDF pages.
 - document_index indexes PDF, Word, Excel, text, and Markdown files from the inbox.
 - local_list / local_search / local_stat / local_read: read-only (page big folders with next_cursor; read big files by range; local_import copies a Word/Excel/PowerPoint/PDF/image file into your inbox for the document tools) access to folders the owner allowlisted on their PC (Settings → Local folders in the desktop app, which must be online). You cannot write to the PC. If a call fails because the relay is offline or a folder is not allowlisted, say exactly that and how to fix it.
-- Load the matching skill (xlsx, docx, pptx, synthesis, transcript) before a specialized workflow.
+- OneDrive (read-only when connected): onedrive_list (browse from drive root '/' or any `path`), onedrive_search, onedrive_recent, onedrive_info, and onedrive_download (imports a file up to 25 MB as an artifact hash for xlsx_import/xlsx_read, docx_import/docx_read, pptx_import, pdf_inspect, document_index, or image_inspect). Load the `onedrive` skill when needed; if not connected, tell the owner to connect OneDrive in Integrations/Connectors (never ask for tokens).
+- Load the matching skill (xlsx, docx, pptx, synthesis, transcript, onedrive) before a specialized workflow.
 - Every build, import, and edit returns an artifact hash. Report it exactly; never invent one.
 
 Operations console:

@@ -578,21 +578,188 @@ async fn download_and_pdf_become_artifacts() {
         .await
         .unwrap();
     assert_eq!(file.filename.as_deref(), Some("report.csv"));
-    assert!(file.artifact_hash.is_some());
-    let stored = h
-        .artifacts
-        .load(file.artifact_hash.as_deref().unwrap())
-        .unwrap();
+    let hash = file.artifact_hash.as_deref().unwrap();
+    assert!(file.content.contains("report.csv"));
+    assert!(file.content.contains("text/csv"));
+    assert!(file.content.contains(hash));
+    assert!(file.content.contains("xlsx_import"));
+    let file_data = file.data.as_ref().unwrap();
+    assert_eq!(file_data["artifact_hash"].as_str(), Some(hash));
+    assert_eq!(file_data["mime"].as_str(), Some("text/csv"));
+    let stored = h.artifacts.load(hash).unwrap();
     assert_eq!(stored.bytes, b"downloaded-bytes");
     assert!(!file.content.contains("downloaded-bytes"));
     let pdf = run(&h, "alice", "browser_pdf", json!({})).await.unwrap();
     assert!(pdf.filename.as_deref().unwrap().ends_with(".pdf"));
+    assert!(pdf.content.contains("pdf_inspect"));
+    assert_eq!(
+        pdf.data.as_ref().unwrap()["mime"].as_str(),
+        Some("application/pdf")
+    );
     assert!(matches!(
         run(
             &h,
             "alice",
             "browser_download",
             json!({"ref": "e1", "timeout_secs": 99})
+        )
+        .await,
+        Err(SeraError::Validation(_))
+    ));
+}
+
+#[tokio::test]
+async fn download_url_and_current_modes_validate_targets_and_save_artifacts() {
+    let h = harness(false);
+    open(&h, "alice").await;
+
+    let (doc, page, layer) = printpdf::PdfDocument::new(
+        "Sample PDF",
+        printpdf::Mm(210.0),
+        printpdf::Mm(297.0),
+        "Layer 1",
+    );
+    let font = doc
+        .add_builtin_font(printpdf::BuiltinFont::Helvetica)
+        .unwrap();
+    let long_line = format!("Invoice summary 2026 {}", "word ".repeat(400));
+    doc.get_page(page).get_layer(layer).use_text(
+        &long_line,
+        12.0,
+        printpdf::Mm(20.0),
+        printpdf::Mm(260.0),
+        &font,
+    );
+    let pdf_bytes = doc.save_to_bytes().unwrap();
+
+    h.launcher.set_fake_download(
+        "alice",
+        "statement.pdf",
+        "application/pdf",
+        pdf_bytes.clone(),
+    );
+    let by_url = run(
+        &h,
+        "alice",
+        "browser_download",
+        json!({"url": "https://93.184.216.34/docs/statement.pdf"}),
+    )
+    .await
+    .unwrap();
+    let url_hash = by_url.artifact_hash.as_deref().unwrap();
+    assert_eq!(by_url.filename.as_deref(), Some("statement.pdf"));
+    assert_eq!(
+        by_url.data.as_ref().unwrap()["mime"].as_str(),
+        Some("application/pdf")
+    );
+    assert!(by_url.content.contains("statement.pdf"));
+    assert!(by_url.content.contains(url_hash));
+    assert!(by_url.content.contains("pdf_inspect"));
+    assert!(by_url.content.contains("document_index"));
+    assert!(by_url.content.contains(UNTRUSTED_BANNER));
+    assert!(by_url.content.contains("Invoice summary 2026"));
+    let preview_part = by_url
+        .content
+        .split("First page text preview:\n")
+        .nth(1)
+        .unwrap();
+    // Bounded to ~1500 chars + trailing "...".
+    assert!(preview_part.chars().count() <= PDF_PREVIEW_CHARS + 3);
+    assert_eq!(h.artifacts.load(url_hash).unwrap().bytes, pdf_bytes);
+
+    h.launcher.set_fake_download(
+        "alice",
+        "viewer.pdf",
+        "application/pdf",
+        b"%PDF-1.4 viewer".to_vec(),
+    );
+    let current = run(&h, "alice", "browser_download", json!({"current": true}))
+        .await
+        .unwrap();
+    assert_eq!(current.filename.as_deref(), Some("viewer.pdf"));
+    assert!(current.content.contains("pdf_inspect"));
+
+    // Next-tool guidance for docx as well.
+    h.launcher.set_fake_download(
+        "alice",
+        "brief.docx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        b"PK\x03\x04docx".to_vec(),
+    );
+    let docx = run(
+        &h,
+        "alice",
+        "browser_download",
+        json!({"url": "https://93.184.216.34/brief.docx"}),
+    )
+    .await
+    .unwrap();
+    assert!(docx.content.contains("docx_import"));
+
+    // Target mode validation: must provide exactly one of ref, url, or current=true.
+    for bad in [
+        json!({}),
+        json!({"current": false}),
+        json!({"ref": "e1", "url": "https://93.184.216.34/a.pdf"}),
+        json!({"ref": "e1", "current": true}),
+        json!({"url": "https://93.184.216.34/a.pdf", "current": true}),
+    ] {
+        assert!(
+            matches!(
+                run(&h, "alice", "browser_download", bad.clone()).await,
+                Err(SeraError::Validation(_))
+            ),
+            "expected validation error for {bad}"
+        );
+    }
+
+    // SSRF: url mode must reject loopback, link-local metadata, localhost, and file URLs.
+    for blocked in [
+        "http://127.0.0.1/secret.pdf",
+        "http://169.254.169.254/latest/meta-data",
+        "http://localhost/report.pdf",
+        "file:///etc/passwd",
+    ] {
+        assert!(
+            matches!(
+                run(&h, "alice", "browser_download", json!({"url": blocked})).await,
+                Err(SeraError::Validation(_))
+            ),
+            "expected SSRF validation error for {blocked}"
+        );
+    }
+
+    // Blocklist filename check.
+    h.launcher.set_fake_download(
+        "alice",
+        "forbiddenterm.pdf",
+        "application/pdf",
+        b"%PDF-1.4".to_vec(),
+    );
+    assert!(matches!(
+        run(
+            &h,
+            "alice",
+            "browser_download",
+            json!({"url": "https://93.184.216.34/forbiddenterm.pdf"})
+        )
+        .await,
+        Err(SeraError::PolicyViolation)
+    ));
+
+    // Size limit enforcement.
+    h.launcher.set_fake_download(
+        "alice",
+        "huge.pdf",
+        "application/pdf",
+        vec![b'a'; (MAX_FILE_BYTES as usize) + 1],
+    );
+    assert!(matches!(
+        run(
+            &h,
+            "alice",
+            "browser_download",
+            json!({"url": "https://93.184.216.34/huge.pdf"})
         )
         .await,
         Err(SeraError::Validation(_))

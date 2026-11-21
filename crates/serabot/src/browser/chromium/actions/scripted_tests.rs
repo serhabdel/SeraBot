@@ -19,6 +19,19 @@ struct Page {
     /// Events to emit after a mouse release, and the file to write first.
     on_release: Vec<Value>,
     download_file: Option<Vec<u8>>,
+    /// Main frame URL & MIME returned by `Page.getFrameTree`.
+    frame_url: &'static str,
+    frame_mime: &'static str,
+    /// After a click (`mouseReleased`), switch `frame_url` / `frame_mime` to these values.
+    after_click_url: Option<&'static str>,
+    after_click_mime: Option<&'static str>,
+    clicked_href: &'static str,
+    /// Resource returned by `Network.loadNetworkResource` and streamed through `IO.read`.
+    resource_success: Option<bool>,
+    resource_status: i64,
+    resource_net_error: &'static str,
+    resource_headers: Option<Value>,
+    resource_chunks: Vec<Vec<u8>>,
 }
 
 fn probe_json(page: &Page, point: bool) -> String {
@@ -38,9 +51,10 @@ fn probe_json(page: &Page, point: bool) -> String {
 async fn backend_with(page: Page) -> (ChromiumBackend, CdpLog, std::path::PathBuf) {
     let state = Arc::new(Mutex::new(page));
     let download_path: Arc<Mutex<String>> = Arc::default();
+    let stream_pos: Arc<Mutex<usize>> = Arc::default();
     let handler_state = state.clone();
     let (cdp, log) = scripted_cdp(move |method, params| {
-        let page = handler_state.lock().unwrap();
+        let mut page = handler_state.lock().unwrap();
         let mut events = Vec::new();
         let result = match method {
             "DOM.resolveNode" if page.detached => json!({"__error": "No node with given id"}),
@@ -53,20 +67,25 @@ async fn backend_with(page: Page) -> (ChromiumBackend, CdpLog, std::path::PathBu
             }
             "Runtime.callFunctionOn" => {
                 let function = params["functionDeclaration"].as_str().unwrap_or_default();
-                let value = if function.contains("attached:") {
-                    probe_json(&page, !params["arguments"][0]["value"].is_null())
-                } else if function.contains("checkable") {
-                    json!({"checkable": true, "checked": page.checked, "radio": false}).to_string()
-                } else if function.contains("not_select") {
-                    if params["arguments"][0]["value"] == "Nowhere" {
-                        json!({"error": "no_option", "options": ["Paris", "Lyon"]}).to_string()
-                    } else {
-                        json!({"label": "Paris"}).to_string()
-                    }
+                if function.contains("closest('a')") {
+                    json!({"result": {"type": "string", "value": page.clicked_href}})
                 } else {
-                    "null".to_owned()
-                };
-                json!({"result": {"type": "string", "value": value}})
+                    let value = if function.contains("attached:") {
+                        probe_json(&page, !params["arguments"][0]["value"].is_null())
+                    } else if function.contains("checkable") {
+                        json!({"checkable": true, "checked": page.checked, "radio": false})
+                            .to_string()
+                    } else if function.contains("not_select") {
+                        if params["arguments"][0]["value"] == "Nowhere" {
+                            json!({"error": "no_option", "options": ["Paris", "Lyon"]}).to_string()
+                        } else {
+                            json!({"label": "Paris"}).to_string()
+                        }
+                    } else {
+                        "null".to_owned()
+                    };
+                    json!({"result": {"type": "string", "value": value}})
+                }
             }
             "Browser.setDownloadBehavior" => {
                 if let Some(path) = params["downloadPath"].as_str() {
@@ -82,10 +101,82 @@ async fn backend_with(page: Page) -> (ChromiumBackend, CdpLog, std::path::PathBu
                             std::fs::write(Path::new(&dir).join("guid-1"), bytes).unwrap();
                         }
                     }
+                    if let Some(next_url) = page.after_click_url {
+                        page.frame_url = next_url;
+                    }
+                    if let Some(next_mime) = page.after_click_mime {
+                        page.frame_mime = next_mime;
+                    }
                     events.extend(page.on_release.clone());
                 }
                 json!({})
             }
+            "Page.getFrameTree" => {
+                let url = if page.frame_url.is_empty() {
+                    "https://93.184.216.34/"
+                } else {
+                    page.frame_url
+                };
+                let mime = if page.frame_mime.is_empty() {
+                    "text/html"
+                } else {
+                    page.frame_mime
+                };
+                json!({
+                    "frameTree": {
+                        "frame": {
+                            "id": "FRAME-1",
+                            "url": url,
+                            "mimeType": mime
+                        }
+                    }
+                })
+            }
+            "Network.loadNetworkResource" => {
+                *stream_pos.lock().unwrap() = 0;
+                let ok = page.resource_success.unwrap_or(true);
+                if !ok {
+                    json!({
+                        "resource": {
+                            "success": false,
+                            "httpStatusCode": page.resource_status,
+                            "netErrorName": page.resource_net_error,
+                        }
+                    })
+                } else {
+                    let headers = page
+                        .resource_headers
+                        .clone()
+                        .unwrap_or_else(|| json!({"Content-Type": "application/pdf"}));
+                    json!({
+                        "resource": {
+                            "success": true,
+                            "httpStatusCode": if page.resource_status == 0 { 200 } else { page.resource_status },
+                            "stream": "stream-1",
+                            "headers": headers,
+                        }
+                    })
+                }
+            }
+            "IO.read" => {
+                use base64::Engine;
+                let mut pos = stream_pos.lock().unwrap();
+                let idx = *pos;
+                if idx < page.resource_chunks.len() {
+                    *pos = idx + 1;
+                    let eof = idx + 1 >= page.resource_chunks.len();
+                    let encoded =
+                        base64::engine::general_purpose::STANDARD.encode(&page.resource_chunks[idx]);
+                    json!({
+                        "data": encoded,
+                        "base64Encoded": true,
+                        "eof": eof,
+                    })
+                } else {
+                    json!({"data": "", "base64Encoded": true, "eof": true})
+                }
+            }
+            "IO.close" => json!({}),
             "Page.printToPDF" => {
                 use base64::Engine;
                 json!({"data": base64::engine::general_purpose::STANDARD.encode(b"%PDF-1.4 test")})
@@ -428,4 +519,214 @@ async fn pdf_is_decoded_and_size_capped() {
     let bytes = backend.do_pdf(1024).await.unwrap();
     assert!(bytes.starts_with(b"%PDF"));
     assert!(backend.do_pdf(4).await.is_err());
+}
+
+#[tokio::test]
+async fn click_that_opens_pdf_viewer_falls_back_to_network_resource_stream() {
+    let page = Page {
+        frame_url: "https://93.184.216.34/docs",
+        frame_mime: "text/html",
+        after_click_url: Some("https://93.184.216.34/files/statement"),
+        after_click_mime: Some("application/pdf"),
+        resource_headers: Some(json!({
+            "Content-Type": "application/pdf; charset=binary",
+            "Content-Disposition": "inline; filename=\"Q4 Report.pdf\""
+        })),
+        resource_chunks: vec![b"%PDF-1.4\n".to_vec(), b"hello world".to_vec()],
+        ..Default::default()
+    };
+    let (backend, log, root) = backend_with(page).await;
+    let file = backend
+        .do_download("e1", Duration::from_secs(4), 1024)
+        .await
+        .unwrap();
+    assert_eq!(file.filename, "Q4 Report.pdf");
+    assert_eq!(file.mime, "application/pdf");
+    assert_eq!(file.bytes, b"%PDF-1.4\nhello world");
+    let called = methods(&log);
+    assert!(called.contains(&"Network.loadNetworkResource".to_owned()));
+    assert!(called.contains(&"IO.read".to_owned()));
+    assert!(called.contains(&"IO.close".to_owned()));
+    let behaviours: Vec<_> = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(m, _)| m == "Browser.setDownloadBehavior")
+        .map(|(_, p)| p["behavior"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(behaviours, vec!["allowAndName", "deny"]);
+    assert_eq!(std::fs::read_dir(&root).map(|d| d.count()).unwrap_or(0), 0);
+}
+
+#[tokio::test]
+async fn click_fallback_also_uses_clicked_href_when_viewer_blocks_navigation() {
+    let page = Page {
+        frame_url: "https://93.184.216.34/portal",
+        frame_mime: "text/html",
+        clicked_href: "https://93.184.216.34/download?id=42",
+        resource_headers: Some(json!({
+            "Content-Type": "application/pdf"
+        })),
+        resource_chunks: vec![b"%PDF-1.4 href".to_vec()],
+        ..Default::default()
+    };
+    let (backend, log, _) = backend_with(page).await;
+    let file = backend
+        .do_download("e1", Duration::from_millis(250), 1024)
+        .await
+        .unwrap();
+    assert_eq!(file.filename, "download.pdf");
+    assert_eq!(file.mime, "application/pdf");
+    assert_eq!(file.bytes, b"%PDF-1.4 href");
+    assert!(methods(&log).contains(&"Network.loadNetworkResource".to_owned()));
+}
+
+#[tokio::test]
+async fn download_url_streams_headers_and_enforces_ssrf_size_and_http_errors() {
+    // Success with cookies enabled and filename derived from URL + MIME.
+    let ok_page = Page {
+        resource_headers: Some(json!({"Content-Type": "application/pdf"})),
+        resource_chunks: vec![b"%PDF-".to_vec(), b"1.7 body".to_vec()],
+        ..Default::default()
+    };
+    let (backend, log, _) = backend_with(ok_page).await;
+    let file = backend
+        .do_download_url(
+            "https://93.184.216.34/archive/invoice",
+            Duration::from_secs(5),
+            1024,
+        )
+        .await
+        .unwrap();
+    assert_eq!(file.filename, "invoice.pdf");
+    assert_eq!(file.mime, "application/pdf");
+    assert_eq!(file.bytes, b"%PDF-1.7 body");
+    let load_call = log
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(m, _)| m == "Network.loadNetworkResource")
+        .map(|(_, p)| p.clone())
+        .unwrap();
+    assert_eq!(load_call["frameId"].as_str(), Some("FRAME-1"));
+    assert_eq!(load_call["options"]["includeCredentials"], json!(true));
+
+    // Private/loopback/file URLs must be rejected before calling CDP.
+    for blocked in [
+        "http://127.0.0.1/secret.pdf",
+        "http://169.254.169.254/latest",
+        "file:///etc/passwd",
+    ] {
+        let (backend, log, _) = backend_with(Page::default()).await;
+        let err = backend
+            .do_download_url(blocked, Duration::from_secs(5), 1024)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!err.is_empty());
+        assert!(!methods(&log).contains(&"Network.loadNetworkResource".to_owned()));
+    }
+
+    // Oversized Content-Length header closes stream without reading.
+    let header_big = Page {
+        resource_headers: Some(json!({
+            "Content-Type": "application/pdf",
+            "Content-Length": "5000000"
+        })),
+        ..Default::default()
+    };
+    let (backend, log, _) = backend_with(header_big).await;
+    let err = backend
+        .do_download_url(
+            "https://93.184.216.34/big.pdf",
+            Duration::from_secs(5),
+            1024 * 1024,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("larger than"), "{err}");
+    assert!(methods(&log).contains(&"IO.close".to_owned()));
+    assert!(!methods(&log).contains(&"IO.read".to_owned()));
+
+    // Oversized streamed body closes handle once chunks cross cap.
+    let chunk_big = Page {
+        resource_chunks: vec![vec![b'x'; 700], vec![b'y'; 700]],
+        ..Default::default()
+    };
+    let (backend, log, _) = backend_with(chunk_big).await;
+    let err = backend
+        .do_download_url(
+            "https://93.184.216.34/stream.pdf",
+            Duration::from_secs(5),
+            1024,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("larger than"), "{err}");
+    assert!(methods(&log).contains(&"IO.close".to_owned()));
+
+    // HTTP failure surfaces a validation error.
+    let not_found = Page {
+        resource_success: Some(false),
+        resource_status: 404,
+        ..Default::default()
+    };
+    let (backend, _, _) = backend_with(not_found).await;
+    let err = backend
+        .do_download_url(
+            "https://93.184.216.34/missing.pdf",
+            Duration::from_secs(5),
+            1024,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("404"), "{err}");
+}
+
+#[tokio::test]
+async fn download_current_saves_pdf_viewer_tab_and_rejects_html_or_blank_tabs() {
+    let pdf_tab = Page {
+        frame_url: "https://93.184.216.34/docs/annual.pdf",
+        frame_mime: "application/pdf",
+        resource_headers: Some(json!({"Content-Type": "application/pdf"})),
+        resource_chunks: vec![b"%PDF-1.4 active tab".to_vec()],
+        ..Default::default()
+    };
+    let (backend, _, _) = backend_with(pdf_tab).await;
+    let file = backend
+        .do_download_current(Duration::from_secs(5), 1024)
+        .await
+        .unwrap();
+    assert_eq!(file.filename, "annual.pdf");
+    assert_eq!(file.mime, "application/pdf");
+    assert_eq!(file.bytes, b"%PDF-1.4 active tab");
+
+    let html_tab = Page {
+        frame_url: "https://93.184.216.34/page",
+        frame_mime: "text/html",
+        ..Default::default()
+    };
+    let (backend, _, _) = backend_with(html_tab).await;
+    let err = backend
+        .do_download_current(Duration::from_secs(5), 1024)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not a downloadable document"), "{err}");
+
+    let blank_tab = Page {
+        frame_url: "about:blank",
+        frame_mime: "text/html",
+        ..Default::default()
+    };
+    let (backend, _, _) = backend_with(blank_tab).await;
+    let err = backend
+        .do_download_current(Duration::from_secs(5), 1024)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no document is open"), "{err}");
 }
