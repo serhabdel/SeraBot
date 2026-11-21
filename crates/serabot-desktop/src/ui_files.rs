@@ -80,6 +80,13 @@ if (!window.__serabotPasteBridge) {
 "#;
 
 /// Remembers the composer caret across streaming repaints.
+/// Save the composer's caret before a repaint, so it can be put back after.
+///
+/// The listeners below remember `selectionStart`/`selectionEnd` on every
+/// caret move — typing, selection changes, and focus/clicks that only place
+/// the caret — so the last remembered position is always from before the
+/// next repaint. [`COMPOSER_CARET_BRIDGE_JS`] restores it after the repaint,
+/// but only while the textarea is still focused.
 pub const COMPOSER_CARET_SETUP_JS: &str = r#"
 (function () {
   if (window.__serabotComposerCaret) return;
@@ -96,6 +103,8 @@ pub const COMPOSER_CARET_SETUP_JS: &str = r#"
   };
   document.addEventListener('selectionchange', remember);
   document.addEventListener('input', remember, true);
+  document.addEventListener('focusin', remember);
+  document.addEventListener('click', remember, true);
   document.addEventListener('keydown', (e) => {
     if (e.target && e.target.id === 'composer-input') {
       window.__serabotComposerGen = (window.__serabotComposerGen || 0) + 1;
