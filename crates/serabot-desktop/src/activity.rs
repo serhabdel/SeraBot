@@ -6,6 +6,7 @@
 //! only ever handed back to the existing approvals API.
 
 use serde_json::Value;
+use std::time::Instant;
 
 /// Most steps kept for one turn.
 const MAX_STEPS: usize = 64;
@@ -198,6 +199,21 @@ pub struct Step {
     pub duration_ms: Option<u64>,
     /// Typed cards from `cards` (`docs/tool-results.md`). Empty when absent.
     pub cards: Vec<StepResult>,
+    /// When this step first started running (0.74.3): set on the first
+    /// running event, never moved afterwards, so a running step can show a
+    /// live elapsed time instead of the static word "Running". Client-side
+    /// only; never sent anywhere.
+    pub started_at: Option<Instant>,
+}
+
+impl Step {
+    /// Milliseconds this step has been running, or `None` when it never
+    /// started (or already finished: finished steps show `duration_ms`).
+    pub fn elapsed_ms(&self, now: Instant) -> Option<u64> {
+        self.started_at
+            .filter(|_| self.phase.spinning())
+            .map(|start| now.duration_since(start).as_millis() as u64)
+    }
 }
 
 /// Steps of the most recent turn. Cleared when the owner sends again.
@@ -205,6 +221,10 @@ pub struct Step {
 pub struct Activity {
     pub task_id: String,
     pub steps: Vec<Step>,
+    /// When the current turn's first step event arrived (0.74.3): the
+    /// turn's start for live elapsed times while no single step is running
+    /// (the Thinking card). Client-side only.
+    pub started_at: Option<Instant>,
     /// Steps past `MAX_STEPS` that were counted but not kept.
     pub dropped: usize,
     /// Call ids already counted in `dropped` (a step's later events must not
@@ -265,7 +285,9 @@ impl Activity {
             self.dropped = 0;
             self.dropped_calls.clear();
             self.task_id = task_id;
+            self.started_at = Some(Instant::now());
         }
+        let now = Instant::now();
         let icon = clean(payload, "icon").unwrap_or_else(|| "bolt".into());
         let approval_id = clean(payload, "approval_id");
         let detail = clean_detail(payload, "detail");
@@ -282,6 +304,9 @@ impl Activity {
         let cards = parse_cards(payload.get("cards"));
         if let Some(step) = self.steps.iter_mut().find(|step| step.call_id == call_id) {
             step.phase = phase;
+            if phase.spinning() && step.started_at.is_none() {
+                step.started_at = Some(now);
+            }
             step.label = label;
             step.icon = icon;
             step.detail = detail.or(step.detail.take());
@@ -339,6 +364,11 @@ impl Activity {
                 },
                 duration_ms,
                 cards,
+                started_at: if phase.spinning() {
+                    Some(now)
+                } else {
+                    None
+                },
             });
         }
         true
@@ -349,6 +379,34 @@ impl Activity {
         self.steps
             .iter()
             .find(|step| step.phase == StepPhase::WaitingApproval && step.approval_id.is_some())
+    }
+
+    /// The one step still running (0.74.3): the first spinning step. The
+    /// feed's working line, the LiveCard and the step rows all derive from
+    /// this single step, so there is never a second "working" indicator.
+    pub fn running_step(&self) -> Option<&Step> {
+        self.steps.iter().find(|step| step.phase.spinning())
+    }
+
+    /// Milliseconds the turn has been running, from its first step event.
+    pub fn elapsed_ms(&self, now: Instant) -> Option<u64> {
+        self.started_at
+            .map(|start| now.duration_since(start).as_millis() as u64)
+    }
+
+    /// How long a finished turn took (0.74.3): the sum of the finished
+    /// steps' reported durations when every finished step has one,
+    /// otherwise the live elapsed time from the first step event.
+    pub fn completed_elapsed_ms(&self, now: Instant) -> Option<u64> {
+        self.total_duration_ms().or_else(|| self.elapsed_ms(now))
+    }
+
+    /// Steps that finished successfully.
+    pub fn done_count(&self) -> usize {
+        self.steps
+            .iter()
+            .filter(|step| step.phase == StepPhase::Done)
+            .count()
     }
 
     /// "1 step" / "5 steps, 12s" for the collapsed summary. The time is the
@@ -630,6 +688,40 @@ mod tests {
     fn ev(task: &str, call: &str, phase: &str) -> Value {
         json!({"task_id": task, "call_id": call, "phase": phase,
                "label": "Opening example.com", "icon": "globe"})
+    }
+
+    #[test]
+    fn running_steps_carry_a_start_time_for_live_elapsed() {
+        let mut a = Activity::default();
+        assert!(a.apply("turn.step", &ev("t1", "c1", "running")));
+        let started = a.steps[0].started_at;
+        assert!(started.is_some(), "first running event stamps the step");
+        assert!(a.started_at.is_some(), "first step event stamps the turn");
+        assert!(a.steps[0].elapsed_ms(Instant::now()).is_some());
+        assert_eq!(a.running_step().map(|s| s.call_id.as_str()), Some("c1"));
+        // A later event of the same step does not move its start.
+        assert!(a.apply("turn.step", &ev("t1", "c1", "running")));
+        assert_eq!(a.steps[0].started_at, started);
+        assert!(a.apply("turn.step", &ev("t1", "c1", "done")));
+        assert!(a.steps[0].elapsed_ms(Instant::now()).is_none());
+        assert!(a.running_step().is_none());
+        // A step that arrives already done never gets a start time.
+        assert!(a.apply("turn.step", &ev("t1", "c2", "done")));
+        assert!(a.steps[1].started_at.is_none());
+        // A new task restarts the turn clock.
+        assert!(a.apply("turn.step", &ev("t2", "c9", "running")));
+        assert!(a.started_at.is_some());
+        assert_eq!(a.steps.len(), 1);
+        // Finished durations still sum for the failed-turn line.
+        let mut b = Activity::default();
+        let mut d1 = ev("t1", "c1", "done");
+        d1["duration_ms"] = json!(2_000);
+        let mut d2 = ev("t1", "c2", "done");
+        d2["duration_ms"] = json!(3_000);
+        b.apply("turn.step", &d1);
+        b.apply("turn.step", &d2);
+        assert_eq!(b.completed_elapsed_ms(Instant::now()), Some(5_000));
+        assert_eq!(b.done_count(), 2);
     }
 
     #[test]
