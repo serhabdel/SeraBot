@@ -506,6 +506,56 @@ pub(super) async fn list_conversations(
     })))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ConversationSearchQuery {
+    #[serde(default)]
+    q: String,
+    #[serde(default)]
+    bot: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+pub(super) async fn search_conversations(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Query(query): Query<ConversationSearchQuery>,
+) -> Result<Json<Value>> {
+    if let Some(bot) = query
+        .bot
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        && !safe_bot_label(bot)
+    {
+        return Err(SeraError::Validation("invalid bot id".into()));
+    }
+    let mut hits = state.store.search_conversations(
+        &user.id,
+        &query.q,
+        query.bot.as_deref(),
+        query.limit.unwrap_or(20),
+    )?;
+    for hit in &mut hits {
+        if state
+            .runtime
+            .scan_owner_output(&user.id, &hit.title)
+            .is_err()
+        {
+            hit.title = "[Content withheld by policy]".to_owned();
+        }
+        if state
+            .runtime
+            .scan_owner_output(&user.id, &hit.snippet)
+            .is_err()
+        {
+            hit.snippet = "[Content withheld by policy]".to_owned();
+        }
+    }
+    Ok(Json(json!({ "hits": hits })))
+}
+
 /// Plain-text list preview: whitespace collapsed, control characters and
 /// markdown emphasis marks dropped, at most 120 characters.
 pub(super) fn preview_text(content: &str) -> String {

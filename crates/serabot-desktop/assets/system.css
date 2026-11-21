@@ -1903,3 +1903,28 @@ html[data-reduce-transparency="true"] .sheet.sheet-palette {
     display: none;
   }
 }
+
+.chat-switcher-msg-hits {
+  border-top: 1px solid var(--hairline);
+  padding-top: 6px;
+}
+
+.chat-switcher-snippet {
+  font-size: var(--fs-caption);
+  color: var(--label-2);
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+.chat-switcher-mark {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  border-radius: 3px;
+  padding: 0 2px;
+  font-weight: 600;
+}
+

@@ -313,3 +313,131 @@ async fn history_pages_back_with_a_cursor_and_reports_more() {
     .await;
     assert!(bad.status().is_client_error());
 }
+
+#[tokio::test]
+async fn conversation_search_route_is_uid_scoped_and_filters_by_bot() {
+    let (app, _, store) = app();
+    let alice = store
+        .create_user("subject-search-a", "sa@example.example", "Search Alice")
+        .unwrap();
+    let bob = store
+        .create_user("subject-search-b", "sb@example.example", "Search Bob")
+        .unwrap();
+    let alice_token = mint_for(&store, &alice.id, "search-a");
+    let bob_token = mint_for(&store, &bob.id, "search-b");
+
+    store
+        .create_conversation_titled(&alice.id, "dir:main", "direct", None, Some("Alice Ops"))
+        .unwrap();
+    store
+        .append_message(
+            &alice.id,
+            "dir:main",
+            None,
+            crate::domain::Role::Assistant,
+            "Quarterly invoice #42 approved",
+        )
+        .unwrap();
+
+    store
+        .create_conversation_titled(
+            &alice.id,
+            "dir:analyst",
+            "direct",
+            None,
+            Some("Alice Analyst"),
+        )
+        .unwrap();
+    store
+        .append_message(
+            &alice.id,
+            "dir:analyst",
+            None,
+            crate::domain::Role::User,
+            "Review invoice #43 breakdown",
+        )
+        .unwrap();
+
+    store
+        .create_conversation_titled(&bob.id, "dir:bob-ops", "direct", None, Some("Bob Ops"))
+        .unwrap();
+    store
+        .append_message(
+            &bob.id,
+            "dir:bob-ops",
+            None,
+            crate::domain::Role::User,
+            "Bob private invoice #99",
+        )
+        .unwrap();
+
+    let alice_all = read_json(
+        call(
+            &app,
+            &alice_token,
+            "GET",
+            "/v1/conversations/search?q=invoice&limit=10",
+            None,
+        )
+        .await,
+    )
+    .await;
+    let hits = alice_all["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 2);
+    assert!(!alice_all.to_string().contains("dir:bob-ops"));
+    assert!(!alice_all.to_string().contains("invoice #99"));
+
+    let alice_analyst = read_json(
+        call(
+            &app,
+            &alice_token,
+            "GET",
+            "/v1/conversations/search?q=invoice&bot=analyst",
+            None,
+        )
+        .await,
+    )
+    .await;
+    let analyst_hits = alice_analyst["hits"].as_array().unwrap();
+    assert_eq!(analyst_hits.len(), 1);
+    assert_eq!(analyst_hits[0]["conversation_id"], "dir:analyst");
+    assert_eq!(analyst_hits[0]["bot"], "analyst");
+    assert!(
+        analyst_hits[0]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("invoice #43")
+    );
+
+    let bob_only = read_json(
+        call(
+            &app,
+            &bob_token,
+            "GET",
+            "/v1/conversations/search?q=invoice",
+            None,
+        )
+        .await,
+    )
+    .await;
+    let bob_hits = bob_only["hits"].as_array().unwrap();
+    assert_eq!(bob_hits.len(), 1);
+    assert_eq!(bob_hits[0]["conversation_id"], "dir:bob-ops");
+
+    // Short query returns empty hits, 200 OK.
+    let short = call(
+        &app,
+        &alice_token,
+        "GET",
+        "/v1/conversations/search?q=x",
+        None,
+    )
+    .await;
+    assert_eq!(short.status(), StatusCode::OK);
+    assert!(
+        read_json(short).await["hits"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}

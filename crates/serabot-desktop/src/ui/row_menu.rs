@@ -263,6 +263,47 @@ fn scroll_selected_history_row() {
     );
 }
 
+fn trim_snippet_parts<'a>(snippet: &'a str, query: &str) -> (&'a str, &'a str, &'a str) {
+    let trimmed = snippet.trim();
+    let q = query.trim();
+    if q.is_empty() {
+        return (trimmed, "", "");
+    }
+    let lower_s = trimmed.to_ascii_lowercase();
+    let lower_q = q.to_ascii_lowercase();
+    if let Some(pos) = lower_s.find(&lower_q) {
+        let end = pos + lower_q.len();
+        if trimmed.is_char_boundary(pos) && trimmed.is_char_boundary(end) {
+            return (&trimmed[..pos], &trimmed[pos..end], &trimmed[end..]);
+        }
+    }
+    (trimmed, "", "")
+}
+
+async fn run_conv_search(
+    session: Signal<Session>,
+    query: String,
+    bot: String,
+) -> Vec<serabot_desktop::ConversationSearchHit> {
+    let Some(creds) = session.read().credentials.clone() else {
+        return Vec::new();
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if std::thread::Builder::new()
+        .name("serabot-conv-search".into())
+        .spawn(move || {
+            let hits = serabot_desktop::ApiClient::new(creds.endpoint.clone(), creds.token.clone())
+                .and_then(|c| c.search_conversations(&query, Some(&bot), 15))
+                .unwrap_or_default();
+            let _ = tx.send(hits);
+        })
+        .is_err()
+    {
+        return Vec::new();
+    }
+    rx.await.unwrap_or_default()
+}
+
 /// The chat switcher in the chat header: the open chat's name with a chevron
 /// plus a clear History button. Opens a solid, searchable, date-grouped history
 /// popover for switching chats, renaming/archiving, or starting a new chat.
@@ -273,13 +314,43 @@ pub(crate) fn ChatSwitcher(session: Signal<Session>, bot: String, title: String)
     let mut query = use_signal(String::new);
     let mut selected_idx = use_signal(|| 0usize);
     let mut renaming = use_signal(|| Option::<(String, String)>::None);
+    let mut search_hits = use_signal(Vec::<serabot_desktop::ConversationSearchHit>::new);
+    let mut search_busy = use_signal(|| false);
+    let mut search_seq = use_signal(|| 0u64);
     let mut prev_bot = use_signal(|| bot.clone());
     if *prev_bot.peek() != bot {
         prev_bot.set(bot.clone());
         query.set(String::new());
         selected_idx.set(0);
         renaming.set(None);
+        search_hits.set(Vec::new());
+        search_busy.set(false);
+        let next_seq = search_seq().wrapping_add(1);
+        search_seq.set(next_seq);
     }
+
+    let trigger_search = {
+        let bot = bot.clone();
+        move |raw_q: String| {
+            let next_seq = search_seq().wrapping_add(1);
+            search_seq.set(next_seq);
+            let q = raw_q.trim().to_owned();
+            if q.chars().count() < 2 {
+                search_hits.set(Vec::new());
+                search_busy.set(false);
+                return;
+            }
+            let bot = bot.clone();
+            search_busy.set(true);
+            spawn(async move {
+                let hits = run_conv_search(session, q, bot).await;
+                if *search_seq.peek() == next_seq {
+                    search_hits.set(hits);
+                    search_busy.set(false);
+                }
+            });
+        }
+    };
 
     let (entries, bot_name, enabled, active_conv, active_title, unread) = {
         let state = session.read();
@@ -363,10 +434,16 @@ pub(crate) fn ChatSwitcher(session: Signal<Session>, bot: String, title: String)
             if next {
                 query.set(String::new());
                 selected_idx.set(0);
+                search_hits.set(Vec::new());
+                search_busy.set(false);
                 focus_chat_history_search();
             }
         }
     };
+
+    let query_str = query();
+    let has_message_search = query_str.trim().chars().count() >= 2;
+    let hits = search_hits();
 
     rsx! {
         div { class: "chat-switcher",
@@ -490,12 +567,17 @@ pub(crate) fn ChatSwitcher(session: Signal<Session>, bot: String, title: String)
                             id: "chat-history-search",
                             class: "chat-switcher-search-input",
                             r#type: "search",
-                            placeholder: "Filter chats by title\u{2026}",
-                            "aria-label": "Filter chats by title",
+                            placeholder: "Filter by title or search messages\u{2026}",
+                            "aria-label": "Filter chats by title or search messages",
                             value: "{query}",
-                            oninput: move |event| {
-                                query.set(event.value());
-                                selected_idx.set(0);
+                            oninput: {
+                                let mut trigger = trigger_search.clone();
+                                move |event| {
+                                    let val = event.value();
+                                    query.set(val.clone());
+                                    selected_idx.set(0);
+                                    trigger(val);
+                                }
                             },
                         }
                         if !query().trim().is_empty() {
@@ -507,6 +589,8 @@ pub(crate) fn ChatSwitcher(session: Signal<Session>, bot: String, title: String)
                                 onclick: move |_| {
                                     query.set(String::new());
                                     selected_idx.set(0);
+                                    search_hits.set(Vec::new());
+                                    search_busy.set(false);
                                     focus_chat_history_search();
                                 },
                                 Icon { name: "x", size: 12 }
@@ -514,16 +598,18 @@ pub(crate) fn ChatSwitcher(session: Signal<Session>, bot: String, title: String)
                         }
                     }
                     div { class: "chat-switcher-list", role: "listbox", "aria-label": "Conversations",
-                        if groups.is_empty() {
+                        if groups.is_empty() && (!has_message_search || (!search_busy() && hits.is_empty())) {
                             div { class: "chat-switcher-empty",
                                 p { class: "chat-switcher-empty-title", "No matching chats" }
-                                p { class: "chat-switcher-empty-sub", "Try another title keyword or clear the filter." }
+                                p { class: "chat-switcher-empty-sub", "Try another keyword or clear the filter." }
                                 button {
                                     class: "btn ghost sm",
                                     r#type: "button",
                                     onclick: move |_| {
                                         query.set(String::new());
                                         selected_idx.set(0);
+                                        search_hits.set(Vec::new());
+                                        search_busy.set(false);
                                         focus_chat_history_search();
                                     },
                                     "Clear filter"
@@ -701,6 +787,71 @@ pub(crate) fn ChatSwitcher(session: Signal<Session>, bot: String, title: String)
                                                                     }
                                                                 },
                                                                 Icon { name: "trash", size: 13 }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if has_message_search && (search_busy() || !hits.is_empty()) {
+                            div { class: "chat-switcher-group chat-switcher-msg-hits",
+                                div { class: "chat-switcher-group-label",
+                                    if search_busy() && hits.is_empty() {
+                                        "Searching messages\u{2026}"
+                                    } else {
+                                        "Message matches"
+                                    }
+                                }
+                                for (idx, hit) in hits.iter().enumerate() {
+                                    {
+                                        let conv_id = hit.conversation_id.clone();
+                                        let hit_title = if hit.title.trim().is_empty() {
+                                            "Chat".to_owned()
+                                        } else {
+                                            hit.title.clone()
+                                        };
+                                        let (pre, matched, post) = trim_snippet_parts(&hit.snippet, &query_str);
+                                        let when = if hit.created_at.is_empty() {
+                                            String::new()
+                                        } else {
+                                            stamp(&hit.created_at)
+                                        };
+                                        let role_label = if hit.role == "user" { "You" } else { &bot_name };
+                                        rsx! {
+                                            div {
+                                                key: "hit-{idx}-{conv_id}",
+                                                class: "chat-switcher-row",
+                                                role: "option",
+                                                "aria-selected": "false",
+                                                button {
+                                                    class: "row-menu-item chat-switcher-item chat-switcher-hit-item",
+                                                    r#type: "button",
+                                                    title: "{hit_title}",
+                                                    onclick: move |_| {
+                                                        open.set(false);
+                                                        session.write().open_conversation(conv_id.clone());
+                                                    },
+                                                    span { class: "chat-switcher-item-icon",
+                                                        Icon { name: "search", size: 14 }
+                                                    }
+                                                    div { class: "chat-switcher-copy",
+                                                        div { class: "chat-switcher-title-line",
+                                                            span { class: "chat-switcher-title", "{hit_title}" }
+                                                            if !when.is_empty() {
+                                                                span { class: "chat-switcher-badge", "{role_label} · {when}" }
+                                                            }
+                                                        }
+                                                        if !hit.snippet.trim().is_empty() {
+                                                            span { class: "chat-switcher-snippet",
+                                                                "{pre}"
+                                                                if !matched.is_empty() {
+                                                                    mark { class: "chat-switcher-mark", "{matched}" }
+                                                                }
+                                                                "{post}"
                                                             }
                                                         }
                                                     }
