@@ -6,7 +6,7 @@
 BEGIN;
 
 CREATE TABLE IF NOT EXISTS project_checks (
-    user_id TEXT NOT NULL REFERENCES users(id),
+    user_id TEXT NOT NULL,
     project TEXT NOT NULL,
     command TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS project_checks (
 
 CREATE TABLE IF NOT EXISTS project_check_runs (
     id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL REFERENCES users(id),
+    user_id TEXT NOT NULL,
     project TEXT NOT NULL,
     status TEXT NOT NULL,
     started_at TEXT NOT NULL,
@@ -31,7 +31,7 @@ CREATE INDEX IF NOT EXISTS idx_project_check_runs
 
 CREATE TABLE IF NOT EXISTS project_diagnostics (
     id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL REFERENCES users(id),
+    user_id TEXT NOT NULL,
     project TEXT NOT NULL,
     run_id TEXT NOT NULL,
     file TEXT NOT NULL,
