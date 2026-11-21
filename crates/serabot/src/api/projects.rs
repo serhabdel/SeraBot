@@ -10,7 +10,7 @@ use super::*;
 use crate::attachments::MAX_ATTACHMENT_BYTES;
 use crate::projects::{
     create_project, delete_project_file, list_project_files, list_projects_with_stats,
-    read_project_file, save_project_upload,
+    read_project_file, save_project_upload, slugify, write_project_file,
 };
 
 pub(super) fn routes() -> Router<Arc<ApiState>> {
@@ -28,8 +28,13 @@ pub(super) fn routes() -> Router<Arc<ApiState>> {
         .route("/v1/projects/{slug}/files", get(list_files))
         .route(
             "/v1/projects/{slug}/files/{*path}",
-            get(download_project_file).delete(delete_file),
+            get(download_project_file)
+                .put(write_file)
+                .delete(delete_file),
         )
+        .route("/v1/projects/{slug}/check", get(get_check).put(set_check))
+        .route("/v1/projects/{slug}/check/run", post(run_check_route))
+        .route("/v1/projects/{slug}/diagnostics", get(get_diagnostics))
         .merge(upload)
 }
 
@@ -170,6 +175,35 @@ async fn download_project_file(
     Ok(files::download_response(&filename, bytes))
 }
 
+#[derive(Deserialize)]
+struct WriteFileRequest {
+    content: String,
+}
+
+/// `PUT /v1/projects/{slug}/files/{*path}` — save a text file from the
+/// workspace editor (0.74). Path containment and the 1 MiB cap are enforced in
+/// `projects::write_project_file`; every save is audit-logged.
+async fn write_file(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path((slug, path)): Path<(String, String)>,
+    Json(body): Json<WriteFileRequest>,
+) -> Result<Json<Value>> {
+    state.runtime.scan_owner_output(&user.id, &path)?;
+    let entry = write_project_file(&state.config, &user.id, &slug, &path, &body.content)?;
+    let _ = state.store.record_audit(
+        &user.id,
+        "project.file_write",
+        Some(&format!("{slug}/{path}")),
+        None,
+        None,
+        None,
+        None,
+        Some(&json!({ "bytes": entry.size_bytes })),
+    );
+    Ok(Json(json!({ "file": entry })))
+}
+
 async fn delete_file(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
@@ -187,4 +221,84 @@ async fn delete_file(
         None,
     );
     Ok(Json(json!({ "deleted": filename })))
+}
+
+#[derive(Deserialize)]
+struct SetCheckRequest {
+    command: Vec<String>,
+}
+
+/// `PUT /v1/projects/{slug}/check` — set the project's check command. The
+/// acting user sets it for their own project only; the program allowlist and
+/// path rules are enforced in `diagnostics::validate_command`.
+async fn set_check(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(slug): Path<String>,
+    Json(body): Json<SetCheckRequest>,
+) -> Result<Json<Value>> {
+    let slug = slugify(&slug)?;
+    for arg in &body.command {
+        state.runtime.scan_owner_output(&user.id, arg)?;
+    }
+    crate::diagnostics::validate_command(&body.command)?;
+    state
+        .store
+        .set_project_check(&user.id, &slug, &body.command)?;
+    let _ = state.store.record_audit(
+        &user.id,
+        "project.check_config",
+        Some(&slug),
+        None,
+        None,
+        None,
+        None,
+        Some(&json!({ "command": body.command })),
+    );
+    Ok(Json(json!({ "project": slug, "command": body.command })))
+}
+
+/// `GET /v1/projects/{slug}/check` — the configured command, or the default.
+async fn get_check(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(slug): Path<String>,
+) -> Result<Json<Value>> {
+    let slug = slugify(&slug)?;
+    let command = state
+        .store
+        .get_project_check(&user.id, &slug)?
+        .and_then(|stored| serde_json::from_str::<Vec<String>>(&stored).ok())
+        .unwrap_or_else(|| {
+            crate::diagnostics::DEFAULT_COMMAND
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        });
+    Ok(Json(json!({ "project": slug, "command": command })))
+}
+
+/// `POST /v1/projects/{slug}/check/run` — run the check now (bounded by the
+/// harness timeout) and store the diagnostics.
+async fn run_check_route(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(slug): Path<String>,
+) -> Result<Json<Value>> {
+    let summary =
+        crate::diagnostics::run_check(&state.config, &state.store, &user.id, &slug).await?;
+    Ok(Json(json!({ "run": summary })))
+}
+
+/// `GET /v1/projects/{slug}/diagnostics` — latest run plus its diagnostics.
+async fn get_diagnostics(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(slug): Path<String>,
+) -> Result<Json<Value>> {
+    let slug = slugify(&slug)?;
+    let (run, rows) = state.store.list_project_diagnostics(&user.id, &slug)?;
+    Ok(Json(
+        json!({ "project": slug, "run": run, "diagnostics": rows }),
+    ))
 }

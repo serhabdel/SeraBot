@@ -26,6 +26,7 @@ or sends something to a third party that cannot be recalled. The list lives in
 | `whatsapp_send_message` | Sends a WhatsApp message to an external contact via WhatsApp Business Cloud API. The approval names the recipient and exact text. |
 | `browser_upload` | Sends one of the member's files to a website through the server browser (a file field on the current page). The approval names the file and the site, and binds the artifact hash. |
 | `whatsapp_send_template` | Sends an approved WhatsApp template message to an external contact. The approval names the recipient and template. |
+| `project_check` (0.73) | Runs the check command configured for one of the member's own project folders (allowlisted program, project folder as cwd, hard timeout) and stores the compiler diagnostics. The approval names the project and the command. |
 
 Not approval-gated (0.64, owner decision): `whatsapp_link_send` to the member's
 own allowed WhatsApp chats (it refuses any other number), under the per-minute

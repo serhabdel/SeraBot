@@ -25,6 +25,7 @@ use crate::gateway::{Tool, ToolContext, ToolOutput, ToolSpec};
 pub const PROJECT_LIST_TOOL: &str = "project_list";
 pub const PROJECT_CREATE_TOOL: &str = "project_create";
 pub const PROJECT_FILE_TOOL: &str = "project_file";
+pub const PROJECT_CHECK_TOOL: &str = "project_check";
 
 const PROJECTS_DIR: &str = "projects";
 const MAX_SLUG: usize = 64;
@@ -413,6 +414,92 @@ pub fn delete_project_file(
     Ok(filename)
 }
 
+/// Maximum size of a text file the workspace editor can save (1 MiB).
+pub const MAX_PROJECT_TEXT_BYTES: usize = 1024 * 1024;
+
+/// Write a text file inside a user's project folder (the workspace editor's
+/// save). Creates missing parent folders, never follows symlinks, and keeps
+/// the target inside the project folder (canonicalized containment).
+pub fn write_project_file(
+    config: &Config,
+    user_id: &str,
+    project: &str,
+    rel_file: &str,
+    content: &str,
+) -> Result<ProjectFileEntry> {
+    if content.len() > MAX_PROJECT_TEXT_BYTES {
+        return Err(SeraError::Validation(
+            "the file is larger than 1 MiB; split it first".into(),
+        ));
+    }
+    let slug = slugify(project)?;
+    if rel_file.trim().is_empty()
+        || rel_file.contains("..")
+        || rel_file.starts_with('/')
+        || rel_file.starts_with('\\')
+    {
+        return Err(SeraError::Validation("invalid project file path".into()));
+    }
+    let inbox = Inbox {
+        config: Arc::new(config.clone()),
+    };
+    let project_dir = inbox.projects_dir(user_id)?.join(&slug);
+    if !project_dir.is_dir() {
+        return Err(SeraError::NotFound(format!("no project named {slug}")));
+    }
+    let projects_root = inbox.projects_dir(user_id)?.canonicalize()?;
+    let project_canon = project_dir.canonicalize()?;
+    if !project_canon.starts_with(&projects_root) {
+        return Err(SeraError::Forbidden(
+            "the project folder is outside the projects directory".into(),
+        ));
+    }
+    let mut target = project_dir.clone();
+    for part in rel_file.split(['/', '\\']).filter(|p| !p.is_empty()) {
+        if part == "." || part == ".." {
+            return Err(SeraError::Validation("invalid project file path".into()));
+        }
+        target.push(part);
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(&target)
+        && (!meta.is_file() || meta.file_type().is_symlink())
+    {
+        return Err(SeraError::Validation("the path is not a plain file".into()));
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| SeraError::Validation("invalid project file path".into()))?;
+    std::fs::create_dir_all(parent)?;
+    let parent_canon = parent.canonicalize()?;
+    if !parent_canon.starts_with(&project_canon) {
+        return Err(SeraError::Forbidden(
+            "the file is outside the project folder".into(),
+        ));
+    }
+    let filename = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+    std::fs::write(&target, content.as_bytes())?;
+    // Strip against the non-canonicalized project_dir: canonicalize() returns
+    // the \\?\ UNC form on Windows, which would never prefix-match here.
+    // Containment is already proven via parent_canon above.
+    let rel_in_project = target
+        .strip_prefix(&project_dir)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| filename.clone());
+    let inbox_path = format!("{user_id}/{PROJECTS_DIR}/{slug}/{rel_in_project}");
+    Ok(ProjectFileEntry {
+        mime: crate::util::mime_for_filename(&filename).to_owned(),
+        name: filename,
+        path: rel_in_project,
+        inbox_path,
+        size_bytes: content.len() as u64,
+        modified_at: Some(chrono::Utc::now().to_rfc3339()),
+    })
+}
+
 pub struct ProjectListTool {
     inbox: Inbox,
 }
@@ -422,6 +509,14 @@ pub struct ProjectCreateTool {
 }
 
 pub struct ProjectFileTool {
+    inbox: Inbox,
+    store: Option<Arc<Store>>,
+}
+
+/// 0.73: run the project's configured check command and report the compiler
+/// diagnostics. Approval-gated (`DESTRUCTIVE_TOOLS`): it starts a process, so
+/// the model can only ask.
+pub struct ProjectCheckTool {
     inbox: Inbox,
     store: Option<Arc<Store>>,
 }
@@ -442,7 +537,11 @@ pub fn register_with_store(
     registry.register(ProjectCreateTool {
         inbox: inbox.clone(),
     })?;
-    registry.register(ProjectFileTool { inbox, store })?;
+    registry.register(ProjectFileTool {
+        inbox: inbox.clone(),
+        store: store.clone(),
+    })?;
+    registry.register(ProjectCheckTool { inbox, store })?;
     Ok(())
 }
 
@@ -630,6 +729,67 @@ impl Tool for ProjectFileTool {
     }
 }
 
+#[async_trait]
+impl Tool for ProjectCheckTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: PROJECT_CHECK_TOOL.into(),
+            description: "Run the check command configured for one of the user's project folders \
+                          (default: cargo check --message-format=json) and report the compiler \
+                          diagnostics: errors and warnings with file, line and column. Starts a \
+                          process, so it always asks for approval first."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project name (slug)"}
+                },
+                "required": ["project"],
+                "additionalProperties": false
+            }),
+            external_effect: true,
+        }
+    }
+
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        let project = args
+            .get("project")
+            .and_then(Value::as_str)
+            .ok_or_else(|| SeraError::Validation("project is required".into()))?;
+        let Some(store) = &self.store else {
+            return Err(SeraError::Internal(
+                "the project check store is unavailable".into(),
+            ));
+        };
+        let summary =
+            crate::diagnostics::run_check(&self.inbox.config, store, &context.user_id, project)
+                .await?;
+        let content = format!(
+            "Check `{}` finished in {}ms: {} errors, {} warnings, {} notes. Full rows are stored \
+             for project `{}` (run {}); list them with the project diagnostics endpoint.",
+            summary.command.join(" "),
+            summary.duration_ms,
+            summary.errors,
+            summary.warnings,
+            summary.notes,
+            summary.project,
+            summary.run_id
+        );
+        Ok(ToolOutput {
+            content,
+            data: Some(json!({
+                "project": summary.project,
+                "run_id": summary.run_id,
+                "errors": summary.errors,
+                "warnings": summary.warnings,
+                "notes": summary.notes,
+                "duration_ms": summary.duration_ms,
+            })),
+            ..ToolOutput::default()
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -659,6 +819,27 @@ mod tests {
             allowed_tools: Default::default(),
             require_approval: Default::default(),
         }
+    }
+
+    #[test]
+    fn write_project_file_stays_inside_the_project() {
+        let (_dir, config) = setup();
+        let (slug, _) = create_project(&config, "alice", "demo").unwrap();
+        let entry =
+            write_project_file(&config, "alice", "demo", "src/main.rs", "fn main() {}\n").unwrap();
+        assert_eq!(entry.path, "src/main.rs");
+        assert_eq!(entry.size_bytes, 13);
+        let (name, bytes) = read_project_file(&config, "alice", &slug, "src/main.rs").unwrap();
+        assert_eq!(name, "main.rs");
+        assert_eq!(bytes, b"fn main() {}\n");
+        // overwrite keeps containment
+        write_project_file(&config, "alice", "demo", "src/main.rs", "fn main() { }\n").unwrap();
+        // escapes are refused
+        assert!(write_project_file(&config, "alice", "demo", "../evil.rs", "x").is_err());
+        assert!(write_project_file(&config, "alice", "demo", "/abs.rs", "x").is_err());
+        assert!(write_project_file(&config, "alice", "demo", "a/../../b.rs", "x").is_err());
+        // another user cannot see or write it
+        assert!(read_project_file(&config, "bob", &slug, "src/main.rs").is_err());
     }
 
     #[test]

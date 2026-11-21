@@ -943,6 +943,7 @@ pub fn known_tool_names() -> Vec<&'static str> {
         "project_list",
         "project_create",
         "project_file",
+        "project_check",
         "whatsapp_link_send",
         "whatsapp_link_reply_file",
         "whatsapp_link_chats",

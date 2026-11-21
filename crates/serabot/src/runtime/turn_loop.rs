@@ -110,6 +110,29 @@ impl Runtime {
             &payload.conversation_id,
             &json!({}),
         )?;
+        // 0.73: tell clients how full the context is at turn start, so the chat
+        // can show a context meter before compaction happens.
+        {
+            let route = self.checked_route(&user, &payload.route)?.clone();
+            let est = estimate_prompt_chars(&history) as u64;
+            let window = self.window_for(&user, &route);
+            let percent = window
+                .filter(|w| *w > 0)
+                .map(|w| (est.saturating_mul(100) / w).min(100) as u32);
+            let _ = self.store.append_event(
+                &user,
+                "turn.context",
+                &json!({
+                    "turn_id": turn.id,
+                    "task_id": task.id,
+                    "conversation_id": payload.conversation_id,
+                    "bot": payload.bot,
+                    "prompt_chars_est": est,
+                    "window": window,
+                    "percent": percent,
+                }),
+            );
+        }
         if let Some(handoff) = &payload.handoff {
             let _ = self.store.append_event(
                 &user,

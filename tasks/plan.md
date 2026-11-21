@@ -290,3 +290,34 @@ overflow flip, caret-stable rename), and polishes the Usage page (shared
 `stat-tile`, section anchors with an updated-ago stamp, chart day labels).
 Source-level audit only; no render was taken, so the owner does a visual pass
 on Windows. No server changes, no new dependencies.
+
+## Status after 0.71.0 (audit follow-ups, 0.72.0)
+
+0.72.0 finishes the 0.71.0 audit: the remaining hard-coded font sizes in the
+chat, sidebar, composer and chat-switcher chrome are on the `--fs-*` tokens,
+the sidebar and All-chats rename inputs are caret-stable (uncontrolled, like
+the switcher), and switcher rows show unread badges. Desktop-only, no server
+changes. Source-level only; owner visual pass pending. Tasks/Kanban/Calendar
+pages still carry px font sizes — noted for a later pass.
+
+## Status after 0.72.0 (coding harness + context + font sweep, 0.73.0)
+
+0.73.0 adds the project check harness: per-project owner-configured check
+commands (allowlisted `cargo`/`rustc`, contained project cwd, no shell, capped
+output, hard timeout) whose rustc-JSON diagnostics are stored UID-scoped and
+shown in a desktop Problems panel; the `project_check` bot tool is
+approval-gated. It also emits `turn.context` (estimated prompt size, model
+window, percent) at turn start, shown as a context meter in the model bar, and
+moves every remaining hard-coded px font-size in the desktop CSS onto the
+`--fs-*` tokens. Synthetic fixtures only; no real compiler ran and no render
+was taken — owner verification pending.
+
+## Status after 0.73.0 (code workspace, 0.74.0)
+
+0.74.0 adds a code workspace to the Projects page: file tree, caret-stable
+editor with line gutter, save through a new contained `PUT
+/v1/projects/{slug}/files/{*path}` endpoint (audit-logged), and Problems
+click-through that opens the file at the diagnostic's line. It also ships
+`docs/specs/lsp-workspace.md`, a proposed rust-analyzer LSP design for 0.75
+that widens the local-process exception and therefore waits for owner
+approval. Queued: 0.76 memory v2, 0.77 phone parity.

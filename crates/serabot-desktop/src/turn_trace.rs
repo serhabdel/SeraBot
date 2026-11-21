@@ -147,11 +147,21 @@ fn items(value: Option<&Value>) -> Vec<MemoryItem> {
         .unwrap_or_default()
 }
 
+/// Context fill at turn start (0.73, `turn.context` event): estimated prompt
+/// size, the routed model's window and the percent used.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TurnContext {
+    pub prompt_chars_est: u64,
+    pub window: Option<u64>,
+    pub percent: Option<u32>,
+}
+
 /// Steps and memories of one turn.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TurnTrace {
     pub activity: Activity,
     pub memory: TurnMemory,
+    pub context: Option<TurnContext>,
 }
 
 impl TurnTrace {
@@ -209,11 +219,20 @@ impl TurnLedger {
         self.turns.get(turn_id).filter(|trace| !trace.is_empty())
     }
 
+    /// Context of the newest turn that reported one (0.73).
+    pub fn latest_context(&self) -> Option<&TurnContext> {
+        self.order.iter().rev().find_map(|turn| {
+            self.turns
+                .get(turn)
+                .and_then(|trace| trace.context.as_ref())
+        })
+    }
+
     /// Apply one stream or history event. Returns whether anything changed.
     /// Events of another conversation, child tasks and unknown kinds are
     /// ignored.
     pub fn apply(&mut self, kind: &str, payload: &Value) -> bool {
-        if kind != "turn.step" && kind != "turn.memory" {
+        if kind != "turn.step" && kind != "turn.memory" && kind != "turn.context" {
             return false;
         }
         if payload.get("parent_task_id").is_some()
@@ -236,6 +255,23 @@ impl TurnLedger {
         let trace = self.turns.entry(turn).or_default();
         let changed = if kind == "turn.step" {
             trace.activity.apply(kind, payload)
+        } else if kind == "turn.context" {
+            let before = trace.context.clone();
+            let est = payload
+                .get("prompt_chars_est")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let window = payload.get("window").and_then(Value::as_u64);
+            let percent = payload
+                .get("percent")
+                .and_then(Value::as_u64)
+                .map(|p| p as u32);
+            trace.context = (est > 0 || window.is_some()).then_some(TurnContext {
+                prompt_chars_est: est,
+                window,
+                percent,
+            });
+            trace.context != before
         } else {
             let before = trace.memory.clone();
             trace.memory.apply(payload);
