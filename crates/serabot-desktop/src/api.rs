@@ -4420,6 +4420,44 @@ impl ApiClient {
         self.get(&["v1", "projects", slug, "files"], &[])
     }
 
+    /// `GET /v1/projects/{slug}/check`: the project's configured check command.
+    pub fn projects_check_get(&self, slug: &str) -> Result<serde_json::Value, ApiError> {
+        check_id(slug)?;
+        self.get(&["v1", "projects", slug, "check"], &[])
+    }
+
+    /// `PUT /v1/projects/{slug}/check`: set the check command (argv array).
+    pub fn projects_check_put(
+        &self,
+        slug: &str,
+        command: &[String],
+    ) -> Result<serde_json::Value, ApiError> {
+        check_id(slug)?;
+        self.request(
+            Method::PUT,
+            &["v1", "projects", slug, "check"],
+            &[],
+            Some(&serde_json::json!({ "command": command })),
+        )
+    }
+
+    /// `POST /v1/projects/{slug}/check/run`: run the check now.
+    pub fn projects_check_run(&self, slug: &str) -> Result<serde_json::Value, ApiError> {
+        check_id(slug)?;
+        self.request(
+            Method::POST,
+            &["v1", "projects", slug, "check", "run"],
+            &[],
+            Some(&serde_json::json!({})),
+        )
+    }
+
+    /// `GET /v1/projects/{slug}/diagnostics`: latest run plus its diagnostics.
+    pub fn projects_diagnostics(&self, slug: &str) -> Result<serde_json::Value, ApiError> {
+        check_id(slug)?;
+        self.get(&["v1", "projects", slug, "diagnostics"], &[])
+    }
+
     /// `POST /v1/projects/{slug}/upload`: upload a file directly into a project.
     pub fn projects_upload(
         &self,
@@ -4530,6 +4568,31 @@ impl ApiClient {
         let parts: Vec<&str> = rel_path.split('/').filter(|p| !p.is_empty()).collect();
         segments.extend(parts);
         self.request::<_, ()>(Method::DELETE, &segments, &[], None)
+    }
+
+    /// `PUT /v1/projects/{slug}/files/{*path}`: save a text file from the
+    /// workspace editor (0.74).
+    pub fn projects_write_file(
+        &self,
+        slug: &str,
+        rel_path: &str,
+        content: &str,
+    ) -> Result<serde_json::Value, ApiError> {
+        check_id(slug)?;
+        if content.len() > 1024 * 1024 {
+            return Err(ApiError::Validation(
+                "Files must be 1 MiB or smaller to edit here.",
+            ));
+        }
+        let mut segments = vec!["v1", "projects", slug, "files"];
+        let parts: Vec<&str> = rel_path.split('/').filter(|p| !p.is_empty()).collect();
+        segments.extend(parts);
+        self.request(
+            Method::PUT,
+            &segments,
+            &[],
+            Some(&serde_json::json!({ "content": content })),
+        )
     }
 
     /// `GET /v1/connectors/github/native`: the member's GitHub sign-in.

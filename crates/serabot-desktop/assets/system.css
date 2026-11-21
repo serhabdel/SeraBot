@@ -1261,3 +1261,174 @@ html[data-reduce-transparency="true"] .sheet.sheet-palette {
 .library-item {
   display: contents;
 }
+
+/* 0.73: context meter in the model bar (turn.context). */
+.ctx-meter {
+  width: 72px;
+  height: 4px;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  overflow: hidden;
+  align-self: center;
+  flex: 0 0 auto;
+}
+
+.ctx-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: var(--r-pill);
+  transition: width var(--dur-1) var(--ease);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ctx-fill {
+    transition: none;
+  }
+}
+
+/* 0.73: Problems panel on the Projects page. */
+.diag-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.diag-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.diag-sev {
+  flex: none;
+  margin-top: 2px;
+  display: inline-flex;
+}
+
+.diag-sev.error {
+  color: var(--danger);
+}
+
+.diag-sev.warning {
+  color: var(--warn);
+}
+
+.diag-sev.note {
+  color: var(--label-3);
+}
+
+.diag-copy {
+  flex: 1;
+  min-width: 0;
+}
+
+.diag-loc {
+  font-size: var(--fs-micro);
+  color: var(--label-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.diag-msg {
+  font-size: var(--fs-body-2);
+  overflow-wrap: anywhere;
+}
+
+/* 0.74: code workspace on the Projects page (tree + editor + problems). */
+.ws-grid {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  gap: 12px;
+  align-items: start;
+}
+
+.ws-tree {
+  max-height: 480px;
+  overflow: auto;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  padding: 4px;
+}
+
+.ws-tree-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 4px 8px;
+  border: 0;
+  background: transparent;
+  border-radius: var(--r-xs);
+  cursor: pointer;
+  font-size: var(--fs-body-2);
+  color: var(--label-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ws-tree-item:hover {
+  background: var(--hover);
+}
+
+.ws-tree-item.active {
+  background: var(--surface-2);
+}
+
+.ws-tree-item.dim {
+  color: var(--label-3);
+  cursor: default;
+}
+
+.ws-editor {
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  overflow: hidden;
+  min-width: 0;
+}
+
+.ws-editor-head {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--hairline);
+  font-size: var(--fs-caption);
+  color: var(--label-2);
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.ws-editor-body {
+  display: flex;
+  max-height: 480px;
+  overflow: hidden;
+}
+
+.ws-gutter {
+  flex: none;
+  width: 46px;
+  overflow: hidden;
+  text-align: right;
+  padding: 8px 6px 8px 8px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-micro);
+  line-height: 1.5;
+  color: var(--label-3);
+  background: var(--surface-2);
+  user-select: none;
+}
+
+.ws-textarea {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: none;
+  resize: none;
+  padding: 8px 10px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-body-2);
+  line-height: 1.5;
+  background: var(--bg);
+  color: var(--label-1);
+  overflow: auto;
+  white-space: pre;
+  tab-size: 2;
+}

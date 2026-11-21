@@ -532,7 +532,12 @@ pub(super) fn ConversationsView(session: Signal<Session>) -> Element {
                                                     input {
                                                         class: "input",
                                                         "aria-label": "Conversation name",
-                                                        value: "{text}",
+                                                        "data-rename-init": "{text}",
+                                                        onmounted: move |_| {
+                                                            document::eval(
+                                                                "(() => { const el = document.querySelector('.conv-rename input[data-rename-init]'); if (!el) return; el.value = el.getAttribute('data-rename-init') || ''; el.removeAttribute('data-rename-init'); el.setSelectionRange(el.value.length, el.value.length); })()",
+                                                            );
+                                                        },
                                                         oninput: move |event| {
                                                             if let Some((_, text)) = rename.write().as_mut() {
                                                                 *text = event.value();

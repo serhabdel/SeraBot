@@ -491,7 +491,7 @@
 
 .composer-wrap .composer-hint {
   padding: 4px 16px 0;
-  font-size: 12px;
+  font-size: var(--fs-caption);
   line-height: 16px;
   color: var(--label-2);
   white-space: nowrap;
@@ -1333,7 +1333,7 @@ details.step-more > summary.step-more-summary:hover {
 
 details.step-more > summary.step-more-summary::before {
   content: "\25B8";
-  font-size: 10px;
+  font-size: var(--fs-micro);
   line-height: 1;
   transition: transform var(--dur-1) var(--ease);
 }
@@ -1423,7 +1423,7 @@ details.step-more[open] > summary.step-more-summary::before {
   border-radius: var(--r-sm);
   border-color: transparent;
   background: var(--hover);
-  font-size: 13px;
+  font-size: var(--fs-caption);
 }
 
 .sidebar .sidebar-search .input:hover {
@@ -1450,7 +1450,7 @@ details.step-more[open] > summary.step-more-summary::before {
   gap: 6px;
   border-radius: var(--r-xs);
   color: var(--label-3);
-  font-size: 11px;
+  font-size: var(--fs-micro);
   font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -1485,7 +1485,7 @@ details.step-more[open] > summary.step-more-summary::before {
   border-radius: var(--r-pill);
   background: var(--hover);
   color: var(--label-3);
-  font-size: 10.5px;
+  font-size: var(--fs-micro);
   font-weight: 600;
   letter-spacing: 0;
   line-height: 1.4;
@@ -1508,7 +1508,7 @@ details.step-more[open] > summary.step-more-summary::before {
   width: 32px;
   height: 32px;
   border-radius: 10px;
-  font-size: 13px;
+  font-size: var(--fs-caption);
 }
 
 .thread .avatar-wrap .avatar {
@@ -1527,13 +1527,13 @@ details.step-more[open] > summary.step-more-summary::before {
 }
 
 .thread-title {
-  font-size: 13.5px;
+  font-size: var(--fs-body-2);
   font-weight: 560;
   line-height: 1.3;
 }
 
 .thread-meta {
-  font-size: 12px;
+  font-size: var(--fs-caption);
   line-height: 1.3;
   color: var(--label-3);
 }
@@ -1562,7 +1562,7 @@ details.step-more[open] > summary.step-more-summary::before {
   min-width: 18px;
   height: 18px;
   padding: 0 5px;
-  font-size: 11px;
+  font-size: var(--fs-micro);
   font-weight: 650;
 }
 
@@ -1570,7 +1570,7 @@ details.step-more[open] > summary.step-more-summary::before {
   height: 16px;
   min-width: 16px;
   padding: 0 4px;
-  font-size: 10.5px;
+  font-size: var(--fs-micro);
   background: var(--hover);
   color: var(--label-3);
 }
@@ -1644,7 +1644,7 @@ details.step-more[open] > summary.step-more-summary::before {
   background: var(--clear);
   color: var(--label-3);
   font: inherit;
-  font-size: 13px;
+  font-size: var(--fs-caption);
   text-align: left;
   cursor: pointer;
   transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
@@ -1708,7 +1708,7 @@ details.step-more[open] > summary.step-more-summary::before {
 
 .chat-header-copy > strong,
 .chat-header-copy .chat-switcher-btn strong {
-  font-size: 15px;
+  font-size: var(--fs-title);
   font-weight: 650;
   line-height: 1.3;
 }
@@ -1720,7 +1720,7 @@ details.step-more[open] > summary.step-more-summary::before {
 
 .chat-header-copy .chat-switcher-count {
   color: var(--accent-ink);
-  font-size: 11px;
+  font-size: var(--fs-micro);
   line-height: 16px;
 }
 
@@ -1728,7 +1728,7 @@ details.step-more[open] > summary.step-more-summary::before {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: var(--fs-caption);
   line-height: 1.3;
   color: var(--label-3);
 }
@@ -1799,7 +1799,7 @@ details.step-more[open] > summary.step-more-summary::before {
 
 .chat-header .chat-header-actions .yolo-btn.active .btn-label {
   display: inline;
-  font-size: 12.5px;
+  font-size: var(--fs-caption);
   font-weight: 600;
 }
 
@@ -1964,7 +1964,7 @@ details.step-more[open] > summary.step-more-summary::before {
   width: auto;
   padding: 0 10px;
   gap: 6px;
-  font-size: 12px;
+  font-size: var(--fs-caption);
   font-weight: 500;
   opacity: 0.78;
   cursor: wait;
@@ -1976,7 +1976,7 @@ details.step-more[open] > summary.step-more-summary::before {
   border-radius: 9px;
   background: var(--hover);
   color: var(--label-2);
-  font-size: 12.5px;
+  font-size: var(--fs-caption);
 }
 
 .model-bar.compact .menu-trigger:hover {
@@ -2049,7 +2049,7 @@ details.step-more[open] > summary.step-more-summary::before {
   background: var(--clear);
   color: var(--label-2);
   font: inherit;
-  font-size: 12.5px;
+  font-size: var(--fs-caption);
   font-weight: 550;
   cursor: pointer;
   transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
@@ -2067,7 +2067,7 @@ details.step-more[open] > summary.step-more-summary::before {
 
 .conv-chip-count {
   color: var(--label-3);
-  font-size: 11px;
+  font-size: var(--fs-micro);
   font-variant-numeric: tabular-nums;
 }
 
@@ -2136,7 +2136,7 @@ details.step-more[open] > summary.step-more-summary::before {
   width: 36px;
   height: 36px;
   border-radius: 11px;
-  font-size: 14px;
+  font-size: var(--fs-body-2);
 }
 
 .conv-copy {
@@ -2157,7 +2157,7 @@ details.step-more[open] > summary.step-more-summary::before {
 .conv-title {
   overflow: hidden;
   color: var(--label-1);
-  font-size: 14px;
+  font-size: var(--fs-body-2);
   font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2169,7 +2169,7 @@ details.step-more[open] > summary.step-more-summary::before {
   border-radius: var(--r-pill);
   background: var(--hover);
   color: var(--label-3);
-  font-size: 10.5px;
+  font-size: var(--fs-micro);
   font-weight: 600;
   letter-spacing: 0.05em;
   line-height: 18px;
@@ -2179,7 +2179,7 @@ details.step-more[open] > summary.step-more-summary::before {
 .conv-parent {
   overflow: hidden;
   color: var(--label-3);
-  font-size: 12px;
+  font-size: var(--fs-caption);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2187,7 +2187,7 @@ details.step-more[open] > summary.step-more-summary::before {
 .conv-preview {
   overflow: hidden;
   color: var(--label-3);
-  font-size: 13px;
+  font-size: var(--fs-caption);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2201,7 +2201,7 @@ details.step-more[open] > summary.step-more-summary::before {
 
 .conv-time {
   color: var(--label-3);
-  font-size: 12px;
+  font-size: var(--fs-caption);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }

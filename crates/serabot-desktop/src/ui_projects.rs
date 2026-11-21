@@ -86,6 +86,56 @@ fn parse_files(value: &Value) -> Vec<FileRow> {
         .unwrap_or_default()
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DiagRow {
+    file: String,
+    line: Option<u64>,
+    column: Option<u64>,
+    severity: String,
+    code: Option<String>,
+    message: String,
+}
+
+/// Split `GET /v1/projects/{slug}/diagnostics` into the run summary and rows.
+fn parse_diagnostics(value: &Value) -> (Option<Value>, Vec<DiagRow>) {
+    let run = value.get("run").cloned();
+    let rows = value["diagnostics"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| DiagRow {
+                    file: item["file"].as_str().unwrap_or("").to_owned(),
+                    line: item["line"].as_u64(),
+                    column: item["column"].as_u64(),
+                    severity: item["severity"].as_str().unwrap_or("note").to_owned(),
+                    code: item["code"].as_str().map(str::to_owned),
+                    message: item["message"].as_str().unwrap_or("").to_owned(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (run, rows)
+}
+
+/// Whether a project file opens in the workspace editor (0.74).
+fn is_editable_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [
+        ".rs", ".toml", ".md", ".txt", ".json", ".csv", ".yaml", ".yml", ".py", ".js", ".ts",
+        ".tsx", ".jsx", ".html", ".css", ".xml", ".svg", ".log", ".sh", ".bat", ".sql", ".env",
+    ]
+    .iter()
+    .any(|ext| lower.ends_with(ext))
+}
+
+fn is_editable_file(mime: &str, name: &str) -> bool {
+    mime.starts_with("text/")
+        || mime.contains("json")
+        || mime.contains("xml")
+        || is_editable_name(name)
+}
+
 fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
@@ -107,11 +157,101 @@ pub fn ProjectsView(session: Signal<Session>) -> Element {
     let mut error = use_signal(|| Option::<String>::None);
     let mut notice = use_signal(|| Option::<String>::None);
     let mut confirm_delete = use_signal(|| Option::<String>::None);
+    // 0.73: project check harness — Problems panel state.
+    let mut diag_rows = use_signal(Vec::<DiagRow>::new);
+    let mut diag_run = use_signal(|| Option::<Value>::None);
+    let mut check_cmd = use_signal(String::new);
+    let mut check_busy = use_signal(|| false);
+
+    let load_diags = move |slug: String| {
+        let slug_diag = slug.clone();
+        let slug_cmd = slug.clone();
+        spawn(async move {
+            if let Ok(value) = call(session, move |creds| api::diagnostics(creds, &slug_diag)).await
+            {
+                let (run, rows) = parse_diagnostics(&value);
+                diag_run.set(run);
+                diag_rows.set(rows);
+            }
+            if let Ok(value) = call(session, move |creds| api::check_get(creds, &slug_cmd)).await {
+                let text = value["command"]
+                    .as_array()
+                    .map(|args| serde_json::to_string(args).unwrap_or_else(|_| "[]".into()))
+                    .unwrap_or_default();
+                check_cmd.set(text.clone());
+                // The command field is uncontrolled (no value binding), so
+                // typing never moves the caret; set the fetched text from JS
+                // only while the field is not focused.
+                if let Ok(js_text) = serde_json::to_string(&text) {
+                    document::eval(&format!(
+                        "(() => {{ const el = document.querySelector('.check-cmd-input'); if (el && document.activeElement !== el) el.value = {js_text}; }})()"
+                    ));
+                }
+            }
+        });
+    };
+
+    let run_check = move |_| {
+        let Some(slug) = selected.read().clone() else {
+            return;
+        };
+        check_busy.set(true);
+        error.set(None);
+        let slug2 = slug.clone();
+        spawn(async move {
+            let result = call(session, move |creds| api::check_run(creds, &slug)).await;
+            check_busy.set(false);
+            match result {
+                Ok(value) => {
+                    if let Some(run) = value.get("run").cloned() {
+                        diag_run.set(Some(run));
+                    }
+                    if let Ok(value) =
+                        call(session, move |creds| api::diagnostics(creds, &slug2)).await
+                    {
+                        let (run, rows) = parse_diagnostics(&value);
+                        diag_run.set(run);
+                        diag_rows.set(rows);
+                    }
+                    notice.set(Some("Check finished.".into()));
+                }
+                Err(message) => error.set(Some(message)),
+            }
+        });
+    };
+
+    let save_check = move |_| {
+        let Some(slug) = selected.read().clone() else {
+            return;
+        };
+        let text = check_cmd.read().trim().to_owned();
+        let command: Vec<String> = serde_json::from_str(&text)
+            .ok()
+            .filter(|parts: &Vec<String>| !parts.is_empty())
+            .unwrap_or_else(|| text.split_whitespace().map(str::to_owned).collect());
+        if command.is_empty() {
+            error.set(Some(
+                "Enter a check command, e.g. [\"cargo\",\"check\"].".into(),
+            ));
+            return;
+        }
+        check_busy.set(true);
+        error.set(None);
+        spawn(async move {
+            let result = call(session, move |creds| api::check_put(creds, &slug, &command)).await;
+            check_busy.set(false);
+            match result {
+                Ok(_) => notice.set(Some("Check command saved.".into())),
+                Err(message) => error.set(Some(message)),
+            }
+        });
+    };
 
     let mut load_files = move |slug: String| {
         busy.set(true);
         error.set(None);
         let slug_req = slug.clone();
+        let slug_diag = slug.clone();
         spawn(async move {
             let result = call(session, move |creds| api::list_files(creds, &slug_req)).await;
             busy.set(false);
@@ -119,6 +259,7 @@ pub fn ProjectsView(session: Signal<Session>) -> Element {
                 Ok(value) => {
                     selected.set(Some(slug));
                     files.set(parse_files(&value));
+                    load_diags(slug_diag);
                 }
                 Err(message) => error.set(Some(message)),
             }
@@ -231,6 +372,56 @@ pub fn ProjectsView(session: Signal<Session>) -> Element {
         }
     };
 
+    // 0.74: workspace editor state and actions.
+    let mut ws_path = use_signal(|| Option::<String>::None);
+    let mut ws_text = use_signal(String::new);
+    let mut ws_dirty = use_signal(|| false);
+    let mut ws_status = use_signal(|| Option::<String>::None);
+    let mut ws_jump_line = use_signal(|| Option::<u64>::None);
+
+    let mut open_file = move |slug: String, path: String, line: Option<u64>| {
+        ws_status.set(None);
+        let s = slug.clone();
+        let p2 = path.clone();
+        spawn(async move {
+            let result = call(session, move |creds| api::download(creds, &s, &p2)).await;
+            match result {
+                Ok(bytes) => {
+                    ws_text.set(String::from_utf8_lossy(&bytes).into_owned());
+                    ws_path.set(Some(path));
+                    ws_dirty.set(false);
+                    ws_jump_line.set(line);
+                }
+                Err(message) => error.set(Some(message)),
+            }
+        });
+    };
+
+    let save_file = move |_| {
+        let (Some(slug), Some(path)) = (selected.read().clone(), ws_path.read().clone()) else {
+            return;
+        };
+        let content = ws_text.read().clone();
+        ws_status.set(Some("Saving…".into()));
+        spawn(async move {
+            let result = call(session, move |creds| {
+                api::write_file(creds, &slug, &path, &content)
+            })
+            .await;
+            match result {
+                Ok(_) => {
+                    ws_dirty.set(false);
+                    ws_status.set(Some("Saved.".into()));
+                    refresh();
+                }
+                Err(message) => {
+                    ws_status.set(Some(format!("Save failed: {message}")));
+                    error.set(Some(message));
+                }
+            }
+        });
+    };
+
     let project_list = projects.read().clone();
     let file_list = files.read().clone();
     let active_slug = selected.read().clone();
@@ -238,6 +429,21 @@ pub fn ProjectsView(session: Signal<Session>) -> Element {
     let err = error.read().clone();
     let note = notice.read().clone();
     let del_target = confirm_delete.read().clone();
+    let diag_list = diag_rows.read().clone();
+    let run_info = diag_run.read().clone();
+    let check_text = check_cmd.read().clone();
+    let checking = *check_busy.read();
+    let ws_open = ws_path.read().clone();
+    let ws_text_value = ws_text.read().clone();
+    let ws_dirty_flag = *ws_dirty.read();
+    let ws_status_text = ws_status.read().clone();
+    let ws_files = files.read().clone();
+    let ws_line_count = ws_text_value.lines().count().max(1);
+    let ws_jump = ws_jump_line
+        .read()
+        .as_ref()
+        .map(|l| l.to_string())
+        .unwrap_or_default();
 
     rsx! {
         div { class: "page-shell projects-page",
@@ -447,8 +653,205 @@ pub fn ProjectsView(session: Signal<Session>) -> Element {
                                 }
                             }
                         }
+                        div { style: "margin-top:16px;border-top:1px solid var(--border-subtle);padding-top:12px;",
+                            div { style: "display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:8px;",
+                                h4 { style: "margin:0;display:flex;align-items:center;gap:8px;",
+                                    "Problems"
+                                    if let Some(run) = run_info.as_ref() {
+                                        {
+                                            let errors = run["errors"].as_u64().unwrap_or(0);
+                                            let warnings = run["warnings"].as_u64().unwrap_or(0);
+                                            rsx! {
+                                                span { class: "chip", "{errors} errors \u{b7} {warnings} warnings" }
+                                            }
+                                        }
+                                    }
+                                }
+                                button {
+                                    r#type: "button",
+                                    class: "btn",
+                                    disabled: is_busy || checking,
+                                    onclick: run_check,
+                                    Icon { name: "refresh", size: 14 }
+                                    " Run checks"
+                                }
+                            }
+                            div { class: "field-row", style: "margin-bottom:8px;",
+                                input {
+                                    r#type: "text",
+                                    class: "input check-cmd-input",
+                                    placeholder: "Check command as JSON argv, e.g. [\"cargo\",\"check\",\"--message-format=json\"]",
+                                    "aria-label": "Check command",
+                                    "data-check-init": "{check_text}",
+                                    onmounted: move |_| {
+                                        document::eval(
+                                            "(() => { const el = document.querySelector('.check-cmd-input[data-check-init]'); if (!el) return; el.value = el.getAttribute('data-check-init') || ''; })()",
+                                        );
+                                    },
+                                    oninput: move |e| check_cmd.set(e.value()),
+                                }
+                                button {
+                                    r#type: "button",
+                                    class: "btn",
+                                    disabled: checking,
+                                    onclick: save_check,
+                                    "Save command"
+                                }
+                            }
+                            if diag_list.is_empty() {
+                                p { class: "muted",
+                                    if run_info.is_some() {
+                                        "No problems found in the last check."
+                                    } else {
+                                        "No check has run yet for this project."
+                                    }
+                                }
+                            } else {
+                                div { class: "diag-list",
+                                    for d in diag_list {
+                                        {
+                                            let key = format!(
+                                                "{}:{}:{}:{}",
+                                                d.file,
+                                                d.line.unwrap_or(0),
+                                                d.column.unwrap_or(0),
+                                                d.message.chars().take(48).collect::<String>()
+                                            );
+                                            let loc = match (d.line, d.column) {
+                                                (Some(l), Some(c)) => format!("{}:{}:{}", d.file, l, c),
+                                                (Some(l), None) => format!("{}:{}", d.file, l),
+                                                _ => d.file.clone(),
+                                            };
+                                            let (icon, sev_class) = match d.severity.as_str() {
+                                                "error" => ("alert", "diag-sev error"),
+                                                "warning" => ("alert-circle", "diag-sev warning"),
+                                                _ => ("code", "diag-sev note"),
+                                            };
+                                            let d_file = d.file.clone();
+                                            let d_line = d.line;
+                                            let d_editable = is_editable_name(&d_file);
+                                            let d_slug = slug.clone();
+                                            rsx! {
+                                                div {
+                                                    key: "{key}",
+                                                    class: "diag-row",
+                                                    style: if d_editable { "cursor:pointer;" } else { "" },
+                                                    title: if d_editable { "Open in workspace editor" } else { "" },
+                                                    onclick: move |_| {
+                                                        if d_editable {
+                                                            open_file(d_slug.clone(), d_file.clone(), d_line);
+                                                        }
+                                                    },
+                                                    span { class: "{sev_class}", Icon { name: icon, size: 14 } }
+                                                    div { class: "diag-copy",
+                                                        div { class: "diag-loc", "{loc}" }
+                                                        div { class: "diag-msg", "{d.message}" }
+                                                    }
+                                                    if let Some(code) = d.code.clone() {
+                                                        span { class: "chip mono", "{code}" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     } else {
                         p { class: "muted", "Select or create a project to browse its files." }
+                    }
+                }
+            }
+            if let Some(ws_slug) = active_slug.clone() {
+                div { class: "surface-card", style: "margin-top:16px;",
+                    div { class: "section-head", style: "display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px;",
+                        h3 { "Workspace" }
+                        div { class: "field-row",
+                            if let Some(status) = ws_status_text.as_ref() {
+                                span { class: "muted", "{status}" }
+                            }
+                            button {
+                                r#type: "button",
+                                class: "btn btn-primary",
+                                disabled: !ws_dirty_flag || is_busy,
+                                onclick: save_file,
+                                Icon { name: "check", size: 14 }
+                                " Save"
+                            }
+                        }
+                    }
+                    div { class: "ws-grid",
+                        div { class: "ws-tree", role: "tree", "aria-label": "Project files",
+                            if ws_files.is_empty() {
+                                p { class: "muted", style: "padding:8px;", "No files yet." }
+                            }
+                            for file in ws_files.clone() {
+                                {
+                                    let depth = file.path.matches('/').count();
+                                    let pad = 8 + depth * 14;
+                                    let editable = is_editable_file(&file.mime, &file.name);
+                                    let active = ws_open.as_deref() == Some(file.path.as_str());
+                                    let p_click = file.path.clone();
+                                    let s_click = ws_slug.clone();
+                                    rsx! {
+                                        button {
+                                            key: "{file.path}",
+                                            r#type: "button",
+                                            class: if active { "ws-tree-item active" } else if editable { "ws-tree-item" } else { "ws-tree-item dim" },
+                                            style: "padding-left:{pad}px;",
+                                            disabled: !editable,
+                                            title: "{file.path}",
+                                            onclick: move |_| {
+                                                if editable {
+                                                    open_file(s_click.clone(), p_click.clone(), None);
+                                                }
+                                            },
+                                            "{file.path}"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        div { class: "ws-editor",
+                            if let Some(path) = ws_open.clone() {
+                                div { class: "ws-editor-head",
+                                    span { "{path}" }
+                                    span { class: "muted", if ws_dirty_flag { "unsaved changes" } else { "saved" } }
+                                }
+                                div { class: "ws-editor-body",
+                                    div { class: "ws-gutter", "aria-hidden": "true",
+                                        for n in 1..=ws_line_count {
+                                            div { key: "{n}", "{n}" }
+                                        }
+                                    }
+                                    textarea {
+                                        key: "{path}",
+                                        class: "ws-textarea",
+                                        spellcheck: false,
+                                        "aria-label": "Edit {path}",
+                                        "data-ws-init": "{ws_text_value}",
+                                        "data-ws-line": "{ws_jump}",
+                                        onmounted: move |_| {
+                                            document::eval(
+                                                "(() => { const ta = document.querySelector('.ws-textarea[data-ws-init]'); if (!ta) return; ta.value = ta.getAttribute('data-ws-init') || ''; const line = Number(ta.getAttribute('data-ws-line') || 0); const g = document.querySelector('.ws-gutter'); if (line > 0) { const lines = ta.value.split('\\n'); let off = 0; for (let i = 0; i < line - 1 && i < lines.length; i++) off += lines[i].length + 1; ta.focus(); ta.selectionStart = ta.selectionEnd = off; const lh = parseFloat(getComputedStyle(ta).lineHeight) || 21; ta.scrollTop = Math.max(0, (line - 1) * lh - ta.clientHeight / 3); if (g) g.scrollTop = ta.scrollTop; } })()",
+                                            );
+                                        },
+                                        onscroll: move |_| {
+                                            document::eval(
+                                                "(() => { const ta = document.querySelector('.ws-textarea'); const g = document.querySelector('.ws-gutter'); if (ta && g) g.scrollTop = ta.scrollTop; })()",
+                                            );
+                                        },
+                                        oninput: move |e| {
+                                            ws_text.set(e.value());
+                                            ws_dirty.set(true);
+                                            ws_status.set(None);
+                                        },
+                                    }
+                                }
+                            } else {
+                                p { class: "muted", style: "padding:12px;", "Select a text file on the left to edit it here. A problem below jumps straight to its line." }
+                            }
+                        }
                     }
                 }
             }

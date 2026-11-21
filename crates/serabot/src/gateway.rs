@@ -59,6 +59,8 @@ pub const DESTRUCTIVE_TOOLS: &[&str] = &[
     "whatsapp_send_template",
     // 0.70: sends a member file to a third-party website.
     "browser_upload",
+    // 0.73: runs the project's configured check command (starts a process).
+    "project_check",
     // 0.64: `whatsapp_link_send` is not here. It only reaches the member's own
     // allowed chats, under per-minute and daily caps (owner decision).
 ];

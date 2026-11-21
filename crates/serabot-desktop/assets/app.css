@@ -594,7 +594,7 @@ body {
   /* Section headers are wayfinding, not decoration: sentence case, one
      weight, quiet. Four uppercase labels in 240px compete with each other
      and none reads as hierarchy. */
-  font-size: 10.5px;
+  font-size: var(--fs-micro);
   font-weight: 600;
   letter-spacing: 0.02em;
   text-transform: none;
@@ -1043,7 +1043,7 @@ body {
   border-color: var(--hairline);
   color: var(--label-2);
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: var(--fs-micro);
   letter-spacing: 0;
 }
 
@@ -1159,7 +1159,7 @@ body {
 .avatar.sm {
   width: 22px;
   height: 22px;
-  font-size: 10px;
+  font-size: var(--fs-micro);
 }
 
 .avatar.bot {
@@ -1244,7 +1244,7 @@ body {
 .msg-body h1,
 .msg-body h2,
 .msg-body h3 {
-  font-size: 15px;
+  font-size: var(--fs-title);
   font-weight: 600;
   letter-spacing: -0.01em;
   margin: 18px 0 6px;
@@ -2793,7 +2793,7 @@ button:not(:disabled):active,
   border-radius: var(--r-pill);
   background: var(--hover);
   color: var(--label-2);
-  font-size: 11.5px;
+  font-size: var(--fs-micro);
   font-weight: 500;
   line-height: 1.5;
   white-space: nowrap;
@@ -2955,7 +2955,7 @@ button:not(:disabled):active,
   overflow: hidden;
   text-align: center;
   white-space: normal;
-  font-size: 10.5px;
+  font-size: var(--fs-micro);
   font-weight: 550;
   line-height: 1.15;
   letter-spacing: 0;
@@ -2978,7 +2978,7 @@ button:not(:disabled):active,
   border-radius: var(--r-pill);
   background: var(--danger);
   color: var(--on-accent);
-  font-size: 10px;
+  font-size: var(--fs-micro);
   font-weight: 700;
   line-height: 1;
   font-variant-numeric: tabular-nums;
@@ -3157,7 +3157,7 @@ button:not(:disabled):active,
 .chat-header .avatar-stack .avatar {
   width: 22px;
   height: 22px;
-  font-size: 10px;
+  font-size: var(--fs-micro);
 }
 
 .icon-btn[aria-pressed="true"] {
@@ -3228,7 +3228,7 @@ button:not(:disabled):active,
   background: var(--tool-bg);
   border: 1px solid var(--hairline);
   color: var(--label-2);
-  font-size: 12.5px;
+  font-size: var(--fs-caption);
   animation: pane-in var(--dur-2) var(--spring);
 }
 
@@ -5123,7 +5123,7 @@ html[data-reduce-transparency="true"] .chat-header {
 .tasks-page .pane-sub {
   margin: 2px 0 0;
   color: var(--label-2);
-  font-size: 13px;
+  font-size: var(--fs-caption);
 }
 
 .tasks-head-actions {
@@ -5139,7 +5139,7 @@ html[data-reduce-transparency="true"] .chat-header {
   color: var(--label-2);
   border-radius: 8px;
   padding: 4px 10px;
-  font-size: 12px;
+  font-size: var(--fs-caption);
   cursor: pointer;
 }
 
@@ -5155,7 +5155,7 @@ html[data-reduce-transparency="true"] .chat-header {
   border-radius: 10px;
   background: var(--warn-soft);
   color: var(--label-1);
-  font-size: 13px;
+  font-size: var(--fs-caption);
 }
 
 .tasks-add {
@@ -5193,7 +5193,7 @@ html[data-reduce-transparency="true"] .chat-header {
   color: var(--label-2);
   border-radius: 8px;
   padding: 4px 10px;
-  font-size: 12px;
+  font-size: var(--fs-caption);
   cursor: pointer;
 }
 
@@ -5245,7 +5245,7 @@ html[data-reduce-transparency="true"] .chat-header {
   border: none;
   border-radius: 999px;
   padding: 2px 10px;
-  font-size: 11px;
+  font-size: var(--fs-micro);
   cursor: pointer;
   text-transform: capitalize;
   flex: 0 0 auto;
@@ -5256,7 +5256,7 @@ html[data-reduce-transparency="true"] .chat-header {
 .task-row .task-status.done { background: var(--ok-soft); color: var(--label-1); text-decoration: line-through; }
 
 .task-row .task-due {
-  font-size: 12px;
+  font-size: var(--fs-caption);
   color: var(--label-2);
   flex: 0 0 auto;
 }
@@ -5267,14 +5267,14 @@ html[data-reduce-transparency="true"] .chat-header {
 }
 
 .task-row .task-synced {
-  font-size: 12px;
+  font-size: var(--fs-caption);
   color: var(--accent);
 }
 
 .tasks-done {
   margin-top: 14px;
   color: var(--label-2);
-  font-size: 13px;
+  font-size: var(--fs-caption);
 }
 
 .kanban {
@@ -5298,7 +5298,7 @@ html[data-reduce-transparency="true"] .chat-header {
   align-items: center;
   gap: 6px;
   margin: 0 0 8px;
-  font-size: 12px;
+  font-size: var(--fs-caption);
   color: var(--label-2);
 }
 
@@ -5327,7 +5327,7 @@ html[data-reduce-transparency="true"] .chat-header {
 }
 
 .cal-dow {
-  font-size: 11px;
+  font-size: var(--fs-micro);
   color: var(--label-2);
   text-align: center;
   padding: 4px 0;
@@ -5356,7 +5356,7 @@ html[data-reduce-transparency="true"] .chat-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  font-size: 11px;
+  font-size: var(--fs-micro);
   color: var(--label-2);
   margin-bottom: 4px;
 }
@@ -5384,7 +5384,7 @@ html[data-reduce-transparency="true"] .chat-header {
 }
 
 .cal-item {
-  font-size: 11px;
+  font-size: var(--fs-micro);
   border-radius: 6px;
   padding: 1px 6px;
   margin-top: 2px;
@@ -5398,7 +5398,7 @@ html[data-reduce-transparency="true"] .chat-header {
 
 .cal-more {
   margin-top: 3px;
-  font-size: 10.5px;
+  font-size: var(--fs-micro);
   color: var(--label-3);
 }
 
@@ -5434,7 +5434,7 @@ html[data-reduce-transparency="true"] .chat-header {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   font: inherit;
-  font-size: 12px;
+  font-size: var(--fs-caption);
   color: var(--label-2);
 }
 
@@ -5442,7 +5442,7 @@ html[data-reduce-transparency="true"] .chat-header {
 .thinking-select {
   width: auto;
   max-width: 170px;
-  font-size: 12px;
+  font-size: var(--fs-caption);
 }
 
 /* Model chip inside the composer. */
@@ -5984,12 +5984,12 @@ html[data-reduce-transparency="true"] .chat-header {
 }
 
 .drop-zone-title {
-  font-size: 15px;
+  font-size: var(--fs-title);
   font-weight: 600;
 }
 
 .drop-zone-meta {
-  font-size: 12.5px;
+  font-size: var(--fs-caption);
   color: var(--label-3);
 }
 
@@ -6015,7 +6015,7 @@ html[data-reduce-transparency="true"] .chat-header {
   order: -2;
   flex: 1 0 100%;
   padding: 0 8px;
-  font-size: 12px;
+  font-size: var(--fs-caption);
   color: var(--label-3);
 }
 
@@ -6023,7 +6023,7 @@ html[data-reduce-transparency="true"] .chat-header {
   order: -3;
   flex: 1 0 100%;
   padding: 0 8px;
-  font-size: 11.5px;
+  font-size: var(--fs-micro);
   color: var(--label-3);
   font-variant-numeric: tabular-nums;
   text-align: right;
@@ -6044,7 +6044,7 @@ html[data-reduce-transparency="true"] .chat-header {
   border-radius: 10px;
   background: var(--warn-soft);
   color: var(--label-2);
-  font-size: 12.5px;
+  font-size: var(--fs-caption);
   line-height: 1.4;
 }
 
@@ -6186,7 +6186,7 @@ html[data-reduce-transparency="true"] .chat-header {
   gap: 12px;
   margin: 14px auto 6px;
   color: var(--label-3);
-  font-size: 12px;
+  font-size: var(--fs-caption);
 }
 
 .day-sep::before,
@@ -6203,7 +6203,7 @@ html[data-reduce-transparency="true"] .chat-header {
   align-items: center;
   gap: 8px;
   color: var(--label-3);
-  font-size: 13px;
+  font-size: var(--fs-caption);
 }
 
 .working-dots {
@@ -6261,7 +6261,7 @@ html[data-reduce-transparency="true"] .chat-header {
   background: var(--glass);
   color: var(--label-2);
   font: inherit;
-  font-size: 13px;
+  font-size: var(--fs-caption);
   cursor: pointer;
   transition: background-color 120ms ease, transform 100ms ease-out;
 }
@@ -6318,7 +6318,7 @@ html[data-reduce-transparency="true"] .chat-header {
   border-radius: 999px;
   background: var(--accent);
   color: #fff;
-  font-size: 11px;
+  font-size: var(--fs-micro);
   font-weight: 600;
   line-height: 18px;
   text-align: center;
@@ -6334,7 +6334,7 @@ html[data-reduce-transparency="true"] .chat-header {
 
 .md-code-lang {
   color: var(--label-3);
-  font-size: 11.5px;
+  font-size: var(--fs-micro);
 }
 
 .md-code-copy {
@@ -6345,7 +6345,7 @@ html[data-reduce-transparency="true"] .chat-header {
   background: transparent;
   color: var(--label-3);
   font: inherit;
-  font-size: 12px;
+  font-size: var(--fs-caption);
   cursor: pointer;
 }
 
@@ -6427,7 +6427,7 @@ html[data-reduce-transparency="true"] .chat-header {
 /* Shown in place of Stop while a tool waits for the owner's approval. */
 .composer-waiting {
   padding: 0 8px;
-  font-size: 12.5px;
+  font-size: var(--fs-caption);
   color: var(--label-3);
   white-space: nowrap;
 }
@@ -6793,7 +6793,7 @@ html[data-reduce-transparency="true"] .chat-header {
   height: 18px;
   padding: 0 5px;
   border-radius: 999px;
-  font-size: 11px;
+  font-size: var(--fs-micro);
   font-weight: 600;
   color: var(--muted);
   background: var(--surface-2, rgba(127, 127, 127, 0.12));
@@ -6832,7 +6832,7 @@ html[data-reduce-transparency="true"] .chat-header {
 }
 
 .chat-switcher-meta {
-  font-size: 11px;
+  font-size: var(--fs-micro);
   color: var(--muted);
   white-space: nowrap;
   overflow: hidden;
@@ -6864,7 +6864,7 @@ html[data-reduce-transparency="true"] .chat-header {
   flex: 1 1 auto;
   min-width: 0;
   height: 28px;
-  font-size: 13px;
+  font-size: var(--fs-caption);
 }
 
 .inline-approvals {
@@ -6893,7 +6893,7 @@ html[data-reduce-transparency="true"] .chat-header {
 
 .approval-card-summary {
   margin: 0;
-  font-size: 13px;
+  font-size: var(--fs-caption);
   line-height: 1.4;
 }
 
