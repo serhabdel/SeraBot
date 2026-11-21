@@ -12,6 +12,7 @@ import '../widgets.dart';
 import 'alerts_screen.dart';
 import 'costs_screen.dart';
 import 'jobs_screen.dart';
+import 'mail_screen.dart';
 import 'usage_insights_screen.dart';
 
 /// Account, theme, read-only connector status, usage summary and About.
@@ -155,6 +156,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
           const Divider(),
           _section(context, 'Connectors'),
           ..._connectorTiles(context),
+          const Divider(),
+          _section(context, 'Mail'),
+          ListTile(
+            key: const Key('mail-settings'),
+            leading: const Icon(Icons.mail_outlined),
+            title: const Text('Mail (SMTP / IMAP)'),
+            subtitle: const Text(
+              'Hostinger or any mailbox: connect, test and disconnect',
+            ),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => MailScreen(app: widget.app),
+              ),
+            ),
+          ),
           const Divider(),
           if (_usage?.quota.enforced ?? false) ...[
             _section(context, 'Quota'),
