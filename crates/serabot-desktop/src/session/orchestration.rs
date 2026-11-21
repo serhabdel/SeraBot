@@ -158,6 +158,8 @@ impl Session {
             Ok(_) => {
                 self.composer.zeroize();
                 self.composer = String::new();
+                // Queuing consumes the draft, like sending: the view clears.
+                self.composer_gen = self.composer_gen.wrapping_add(1);
                 self.drafts.clear(&self.conversation);
             }
             Err(refusal) => self.toast = Some(refusal.message().into()),
