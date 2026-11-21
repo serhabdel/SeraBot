@@ -36,6 +36,41 @@ impl Runtime {
         Ok(resolve_turn_limits(config_defaults(&self.config), owner))
     }
 
+    /// Re-emit `turn.context` with the current prompt estimate and the window
+    /// of `selection` (0.74.3): after a compaction shrank the prompt, or after
+    /// failover moved the turn to another route, the meter the turn start sent
+    /// is stale. Best-effort like the turn-start emission: a failed append
+    /// never fails the turn.
+    fn emit_turn_context(
+        &self,
+        user: &str,
+        task_id: &str,
+        turn_id: &str,
+        conversation_id: &str,
+        bot: &str,
+        selection: &ModelSelection,
+        messages: &[LlmMessage],
+    ) {
+        let est = estimate_prompt_chars(messages) as u64;
+        let window = self.window_for_selection(user, selection);
+        let percent = window
+            .filter(|w| *w > 0)
+            .map(|w| (est.saturating_mul(100) / w).min(100) as u32);
+        let _ = self.store.append_event(
+            user,
+            "turn.context",
+            &json!({
+                "turn_id": turn_id,
+                "task_id": task_id,
+                "conversation_id": conversation_id,
+                "bot": bot,
+                "prompt_chars_est": est,
+                "window": window,
+                "percent": percent,
+            }),
+        );
+    }
+
     pub(super) async fn run_turn(&self, task: &Task) -> Result<TurnOutcome> {
         let payload: TurnPayload = serde_json::from_value(task.payload.clone())
             .map_err(|error| SeraError::Validation(format!("invalid turn payload: {error}")))?;
@@ -114,23 +149,14 @@ impl Runtime {
         // can show a context meter before compaction happens.
         {
             let route = self.checked_route(&user, &payload.route)?.clone();
-            let est = estimate_prompt_chars(&history) as u64;
-            let window = self.window_for(&user, &route);
-            let percent = window
-                .filter(|w| *w > 0)
-                .map(|w| (est.saturating_mul(100) / w).min(100) as u32);
-            let _ = self.store.append_event(
+            self.emit_turn_context(
                 &user,
-                "turn.context",
-                &json!({
-                    "turn_id": turn.id,
-                    "task_id": task.id,
-                    "conversation_id": payload.conversation_id,
-                    "bot": payload.bot,
-                    "prompt_chars_est": est,
-                    "window": window,
-                    "percent": percent,
-                }),
+                &task.id,
+                &turn.id,
+                &payload.conversation_id,
+                &payload.bot,
+                &route.selection,
+                &history,
             );
         }
         if let Some(handoff) = &payload.handoff {
@@ -799,7 +825,9 @@ impl Runtime {
         };
         upsert_app_notice(&mut state.messages, &app_notes);
         let temperature = bot.config.temperature;
-        self.checked_route(&user, &state.route)?;
+        // 0.74.3: the selection the last `turn.context` event described. It
+        // starts as the pinned head; a failover (or a switch back) moves it.
+        let mut context_selection = self.checked_route(&user, &state.route)?.selection.clone();
 
         let limits = self.turn_limits_for(&user)?;
         for _ in 0..limits.max_tool_rounds {
@@ -837,7 +865,19 @@ impl Runtime {
                             .finish_stopped(task, turn, &state, conversation_id)
                             .await;
                     };
-                    compact_res?;
+                    if compact_res? {
+                        // 0.74.3: the prompt just shrank; the meter the turn
+                        // start sent is stale.
+                        self.emit_turn_context(
+                            &user,
+                            &task.id,
+                            &turn.id,
+                            conversation_id,
+                            &turn.bot,
+                            &route.selection,
+                            &state.messages,
+                        );
+                    }
                 }
                 self.scan_model_messages(&user, &state.messages)?;
                 self.gateway
@@ -903,12 +943,38 @@ impl Runtime {
                         if !compacted {
                             return Err(error);
                         }
+                        // 0.74.3: the prompt just shrank; re-emit the context
+                        // for the route the retry will use.
+                        self.emit_turn_context(
+                            &user,
+                            &task.id,
+                            &turn.id,
+                            conversation_id,
+                            &turn.bot,
+                            &route.selection,
+                            &state.messages,
+                        );
                     }
                     Err(error) => return Err(error),
                 }
             };
             let used = routed.used;
             let response = routed.response;
+            // 0.74.3: a failover (or a switch back to the head route) changes
+            // the window the meter should show; re-emit the context for the
+            // route that actually answered.
+            if used != context_selection {
+                self.emit_turn_context(
+                    &user,
+                    &task.id,
+                    &turn.id,
+                    conversation_id,
+                    &turn.bot,
+                    &used,
+                    &state.messages,
+                );
+                context_selection = used.clone();
+            }
             if let Some(reasoning) = response.reasoning.as_deref() {
                 self.emit_thinking(&user, task, turn, reasoning);
             }
