@@ -482,8 +482,11 @@ pub fn write_project_file(
         .unwrap_or("file")
         .to_string();
     std::fs::write(&target, content.as_bytes())?;
+    // Strip against the non-canonicalized project_dir: canonicalize() returns
+    // the \\?\ UNC form on Windows, which would never prefix-match here.
+    // Containment is already proven via parent_canon above.
     let rel_in_project = target
-        .strip_prefix(&project_canon)
+        .strip_prefix(&project_dir)
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .unwrap_or_else(|_| filename.clone());
     let inbox_path = format!("{user_id}/{PROJECTS_DIR}/{slug}/{rel_in_project}");
