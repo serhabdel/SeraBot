@@ -93,3 +93,4 @@ the console, or a bot may set it itself with `yolo_toggle` when its judgement
 says the task should run without prompts; every self-enable is audited as
 `yolo.self_enabled`. **YOLO never covers a destructive tool** — those always
 wait for the owner's own decision, even with YOLO on.
+| `mail_send` (mail branch) | Sends an email (optionally with attachments) through the member's own SMTP mailbox to named recipients. The approval names the recipients and subject. |

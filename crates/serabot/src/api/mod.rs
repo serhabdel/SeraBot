@@ -68,6 +68,7 @@ mod job_search;
 mod jobs;
 mod local;
 mod logs;
+mod mail;
 mod marketplace;
 mod media;
 mod memories;
@@ -888,6 +889,7 @@ pub fn router(state: ApiState) -> Router {
         .merge(profiles::routes())
         .merge(files::routes())
         .merge(projects::routes())
+        .merge(mail::routes())
         .merge(local::routes())
         .layer(middleware::from_fn_with_state(shared.clone(), rate_limit))
         .layer(middleware::from_fn_with_state(shared.clone(), authorize));
