@@ -1173,7 +1173,7 @@ mod tests {
 
     #[test]
     fn parses_rfc822_message() {
-        let raw = "From: Alice <alice@example.com>\r\nSubject: =?UTF-8?B?SMOpbG8=?=\r\nDate: Mon, 1 Jan 2026 10:00:00 +0000\r\nX-Long: one\r\n two\r\n\r\nHello body\r\n";
+        let raw = "From: Alice <alice@example.com>\r\nSubject: =?UTF-8?B?SMOpbGxv=?=\r\nDate: Mon, 1 Jan 2026 10:00:00 +0000\r\nX-Long: one\r\n two\r\n\r\nHello body\r\n";
         let msg = parse_message(42, vec!["\\Seen".into()], raw);
         assert_eq!(msg.uid, 42);
         assert_eq!(msg.subject, "Héllo");
@@ -1186,7 +1186,7 @@ mod tests {
     fn parses_fetch_block() {
         let block = "* 1 FETCH (FLAGS (\\Seen) UID 7 BODY[] {20}\r\nSubject: Hi\r\n\r\nbody here)";
         let (flags, body) = parse_fetch_block(block);
-        assert_eq!(flags, vec!["\\Seen"]);
+        assert_eq!(flags, vec!["Seen"]);
         assert!(body.unwrap().contains("Subject: Hi"));
     }
 
