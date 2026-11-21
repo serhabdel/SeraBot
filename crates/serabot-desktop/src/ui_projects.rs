@@ -104,15 +104,13 @@ fn parse_diagnostics(value: &Value) -> (Option<Value>, Vec<DiagRow>) {
         .map(|items| {
             items
                 .iter()
-                .filter_map(|item| {
-                    Some(DiagRow {
-                        file: item["file"].as_str().unwrap_or("").to_owned(),
-                        line: item["line"].as_u64(),
-                        column: item["column"].as_u64(),
-                        severity: item["severity"].as_str().unwrap_or("note").to_owned(),
-                        code: item["code"].as_str().map(str::to_owned),
-                        message: item["message"].as_str().unwrap_or("").to_owned(),
-                    })
+                .map(|item| DiagRow {
+                    file: item["file"].as_str().unwrap_or("").to_owned(),
+                    line: item["line"].as_u64(),
+                    column: item["column"].as_u64(),
+                    severity: item["severity"].as_str().unwrap_or("note").to_owned(),
+                    code: item["code"].as_str().map(str::to_owned),
+                    message: item["message"].as_str().unwrap_or("").to_owned(),
                 })
                 .collect()
         })
@@ -147,7 +145,7 @@ pub fn ProjectsView(session: Signal<Session>) -> Element {
     let mut check_cmd = use_signal(String::new);
     let mut check_busy = use_signal(|| false);
 
-    let mut load_diags = move |slug: String| {
+    let load_diags = move |slug: String| {
         let slug_diag = slug.clone();
         let slug_cmd = slug.clone();
         spawn(async move {
