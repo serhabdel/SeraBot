@@ -1928,3 +1928,102 @@ html[data-reduce-transparency="true"] .sheet.sheet-palette {
   font-weight: 600;
 }
 
+
+/* Handwritten notes (0.74.3): the hand font at message size, a touch
+   larger, with a roomier line. No tilt, no paper in v1: the typeface alone
+   carries the handwriting. */
+.md-hand {
+  font-family: var(--font-hand);
+  font-size: calc(var(--fs-msg) * 1.18);
+  line-height: 1.55;
+  color: inherit;
+}
+
+/* The one live working indicator (0.74.3). Built from the same tokens as
+   `.banner` (surface, hairline, radius, body size), `.chip` (chips) and
+   `.btn` (actions); the dot reuses the `pulse` keyframes of `.pill-dot`. */
+.live-card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  border: 1px solid var(--hairline);
+  font-size: var(--fs-body-2);
+  color: var(--label-1);
+}
+
+.live-card .live-dot {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: var(--r-pill);
+  background: var(--accent);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+.live-card .live-text {
+  font-weight: 600;
+}
+
+.live-card .live-sub {
+  color: var(--label-2);
+}
+
+.live-card .live-time {
+  color: var(--label-3);
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
+}
+
+.live-card .live-chip {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.live-card .reason-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  border: 1px solid var(--hairline);
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.live-card .banner {
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  border: 0;
+}
+
+.live-card.failed {
+  display: block;
+}
+
+.live-card .live-failed-line {
+  margin: 0 0 8px;
+  color: var(--label-2);
+  font-size: var(--fs-body-2);
+}
+
+.live-card .live-failed-line + .failed-card {
+  margin: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .live-card .live-dot {
+    animation: none;
+  }
+}
+
+.root[data-motion="reduce"] .live-card .live-dot {
+  animation: none;
+}
