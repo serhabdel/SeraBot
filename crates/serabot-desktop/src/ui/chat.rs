@@ -71,6 +71,8 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     })
                     .collect::<Vec<_>>(),
             ),
+            state.state.turns.revision(),
+            &state.state.activity,
         );
         let cached = row_cache
             .borrow()
@@ -340,12 +342,133 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             .collect::<Vec<RosterRow>>();
         (active, name, avatar, roster)
     };
-    // "Main is working", plus the step that is running right now.
-    let running_step = steps
-        .iter()
-        .find(|step| step.phase == StepPhase::Running)
-        .map(|step| step.label.clone());
-    let working = chat_feed::working_line(&active_name, running_step.as_deref());
+    // The one working indicator (0.74.3): a single LiveCard derived from
+    // the live turn — the same single running step the step rows show, so
+    // the feed never shows two "working" states at once. It collapses into
+    // the reply's TurnTrace when the turn completes.
+    let model_label = {
+        let state = session.read();
+        let bot = state.conversation_bot(&state.conversation);
+        if bot
+            .as_deref()
+            .is_some_and(|bot| state.bot_uses_claude_agent(bot))
+        {
+            "Claude Code (local)".to_owned()
+        } else {
+            match state.state.catalog.as_ref().map(|c| &c.selection) {
+                Some(selection) if !selection.is_auto() => short_model(&selection.model),
+                _ => "Auto".to_owned(),
+            }
+        }
+    };
+    // The latest route switch, for the failover flash (~6s) and the
+    // waiting-for-a-model reason chip. Labels only: no provider error text.
+    let latest_switch = {
+        let state = session.read();
+        state
+            .state
+            .route_events
+            .iter()
+            .filter(|event| {
+                event
+                    .to_provider
+                    .as_deref()
+                    .is_some_and(|provider| !provider.is_empty())
+            })
+            .max_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| a.id.cmp(&b.id))
+            })
+            .cloned()
+    };
+    let failover: Option<(String, String)> = {
+        let state = session.read();
+        let now_secs = serabot_desktop::workflows::now_secs();
+        latest_switch
+            .clone()
+            .filter(|event| {
+                serabot_desktop::workflows::epoch_secs(&event.created_at)
+                    .is_some_and(|at| now_secs >= at && now_secs - at <= 6)
+            })
+            .map(|event| {
+                let options = state.route_options();
+                let from = serabot_desktop::route_editor::route_line(
+                    &options,
+                    event.from_provider.as_deref().unwrap_or(""),
+                    event.from_account.as_deref(),
+                    event.from_model.as_deref().unwrap_or(""),
+                    None,
+                );
+                let to = serabot_desktop::route_editor::route_line(
+                    &options,
+                    event.to_provider.as_deref().unwrap_or(""),
+                    event.to_account.as_deref(),
+                    event.to_model.as_deref().unwrap_or(""),
+                    None,
+                );
+                (from, to)
+            })
+    };
+    let waiting_reason = latest_switch
+        .as_ref()
+        .map(|event| serabot_desktop::route_editor::reason_text(&event.reason).to_owned());
+    // Another bot working in this conversation is a handoff: the Jobs panel
+    // already decides what counts, so the card reuses its rule and its name.
+    let delegate_bot: Option<String> = {
+        let state = session.read();
+        let items = serabot_desktop::jobs::build(
+            state.state.task.as_ref(),
+            &state.state.media_jobs,
+            &state.state.working,
+            &state.state.activity,
+            &state.conversation,
+            &state.state.jobs_reliability,
+            Instant::now(),
+        );
+        items
+            .iter()
+            .find(|item| item.kind == serabot_desktop::jobs::JobKind::Handoff)
+            .map(|item| state.bot_display_name(&item.bot))
+    };
+    let streaming_reply = session
+        .read()
+        .state
+        .messages
+        .last()
+        .is_some_and(|message| message.role != Role::User);
+    let live_card: Option<LiveCardData> = (live_task.is_some() || wait_line.is_some()).then(|| {
+        let activity = session.read().state.activity.clone();
+        derive_live_card(LiveCardInputs {
+            bot_name: &active_name,
+            model_label: Some(model_label.as_str()),
+            activity: &activity,
+            waiting_line: wait_line.as_deref(),
+            waiting_reason: waiting_reason.as_deref(),
+            failover: failover
+                .as_ref()
+                .map(|(from, to)| (from.as_str(), to.as_str())),
+            delegate_bot: delegate_bot.as_deref(),
+            streaming_reply,
+            failed: false,
+            now: Instant::now(),
+        })
+    });
+    let failed_live_card: Option<LiveCardData> = show_failed_card.as_ref().map(|_| {
+        let activity = session.read().state.activity.clone();
+        derive_live_card(LiveCardInputs {
+            bot_name: &active_name,
+            model_label: Some(model_label.as_str()),
+            activity: &activity,
+            waiting_line: None,
+            waiting_reason: None,
+            failover: None,
+            delegate_bot: None,
+            streaming_reply: false,
+            failed: true,
+            now: Instant::now(),
+        })
+    });
     let bot_meta: HashMap<String, (String, bool)> = roster
         .iter()
         .map(|(id, _, _, _, live, role)| (id.clone(), (role.clone(), *live)))
@@ -470,29 +593,36 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let mut dismissed_transcript_err = use_signal(|| Option::<String>::None);
     let enter_sends_pref = session.read().prefs.enter_sends;
     let mut composer_room = use_signal(|| session.read().conversation.clone());
-    let mut prev_external = use_signal(|| session.read().composer.clone());
+    let mut prev_gen = use_signal(|| session.read().composer_gen);
     use_effect(move || {
-        let (conversation, external) = {
+        let (conversation, external, gen) = {
             let state = session.read();
-            (state.conversation.clone(), state.composer.clone())
+            (
+                state.conversation.clone(),
+                state.composer.clone(),
+                state.composer_gen,
+            )
         };
         if *composer_room.peek() != conversation {
             composer_room.set(conversation);
-            prev_external.set(external.clone());
+            prev_gen.set(gen);
             composer_draft.set(external);
             return;
         }
-        let prev = prev_external.peek().clone();
+        // The generation decides: only an intentional replace (chip, slash
+        // insert, failed-send restore, conversation switch) syncs the box.
+        // Background session writes while the owner types never erase input.
         if chat_compose::should_sync_external_composer(
             &external,
-            &prev,
+            gen,
+            *prev_gen.peek(),
             *composer_focused.peek(),
             &composer_draft.peek(),
         ) {
             composer_draft.set(external.clone());
         }
-        if external != prev {
-            prev_external.set(external);
+        if gen != *prev_gen.peek() {
+            prev_gen.set(gen);
         }
     });
     // Files pasted into the composer arrive through the JS bridge.
@@ -517,21 +647,27 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             }
         }
     });
-    // The first visible row, reported by the page after it moved a few rows.
+    // The first visible row, reported by the page as its message id after it
+    // moved a few rows. The id resolves to an index against the ids as last
+    // drawn, so rows loading in front never move the window.
     use_future(move || {
         let ids = Rc::clone(&feed_ids_sink);
         async move {
             let _ = dioxus::document::eval(&feed_view::feed_window_js());
             let mut sink = dioxus::document::eval(feed_view::FEED_SINK_JS);
-            while let Ok(index) = sink.recv::<i64>().await {
-                let index = usize::try_from(index).unwrap_or(0);
+            while let Ok(id) = sink.recv::<String>().await {
+                let Some(index) = feed_view::anchor_index(
+                    ids.borrow().iter().map(String::as_str),
+                    id.as_str(),
+                ) else {
+                    continue;
+                };
                 if !feed_view::moved_enough(*feed_reported.peek(), index) {
                     continue;
                 }
                 feed_reported.set(Some(index));
-                let id = ids.borrow().get(index).cloned();
-                if *feed_anchor.peek() != id {
-                    feed_anchor.set(id);
+                if *feed_anchor.peek().as_deref() != Some(id.as_str()) {
+                    feed_anchor.set(Some(id));
                 }
             }
         }
@@ -585,7 +721,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         } else {
             format!("{}\n{}", composer.composer, text)
         };
-        composer.composer = next.clone();
+        composer.replace_composer(next.clone());
         composer_draft.set(next);
     });
     use_effect(move || {
@@ -1118,7 +1254,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                             r#type: "button",
                                             onclick: move |_| {
                                                 let text = text.to_owned();
-                                                session.write().composer = text.clone();
+                                                session.write().replace_composer(text.clone());
                                                 composer_draft.set(text);
                                                 focus_composer();
                                             },
@@ -1133,7 +1269,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                             class: "suggestion",
                                             onclick: move |_| {
                                                 let text = text.to_owned();
-                                                session.write().composer = text.clone();
+                                                session.write().replace_composer(text.clone());
                                                 composer_draft.set(text);
                                                 focus_composer();
                                             },
@@ -1219,6 +1355,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                 bot_meta: view.bot_meta,
                                 media: view.media,
                                 accepts,
+                                handwritten: session.read().prefs.handwritten_notes,
                                 copied,
                                 confirm_regen,
                                 task_added_ids,
@@ -1286,18 +1423,22 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     }
                     if live_task.is_some() {
                         div { class: "activity", role: "status", "aria-live": "polite",
-                            span { class: "working",
-                                span { class: "working-text",
-                                    if stopping {
-                                        "Stopping\u{2026}"
-                                    } else {
-                                        "{working}"
+                            if stopping {
+                                span { class: "working",
+                                    span { class: "working-text", "Stopping\u{2026}" }
+                                    span { class: "working-dots", "aria-hidden": "true",
+                                        span {}
+                                        span {}
+                                        span {}
                                     }
                                 }
-                                span { class: "working-dots", "aria-hidden": "true",
-                                    span {}
-                                    span {}
-                                    span {}
+                            } else if let Some(data) = live_card.clone() {
+                                LiveCard {
+                                    session,
+                                    data,
+                                    failed_card: None,
+                                    failed_can_act: false,
+                                    ondismiss: move |_| {},
                                 }
                             }
                             if !steps.is_empty() {
@@ -1375,18 +1516,18 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     }
                     crate::ui_cards::InlineApprovals { session }
                     if let Some(card) = show_failed_card.clone() {
-                        FailedTurnCard {
-                            session,
-                            card,
-                            can_act: can_send_again,
-                            ondismiss: {
-                                let failed = failed_task.clone();
-                                move |_| dismissed_fallback.set(failed.clone())
-                            },
+                        if let Some(data) = failed_live_card.clone() {
+                            LiveCard {
+                                session,
+                                data,
+                                failed_card: Some(card),
+                                failed_can_act: can_send_again,
+                                ondismiss: {
+                                    let failed = failed_task.clone();
+                                    move |_| dismissed_fallback.set(failed.clone())
+                                },
+                            }
                         }
-                    }
-                    if let Some(line) = wait_line.clone() {
-                        WaitBanner { line }
                     }
                     if let Some(failure) = show_failure.clone() {
                         div { class: "banner err", role: "alert",
@@ -1490,7 +1631,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     onclick: move |_| {
                                         let redacted = chat_compose::redact_sensitive_draft(&composer_draft());
                                         composer_draft.set(redacted.clone());
-                                        session.write().composer = redacted;
+                                        session.write().replace_composer(redacted);
                                         focus_composer();
                                     },
                                     "Redact before sending"
@@ -1612,7 +1753,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                                     let text = composer_draft();
                                                     let next = insert_mention_text(&text, &id);
                                                     composer_draft.set(next.clone());
-                                                    session.write().composer = next;
+                                                    session.write().replace_composer(next);
                                                     mention.set(None);
                                                     mention_idx.set(0);
                                                     focus_composer();
@@ -1628,7 +1769,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                                         if let Some((command, _, _)) = key_slash_actions.get(i) {
                                                             let next = format!("/{command}");
                                                             composer_draft.set(next.clone());
-                                                            session.write().composer = next;
+                                                            session.write().replace_composer(next);
                                                             slash.set(None);
                                                             slash_idx.set(0);
                                                             focus_composer();
@@ -1638,7 +1779,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                                         if let Some((id, _, _)) = key_slash_skills.get(i) {
                                                             let next = insert_slash_text(&composer_draft(), id);
                                                             composer_draft.set(next.clone());
-                                                            session.write().composer = next;
+                                                            session.write().replace_composer(next);
                                                             slash.set(None);
                                                             slash_idx.set(0);
                                                             focus_composer();
@@ -1648,7 +1789,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                                         if let Some(tool) = key_slash_tools.get(i) {
                                                             let next = insert_slash_text(&composer_draft(), tool);
                                                             composer_draft.set(next.clone());
-                                                            session.write().composer = next;
+                                                            session.write().replace_composer(next);
                                                             slash.set(None);
                                                             slash_idx.set(0);
                                                             focus_composer();
@@ -1691,7 +1832,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     if let Some(text) = chat_compose::recall_text(&refs) {
                                         event.prevent_default();
                                         composer_draft.set(text.clone());
-                                        session.write().composer = text;
+                                        session.write().replace_composer(text);
                                     }
                                 }
                                 if event.key() == Key::Enter {
@@ -1911,7 +2052,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                                     let text = composer_draft();
                                                     let next = insert_mention_text(&text, &id);
                                                     composer_draft.set(next.clone());
-                                                    session.write().composer = next;
+                                                    session.write().replace_composer(next);
                                                     mention.set(None);
                                                     mention_idx.set(0);
                                                 }
@@ -1934,7 +2075,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                                     let text = composer_draft();
                                                     let next = insert_mention_text(&text, &cid);
                                                     composer_draft.set(next.clone());
-                                                    session.write().composer = next;
+                                                    session.write().replace_composer(next);
                                                     mention.set(None);
                                                     mention_idx.set(0);
                                                 }
@@ -1973,7 +2114,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                                 move |_| {
                                                     let text = format!("/{command}");
                                                     composer_draft.set(text.clone());
-                                                    session.write().composer = text;
+                                                    session.write().replace_composer(text);
                                                     slash.set(None);
                                                     slash_idx.set(0);
                                                     focus_composer();
@@ -1996,7 +2137,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                                     let text = composer_draft();
                                                     let next = insert_slash_text(&text, &id);
                                                     composer_draft.set(next.clone());
-                                                    session.write().composer = next;
+                                                    session.write().replace_composer(next);
                                                     slash.set(None);
                                                     slash_idx.set(0);
                                                     focus_composer();
@@ -2024,7 +2165,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                                     let text = composer_draft();
                                                     let next = insert_slash_text(&text, &tool);
                                                     composer_draft.set(next.clone());
-                                                    session.write().composer = next;
+                                                    session.write().replace_composer(next);
                                                     slash.set(None);
                                                     slash_idx.set(0);
                                                     focus_composer();
@@ -2060,13 +2201,14 @@ fn MessageRow(
     bot_meta: Option<(String, bool)>,
     media: Vec<serabot_desktop::LibraryEntry>,
     accepts: bool,
+    handwritten: bool,
     mut copied: Signal<Option<String>>,
     mut confirm_regen: Signal<Option<String>>,
     mut task_added_ids: Signal<HashSet<String>>,
     mut composer_draft: Signal<String>,
 ) -> Element {
     rsx! {
-        div { class: "{class}",
+        div { class: "{class}", "data-row-id": "{row.id}",
             span {
                 class: if row.user { "msg-avatar avatar user" } else { "msg-avatar avatar bot" },
                 style: row.bot.as_deref().map(avatar_style).unwrap_or_default(),
@@ -2097,7 +2239,7 @@ fn MessageRow(
                     TurnTraceBlock { session, trace }
                 }
                 div { class: "msg-body", title: "{row.stamp}",
-                    MarkdownBody { message_id: row.id.clone(), content: row.content.clone() }
+                    MarkdownBody { message_id: row.id.clone(), content: row.content.clone(), handwritten }
                     if row.user {
                         MessageFiles { session, id: row.id.clone() }
                     }
@@ -2168,7 +2310,7 @@ fn MessageRow(
                                         &text,
                                     );
                                     composer_draft.set(next.clone());
-                                    session.write().composer = next;
+                                    session.write().replace_composer(next);
                                     focus_composer();
                                 }
                             },
