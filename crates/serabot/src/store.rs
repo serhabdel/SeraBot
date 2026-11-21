@@ -88,6 +88,7 @@ const MIGRATION_46: &str = include_str!("../migrations/0046_costs.sql");
 const MIGRATION_47: &str = include_str!("../migrations/0047_plan_prices.sql");
 const MIGRATION_48: &str = include_str!("../migrations/0048_jobs.sql");
 const MIGRATION_49: &str = include_str!("../migrations/0049_helpers.sql");
+const MIGRATION_50: &str = include_str!("../migrations/0050_project_checks.sql");
 
 /// One member's account for a marketplace plugin (no secret).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -852,6 +853,11 @@ impl Store {
                 }
             }
             connection.pragma_update(None, "user_version", 49)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 50 {
+            connection.execute_batch(MIGRATION_50)?;
+            connection.pragma_update(None, "user_version", 50)?;
         }
         // VACUUM INTO (backups) may renumber rowids; rebuild the external-content
         // FTS index only when its row count no longer matches `memories`.

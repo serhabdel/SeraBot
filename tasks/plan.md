@@ -299,3 +299,15 @@ the sidebar and All-chats rename inputs are caret-stable (uncontrolled, like
 the switcher), and switcher rows show unread badges. Desktop-only, no server
 changes. Source-level only; owner visual pass pending. Tasks/Kanban/Calendar
 pages still carry px font sizes — noted for a later pass.
+
+## Status after 0.72.0 (coding harness + context + font sweep, 0.73.0)
+
+0.73.0 adds the project check harness: per-project owner-configured check
+commands (allowlisted `cargo`/`rustc`, contained project cwd, no shell, capped
+output, hard timeout) whose rustc-JSON diagnostics are stored UID-scoped and
+shown in a desktop Problems panel; the `project_check` bot tool is
+approval-gated. It also emits `turn.context` (estimated prompt size, model
+window, percent) at turn start, shown as a context meter in the model bar, and
+moves every remaining hard-coded px font-size in the desktop CSS onto the
+`--fs-*` tokens. Synthetic fixtures only; no real compiler ran and no render
+was taken — owner verification pending.
