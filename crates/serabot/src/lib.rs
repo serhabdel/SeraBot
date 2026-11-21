@@ -54,6 +54,7 @@ pub mod local_bulk;
 pub mod local_relay;
 pub mod local_transfer;
 pub mod logging;
+pub mod mail;
 pub mod maker;
 pub mod marketplace;
 pub mod marketplace_auth;

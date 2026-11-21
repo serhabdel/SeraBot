@@ -1,0 +1,1264 @@
+//! SMTP/IMAP mail connector (feature branch, no version bump): per-user
+//! mailbox credentials (Hostinger or any provider) live in the per-user
+//! envelope-encrypted store under provider `mail`; gateway tools `mail_send`
+//! (approval-gated), `mail_list` and `mail_read`; HTTP API `/v1/mail/*`.
+//!
+//! The wire clients are minimal hand-rolled SMTP/IMAP over `tokio-rustls`
+//! (already in the dependency tree — no new crates beyond the two direct
+//! edges in Cargo.toml). Plain (`none`) security is refused for non-loopback
+//! hosts. Message and attachment sizes are capped; every command has a hard
+//! I/O timeout. Tests use a fake in-process SMTP server and canned IMAP
+//! fixtures; nothing here ran against a real mailbox.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use base64::Engine;
+use secrecy::ExposeSecret;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
+
+use crate::error::{Result, SeraError};
+use crate::gateway::{Tool, ToolContext, ToolOutput, ToolRegistry, ToolSpec};
+use crate::user_secrets::UserSecrets;
+
+pub const MAIL_PROVIDER: &str = "mail";
+pub const MAIL_SEND_TOOL: &str = "mail_send";
+pub const MAIL_LIST_TOOL: &str = "mail_list";
+pub const MAIL_READ_TOOL: &str = "mail_read";
+pub const MAX_MESSAGE_BYTES: usize = 25 * 1024 * 1024;
+pub const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+pub const MAX_ATTACHMENTS: usize = 10;
+pub const MAX_RECIPIENTS: usize = 20;
+pub const MAX_LIST: u32 = 50;
+pub const MAX_BODY_CHARS: usize = 256 * 1024;
+pub const MAX_SUBJECT_CHARS: usize = 500;
+const IO_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_LINE: usize = 16 * 1024;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Security {
+    #[default]
+    StartTls,
+    Ssl,
+    None,
+}
+
+/// Per-user mailbox credentials, stored as JSON under provider `mail`.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MailCredentials {
+    pub smtp_host: String,
+    #[serde(default = "default_smtp_port")]
+    pub smtp_port: u16,
+    #[serde(default)]
+    pub smtp_security: Security,
+    pub username: String,
+    pub password: String,
+    pub imap_host: String,
+    #[serde(default = "default_imap_port")]
+    pub imap_port: u16,
+    #[serde(default = "default_imap_ssl")]
+    pub imap_security: Security,
+    /// From header; defaults to the username.
+    #[serde(default)]
+    pub from: Option<String>,
+}
+
+pub fn default_smtp_port() -> u16 {
+    587
+}
+pub fn default_imap_port() -> u16 {
+    993
+}
+pub fn default_imap_ssl() -> Security {
+    Security::Ssl
+}
+
+fn is_loopback(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "::1" | "localhost")
+}
+
+/// Validate credentials. Plain-text security is only allowed on loopback.
+pub fn validate_credentials(creds: &MailCredentials) -> Result<()> {
+    for (label, host) in [("smtp", &creds.smtp_host), ("imap", &creds.imap_host)] {
+        let host = host.trim();
+        if host.is_empty()
+            || host.len() > 253
+            || host.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
+            return Err(SeraError::Validation(format!("invalid {label} host")));
+        }
+        if creds.smtp_port == 0 || creds.imap_port == 0 {
+            return Err(SeraError::Validation("port must be 1-65535".into()));
+        }
+    }
+    if creds.smtp_security == Security::None && !is_loopback(creds.smtp_host.trim()) {
+        return Err(SeraError::Validation(
+            "plain SMTP is only allowed for loopback hosts; use starttls or ssl".into(),
+        ));
+    }
+    if creds.imap_security == Security::None && !is_loopback(creds.imap_host.trim()) {
+        return Err(SeraError::Validation(
+            "plain IMAP is only allowed for loopback hosts; use ssl".into(),
+        ));
+    }
+    if creds.username.is_empty() || creds.username.len() > 256 {
+        return Err(SeraError::Validation("invalid username".into()));
+    }
+    if creds.password.is_empty() || creds.password.len() > 1024 {
+        return Err(SeraError::Validation(
+            "password must be 1-1024 characters".into(),
+        ));
+    }
+    if let Some(from) = &creds.from
+        && (from.is_empty() || from.len() > 256 || from.chars().any(|c| c == '\r' || c == '\n'))
+    {
+        return Err(SeraError::Validation("invalid from address".into()));
+    }
+    Ok(())
+}
+
+pub fn store_credentials(
+    secrets: &UserSecrets,
+    user_id: &str,
+    creds: &MailCredentials,
+) -> Result<()> {
+    validate_credentials(creds)?;
+    let json = serde_json::to_string(creds)
+        .map_err(|e| SeraError::Internal(format!("mail creds serialise: {e}")))?;
+    secrets.set(user_id, MAIL_PROVIDER, &json)
+}
+
+pub fn load_credentials(secrets: &UserSecrets, user_id: &str) -> Result<Option<MailCredentials>> {
+    let Some(raw) = secrets.get(user_id, MAIL_PROVIDER)? else {
+        return Ok(None);
+    };
+    let creds: MailCredentials = serde_json::from_str(raw.expose_secret())
+        .map_err(|e| SeraError::Internal(format!("stored mail credentials are invalid: {e}")))?;
+    validate_credentials(&creds)?;
+    Ok(Some(creds))
+}
+
+pub fn delete_credentials(secrets: &UserSecrets, user_id: &str) -> Result<bool> {
+    secrets.delete(user_id, MAIL_PROVIDER)
+}
+
+pub fn from_address(creds: &MailCredentials) -> String {
+    creds.from.clone().unwrap_or_else(|| creds.username.clone())
+}
+
+// ---------------------------------------------------------------- MIME ----
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attachment {
+    pub name: String,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Sanitize a header value: strip CR/LF and control chars.
+fn clean_header(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\t')
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+/// RFC 2047 encode a header value when it is not plain ASCII.
+fn encode_header(value: &str) -> String {
+    if value.is_ascii() {
+        clean_header(value)
+    } else {
+        format!(
+            "=?UTF-8?B?{}?=",
+            base64::engine::general_purpose::STANDARD.encode(value.as_bytes())
+        )
+    }
+}
+
+/// Build a MIME message (multipart/mixed when there are attachments).
+pub fn build_message(
+    from: &str,
+    to: &[String],
+    subject: &str,
+    body: &str,
+    attachments: &[Attachment],
+) -> Result<Vec<u8>> {
+    if to.is_empty() || to.len() > MAX_RECIPIENTS {
+        return Err(SeraError::Validation(format!(
+            "1 to {MAX_RECIPIENTS} recipients are allowed"
+        )));
+    }
+    for addr in to {
+        if addr.is_empty()
+            || addr.len() > 254
+            || addr.chars().any(|c| c == '\r' || c == '\n' || c == ',')
+        {
+            return Err(SeraError::Validation(format!("invalid recipient {addr:?}")));
+        }
+    }
+    if subject.chars().count() > MAX_SUBJECT_CHARS {
+        return Err(SeraError::Validation("subject is too long".into()));
+    }
+    if body.chars().count() > MAX_BODY_CHARS {
+        return Err(SeraError::Validation("body is too long".into()));
+    }
+    if attachments.len() > MAX_ATTACHMENTS {
+        return Err(SeraError::Validation(format!(
+            "at most {MAX_ATTACHMENTS} attachments"
+        )));
+    }
+    for att in attachments {
+        if att.name.is_empty()
+            || att.name.len() > 200
+            || att.name.chars().any(|c| c == '\r' || c == '\n' || c == '"')
+        {
+            return Err(SeraError::Validation("invalid attachment name".into()));
+        }
+        if att.content_type.is_empty()
+            || att.content_type.len() > 100
+            || att.content_type.chars().any(|c| c.is_control())
+        {
+            return Err(SeraError::Validation("invalid attachment type".into()));
+        }
+        if att.bytes.is_empty() || att.bytes.len() > MAX_ATTACHMENT_BYTES {
+            return Err(SeraError::Validation(
+                "each attachment must be 1 byte to 20 MiB".into(),
+            ));
+        }
+    }
+    let total: usize = body.len()
+        + attachments
+            .iter()
+            .map(|a| a.bytes.len() * 4 / 3 + 200)
+            .sum::<usize>();
+    if total > MAX_MESSAGE_BYTES {
+        return Err(SeraError::Validation(
+            "the whole message must stay under 25 MiB".into(),
+        ));
+    }
+    let boundary = format!("serabot-{}", uuid::Uuid::now_v7().simple());
+    let mut out = String::new();
+    out.push_str(&format!("From: {}\r\n", clean_header(from)));
+    out.push_str(&format!(
+        "To: {}\r\n",
+        to.iter()
+            .map(|a| clean_header(a))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    out.push_str(&format!("Subject: {}\r\n", encode_header(subject)));
+    out.push_str(&format!("Date: {}\r\n", chrono::Utc::now().to_rfc2822()));
+    out.push_str(&format!(
+        "Message-ID: <{}@serabot>\r\n",
+        uuid::Uuid::now_v7().simple()
+    ));
+    out.push_str("MIME-Version: 1.0\r\n");
+    if attachments.is_empty() {
+        out.push_str(
+            "Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n",
+        );
+        out.push_str(body);
+        if !body.ends_with('\n') {
+            out.push('\n');
+        }
+    } else {
+        out.push_str(&format!(
+            "Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n"
+        ));
+        out.push_str(&format!("--{boundary}\r\n"));
+        out.push_str(
+            "Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n",
+        );
+        out.push_str(body);
+        if !body.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&format!("\r\n--{boundary}\r\n"));
+        for att in attachments {
+            out.push_str(&format!("Content-Type: {}\r\n", att.content_type));
+            out.push_str("Content-Transfer-Encoding: base64\r\n");
+            out.push_str(&format!(
+                "Content-Disposition: attachment; filename=\"{}\"\r\n\r\n",
+                clean_header(&att.name)
+            ));
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&att.bytes);
+            for chunk in encoded.as_bytes().chunks(76) {
+                out.push_str(std::str::from_utf8(chunk).unwrap_or(""));
+                out.push_str("\r\n");
+            }
+            out.push_str(&format!("--{boundary}\r\n"));
+        }
+        out.push_str(&format!("--{boundary}--\r\n"));
+    }
+    Ok(out.into_bytes())
+}
+
+// ------------------------------------------------------------- wire I/O ----
+
+/// Line-oriented reader/writer over any async stream, with caps and timeout.
+struct Wire<S> {
+    stream: S,
+    buf: Vec<u8>,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
+    fn new(stream: S) -> Self {
+        Wire {
+            stream,
+            buf: Vec::new(),
+        }
+    }
+
+    async fn read_line(&mut self) -> Result<String> {
+        loop {
+            if let Some(pos) = self.buf.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = self.buf.drain(..=pos).collect();
+                let text = String::from_utf8_lossy(&line)
+                    .trim_end_matches(['\r', '\n'])
+                    .to_owned();
+                return Ok(text);
+            }
+            if self.buf.len() > MAX_LINE {
+                return Err(SeraError::External("server line too long".into()));
+            }
+            let mut chunk = [0u8; 4096];
+            let n = tokio::time::timeout(IO_TIMEOUT, self.stream.read(&mut chunk))
+                .await
+                .map_err(|_| SeraError::External("mail server read timed out".into()))?
+                .map_err(|e| SeraError::External(format!("mail server read: {e}")))?;
+            if n == 0 {
+                return Err(SeraError::External(
+                    "mail server closed the connection".into(),
+                ));
+            }
+            self.buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    /// Read one logical line; IMAP literals `{N}\r\n<bytes>` are folded in.
+    async fn read_logical_line(&mut self) -> Result<String> {
+        let mut line = self.read_line().await?;
+        while let Some(open) = line.rfind("{")
+            && let Some(close) = line[open..].find('}')
+        {
+            let size: usize = line[open + 1..open + close]
+                .parse()
+                .map_err(|_| SeraError::External("bad IMAP literal size".into()))?;
+            if size > MAX_MESSAGE_BYTES {
+                return Err(SeraError::External("IMAP literal too large".into()));
+            }
+            let mut literal = vec![0u8; size];
+            tokio::time::timeout(IO_TIMEOUT, self.stream.read_exact(&mut literal))
+                .await
+                .map_err(|_| SeraError::External("mail server literal timed out".into()))?
+                .map_err(|e| SeraError::External(format!("literal read: {e}")))?;
+            let mut crlf = [0u8; 2];
+            self.stream
+                .read_exact(&mut crlf)
+                .await
+                .map_err(|e| SeraError::External(format!("literal crlf: {e}")))?;
+            line.push_str(&String::from_utf8_lossy(&literal));
+            // the rest of the response continues on the next physical line
+            let rest = self.read_line().await?;
+            line.push_str(&rest);
+            if !line.contains("{") {
+                break;
+            }
+        }
+        Ok(line)
+    }
+
+    async fn send_line(&mut self, line: &str) -> Result<()> {
+        if line.chars().any(|c| c == '\r' || c == '\n') {
+            return Err(SeraError::Validation("line injection attempt".into()));
+        }
+        tokio::time::timeout(IO_TIMEOUT, self.stream.write_all(line.as_bytes()))
+            .await
+            .map_err(|_| SeraError::External("mail server write timed out".into()))?
+            .map_err(|e| SeraError::External(format!("mail server write: {e}")))?;
+        tokio::time::timeout(IO_TIMEOUT, self.stream.write_all(b"\r\n"))
+            .await
+            .map_err(|_| SeraError::External("mail server write timed out".into()))?
+            .map_err(|e| SeraError::External(format!("mail server write: {e}")))?;
+        self.stream
+            .flush()
+            .await
+            .map_err(|e| SeraError::External(format!("flush: {e}")))?;
+        Ok(())
+    }
+
+    /// Read a reply and require its code to start with `want` (e.g. "250").
+    async fn expect(&mut self, want: &str) -> Result<String> {
+        let line = self.read_logical_line().await?;
+        if line.len() >= 3 && line[..3].starts_with(want) {
+            Ok(line)
+        } else {
+            Err(SeraError::External(format!(
+                "mail server replied unexpectedly: {}",
+                clip(&line, 200)
+            )))
+        }
+    }
+
+    /// Read until the tagged reply for `tag` arrives; untagged lines are
+    /// skipped (and returned via `untagged` when provided).
+    async fn expect_tagged(&mut self, tag: &str) -> Result<(String, Vec<String>)> {
+        let mut untagged = Vec::new();
+        loop {
+            let line = self.read_logical_line().await?;
+            if line.starts_with(tag) {
+                if line.starts_with(&format!("{tag} OK")) {
+                    return Ok((line, untagged));
+                }
+                return Err(SeraError::External(format!(
+                    "mail server replied unexpectedly: {}",
+                    clip(&line, 200)
+                )));
+            }
+            if line.starts_with('*') {
+                untagged.push(line);
+            }
+        }
+    }
+}
+
+fn clip(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
+}
+
+fn tls_connector() -> Result<TlsConnector> {
+    use tokio_rustls::rustls::ClientConfig;
+    let roots = tokio_rustls::rustls::RootCertStore::from_iter(
+        webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+    );
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+
+enum MailStream {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for MailStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            MailStream::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            MailStream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for MailStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            MailStream::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            MailStream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            MailStream::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
+            MailStream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            MailStream::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            MailStream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
+async fn connect(host: &str, port: u16, security: Security) -> Result<Wire<MailStream>> {
+    let addr = format!("{host}:{port}");
+    let tcp = tokio::time::timeout(IO_TIMEOUT, TcpStream::connect(&addr))
+        .await
+        .map_err(|_| SeraError::External(format!("connect to {addr} timed out")))?
+        .map_err(|e| SeraError::External(format!("connect to {addr}: {e}")))?;
+    tcp.set_nodelay(true).ok();
+    match security {
+        Security::Ssl => {
+            let connector = tls_connector()?;
+            let domain = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_owned())
+                .map_err(|_| SeraError::Validation("invalid TLS host name".into()))?;
+            let tls = tokio::time::timeout(IO_TIMEOUT, connector.connect(domain, tcp))
+                .await
+                .map_err(|_| SeraError::External("TLS handshake timed out".into()))?
+                .map_err(|e| SeraError::External(format!("TLS handshake: {e}")))?;
+            Ok(Wire::new(MailStream::Tls(Box::new(tls))))
+        }
+        _ => Ok(Wire::new(MailStream::Plain(tcp))),
+    }
+}
+
+// ---------------------------------------------------------------- SMTP ----
+
+/// Send one message. `security` drives plain/STARTTLS/implicit-TLS.
+pub async fn smtp_send(
+    creds: &MailCredentials,
+    from: &str,
+    to: &[String],
+    message: &[u8],
+) -> Result<()> {
+    if message.len() > MAX_MESSAGE_BYTES {
+        return Err(SeraError::Validation(
+            "the message exceeds the 25 MiB cap".into(),
+        ));
+    }
+    let mut wire = connect(creds.smtp_host.trim(), creds.smtp_port, creds.smtp_security).await?;
+    wire.expect("220").await?;
+    let host = creds.smtp_host.trim().to_owned();
+    wire.send_line(&format!("EHLO {host}")).await?;
+    // multi-line 250- reply: keep reading until "250 " (space, not dash)
+    loop {
+        let line = wire.read_line().await?;
+        if line.starts_with("250 ") {
+            break;
+        }
+        if line.starts_with("250") && !line.starts_with("250-") {
+            break;
+        }
+    }
+    if creds.smtp_security == Security::StartTls {
+        wire.send_line("STARTTLS").await?;
+        wire.expect("220").await?;
+        let tcp = match wire.stream {
+            MailStream::Plain(tcp) => tcp,
+            _ => return Err(SeraError::Internal("STARTTLS on a TLS stream".into())),
+        };
+        let connector = tls_connector()?;
+        let domain = tokio_rustls::rustls::pki_types::ServerName::try_from(host.clone())
+            .map_err(|_| SeraError::Validation("invalid TLS host name".into()))?;
+        let tls = tokio::time::timeout(IO_TIMEOUT, connector.connect(domain, tcp))
+            .await
+            .map_err(|_| SeraError::External("TLS handshake timed out".into()))?
+            .map_err(|e| SeraError::External(format!("TLS handshake: {e}")))?;
+        wire.stream = MailStream::Tls(Box::new(tls));
+        wire.send_line(&format!("EHLO {host}")).await?;
+        loop {
+            let line = wire.read_line().await?;
+            if line.starts_with("250 ") {
+                break;
+            }
+            if line.starts_with("250") && !line.starts_with("250-") {
+                break;
+            }
+        }
+    }
+    wire.send_line("AUTH LOGIN").await?;
+    wire.expect("334").await?;
+    wire.send_line(&base64::engine::general_purpose::STANDARD.encode(creds.username.as_bytes()))
+        .await?;
+    wire.expect("334").await?;
+    wire.send_line(&base64::engine::general_purpose::STANDARD.encode(creds.password.as_bytes()))
+        .await?;
+    wire.expect("235").await?;
+    wire.send_line(&format!("MAIL FROM:<{}>", clean_header(from)))
+        .await?;
+    wire.expect("250").await?;
+    for rcpt in to {
+        wire.send_line(&format!("RCPT TO:<{}>", clean_header(rcpt)))
+            .await?;
+        wire.expect("250").await?;
+    }
+    wire.send_line("DATA").await?;
+    wire.expect("354").await?;
+    // dot-stuff and normalize to CRLF
+    let text = String::from_utf8_lossy(message)
+        .replace("\r\n", "\n")
+        .replace('\n', "\r\n");
+    let mut stuffed = String::with_capacity(text.len() + 64);
+    for line in text.split("\r\n") {
+        if line.starts_with('.') {
+            stuffed.push('.');
+        }
+        stuffed.push_str(line);
+        stuffed.push_str("\r\n");
+    }
+    stuffed.push_str(".\r\n");
+    tokio::time::timeout(IO_TIMEOUT, wire.stream.write_all(stuffed.as_bytes()))
+        .await
+        .map_err(|_| SeraError::External("DATA write timed out".into()))?
+        .map_err(|e| SeraError::External(format!("DATA write: {e}")))?;
+    wire.stream.flush().await.ok();
+    wire.expect("250").await?;
+    let _ = wire.send_line("QUIT").await;
+    Ok(())
+}
+
+/// Connect + EHLO + AUTH + QUIT without sending (used by `POST /v1/mail/connect`).
+pub async fn smtp_test(creds: &MailCredentials) -> Result<()> {
+    let mut wire = connect(creds.smtp_host.trim(), creds.smtp_port, creds.smtp_security).await?;
+    wire.expect("220").await?;
+    let host = creds.smtp_host.trim().to_owned();
+    wire.send_line(&format!("EHLO {host}")).await?;
+    loop {
+        let line = wire.read_line().await?;
+        if line.starts_with("250 ") || (line.starts_with("250") && !line.starts_with("250-")) {
+            break;
+        }
+    }
+    if creds.smtp_security == Security::StartTls {
+        wire.send_line("STARTTLS").await?;
+        wire.expect("220").await?;
+        let tcp = match wire.stream {
+            MailStream::Plain(tcp) => tcp,
+            _ => return Err(SeraError::Internal("STARTTLS on a TLS stream".into())),
+        };
+        let connector = tls_connector()?;
+        let domain = tokio_rustls::rustls::pki_types::ServerName::try_from(host.clone())
+            .map_err(|_| SeraError::Validation("invalid TLS host name".into()))?;
+        let tls = tokio::time::timeout(IO_TIMEOUT, connector.connect(domain, tcp))
+            .await
+            .map_err(|_| SeraError::External("TLS handshake timed out".into()))?
+            .map_err(|e| SeraError::External(format!("TLS handshake: {e}")))?;
+        wire.stream = MailStream::Tls(Box::new(tls));
+        wire.send_line(&format!("EHLO {host}")).await?;
+        loop {
+            let line = wire.read_line().await?;
+            if line.starts_with("250 ") || (line.starts_with("250") && !line.starts_with("250-")) {
+                break;
+            }
+        }
+    }
+    wire.send_line("AUTH LOGIN").await?;
+    wire.expect("334").await?;
+    wire.send_line(&base64::engine::general_purpose::STANDARD.encode(creds.username.as_bytes()))
+        .await?;
+    wire.expect("334").await?;
+    wire.send_line(&base64::engine::general_purpose::STANDARD.encode(creds.password.as_bytes()))
+        .await?;
+    wire.expect("235").await?;
+    let _ = wire.send_line("QUIT").await;
+    Ok(())
+}
+
+// ---------------------------------------------------------------- IMAP ----
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct MailMessage {
+    pub uid: u32,
+    pub subject: String,
+    pub from: String,
+    pub date: String,
+    pub flags: Vec<String>,
+    /// Raw message body (best effort text; multipart bodies keep their raw
+    /// text — v1 does not decode HTML parts).
+    pub body: String,
+}
+
+/// Quote an IMAP string literal.
+fn imap_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+async fn imap_connect(creds: &MailCredentials) -> Result<Wire<MailStream>> {
+    let mut wire = connect(creds.imap_host.trim(), creds.imap_port, creds.imap_security).await?;
+    wire.expect("* OK").await?;
+    wire.send_line(&format!(
+        "a1 LOGIN {} {}",
+        imap_quote(&creds.username),
+        imap_quote(&creds.password)
+    ))
+    .await?;
+    wire.expect("a1 OK").await?;
+    Ok(wire)
+}
+
+/// Parse one raw RFC822 message into a MailMessage (header unfold + minimal
+/// RFC 2047 subject decode + raw body).
+pub fn parse_message(uid: u32, flags: Vec<String>, raw: &str) -> MailMessage {
+    let (head, body) = match raw.find("\r\n\r\n") {
+        Some(pos) => (&raw[..pos], &raw[pos + 4..]),
+        None => match raw.find("\n\n") {
+            Some(pos) => (&raw[..pos], &raw[pos + 2..]),
+            None => (raw, ""),
+        },
+    };
+    let mut subject = String::new();
+    let mut from = String::new();
+    let mut date = String::new();
+    let mut last_key = String::new();
+    for line in head.replace("\r\n", "\n").split('\n') {
+        if (line.starts_with(' ') || line.starts_with('\t')) && !last_key.is_empty() {
+            let target = match last_key.as_str() {
+                "subject" => &mut subject,
+                "from" => &mut from,
+                "date" => &mut date,
+                _ => continue,
+            };
+            target.push(' ');
+            target.push_str(line.trim());
+            continue;
+        }
+        if let Some((key, value)) = line.split_once(':') {
+            last_key = key.trim().to_ascii_lowercase();
+            let value = value.trim();
+            match last_key.as_str() {
+                "subject" => subject = decode_rfc2047(value),
+                "from" => from = clean_header(value),
+                "date" => date = clean_header(value),
+                _ => {}
+            }
+        }
+    }
+    MailMessage {
+        uid,
+        subject,
+        from,
+        date,
+        flags,
+        body: body.replace("\r\n", "\n"),
+    }
+}
+
+fn decode_rfc2047(value: &str) -> String {
+    // =?UTF-8?B?...?= (one encoded word is enough for subjects)
+    if let Some(rest) = value
+        .strip_prefix("=?UTF-8?B?")
+        .and_then(|r| r.strip_suffix("?="))
+        && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(rest.trim())
+    {
+        return String::from_utf8_lossy(&bytes).into_owned();
+    }
+    clean_header(value)
+}
+
+/// Extract flags and the BODY[] literal from an untagged FETCH response block.
+fn parse_fetch_block(block: &str) -> (Vec<String>, Option<String>) {
+    let mut flags = Vec::new();
+    if let Some(start) = block.find("FLAGS (")
+        && let Some(end) = block[start..].find(')')
+    {
+        flags = block[start + 7..start + end]
+            .split_whitespace()
+            .map(|f| f.trim_matches(['\\', '(', ')']).to_owned())
+            .filter(|f| !f.is_empty())
+            .collect();
+    }
+    let body = block
+        .find("BODY[]")
+        .and_then(|pos| block[pos..].find('{'))
+        .and_then(|brace| {
+            let rest = &block[brace..];
+            let close = rest.find('}')?;
+            let size: usize = rest[1..close].parse().ok()?;
+            let start = close + 1;
+            // the literal content follows the size marker in the folded line
+            let content = &rest[start..];
+            Some(content.trim_end_matches(')').trim().to_owned()).filter(|c| {
+                let _ = size;
+                !c.is_empty()
+            })
+        });
+    (flags, body)
+}
+
+/// Connect + LOGIN + LOGOUT without selecting a folder (connect test).
+pub async fn imap_test(creds: &MailCredentials) -> Result<()> {
+    let mut wire = imap_connect(creds).await?;
+    let _ = wire.send_line("a9 LOGOUT").await;
+    Ok(())
+}
+
+/// List the newest `limit` messages of a folder (default INBOX).
+pub async fn imap_list(
+    creds: &MailCredentials,
+    folder: &str,
+    limit: u32,
+) -> Result<Vec<MailMessage>> {
+    let limit = limit.clamp(1, MAX_LIST);
+    let mut wire = imap_connect(creds).await?;
+    let folder = if folder.trim().is_empty() {
+        "INBOX".to_owned()
+    } else {
+        folder.trim().to_owned()
+    };
+    wire.send_line(&format!("a2 SELECT {}", imap_quote(&folder)))
+        .await?;
+    wire.expect("a2 OK").await?;
+    wire.send_line("a3 UID SEARCH ALL").await?;
+    let (_, untagged) = wire.expect_tagged("a3").await?;
+    let search = untagged
+        .iter()
+        .find(|l| l.starts_with("* SEARCH"))
+        .cloned()
+        .unwrap_or_default();
+    let uids: Vec<u32> = search
+        .split_whitespace()
+        .skip(2)
+        .filter_map(|w| w.parse::<u32>().ok())
+        .collect();
+    let uids: Vec<u32> = uids.into_iter().rev().take(limit as usize).collect();
+    let mut out = Vec::new();
+    for uid in uids {
+        if let Ok(msg) = imap_fetch(&mut wire, uid).await {
+            out.push(msg);
+        }
+    }
+    let _ = wire.send_line("a9 LOGOUT").await;
+    Ok(out)
+}
+
+/// Read one message by UID.
+pub async fn imap_read(creds: &MailCredentials, folder: &str, uid: u32) -> Result<MailMessage> {
+    let mut wire = imap_connect(creds).await?;
+    let folder = if folder.trim().is_empty() {
+        "INBOX".to_owned()
+    } else {
+        folder.trim().to_owned()
+    };
+    wire.send_line(&format!("a2 SELECT {}", imap_quote(&folder)))
+        .await?;
+    wire.expect("a2 OK").await?;
+    let msg = imap_fetch(&mut wire, uid).await?;
+    let _ = wire.send_line("a9 LOGOUT").await;
+    Ok(msg)
+}
+
+async fn imap_fetch<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut Wire<S>,
+    uid: u32,
+) -> Result<MailMessage> {
+    wire.send_line(&format!("a4 UID FETCH {uid} (FLAGS BODY.PEEK[])"))
+        .await?;
+    let mut block = String::new();
+    loop {
+        let line = wire.read_logical_line().await?;
+        if line.starts_with("a4 ") {
+            if !line.starts_with("a4 OK") {
+                return Err(SeraError::External(format!(
+                    "FETCH failed: {}",
+                    clip(&line, 200)
+                )));
+            }
+            break;
+        }
+        if line.starts_with('*') {
+            block.push_str(&line);
+            block.push('\n');
+        }
+    }
+    let (flags, body) = parse_fetch_block(&block);
+    let raw = body.unwrap_or_default();
+    if raw.is_empty() {
+        return Err(SeraError::NotFound(format!("message {uid} has no body")));
+    }
+    Ok(parse_message(uid, flags, &raw))
+}
+
+// --------------------------------------------------------------- tools ----
+
+pub fn register(registry: &mut ToolRegistry, secrets: Arc<UserSecrets>) -> Result<()> {
+    registry.register(MailSendTool {
+        secrets: secrets.clone(),
+    })?;
+    registry.register(MailListTool {
+        secrets: secrets.clone(),
+    })?;
+    registry.register(MailReadTool { secrets })?;
+    Ok(())
+}
+
+fn require_creds(secrets: &UserSecrets, user_id: &str) -> Result<MailCredentials> {
+    load_credentials(secrets, user_id)?
+        .ok_or_else(|| SeraError::Validation("mail is not connected; connect it first".into()))
+}
+
+pub struct MailSendTool {
+    secrets: Arc<UserSecrets>,
+}
+
+#[async_trait]
+impl Tool for MailSendTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: MAIL_SEND_TOOL.into(),
+            description: "Send an email through the member's own SMTP mailbox (with optional \
+                          attachments). Always asks for approval; the approval names the \
+                          recipients and subject."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "to": {"type": "array", "items": {"type": "string"}, "description": "Recipient addresses"},
+                    "subject": {"type": "string"},
+                    "body": {"type": "string", "description": "Plain-text body"},
+                    "attachments": {"type": "array", "items": {"type": "object", "properties": {
+                        "name": {"type": "string"},
+                        "content_type": {"type": "string"},
+                        "data_base64": {"type": "string"}
+                    }, "required": ["name", "data_base64"]}},
+                },
+                "required": ["to", "subject", "body"],
+                "additionalProperties": false
+            }),
+            external_effect: true,
+        }
+    }
+
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        let creds = require_creds(&self.secrets, &context.user_id)?;
+        let to: Vec<String> = args
+            .get("to")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let subject = args
+            .get("subject")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let body = args
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let mut attachments = Vec::new();
+        if let Some(items) = args.get("attachments").and_then(Value::as_array) {
+            for item in items {
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("file")
+                    .to_owned();
+                let content_type = item
+                    .get("content_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("application/octet-stream")
+                    .to_owned();
+                let data = item
+                    .get("data_base64")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .map_err(|_| SeraError::Validation("attachment is not valid base64".into()))?;
+                attachments.push(Attachment {
+                    name,
+                    content_type,
+                    bytes,
+                });
+            }
+        }
+        let message = build_message(&from_address(&creds), &to, &subject, &body, &attachments)?;
+        smtp_send(&creds, &from_address(&creds), &to, &message).await?;
+        Ok(ToolOutput {
+            content: format!(
+                "Sent to {}: \"{}\" ({} attachment(s), {} bytes).",
+                to.join(", "),
+                clip(&subject, 120),
+                attachments.len(),
+                message.len()
+            ),
+            data: Some(json!({
+                "to": to,
+                "subject": subject,
+                "attachments": attachments.iter().map(|a| json!({"name": a.name, "bytes": a.bytes.len()})).collect::<Vec<_>>(),
+            })),
+            ..ToolOutput::default()
+        })
+    }
+}
+
+pub struct MailListTool {
+    secrets: Arc<UserSecrets>,
+}
+
+#[async_trait]
+impl Tool for MailListTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: MAIL_LIST_TOOL.into(),
+            description: "List the newest messages of the member's own IMAP mailbox (subject, \
+                          from, date, flags). Read-only."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "folder": {"type": "string", "description": "Folder, default INBOX"},
+                    "limit": {"type": "integer", "description": "How many, 1-50, default 10"}
+                },
+                "additionalProperties": false
+            }),
+            external_effect: false,
+        }
+    }
+
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        let creds = require_creds(&self.secrets, &context.user_id)?;
+        let folder = args
+            .get("folder")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|n| n as u32)
+            .unwrap_or(10);
+        let messages = imap_list(&creds, &folder, limit).await?;
+        let lines: Vec<String> = messages
+            .iter()
+            .map(|m| {
+                format!(
+                    "#{} {} {} — {} [{}]",
+                    m.uid,
+                    clip(&m.from, 60),
+                    clip(&m.subject, 80),
+                    m.date,
+                    m.flags.join(" ")
+                )
+            })
+            .collect();
+        Ok(ToolOutput {
+            content: if lines.is_empty() {
+                "No messages.".to_owned()
+            } else {
+                lines.join("\n")
+            },
+            data: Some(json!({"messages": messages})),
+            ..ToolOutput::default()
+        })
+    }
+}
+
+pub struct MailReadTool {
+    secrets: Arc<UserSecrets>,
+}
+
+#[async_trait]
+impl Tool for MailReadTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: MAIL_READ_TOOL.into(),
+            description: "Read one message (by UID from mail_list) from the member's own IMAP \
+                          mailbox: headers plus body text. Read-only."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "uid": {"type": "integer"},
+                    "folder": {"type": "string", "description": "Folder, default INBOX"}
+                },
+                "required": ["uid"],
+                "additionalProperties": false
+            }),
+            external_effect: false,
+        }
+    }
+
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        let creds = require_creds(&self.secrets, &context.user_id)?;
+        let uid =
+            args.get("uid")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| SeraError::Validation("uid is required".into()))? as u32;
+        let folder = args
+            .get("folder")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let message = imap_read(&creds, &folder, uid).await?;
+        Ok(ToolOutput {
+            content: format!(
+                "From: {}\nDate: {}\nSubject: {}\nFlags: {}\n\n{}",
+                message.from,
+                message.date,
+                message.subject,
+                message.flags.join(" "),
+                clip(&message.body, 8000)
+            ),
+            data: Some(json!({"message": message})),
+            ..ToolOutput::default()
+        })
+    }
+}
+
+// --------------------------------------------------------------- tests ----
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::net::TcpListener;
+
+    fn creds(security: Security) -> MailCredentials {
+        MailCredentials {
+            smtp_host: "127.0.0.1".into(),
+            smtp_port: 2525,
+            smtp_security: security,
+            username: "me@example.com".into(),
+            password: "app-password".into(),
+            imap_host: "127.0.0.1".into(),
+            imap_port: 1143,
+            imap_security: Security::None,
+            from: None,
+        }
+    }
+
+    #[test]
+    fn credentials_validation() {
+        let mut c = creds(Security::None);
+        assert!(validate_credentials(&c).is_ok());
+        c.smtp_security = Security::None;
+        c.smtp_host = "mail.hostinger.com".into();
+        assert!(
+            validate_credentials(&c).is_err(),
+            "plain refused off-loopback"
+        );
+        let mut c = creds(Security::StartTls);
+        c.smtp_host = "mail.hostinger.com".into();
+        assert!(validate_credentials(&c).is_ok());
+        c.password = String::new();
+        assert!(validate_credentials(&c).is_err());
+    }
+
+    #[test]
+    fn mime_with_attachment_roundtrips() {
+        let msg = build_message(
+            "me@example.com",
+            &["you@example.com".to_owned()],
+            "Rapport hébdo",
+            "Bonjour,\nvoir pièce jointe.\n",
+            &[Attachment {
+                name: "rapport.pdf".into(),
+                content_type: "application/pdf".into(),
+                bytes: b"%PDF-1.4 fake".to_vec(),
+            }],
+        )
+        .unwrap();
+        let text = String::from_utf8(msg).unwrap();
+        assert!(text.contains("multipart/mixed; boundary=\"serabot-"));
+        assert!(text.contains("Subject: =?UTF-8?B?"));
+        assert!(text.contains("Content-Disposition: attachment; filename=\"rapport.pdf\""));
+        assert!(
+            text.contains("JVBERi0xLjQgZmFrZQ=="),
+            "base64 of the pdf bytes"
+        );
+        assert!(text.contains("Bonjour,"));
+        // injection attempts are refused
+        assert!(build_message("a@b", &["x@y\r\nBcc: evil@z".into()], "s", "b", &[]).is_err());
+    }
+
+    #[test]
+    fn parses_rfc822_message() {
+        let raw = "From: Alice <alice@example.com>\r\nSubject: =?UTF-8?B?SMOpbG8=?=\r\nDate: Mon, 1 Jan 2026 10:00:00 +0000\r\nX-Long: one\r\n two\r\n\r\nHello body\r\n";
+        let msg = parse_message(42, vec!["\\Seen".into()], raw);
+        assert_eq!(msg.uid, 42);
+        assert_eq!(msg.subject, "Héllo");
+        assert_eq!(msg.from, "Alice <alice@example.com>");
+        assert_eq!(msg.body, "Hello body\n");
+        assert_eq!(msg.flags, vec!["\\Seen"]);
+    }
+
+    #[test]
+    fn parses_fetch_block() {
+        let block = "* 1 FETCH (FLAGS (\\Seen) UID 7 BODY[] {20}\r\nSubject: Hi\r\n\r\nbody here)";
+        let (flags, body) = parse_fetch_block(block);
+        assert_eq!(flags, vec!["\\Seen"]);
+        assert!(body.unwrap().contains("Subject: Hi"));
+    }
+
+    #[tokio::test]
+    async fn smtp_send_against_fake_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            let mut data = String::new();
+            writer.write_all(b"220 fake ESMTP\r\n").await.unwrap();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.starts_with("EHLO") {
+                    writer
+                        .write_all(b"250-fake\r\n250 AUTH LOGIN\r\n")
+                        .await
+                        .unwrap();
+                } else if line == "AUTH LOGIN" {
+                    writer.write_all(b"334 VXNlcm5hbWU6\r\n").await.unwrap();
+                    lines.next_line().await.unwrap().unwrap();
+                    writer.write_all(b"334 UGFzc3dvcmQ6\r\n").await.unwrap();
+                    lines.next_line().await.unwrap().unwrap();
+                    writer.write_all(b"235 ok\r\n").await.unwrap();
+                } else if line.starts_with("MAIL FROM") || line.starts_with("RCPT TO") {
+                    writer.write_all(b"250 ok\r\n").await.unwrap();
+                } else if line == "DATA" {
+                    writer.write_all(b"354 go\r\n").await.unwrap();
+                    loop {
+                        let l = lines.next_line().await.unwrap().unwrap();
+                        if l == "." {
+                            break;
+                        }
+                        data.push_str(&l);
+                        data.push('\n');
+                    }
+                    writer.write_all(b"250 queued\r\n").await.unwrap();
+                } else if line == "QUIT" {
+                    writer.write_all(b"221 bye\r\n").await.unwrap();
+                    break;
+                } else {
+                    writer.write_all(b"250 ok\r\n").await.unwrap();
+                }
+            }
+            data
+        });
+        let mut c = creds(Security::None);
+        c.smtp_port = port;
+        let message = build_message(
+            "me@example.com",
+            &["you@example.com".to_owned()],
+            "Hi",
+            "line one\n.stuffed line\n",
+            &[],
+        )
+        .unwrap();
+        smtp_send(
+            &c,
+            "me@example.com",
+            &["you@example.com".to_owned()],
+            &message,
+        )
+        .await
+        .unwrap();
+        let data = server.await.unwrap();
+        assert!(data.contains("line one"));
+        assert!(
+            data.contains("..stuffed line"),
+            "dot-stuffing applied: {data:?}"
+        );
+        assert!(data.contains("Subject: Hi"));
+        assert!(!data.contains("\r"), "server saw CRLF-normalized lines");
+    }
+}

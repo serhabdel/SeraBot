@@ -385,3 +385,14 @@ never merge without the owner's OK.
 - [x] `docs/specs/lsp-workspace.md` (proposed; owner approval needed before 0.75 code).
 - [x] Version bump 0.74.0, release notes.
 - [ ] Owner: open a project on Windows, edit + save a file, run checks, click a problem to its line.
+
+## Feature branch (no version bump) — mail connector (SMTP/IMAP)
+
+Branch `vibe/email-smtp-imap-2c32c0`, stacked on the 0.74 branch, version stays 0.74.0 so it merges cleanly with outgoing branches later.
+
+- [x] `crates/serabot/src/mail.rs`: hand-rolled SMTP (EHLO/STARTTLS/AUTH LOGIN/MAIL/RCPT/DATA with dot-stuffing/QUIT) + IMAP (LOGIN/SELECT/UID SEARCH/UID FETCH BODY[]) over tokio-rustls (ring, webpki-roots); plain refused off-loopback; per-user creds in `user_secrets` provider `mail`; MIME builder with base64 attachments (25 MiB msg / 20 MiB att / 10 atts / 20 rcpts caps, CRLF-injection refusal); tools `mail_send` (approval-gated), `mail_list`, `mail_read`; synthetic tests incl. fake in-process SMTP server.
+- [x] `crates/serabot/src/api/mail.rs`: `POST /v1/mail/connect` (validate + store + live per-side login test, audit `mail.connect`), `GET /v1/mail` (status, never the password), `DELETE /v1/mail` (audit `mail.disconnect`).
+- [x] Registration: `lib.rs`, `api/mod.rs`, `main.rs`, `tools.rs`, `gateway.rs` DESTRUCTIVE_TOOLS, `collaboration.rs` SHARED_TOOLS, `docs/approvals.md`, `AGENTS.md`, `docs/connectors.md`.
+- [x] Deps: only `tokio-rustls` + `webpki-roots` edges added (both already in Cargo.lock).
+- [ ] Desktop Integrations card for mail connect/status/disconnect (deliberately deferred to keep this branch conflict-free).
+- [ ] Owner: connect a real Hostinger mailbox (SMTP 587 STARTTLS + IMAP 993 SSL), send with an attachment, list + read inbox.

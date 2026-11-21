@@ -99,6 +99,9 @@ pub const SHARED_TOOLS: &[&str] = &[
     "project_file",
     // 0.73: run a project's configured check command; approval-gated.
     "project_check",
+    "mail_send",
+    "mail_list",
+    "mail_read",
     "conversation_library",
     "pdf_inspect",
     "pdf_edit",

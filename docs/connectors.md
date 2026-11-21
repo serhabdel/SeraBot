@@ -207,3 +207,30 @@ up to 5 pages (http or https, no embedded credentials) and keeps at most
 20,000 characters per page. A `401` shows "Exa rejected your API key"; running
 out of credits or a plan limit is reported in Exa's own words with the key
 removed.
+
+## Mail (SMTP/IMAP, per-user)
+
+Native SMTP/IMAP connector for any mailbox the user controls outright (e.g.
+Hostinger): no OAuth, no API key, just the mailbox credentials. The wire
+clients are hand-rolled in `crates/serabot/src/mail.rs` over the workspace's
+existing tokio-rustls — no new mail crates. TLS is always verified against
+webpki-roots; plain (non-TLS) connections are refused unless the host is
+loopback, so credentials never cross a network unencrypted.
+
+- Credentials (SMTP host/port/security, IMAP host/port/security, username,
+  password, from address; default ports 587 STARTTLS / 993 SSL) are stored as
+  JSON in the acting user's own secret store under provider `mail`
+  (`user_secrets`), never in config or logs, and are never returned by the
+  API.
+- API: `POST /v1/mail/connect` validates, stores, and runs a live SMTP + IMAP
+  login test (per-side result, audited as `mail.connect`); `GET /v1/mail`
+  reports status without the password; `DELETE /v1/mail` removes the
+  credentials (audited as `mail.disconnect`).
+- Tools: `mail_send` (external effect, approval-gated — see
+  [approvals.md](approvals.md); MIME multipart/mixed builder with RFC 2047
+  subjects and base64 attachments; caps: 25 MiB message, 20 MiB per
+  attachment, 10 attachments, 20 recipients; CRLF injection refused),
+  `mail_list` (INBOX headers via IMAP UID SEARCH + FETCH), `mail_read`
+  (full message by UID, RFC 2047 decoding, flags).
+- The existing `plugins/resend` placeholder stays untouched; this connector is
+  the full-control path for self-hosted/Hostinger-style mailboxes.

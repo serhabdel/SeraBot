@@ -83,6 +83,7 @@ subtle = "2"
 text-splitter = "0.16"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net", "fs", "process"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 tokio-util = { version = "0.7", features = ["io"] }
 toml = "0.8"
 tower-http = { version = "0.6", features = ["trace", "limit", "timeout", "compression-gzip"] }
@@ -91,6 +92,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 unicode-normalization = "0.1"
 url = "2"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
+webpki-roots = "0.26"
 # DOCX reader/writer, pinned to the v0.9.0 revision. Both crates resolve from the
 # same repository; `wordcraft-doc` is the document model, `wordcraft-docx` the
 # WordprocessingML reader/writer.
