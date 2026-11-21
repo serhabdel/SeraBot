@@ -86,6 +86,38 @@ fn parse_files(value: &Value) -> Vec<FileRow> {
         .unwrap_or_default()
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DiagRow {
+    file: String,
+    line: Option<u64>,
+    column: Option<u64>,
+    severity: String,
+    code: Option<String>,
+    message: String,
+}
+
+/// Split `GET /v1/projects/{slug}/diagnostics` into the run summary and rows.
+fn parse_diagnostics(value: &Value) -> (Option<Value>, Vec<DiagRow>) {
+    let run = value.get("run").cloned();
+    let rows = value["diagnostics"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| DiagRow {
+                    file: item["file"].as_str().unwrap_or("").to_owned(),
+                    line: item["line"].as_u64(),
+                    column: item["column"].as_u64(),
+                    severity: item["severity"].as_str().unwrap_or("note").to_owned(),
+                    code: item["code"].as_str().map(str::to_owned),
+                    message: item["message"].as_str().unwrap_or("").to_owned(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (run, rows)
+}
+
 fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
@@ -107,11 +139,101 @@ pub fn ProjectsView(session: Signal<Session>) -> Element {
     let mut error = use_signal(|| Option::<String>::None);
     let mut notice = use_signal(|| Option::<String>::None);
     let mut confirm_delete = use_signal(|| Option::<String>::None);
+    // 0.73: project check harness — Problems panel state.
+    let mut diag_rows = use_signal(Vec::<DiagRow>::new);
+    let mut diag_run = use_signal(|| Option::<Value>::None);
+    let mut check_cmd = use_signal(String::new);
+    let mut check_busy = use_signal(|| false);
+
+    let load_diags = move |slug: String| {
+        let slug_diag = slug.clone();
+        let slug_cmd = slug.clone();
+        spawn(async move {
+            if let Ok(value) = call(session, move |creds| api::diagnostics(creds, &slug_diag)).await
+            {
+                let (run, rows) = parse_diagnostics(&value);
+                diag_run.set(run);
+                diag_rows.set(rows);
+            }
+            if let Ok(value) = call(session, move |creds| api::check_get(creds, &slug_cmd)).await {
+                let text = value["command"]
+                    .as_array()
+                    .map(|args| serde_json::to_string(args).unwrap_or_else(|_| "[]".into()))
+                    .unwrap_or_default();
+                check_cmd.set(text.clone());
+                // The command field is uncontrolled (no value binding), so
+                // typing never moves the caret; set the fetched text from JS
+                // only while the field is not focused.
+                if let Ok(js_text) = serde_json::to_string(&text) {
+                    document::eval(&format!(
+                        "(() => {{ const el = document.querySelector('.check-cmd-input'); if (el && document.activeElement !== el) el.value = {js_text}; }})()"
+                    ));
+                }
+            }
+        });
+    };
+
+    let run_check = move |_| {
+        let Some(slug) = selected.read().clone() else {
+            return;
+        };
+        check_busy.set(true);
+        error.set(None);
+        let slug2 = slug.clone();
+        spawn(async move {
+            let result = call(session, move |creds| api::check_run(creds, &slug)).await;
+            check_busy.set(false);
+            match result {
+                Ok(value) => {
+                    if let Some(run) = value.get("run").cloned() {
+                        diag_run.set(Some(run));
+                    }
+                    if let Ok(value) =
+                        call(session, move |creds| api::diagnostics(creds, &slug2)).await
+                    {
+                        let (run, rows) = parse_diagnostics(&value);
+                        diag_run.set(run);
+                        diag_rows.set(rows);
+                    }
+                    notice.set(Some("Check finished.".into()));
+                }
+                Err(message) => error.set(Some(message)),
+            }
+        });
+    };
+
+    let save_check = move |_| {
+        let Some(slug) = selected.read().clone() else {
+            return;
+        };
+        let text = check_cmd.read().trim().to_owned();
+        let command: Vec<String> = serde_json::from_str(&text)
+            .ok()
+            .filter(|parts: &Vec<String>| !parts.is_empty())
+            .unwrap_or_else(|| text.split_whitespace().map(str::to_owned).collect());
+        if command.is_empty() {
+            error.set(Some(
+                "Enter a check command, e.g. [\"cargo\",\"check\"].".into(),
+            ));
+            return;
+        }
+        check_busy.set(true);
+        error.set(None);
+        spawn(async move {
+            let result = call(session, move |creds| api::check_put(creds, &slug, &command)).await;
+            check_busy.set(false);
+            match result {
+                Ok(_) => notice.set(Some("Check command saved.".into())),
+                Err(message) => error.set(Some(message)),
+            }
+        });
+    };
 
     let mut load_files = move |slug: String| {
         busy.set(true);
         error.set(None);
         let slug_req = slug.clone();
+        let slug_diag = slug.clone();
         spawn(async move {
             let result = call(session, move |creds| api::list_files(creds, &slug_req)).await;
             busy.set(false);
@@ -119,6 +241,7 @@ pub fn ProjectsView(session: Signal<Session>) -> Element {
                 Ok(value) => {
                     selected.set(Some(slug));
                     files.set(parse_files(&value));
+                    load_diags(slug_diag);
                 }
                 Err(message) => error.set(Some(message)),
             }
@@ -238,6 +361,10 @@ pub fn ProjectsView(session: Signal<Session>) -> Element {
     let err = error.read().clone();
     let note = notice.read().clone();
     let del_target = confirm_delete.read().clone();
+    let diag_list = diag_rows.read().clone();
+    let run_info = diag_run.read().clone();
+    let check_text = check_cmd.read().clone();
+    let checking = *check_busy.read();
 
     rsx! {
         div { class: "page-shell projects-page",
@@ -439,6 +566,97 @@ pub fn ProjectsView(session: Signal<Session>) -> Element {
                                                             onclick: move |_| confirm_delete.set(Some(path_for_del.clone())),
                                                             "Delete"
                                                         }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        div { style: "margin-top:16px;border-top:1px solid var(--border-subtle);padding-top:12px;",
+                            div { style: "display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:8px;",
+                                h4 { style: "margin:0;display:flex;align-items:center;gap:8px;",
+                                    "Problems"
+                                    if let Some(run) = run_info.as_ref() {
+                                        {
+                                            let errors = run["errors"].as_u64().unwrap_or(0);
+                                            let warnings = run["warnings"].as_u64().unwrap_or(0);
+                                            rsx! {
+                                                span { class: "chip", "{errors} errors \u{b7} {warnings} warnings" }
+                                            }
+                                        }
+                                    }
+                                }
+                                button {
+                                    r#type: "button",
+                                    class: "btn",
+                                    disabled: is_busy || checking,
+                                    onclick: run_check,
+                                    Icon { name: "refresh", size: 14 }
+                                    " Run checks"
+                                }
+                            }
+                            div { class: "field-row", style: "margin-bottom:8px;",
+                                input {
+                                    r#type: "text",
+                                    class: "input check-cmd-input",
+                                    placeholder: "Check command as JSON argv, e.g. [\"cargo\",\"check\",\"--message-format=json\"]",
+                                    "aria-label": "Check command",
+                                    "data-check-init": "{check_text}",
+                                    onmounted: move |_| {
+                                        document::eval(
+                                            "(() => { const el = document.querySelector('.check-cmd-input[data-check-init]'); if (!el) return; el.value = el.getAttribute('data-check-init') || ''; })()",
+                                        );
+                                    },
+                                    oninput: move |e| check_cmd.set(e.value()),
+                                }
+                                button {
+                                    r#type: "button",
+                                    class: "btn",
+                                    disabled: checking,
+                                    onclick: save_check,
+                                    "Save command"
+                                }
+                            }
+                            if diag_list.is_empty() {
+                                p { class: "muted",
+                                    if run_info.is_some() {
+                                        "No problems found in the last check."
+                                    } else {
+                                        "No check has run yet for this project."
+                                    }
+                                }
+                            } else {
+                                div { class: "diag-list",
+                                    for d in diag_list {
+                                        {
+                                            let key = format!(
+                                                "{}:{}:{}:{}",
+                                                d.file,
+                                                d.line.unwrap_or(0),
+                                                d.column.unwrap_or(0),
+                                                d.message.chars().take(48).collect::<String>()
+                                            );
+                                            let loc = match (d.line, d.column) {
+                                                (Some(l), Some(c)) => format!("{}:{}:{}", d.file, l, c),
+                                                (Some(l), None) => format!("{}:{}", d.file, l),
+                                                _ => d.file.clone(),
+                                            };
+                                            let (icon, sev_class) = match d.severity.as_str() {
+                                                "error" => ("alert", "diag-sev error"),
+                                                "warning" => ("alert-circle", "diag-sev warning"),
+                                                _ => ("code", "diag-sev note"),
+                                            };
+                                            rsx! {
+                                                div { key: "{key}", class: "diag-row",
+                                                    span { class: "{sev_class}", Icon { name: icon, size: 14 } }
+                                                    div { class: "diag-copy",
+                                                        div { class: "diag-loc", "{loc}" }
+                                                        div { class: "diag-msg", "{d.message}" }
+                                                    }
+                                                    if let Some(code) = d.code.clone() {
+                                                        span { class: "chip mono", "{code}" }
                                                     }
                                                 }
                                             }

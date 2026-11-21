@@ -2496,6 +2496,27 @@ pub(super) fn ModelBar(
     };
     let bot_for_enter = active_bot.clone();
     let bot_for_click = active_bot.clone();
+    // 0.73: context fill of the latest turn (turn.context), shown as a thin
+    // meter in the model bar.
+    let (ctx_percent, ctx_title) = {
+        let s = session.read();
+        match s.state.turns.latest_context() {
+            Some(c) if c.percent.is_some() => {
+                let window = c
+                    .window
+                    .map(|w| w.to_string())
+                    .unwrap_or_else(|| "unknown".to_owned());
+                (
+                    c.percent,
+                    format!(
+                        "~{} chars of {} context used by the latest turn",
+                        c.prompt_chars_est, window
+                    ),
+                )
+            }
+            _ => (None, String::new()),
+        }
+    };
     rsx! {
         div { class: if compact { "model-bar compact" } else { "model-bar" },
             if !compact {
@@ -2720,6 +2741,18 @@ pub(super) fn ModelBar(
                             "{segment.label}"
                         }
                     }
+                }
+            }
+            if let Some(p) = ctx_percent {
+                div {
+                    class: "ctx-meter",
+                    role: "progressbar",
+                    "aria-label": "Context used by the latest turn",
+                    "aria-valuemin": "0",
+                    "aria-valuemax": "100",
+                    "aria-valuenow": "{p}",
+                    title: "{ctx_title}",
+                    div { class: "ctx-fill", style: "width: {p}%;" }
                 }
             }
             if changed && !compact {

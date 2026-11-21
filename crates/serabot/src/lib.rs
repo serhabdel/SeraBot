@@ -26,6 +26,7 @@ pub mod deck;
 pub mod deck_pptx;
 pub mod default_avatars;
 pub mod delegate;
+pub mod diagnostics;
 pub mod digest;
 pub mod documents;
 #[cfg(feature = "docx")]

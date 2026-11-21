@@ -53,3 +53,35 @@ pub fn delete_file(credentials: &Credentials, slug: &str, rel_path: &str) -> Res
         .projects_delete_file(slug, rel_path)
         .map_err(|error| error.to_string())
 }
+
+/// `GET /v1/projects/{slug}/check` (0.73): the configured check command.
+pub fn check_get(credentials: &Credentials, slug: &str) -> Result<Value, String> {
+    client(credentials)?
+        .projects_check_get(slug)
+        .map_err(|error| error.to_string())
+}
+
+/// `PUT /v1/projects/{slug}/check` (0.73): set the check command (argv array).
+pub fn check_put(
+    credentials: &Credentials,
+    slug: &str,
+    command: &[String],
+) -> Result<Value, String> {
+    client(credentials)?
+        .projects_check_put(slug, command)
+        .map_err(|error| error.to_string())
+}
+
+/// `POST /v1/projects/{slug}/check/run` (0.73): run the check now.
+pub fn check_run(credentials: &Credentials, slug: &str) -> Result<Value, String> {
+    client(credentials)?
+        .projects_check_run(slug)
+        .map_err(|error| error.to_string())
+}
+
+/// `GET /v1/projects/{slug}/diagnostics` (0.73): latest run plus diagnostics.
+pub fn diagnostics(credentials: &Credentials, slug: &str) -> Result<Value, String> {
+    client(credentials)?
+        .projects_diagnostics(slug)
+        .map_err(|error| error.to_string())
+}

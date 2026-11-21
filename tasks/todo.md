@@ -362,3 +362,12 @@ never merge without the owner's OK.
 - [x] Version bump 0.72.0, release notes, review-doc addendum.
 - [ ] Owner: visual pass on Windows (text sizes in chat/sidebar, rename in place, switcher badges).
 - [ ] Later: Tasks/Kanban/Calendar pages still have hard-coded px font sizes.
+
+## Release 0.73.0 — project check harness, turn context, console-wide font tokens
+
+- [x] Server: diagnostics harness (migration 0050, `diagnostics.rs`): owner-set allowlisted check command per project, contained cwd, capped output, 120s timeout, rustc-JSON parsing, UID-scoped storage, audit; API `check` get/put, `check/run`, `diagnostics`; approval-gated `project_check` bot tool (SHARED_TOOLS, DESTRUCTIVE_TOOLS, docs/approvals.md).
+- [x] Desktop: Problems panel on Projects (counts, run button, command editor, diagnostics list); API client + helpers.
+- [x] `turn.context` event at turn start (est chars, window, percent) + context meter in the model bar.
+- [x] All remaining hard-coded px font-sizes in desktop CSS onto `--fs-*` tokens (0 left).
+- [x] Version bump 0.73.0, release notes.
+- [ ] Owner: run "Run checks" on a real project on the server; visual pass on Windows (Problems panel, context meter, text sizes).

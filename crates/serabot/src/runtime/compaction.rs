@@ -147,6 +147,13 @@ impl Runtime {
         if tokens < WINDOW_CHECK_FLOOR_TOKENS {
             return false;
         }
+        self.window_for(user, route)
+            .is_some_and(|window| crosses_window(tokens, window))
+    }
+
+    /// The routed model's context window, when the catalog knows it (0.73:
+    /// also feeds the `turn.context` event so clients can show a context meter).
+    pub(super) fn window_for(&self, user: &str, route: &PinnedRoute) -> Option<u64> {
         self.router()
             .catalog_entries(user)
             .into_iter()
@@ -154,7 +161,6 @@ impl Runtime {
                 entry.provider == route.selection.provider && entry.model == route.selection.model
             })
             .and_then(|entry| entry.context_length)
-            .is_some_and(|window| crosses_window(tokens, window))
     }
 
     /// Fold the older part of the turn's transcript into one summary message.

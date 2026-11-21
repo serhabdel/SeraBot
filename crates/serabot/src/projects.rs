@@ -25,6 +25,7 @@ use crate::gateway::{Tool, ToolContext, ToolOutput, ToolSpec};
 pub const PROJECT_LIST_TOOL: &str = "project_list";
 pub const PROJECT_CREATE_TOOL: &str = "project_create";
 pub const PROJECT_FILE_TOOL: &str = "project_file";
+pub const PROJECT_CHECK_TOOL: &str = "project_check";
 
 const PROJECTS_DIR: &str = "projects";
 const MAX_SLUG: usize = 64;
@@ -426,6 +427,14 @@ pub struct ProjectFileTool {
     store: Option<Arc<Store>>,
 }
 
+/// 0.73: run the project's configured check command and report the compiler
+/// diagnostics. Approval-gated (`DESTRUCTIVE_TOOLS`): it starts a process, so
+/// the model can only ask.
+pub struct ProjectCheckTool {
+    inbox: Inbox,
+    store: Option<Arc<Store>>,
+}
+
 pub fn register(registry: &mut crate::gateway::ToolRegistry, config: Arc<Config>) -> Result<()> {
     register_with_store(registry, config, None)
 }
@@ -442,7 +451,11 @@ pub fn register_with_store(
     registry.register(ProjectCreateTool {
         inbox: inbox.clone(),
     })?;
-    registry.register(ProjectFileTool { inbox, store })?;
+    registry.register(ProjectFileTool {
+        inbox: inbox.clone(),
+        store: store.clone(),
+    })?;
+    registry.register(ProjectCheckTool { inbox, store })?;
     Ok(())
 }
 
@@ -625,6 +638,67 @@ impl Tool for ProjectFileTool {
         Ok(ToolOutput {
             content: format!("Moved {filename} to {new_path}."),
             data: Some(json!({"project": slug, "path": new_path})),
+            ..ToolOutput::default()
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for ProjectCheckTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: PROJECT_CHECK_TOOL.into(),
+            description: "Run the check command configured for one of the user's project folders \
+                          (default: cargo check --message-format=json) and report the compiler \
+                          diagnostics: errors and warnings with file, line and column. Starts a \
+                          process, so it always asks for approval first."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project name (slug)"}
+                },
+                "required": ["project"],
+                "additionalProperties": false
+            }),
+            external_effect: true,
+        }
+    }
+
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        let project = args
+            .get("project")
+            .and_then(Value::as_str)
+            .ok_or_else(|| SeraError::Validation("project is required".into()))?;
+        let Some(store) = &self.store else {
+            return Err(SeraError::Internal(
+                "the project check store is unavailable".into(),
+            ));
+        };
+        let summary =
+            crate::diagnostics::run_check(&self.inbox.config, store, &context.user_id, project)
+                .await?;
+        let content = format!(
+            "Check `{}` finished in {}ms: {} errors, {} warnings, {} notes. Full rows are stored \
+             for project `{}` (run {}); list them with the project diagnostics endpoint.",
+            summary.command.join(" "),
+            summary.duration_ms,
+            summary.errors,
+            summary.warnings,
+            summary.notes,
+            summary.project,
+            summary.run_id
+        );
+        Ok(ToolOutput {
+            content,
+            data: Some(json!({
+                "project": summary.project,
+                "run_id": summary.run_id,
+                "errors": summary.errors,
+                "warnings": summary.warnings,
+                "notes": summary.notes,
+                "duration_ms": summary.duration_ms,
+            })),
             ..ToolOutput::default()
         })
     }

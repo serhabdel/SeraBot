@@ -1261,3 +1261,75 @@ html[data-reduce-transparency="true"] .sheet.sheet-palette {
 .library-item {
   display: contents;
 }
+
+/* 0.73: context meter in the model bar (turn.context). */
+.ctx-meter {
+  width: 72px;
+  height: 4px;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  overflow: hidden;
+  align-self: center;
+  flex: 0 0 auto;
+}
+
+.ctx-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: var(--r-pill);
+  transition: width var(--dur-1) var(--ease);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ctx-fill {
+    transition: none;
+  }
+}
+
+/* 0.73: Problems panel on the Projects page. */
+.diag-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.diag-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.diag-sev {
+  flex: none;
+  margin-top: 2px;
+  display: inline-flex;
+}
+
+.diag-sev.error {
+  color: var(--danger);
+}
+
+.diag-sev.warning {
+  color: var(--warn);
+}
+
+.diag-sev.note {
+  color: var(--label-3);
+}
+
+.diag-copy {
+  flex: 1;
+  min-width: 0;
+}
+
+.diag-loc {
+  font-size: var(--fs-micro);
+  color: var(--label-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.diag-msg {
+  font-size: var(--fs-body-2);
+  overflow-wrap: anywhere;
+}
