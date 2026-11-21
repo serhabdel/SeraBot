@@ -9,8 +9,9 @@ use super::*;
 pub const VIEWPORT_ROWS: usize = 24;
 /// Extra rows drawn above and below the viewport.
 pub const OVERSCAN_ROWS: usize = 16;
-/// Height a row not on screen is assumed to have (px). Both the spacers and
-/// the page's scroll maths use it.
+/// Height a row not on screen is assumed to have (px). Only the spacers use
+/// it now: the page reports the first visible row by id, never from the
+/// scroll offset, so a wrong estimate cannot move the window.
 pub const EST_ROW_PX: usize = 96;
 /// The page reports a new first row only after it moved this many rows, so a
 /// scroll does not re-render the feed on every wheel tick.
@@ -84,81 +85,72 @@ pub fn moved_enough(last: Option<usize>, reported: usize) -> bool {
     last.is_none_or(|last| last.abs_diff(reported) >= REPORT_STEP_ROWS)
 }
 
-/// Reports the first visible row to Rust. With the window's top spacer
-/// (`#feed-spacer-top`, `data-start`) in view the row is estimated from the
-/// scroll offset; otherwise it is the first `.msg` whose bottom is on screen.
-/// Reports only after a move of `REPORT_STEP_ROWS`.
+/// Reports the first visible row to Rust, as its message id. The page finds
+/// the first `.msg` (each carries `data-row-id`) whose bottom is on screen;
+/// the top spacer is never measured — it only stands in for height, so
+/// deriving the row from `scrollTop / EST_ROW_PX` drifted whenever real rows
+/// were taller or shorter than the estimate. Rust resolves the id to an index
+/// with [`anchor_index`]; Rust keeps the move threshold (`REPORT_STEP_ROWS`,
+/// via [`moved_enough`]) so a scroll reports only after a real move.
 pub fn feed_window_js() -> String {
-    format!(
-        r#"
-(function () {{
+    r#"
+(function () {
   if (window.__serabotFeedWindow) return;
   window.__serabotFeedWindow = true;
-  const EST = {est};
-  const STEP = {step};
-  let last = -1;
   let lastConv = '';
+  let lastId = '';
   let raf = 0;
-  const compute = () => {{
+  const compute = () => {
     raf = 0;
     const b = document.getElementById('messages');
     if (!b) return;
     const conv = b.dataset ? (b.dataset.conv || '') : '';
-    if (conv !== lastConv) {{
+    if (conv !== lastConv) {
       lastConv = conv;
-      last = -1;
-    }}
-    const sp = document.getElementById('feed-spacer-top');
-    const start = sp ? Number(sp.dataset.start) || 0 : 0;
-    const spacer = sp ? sp.offsetHeight : 0;
-    let ix;
-    if (b.scrollTop < spacer) {{
-      ix = Math.floor(b.scrollTop / EST);
-    }} else {{
-      ix = start;
-      const top = b.getBoundingClientRect().top;
-      const rows = b.querySelectorAll(':scope > .msg');
-      for (let k = 0; k < rows.length; k++) {{
-        if (rows[k].getBoundingClientRect().bottom > top) {{ ix = start + k; break; }}
-      }}
-    }}
-    if (last < 0 || Math.abs(ix - last) >= STEP) {{
-      last = ix;
-      if (window.__serabotFeedSink) window.__serabotFeedSink(ix);
-    }}
-  }};
-  const schedule = () => {{ if (!raf) raf = requestAnimationFrame(compute); }};
-  const hook = () => {{
+      lastId = '';
+    }
+    const top = b.getBoundingClientRect().top;
+    const rows = b.querySelectorAll(':scope > .msg');
+    let id = '';
+    for (let k = 0; k < rows.length; k++) {
+      if (rows[k].getBoundingClientRect().bottom > top) {
+        id = (rows[k].dataset && rows[k].dataset.rowId) || '';
+        break;
+      }
+    }
+    if (!id || id === lastId) return;
+    lastId = id;
+    if (window.__serabotFeedSink) window.__serabotFeedSink(id);
+  };
+  const schedule = () => { if (!raf) raf = requestAnimationFrame(compute); };
+  const hook = () => {
     const b = document.getElementById('messages');
     if (!b) return;
     const conv = b.dataset ? (b.dataset.conv || '') : '';
-    if (!b.__serabotFeedHooked) {{
+    if (!b.__serabotFeedHooked) {
       b.__serabotFeedHooked = true;
       lastConv = conv;
-      last = -1;
-      b.addEventListener('scroll', schedule, {{ passive: true }});
-      new MutationObserver(() => {{
+      lastId = '';
+      b.addEventListener('scroll', schedule, { passive: true });
+      new MutationObserver(() => {
         const c = b.dataset ? (b.dataset.conv || '') : '';
-        if (c !== lastConv) {{
+        if (c !== lastConv) {
           lastConv = c;
-          last = -1;
-        }}
-      }}).observe(b, {{ attributes: true, attributeFilter: ['data-conv'] }});
-    }} else if (conv !== lastConv) {{
+          lastId = '';
+        }
+      }).observe(b, { attributes: true, attributeFilter: ['data-conv'] });
+    } else if (conv !== lastConv) {
       lastConv = conv;
-      last = -1;
-    }}
-  }};
-  new MutationObserver(hook).observe(document.body, {{ childList: true, subtree: true }});
+      lastId = '';
+    }
+  };
+  new MutationObserver(hook).observe(document.body, { childList: true, subtree: true });
   hook();
-}})();
-"#,
-        est = EST_ROW_PX,
-        step = REPORT_STEP_ROWS,
-    )
+})();
+"#.to_owned()
 }
 
-/// Starts the sink that receives the first visible row from the page.
+/// Starts the sink that receives the first visible row's id from the page.
 pub const FEED_SINK_JS: &str = r#"
 window.__serabotFeedSink = (value) => dioxus.send(value);
 "#;
@@ -238,9 +230,19 @@ mod tests {
     }
 
     #[test]
-    fn bridge_embeds_the_shared_constants() {
+    fn bridge_reports_row_ids_from_visible_rows_not_the_spacer() {
         let js = feed_window_js();
-        assert!(js.contains(&format!("const EST = {EST_ROW_PX};")));
-        assert!(js.contains(&format!("const STEP = {REPORT_STEP_ROWS};")));
+        assert!(js.contains("dataset.rowId"));
+        assert!(js.contains("getBoundingClientRect().bottom > top"));
+        assert!(js.contains("__serabotFeedSink(id)"));
+        assert!(
+            !js.contains("feed-spacer-top"),
+            "the spacer is never measured for the anchor"
+        );
+        assert!(
+            !js.contains("scrollTop /"),
+            "the anchor is never derived from scrollTop / EST_ROW_PX"
+        );
+        assert!(!js.contains("Math.floor(b.scrollTop"));
     }
 }
