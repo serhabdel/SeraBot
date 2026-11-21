@@ -138,6 +138,10 @@ pub const CAPABILITIES: &[Capability] = &[
         tools: &[
             "onedrive_upload",
             "onedrive_list",
+            "onedrive_download",
+            "onedrive_search",
+            "onedrive_recent",
+            "onedrive_info",
             "google_drive_list",
             "google_sheets_read",
             "notion_query_database",

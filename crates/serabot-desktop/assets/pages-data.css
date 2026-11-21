@@ -72,6 +72,121 @@
 
 /* ---- Memory ---- */
 
+.memory-page .pane-body {
+  max-width: 1240px;
+}
+
+.mem-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 12px;
+}
+
+.mem-stats .stat-tile.is-attention {
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--hairline));
+  background: color-mix(in srgb, var(--warn-soft) 45%, var(--surface));
+}
+
+.mem-review-card {
+  gap: 12px;
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--hairline));
+  background: var(--surface);
+}
+
+.mem-review-card.is-clear {
+  border-color: var(--hairline);
+}
+
+.mem-review-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px 14px;
+}
+
+.mem-review-title-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 220px;
+  flex: 1;
+}
+
+.mem-review-title {
+  margin: 0;
+}
+
+.mem-review-sub {
+  margin: 0;
+  font-size: var(--fs-caption);
+  color: var(--label-2);
+  line-height: 1.4;
+}
+
+.mem-review-badges {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.mem-review-error {
+  margin: 0;
+  color: var(--danger);
+}
+
+.mem-review-skeletons {
+  display: grid;
+  gap: 8px;
+}
+
+.mem-review-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 10px;
+}
+
+.mem-review-item {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+}
+
+.mem-review-item.is-conflict {
+  border-color: color-mix(in srgb, var(--warn) 50%, var(--hairline));
+}
+
+.mem-review-compare {
+  padding: 8px 10px;
+  border-left: 2px solid var(--accent);
+  border-radius: 0 var(--r-xs) var(--r-xs) 0;
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mem-review-compare-label {
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--label-3);
+}
+
+.mem-review-compare-text {
+  margin: 0;
+  font-size: var(--fs-caption);
+  color: var(--label-2);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
 .mem-composer {
   gap: 12px;
   animation: item-in var(--enter-dur) var(--spring) both;
@@ -94,6 +209,10 @@
   justify-content: flex-end;
 }
 
+.mem-filter-panel {
+  gap: 12px;
+}
+
 .mem-toolbar {
   display: flex;
   flex-wrap: wrap;
@@ -107,8 +226,43 @@
   max-width: 560px;
 }
 
+.mem-facets {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 18px;
+  padding-top: 10px;
+  border-top: 1px solid var(--hairline);
+}
+
+.mem-facet-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.mem-facet-label {
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--label-3);
+}
+
+.mem-seg-wrap {
+  flex-wrap: wrap;
+}
+
+.mem-facet-status {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .mem-grid {
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
   gap: 14px;
 }
 
@@ -142,6 +296,11 @@
   gap: 6px;
 }
 
+.mem-bot-chip {
+  background: var(--surface-2);
+  color: var(--label-2);
+}
+
 .mem-text {
   flex: 1;
   margin: 0;
@@ -154,6 +313,13 @@
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+.mem-foot-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
 
 .mem-foot .tiny {
@@ -172,6 +338,19 @@
   height: 4px;
 }
 
+.mem-source-tag {
+  max-width: 140px;
+  padding: 1px 7px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--hairline);
+  background: var(--surface-2);
+  color: var(--label-3);
+  font-size: var(--fs-micro);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .mem-actions {
   margin-top: 2px;
   padding-top: 8px;
@@ -180,6 +359,16 @@
 
 .memory-page .empty {
   padding: 56px 24px;
+}
+
+@media (max-width: 720px) {
+  .mem-composer-row {
+    grid-template-columns: 1fr;
+  }
+
+  .mem-facet-status {
+    margin-left: 0;
+  }
 }
 
 /* ---- Vault ---- */
@@ -552,6 +741,7 @@
 
 @media (prefers-reduced-motion: reduce) {
   .mem-composer,
+  .mem-review-card,
   .vault-entry-grid > *,
   .vault-provider-grid > *,
   .vault-hero > *,
@@ -568,6 +758,7 @@
     transform: none;
   }
 
+  .mem-card,
   .settings-nav-item::before,
   .meter-fill {
     transition: none;
@@ -575,6 +766,7 @@
 }
 
 .root[data-motion="reduce"] .mem-composer,
+.root[data-motion="reduce"] .mem-review-card,
 .root[data-motion="reduce"] .vault-entry-grid > *,
 .root[data-motion="reduce"] .vault-provider-grid > *,
 .root[data-motion="reduce"] .vault-hero > *,
@@ -591,6 +783,7 @@
   transform: none;
 }
 
+.root[data-motion="reduce"] .mem-card,
 .root[data-motion="reduce"] .settings-nav-item::before,
 .root[data-motion="reduce"] .meter-fill {
   transition: none;

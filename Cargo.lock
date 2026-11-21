@@ -7450,7 +7450,7 @@ dependencies = [
 
 [[package]]
 name = "serabot"
-version = "0.74.0"
+version = "0.74.1"
 dependencies = [
  "age",
  "anyhow",
@@ -7497,6 +7497,7 @@ dependencies = [
  "text-splitter",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "toml 0.8.2",
  "tower",
@@ -7506,6 +7507,7 @@ dependencies = [
  "unicode-normalization",
  "url",
  "uuid",
+ "webpki-roots 0.26.11",
  "whatsapp-rust",
  "wiremock",
  "wordcraft-doc",
@@ -7517,7 +7519,7 @@ dependencies = [
 
 [[package]]
 name = "serabot-desktop"
-version = "0.74.0"
+version = "0.74.1"
 dependencies = [
  "base64 0.22.1",
  "dioxus",

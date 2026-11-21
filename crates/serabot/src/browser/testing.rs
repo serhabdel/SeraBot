@@ -35,6 +35,8 @@ pub(crate) struct FakeBackend {
     pub fail_next: std::sync::Mutex<Option<String>>,
     /// Paths handed to `upload_ref`, to check they are deleted afterwards.
     pub uploaded: std::sync::Mutex<Vec<std::path::PathBuf>>,
+    /// Optional override for `FakeBackend` download tests: `(filename, mime, bytes)`.
+    pub fake_download: std::sync::Mutex<Option<(String, String, Vec<u8>)>>,
 }
 
 impl FakeBackend {
@@ -271,12 +273,78 @@ impl BrowserBackend for FakeBackend {
     ) -> Result<Download> {
         self.record(format!("download {reference}"));
         self.take_failure()?;
-        let bytes = b"downloaded-bytes".to_vec();
+        let (filename, mime, bytes) =
+            self.fake_download
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| {
+                    (
+                        "report.csv".into(),
+                        "text/csv".into(),
+                        b"downloaded-bytes".to_vec(),
+                    )
+                });
         if bytes.len() as u64 > max_bytes {
             return Err(SeraError::Validation("the file is too large".into()));
         }
         Ok(Download {
-            filename: "report.csv".into(),
+            filename,
+            mime,
+            bytes,
+        })
+    }
+    async fn download_url(
+        &self,
+        url: &str,
+        _timeout: Duration,
+        max_bytes: u64,
+    ) -> Result<Download> {
+        self.record(format!("download_url {url}"));
+        self.take_failure()?;
+        let (filename, mime, bytes) =
+            self.fake_download
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| {
+                    (
+                        "document.pdf".into(),
+                        "application/pdf".into(),
+                        b"%PDF-1.4 fake-url".to_vec(),
+                    )
+                });
+        if bytes.len() as u64 > max_bytes {
+            return Err(SeraError::Validation("the file is too large".into()));
+        }
+        Ok(Download {
+            filename,
+            mime,
+            bytes,
+        })
+    }
+    async fn download_current(&self, _timeout: Duration, max_bytes: u64) -> Result<Download> {
+        let current = self.url();
+        self.record(format!("download_current {current}"));
+        self.take_failure()?;
+        let (filename, mime, bytes) =
+            self.fake_download
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| {
+                    (
+                        "current.pdf".into(),
+                        "application/pdf".into(),
+                        b"%PDF-1.4 fake-current".to_vec(),
+                    )
+                });
+        if bytes.len() as u64 > max_bytes {
+            return Err(SeraError::Validation("the file is too large".into()));
+        }
+        Ok(Download {
+            filename,
+            mime,
             bytes,
         })
     }
@@ -345,6 +413,15 @@ impl FakeLauncher {
             }
         }
     }
+    /// Set the next download response `(filename, mime, bytes)` for `user`.
+    pub fn set_fake_download(&self, user: &str, filename: &str, mime: &str, bytes: Vec<u8>) {
+        for backend in self.backends.lock().unwrap().iter() {
+            if backend.user == user {
+                *backend.fake_download.lock().unwrap() =
+                    Some((filename.to_owned(), mime.to_owned(), bytes.clone()));
+            }
+        }
+    }
     pub fn uploaded_paths(&self, user: &str) -> Vec<std::path::PathBuf> {
         self.backends
             .lock()
@@ -397,6 +474,7 @@ impl BrowserLauncher for FakeLauncher {
             banners: Default::default(),
             fail_next: Default::default(),
             uploaded: Default::default(),
+            fake_download: Default::default(),
         });
         self.backends.lock().unwrap().push(backend.clone());
         Ok(backend)

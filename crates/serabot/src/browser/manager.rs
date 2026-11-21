@@ -83,11 +83,12 @@ pub struct ScrollState {
     pub view: f64,
 }
 
-/// A file the page offered for download, read from the browser's own temp
-/// directory (already deleted).
+/// A file the page offered for download or fetched from the session, read from
+/// the browser's temp directory (already deleted) or streamed via CDP.
 #[derive(Debug, Clone)]
 pub struct Download {
     pub filename: String,
+    pub mime: String,
     pub bytes: Vec<u8>,
 }
 
@@ -169,14 +170,30 @@ pub trait BrowserBackend: Send + Sync {
     async fn wait_load_state(&self, _state: LoadState, _timeout: Duration) -> Result<bool> {
         Err(unsupported("waiting for the page to load"))
     }
-    /// Click an element and wait for the download it starts; refuses files
-    /// above `max_bytes`.
+    /// Click an element and wait for the download it starts (or fall back to
+    /// fetching the navigated document/PDF); refuses files above `max_bytes`.
     async fn click_download(
         &self,
         _reference: &str,
         _timeout: Duration,
         _max_bytes: u64,
     ) -> Result<Download> {
+        Err(unsupported("downloads"))
+    }
+    /// Fetch a specific public http(s) URL inside the browser session
+    /// (preserving cookies) without rendering it as a page; refuses files
+    /// above `max_bytes`.
+    async fn download_url(
+        &self,
+        _url: &str,
+        _timeout: Duration,
+        _max_bytes: u64,
+    ) -> Result<Download> {
+        Err(unsupported("downloads"))
+    }
+    /// Save the active tab's document (for example an open PDF viewer tab)
+    /// directly via the browser session; refuses files above `max_bytes`.
+    async fn download_current(&self, _timeout: Duration, _max_bytes: u64) -> Result<Download> {
         Err(unsupported("downloads"))
     }
     /// Print the page to PDF, at most `max_bytes`.

@@ -12,6 +12,15 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
     let undo = use_signal(|| Option::<String>::None);
     // The topbar's search button and the chat view's find bar share this flag.
     use_context_provider(|| ChatFindOpen(Signal::new(false)));
+    // The topbar switcher, its History button, and the sidebar's "All chats..."
+    // entry share this flag.
+    let mut history_open = use_context_provider(|| ChatHistoryOpen(Signal::new(false)));
+    let active_conv_for_history = session.read().conversation.clone();
+    let mut prev_conv_for_history = use_signal(|| active_conv_for_history.clone());
+    if *prev_conv_for_history.peek() != active_conv_for_history {
+        prev_conv_for_history.set(active_conv_for_history);
+        history_open.0.set(false);
+    }
     // Claude Code on this computer keeps running while other pages are open.
     crate::ui_claude_code::use_claude_code_provider();
     // A sign-in the session starts by itself (right after a save, or when an
@@ -414,6 +423,7 @@ pub(super) fn Sidebar(
     let mut renaming = use_signal(|| Option::<(String, String)>::None);
     // Which row's "more actions" menu is open (by row id).
     let menu = use_signal(|| Option::<String>::None);
+    let mut history_open = use_context::<ChatHistoryOpen>().0;
     let needle = search().trim().to_lowercase();
     let current = session.read().conversation.clone();
     let loaded = session.read().state.conversations_loaded;
@@ -530,8 +540,9 @@ pub(super) fn Sidebar(
                         })
                         .map(|conversation| state.conversation_list_subtitle(conversation))
                         .unwrap_or_else(|| capitalise_role(&bot.role));
+                    let bot_active = id == current || has_active;
                     items.push(RailItem::Bot {
-                        active: id == current || has_active,
+                        active: bot_active,
                         pinned: pins.contains(&bot.id),
                         id,
                         label: state.bot_display_name(&bot.id),
@@ -543,6 +554,71 @@ pub(super) fn Sidebar(
                         unread,
                         extra_chats: extra,
                     });
+                    if bot_active && needle.is_empty() && chats.len() > 1 {
+                        let recent_key = format!("recent:{}", bot.id);
+                        let recent_closed = collapsed().contains(&recent_key);
+                        items.push(RailItem::RecentChatsToggle {
+                            key: recent_key,
+                            count: chats.len(),
+                            collapsed: recent_closed,
+                        });
+                        if !recent_closed {
+                            let now_secs = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            let (shown, hidden) =
+                                serabot_desktop::bot_chats::visible_chats(&chats, false, &current);
+                            for chat in shown {
+                                let unread = conversations
+                                    .iter()
+                                    .find(|c| c.id == chat.id)
+                                    .map(|c| c.unread_count)
+                                    .unwrap_or(0);
+                                let raw_stamp = chat
+                                    .last_message_at
+                                    .as_deref()
+                                    .unwrap_or(chat.created_at.as_str());
+                                let rel_time = if raw_stamp.trim().is_empty() {
+                                    String::new()
+                                } else {
+                                    serabot_desktop::bot_chats::format_relative_time(
+                                        raw_stamp, now_secs,
+                                    )
+                                };
+                                let title = if chat.id == current {
+                                    let active_title = state.conversation_title();
+                                    let base = serabot_desktop::bot_chats::chat_title(chat);
+                                    if !active_title.is_empty()
+                                        && base.starts_with("New conversation")
+                                    {
+                                        active_title
+                                    } else {
+                                        base
+                                    }
+                                } else {
+                                    serabot_desktop::bot_chats::chat_title(chat)
+                                };
+                                items.push(RailItem::BotChatRow {
+                                    id: chat.id.clone(),
+                                    title,
+                                    primary: chat.primary,
+                                    active: chat.id == current,
+                                    unread,
+                                    turns: chat.turns,
+                                    rel_time,
+                                    full_stamp: raw_stamp.to_owned(),
+                                });
+                            }
+                            let total = chats.len();
+                            if hidden > 0 || total > 1 {
+                                items.push(RailItem::BotAllChats {
+                                    bot_id: bot.id.clone(),
+                                    total,
+                                });
+                            }
+                        }
+                    }
                 }
                 if needle.is_empty() && state.state.shipped_bots.len() > bots.len() {
                     items.push(RailItem::AddBots);
@@ -939,6 +1015,99 @@ pub(super) fn Sidebar(
                                         }
                                     }
                                 }
+                            }
+                        },
+                        RailItem::RecentChatsToggle { key, count, collapsed: closed } => {
+                            let toggle = key.clone();
+                            rsx! {
+                                button {
+                                    key: "{key}",
+                                    class: "sidebar-recent-toggle",
+                                    r#type: "button",
+                                    "aria-expanded": if closed { "false" } else { "true" },
+                                    onclick: move |_| {
+                                        let mut set = collapsed.write();
+                                        if set.contains(&toggle) {
+                                            set.remove(&toggle);
+                                        } else {
+                                            set.insert(toggle.clone());
+                                        }
+                                    },
+                                    Icon { name: if closed { "chevron-right" } else { "chevron-down" }, size: 11 }
+                                    span { class: "sidebar-recent-label", "Recent chats" }
+                                    span { class: "sidebar-recent-count", "{count}" }
+                                }
+                            }
+                        },
+                        RailItem::BotChatRow { id, title, primary, active, unread, turns, rel_time, full_stamp } => {
+                            let turns_text = if turns > 0 {
+                                serabot_desktop::bot_chats::format_turn_count(turns)
+                            } else {
+                                String::new()
+                            };
+                            let mut meta_parts = Vec::new();
+                            if primary {
+                                meta_parts.push("Main".to_owned());
+                            }
+                            if !turns_text.is_empty() {
+                                meta_parts.push(turns_text);
+                            }
+                            if !rel_time.is_empty() {
+                                meta_parts.push(rel_time.clone());
+                            }
+                            let meta = meta_parts.join(" \u{00b7} ");
+                            let tip = if full_stamp.is_empty() {
+                                title.clone()
+                            } else {
+                                format!("{title} \u{2014} {}", stamp(&full_stamp))
+                            };
+                            rsx! {
+                                button {
+                                    key: "{id}",
+                                    class: if active { "sidebar-recent-row active" } else { "sidebar-recent-row" },
+                                    r#type: "button",
+                                    title: "{tip}",
+                                    onclick: {
+                                        let id = id.clone();
+                                        move |_| {
+                                            drawer_open.set(false);
+                                            session.write().open_conversation(id.clone());
+                                        }
+                                    },
+                                    Icon { name: if active { "check" } else { "chat" }, size: 13 }
+                                    div { class: "sidebar-recent-copy",
+                                        span { class: "sidebar-recent-title", "{title}" }
+                                        if !meta.is_empty() {
+                                            span { class: "sidebar-recent-meta", "{meta}" }
+                                        }
+                                    }
+                                    if let Some(badge) = chat_feed::unread_badge(unread) {
+                                        span {
+                                            class: "unread-badge",
+                                            role: "img",
+                                            "aria-label": "{chat_feed::unread_label(unread)}",
+                                            "{badge}"
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        RailItem::BotAllChats { bot_id, total } => rsx! {
+                            button {
+                                key: "bot-all:{bot_id}",
+                                class: "sidebar-recent-all",
+                                r#type: "button",
+                                title: "Search and browse all {total} chats with this bot",
+                                onclick: move |_| {
+                                    drawer_open.set(false);
+                                    history_open.set(true);
+                                    let _ = dioxus::document::eval(
+                                        "requestAnimationFrame(() => { const el = document.getElementById('chat-history-search'); if (el) el.focus(); })",
+                                    );
+                                },
+                                Icon { name: "history", size: 12 }
+                                span { "All chats\u{2026}" }
+                                span { class: "sidebar-recent-count", "{total}" }
                             }
                         },
                         RailItem::Thread { id, label, subtitle, depth, active, unread, archived, pinned } => {
@@ -1574,6 +1743,25 @@ pub(super) enum RailItem {
         /// Chats beyond the primary one.
         extra_chats: usize,
     },
+    /// Collapsible sub-header for the active bot's recent chats in the sidebar.
+    RecentChatsToggle {
+        key: String,
+        count: usize,
+        collapsed: bool,
+    },
+    /// One recent chat nested under the active bot in the sidebar.
+    BotChatRow {
+        id: String,
+        title: String,
+        primary: bool,
+        active: bool,
+        unread: i64,
+        turns: u64,
+        rel_time: String,
+        full_stamp: String,
+    },
+    /// "All chats…" footer inside the active bot's sidebar sub-list.
+    BotAllChats { bot_id: String, total: usize },
     /// "Add more bots", the quiet last row of the Bots group.
     AddBots,
     /// A quiet label inside the Bots group: Pinned, Recent, All bots (0.63).
@@ -1863,7 +2051,17 @@ pub(super) fn Topbar(
                 } else if let Some(bot) = active_bot.clone() {
                     ChatSwitcher { session, bot, title: title.clone() }
                 } else {
-                    strong { "{title}" }
+                    div { class: "chat-switcher-triggers",
+                        strong { "{title}" }
+                        button {
+                            class: "btn ghost sm chat-history-btn",
+                            r#type: "button",
+                            title: "Browse all conversations",
+                            onclick: move |_| session.write().open_section(Section::Conversations),
+                            Icon { name: "history", size: 14 }
+                            span { "History" }
+                        }
+                    }
                 }
                 if let Some(text) = header_label {
                     span { class: "topbar-sub topbar-status", role: "status",

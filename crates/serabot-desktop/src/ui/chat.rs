@@ -6,6 +6,12 @@ use super::*;
 #[derive(Clone, Copy)]
 pub(crate) struct ChatFindOpen(pub Signal<bool>);
 
+/// Whether the bot chat history popover is open. Provided by `Shell` so the
+/// topbar switcher, its History button, and the sidebar's "All chats..." link
+/// share one flag.
+#[derive(Clone, Copy)]
+pub(crate) struct ChatHistoryOpen(pub Signal<bool>);
+
 #[component]
 pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
     let conversation_kind = session.read().conversation_kind().map(str::to_owned);

@@ -1,27 +1,30 @@
-//! The 0.70 page actions of the Chromium backend: actionability-checked
+//! The 0.70+ page actions of the Chromium backend: actionability-checked
 //! clicks, hover, select, check, scroll, upload, download, PDF, banners, page
 //! text and load waiting.
 //!
 //! CDP used here: `DOM.resolveNode`, `DOM.getBoxModel`,
 //! `DOM.scrollIntoViewIfNeeded`, `DOM.setFileInputFiles`,
 //! `Runtime.callFunctionOn`, `Runtime.evaluate`, `Input.dispatchMouseEvent`,
-//! `Page.printToPDF`, `Browser.setDownloadBehavior`, `Browser.cancelDownload`
-//! and the `Browser.downloadWillBegin` / `Browser.downloadProgress` events.
+//! `Page.printToPDF`, `Page.getFrameTree`, `Network.loadNetworkResource`,
+//! `IO.read`, `IO.close`, `Target.getTargetInfo`, `Target.getTargets`,
+//! `Browser.setDownloadBehavior`, `Browser.cancelDownload` and the
+//! `Browser.downloadWillBegin` / `Browser.downloadProgress` events.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use serde_json::{Value, json};
+use url::Url;
 
 use super::{ChromiumBackend, browser_error};
 use crate::browser::actionability::{Action, PROBE_JS, Probe, quad_centre};
 use crate::browser::banners::{BannerCandidate, COLLECT_JS, click_js};
-use crate::browser::guard::validate_navigation_url;
+use crate::browser::guard::{validate_navigation_url, validate_resolved};
 use crate::browser::manager::{BrowserBackend, Download, LoadState, ScrollState};
 use crate::browser::outline::RefTarget;
 use crate::error::{Result, SeraError};
-use crate::util::truncate_chars;
+use crate::util::{mime_for_filename, truncate_chars};
 
 const PAGE_TEXT_JS: &str = r#"(() => {
   const pick = document.querySelector('main, article, [role=main]');
@@ -70,6 +73,9 @@ fn scroll_page_js(dx: f64, dy: f64) -> String {
 
 const LOAD_STATE_JS: &str =
     "JSON.stringify({rs: document.readyState, n: performance.getEntriesByType('resource').length})";
+
+const IO_READ_CHUNK_BYTES: usize = 64 * 1024;
+const CLICK_DOWNLOAD_FALLBACK_POLL: Duration = Duration::from_secs(2);
 
 /// Decides "network idle" from samples of (ready state, resource count): the
 /// page is idle once it is loaded and the count has not moved for `quiet`.
@@ -121,6 +127,204 @@ pub fn clean_download_name(raw: &str) -> String {
     } else {
         truncate_chars(&name, 120)
     }
+}
+
+/// Normalize a Content-Type header value into a bare lowercase media type.
+pub fn normalize_mime(raw: Option<&str>) -> Option<String> {
+    let raw = raw?.split(';').next()?.trim().to_ascii_lowercase();
+    (!raw.is_empty()).then_some(raw)
+}
+
+/// Map a MIME type to a default file extension (without leading dot).
+pub fn extension_for_mime(mime: &str) -> Option<&'static str> {
+    let base = mime.split(';').next()?.trim().to_ascii_lowercase();
+    match base.as_str() {
+        "application/pdf" => Some("pdf"),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => Some("docx"),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => Some("xlsx"),
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => Some("pptx"),
+        "text/csv" | "application/csv" => Some("csv"),
+        "text/plain" => Some("txt"),
+        "text/markdown" => Some("md"),
+        "application/json" => Some("json"),
+        "application/xml" | "text/xml" => Some("xml"),
+        "text/html" | "application/xhtml+xml" => Some("html"),
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/webp" => Some("webp"),
+        "image/gif" => Some("gif"),
+        "application/zip" => Some("zip"),
+        _ => None,
+    }
+}
+
+/// Look up a header value case-insensitively in a CDP `headers` JSON object.
+pub fn header_value<'a>(headers: &'a Value, name: &str) -> Option<&'a str> {
+    let map = headers.as_object()?;
+    map.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .and_then(|(_, v)| v.as_str())
+}
+
+/// Extract the filename from a `Content-Disposition` header (`filename*=` or `filename=`).
+pub fn filename_from_content_disposition(header: &str) -> Option<String> {
+    let mut plain: Option<String> = None;
+    for part in header.split(';').skip(1) {
+        let part = part.trim();
+        let Some((key, raw_val)) = part.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let val = raw_val.trim();
+        if key == "filename*" {
+            let encoded = val
+                .split_once("''")
+                .map_or(val, |(_, rest)| rest)
+                .trim_matches('"');
+            let decoded = percent_decode(encoded);
+            let cleaned = clean_download_name(&decoded);
+            if cleaned != "download.bin" {
+                return Some(cleaned);
+            }
+        } else if key == "filename" && plain.is_none() {
+            let unquoted = val.trim_matches('"').trim_matches('\'');
+            let cleaned = clean_download_name(unquoted);
+            if cleaned != "download.bin" {
+                plain = Some(cleaned);
+            }
+        }
+    }
+    plain
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Derive a safe download filename from `Content-Disposition`, the URL path,
+/// and the response MIME type (for example `application/pdf` -> `.pdf`).
+pub fn derive_download_filename(
+    content_disposition: Option<&str>,
+    url: &str,
+    mime: Option<&str>,
+    bytes: &[u8],
+) -> String {
+    let inferred_mime = normalize_mime(mime).or_else(|| {
+        bytes
+            .starts_with(b"%PDF")
+            .then(|| "application/pdf".to_owned())
+    });
+    let default_ext = inferred_mime
+        .as_deref()
+        .and_then(extension_for_mime)
+        .unwrap_or("bin");
+
+    if let Some(cd) = content_disposition
+        && let Some(name) = filename_from_content_disposition(cd)
+    {
+        return ensure_extension(&name, default_ext, inferred_mime.as_deref());
+    }
+
+    if let Ok(parsed) = Url::parse(url)
+        && let Some(segment) = parsed
+            .path_segments()
+            .and_then(|mut s| s.rfind(|seg| !seg.is_empty()))
+    {
+        let decoded = percent_decode(segment);
+        let cleaned = clean_download_name(&decoded);
+        if cleaned != "download.bin" {
+            return ensure_extension(&cleaned, default_ext, inferred_mime.as_deref());
+        }
+    }
+
+    format!("download.{default_ext}")
+}
+
+fn ensure_extension(name: &str, default_ext: &str, mime: Option<&str>) -> String {
+    let has_ext = Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| {
+            !e.is_empty() && e.len() <= 10 && e.chars().all(|c| c.is_ascii_alphanumeric())
+        });
+    if has_ext {
+        return name.to_owned();
+    }
+    if mime == Some("application/pdf") || default_ext != "bin" {
+        return truncate_chars(&format!("{name}.{default_ext}"), 120);
+    }
+    name.to_owned()
+}
+
+/// True when the MIME type is a document/file rather than a standard HTML web page.
+pub fn is_document_mime(mime: &str) -> bool {
+    let base = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    !base.is_empty()
+        && !matches!(
+            base.as_str(),
+            "text/html" | "application/xhtml+xml" | "about:blank"
+        )
+}
+
+/// True when the URL path ends with a known downloadable document extension.
+pub fn path_looks_like_document(url: &str) -> bool {
+    let Ok(parsed) = Url::parse(url) else {
+        return false;
+    };
+    let ext = Path::new(parsed.path())
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    matches!(
+        ext.as_deref(),
+        Some("pdf" | "docx" | "xlsx" | "pptx" | "csv" | "zip" | "txt" | "json" | "xml")
+    )
+}
+
+/// Determine the final MIME type from response header, magic bytes, or filename.
+pub fn resolve_mime(header_mime: Option<&str>, filename: &str, bytes: &[u8]) -> String {
+    if bytes.starts_with(b"%PDF") {
+        return "application/pdf".to_owned();
+    }
+    if let Some(mime) = normalize_mime(header_mime)
+        && mime != "application/octet-stream"
+    {
+        return mime;
+    }
+    let by_name = mime_for_filename(filename);
+    if by_name != "application/octet-stream" {
+        return by_name.to_owned();
+    }
+    normalize_mime(header_mime).unwrap_or_else(|| "application/octet-stream".to_owned())
 }
 
 impl ChromiumBackend {
@@ -482,6 +686,316 @@ impl ChromiumBackend {
         result
     }
 
+    pub(super) async fn do_download_url(
+        &self,
+        url: &str,
+        timeout: Duration,
+        max_bytes: u64,
+    ) -> Result<Download> {
+        let parsed = validate_resolved(url).await?;
+        let tab = self.active()?;
+        self.load_network_resource_in_session(&tab.session_id, parsed.as_str(), timeout, max_bytes)
+            .await
+    }
+
+    pub(super) async fn do_download_current(
+        &self,
+        timeout: Duration,
+        max_bytes: u64,
+    ) -> Result<Download> {
+        let tab = self.active()?;
+        let (url, frame_id, mime) = self.session_document_info(&tab.session_id).await?;
+        if url.is_empty() || url == "about:blank" {
+            return Err(SeraError::Validation(
+                "no document is open in the current tab; open a page or PDF first".into(),
+            ));
+        }
+        let parsed = validate_resolved(&url).await?;
+        if let Some(mime) = mime.as_deref()
+            && !is_document_mime(mime)
+        {
+            return Err(SeraError::Validation(format!(
+                "the current tab is a web page ({mime}), not a downloadable document; use browser_download with ref or url, or browser_pdf to print the page"
+            )));
+        }
+        self.load_network_resource_with_frame(
+            &tab.session_id,
+            &frame_id,
+            parsed.as_str(),
+            timeout,
+            max_bytes,
+        )
+        .await
+    }
+
+    async fn clicked_link_url(&self, target: &RefTarget) -> Option<String> {
+        let object_id = self.object_id(target).await.ok()?;
+        let res = self
+            .call_on(
+                &object_id,
+                "function() { return this.href || (this.closest && this.closest('a') && this.closest('a').href) || ''; }",
+                Vec::new(),
+            )
+            .await
+            .ok()?;
+        let href = res["result"]["value"].as_str()?.trim().to_owned();
+        (!href.is_empty() && !href.starts_with('#')).then_some(href)
+    }
+
+    async fn session_document_info(
+        &self,
+        session_id: &str,
+    ) -> Result<(String, String, Option<String>)> {
+        let tree = self
+            .cdp
+            .call(Some(session_id), "Page.getFrameTree", json!({}))
+            .await?;
+        let frame = &tree["frameTree"]["frame"];
+        let frame_id = frame["id"].as_str().unwrap_or_default().to_owned();
+        let url = frame["url"].as_str().unwrap_or_default().to_owned();
+        let mime = normalize_mime(frame["mimeType"].as_str());
+        Ok((url, frame_id, mime))
+    }
+
+    async fn active_document_snapshot(&self) -> (String, String, String, Option<String>) {
+        let Ok(tab) = self.active() else {
+            return (String::new(), String::new(), String::new(), None);
+        };
+        if let Ok((url, frame_id, mime)) = self.session_document_info(&tab.session_id).await
+            && !url.is_empty()
+        {
+            return (tab.session_id, url, frame_id, mime);
+        }
+        let url = self.info().await.map(|info| info.url).unwrap_or_default();
+        (tab.session_id, url, String::new(), None)
+    }
+
+    async fn load_network_resource_in_session(
+        &self,
+        session_id: &str,
+        url: &str,
+        timeout: Duration,
+        max_bytes: u64,
+    ) -> Result<Download> {
+        let tree = self
+            .cdp
+            .call(Some(session_id), "Page.getFrameTree", json!({}))
+            .await?;
+        let frame_id = tree["frameTree"]["frame"]["id"]
+            .as_str()
+            .ok_or_else(|| browser_error("active tab has no main frame"))?
+            .to_owned();
+        self.load_network_resource_with_frame(session_id, &frame_id, url, timeout, max_bytes)
+            .await
+    }
+
+    async fn load_network_resource_with_frame(
+        &self,
+        session_id: &str,
+        frame_id: &str,
+        url: &str,
+        timeout: Duration,
+        max_bytes: u64,
+    ) -> Result<Download> {
+        let deadline = Instant::now() + timeout;
+        let call_fut = self.cdp.call(
+            Some(session_id),
+            "Network.loadNetworkResource",
+            json!({
+                "frameId": frame_id,
+                "url": url,
+                "options": {"disableCache": false, "includeCredentials": true}
+            }),
+        );
+        let reply = tokio::time::timeout(timeout, call_fut)
+            .await
+            .map_err(|_| SeraError::Validation("timed out fetching the document".into()))??;
+        let resource = &reply["resource"];
+        if !resource["success"].as_bool().unwrap_or(false) {
+            let status = resource["httpStatusCode"].as_i64();
+            let net_err = resource["netErrorName"].as_str().unwrap_or_default();
+            if let Some(code) = status.filter(|c| *c >= 400) {
+                return Err(SeraError::Validation(format!(
+                    "document download failed with HTTP {code}"
+                )));
+            }
+            if !net_err.is_empty() {
+                return Err(SeraError::Validation(format!(
+                    "document download failed ({net_err})"
+                )));
+            }
+            return Err(SeraError::Validation(
+                "document download failed in the browser".into(),
+            ));
+        }
+
+        let headers = &resource["headers"];
+        if let Some(len_str) = header_value(headers, "content-length")
+            && let Ok(len) = len_str.trim().parse::<u64>()
+            && len > max_bytes
+        {
+            if let Some(handle) = resource["stream"].as_str() {
+                let _ = self
+                    .cdp
+                    .call(Some(session_id), "IO.close", json!({"handle": handle}))
+                    .await;
+            }
+            return Err(SeraError::Validation(format!(
+                "the file is larger than {} MB; not downloading it",
+                max_bytes / (1024 * 1024)
+            )));
+        }
+
+        let handle = resource["stream"]
+            .as_str()
+            .ok_or_else(|| browser_error("browser returned no stream handle for resource"))?;
+        let bytes = self
+            .read_io_stream(session_id, handle, deadline, max_bytes)
+            .await?;
+
+        let content_disposition = header_value(headers, "content-disposition");
+        let content_type = header_value(headers, "content-type");
+        let filename = derive_download_filename(content_disposition, url, content_type, &bytes);
+        let mime = resolve_mime(content_type, &filename, &bytes);
+        Ok(Download {
+            filename,
+            mime,
+            bytes,
+        })
+    }
+
+    async fn read_io_stream(
+        &self,
+        session_id: &str,
+        handle: &str,
+        deadline: Instant,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        let read_result: Result<()> = async {
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(SeraError::Validation(
+                        "timed out reading the document stream".into(),
+                    ));
+                }
+                let chunk = tokio::time::timeout(
+                    left,
+                    self.cdp.call(
+                        Some(session_id),
+                        "IO.read",
+                        json!({"handle": handle, "size": IO_READ_CHUNK_BYTES}),
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    SeraError::Validation("timed out reading the document stream".into())
+                })??;
+                let data = chunk["data"].as_str().unwrap_or_default();
+                let decoded = if chunk["base64Encoded"].as_bool().unwrap_or(false) {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(data)
+                        .map_err(|_| browser_error("document stream chunk was not valid base64"))?
+                } else {
+                    data.as_bytes().to_vec()
+                };
+                if (out.len() as u64).saturating_add(decoded.len() as u64) > max_bytes {
+                    return Err(SeraError::Validation(format!(
+                        "the file is larger than {} MB; not downloading it",
+                        max_bytes / (1024 * 1024)
+                    )));
+                }
+                out.extend_from_slice(&decoded);
+                if chunk["eof"].as_bool().unwrap_or(false) {
+                    break;
+                }
+            }
+            Ok(())
+        }
+        .await;
+        let _ = self
+            .cdp
+            .call(Some(session_id), "IO.close", json!({"handle": handle}))
+            .await;
+        read_result?;
+        Ok(out)
+    }
+
+    async fn try_click_document_fallback(
+        &self,
+        before_session: &str,
+        before_url: &str,
+        clicked_href: Option<&str>,
+        deadline: Instant,
+        max_bytes: u64,
+    ) -> Result<Option<Download>> {
+        let (after_session, after_url, after_frame, after_mime) =
+            self.active_document_snapshot().await;
+        let url_changed = !after_url.is_empty()
+            && after_url != "about:blank"
+            && (after_url != before_url || after_session != before_session);
+
+        // Case 1: The click navigated (in the same tab or a newly adopted
+        // target=_blank tab) directly to a PDF or other non-HTML document.
+        if url_changed {
+            let looks_doc = after_mime.as_deref().is_some_and(is_document_mime)
+                || path_looks_like_document(&after_url);
+            if looks_doc {
+                let parsed = validate_resolved(&after_url).await?;
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Ok(None);
+                }
+                let dl = if !after_frame.is_empty() {
+                    self.load_network_resource_with_frame(
+                        &after_session,
+                        &after_frame,
+                        parsed.as_str(),
+                        left,
+                        max_bytes,
+                    )
+                    .await?
+                } else {
+                    self.load_network_resource_in_session(
+                        &after_session,
+                        parsed.as_str(),
+                        left,
+                        max_bytes,
+                    )
+                    .await?
+                };
+                return Ok(Some(dl));
+            }
+        }
+
+        // Case 2: The clicked element was a link whose href points to a
+        // downloadable document (for example a PDF that didn't finish opening
+        // or was prevented from triggering a download event).
+        if let Some(href) = clicked_href
+            && validate_navigation_url(href).is_ok()
+        {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if !left.is_zero() && !after_session.is_empty() {
+                let parsed = validate_resolved(href).await?;
+                if let Ok(dl) = self
+                    .load_network_resource_in_session(
+                        &after_session,
+                        parsed.as_str(),
+                        left,
+                        max_bytes,
+                    )
+                    .await
+                    && is_document_mime(&dl.mime)
+                {
+                    return Ok(Some(dl));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     async fn download_inner(
         &self,
         target: &RefTarget,
@@ -490,6 +1004,8 @@ impl ChromiumBackend {
         max_bytes: u64,
     ) -> Result<Download> {
         let (x, y) = self.actionable_point(target, Action::Click).await?;
+        let (before_session, before_url, _, _) = self.active_document_snapshot().await;
+        let clicked_href = self.clicked_link_url(target).await;
         self.cdp
             .call(
                 None,
@@ -500,17 +1016,73 @@ impl ChromiumBackend {
         let mut events = self.cdp.subscribe();
         self.click_at(x, y).await?;
         let deadline = Instant::now() + timeout;
+        let fallback_at = (Instant::now() + CLICK_DOWNLOAD_FALLBACK_POLL).min(deadline);
+        let mut fallback_checked = false;
         let mut filename = String::from("download.bin");
+        let mut download_url = String::new();
         let mut guid = String::new();
         loop {
-            let left = deadline.saturating_duration_since(Instant::now());
+            let now = Instant::now();
+            if now >= deadline {
+                if guid.is_empty()
+                    && let Some(dl) = self
+                        .try_click_document_fallback(
+                            &before_session,
+                            &before_url,
+                            clicked_href.as_deref(),
+                            now + Duration::from_secs(5),
+                            max_bytes,
+                        )
+                        .await?
+                {
+                    return Ok(dl);
+                }
+                return Err(SeraError::Validation(
+                    "no download finished in time; the click may not start a download (if it opened in a viewer, call browser_download with url or current=true)".into(),
+                ));
+            }
+            let wait_until = if guid.is_empty() && !fallback_checked {
+                fallback_at.min(deadline)
+            } else {
+                deadline
+            };
+            let left = wait_until.saturating_duration_since(now);
             let event = match tokio::time::timeout(left, events.recv()).await {
                 Ok(Ok(event)) => event,
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
                 Ok(Err(_)) => return Err(browser_error("browser connection closed")),
                 Err(_) => {
+                    if guid.is_empty() && !fallback_checked {
+                        fallback_checked = true;
+                        if let Some(dl) = self
+                            .try_click_document_fallback(
+                                &before_session,
+                                &before_url,
+                                clicked_href.as_deref(),
+                                deadline,
+                                max_bytes,
+                            )
+                            .await?
+                        {
+                            return Ok(dl);
+                        }
+                        continue;
+                    }
+                    if guid.is_empty()
+                        && let Some(dl) = self
+                            .try_click_document_fallback(
+                                &before_session,
+                                &before_url,
+                                clicked_href.as_deref(),
+                                Instant::now() + Duration::from_secs(5),
+                                max_bytes,
+                            )
+                            .await?
+                    {
+                        return Ok(dl);
+                    }
                     return Err(SeraError::Validation(
-                        "no download finished in time; the click may not start a download".into(),
+                        "no download finished in time; the click may not start a download (if it opened in a viewer, call browser_download with url or current=true)".into(),
                     ));
                 }
             };
@@ -528,6 +1100,7 @@ impl ChromiumBackend {
                             "the download came from a non-public address and was refused".into(),
                         ));
                     }
+                    download_url = url.to_owned();
                     filename = clean_download_name(
                         event.params["suggestedFilename"]
                             .as_str()
@@ -568,7 +1141,16 @@ impl ChromiumBackend {
                                 ));
                             }
                             let bytes = std::fs::read(&path)?;
-                            return Ok(Download { filename, bytes });
+                            if filename == "download.bin" && !download_url.is_empty() {
+                                filename =
+                                    derive_download_filename(None, &download_url, None, &bytes);
+                            }
+                            let mime = resolve_mime(None, &filename, &bytes);
+                            return Ok(Download {
+                                filename,
+                                mime,
+                                bytes,
+                            });
                         }
                         _ => {}
                     }
@@ -655,6 +1237,64 @@ mod tests {
         assert!(safe_guid("1a2b-3c"));
         assert!(!safe_guid("../x"));
         assert!(!safe_guid(""));
+    }
+
+    #[test]
+    fn derives_filename_from_content_disposition_url_and_mime() {
+        assert_eq!(
+            derive_download_filename(
+                Some("attachment; filename=\"../annual-report.pdf\""),
+                "https://example.com/download?id=9",
+                Some("application/pdf"),
+                b"",
+            ),
+            "annual-report.pdf"
+        );
+        assert_eq!(
+            derive_download_filename(
+                Some("inline; filename*=UTF-8''Q3%20Summary.pdf; filename=\"fallback.pdf\""),
+                "https://example.com/view",
+                Some("application/pdf"),
+                b"",
+            ),
+            "Q3 Summary.pdf"
+        );
+        assert_eq!(
+            derive_download_filename(
+                None,
+                "https://example.com/files/tax-form%202026.pdf?token=abc",
+                Some("application/pdf"),
+                b"",
+            ),
+            "tax-form 2026.pdf"
+        );
+        // Extensionless URL path gets .pdf when MIME is application/pdf.
+        assert_eq!(
+            derive_download_filename(
+                None,
+                "https://example.com/statement",
+                Some("application/pdf; charset=binary"),
+                b"",
+            ),
+            "statement.pdf"
+        );
+        // Root path with no Content-Disposition falls back to download.<ext>.
+        assert_eq!(
+            derive_download_filename(None, "https://example.com/", Some("application/pdf"), b"",),
+            "download.pdf"
+        );
+        // Magic %PDF bytes infer .pdf even without headers.
+        assert_eq!(
+            derive_download_filename(None, "https://example.com/blob", None, b"%PDF-1.4\n"),
+            "blob.pdf"
+        );
+        assert_eq!(
+            resolve_mime(Some("application/octet-stream"), "report.xlsx", b"PK"),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        );
+        assert!(is_document_mime("application/pdf; charset=utf-8"));
+        assert!(!is_document_mime("text/html; charset=utf-8"));
+        assert!(!is_document_mime("application/xhtml+xml"));
     }
 }
 

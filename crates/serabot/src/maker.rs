@@ -724,6 +724,68 @@ impl OneDriveUploadTool {
             folder: folder.into(),
         }
     }
+
+    fn resolve_destination(&self, args: &Value) -> Result<String> {
+        let folder = args.get("folder").and_then(Value::as_str);
+        let subfolder = args.get("subfolder").and_then(Value::as_str);
+        if folder.is_some() && subfolder.is_some() {
+            return Err(SeraError::Validation(
+                "provide either folder or subfolder, not both".into(),
+            ));
+        }
+        if let Some(folder) = folder {
+            let trimmed = folder.trim();
+            if matches!(trimmed, "" | "/" | "." | "root") {
+                return Ok("/".to_owned());
+            }
+            let inner = trimmed.strip_prefix('/').unwrap_or(trimmed);
+            let inner = inner.strip_suffix('/').unwrap_or(inner);
+            if inner.is_empty() || inner == "." || inner == "root" {
+                return Ok("/".to_owned());
+            }
+            validate_onedrive_path_segments(inner, 12, "folder")?;
+            return Ok(format!("/{inner}"));
+        }
+        if let Some(subfolder) = subfolder {
+            let trimmed = subfolder.trim();
+            validate_onedrive_path_segments(trimmed, 4, "subfolder")?;
+            return Ok(format!("/{}/{}", self.folder.trim_matches('/'), trimmed));
+        }
+        Ok(format!("/{}", self.folder.trim_matches('/')))
+    }
+}
+
+fn validate_onedrive_path_segments(value: &str, max_depth: usize, label: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(SeraError::Validation(format!("{label} must not be empty")));
+    }
+    if value.starts_with('/') || value.ends_with('/') {
+        return Err(SeraError::Validation(format!(
+            "{label} must not start or end with '/'"
+        )));
+    }
+    let parts: Vec<&str> = value.split('/').collect();
+    if parts.len() > max_depth {
+        return Err(SeraError::Validation(format!(
+            "{label} exceeds the maximum depth of {max_depth} segments"
+        )));
+    }
+    for part in &parts {
+        if part.is_empty() || *part == "." || *part == ".." || part.trim() != *part {
+            return Err(SeraError::Validation(format!(
+                "{label} contains an invalid path segment"
+            )));
+        }
+        if part
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '\\' | ':' | '*' | '<' | '>' | '?' | '"' | '|'))
+        {
+            return Err(SeraError::Validation(format!(
+                "{label} contains an unsupported character"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -731,14 +793,19 @@ impl Tool for OneDriveUploadTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "onedrive_upload".into(),
-            description:
-                "Upload an existing rendered artifact to the acting user's approved OneDrive dossier folder."
-                    .into(),
+            description: format!(
+                "Upload an existing stored artifact to the acting user's OneDrive (requires approval). \
+                 By default uploads into the configured dossier folder ('{}', optionally under `subfolder`); \
+                 pass `folder` to upload to any path from the drive root (e.g. 'Documents/Jobs', or '/' for root). \
+                 Never overwrites existing files (renames or fails according to server policy).",
+                self.folder
+            ),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "artifact_hash": {"type": "string"},
-                    "subfolder": {"type": "string"}
+                    "artifact_hash": {"type": "string", "description": "SHA-256 hash of the stored artifact to upload"},
+                    "folder": {"type": "string", "maxLength": 300, "description": "Optional destination folder path from the drive root (e.g. 'Documents/Jobs' or '/')"},
+                    "subfolder": {"type": "string", "maxLength": 300, "description": "Optional subfolder below the configured dossier folder"}
                 },
                 "required": ["artifact_hash"],
                 "additionalProperties": false
@@ -753,16 +820,18 @@ impl Tool for OneDriveUploadTool {
             .and_then(Value::as_str)
             .unwrap_or_default();
         let artifact = self.artifacts.load(hash)?;
-        let destination = match args.get("subfolder").and_then(Value::as_str) {
-            Some(subfolder) => format!("{}/{}", self.folder, subfolder),
-            None => self.folder.clone(),
+        let destination_folder = self.resolve_destination(args)?;
+        let exact_path = if destination_folder == "/" {
+            format!("/{}", artifact.filename)
+        } else {
+            format!("{}/{}", destination_folder, artifact.filename)
         };
         Ok(ApprovalDetails {
             summary: format!(
-                "Upload '{}' to OneDrive folder '{}'",
-                artifact.filename, destination
+                "Upload '{}' to OneDrive path '{}'",
+                artifact.filename, exact_path
             ),
-            destination: Some(format!("onedrive:{destination}")),
+            destination: Some(format!("onedrive:{exact_path}")),
             artifact_hash: Some(artifact.hash),
         })
     }
@@ -772,6 +841,7 @@ impl Tool for OneDriveUploadTool {
             .get("artifact_hash")
             .and_then(Value::as_str)
             .ok_or_else(|| SeraError::Validation("artifact_hash is required".into()))?;
+        let folder = args.get("folder").and_then(Value::as_str);
         let subfolder = args.get("subfolder").and_then(Value::as_str);
         let artifact = self.artifacts.load(hash)?;
         // The acting user's own client: no connected drive is an explicit
@@ -779,10 +849,11 @@ impl Tool for OneDriveUploadTool {
         let client = self.registry.client_for(&context.user_id)?;
         let mut client = client.lock().await;
         let result = client
-            .upload(
+            .upload_to_folder(
                 &artifact.filename,
                 artifact.bytes,
                 mime_for_filename(&artifact.filename),
+                folder,
                 subfolder,
             )
             .await?;
@@ -807,6 +878,28 @@ impl Tool for OneDriveUploadTool {
 /// Largest file `onedrive_download` imports.
 const MAX_ONEDRIVE_DOWNLOAD_BYTES: usize = 25 * 1024 * 1024;
 
+fn next_reader_hint(filename: &str) -> &'static str {
+    let ext = Path::new(filename)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("pdf") => {
+            "pdf_inspect (or document_index for OCR/text search, pdf_to_images for scanned pages)"
+        }
+        Some("xlsx" | "xlsm" | "xls" | "ods") => {
+            "xlsx_import then xlsx_read / xlsx_inspect / xlsx_edit"
+        }
+        Some("csv") => "xlsx_analyze or document_index",
+        Some("docx") => "docx_import then docx_read / docx_inspect / docx_edit",
+        Some("pptx") => "pptx_import then pptx_inspect / pptx_edit",
+        Some("png" | "jpg" | "jpeg" | "webp" | "gif") => {
+            "image_inspect / image_crop / image_adjust / image_compress"
+        }
+        _ => "document_index",
+    }
+}
+
 /// Read-only: copy one file from the acting member's own OneDrive into an
 /// artifact (for example their Excel tracker, before `xlsx_edit`).
 pub struct OneDriveDownloadTool {
@@ -828,10 +921,10 @@ impl Tool for OneDriveDownloadTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "onedrive_download".into(),
-            description: "Import one file from the acting user's own OneDrive into an artifact (read-only; path from the drive root, as onedrive_list shows, e.g. Documents/Jobs/tracker.xlsx). Then use xlsx_import / xlsx_edit or docx_import on the artifact.".into(),
+            description: "Import one file from the acting user's own OneDrive into an artifact (read-only; max 25 MB; path from the drive root as shown by onedrive_list, onedrive_search, or onedrive_recent, e.g. 'Documents/Jobs/tracker.xlsx'). Returns an artifact hash and recommends the matching reader tool by file type (pdf -> pdf_inspect/document_index; xlsx/csv -> xlsx_import/xlsx_read; docx -> docx_import; pptx -> pptx_import; images -> image_inspect).".into(),
             parameters: json!({
                 "type": "object",
-                "properties": {"path": {"type": "string", "maxLength": 300}},
+                "properties": {"path": {"type": "string", "maxLength": 300, "description": "File path from the drive root (e.g. 'Documents/Jobs/tracker.xlsx')"}},
                 "required": ["path"],
                 "additionalProperties": false
             }),
@@ -862,18 +955,72 @@ impl Tool for OneDriveDownloadTool {
                 created_at: Utc::now(),
             },
         )?;
+        let hint = next_reader_hint(&stored.filename);
         Ok(ToolOutput {
             content: format!(
-                "Imported '{}' from your OneDrive ({} bytes) as artifact {}.",
+                "Imported '{}' from your OneDrive ({} bytes) as artifact {}.\nNext: pass this artifact hash to {}.",
                 stored.filename,
                 bytes.len(),
-                stored.hash
+                stored.hash,
+                hint
             ),
+            data: Some(json!({
+                "artifact_hash": stored.hash,
+                "filename": stored.filename,
+                "size_bytes": bytes.len(),
+                "next_tool_hint": hint,
+            })),
             artifact_hash: Some(stored.hash),
             filename: Some(stored.filename),
             ..ToolOutput::default()
         })
     }
+}
+
+fn format_drive_item_line(item: &crate::onedrive::DriveListItem) -> String {
+    let mut meta = Vec::new();
+    if item.folder {
+        if let Some(count) = item.child_count {
+            meta.push(format!("{count} items"));
+        }
+    } else {
+        meta.push(format!("{} bytes", item.size));
+    }
+    if let Some(modified) = &item.last_modified {
+        meta.push(format!("modified {modified}"));
+    }
+    if let Some(url) = &item.web_url {
+        meta.push(url.clone());
+    }
+    let kind = if item.folder { "folder" } else { "file" };
+    if meta.is_empty() {
+        format!("- [{kind}] {} ({})", item.name, item.path)
+    } else {
+        format!(
+            "- [{kind}] {} ({} — {})",
+            item.name,
+            item.path,
+            meta.join(", ")
+        )
+    }
+}
+
+fn drive_items_json(items: &[crate::onedrive::DriveListItem]) -> Vec<Value> {
+    items
+        .iter()
+        .map(|item| {
+            json!({
+                "id": item.id,
+                "name": item.name,
+                "folder": item.folder,
+                "size": item.size,
+                "path": item.path,
+                "last_modified": item.last_modified,
+                "web_url": item.web_url,
+                "child_count": item.child_count,
+            })
+        })
+        .collect()
 }
 
 pub struct OneDriveListTool {
@@ -895,13 +1042,18 @@ impl Tool for OneDriveListTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "onedrive_list".into(),
-            description:
-                "List files and folders in the acting user's approved OneDrive dossier folder (read-only)."
-                    .into(),
+            description: format!(
+                "List files and folders in the acting user's own OneDrive (read-only). \
+                 By default lists the drive root ('/'); pass `path` for any folder from the drive root \
+                 (e.g. 'Documents/Jobs'), or pass `subfolder` to list inside the configured dossier folder ('{}'). \
+                 Returns name, path, size, folder flag, child count, last modified time, and web URL.",
+                self.folder
+            ),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "subfolder": {"type": "string"},
+                    "path": {"type": "string", "maxLength": 300, "description": "Folder path from the drive root (default '/' for drive root, e.g. 'Documents/Jobs')"},
+                    "subfolder": {"type": "string", "maxLength": 300, "description": "Optional subfolder relative to the configured dossier folder"},
                     "max_pages": {"type": "integer", "minimum": 1, "maximum": 10}
                 },
                 "additionalProperties": false
@@ -910,20 +1062,14 @@ impl Tool for OneDriveListTool {
         }
     }
 
-    fn approval_details(&self, args: &Value) -> Result<ApprovalDetails> {
-        let destination = match args.get("subfolder").and_then(Value::as_str) {
-            Some(subfolder) => format!("{}/{}", self.folder, subfolder),
-            None => self.folder.clone(),
-        };
-        Ok(ApprovalDetails {
-            summary: format!("List OneDrive folder '{destination}'"),
-            destination: Some(format!("onedrive:{destination}")),
-            artifact_hash: None,
-        })
-    }
-
     async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        let path = args.get("path").and_then(Value::as_str);
         let subfolder = args.get("subfolder").and_then(Value::as_str);
+        if path.is_some() && subfolder.is_some() {
+            return Err(SeraError::Validation(
+                "provide either path or subfolder, not both".into(),
+            ));
+        }
         let max_pages = args
             .get("max_pages")
             .and_then(Value::as_u64)
@@ -931,20 +1077,23 @@ impl Tool for OneDriveListTool {
             .unwrap_or(5);
         let client = self.registry.client_for(&context.user_id)?;
         let client = client.lock().await;
-        let mut listed_scope = match subfolder {
-            Some(sub) => format!("{}/{}", self.folder, sub),
-            None => self.folder.clone(),
+        let (listed_scope, result) = if let Some(subfolder) = subfolder {
+            let scope = format!(
+                "/{}/{}",
+                self.folder.trim_matches('/'),
+                subfolder.trim_matches('/')
+            );
+            (scope, client.list_folder(Some(subfolder), max_pages).await?)
+        } else {
+            let scope = match path.map(str::trim) {
+                None | Some("" | "/" | "." | "root") => "/ (OneDrive root)".to_owned(),
+                Some(p) => format!("/{}", p.trim_matches('/')),
+            };
+            (scope, client.list_path(path, max_pages).await?)
         };
-        let mut result = client.list_folder(subfolder, max_pages).await?;
-        if subfolder.is_none() && result.items.is_empty() {
-            let root_result = client.list_folder(Some("/"), max_pages).await?;
-            if !root_result.items.is_empty() {
-                result = root_result;
-                listed_scope = "/ (OneDrive root)".to_owned();
-            }
-        }
         let header = format!(
-            "OneDrive listing ({listed_scope}): {} item(s){}",
+            "OneDrive listing ({listed_scope}; configured dossier folder: /{}): {} item(s){}",
+            self.folder.trim_matches('/'),
             result.items.len(),
             if result.truncated { " (truncated)" } else { "" }
         );
@@ -954,16 +1103,7 @@ impl Tool for OneDriveListTool {
             let lines = result
                 .items
                 .iter()
-                .map(|item| {
-                    if item.folder {
-                        format!("- [folder] {} ({})", item.name, item.path)
-                    } else {
-                        format!(
-                            "- [file] {} ({} bytes, {})",
-                            item.name, item.size, item.path
-                        )
-                    }
-                })
+                .map(format_drive_item_line)
                 .collect::<Vec<_>>()
                 .join("\n");
             format!("{header}\n{lines}")
@@ -971,14 +1111,231 @@ impl Tool for OneDriveListTool {
         Ok(ToolOutput {
             content,
             data: Some(json!({
-                "items": result.items.iter().map(|item| json!({
-                    "id": item.id,
-                    "name": item.name,
-                    "folder": item.folder,
-                    "size": item.size,
-                    "path": item.path,
-                })).collect::<Vec<_>>(),
+                "scope": listed_scope,
+                "dossier_folder": format!("/{}", self.folder.trim_matches('/')),
+                "items": drive_items_json(&result.items),
                 "truncated": result.truncated,
+            })),
+            ..ToolOutput::default()
+        })
+    }
+}
+
+/// Read-only search across the acting member's own OneDrive.
+pub struct OneDriveSearchTool {
+    registry: Arc<OneDriveRegistry>,
+}
+
+impl OneDriveSearchTool {
+    pub fn new(registry: Arc<OneDriveRegistry>) -> Self {
+        Self { registry }
+    }
+}
+
+#[async_trait]
+impl Tool for OneDriveSearchTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "onedrive_search".into(),
+            description: "Search files and folders across the acting user's own OneDrive by name or content query (read-only). Returns matching drive-root paths, sizes, modified times, and web URLs.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "minLength": 1, "maxLength": 200, "description": "Search text"},
+                    "max_results": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Maximum results to return (default 20, max 50)"}
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+            external_effect: false,
+        }
+    }
+
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        let query = args
+            .get("query")
+            .and_then(Value::as_str)
+            .ok_or_else(|| SeraError::Validation("query is required".into()))?;
+        let max_results = args
+            .get("max_results")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .unwrap_or(20);
+        let client = self.registry.client_for(&context.user_id)?;
+        let client = client.lock().await;
+        let result = client.search(query, max_results).await?;
+        let header = format!(
+            "OneDrive search for '{}': {} item(s){}",
+            query.trim(),
+            result.items.len(),
+            if result.truncated { " (truncated)" } else { "" }
+        );
+        let content = if result.items.is_empty() {
+            header
+        } else {
+            let lines = result
+                .items
+                .iter()
+                .map(format_drive_item_line)
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{header}\n{lines}")
+        };
+        Ok(ToolOutput {
+            content,
+            data: Some(json!({
+                "query": query.trim(),
+                "items": drive_items_json(&result.items),
+                "truncated": result.truncated,
+            })),
+            ..ToolOutput::default()
+        })
+    }
+}
+
+/// Read-only list of recently accessed items in the acting member's own OneDrive.
+pub struct OneDriveRecentTool {
+    registry: Arc<OneDriveRegistry>,
+}
+
+impl OneDriveRecentTool {
+    pub fn new(registry: Arc<OneDriveRegistry>) -> Self {
+        Self { registry }
+    }
+}
+
+#[async_trait]
+impl Tool for OneDriveRecentTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "onedrive_recent".into(),
+            description: "List recently accessed files in the acting user's own OneDrive (read-only). Useful when the user asks about a file they worked on recently without knowing its folder.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "max_results": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Maximum items to return (default 20, max 50)"}
+                },
+                "additionalProperties": false
+            }),
+            external_effect: false,
+        }
+    }
+
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        let max_results = args
+            .get("max_results")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .unwrap_or(20);
+        let client = self.registry.client_for(&context.user_id)?;
+        let client = client.lock().await;
+        let result = client.recent(max_results).await?;
+        let header = format!(
+            "OneDrive recent files: {} item(s){}",
+            result.items.len(),
+            if result.truncated { " (truncated)" } else { "" }
+        );
+        let content = if result.items.is_empty() {
+            header
+        } else {
+            let lines = result
+                .items
+                .iter()
+                .map(format_drive_item_line)
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{header}\n{lines}")
+        };
+        Ok(ToolOutput {
+            content,
+            data: Some(json!({
+                "items": drive_items_json(&result.items),
+                "truncated": result.truncated,
+            })),
+            ..ToolOutput::default()
+        })
+    }
+}
+
+/// Read-only item metadata lookup in the acting member's own OneDrive.
+pub struct OneDriveInfoTool {
+    registry: Arc<OneDriveRegistry>,
+}
+
+impl OneDriveInfoTool {
+    pub fn new(registry: Arc<OneDriveRegistry>) -> Self {
+        Self { registry }
+    }
+}
+
+#[async_trait]
+impl Tool for OneDriveInfoTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "onedrive_info".into(),
+            description: "Inspect metadata for one file or folder in the acting user's own OneDrive by path from the drive root (read-only): size, created/modified timestamps, MIME type, child count, SHA-256 hash when provided, and web URL.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "maxLength": 300, "description": "File or folder path from the drive root (or '/' for the root)"}
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+            external_effect: false,
+        }
+    }
+
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| SeraError::Validation("path is required".into()))?;
+        let client = self.registry.client_for(&context.user_id)?;
+        let client = client.lock().await;
+        let info = client.item_info(path).await?;
+        let mut lines = vec![
+            format!(
+                "OneDrive {}: {} ({})",
+                if info.folder { "folder" } else { "file" },
+                info.name,
+                info.path
+            ),
+            format!("id: {}", info.id),
+            format!("size: {} bytes", info.size),
+        ];
+        if let Some(count) = info.child_count {
+            lines.push(format!("children: {count}"));
+        }
+        if let Some(mime) = &info.mime_type {
+            lines.push(format!("mime: {mime}"));
+        }
+        if let Some(created) = &info.created_at {
+            lines.push(format!("created: {created}"));
+        }
+        if let Some(modified) = &info.last_modified {
+            lines.push(format!("modified: {modified}"));
+        }
+        if let Some(sha) = &info.sha256 {
+            lines.push(format!("sha256: {sha}"));
+        }
+        if let Some(url) = &info.web_url {
+            lines.push(format!("web_url: {url}"));
+        }
+        Ok(ToolOutput {
+            content: lines.join("\n"),
+            data: Some(json!({
+                "id": info.id,
+                "name": info.name,
+                "folder": info.folder,
+                "size": info.size,
+                "path": info.path,
+                "created_at": info.created_at,
+                "last_modified": info.last_modified,
+                "web_url": info.web_url,
+                "mime_type": info.mime_type,
+                "child_count": info.child_count,
+                "sha256": info.sha256,
             })),
             ..ToolOutput::default()
         })
@@ -1248,5 +1605,345 @@ mod tests {
             .register(DeckBuildTool::new(Arc::new(brand()), artifacts, store, 5))
             .unwrap();
         let _ = Policy::empty();
+    }
+
+    fn onedrive_registry_for_server(
+        server: &wiremock::MockServer,
+    ) -> (
+        tempfile::TempDir,
+        Arc<crate::onedrive::OneDriveRegistry>,
+        crate::config::Config,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory(384).unwrap();
+        let users =
+            Arc::new(crate::user_secrets::UserSecrets::with_master_key(store, [7u8; 32]).unwrap());
+        users
+            .set(
+                crate::store::ADMIN_USER_ID,
+                crate::onedrive::ONEDRIVE_PROVIDER,
+                "refresh-1",
+            )
+            .unwrap();
+
+        let secrets = crate::secrets::SharedSecrets::new(crate::secrets::SecretStore::from_map(
+            std::collections::BTreeMap::from([("onedrive_client_id".into(), "client-1".into())]),
+        ));
+
+        let mut config = crate::config::Config::default();
+        config.onedrive.enabled = true;
+        config.onedrive.folder = "SeraBot".into();
+        config.onedrive.graph_base = format!("{}/v1.0", server.uri());
+
+        let registry = Arc::new(
+            crate::onedrive::OneDriveRegistry::new(&config, &secrets, users)
+                .unwrap()
+                .with_token_url(format!("{}/token", server.uri()))
+                .unwrap(),
+        );
+        (dir, registry, config)
+    }
+
+    async fn mount_maker_onedrive_token(server: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-1",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[test]
+    fn onedrive_read_tools_are_non_destructive_and_upload_binds_destination() {
+        let art_dir = tempfile::tempdir().unwrap();
+        let artifacts = Arc::new(ArtifactStore::new(art_dir.path()).unwrap());
+        let stored = artifacts
+            .save(
+                b"%PDF-1.7 test",
+                "brief.pdf",
+                ArtifactMeta {
+                    title: "Brief".into(),
+                    filename: "brief.pdf".into(),
+                    language: Language::En,
+                    source_artifact: None,
+                    created_at: Utc::now(),
+                },
+            )
+            .unwrap();
+
+        assert!(!crate::gateway::is_destructive_tool("onedrive_list"));
+        assert!(!crate::gateway::is_destructive_tool("onedrive_search"));
+        assert!(!crate::gateway::is_destructive_tool("onedrive_recent"));
+        assert!(!crate::gateway::is_destructive_tool("onedrive_info"));
+        assert!(!crate::gateway::is_destructive_tool("onedrive_download"));
+        assert!(crate::gateway::is_destructive_tool("onedrive_upload"));
+
+        let server_uri = "https://graph.microsoft.com/v1.0".to_owned();
+        let store = Store::open_in_memory(384).unwrap();
+        let users =
+            Arc::new(crate::user_secrets::UserSecrets::with_master_key(store, [8u8; 32]).unwrap());
+        let secrets = crate::secrets::SharedSecrets::new(crate::secrets::SecretStore::from_map(
+            std::collections::BTreeMap::from([("onedrive_client_id".into(), "client-1".into())]),
+        ));
+        let mut config = crate::config::Config::default();
+        config.onedrive.enabled = true;
+        config.onedrive.folder = "SeraBot".into();
+        config.onedrive.graph_base = server_uri;
+        let registry =
+            Arc::new(crate::onedrive::OneDriveRegistry::new(&config, &secrets, users).unwrap());
+
+        let upload = OneDriveUploadTool::new(registry.clone(), artifacts.clone(), "SeraBot");
+        assert!(upload.spec().external_effect);
+        assert!(
+            !OneDriveListTool::new(registry.clone(), "SeraBot")
+                .spec()
+                .external_effect
+        );
+        assert!(
+            !OneDriveSearchTool::new(registry.clone())
+                .spec()
+                .external_effect
+        );
+        assert!(
+            !OneDriveRecentTool::new(registry.clone())
+                .spec()
+                .external_effect
+        );
+        assert!(
+            !OneDriveInfoTool::new(registry.clone())
+                .spec()
+                .external_effect
+        );
+        assert!(
+            !OneDriveDownloadTool::new(registry, artifacts)
+                .spec()
+                .external_effect
+        );
+
+        let default_dest = upload
+            .approval_details(&json!({"artifact_hash": stored.hash}))
+            .unwrap();
+        assert_eq!(
+            default_dest.destination.as_deref(),
+            Some("onedrive:/SeraBot/brief.pdf")
+        );
+
+        let sub_dest = upload
+            .approval_details(&json!({"artifact_hash": stored.hash, "subfolder": "Q4"}))
+            .unwrap();
+        assert_eq!(
+            sub_dest.destination.as_deref(),
+            Some("onedrive:/SeraBot/Q4/brief.pdf")
+        );
+
+        let folder_dest = upload
+            .approval_details(&json!({"artifact_hash": stored.hash, "folder": "Documents/Jobs"}))
+            .unwrap();
+        assert_eq!(
+            folder_dest.destination.as_deref(),
+            Some("onedrive:/Documents/Jobs/brief.pdf")
+        );
+
+        let root_dest = upload
+            .approval_details(&json!({"artifact_hash": stored.hash, "folder": "/"}))
+            .unwrap();
+        assert_eq!(
+            root_dest.destination.as_deref(),
+            Some("onedrive:/brief.pdf")
+        );
+
+        assert!(
+            upload
+                .approval_details(&json!({
+                    "artifact_hash": stored.hash,
+                    "folder": "Documents",
+                    "subfolder": "Q4"
+                }))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn onedrive_download_hints_match_file_extension() {
+        assert!(next_reader_hint("cv.pdf").contains("pdf_inspect"));
+        assert!(next_reader_hint("tracker.xlsx").contains("xlsx_import"));
+        assert!(next_reader_hint("data.csv").contains("xlsx_analyze"));
+        assert!(next_reader_hint("letter.docx").contains("docx_import"));
+        assert!(next_reader_hint("slides.pptx").contains("pptx_import"));
+        assert!(next_reader_hint("scan.png").contains("image_inspect"));
+    }
+
+    #[tokio::test]
+    async fn onedrive_list_search_recent_info_and_download_execute_against_mock() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        mount_maker_onedrive_token(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/drive/root/children"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "value": [{
+                    "id": "d1",
+                    "name": "Documents",
+                    "folder": { "childCount": 3 },
+                    "lastModifiedDateTime": "2026-11-20T09:00:00Z"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/drive/root:/Documents/Jobs:/children"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "value": [{
+                    "id": "f1",
+                    "name": "cv.pdf",
+                    "size": 100,
+                    "file": {},
+                    "parentReference": { "path": "/drive/root:/Documents/Jobs" }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/drive/root:/SeraBot/Out:/children"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "value": []
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/drive/root/search(q='tracker')"))
+            .and(query_param("$top", "5"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "value": [{
+                    "id": "f2",
+                    "name": "tracker.xlsx",
+                    "size": 200,
+                    "file": {},
+                    "parentReference": { "path": "/drive/root:/Documents/Jobs" }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/drive/recent"))
+            .and(query_param("$top", "4"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "value": [{
+                    "id": "f2",
+                    "name": "tracker.xlsx",
+                    "size": 200,
+                    "file": {},
+                    "parentReference": { "path": "/drive/root:/Documents/Jobs" }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/drive/root:/Documents/Jobs/tracker.xlsx"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "f2",
+                "name": "tracker.xlsx",
+                "size": 200,
+                "parentReference": { "path": "/drive/root:/Documents/Jobs" },
+                "file": { "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/v1.0/me/drive/root:/Documents/Jobs/tracker.xlsx:/content",
+            ))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/dl/tracker.xlsx", server.uri())),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/dl/tracker.xlsx"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-xlsx".to_vec()))
+            .mount(&server)
+            .await;
+
+        let (_dir, registry, _config) = onedrive_registry_for_server(&server);
+        let art_dir = tempfile::tempdir().unwrap();
+        let artifacts = Arc::new(ArtifactStore::new(art_dir.path()).unwrap());
+        let ctx = context();
+
+        let list = OneDriveListTool::new(registry.clone(), "SeraBot");
+        let root_out = list.execute(json!({}), &ctx).await.unwrap();
+        assert!(
+            root_out
+                .content
+                .contains("configured dossier folder: /SeraBot")
+        );
+        assert!(root_out.content.contains("/Documents"));
+
+        let path_out = list
+            .execute(json!({"path": "Documents/Jobs"}), &ctx)
+            .await
+            .unwrap();
+        assert!(path_out.content.contains("/Documents/Jobs/cv.pdf"));
+
+        let sub_out = list
+            .execute(json!({"subfolder": "Out"}), &ctx)
+            .await
+            .unwrap();
+        assert!(sub_out.content.contains("/SeraBot/Out"));
+
+        assert!(
+            list.execute(json!({"path": "Documents", "subfolder": "Out"}), &ctx)
+                .await
+                .is_err()
+        );
+
+        let search = OneDriveSearchTool::new(registry.clone());
+        let search_out = search
+            .execute(json!({"query": "tracker", "max_results": 5}), &ctx)
+            .await
+            .unwrap();
+        assert!(search_out.content.contains("/Documents/Jobs/tracker.xlsx"));
+
+        let recent = OneDriveRecentTool::new(registry.clone());
+        let recent_out = recent
+            .execute(json!({"max_results": 4}), &ctx)
+            .await
+            .unwrap();
+        assert!(recent_out.content.contains("tracker.xlsx"));
+
+        let info = OneDriveInfoTool::new(registry.clone());
+        let info_out = info
+            .execute(json!({"path": "Documents/Jobs/tracker.xlsx"}), &ctx)
+            .await
+            .unwrap();
+        assert!(info_out.content.contains("size: 200 bytes"));
+
+        let download = OneDriveDownloadTool::new(registry.clone(), artifacts);
+        let dl_out = download
+            .execute(json!({"path": "/Documents/Jobs/tracker.xlsx"}), &ctx)
+            .await
+            .unwrap();
+        assert!(dl_out.artifact_hash.is_some());
+        assert!(dl_out.content.contains("xlsx_import"));
+
+        // Non-connected member fails closed rather than falling back to admin.
+        let mut other_ctx = ctx.clone();
+        other_ctx.user_id = "other-member".into();
+        assert!(list.execute(json!({}), &other_ctx).await.is_err());
     }
 }

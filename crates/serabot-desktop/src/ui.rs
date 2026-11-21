@@ -464,7 +464,8 @@ fn capability_label(tool: &str) -> Option<&'static str> {
         "elevenlabs_mcp_search_tools" | "elevenlabs_mcp_describe_tool" | "elevenlabs_mcp_call" => {
             Some("ElevenLabs tools")
         }
-        "onedrive_upload" | "onedrive_list" => Some("OneDrive files"),
+        "onedrive_upload" | "onedrive_list" | "onedrive_download" | "onedrive_search"
+        | "onedrive_recent" | "onedrive_info" => Some("OneDrive files"),
         "github_search_repos"
         | "github_list_issues"
         | "github_get_issue"
@@ -926,6 +927,7 @@ pub(crate) fn Icon(name: String, #[props(default = 20)] size: u32) -> Element {
         "lock" => "M6 11h12v9H6zM8 11V8a4 4 0 0 1 8 0v3",
         "usage" => "M5 20V10M12 20V4M19 20v-7",
         "logs" => "M6 4h9l3 3v13H6zM9 9h6M9 13h6M9 17h4",
+        "history" => "M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5M12 7v5l3 2",
         "workflows" => "M12 8v4l3 2M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z",
         "globe" => {
             "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"
@@ -1473,6 +1475,28 @@ break
         assert!(css.contains("z-index: 30;"));
         assert!(css.contains(".msg.user .msg-body"));
         assert!(!css.contains(".msg.me .bubble"));
+    }
+
+    #[test]
+    fn chat_switcher_menu_is_opaque_and_memory_css_is_scoped() {
+        let system = include_str!("../assets/system.css");
+        let block_start = system
+            .find(".row-menu.chat-switcher-menu {")
+            .expect("chat-switcher-menu rule");
+        let block_end = system[block_start..]
+            .find('}')
+            .expect("closing brace for chat-switcher-menu");
+        let block = &system[block_start..block_start + block_end];
+        assert!(block.contains("background: var(--surface);"));
+        assert!(block.contains("max-height: min(70vh, 620px);"));
+        assert!(block.contains("z-index: 121;"));
+        assert!(system.contains(".chat-history-btn {"));
+        assert!(system.contains(".sidebar-recent-toggle {"));
+
+        let data_css = include_str!("../assets/pages-data.css");
+        assert!(data_css.contains(".mem-stats {"));
+        assert!(data_css.contains(".mem-review-card {"));
+        assert!(data_css.contains(".mem-filter-panel {"));
     }
 
     #[test]

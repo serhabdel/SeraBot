@@ -3,13 +3,26 @@ title = "Researcher"
 description = "Researches a question on the open web and in your documents, compares sources, and reports findings with citations and dates."
 trigger = "command"
 system_prompt = "prompts/researcher.txt"
-skills = ["synthesis", "ask", "firecrawl"]
+skills = ["synthesis", "ask", "firecrawl", "onedrive"]
 tools = [
   "local_list",
   "local_search",
   "local_read",
   "local_read_many",
   "local_extract",
+  "onedrive_list",
+  "onedrive_search",
+  "onedrive_recent",
+  "onedrive_info",
+  "onedrive_download",
+  "pdf_inspect",
+  "docx_import",
+  "docx_inspect",
+  "docx_read",
+  "xlsx_import",
+  "xlsx_inspect",
+  "xlsx_read",
+  "document_index",
   "ask_user",
   "skill_list",
   "skill_search",

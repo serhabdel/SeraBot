@@ -111,6 +111,15 @@ pub fn merge_action(target: &str) -> String {
     format!("merge_into:{target}")
 }
 
+/// Counts `(total, contradicted)` review items for header summary tiles.
+pub fn review_counts(list: &[ReviewRow]) -> (usize, usize) {
+    let conflicts = list
+        .iter()
+        .filter(|row| row.reason == "contradicted")
+        .count();
+    (list.len(), conflicts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,16 +144,36 @@ mod tests {
         );
         assert_eq!(found[1].merge_target, None);
         assert_eq!(found[1].reason_label, "Not checked lately");
+        assert_eq!(review_counts(&found), (2, 0));
         assert!(rows(&json!({})).is_empty());
     }
 
     #[test]
-    fn summary_and_merge_action_read_plainly() {
+    fn summary_merge_action_and_counts_read_plainly() {
         assert_eq!(summary(0), "Nothing to check right now.");
         assert_eq!(summary(1), "1 memory worth a look.");
         assert_eq!(summary(7), "7 memories worth a look.");
         assert_eq!(merge_action("m2"), "merge_into:m2");
         assert_eq!(reason_label("contradicted"), "May contradict");
         assert_eq!(reason_label("other"), "Review");
+        let sample = vec![
+            ReviewRow {
+                id: "1".into(),
+                content: "A".into(),
+                reason: "contradicted".into(),
+                reason_label: "May contradict",
+                detail: String::new(),
+                merge_target: None,
+            },
+            ReviewRow {
+                id: "2".into(),
+                content: "B".into(),
+                reason: "duplicate".into(),
+                reason_label: "Duplicate",
+                detail: String::new(),
+                merge_target: None,
+            },
+        ];
+        assert_eq!(review_counts(&sample), (2, 1));
     }
 }
