@@ -64,6 +64,28 @@ Tasks/Kanban polish).
 - Deferred: per-bot filter on message search, Kanban drag-and-drop,
   mail_list/mail_read inbox UI.
 
+## CI fixes
+
+- IMAP greeting: `Wire::expect()` in `mail.rs` compared only the first 3
+  bytes, so `* OK` / `a1 OK` replies were rejected; now a full-prefix
+  match, with tests using a real Hostinger-style greeting.
+- Pinned MCP clients (`mcp_client.rs` `new_pinned`) never use an
+  environment proxy: a proxy would receive the credential and bypass the
+  DNS pin, and made the pinned-connection test time out wherever a proxy
+  was set (reproduced locally: `TimedOut` after 5s with a proxy,
+  0.01s without).
+- Windows-only clippy error in the new handwriting block
+  (`ui/markdown.rs:956`): a `key` on `InlineMarkdown` is the second node
+  in its `for` body, which Dioxus rejects as a deprecated `Warning`
+  under `-D warnings` on the Windows target (Linux clippy stays silent);
+  the key is dropped — the `br` above it is the first node and keeps
+  its key.
+- `gen` is a reserved keyword in Rust 2024 (`ui/chat.rs`); `Cargo.lock`
+  0.74.3 sync; `cargo fmt`; clippy `nonminimal_bool` /
+  `collapsible_match` / `too_many_arguments`; always-true test in
+  `auth.rs`; LiveCard `PartialEq` / `ondismiss` fixes; mobile mail
+  model/screen fixes.
+
 ## Verification
 
 - `cargo fmt --all -- --check`

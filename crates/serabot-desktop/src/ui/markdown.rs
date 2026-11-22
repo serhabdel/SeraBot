@@ -953,7 +953,13 @@ pub fn MarkdownBody(
                                         if l_idx > 0 {
                                             br { key: "b{l_idx}" }
                                         }
-                                        InlineMarkdown { key: "l{l_idx}", text: line }
+                                        // No key here: Dioxus only allows a key on the
+                                        // first node in a block, and the `br` above is
+                                        // that node when present. A key on this
+                                        // component is a `-D warnings` error on Windows
+                                        // (deprecated `Warning` struct in the RSX
+                                        // expansion) while Linux clippy stays silent.
+                                        InlineMarkdown { text: line }
                                     }
                                 }
                             }

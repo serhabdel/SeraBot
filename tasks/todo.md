@@ -410,6 +410,10 @@ never merge without the owner's OK.
 
 - [x] Server: re-emit turn.context after compaction/failover; strip
   :::hand fences in Telegram/WhatsApp; Cargo.toml 0.74.3.
+- [x] CI fixes: IMAP greeting full-prefix match in mail.rs; pinned MCP
+  clients never use an environment proxy (mcp_client.rs .no_proxy());
+  dropped the misplaced `key` in the handwriting block (ui/markdown.rs)
+  that failed Windows clippy under -D warnings.
 - [x] Desktop: row-id scroll anchor; fingerprint incl. ledger revision +
   steps; generation-counted composer; latest_context newest-or-None;
   LiveCard; :::hand block + Caveat font + Appearance toggle.
