@@ -53,10 +53,12 @@ pub const BUILTIN_BOTS: &[BuiltinBot] = &[
     builtin_bot!("auditor"),
     builtin_bot!("comptable"),
     builtin_bot!("courier"),
+    builtin_bot!("hostinger"),
     builtin_bot!("inbox"),
     builtin_bot!("jobfinder"),
     builtin_bot!("legal"),
     builtin_bot!("main"),
+    builtin_bot!("mailbox"),
     builtin_bot!("maker"),
     builtin_bot!("marketer"),
     builtin_bot!("markets"),
@@ -136,7 +138,7 @@ mod tests {
         let embedded: BTreeSet<String> = BUILTIN_BOTS.iter().map(|b| b.name.to_owned()).collect();
         assert_eq!(embedded.len(), BUILTIN_BOTS.len(), "duplicate builtin bot");
         assert_eq!(embedded, on_disk, "BUILTIN_BOTS out of sync with bots/");
-        assert_eq!(BUILTIN_BOTS.len(), 20);
+        assert_eq!(BUILTIN_BOTS.len(), 22);
     }
 
     #[test]

@@ -1,7 +1,9 @@
-//! SMTP/IMAP mail connector (feature branch, no version bump): per-user
-//! mailbox credentials (Hostinger or any provider) live in the per-user
-//! envelope-encrypted store under provider `mail`; gateway tools `mail_send`
-//! (approval-gated), `mail_list` and `mail_read`; HTTP API `/v1/mail/*`.
+//! SMTP/IMAP mail connector (0.74.1; multi-account + untagged-reply fix in
+//! 0.74.4): per-user mailbox credentials (Hostinger or any provider) live in
+//! the per-user envelope-encrypted store under provider `mail` (the default
+//! mailbox) or `mail.<label>` (a named extra account); gateway tools
+//! `mail_send` (approval-gated), `mail_list` and `mail_read` take an optional
+//! `account`; HTTP API `/v1/mail/*`.
 //!
 //! The wire clients are minimal hand-rolled SMTP/IMAP over `tokio-rustls`
 //! (already in the dependency tree — no new crates beyond the two direct
@@ -27,6 +29,9 @@ use crate::gateway::{Tool, ToolContext, ToolOutput, ToolRegistry, ToolSpec};
 use crate::user_secrets::UserSecrets;
 
 pub const MAIL_PROVIDER: &str = "mail";
+/// Prefix of the secret-store provider ids for named mail accounts.
+pub const MAIL_ACCOUNT_PREFIX: &str = "mail.";
+const MAX_ACCOUNT_LABEL_CHARS: usize = 24;
 pub const MAIL_SEND_TOOL: &str = "mail_send";
 pub const MAIL_LIST_TOOL: &str = "mail_list";
 pub const MAIL_READ_TOOL: &str = "mail_read";
@@ -123,19 +128,46 @@ pub fn validate_credentials(creds: &MailCredentials) -> Result<()> {
     Ok(())
 }
 
+/// Secret-store provider id for one mail account: `mail` for the default
+/// mailbox, `mail.<label>` for a named extra account. The label is lowercase
+/// letters, digits, `-` or `_` (at most 24 chars) so the provider id stays
+/// inside the store's provider-id rules.
+pub fn account_provider(account: Option<&str>) -> Result<String> {
+    match account.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(MAIL_PROVIDER.to_owned()),
+        Some(label) => {
+            let valid = label.len() <= MAX_ACCOUNT_LABEL_CHARS
+                && label.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_')
+                });
+            if !valid {
+                return Err(SeraError::Validation(
+                    "account name must be 1-24 chars: lowercase letters, digits, '-' or '_'".into(),
+                ));
+            }
+            Ok(format!("{MAIL_PROVIDER}.{label}"))
+        }
+    }
+}
+
 pub fn store_credentials(
     secrets: &UserSecrets,
     user_id: &str,
+    account: Option<&str>,
     creds: &MailCredentials,
 ) -> Result<()> {
     validate_credentials(creds)?;
     let json = serde_json::to_string(creds)
         .map_err(|e| SeraError::Internal(format!("mail creds serialise: {e}")))?;
-    secrets.set(user_id, MAIL_PROVIDER, &json)
+    secrets.set(user_id, &account_provider(account)?, &json)
 }
 
-pub fn load_credentials(secrets: &UserSecrets, user_id: &str) -> Result<Option<MailCredentials>> {
-    let Some(raw) = secrets.get(user_id, MAIL_PROVIDER)? else {
+pub fn load_credentials(
+    secrets: &UserSecrets,
+    user_id: &str,
+    account: Option<&str>,
+) -> Result<Option<MailCredentials>> {
+    let Some(raw) = secrets.get(user_id, &account_provider(account)?)? else {
         return Ok(None);
     };
     let creds: MailCredentials = serde_json::from_str(raw.expose_secret())
@@ -144,8 +176,49 @@ pub fn load_credentials(secrets: &UserSecrets, user_id: &str) -> Result<Option<M
     Ok(Some(creds))
 }
 
-pub fn delete_credentials(secrets: &UserSecrets, user_id: &str) -> Result<bool> {
-    secrets.delete(user_id, MAIL_PROVIDER)
+pub fn delete_credentials(
+    secrets: &UserSecrets,
+    user_id: &str,
+    account: Option<&str>,
+) -> Result<bool> {
+    secrets.delete(user_id, &account_provider(account)?)
+}
+
+/// One connected mailbox for status listings; `account` is empty for the
+/// default mailbox. Never carries the password.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct MailAccountInfo {
+    pub account: String,
+    pub username: String,
+    pub smtp_host: String,
+    pub imap_host: String,
+}
+
+/// All mail accounts the user has connected (`mail` plus every `mail.*`).
+pub fn list_accounts(secrets: &UserSecrets, user_id: &str) -> Result<Vec<MailAccountInfo>> {
+    let mut out = Vec::new();
+    for provider in secrets.store().list_user_credential_providers(user_id)? {
+        let account: Option<&str> = if provider == MAIL_PROVIDER {
+            Some("")
+        } else {
+            provider.strip_prefix(MAIL_ACCOUNT_PREFIX)
+        };
+        let Some(account) = account else { continue };
+        let lookup = if account.is_empty() {
+            None
+        } else {
+            Some(account)
+        };
+        if let Some(creds) = load_credentials(secrets, user_id, lookup)? {
+            out.push(MailAccountInfo {
+                account: account.to_owned(),
+                username: creds.username,
+                smtp_host: creds.smtp_host,
+                imap_host: creds.imap_host,
+            });
+        }
+    }
+    Ok(out)
 }
 
 pub fn from_address(creds: &MailCredentials) -> String {
@@ -343,10 +416,35 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
         }
     }
 
-    /// Read one logical line; IMAP literals `{N}\r\n<bytes>` are folded in.
+    /// Read exactly `n` bytes, consuming the read buffer first (a previous
+    /// `read_line` may already have buffered them from the socket).
+    async fn read_buffered_exact(&mut self, n: usize) -> Result<Vec<u8>> {
+        while self.buf.len() < n {
+            if self.buf.len() > MAX_MESSAGE_BYTES {
+                return Err(SeraError::External("IMAP literal too large".into()));
+            }
+            let mut chunk = [0u8; 4096];
+            let read = tokio::time::timeout(IO_TIMEOUT, self.stream.read(&mut chunk))
+                .await
+                .map_err(|_| SeraError::External("mail server read timed out".into()))?
+                .map_err(|e| SeraError::External(format!("mail server read: {e}")))?;
+            if read == 0 {
+                return Err(SeraError::External(
+                    "mail server closed the connection".into(),
+                ));
+            }
+            self.buf.extend_from_slice(&chunk[..read]);
+        }
+        Ok(self.buf.drain(..n).collect())
+    }
+
+    /// Read one logical line; an IMAP literal `{N}\r\n<bytes>` is folded in
+    /// (at most one per line — every command this client sends yields a single
+    /// `BODY[]` literal). The `{N}` marker stays in the folded text so
+    /// `parse_fetch_block` can locate the body.
     async fn read_logical_line(&mut self) -> Result<String> {
         let mut line = self.read_line().await?;
-        while let Some(open) = line.rfind("{")
+        if let Some(open) = line.rfind("{")
             && let Some(close) = line[open..].find('}')
         {
             let size: usize = line[open + 1..open + close]
@@ -355,23 +453,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
             if size > MAX_MESSAGE_BYTES {
                 return Err(SeraError::External("IMAP literal too large".into()));
             }
-            let mut literal = vec![0u8; size];
-            tokio::time::timeout(IO_TIMEOUT, self.stream.read_exact(&mut literal))
-                .await
-                .map_err(|_| SeraError::External("mail server literal timed out".into()))?
-                .map_err(|e| SeraError::External(format!("literal read: {e}")))?;
-            let mut crlf = [0u8; 2];
-            self.stream
-                .read_exact(&mut crlf)
-                .await
-                .map_err(|e| SeraError::External(format!("literal crlf: {e}")))?;
+            let literal = self.read_buffered_exact(size).await?;
+            let _crlf = self.read_buffered_exact(2).await?;
             line.push_str(&String::from_utf8_lossy(&literal));
             // the rest of the response continues on the next physical line
             let rest = self.read_line().await?;
             line.push_str(&rest);
-            if !line.contains("{") {
-                break;
-            }
         }
         Ok(line)
     }
@@ -684,14 +771,26 @@ fn imap_quote(value: &str) -> String {
 
 async fn imap_connect(creds: &MailCredentials) -> Result<Wire<MailStream>> {
     let mut wire = connect(creds.imap_host.trim(), creds.imap_port, creds.imap_security).await?;
-    wire.expect("* OK").await?;
-    wire.send_line(&format!(
-        "a1 LOGIN {} {}",
-        imap_quote(&creds.username),
-        imap_quote(&creds.password)
-    ))
-    .await?;
-    wire.expect("a1 OK").await?;
+    let greeting = wire.read_logical_line().await?;
+    if greeting.starts_with("* PREAUTH") {
+        // Already authenticated (e.g. trusted-IP preauth): skip LOGIN.
+    } else if greeting.starts_with("* OK") {
+        wire.send_line(&format!(
+            "a1 LOGIN {} {}",
+            imap_quote(&creds.username),
+            imap_quote(&creds.password)
+        ))
+        .await?;
+        // Servers (e.g. Hostinger/Dovecot) send untagged lines such as
+        // "* FLAGS (...)", "* n EXISTS" or untagged "* OK [PERMANENTFLAGS ...]"
+        // between LOGIN and the tagged reply; skip them.
+        wire.expect_tagged("a1").await?;
+    } else {
+        return Err(SeraError::External(format!(
+            "mail server replied unexpectedly: {}",
+            clip(&greeting, 200)
+        )));
+    }
     Ok(wire)
 }
 
@@ -806,7 +905,9 @@ pub async fn imap_list(
     };
     wire.send_line(&format!("a2 SELECT {}", imap_quote(&folder)))
         .await?;
-    wire.expect("a2 OK").await?;
+    // SELECT also answers with untagged FLAGS/EXISTS/RECENT lines before the
+    // tagged reply.
+    wire.expect_tagged("a2").await?;
     wire.send_line("a3 UID SEARCH ALL").await?;
     let (_, untagged) = wire.expect_tagged("a3").await?;
     let search = untagged
@@ -840,7 +941,7 @@ pub async fn imap_read(creds: &MailCredentials, folder: &str, uid: u32) -> Resul
     };
     wire.send_line(&format!("a2 SELECT {}", imap_quote(&folder)))
         .await?;
-    wire.expect("a2 OK").await?;
+    wire.expect_tagged("a2").await?;
     let msg = imap_fetch(&mut wire, uid).await?;
     let _ = wire.send_line("a9 LOGOUT").await;
     Ok(msg)
@@ -890,9 +991,26 @@ pub fn register(registry: &mut ToolRegistry, secrets: Arc<UserSecrets>) -> Resul
     Ok(())
 }
 
-fn require_creds(secrets: &UserSecrets, user_id: &str) -> Result<MailCredentials> {
-    load_credentials(secrets, user_id)?
-        .ok_or_else(|| SeraError::Validation("mail is not connected; connect it first".into()))
+fn require_creds(
+    secrets: &UserSecrets,
+    user_id: &str,
+    account: Option<&str>,
+) -> Result<MailCredentials> {
+    load_credentials(secrets, user_id, account)?.ok_or_else(|| {
+        SeraError::Validation(match account.filter(|a| !a.trim().is_empty()) {
+            Some(label) => format!(
+                "mail account '{label}' is not connected; connect it in Integrations → Mail first"
+            ),
+            None => "mail is not connected; connect it first".into(),
+        })
+    })
+}
+
+/// Optional `account` argument shared by all mail tools.
+fn arg_account(args: &Value) -> Option<String> {
+    args.get("account")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 pub struct MailSendTool {
@@ -914,6 +1032,7 @@ impl Tool for MailSendTool {
                     "to": {"type": "array", "items": {"type": "string"}, "description": "Recipient addresses"},
                     "subject": {"type": "string"},
                     "body": {"type": "string", "description": "Plain-text body"},
+                    "account": {"type": "string", "description": "Named mailbox connected in Integrations → Mail; omit for the default account"},
                     "attachments": {"type": "array", "items": {"type": "object", "properties": {
                         "name": {"type": "string"},
                         "content_type": {"type": "string"},
@@ -928,7 +1047,8 @@ impl Tool for MailSendTool {
     }
 
     async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
-        let creds = require_creds(&self.secrets, &context.user_id)?;
+        let account = arg_account(&args);
+        let creds = require_creds(&self.secrets, &context.user_id, account.as_deref())?;
         let to: Vec<String> = args
             .get("to")
             .and_then(Value::as_array)
@@ -1012,7 +1132,8 @@ impl Tool for MailListTool {
                 "type": "object",
                 "properties": {
                     "folder": {"type": "string", "description": "Folder, default INBOX"},
-                    "limit": {"type": "integer", "description": "How many, 1-50, default 10"}
+                    "limit": {"type": "integer", "description": "How many, 1-50, default 10"},
+                    "account": {"type": "string", "description": "Named mailbox connected in Integrations → Mail; omit for the default account"}
                 },
                 "additionalProperties": false
             }),
@@ -1021,7 +1142,8 @@ impl Tool for MailListTool {
     }
 
     async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
-        let creds = require_creds(&self.secrets, &context.user_id)?;
+        let account = arg_account(&args);
+        let creds = require_creds(&self.secrets, &context.user_id, account.as_deref())?;
         let folder = args
             .get("folder")
             .and_then(Value::as_str)
@@ -1074,7 +1196,8 @@ impl Tool for MailReadTool {
                 "type": "object",
                 "properties": {
                     "uid": {"type": "integer"},
-                    "folder": {"type": "string", "description": "Folder, default INBOX"}
+                    "folder": {"type": "string", "description": "Folder, default INBOX"},
+                    "account": {"type": "string", "description": "Named mailbox connected in Integrations → Mail; omit for the default account"}
                 },
                 "required": ["uid"],
                 "additionalProperties": false
@@ -1084,7 +1207,8 @@ impl Tool for MailReadTool {
     }
 
     async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
-        let creds = require_creds(&self.secrets, &context.user_id)?;
+        let account = arg_account(&args);
+        let creds = require_creds(&self.secrets, &context.user_id, account.as_deref())?;
         let uid =
             args.get("uid")
                 .and_then(Value::as_u64)
@@ -1311,5 +1435,189 @@ mod tests {
         c.imap_port = port;
         assert!(imap_connect(&c).await.is_err());
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn imap_connect_tolerates_untagged_lines_after_login() {
+        // Hostinger/Dovecot answer LOGIN with untagged FLAGS/EXISTS/RECENT
+        // and untagged OK lines before the tagged "a1 OK"; reading only the
+        // first line used to fail with
+        // "mail server replied unexpectedly: * FLAGS (...)".
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            writer
+                .write_all(b"* OK [CAPABILITY IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE LITERAL+ AUTH=PLAIN AUTH=LOGIN] Server ready.\r\n")
+                .await
+                .unwrap();
+            let login = lines.next_line().await.unwrap().unwrap();
+            assert!(login.starts_with("a1 LOGIN"), "login line: {login}");
+            writer
+                .write_all(
+                    b"* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n\
+                      * OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft \\*)] Flags permitted.\r\n\
+                      * 3 EXISTS\r\n\
+                      * 0 RECENT\r\n\
+                      a1 OK [CAPABILITY IMAP4rev1] LOGIN completed\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let mut c = creds(Security::None);
+        c.imap_port = port;
+        imap_connect(&c).await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn imap_list_tolerates_untagged_select_and_search() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            writer
+                .write_all(b"* OK [CAPABILITY IMAP4rev1 AUTH=LOGIN] Server ready.\r\n")
+                .await
+                .unwrap();
+            assert!(
+                lines
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .starts_with("a1 LOGIN")
+            );
+            writer
+                .write_all(
+                    b"* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n\
+                      * 2 EXISTS\r\n\
+                      * 0 RECENT\r\n\
+                      a1 OK LOGIN completed\r\n",
+                )
+                .await
+                .unwrap();
+            assert!(
+                lines
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .starts_with("a2 SELECT")
+            );
+            writer
+                .write_all(
+                    b"* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n\
+                      * 2 EXISTS\r\n\
+                      * 0 RECENT\r\n\
+                      * OK [UNSEEN 1] First unseen\r\n\
+                      * OK [UIDVALIDITY 1] UIDs valid\r\n\
+                      a2 OK [READ-WRITE] SELECT completed\r\n",
+                )
+                .await
+                .unwrap();
+            assert!(
+                lines
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .starts_with("a3 UID SEARCH")
+            );
+            writer
+                .write_all(b"* SEARCH 1 2\r\na3 OK SEARCH completed\r\n")
+                .await
+                .unwrap();
+            for uid in [2u32, 1] {
+                assert!(
+                    lines
+                        .next_line()
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .starts_with("a4 UID FETCH")
+                );
+                let body = format!("Subject: Msg {uid}\r\nFrom: a@b.example\r\n\r\nbody {uid}\r\n");
+                writer
+                    .write_all(
+                        format!(
+                            "* {uid} FETCH (FLAGS (\\Seen) UID {uid} BODY[] {{{}}}\r\n{}\r\n)\r\na4 OK FETCH completed\r\n",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let _ = lines.next_line().await; // a9 LOGOUT
+        });
+        let mut c = creds(Security::None);
+        c.imap_port = port;
+        let msgs = imap_list(&c, "INBOX", 10).await.unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].uid, 2, "newest first");
+        assert_eq!(msgs[0].subject, "Msg 2");
+        assert_eq!(msgs[0].flags, vec!["Seen"]);
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn account_provider_labels() {
+        assert_eq!(account_provider(None).unwrap(), "mail");
+        assert_eq!(account_provider(Some("   ")).unwrap(), "mail");
+        assert_eq!(account_provider(Some("work")).unwrap(), "mail.work");
+        assert_eq!(account_provider(Some("shop-2")).unwrap(), "mail.shop-2");
+        assert!(account_provider(Some("Work")).is_err());
+        assert!(account_provider(Some("a b")).is_err());
+        assert!(account_provider(Some("a.b")).is_err());
+        assert!(account_provider(Some(&"x".repeat(25))).is_err());
+    }
+
+    #[test]
+    fn multi_account_store_roundtrip() {
+        let store = crate::store::Store::open_in_memory(384).unwrap();
+        let user = store
+            .create_user("mail-multi", "m@example.example", "M")
+            .unwrap();
+        let secrets =
+            UserSecrets::with_master_key(store, [7u8; crate::user_secrets::KEY_BYTES]).unwrap();
+        let mut c = creds(Security::None);
+        store_credentials(&secrets, &user.id, None, &c).unwrap();
+        c.username = "work@example.com".into();
+        store_credentials(&secrets, &user.id, Some("work"), &c).unwrap();
+        assert_eq!(
+            load_credentials(&secrets, &user.id, None)
+                .unwrap()
+                .unwrap()
+                .username,
+            "me@example.com"
+        );
+        assert_eq!(
+            load_credentials(&secrets, &user.id, Some("work"))
+                .unwrap()
+                .unwrap()
+                .username,
+            "work@example.com"
+        );
+        let accounts = list_accounts(&secrets, &user.id).unwrap();
+        assert_eq!(accounts.len(), 2);
+        assert!(
+            accounts
+                .iter()
+                .any(|a| a.account.is_empty() && a.username == "me@example.com")
+        );
+        assert!(accounts.iter().any(|a| a.account == "work"));
+        assert!(delete_credentials(&secrets, &user.id, Some("work")).unwrap());
+        assert_eq!(list_accounts(&secrets, &user.id).unwrap().len(), 1);
+        assert!(
+            load_credentials(&secrets, &user.id, Some("work"))
+                .unwrap()
+                .is_none()
+        );
     }
 }

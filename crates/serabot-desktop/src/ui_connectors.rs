@@ -1114,6 +1114,7 @@ pub(crate) fn MailConnectorCard(
     let mut username = use_signal(String::new);
     let mut password = use_signal(String::new);
     let mut from_addr = use_signal(String::new);
+    let mut account_name = use_signal(String::new);
 
     let load_status = move || {
         loading.set(true);
@@ -1160,6 +1161,26 @@ pub(crate) fn MailConnectorCard(
         .as_ref()
         .and_then(|s| s.imap_host.clone())
         .unwrap_or_default();
+    let accounts_line = status()
+        .as_ref()
+        .map(|s| {
+            s.accounts
+                .iter()
+                .map(|a| {
+                    let label = if a.account.is_empty() {
+                        "default".to_owned()
+                    } else {
+                        a.account.clone()
+                    };
+                    match a.username.as_deref().filter(|u| !u.is_empty()) {
+                        Some(u) => format!("{label} ({u})"),
+                        None => label,
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
 
     let submit_connect = move |_| {
         if busy() {
@@ -1176,7 +1197,9 @@ pub(crate) fn MailConnectorCard(
             return;
         };
         let from_val = from_addr().trim().to_owned();
+        let account_val = account_name().trim().to_owned();
         let req = MailConnectRequest {
+            account: (!account_val.is_empty()).then_some(account_val),
             smtp_host: smtp_host().trim().to_owned(),
             smtp_port: sp,
             smtp_security: smtp_security(),
@@ -1198,15 +1221,12 @@ pub(crate) fn MailConnectorCard(
             match res {
                 Ok(reply) => {
                     password.set(String::new());
-                    let next = MailStatus {
-                        connected: reply.connected,
-                        smtp_host: reply.smtp_host.clone(),
-                        imap_host: reply.imap_host.clone(),
-                        username: reply.username.clone(),
-                    };
-                    on_status.call(next.clone());
-                    status.set(Some(next));
                     test_result.set(Some(reply));
+                    // Re-fetch so the accounts list includes the new mailbox.
+                    if let Ok(st) = run_mail_job(session, |c| c.mail_status()).await {
+                        on_status.call(st.clone());
+                        status.set(Some(st));
+                    }
                 }
                 Err(msg) => error.set(Some(msg)),
             }
@@ -1267,6 +1287,12 @@ pub(crate) fn MailConnectorCard(
                             span { class: "mono", "{connected_imap}" }
                         }
                     }
+                    if !accounts_line.is_empty() {
+                        p { class: "tiny muted",
+                            "Mailboxes: "
+                            span { class: "mono", "{accounts_line}" }
+                        }
+                    }
                 }
                 if confirm_disconnect() {
                     div { class: "mp-confirm", role: "alertdialog", "aria-label": "Confirm mail disconnect",
@@ -1280,14 +1306,21 @@ pub(crate) fn MailConnectorCard(
                                 busy.set(true);
                                 error.set(None);
                                 test_result.set(None);
+                                let acct = account_name().trim().to_owned();
+                                let acct = if acct.is_empty() { None } else { Some(acct) };
                                 spawn(async move {
-                                    let res = run_mail_job(session, |c| c.mail_disconnect()).await;
+                                    let res = run_mail_job(session, move |c| c.mail_disconnect(acct.as_deref())).await;
                                     busy.set(false);
                                     match res {
                                         Ok(_) => {
-                                            let next = MailStatus::default();
-                                            on_status.call(next.clone());
-                                            status.set(Some(next));
+                                            if let Ok(st) = run_mail_job(session, |c| c.mail_status()).await {
+                                                on_status.call(st.clone());
+                                                status.set(Some(st));
+                                            } else {
+                                                let next = MailStatus::default();
+                                                on_status.call(next.clone());
+                                                status.set(Some(next));
+                                            }
                                         }
                                         Err(msg) => error.set(Some(msg)),
                                     }
@@ -1363,6 +1396,18 @@ pub(crate) fn MailConnectorCard(
             }
 
             div { class: "form-grid mail-form-grid",
+                div { class: "field mail-from-field",
+                    label { class: "field-label", r#for: "mail-account", "Account name (optional)" }
+                    input {
+                        id: "mail-account",
+                        class: "input",
+                        r#type: "text",
+                        placeholder: "default (leave empty for the main mailbox)",
+                        disabled: busy(),
+                        value: "{account_name}",
+                        oninput: move |e| account_name.set(e.value()),
+                    }
+                }
                 div { class: "field",
                     label { class: "field-label", r#for: "mail-smtp-host", "SMTP host" }
                     input {

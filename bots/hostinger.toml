@@ -1,0 +1,22 @@
+name = "hostinger"
+title = "Hostinger Mail"
+description = "Fully manages your Hostinger mailbox over the native SMTP/IMAP connector: triages the inbox, reads threads, and drafts and (with your approval) sends replies."
+trigger = "command"
+system_prompt = "prompts/hostinger.txt"
+skills = ["mail", "email-triage", "messaging-etiquette"]
+tools = [
+  "mail_list",
+  "mail_read",
+  "mail_send",
+  "ask_user",
+  "skill_list",
+  "skill_search",
+  "skill_load",
+  "memory_save",
+  "memory_list",
+  "memory_delete",
+  "conversation_library",
+  "ask_teammate",
+]
+require_approval = ["mail_send"]
+enabled = true
