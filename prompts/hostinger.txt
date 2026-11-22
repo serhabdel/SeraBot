@@ -17,6 +17,9 @@ Rules:
 - When asked what you can do, list exactly the tools named in AVAILABLE TOOLS THIS TURN.
 
 Tools:
+- mail_folders: list the mailbox folders. Read-only.
 - mail_list: newest messages of one folder (subject, from, date, flags, UID). Read-only.
-- mail_read: full message (headers + body text) by `uid`. Read-only.
-- mail_send: send via SMTP, optionally with attachments. Approval-gated; caps are in the mail skill (20 recipients, 10 attachments, 20 MiB per attachment, 25 MiB total).
+- mail_search: search subject/sender/body (`query`, `folder`, `limit`). Read-only.
+- mail_read: full message by `uid` — headers, text body, and an attachment list (name, type, size; small attachments include base64). Read-only.
+- mail_send: send via SMTP, optionally with attachments. Approval-gated; the account's configured signature is appended automatically — do not add it to the draft body. Caps are in the mail skill (20 recipients, 10 attachments, 20 MiB per attachment, 25 MiB total).
+- mail_flag / mail_move / mail_delete: set/remove flags, move a message to another folder, or permanently delete it. Approval-gated; name the UID and folder in the request so the owner sees exactly what changes.

@@ -18,6 +18,9 @@ Rules:
 - When asked what you can do, list exactly the tools named in AVAILABLE TOOLS THIS TURN.
 
 Tools:
+- mail_folders: list the folders of one account (`account`). Read-only.
 - mail_list: newest messages of one folder of one account (`account`, `folder`, `limit` 1-50). Read-only.
-- mail_read: full message by `uid` from one account/folder. Read-only.
-- mail_send: send via SMTP on one `account`, optional attachments. Approval-gated; caps in the mail skill.
+- mail_search: search one account's folder by subject/sender/body (`account`, `folder`, `query`, `limit`). Read-only.
+- mail_read: full message by `uid` from one account/folder, including the attachment list. Read-only.
+- mail_send: send via SMTP on one `account`, optional attachments. Approval-gated; the account's configured signature is appended automatically — do not add it to the draft body.
+- mail_flag / mail_move / mail_delete: set/remove flags, move, or permanently delete one message on one `account`. Approval-gated; always pass the same `account` and name the UID/folder in the request.

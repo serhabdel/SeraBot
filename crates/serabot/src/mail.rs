@@ -35,6 +35,11 @@ const MAX_ACCOUNT_LABEL_CHARS: usize = 24;
 pub const MAIL_SEND_TOOL: &str = "mail_send";
 pub const MAIL_LIST_TOOL: &str = "mail_list";
 pub const MAIL_READ_TOOL: &str = "mail_read";
+pub const MAIL_FOLDERS_TOOL: &str = "mail_folders";
+pub const MAIL_SEARCH_TOOL: &str = "mail_search";
+pub const MAIL_FLAG_TOOL: &str = "mail_flag";
+pub const MAIL_MOVE_TOOL: &str = "mail_move";
+pub const MAIL_DELETE_TOOL: &str = "mail_delete";
 pub const MAX_MESSAGE_BYTES: usize = 25 * 1024 * 1024;
 pub const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 pub const MAX_ATTACHMENTS: usize = 10;
@@ -42,6 +47,9 @@ pub const MAX_RECIPIENTS: usize = 20;
 pub const MAX_LIST: u32 = 50;
 pub const MAX_BODY_CHARS: usize = 256 * 1024;
 pub const MAX_SUBJECT_CHARS: usize = 500;
+pub const MAX_SIGNATURE_CHARS: usize = 4096;
+const MAX_INLINE_ATTACHMENT_BYTES: usize = 512 * 1024;
+const MAX_INLINE_ATTACHMENTS_TOTAL: usize = 2 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_LINE: usize = 16 * 1024;
 
@@ -72,6 +80,10 @@ pub struct MailCredentials {
     /// From header; defaults to the username.
     #[serde(default)]
     pub from: Option<String>,
+    /// Signature appended to every sent message (`\n\n-- \n<signature>`),
+    /// stored per account (0.74.5).
+    #[serde(default)]
+    pub signature: Option<String>,
 }
 
 pub fn default_smtp_port() -> u16 {
@@ -124,6 +136,18 @@ pub fn validate_credentials(creds: &MailCredentials) -> Result<()> {
         && (from.is_empty() || from.len() > 256 || from.chars().any(|c| c == '\r' || c == '\n'))
     {
         return Err(SeraError::Validation("invalid from address".into()));
+    }
+    if let Some(sig) = &creds.signature {
+        let bad = sig.is_empty()
+            || sig.len() > MAX_SIGNATURE_CHARS
+            || sig
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t');
+        if bad {
+            return Err(SeraError::Validation(
+                "signature must be 1-4096 chars without control characters".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -223,6 +247,22 @@ pub fn list_accounts(secrets: &UserSecrets, user_id: &str) -> Result<Vec<MailAcc
 
 pub fn from_address(creds: &MailCredentials) -> String {
     creds.from.clone().unwrap_or_else(|| creds.username.clone())
+}
+
+/// Append the account's configured signature to an outgoing body.
+pub fn body_with_signature(creds: &MailCredentials, body: String) -> Result<String> {
+    match creds.signature.as_deref().filter(|s| !s.trim().is_empty()) {
+        None => Ok(body),
+        Some(sig) => {
+            let out = format!("{body}\n\n-- \n{sig}");
+            if out.chars().count() > MAX_BODY_CHARS {
+                return Err(SeraError::Validation(format!(
+                    "body plus signature must stay under {MAX_BODY_CHARS} characters"
+                )));
+            }
+            Ok(out)
+        }
+    }
 }
 
 // ---------------------------------------------------------------- MIME ----
@@ -752,6 +792,16 @@ pub async fn smtp_test(creds: &MailCredentials) -> Result<()> {
 
 // ---------------------------------------------------------------- IMAP ----
 
+/// One attachment of a read message: metadata always, base64 payload only
+/// when small enough to inline (0.74.5).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct MailAttachment {
+    pub name: String,
+    pub content_type: String,
+    pub size: usize,
+    pub data_base64: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct MailMessage {
     pub uid: u32,
@@ -759,9 +809,10 @@ pub struct MailMessage {
     pub from: String,
     pub date: String,
     pub flags: Vec<String>,
-    /// Raw message body (best effort text; multipart bodies keep their raw
-    /// text — v1 does not decode HTML parts).
+    /// Best-effort text body: the first text/plain part of a multipart
+    /// message, else the raw body (HTML parts are not decoded).
     pub body: String,
+    pub attachments: Vec<MailAttachment>,
 }
 
 /// Quote an IMAP string literal.
@@ -831,14 +882,118 @@ pub fn parse_message(uid: u32, flags: Vec<String>, raw: &str) -> MailMessage {
             }
         }
     }
+    let (text_body, attachments) = extract_body_and_attachments(head, body);
     MailMessage {
         uid,
         subject,
         from,
         date,
         flags,
-        body: body.replace("\r\n", "\n"),
+        body: text_body.replace("\r\n", "\n"),
+        attachments,
     }
+}
+
+/// Split a message body into the readable text and its attachments. For
+/// multipart messages the parts are split on the boundary from the
+/// Content-Type header; single-part messages keep the raw body.
+fn extract_body_and_attachments(head: &str, body: &str) -> (String, Vec<MailAttachment>) {
+    let boundary = head.replace("\r\n", "\n").split('\n').find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        if key.trim().eq_ignore_ascii_case("content-type") {
+            value.split(';').find_map(|param| {
+                let (k, v) = param.split_once('=')?;
+                if k.trim().eq_ignore_ascii_case("boundary") {
+                    return Some(v.trim().trim_matches('"').to_owned());
+                }
+                None
+            })
+        } else {
+            None
+        }
+    });
+    let Some(boundary) = boundary else {
+        return (body.to_owned(), Vec::new());
+    };
+    let delimiter = format!("--{boundary}");
+    let mut plain: Option<String> = None;
+    let mut html: Option<String> = None;
+    let mut attachments = Vec::new();
+    let mut inline_total = 0usize;
+    for part in body.split(&delimiter).skip(1) {
+        let part = part
+            .strip_prefix("\r\n")
+            .or_else(|| part.strip_prefix('\n'))
+            .unwrap_or(part);
+        if part.starts_with("--") {
+            break; // closing delimiter
+        }
+        let part = part
+            .strip_suffix("\r\n")
+            .or_else(|| part.strip_suffix('\n'))
+            .unwrap_or(part);
+        let (part_head, part_body) = match part.find("\r\n\r\n") {
+            Some(pos) => (&part[..pos], &part[pos + 4..]),
+            None => match part.find("\n\n") {
+                Some(pos) => (&part[..pos], &part[pos + 2..]),
+                None => (part, ""),
+            },
+        };
+        let head_lc = part_head.to_ascii_lowercase();
+        let content_type = head_lc
+            .split('\n')
+            .find_map(|l| {
+                l.split_once(':')
+                    .filter(|(k, _)| k.trim() == "content-type")
+            })
+            .map(|(_, v)| v.split(';').next().unwrap_or("").trim().to_owned())
+            .unwrap_or_else(|| "text/plain".to_owned());
+        let filename = part_head.split('\n').find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            if !k.trim().eq_ignore_ascii_case("content-disposition") {
+                return None;
+            }
+            v.split(';').find_map(|p| {
+                let (k, v) = p.split_once('=')?;
+                if k.trim().eq_ignore_ascii_case("filename") {
+                    Some(v.trim().trim_matches('"').to_owned())
+                } else {
+                    None
+                }
+            })
+        });
+        let decoded = if head_lc.contains("content-transfer-encoding: base64") {
+            let compact: String = part_body.chars().filter(|c| !c.is_whitespace()).collect();
+            base64::engine::general_purpose::STANDARD
+                .decode(compact)
+                .unwrap_or_default()
+        } else {
+            part_body.as_bytes().to_vec()
+        };
+        if let Some(name) = filename {
+            let size = decoded.len();
+            let data_base64 = if size <= MAX_INLINE_ATTACHMENT_BYTES
+                && inline_total + size <= MAX_INLINE_ATTACHMENTS_TOTAL
+            {
+                inline_total += size;
+                Some(base64::engine::general_purpose::STANDARD.encode(&decoded))
+            } else {
+                None
+            };
+            attachments.push(MailAttachment {
+                name,
+                content_type,
+                size,
+                data_base64,
+            });
+        } else if content_type.starts_with("text/plain") && plain.is_none() {
+            plain = Some(String::from_utf8_lossy(&decoded).into_owned());
+        } else if content_type.starts_with("text/html") && html.is_none() {
+            html = Some(String::from_utf8_lossy(&decoded).into_owned());
+        }
+    }
+    let text = plain.or(html).unwrap_or_default();
+    (text, attachments)
 }
 
 fn decode_rfc2047(value: &str) -> String {
@@ -890,6 +1045,69 @@ pub async fn imap_test(creds: &MailCredentials) -> Result<()> {
     Ok(())
 }
 
+/// Normalise the folder argument (empty means INBOX) and validate it.
+fn normalize_folder(folder: &str) -> Result<String> {
+    let folder = folder.trim();
+    let folder = if folder.is_empty() { "INBOX" } else { folder };
+    if folder.len() > 512 || folder.chars().any(|c| c.is_control()) {
+        return Err(SeraError::Validation("invalid folder name".into()));
+    }
+    Ok(folder.to_owned())
+}
+
+fn folder_or_inbox(folder: &str) -> String {
+    if folder.trim().is_empty() {
+        "INBOX".to_owned()
+    } else {
+        folder.trim().to_owned()
+    }
+}
+
+/// SELECT a folder; untagged FLAGS/EXISTS/RECENT lines precede the tagged OK.
+async fn select_folder<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut Wire<S>,
+    folder: &str,
+) -> Result<()> {
+    wire.send_line(&format!("a2 SELECT {}", imap_quote(folder)))
+        .await?;
+    wire.expect_tagged("a2").await?;
+    Ok(())
+}
+
+/// Parse the UIDs out of an untagged `* SEARCH ...` line.
+fn parse_search_uids(untagged: &[String]) -> Vec<u32> {
+    let search = untagged
+        .iter()
+        .find(|l| l.starts_with("* SEARCH"))
+        .cloned()
+        .unwrap_or_default();
+    search
+        .split_whitespace()
+        .skip(2)
+        .filter_map(|w| w.parse::<u32>().ok())
+        .collect()
+}
+
+/// Fetch the newest `limit` matching messages of a folder after a SEARCH.
+async fn fetch_search_results<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut Wire<S>,
+    untagged: Vec<String>,
+    limit: u32,
+) -> Result<Vec<MailMessage>> {
+    let uids: Vec<u32> = parse_search_uids(&untagged)
+        .into_iter()
+        .rev()
+        .take(limit as usize)
+        .collect();
+    let mut out = Vec::new();
+    for uid in uids {
+        if let Ok(msg) = imap_fetch(wire, uid).await {
+            out.push(msg);
+        }
+    }
+    Ok(out)
+}
+
 /// List the newest `limit` messages of a folder (default INBOX).
 pub async fn imap_list(
     creds: &MailCredentials,
@@ -898,50 +1116,144 @@ pub async fn imap_list(
 ) -> Result<Vec<MailMessage>> {
     let limit = limit.clamp(1, MAX_LIST);
     let mut wire = imap_connect(creds).await?;
-    let folder = if folder.trim().is_empty() {
-        "INBOX".to_owned()
-    } else {
-        folder.trim().to_owned()
-    };
-    wire.send_line(&format!("a2 SELECT {}", imap_quote(&folder)))
-        .await?;
-    // SELECT also answers with untagged FLAGS/EXISTS/RECENT lines before the
-    // tagged reply.
-    wire.expect_tagged("a2").await?;
+    let folder = normalize_folder(folder)?;
+    select_folder(&mut wire, &folder).await?;
     wire.send_line("a3 UID SEARCH ALL").await?;
     let (_, untagged) = wire.expect_tagged("a3").await?;
-    let search = untagged
-        .iter()
-        .find(|l| l.starts_with("* SEARCH"))
-        .cloned()
-        .unwrap_or_default();
-    let uids: Vec<u32> = search
-        .split_whitespace()
-        .skip(2)
-        .filter_map(|w| w.parse::<u32>().ok())
-        .collect();
-    let uids: Vec<u32> = uids.into_iter().rev().take(limit as usize).collect();
-    let mut out = Vec::new();
-    for uid in uids {
-        if let Ok(msg) = imap_fetch(&mut wire, uid).await {
-            out.push(msg);
+    let out = fetch_search_results(&mut wire, untagged, limit).await?;
+    let _ = wire.send_line("a9 LOGOUT").await;
+    Ok(out)
+}
+
+/// Search a folder by subject/from/body text; returns the newest `limit` matches.
+pub async fn imap_search(
+    creds: &MailCredentials,
+    folder: &str,
+    query: &str,
+    limit: u32,
+) -> Result<Vec<MailMessage>> {
+    let limit = limit.clamp(1, MAX_LIST);
+    let query = query.trim();
+    if query.is_empty() || query.len() > 256 {
+        return Err(SeraError::Validation(
+            "query must be 1-256 characters".into(),
+        ));
+    }
+    let mut wire = imap_connect(creds).await?;
+    let folder = normalize_folder(folder)?;
+    select_folder(&mut wire, &folder).await?;
+    let q = imap_quote(query);
+    wire.send_line(&format!(
+        "a3 UID SEARCH OR OR SUBJECT {q} FROM {q} TEXT {q}"
+    ))
+    .await?;
+    let (_, untagged) = wire.expect_tagged("a3").await?;
+    let out = fetch_search_results(&mut wire, untagged, limit).await?;
+    let _ = wire.send_line("a9 LOGOUT").await;
+    Ok(out)
+}
+
+/// List all folder names (`LIST "" "*"`).
+pub async fn imap_folders(creds: &MailCredentials) -> Result<Vec<String>> {
+    let mut wire = imap_connect(creds).await?;
+    wire.send_line("a2 LIST \"\" \"*\"").await?;
+    let (_, untagged) = wire.expect_tagged("a2").await?;
+    let mut folders = Vec::new();
+    for line in &untagged {
+        if let Some(name) = parse_list_name(line) {
+            folders.push(name);
         }
     }
     let _ = wire.send_line("a9 LOGOUT").await;
-    Ok(out)
+    Ok(folders)
+}
+
+/// Extract the folder name (last quoted string) from an untagged LIST reply.
+fn parse_list_name(line: &str) -> Option<String> {
+    let end = line.rfind('"')?;
+    let start = line[..end].rfind('"')?;
+    let name = &line[start + 1..end];
+    if name.is_empty() || name == "*" {
+        return None;
+    }
+    Some(name.replace("\\\"", "\"").replace("\\\\", "\\"))
+}
+
+/// Validate an IMAP flag (`\Seen`, `\Flagged`, ...): backslash + letters only.
+fn validate_flag(flag: &str) -> Result<()> {
+    let valid = flag.starts_with('\\')
+        && flag.len() <= 32
+        && flag[1..].chars().all(|c| c.is_ascii_alphabetic());
+    if !valid {
+        return Err(SeraError::Validation(
+            "flags must look like \\Seen or \\Flagged".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Add or remove flags on one message (`UID STORE ±FLAGS.SILENT`).
+pub async fn imap_store_flags(
+    creds: &MailCredentials,
+    folder: &str,
+    uid: u32,
+    add: bool,
+    flags: &[String],
+) -> Result<()> {
+    if flags.is_empty() || flags.len() > 8 {
+        return Err(SeraError::Validation("1 to 8 flags are allowed".into()));
+    }
+    for f in flags {
+        validate_flag(f)?;
+    }
+    let mut wire = imap_connect(creds).await?;
+    let folder = normalize_folder(folder)?;
+    select_folder(&mut wire, &folder).await?;
+    let op = if add {
+        "+FLAGS.SILENT"
+    } else {
+        "-FLAGS.SILENT"
+    };
+    wire.send_line(&format!("a4 UID STORE {uid} {op} ({})", flags.join(" ")))
+        .await?;
+    wire.expect_tagged("a4").await?;
+    let _ = wire.send_line("a9 LOGOUT").await;
+    Ok(())
+}
+
+/// Move one message to another folder (`UID MOVE`, IMAP4rev1 extension that
+/// Hostinger/Dovecot support).
+pub async fn imap_move(creds: &MailCredentials, folder: &str, uid: u32, dest: &str) -> Result<()> {
+    let dest = normalize_folder(dest)?;
+    let mut wire = imap_connect(creds).await?;
+    let folder = normalize_folder(folder)?;
+    select_folder(&mut wire, &folder).await?;
+    wire.send_line(&format!("a4 UID MOVE {uid} {}", imap_quote(&dest)))
+        .await?;
+    wire.expect_tagged("a4").await?;
+    let _ = wire.send_line("a9 LOGOUT").await;
+    Ok(())
+}
+
+/// Permanently delete one message: flag `\Deleted`, then `UID EXPUNGE`.
+pub async fn imap_delete(creds: &MailCredentials, folder: &str, uid: u32) -> Result<()> {
+    let mut wire = imap_connect(creds).await?;
+    let folder = normalize_folder(folder)?;
+    select_folder(&mut wire, &folder).await?;
+    wire.send_line(&format!("a4 UID STORE {uid} +FLAGS.SILENT (\\Deleted)"))
+        .await?;
+    wire.expect_tagged("a4").await?;
+    wire.send_line(&format!("a5 UID EXPUNGE {uid}")).await?;
+    wire.expect_tagged("a5").await?;
+    let _ = wire.send_line("a9 LOGOUT").await;
+    Ok(())
 }
 
 /// Read one message by UID.
 pub async fn imap_read(creds: &MailCredentials, folder: &str, uid: u32) -> Result<MailMessage> {
     let mut wire = imap_connect(creds).await?;
-    let folder = if folder.trim().is_empty() {
-        "INBOX".to_owned()
-    } else {
-        folder.trim().to_owned()
-    };
-    wire.send_line(&format!("a2 SELECT {}", imap_quote(&folder)))
-        .await?;
-    wire.expect_tagged("a2").await?;
+    let folder = normalize_folder(folder)?;
+    select_folder(&mut wire, &folder).await?;
     let msg = imap_fetch(&mut wire, uid).await?;
     let _ = wire.send_line("a9 LOGOUT").await;
     Ok(msg)
@@ -987,7 +1299,22 @@ pub fn register(registry: &mut ToolRegistry, secrets: Arc<UserSecrets>) -> Resul
     registry.register(MailListTool {
         secrets: secrets.clone(),
     })?;
-    registry.register(MailReadTool { secrets })?;
+    registry.register(MailReadTool {
+        secrets: secrets.clone(),
+    })?;
+    registry.register(MailFoldersTool {
+        secrets: secrets.clone(),
+    })?;
+    registry.register(MailSearchTool {
+        secrets: secrets.clone(),
+    })?;
+    registry.register(MailFlagTool {
+        secrets: secrets.clone(),
+    })?;
+    registry.register(MailMoveTool {
+        secrets: secrets.clone(),
+    })?;
+    registry.register(MailDeleteTool { secrets })?;
     Ok(())
 }
 
@@ -1069,6 +1396,7 @@ impl Tool for MailSendTool {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
+        let body = body_with_signature(&creds, body)?;
         let mut attachments = Vec::new();
         if let Some(items) = args.get("attachments").and_then(Value::as_array) {
             for item in items {
@@ -1219,16 +1547,301 @@ impl Tool for MailReadTool {
             .unwrap_or("")
             .to_owned();
         let message = imap_read(&creds, &folder, uid).await?;
+        let attachment_line = if message.attachments.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nAttachments: {}",
+                message
+                    .attachments
+                    .iter()
+                    .map(|a| format!("{} ({}, {} bytes)", a.name, a.content_type, a.size))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         Ok(ToolOutput {
             content: format!(
-                "From: {}\nDate: {}\nSubject: {}\nFlags: {}\n\n{}",
+                "From: {}\nDate: {}\nSubject: {}\nFlags: {}\n{}\n\n{}",
                 message.from,
                 message.date,
                 message.subject,
                 message.flags.join(" "),
+                attachment_line,
                 clip(&message.body, 8000)
             ),
             data: Some(json!({"message": message})),
+            ..ToolOutput::default()
+        })
+    }
+}
+
+pub struct MailFoldersTool {
+    secrets: Arc<UserSecrets>,
+}
+
+#[async_trait]
+impl Tool for MailFoldersTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: MAIL_FOLDERS_TOOL.into(),
+            description: "List the folders of the member's own IMAP mailbox. Read-only.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "account": {"type": "string", "description": "Named mailbox connected in Integrations → Mail; omit for the default account"}
+                },
+                "additionalProperties": false
+            }),
+            external_effect: false,
+        }
+    }
+
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        let account = arg_account(&args);
+        let creds = require_creds(&self.secrets, &context.user_id, account.as_deref())?;
+        let folders = imap_folders(&creds).await?;
+        Ok(ToolOutput {
+            content: if folders.is_empty() {
+                "No folders.".to_owned()
+            } else {
+                folders.join("\n")
+            },
+            data: Some(json!({"folders": folders})),
+            ..ToolOutput::default()
+        })
+    }
+}
+
+pub struct MailSearchTool {
+    secrets: Arc<UserSecrets>,
+}
+
+#[async_trait]
+impl Tool for MailSearchTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: MAIL_SEARCH_TOOL.into(),
+            description: "Search the member's own IMAP mailbox by subject, sender, or body text \
+                          (newest matches first). Read-only."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search text, 1-256 chars"},
+                    "folder": {"type": "string", "description": "Folder, default INBOX"},
+                    "limit": {"type": "integer", "description": "How many matches, 1-50, default 10"},
+                    "account": {"type": "string", "description": "Named mailbox connected in Integrations → Mail; omit for the default account"}
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+            external_effect: false,
+        }
+    }
+
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        let account = arg_account(&args);
+        let creds = require_creds(&self.secrets, &context.user_id, account.as_deref())?;
+        let query = args
+            .get("query")
+            .and_then(Value::as_str)
+            .ok_or_else(|| SeraError::Validation("query is required".into()))?;
+        let folder = args
+            .get("folder")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|n| n as u32)
+            .unwrap_or(10);
+        let messages = imap_search(&creds, &folder, query, limit).await?;
+        let lines: Vec<String> = messages
+            .iter()
+            .map(|m| {
+                format!(
+                    "#{} {} {} — {} [{}]",
+                    m.uid,
+                    clip(&m.from, 60),
+                    clip(&m.subject, 80),
+                    m.date,
+                    m.flags.join(" ")
+                )
+            })
+            .collect();
+        Ok(ToolOutput {
+            content: if lines.is_empty() {
+                format!("No messages matching \"{}\".", clip(query, 120))
+            } else {
+                lines.join("\n")
+            },
+            data: Some(json!({"messages": messages})),
+            ..ToolOutput::default()
+        })
+    }
+}
+
+pub struct MailFlagTool {
+    secrets: Arc<UserSecrets>,
+}
+
+#[async_trait]
+impl Tool for MailFlagTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: MAIL_FLAG_TOOL.into(),
+            description: "Add or remove flags (\\Seen, \\Flagged, \\Answered, \\Draft, \\Deleted) on one \
+                          message of the member's own mailbox. Changes the mailbox — approval-gated."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "uid": {"type": "integer"},
+                    "flags": {"type": "array", "items": {"type": "string"}, "description": "Flags like \\Seen or \\Flagged"},
+                    "add": {"type": "boolean", "description": "true to add (default), false to remove"},
+                    "folder": {"type": "string", "description": "Folder, default INBOX"},
+                    "account": {"type": "string", "description": "Named mailbox connected in Integrations → Mail; omit for the default account"}
+                },
+                "required": ["uid", "flags"],
+                "additionalProperties": false
+            }),
+            external_effect: true,
+        }
+    }
+
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        let account = arg_account(&args);
+        let creds = require_creds(&self.secrets, &context.user_id, account.as_deref())?;
+        let uid =
+            args.get("uid")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| SeraError::Validation("uid is required".into()))? as u32;
+        let flags: Vec<String> = args
+            .get("flags")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let add = args.get("add").and_then(Value::as_bool).unwrap_or(true);
+        let folder = args
+            .get("folder")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        imap_store_flags(&creds, &folder, uid, add, &flags).await?;
+        Ok(ToolOutput {
+            content: format!(
+                "{} flags {} on message {uid} ({}).",
+                if add { "Added" } else { "Removed" },
+                flags.join(" "),
+                folder_or_inbox(&folder)
+            ),
+            data: Some(json!({"uid": uid, "flags": flags, "add": add, "folder": folder})),
+            ..ToolOutput::default()
+        })
+    }
+}
+
+pub struct MailMoveTool {
+    secrets: Arc<UserSecrets>,
+}
+
+#[async_trait]
+impl Tool for MailMoveTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: MAIL_MOVE_TOOL.into(),
+            description: "Move one message of the member's own mailbox to another folder. \
+                          Changes the mailbox — approval-gated."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "uid": {"type": "integer"},
+                    "dest": {"type": "string", "description": "Destination folder, e.g. Archive"},
+                    "folder": {"type": "string", "description": "Current folder, default INBOX"},
+                    "account": {"type": "string", "description": "Named mailbox connected in Integrations → Mail; omit for the default account"}
+                },
+                "required": ["uid", "dest"],
+                "additionalProperties": false
+            }),
+            external_effect: true,
+        }
+    }
+
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        let account = arg_account(&args);
+        let creds = require_creds(&self.secrets, &context.user_id, account.as_deref())?;
+        let uid =
+            args.get("uid")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| SeraError::Validation("uid is required".into()))? as u32;
+        let dest = args
+            .get("dest")
+            .and_then(Value::as_str)
+            .ok_or_else(|| SeraError::Validation("dest is required".into()))?;
+        let folder = args
+            .get("folder")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        imap_move(&creds, &folder, uid, dest).await?;
+        Ok(ToolOutput {
+            content: format!("Moved message {uid} to {dest}."),
+            data: Some(json!({"uid": uid, "dest": dest, "folder": folder})),
+            ..ToolOutput::default()
+        })
+    }
+}
+
+pub struct MailDeleteTool {
+    secrets: Arc<UserSecrets>,
+}
+
+#[async_trait]
+impl Tool for MailDeleteTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: MAIL_DELETE_TOOL.into(),
+            description: "Permanently delete one message from the member's own mailbox (flags \
+                          \\Deleted then UID EXPUNGE). Irreversible — approval-gated."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "uid": {"type": "integer"},
+                    "folder": {"type": "string", "description": "Folder, default INBOX"},
+                    "account": {"type": "string", "description": "Named mailbox connected in Integrations → Mail; omit for the default account"}
+                },
+                "required": ["uid"],
+                "additionalProperties": false
+            }),
+            external_effect: true,
+        }
+    }
+
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        let account = arg_account(&args);
+        let creds = require_creds(&self.secrets, &context.user_id, account.as_deref())?;
+        let uid =
+            args.get("uid")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| SeraError::Validation("uid is required".into()))? as u32;
+        let folder = args
+            .get("folder")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        imap_delete(&creds, &folder, uid).await?;
+        Ok(ToolOutput {
+            content: format!("Deleted message {uid} from {}.", folder_or_inbox(&folder)),
+            data: Some(json!({"uid": uid, "folder": folder})),
             ..ToolOutput::default()
         })
     }
@@ -1253,6 +1866,7 @@ mod tests {
             imap_port: 1143,
             imap_security: Security::None,
             from: None,
+            signature: None,
         }
     }
 
@@ -1619,5 +2233,164 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn signature_is_appended_once_and_capped() {
+        let mut c = creds(Security::None);
+        assert_eq!(body_with_signature(&c, "Hi".into()).unwrap(), "Hi");
+        c.signature = Some("Jane — Acme".into());
+        assert_eq!(
+            body_with_signature(&c, "Hi".into()).unwrap(),
+            "Hi\n\n-- \nJane — Acme"
+        );
+        c.signature = Some("x".repeat(MAX_SIGNATURE_CHARS + 1));
+        assert!(validate_credentials(&c).is_err());
+    }
+
+    #[test]
+    fn parses_list_names_and_flags() {
+        assert_eq!(
+            parse_list_name("* LIST (\\HasNoChildren) \"/\" \"INBOX\""),
+            Some("INBOX".to_owned())
+        );
+        assert_eq!(
+            parse_list_name("* LIST (\\Noselect) \"/\" \"Sent Items\""),
+            Some("Sent Items".to_owned())
+        );
+        assert_eq!(parse_list_name("* LIST (\\HasNoChildren) \"/\" \"\""), None);
+        assert!(validate_flag("\\Seen").is_ok());
+        assert!(validate_flag("\\Flagged").is_ok());
+        assert!(validate_flag("Seen").is_err());
+        assert!(validate_flag("\\Seen); DROP").is_err());
+    }
+
+    #[test]
+    fn parses_multipart_message_with_attachment() {
+        let pdf = b"%PDF-1.4 fake";
+        let raw = format!(
+            "From: Alice <alice@example.com>\r\nSubject: Doc\r\nContent-Type: multipart/mixed; boundary=\"bnd\"\r\n\r\n\
+             --bnd\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nHello there\r\n\
+             --bnd\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=\"doc.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n\
+             --bnd--\r\n",
+            base64::engine::general_purpose::STANDARD.encode(pdf)
+        );
+        let msg = parse_message(7, vec!["\\Seen".into()], &raw);
+        assert_eq!(msg.subject, "Doc");
+        assert_eq!(msg.body, "Hello there");
+        assert_eq!(msg.attachments.len(), 1);
+        assert_eq!(msg.attachments[0].name, "doc.pdf");
+        assert_eq!(msg.attachments[0].content_type, "application/pdf");
+        assert_eq!(msg.attachments[0].size, pdf.len());
+        assert_eq!(
+            msg.attachments[0].data_base64.as_deref(),
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode(pdf)
+                    .as_str()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn imap_management_commands_against_fake_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            // Five connections: folders, search, store, move, delete.
+            for _ in 0..5 {
+                let (socket, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = socket.into_split();
+                let mut lines = BufReader::new(reader).lines();
+                writer
+                    .write_all(b"* OK [CAPABILITY IMAP4rev1 UIDPLUS MOVE AUTH=LOGIN] ready.\r\n")
+                    .await
+                    .unwrap();
+                let login = lines.next_line().await.unwrap().unwrap();
+                assert!(login.starts_with("a1 LOGIN"), "{login}");
+                writer
+                    .write_all(
+                        b"* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\na1 OK ok\r\n",
+                    )
+                    .await
+                    .unwrap();
+                let cmd = lines.next_line().await.unwrap().unwrap();
+                if cmd.starts_with("a2 LIST") {
+                    writer
+                        .write_all(b"* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n* LIST (\\HasNoChildren) \"/\" \"Archive\"\r\na2 OK done\r\n")
+                        .await
+                        .unwrap();
+                } else {
+                    assert!(cmd.starts_with("a2 SELECT"), "{cmd}");
+                    writer
+                        .write_all(b"* 2 EXISTS\r\na2 OK [READ-WRITE] selected\r\n")
+                        .await
+                        .unwrap();
+                    let cmd = lines.next_line().await.unwrap().unwrap();
+                    if cmd.starts_with("a3 UID SEARCH OR") {
+                        writer
+                            .write_all(b"* SEARCH 5 9\r\na3 OK done\r\n")
+                            .await
+                            .unwrap();
+                        for uid in [9u32, 5] {
+                            let fetch = lines.next_line().await.unwrap().unwrap();
+                            assert!(fetch.starts_with(&format!("a4 UID FETCH {uid}")), "{fetch}");
+                            let body = format!("Subject: Hit {uid}\r\n\r\nbody\r\n");
+                            writer
+                                .write_all(
+                                    format!(
+                                        "* {uid} FETCH (FLAGS (\\Seen) UID {uid} BODY[] {{{}}}\r\n{}\r\n)\r\na4 OK done\r\n",
+                                        body.len(),
+                                        body
+                                    )
+                                    .as_bytes(),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                    } else if cmd.starts_with("a4 UID STORE") {
+                        writer.write_all(b"a4 OK stored\r\n").await.unwrap();
+                        if cmd.contains("\\Deleted") {
+                            let exp = lines.next_line().await.unwrap().unwrap();
+                            assert!(exp.starts_with("a5 UID EXPUNGE"), "{exp}");
+                            writer
+                                .write_all(b"* 1 EXPUNGE\r\na5 OK expunged\r\n")
+                                .await
+                                .unwrap();
+                        }
+                    } else if cmd.starts_with("a4 UID MOVE") {
+                        writer
+                            .write_all(b"* 1 EXPUNGE\r\na4 OK moved\r\n")
+                            .await
+                            .unwrap();
+                    } else {
+                        panic!("unexpected command: {cmd}");
+                    }
+                }
+                let _ = lines.next_line().await; // a9 LOGOUT
+            }
+        });
+        let mut c = creds(Security::None);
+        c.imap_port = port;
+
+        let folders = imap_folders(&c).await.unwrap();
+        assert_eq!(folders, vec!["INBOX".to_owned(), "Archive".to_owned()]);
+
+        let hits = imap_search(&c, "INBOX", "invoice", 10).await.unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].uid, 9);
+        assert_eq!(hits[0].subject, "Hit 9");
+
+        imap_store_flags(&c, "INBOX", 9, true, &["\\Flagged".to_owned()])
+            .await
+            .unwrap();
+        imap_move(&c, "INBOX", 9, "Archive").await.unwrap();
+        imap_delete(&c, "INBOX", 5).await.unwrap();
+        assert!(
+            imap_store_flags(&c, "INBOX", 9, true, &["bad flag".to_owned()])
+                .await
+                .is_err()
+        );
+        server.await.unwrap();
     }
 }

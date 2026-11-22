@@ -13,6 +13,9 @@ pub(super) fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/v1/mail", get(status).delete(disconnect))
         .route("/v1/mail/connect", post(connect))
+        .route("/v1/mail/folders", get(folders))
+        .route("/v1/mail/messages", get(messages))
+        .route("/v1/mail/messages/{uid}", get(message))
 }
 
 #[derive(Deserialize)]
@@ -34,6 +37,9 @@ struct ConnectRequest {
     imap_security: Security,
     #[serde(default)]
     from: Option<String>,
+    /// Signature appended to every sent message (0.74.5).
+    #[serde(default)]
+    signature: Option<String>,
 }
 
 async fn connect(
@@ -57,6 +63,7 @@ async fn connect(
         imap_port: body.imap_port,
         imap_security: body.imap_security,
         from: body.from,
+        signature: body.signature,
     };
     mail::validate_credentials(&creds)?;
     mail::store_credentials(&state.users, &user.id, account_label, &creds)?;
@@ -111,6 +118,70 @@ struct DisconnectQuery {
     /// Named account label; omitted means the default mailbox.
     #[serde(default)]
     account: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AccountQuery {
+    /// Named account label; omitted means the default mailbox.
+    #[serde(default)]
+    account: Option<String>,
+    #[serde(default)]
+    folder: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+fn query_account(query: &AccountQuery) -> Result<Option<&str>> {
+    let label = query
+        .account
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    mail::account_provider(label)?;
+    Ok(label)
+}
+
+/// `GET /v1/mail/folders?account=`: folder names of one mailbox (read-only).
+async fn folders(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Query(query): Query<AccountQuery>,
+) -> Result<Json<Value>> {
+    let account = query_account(&query)?;
+    let creds = mail::load_credentials(&state.users, &user.id, account)?
+        .ok_or_else(|| SeraError::Validation("mail is not connected; connect it first".into()))?;
+    let folders = mail::imap_folders(&creds).await?;
+    Ok(Json(json!({ "folders": folders })))
+}
+
+/// `GET /v1/mail/messages?account=&folder=&limit=`: newest messages (read-only).
+async fn messages(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Query(query): Query<AccountQuery>,
+) -> Result<Json<Value>> {
+    let account = query_account(&query)?;
+    let creds = mail::load_credentials(&state.users, &user.id, account)?
+        .ok_or_else(|| SeraError::Validation("mail is not connected; connect it first".into()))?;
+    let folder = query.folder.as_deref().unwrap_or("");
+    let limit = query.limit.unwrap_or(20);
+    let messages = mail::imap_list(&creds, folder, limit).await?;
+    Ok(Json(json!({ "messages": messages })))
+}
+
+/// `GET /v1/mail/messages/{uid}?account=&folder=`: one full message (read-only).
+async fn message(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(uid): Path<u32>,
+    Query(query): Query<AccountQuery>,
+) -> Result<Json<Value>> {
+    let account = query_account(&query)?;
+    let creds = mail::load_credentials(&state.users, &user.id, account)?
+        .ok_or_else(|| SeraError::Validation("mail is not connected; connect it first".into()))?;
+    let folder = query.folder.as_deref().unwrap_or("");
+    let message = mail::imap_read(&creds, folder, uid).await?;
+    Ok(Json(json!({ "message": message })))
 }
 
 async fn disconnect(

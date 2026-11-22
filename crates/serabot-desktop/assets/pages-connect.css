@@ -527,6 +527,21 @@
 .wa-link-card .wa-allowlist { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
 .wa-link-card textarea { width: 100%; resize: vertical; }
 
+/* Mail reading window (0.74.5) — rendered only while a mailbox is connected. */
+.mail-window { width: min(960px, 92vw); max-height: 86vh; display: flex; flex-direction: column; }
+.mail-window-body { overflow: auto; }
+.mail-window-controls { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+.mail-window-controls select { width: auto; max-width: 260px; }
+.mail-window-cols { display: grid; grid-template-columns: 300px 1fr; gap: 10px; min-height: 320px; }
+.mail-list { border: 1px solid var(--hairline); border-radius: var(--r-sm); overflow-y: auto; max-height: 60vh; background: var(--surface-2); }
+.mail-list-item { padding: 6px 8px; cursor: pointer; border-bottom: 1px solid var(--hairline); }
+.mail-list-item:hover { background: var(--surface); }
+.mail-list-item.selected { background: var(--surface); box-shadow: inset 2px 0 0 var(--accent, #7c6cf0); }
+.mail-list-subject { font-size: var(--fs-sm); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mail-read { border: 1px solid var(--hairline); border-radius: var(--r-sm); padding: 10px 12px; overflow-y: auto; max-height: 60vh; }
+.mail-read-subject { margin: 0 0 4px; font-size: var(--fs-md); }
+.mail-body { white-space: pre-wrap; word-break: break-word; font-size: var(--fs-sm); }
+
 /* Native SMTP/IMAP Mail connector card (0.74.2). */
 .mail-connector-card .mail-connected-summary {
   display: flex;

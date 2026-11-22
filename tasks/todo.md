@@ -446,3 +446,24 @@ never merge without the owner's OK.
 - [ ] Owner: live verification on Windows — Hostinger preset connect in
   Integrations → Mail (the `* FLAGS` error should be gone), second named
   account, `hostinger`/`mailbox` bots triaging.
+
+## Release 0.74.5 — mail management depth, signatures, mail window
+
+- [x] Server: `mail_folders`/`mail_search` (read-only), approval-gated
+  `mail_flag`/`mail_move`/`mail_delete` (DESTRUCTIVE_TOOLS + docs/approvals.md),
+  `mail_read` attachment listing (multipart parse), per-account `signature`
+  appended on `mail_send`; tools registered in `tools.rs`.
+- [x] Server API: `/v1/mail/folders`, `/v1/mail/messages`,
+  `/v1/mail/messages/{uid}` (read-only, account-aware); `signature` in connect.
+- [x] Desktop: mail window (`MailWindow` in `ui_connectors.rs`, only rendered
+  while connected) with account/folder selectors, list, reading pane; signature
+  field on the mail card; api.rs models + client methods.
+- [x] Mobile: account-name field on the mail screen (connect/disconnect),
+  mailboxes list in the status card.
+- [x] Bots: `hostinger`/`mailbox` get the 5 new mail tools (flag/move/delete
+  approval-gated), `inbox` gets folders/search; prompts + `skills/mail`
+  updated (account rule, signature auto-append, new tools).
+- [x] Version bump 0.74.5 (Cargo.toml), mobile 0.74.5+79,
+  `docs/release-0.74.5.md`, README, AGENTS.md.
+- [ ] Owner: live pass on Windows — Hostinger preset, Open inbox window,
+  flag/move/delete with approval cards, signature on sent mail.

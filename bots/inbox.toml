@@ -30,6 +30,8 @@ tools = [
   "mail_list",
   "mail_read",
   "mail_send",
+  "mail_folders",
+  "mail_search",
   "conversation_library",
   "telegram_send_document",
   "tavily_search",
