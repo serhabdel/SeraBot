@@ -1395,7 +1395,7 @@ mod tests {
 
         let mut config = test_config();
         config.auth.providers = vec!["google".into()];
-        assert!(report.iter().all(|row| !row.enabled) || true);
+        assert!(provider_report(&config.auth).iter().all(|row| !row.enabled));
         for row in provider_report(&config.auth) {
             assert!(!row.enabled, "google cannot be enabled in v1");
         }

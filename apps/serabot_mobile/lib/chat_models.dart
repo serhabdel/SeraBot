@@ -140,6 +140,65 @@ class ConversationPage {
   }
 }
 
+/// One hit from `GET /v1/conversations/search` (0.74.2): the conversation
+/// the match lives in, which bot it belongs to, the matched role and a
+/// bounded, UTF-8-safe ~160-char snippet. Mirrors the desktop `api.rs`
+/// `ConversationSearchHit`.
+class ConversationSearchHit {
+  const ConversationSearchHit({
+    required this.conversationId,
+    this.bot = '',
+    this.title = '',
+    this.role = '',
+    this.snippet = '',
+    this.createdAt = '',
+  });
+
+  factory ConversationSearchHit.fromJson(Map<String, dynamic> json) {
+    return ConversationSearchHit(
+      conversationId: json['conversation_id'] as String? ?? '',
+      bot: json['bot'] as String? ?? '',
+      title: json['title'] as String? ?? '',
+      role: json['role'] as String? ?? '',
+      snippet: json['snippet'] as String? ?? '',
+      createdAt: json['created_at'] as String? ?? '',
+    );
+  }
+
+  final String conversationId;
+  final String bot;
+  final String title;
+  final String role;
+  final String snippet;
+  final String createdAt;
+
+  /// True when the server row actually names a conversation.
+  bool get valid => conversationId.isNotEmpty;
+}
+
+/// Parses the `{"hits": [...]}` body of `GET /v1/conversations/search`.
+/// Rows without a conversation id are skipped; at most [maxHits] are kept.
+List<ConversationSearchHit> parseConversationSearchHits(
+  Map<String, dynamic> json, {
+  int maxHits = 50,
+}) {
+  final list = json['hits'];
+  if (list is! List) {
+    return const [];
+  }
+  final out = <ConversationSearchHit>[];
+  for (final row in list.whereType<Map<String, dynamic>>()) {
+    final hit = ConversationSearchHit.fromJson(row);
+    if (hit.valid) {
+      out.add(hit);
+      if (out.length >= maxHits) {
+        break;
+      }
+    }
+  }
+  return out;
+}
+
 /// A folder in the chat list: a section or group and the chats under it.
 class ConversationBucket {
   ConversationBucket(this.folder);

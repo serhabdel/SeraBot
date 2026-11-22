@@ -11,7 +11,7 @@ Deterministic Rust around bounded LLM calls.</p>
 
 ## What it is
 
-SeraBot (`0.74.2`) is an invitation-only, multi-user self-hosted agent built as **one Rust binary** and **one SQLite/WAL database**. Each invited member signs in with Microsoft OIDC and gets an isolated, UID-scoped workspace—chats, bot fleet, skills, memory, documents, project folders, AI provider accounts, connectors, and an encrypted vault. Nobody can read another member's data or credentials.
+SeraBot (`0.74.3`) is an invitation-only, multi-user self-hosted agent built as **one Rust binary** and **one SQLite/WAL database**. Each invited member signs in with Microsoft OIDC and gets an isolated, UID-scoped workspace—chats, bot fleet, skills, memory, documents, project folders, AI provider accounts, connectors, and an encrypted vault. Nobody can read another member's data or credentials.
 
 | Part | Stack | What it does |
 | --- | --- | --- |
@@ -220,7 +220,7 @@ Synthetic starter files in [`config/`](config/): [`brand.example.toml`](config/b
 
 SeraBot ships as **patch batches** on top of the current minor (`0.74.1`, `0.74.2`, …) until the owner confirms satisfaction, before advancing to the next minor. Each batch updates [`Cargo.toml`](Cargo.toml), [`apps/serabot_mobile/pubspec.yaml`](apps/serabot_mobile/pubspec.yaml), [`tasks/todo.md`](tasks/todo.md), and adds `docs/release-<version>.md`.
 
-- **Recent highlights:** [0.74.0](docs/release-0.74.0.md) (workspace editor & gated project writes) · [0.73.0](docs/release-0.73.0.md) (project check harness, Problems panel & context meter) · [0.71.0](docs/release-0.71.0.md)–[0.72.0](docs/release-0.72.0.md) (UI/UX audit & `--fs-*` token sweep) · [0.70.0](docs/release-0.70.0.md) (JobFinder, browser upgrade, morning brief, email triage, memory review, research reports, plan/cache costs) · [0.68.0](docs/release-0.68.0.md)–[0.69.0](docs/release-0.69.0.md) (alerts, encrypted backups, image tools, budgets) · [0.66.0](docs/release-0.66.0.md)–[0.67.0](docs/release-0.67.0.md) (desktop network relay & usage insights) · [0.50.0](docs/release-0.50.0.md)–[0.65.0](docs/release-0.65.0.md) (orchestration at scale, MCP OAuth marketplace, ACP Claude Code, WhatsApp linked device, semantic memory).
+- **Recent highlights:** [0.74.3](docs/release-0.74.3.md) (LiveCard, chat stability, handwriting, mobile catch-up) · [0.74.0](docs/release-0.74.0.md) (workspace editor & gated project writes) · [0.73.0](docs/release-0.73.0.md) (project check harness, Problems panel & context meter) · [0.71.0](docs/release-0.71.0.md)–[0.72.0](docs/release-0.72.0.md) (UI/UX audit & `--fs-*` token sweep) · [0.70.0](docs/release-0.70.0.md) (JobFinder, browser upgrade, morning brief, email triage, memory review, research reports, plan/cache costs) · [0.68.0](docs/release-0.68.0.md)–[0.69.0](docs/release-0.69.0.md) (alerts, encrypted backups, image tools, budgets) · [0.66.0](docs/release-0.66.0.md)–[0.67.0](docs/release-0.67.0.md) (desktop network relay & usage insights) · [0.50.0](docs/release-0.50.0.md)–[0.65.0](docs/release-0.65.0.md) (orchestration at scale, MCP OAuth marketplace, ACP Claude Code, WhatsApp linked device, semantic memory).
 - **Documentation index & deploy automation:** [`docs/README.md`](docs/README.md), [`docs/deployment.md`](docs/deployment.md), [`docs/deploy-automation.md`](docs/deploy-automation.md), [`tasks/plan.md`](tasks/plan.md).
 
 ---

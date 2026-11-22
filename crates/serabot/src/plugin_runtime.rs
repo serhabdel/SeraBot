@@ -1279,6 +1279,9 @@ mod tests {
 
     /// The connection goes only to the pinned address. The host name does not
     /// resolve in DNS (".invalid"), so a request that succeeds proves the pin.
+    /// The pinned client also ignores any environment proxy: with a proxy the
+    /// request would go to the proxy (and time out on ".invalid") instead of
+    /// the pinned address, and the credential with it.
     #[tokio::test]
     async fn a_pinned_connection_reaches_only_the_checked_address() {
         use serde_json::json;

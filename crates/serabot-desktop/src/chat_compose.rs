@@ -150,17 +150,21 @@ pub fn sync_composer_from_session(
 }
 
 /// Whether an external update to `session.composer` should overwrite the
-/// local textarea draft. When `external == prev_external`, nothing in
-/// `session.composer` actually changed since the last check (so typing in the
-/// local draft before `onblur` syncs, or unrelated `session.write()` updates
-/// like streaming tokens and polls, never erase in-progress input).
+/// local textarea draft (0.74.3). The generation decides first: when
+/// `external_gen == prev_gen` nothing intentionally replaced the composer
+/// (a chip, a slash insert, a failed-send restore, a conversation switch),
+/// so typing in the local draft before `onblur` syncs, or unrelated
+/// `session.write()` updates like streaming tokens and polls, never erase
+/// in-progress input — even when the text happens to differ. When the
+/// generation moved, the usual focus/emptiness rules below decide.
 pub fn should_sync_external_composer(
     external: &str,
-    prev_external: &str,
+    external_gen: u64,
+    prev_gen: u64,
     composer_focused: bool,
     local_draft: &str,
 ) -> bool {
-    if external == prev_external {
+    if external_gen == prev_gen {
         return false;
     }
     sync_composer_from_session(
@@ -1218,23 +1222,38 @@ mod tests {
 
     #[test]
     fn typing_and_background_session_updates_never_erase_local_draft() {
-        // Every keystroke while `session.composer` is still "" must keep the
-        // in-progress local draft intact rather than resetting to "".
-        assert!(!should_sync_external_composer("", "", true, "h"));
-        assert!(!should_sync_external_composer("", "", true, "hello world"));
-        // Unrelated session ticks after a prior blur (`session.composer == "old"`)
-        // must not overwrite a cleared or edited local draft either.
-        assert!(!should_sync_external_composer("old", "old", true, ""));
+        // The generation, not the text, decides. Every keystroke while
+        // `session.composer` is still "" must keep the in-progress local
+        // draft intact rather than resetting to "".
+        assert!(!should_sync_external_composer("", 3, 3, true, "h"));
         assert!(!should_sync_external_composer(
-            "old", "old", true, "new text"
+            "",
+            3,
+            3,
+            true,
+            "hello world"
         ));
-        // External transitions still take effect as expected:
+        // Unrelated session ticks after a prior blur (`session.composer == "old"`)
+        // must not overwrite a cleared or edited local draft either, even
+        // when the text differs from what was last seen.
+        assert!(!should_sync_external_composer("old", 3, 3, true, ""));
+        assert!(!should_sync_external_composer(
+            "old", 3, 3, true, "new text"
+        ));
+        assert!(!should_sync_external_composer(
+            "changed", 3, 3, true, "typed"
+        ));
+        // External transitions still take effect as expected, once their
+        // generation moved:
         // 1) Failed send asynchronously restores `session.composer`.
-        assert!(should_sync_external_composer("failed text", "", true, ""));
+        assert!(should_sync_external_composer("failed text", 4, 3, true, ""));
         // 2) Submit/queue clears `session.composer` from a previously synced draft.
-        assert!(should_sync_external_composer("", "old", true, "old"));
+        assert!(should_sync_external_composer("", 4, 3, true, "old"));
         // 3) Blur sync while unfocused updates cleanly.
-        assert!(should_sync_external_composer("typed", "", false, "typed"));
+        assert!(should_sync_external_composer("typed", 4, 3, false, "typed"));
+        // 4) A bumped generation still respects focus: a non-empty local
+        // draft wins while the box is focused.
+        assert!(!should_sync_external_composer("new", 4, 3, true, "typing"));
     }
 
     #[test]

@@ -72,6 +72,9 @@ pub struct UiPrefs {
     pub notify_approvals: bool,
     /// Enter sends the message (Shift+Enter adds a line); off means Ctrl+Enter sends.
     pub enter_sends: bool,
+    /// Show `:::hand` notes in a handwriting font (0.74.3). Off renders
+    /// them as plain paragraphs. Local only, like the rest of `UiPrefs`.
+    pub handwritten_notes: bool,
 }
 
 impl Default for UiPrefs {
@@ -81,6 +84,7 @@ impl Default for UiPrefs {
             reduce_motion: false,
             notify_approvals: true,
             enter_sends: true,
+            handwritten_notes: true,
         }
     }
 }
@@ -564,6 +568,7 @@ mod tests {
             reduce_motion: true,
             notify_approvals: false,
             enter_sends: false,
+            handwritten_notes: true,
         };
         save_settings_to(
             &dir,

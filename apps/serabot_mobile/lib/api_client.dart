@@ -9,6 +9,7 @@ import 'bot_library_models.dart';
 import 'chat_models.dart';
 import 'costs_models.dart';
 import 'jobs_models.dart';
+import 'mail_models.dart';
 import 'models.dart';
 import 'usage_insights_models.dart';
 import 'validation.dart';
@@ -545,6 +546,41 @@ class ApiClient {
     return out;
   }
 
+  /// Full-text message search (`GET /v1/conversations/search?q=...&bot=...&
+  /// limit=...`, 0.74.2): UID-scoped, searches message content and titles,
+  /// deduplicates by conversation (newest match first) and returns bounded
+  /// ~160-char snippets. Queries under 2 characters return no hits without
+  /// hitting the server, mirroring the desktop; an older server answering
+  /// 404 also yields an empty hit list instead of an error.
+  Future<List<ConversationSearchHit>> searchConversations(
+    String query, {
+    String? bot,
+    int limit = 15,
+  }) async {
+    final q = query.trim();
+    if (q.runes.length < 2 || q.runes.length > 200) {
+      return const [];
+    }
+    final queryParams = <String, String>{
+      'q': q,
+      'limit': '${limit.clamp(1, 50)}',
+      if (bot != null && bot.trim().isNotEmpty) 'bot': bot.trim(),
+    };
+    final json = await _requestOptional(
+      'GET',
+      ['v1', 'conversations', 'search'],
+      query: queryParams,
+    );
+    if (json == null) {
+      return const [];
+    }
+    try {
+      return parseConversationSearchHits(json);
+    } catch (_) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
+  }
+
   /// A new node in the tree. [kind] direct/room sit under a section or group.
   Future<ConversationSummary> createChat({
     required ConversationKind kind,
@@ -1066,6 +1102,51 @@ class ApiClient {
       return list
           .map((e) => ConnectorStatus.fromJson(e as Map<String, dynamic>))
           .toList();
+    } catch (_) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
+  }
+
+  /// Per-user SMTP/IMAP mail status (`GET /v1/mail`, 0.74.1–0.74.2). Never
+  /// returns the password. A 404 means the server predates mail, which
+  /// reads as "not connected" instead of an error.
+  Future<MailStatus> mailStatus() async {
+    final json = await _requestOptional('GET', ['v1', 'mail']);
+    if (json == null) {
+      return const MailStatus(connected: false);
+    }
+    try {
+      return MailStatus.fromJson(json);
+    } catch (_) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
+  }
+
+  /// Saves per-user SMTP/IMAP credentials and runs the live SMTP + IMAP
+  /// login tests (`POST /v1/mail/connect`). Validated locally first, so a
+  /// plain-text remote host never leaves the phone.
+  Future<MailConnectResponse> mailConnect(MailConnectRequest req) async {
+    final problem = validateMailConnect(req);
+    if (problem != null) {
+      throw ApiException(ApiErrorKind.validation, detail: problem);
+    }
+    final json = await _request(
+      'POST',
+      ['v1', 'mail', 'connect'],
+      body: req.toJson(),
+    );
+    try {
+      return MailConnectResponse.fromJson(json);
+    } catch (_) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
+  }
+
+  /// Removes the saved per-user SMTP/IMAP credentials (`DELETE /v1/mail`).
+  Future<MailDisconnectResponse> mailDisconnect() async {
+    final json = await _request('DELETE', ['v1', 'mail']);
+    try {
+      return MailDisconnectResponse.fromJson(json);
     } catch (_) {
       throw ApiException(ApiErrorKind.invalidResponse);
     }

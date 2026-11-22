@@ -406,4 +406,22 @@ never merge without the owner's OK.
 - [x] `docs/release-0.74.2.md` and `README.md` updated for `0.74.2`.
 - [ ] Owner: live pass on Windows (Mail card connect/test with Hostinger, full-text History search, Tasks/Kanban/Calendar layout).
 
+## Release 0.74.3 — LiveCard, chat stability, handwriting, mobile catch-up
 
+- [x] Server: re-emit turn.context after compaction/failover; strip
+  :::hand fences in Telegram/WhatsApp; Cargo.toml 0.74.3.
+- [x] CI fixes: IMAP greeting full-prefix match in mail.rs; pinned MCP
+  clients never use an environment proxy (mcp_client.rs .no_proxy());
+  dropped the misplaced `key` in the handwriting block (ui/markdown.rs)
+  that failed Windows clippy under -D warnings.
+- [x] Desktop: row-id scroll anchor; fingerprint incl. ledger revision +
+  steps; generation-counted composer; latest_context newest-or-None;
+  LiveCard; :::hand block + Caveat font + Appearance toggle.
+- [x] Mobile: history full-text search; Mail card; Tasks stat tiles +
+  Kanban Board; hand block; pubspec 0.74.3+77.
+- [x] Release notes docs/release-0.74.3.md; README 0.74.3.
+- [ ] CI green on PR; merge only if all checks pass.
+- [ ] Owner: live verification on Windows (LiveCard states, scroll/caret,
+  handwriting), Hostinger mail via desktop/mobile, mobile search jump.
+- [ ] Follow-up (not in 0.74.3): bundle Caveat TTF on mobile via a
+  binary-capable route; inline hand spans; PDF/DOCX handwriting.

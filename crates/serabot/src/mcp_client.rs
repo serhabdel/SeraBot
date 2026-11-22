@@ -181,7 +181,8 @@ impl McpClient {
     /// Like [`McpClient::new`], but the connection to `host` goes only to the
     /// given addresses. The caller has already checked each one, so a DNS
     /// answer that changes later cannot send the request, or its secret, to an
-    /// unchecked address.
+    /// unchecked address. The client never uses an environment proxy either:
+    /// a proxy would receive the credential and bypass the pin entirely.
     pub fn new_pinned(
         label: &'static str,
         url: String,
@@ -194,6 +195,7 @@ impl McpClient {
         let http = reqwest::Client::builder()
             .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .resolve_to_addrs(host, addrs)
             .build()
             .map_err(|error| McpError::Other(format!("{label} MCP client: {error}")))?;

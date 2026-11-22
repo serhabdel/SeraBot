@@ -435,10 +435,8 @@ fn replace_dangling(object: &mut Object, existing: &HashSet<ObjectId>, depth: us
         return;
     }
     match object {
-        Object::Reference(id) => {
-            if !existing.contains(id) {
-                *object = Object::Null;
-            }
+        Object::Reference(id) if !existing.contains(id) => {
+            *object = Object::Null;
         }
         Object::Array(values) => {
             for value in values {

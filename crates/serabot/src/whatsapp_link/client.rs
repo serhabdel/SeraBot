@@ -755,6 +755,8 @@ impl WhatsappLink {
 
     /// Send text to one of the member's allowed chats, rate limited.
     pub async fn send_text_to(&self, user_id: &str, jid: &str, text: &str) -> Result<()> {
+        // 0.74.3: `:::hand` is desktop-only; WhatsApp gets the inner text.
+        let text = strip_hand_fences(text);
         let allowed = self
             .store
             .whatsapp_link_account(user_id)?
@@ -776,7 +778,7 @@ impl WhatsappLink {
             .parse()
             .map_err(|_| SeraError::Validation("invalid WhatsApp chat".into()))?;
         client
-            .send_message(to, wa::Message::text(text.to_string()))
+            .send_message(to, wa::Message::text(text))
             .await
             .map_err(|error| SeraError::External(format!("WhatsApp send failed: {error}")))?;
         self.touch_presence(user_id, &client);
@@ -793,6 +795,8 @@ impl WhatsappLink {
         bytes: Vec<u8>,
         caption: Option<String>,
     ) -> Result<()> {
+        // 0.74.3: a caption can carry reply text; strip its fences too.
+        let caption = caption.map(|caption| strip_hand_fences(&caption));
         let allowed = self
             .store
             .whatsapp_link_account(user_id)?
@@ -1248,6 +1252,85 @@ impl WhatsappLinkSendTool {
     }
 }
 
+/// Strip desktop-only `:::hand` fences (0.74.3): the desktop renders the
+/// fenced lines in a handwriting font, but a plain-text channel gets the inner
+/// text as-is, with the first line of each handwritten passage marked `✎ `.
+/// A fence never leaks literally: an unclosed block still sends its text, and
+/// a stray `:::` line is dropped. The newline ending a fence line goes with
+/// the fence, so no blank line is left behind.
+fn strip_hand_fences(text: &str) -> String {
+    // Split into (handwritten, chunk) spans at the fence markers.
+    let mut spans: Vec<(bool, &str)> = Vec::new();
+    let mut in_hand = false;
+    let mut rest = text;
+    while !rest.is_empty() {
+        if in_hand {
+            match rest.find(":::") {
+                Some(idx) => {
+                    spans.push((true, &rest[..idx]));
+                    rest = &rest[idx + 3..];
+                    if rest.starts_with('\n') {
+                        rest = &rest[1..];
+                    }
+                    in_hand = false;
+                }
+                None => {
+                    spans.push((true, rest));
+                    break;
+                }
+            }
+        } else {
+            let open = rest.find(":::hand");
+            let stray = rest.find(":::");
+            match (open, stray) {
+                (Some(open_idx), Some(stray_idx)) if stray_idx < open_idx => {
+                    spans.push((false, &rest[..stray_idx]));
+                    rest = &rest[stray_idx + 3..];
+                    if rest.starts_with('\n') {
+                        rest = &rest[1..];
+                    }
+                }
+                (Some(open_idx), _) => {
+                    spans.push((false, &rest[..open_idx]));
+                    rest = &rest[open_idx + ":::hand".len()..];
+                    if rest.starts_with('\n') {
+                        rest = &rest[1..];
+                    }
+                    in_hand = true;
+                }
+                (None, Some(stray_idx)) => {
+                    spans.push((false, &rest[..stray_idx]));
+                    rest = &rest[stray_idx + 3..];
+                    if rest.starts_with('\n') {
+                        rest = &rest[1..];
+                    }
+                }
+                (None, None) => {
+                    spans.push((false, rest));
+                    break;
+                }
+            }
+        }
+    }
+    let mut out = String::new();
+    for (hand, chunk) in spans {
+        if !hand {
+            out.push_str(chunk);
+            continue;
+        }
+        // Mark the first non-blank line of the passage.
+        let mut marked = false;
+        for line in chunk.split_inclusive('\n') {
+            if !marked && !line.trim().is_empty() {
+                out.push_str("\u{270e} ");
+                marked = true;
+            }
+            out.push_str(line);
+        }
+    }
+    out
+}
+
 fn send_args(args: &serde_json::Value) -> Result<(String, String)> {
     let to = args
         .get("to")
@@ -1558,5 +1641,30 @@ mod tests {
         let off = WhatsappLink::new(Arc::new(config), link.store.clone());
         assert!(off.start(&admin, None).await.is_err());
         assert!(!off.is_live(&admin));
+    }
+
+    #[test]
+    fn hand_fences_never_reach_plain_text_channels() {
+        assert_eq!(strip_hand_fences("plain text"), "plain text");
+        assert_eq!(
+            strip_hand_fences("Hello\n:::hand\nDear diary\n:::\nBye"),
+            "Hello\n\u{270e} Dear diary\nBye"
+        );
+        assert_eq!(
+            strip_hand_fences(":::hand\none\ntwo\n:::"),
+            "\u{270e} one\ntwo\n"
+        );
+        // Unclosed block still sends its text, without the fence.
+        assert_eq!(
+            strip_hand_fences(":::hand\nnever closed"),
+            "\u{270e} never closed"
+        );
+        // A stray fence line is dropped.
+        assert_eq!(strip_hand_fences("a\n:::\nb"), "a\nb");
+        // Two passages are each marked.
+        assert_eq!(
+            strip_hand_fences(":::hand\nfirst\n:::\nmiddle\n:::hand\nsecond\n:::"),
+            "\u{270e} first\nmiddle\n\u{270e} second\n"
+        );
     }
 }

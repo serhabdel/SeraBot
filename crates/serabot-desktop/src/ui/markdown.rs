@@ -33,6 +33,10 @@ pub enum MdBlock {
     },
     /// A checklist (`- [ ] todo`, `- [x] done`).
     TaskList(Vec<TaskItem>),
+    /// A handwritten note (`:::hand` … `:::`), at most a few lines, for a
+    /// short note or sign-off (0.74.3). Rendered in the hand font; when the
+    /// owner turns handwritten notes off it reads as a plain paragraph.
+    HandNote(String),
     Paragraph(String),
 }
 
@@ -350,6 +354,30 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
         if trimmed.is_empty() {
             i += 1;
             continue;
+        }
+
+        // Handwritten note (`:::hand` … `:::`): a short note or sign-off in
+        // the hand font. The closing fence is exactly `:::`; without one the
+        // block never opens and the lines stay a plain paragraph.
+        if trimmed == ":::hand" {
+            let mut note_lines = Vec::new();
+            let mut closed = false;
+            let mut j = i + 1;
+            while j < lines.len() {
+                if lines[j].trim() == ":::" {
+                    closed = true;
+                    break;
+                }
+                note_lines.push(lines[j]);
+                j += 1;
+            }
+            if closed {
+                i = j + 1;
+                blocks.push(MdBlock::HandNote(note_lines.join("\n")));
+                continue;
+            }
+            // Unclosed: fall through so `:::hand` and its lines are parsed
+            // as an ordinary paragraph.
         }
 
         // Fenced code block (``` or ~~~, supporting longer outer fences)
@@ -901,12 +929,48 @@ pub(super) fn CodeBlock(lang: String, code: String) -> Element {
 }
 
 #[component]
-pub fn MarkdownBody(message_id: String, content: String) -> Element {
+pub fn MarkdownBody(
+    message_id: String,
+    content: String,
+    #[props(default = true)] handwritten: bool,
+) -> Element {
     let blocks = use_memo(move || parse_markdown_cached(message_id.as_str(), content.as_str()));
     rsx! {
         div { class: "md-body",
             for (idx, block) in blocks().iter().cloned().enumerate() {
                 {match block {
+                    MdBlock::HandNote(text) => {
+                        if handwritten {
+                            let lines: Vec<String> = text
+                                .lines()
+                                .map(str::trim)
+                                .filter(|line| !line.is_empty())
+                                .map(str::to_owned)
+                                .collect();
+                            rsx! {
+                                div { key: "{idx}", class: "md-hand",
+                                    for (l_idx, line) in lines.into_iter().enumerate() {
+                                        if l_idx > 0 {
+                                            br { key: "b{l_idx}" }
+                                        }
+                                        // No key here: Dioxus only allows a key on the
+                                        // first node in a block, and the `br` above is
+                                        // that node when present. A key on this
+                                        // component is a `-D warnings` error on Windows
+                                        // (deprecated `Warning` struct in the RSX
+                                        // expansion) while Linux clippy stays silent.
+                                        InlineMarkdown { text: line }
+                                    }
+                                }
+                            }
+                        } else {
+                            rsx! {
+                                p { key: "{idx}", class: "md-p",
+                                    InlineMarkdown { text: text.lines().collect::<Vec<_>>().join(" ") }
+                                }
+                            }
+                        }
+                    },
                     MdBlock::Heading { level, text } => match level {
                         1 => rsx! { h1 { key: "{idx}", class: "md-h1", InlineMarkdown { text } } },
                         2 => rsx! { h2 { key: "{idx}", class: "md-h2", InlineMarkdown { text } } },
@@ -1115,6 +1179,38 @@ pub(super) fn RenderSpan(span: InlineSpan) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hand_note_parses_closed_and_unclosed_and_keeps_inline_marks() {
+        let blocks =
+            parse_markdown_blocks("Done.\n\n:::hand\nSee you tomorrow\n— Main\n:::\n\nAfter.");
+        assert_eq!(
+            blocks,
+            vec![
+                MdBlock::Paragraph("Done.".into()),
+                MdBlock::HandNote("See you tomorrow\n— Main".into()),
+                MdBlock::Paragraph("After.".into()),
+            ]
+        );
+        // No closing fence: the opener and its lines stay a plain paragraph.
+        let blocks = parse_markdown_blocks(":::hand\nNever closed\nstill going");
+        assert_eq!(
+            blocks,
+            vec![MdBlock::Paragraph(
+                ":::hand Never closed still going".into()
+            )]
+        );
+        // Bold-italic survives inside a hand note.
+        let blocks = parse_markdown_blocks(":::hand\n***both***\n:::");
+        assert_eq!(blocks, vec![MdBlock::HandNote("***both***".into())]);
+        assert_eq!(
+            parse_inline("***both***"),
+            vec![InlineSpan::Bold(vec![InlineSpan::Italic("both".into())])]
+        );
+        // A closing fence that is not exactly `:::` does not close the note.
+        let blocks = parse_markdown_blocks(":::hand\none\n::: more\n:::");
+        assert_eq!(blocks, vec![MdBlock::HandNote("one\n::: more".into())]);
+    }
 
     #[test]
     fn paragraphs_break_before_ordered_lists_and_fences_and_tasks() {

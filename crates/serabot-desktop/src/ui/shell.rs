@@ -1313,9 +1313,16 @@ pub(super) fn ActivityRow(mut session: Signal<Session>, step: Step) -> Element {
     };
     let title = step.title.clone().unwrap_or_else(|| step.label.clone());
     let summary = (step.title.is_some() && step.label != title).then(|| step.label.clone());
-    let duration = step
-        .duration_ms
-        .map(serabot_desktop::activity::format_duration);
+    // A running step shows its live elapsed time (`4s`), never the static
+    // word "Running": a long tool call visibly ages on the 1s repaint.
+    // Finished steps keep their reported duration.
+    let elapsed = step.elapsed_ms(Instant::now());
+    let duration = if step.phase.spinning() {
+        elapsed.map(serabot_desktop::activity::format_duration)
+    } else {
+        step.duration_ms
+            .map(serabot_desktop::activity::format_duration)
+    };
     let approval = step.approval_id.clone();
     let can_retry = session.read().state.can_send();
     // Only a retryable failed step ever uses the last message: the other
@@ -1338,7 +1345,14 @@ pub(super) fn ActivityRow(mut session: Signal<Session>, step: Step) -> Element {
         || !step.cards.is_empty()
         || step.detail.is_some()
         || step.result_summary.is_some();
-    let described = format!("{title}, {status_word}");
+    let described = if step.phase.spinning() {
+        match elapsed.map(serabot_desktop::activity::format_duration) {
+            Some(elapsed) => format!("{title}, running {elapsed}"),
+            None => format!("{title}, running"),
+        }
+    } else {
+        format!("{title}, {status_word}")
+    };
     rsx! {
         div { class: "{state_class}", role: "group", "aria-label": "{described}",
             div { class: "step-head",

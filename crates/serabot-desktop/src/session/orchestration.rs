@@ -18,7 +18,7 @@ impl Session {
             || !self.state.history_loaded
             || self.state.unknown_outcome
             || !self.ready()
-            || !(self.state.runs.stale || !self.state.runs.asked)
+            || !self.state.runs.stale && self.state.runs.asked
             || self
                 .runs_last_read
                 .is_some_and(|at| at.elapsed() < RUNS_MIN_INTERVAL)
@@ -158,6 +158,8 @@ impl Session {
             Ok(_) => {
                 self.composer.zeroize();
                 self.composer = String::new();
+                // Queuing consumes the draft, like sending: the view clears.
+                self.composer_gen = self.composer_gen.wrapping_add(1);
                 self.drafts.clear(&self.conversation);
             }
             Err(refusal) => self.toast = Some(refusal.message().into()),

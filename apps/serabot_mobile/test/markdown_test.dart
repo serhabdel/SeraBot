@@ -29,6 +29,25 @@ void main() {
     expect(p.map((e) => e.text).join(), 'a b c d e f');
   });
 
+  test('hand: :::hand fence is stripped, inner text is a hand block', () {
+    final b = parseMarkdownBlocks(
+      'Before\n\n:::hand\nNote to self\nsecond line\n:::\n\nAfter\n',
+    );
+    expect(b.map((e) => e.kind), [
+      MdBlockKind.paragraph,
+      MdBlockKind.hand,
+      MdBlockKind.paragraph,
+    ]);
+    expect(b[1].text, 'Note to self\nsecond line');
+    expect(b[2].text, 'After');
+  });
+
+  test('hand: unterminated block runs to the end, fence never leaks', () {
+    final b = parseMarkdownBlocks(':::hand\nLoose note\n');
+    expect(b.map((e) => e.kind), [MdBlockKind.hand]);
+    expect(b.single.text, 'Loose note');
+  });
+
   test('javascript: links are not links', () {
     final p = parseInline('[x](javascript:alert(1))');
     expect(p.every((e) => e.link == null), isTrue);

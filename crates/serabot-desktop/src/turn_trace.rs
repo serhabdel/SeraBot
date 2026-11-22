@@ -219,13 +219,14 @@ impl TurnLedger {
         self.turns.get(turn_id).filter(|trace| !trace.is_empty())
     }
 
-    /// Context of the newest turn that reported one (0.73).
+    /// Context of the newest turn (0.73, 0.74.3): `None` when the newest
+    /// turn reported none, even when an older turn did. Showing an older
+    /// turn's context under a newer reply would describe the wrong turn.
     pub fn latest_context(&self) -> Option<&TurnContext> {
-        self.order.iter().rev().find_map(|turn| {
-            self.turns
-                .get(turn)
-                .and_then(|trace| trace.context.as_ref())
-        })
+        let newest = self.order.back()?;
+        self.turns
+            .get(newest)
+            .and_then(|trace| trace.context.as_ref())
     }
 
     /// Apply one stream or history event. Returns whether anything changed.
@@ -337,6 +338,31 @@ mod tests {
             "phase": phase,
             "duration_ms": 1200,
         })
+    }
+
+    #[test]
+    fn latest_context_is_the_newest_turns_or_nothing() {
+        let mut ledger = TurnLedger::default();
+        ledger.reset("dir:main");
+        assert!(ledger.latest_context().is_none());
+        let base = json!({"turn_id": "t1", "conversation_id": "dir:main", "prompt_chars_est": 1000, "window": 200_000, "percent": 1});
+        assert!(ledger.apply("turn.context", &base));
+        assert_eq!(
+            ledger.latest_context().map(|c| c.prompt_chars_est),
+            Some(1000)
+        );
+        // A newer turn with no context hides the older turn's: the context
+        // line must describe the reply it sits under, not a previous turn.
+        assert!(ledger.apply("turn.step", &step("t2", "a", "done")));
+        assert!(ledger.latest_context().is_none());
+        let mut newer = base.clone();
+        newer["turn_id"] = json!("t2");
+        newer["prompt_chars_est"] = json!(2000);
+        assert!(ledger.apply("turn.context", &newer));
+        assert_eq!(
+            ledger.latest_context().map(|c| c.prompt_chars_est),
+            Some(2000)
+        );
     }
 
     #[test]

@@ -57,6 +57,10 @@
   --font: "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI", -apple-system, "SF Pro Text",
     system-ui, sans-serif;
   --font-mono: "Cascadia Code", "Cascadia Mono", Consolas, "SFMono-Regular", ui-monospace, monospace;
+  /* Handwriting for short notes (`:::hand`, 0.74.3): the bundled Caveat
+     face ("SeraBot Hand") first, then the system's handwriting face, then
+     a generic cursive. */
+  --font-hand: "SeraBot Hand", "Caveat", "Segoe Script", cursive;
 }
 
 /* Dark theme: opt-in via the Theme switch. */
