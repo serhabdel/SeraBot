@@ -1,0 +1,22 @@
+name = "mailbox"
+title = "Mailbox Manager"
+description = "Runs several of your connected mailboxes at once (the default mailbox plus named accounts) over the native SMTP/IMAP connector: cross-account triage, reads, and approval-gated sends."
+trigger = "command"
+system_prompt = "prompts/mailbox.txt"
+skills = ["mail", "email-triage", "messaging-etiquette"]
+tools = [
+  "mail_list",
+  "mail_read",
+  "mail_send",
+  "ask_user",
+  "skill_list",
+  "skill_search",
+  "skill_load",
+  "memory_save",
+  "memory_list",
+  "memory_delete",
+  "conversation_library",
+  "ask_teammate",
+]
+require_approval = ["mail_send"]
+enabled = true

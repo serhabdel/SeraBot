@@ -1741,7 +1741,23 @@ impl MailSecurity {
     }
 }
 
+/// One connected mailbox in `GET /v1/mail`'s `accounts` list (0.74.4);
+/// `account` is empty for the default mailbox. Never carries a password.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct MailAccountStatus {
+    #[serde(default)]
+    pub account: String,
+    #[serde(default)]
+    pub smtp_host: Option<String>,
+    #[serde(default)]
+    pub imap_host: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+}
+
 /// `GET /v1/mail`: per-user SMTP/IMAP connection status (never returns password).
+/// The top-level fields describe the default mailbox; `accounts` lists every
+/// connected mailbox (default + named `mail.<label>` accounts, 0.74.4).
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct MailStatus {
     #[serde(default)]
@@ -1752,11 +1768,16 @@ pub struct MailStatus {
     pub imap_host: Option<String>,
     #[serde(default)]
     pub username: Option<String>,
+    #[serde(default)]
+    pub accounts: Vec<MailAccountStatus>,
 }
 
 /// Body of `POST /v1/mail/connect`. Password is wiped when dropped.
 #[derive(Clone, Serialize)]
 pub struct MailConnectRequest {
+    /// Named account label (0.74.4); omitted means the default mailbox.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
     pub smtp_host: String,
     pub smtp_port: u16,
     pub smtp_security: MailSecurity,
@@ -1808,6 +1829,8 @@ pub struct MailConnectResponse {
     #[serde(default)]
     pub connected: bool,
     #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
     pub smtp_host: Option<String>,
     #[serde(default)]
     pub imap_host: Option<String>,
@@ -1830,6 +1853,22 @@ fn is_loopback_mail_host(host: &str) -> bool {
 
 /// Validate mail credentials locally before sending.
 pub fn validate_mail_connect(req: &MailConnectRequest) -> Result<(), ApiError> {
+    if let Some(account) = req
+        .account
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let valid = account.len() <= 24
+            && account
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'));
+        if !valid {
+            return Err(ApiError::Validation(
+                "Account name must be 1-24 chars: lowercase letters, digits, '-' or '_'.",
+            ));
+        }
+    }
     for (label, host) in [
         ("SMTP host", req.smtp_host.trim()),
         ("IMAP host", req.imap_host.trim()),
@@ -4859,9 +4898,18 @@ impl ApiClient {
         self.request(Method::POST, &["v1", "mail", "connect"], &[], Some(req))
     }
 
-    /// `DELETE /v1/mail`: disconnect and remove saved per-user SMTP/IMAP credentials.
-    pub fn mail_disconnect(&self) -> Result<MailDisconnectResponse, ApiError> {
-        self.request::<_, ()>(Method::DELETE, &["v1", "mail"], &[], None)
+    /// `DELETE /v1/mail`: disconnect and remove saved per-user SMTP/IMAP
+    /// credentials. `account` names an extra mailbox (0.74.4); `None`
+    /// removes the default one.
+    pub fn mail_disconnect(
+        &self,
+        account: Option<&str>,
+    ) -> Result<MailDisconnectResponse, ApiError> {
+        let query: &[(&str, &str)] = match account.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(label) => &[("account", label)],
+            None => &[],
+        };
+        self.request::<_, ()>(Method::DELETE, &["v1", "mail"], query, None)
     }
 
     /// `GET /v1/conversations/search?q=...&bot=...&limit=15`: full-text message search.
@@ -8156,6 +8204,7 @@ mod mail_and_search_tests {
     #[test]
     fn mail_validation_refuses_plain_remote_hosts() {
         let mut req = MailConnectRequest {
+            account: None,
             smtp_host: "smtp.hostinger.com".into(),
             smtp_port: 587,
             smtp_security: MailSecurity::None,

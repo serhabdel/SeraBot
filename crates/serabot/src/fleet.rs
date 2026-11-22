@@ -967,9 +967,9 @@ mod tests {
             FleetRegistry::new(Arc::new(config), store.clone(), templates, catalog).unwrap();
         let admin = store.admin_user_id().unwrap();
         // The seven catalog-only bots are listed but not seeded.
-        assert_eq!(registry.seed(&admin).unwrap(), 13);
+        assert_eq!(registry.seed(&admin).unwrap(), 15);
         let fleet = registry.load(&admin).unwrap();
-        assert_eq!(fleet.len(), 13);
+        assert_eq!(fleet.len(), 15);
         assert!(!fleet.contains_key("researcher"));
         let listed = registry.template_catalog(&admin).unwrap();
         assert_eq!(listed.len(), templates_total);
@@ -1819,7 +1819,7 @@ mod tests {
         let admin = store.admin_user_id().unwrap();
         let registry = FleetRegistry::new(Arc::new(config), store, bots, catalog).unwrap();
         let entries = registry.template_catalog(&admin).unwrap();
-        assert_eq!(entries.len(), 20);
+        assert_eq!(entries.len(), 22);
         assert!(entries.iter().any(|entry| entry.name == "comptable"));
         assert!(
             entries

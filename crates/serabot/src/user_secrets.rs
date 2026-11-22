@@ -403,11 +403,13 @@ impl UserSecrets {
     /// admin grants. Names only — never a value.
     pub fn providers_for(&self, user_id: &str) -> Result<Vec<String>> {
         let mut names = self.store.list_user_credential_providers(user_id)?;
-        // Vault entries and password manager tokens are not AI providers.
+        // Vault entries, password manager tokens, and named mail accounts
+        // (`mail.<label>` — the default `mail` row stays) are not AI providers.
         names.retain(|name| {
             !name.starts_with(VAULT_PROVIDER_PREFIX)
                 && !name.starts_with(VAULT_PROVIDER_TOKEN_PREFIX)
                 && !name.starts_with(ACCOUNT_PROVIDER_PREFIX)
+                && !name.starts_with(crate::mail::MAIL_ACCOUNT_PREFIX)
                 && !is_marketplace_oauth_id(name)
         });
         for grant in self.store.list_active_grants_for(user_id)? {

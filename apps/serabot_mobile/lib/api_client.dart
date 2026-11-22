@@ -1143,8 +1143,14 @@ class ApiClient {
   }
 
   /// Removes the saved per-user SMTP/IMAP credentials (`DELETE /v1/mail`).
-  Future<MailDisconnectResponse> mailDisconnect() async {
-    final json = await _request('DELETE', ['v1', 'mail']);
+  /// [account] names an extra mailbox (0.74.4); null removes the default one.
+  Future<MailDisconnectResponse> mailDisconnect({String? account}) async {
+    final a = account?.trim();
+    final json = await _request(
+      'DELETE',
+      ['v1', 'mail'],
+      query: (a != null && a.isNotEmpty) ? {'account': a} : null,
+    );
     try {
       return MailDisconnectResponse.fromJson(json);
     } catch (_) {

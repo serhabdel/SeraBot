@@ -425,3 +425,24 @@ never merge without the owner's OK.
   handwriting), Hostinger mail via desktop/mobile, mobile search jump.
 - [ ] Follow-up (not in 0.74.3): bundle Caveat TTF on mobile via a
   binary-capable route; inline hand spans; PDF/DOCX handwriting.
+
+## Release 0.74.4 — Hostinger IMAP fix, multi-account mail, hostinger & mailbox bots
+
+- [x] Server: IMAP `expect_tagged` after LOGIN and SELECT (skip untagged
+  `* FLAGS (...)` / `* n EXISTS` lines; accept `* PREAUTH` greeting) plus
+  literal-folding fix in `read_logical_line` (buffered read, one literal per
+  line) with Hostinger-style fake-server tests (`mail.rs`).
+- [x] Server: named mail accounts (`mail.<label>`) — `account` on
+  `mail_list`/`mail_read`/`mail_send`, `/v1/mail` connect/status(`accounts`)/disconnect(`?account=`), `providers_for` filter.
+- [x] Desktop: mail card account-name field, mailboxes summary, per-account
+  disconnect (`ui_connectors.rs`, `api.rs`); mobile models/api client
+  (`mail_models.dart`, `api_client.dart`).
+- [x] Bots: `hostinger` (full Hostinger mailbox) + `mailbox` (multi-account)
+  in `bots/`, `prompts/`, `shipped.rs` (fleet 22), default avatars
+  (`assets/bots/hostinger.png`, `mailbox.png`), desktop starter prompts
+  (`chat_feed.rs`); fleet-count tests updated (22 templates / 15 seeded);
+  `skills/mail/SKILL.md` updated.
+- [x] Version bump 0.74.4 (Cargo.toml), mobile 0.74.4+78, `docs/release-0.74.4.md`, README, AGENTS.md.
+- [ ] Owner: live verification on Windows — Hostinger preset connect in
+  Integrations → Mail (the `* FLAGS` error should be gone), second named
+  account, `hostinger`/`mailbox` bots triaging.

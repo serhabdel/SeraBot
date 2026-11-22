@@ -32,22 +32,54 @@ extension MailSecurityX on MailSecurity {
   }
 }
 
+/// One connected mailbox in `GET /v1/mail`'s `accounts` list (0.74.4);
+/// [account] is empty for the default mailbox. Never carries a password.
+class MailAccountStatus {
+  const MailAccountStatus({
+    this.account = '',
+    this.smtpHost,
+    this.imapHost,
+    this.username,
+  });
+
+  factory MailAccountStatus.fromJson(Map<String, dynamic> json) {
+    return MailAccountStatus(
+      account: json['account'] as String? ?? '',
+      smtpHost: json['smtp_host'] as String?,
+      imapHost: json['imap_host'] as String?,
+      username: json['username'] as String?,
+    );
+  }
+
+  final String account;
+  final String? smtpHost;
+  final String? imapHost;
+  final String? username;
+}
+
 /// `GET /v1/mail`: per-user SMTP/IMAP connection status. Never carries a
-/// password.
+/// password. The top-level fields describe the default mailbox; [accounts]
+/// lists every connected mailbox (default + named accounts, 0.74.4).
 class MailStatus {
   const MailStatus({
     this.connected = false,
     this.smtpHost,
     this.imapHost,
     this.username,
+    this.accounts = const [],
   });
 
   factory MailStatus.fromJson(Map<String, dynamic> json) {
+    final accounts = (json['accounts'] as List? ?? const [])
+        .whereType<Map<String, dynamic>>()
+        .map(MailAccountStatus.fromJson)
+        .toList();
     return MailStatus(
       connected: json['connected'] as bool? ?? false,
       smtpHost: json['smtp_host'] as String?,
       imapHost: json['imap_host'] as String?,
       username: json['username'] as String?,
+      accounts: accounts,
     );
   }
 
@@ -55,6 +87,7 @@ class MailStatus {
   final String? smtpHost;
   final String? imapHost;
   final String? username;
+  final List<MailAccountStatus> accounts;
 }
 
 /// Outcome of one live probe inside `POST /v1/mail/connect`. The server
@@ -90,6 +123,7 @@ class MailProbeOutcome {
 /// is never logged or returned by the server.
 class MailConnectRequest {
   const MailConnectRequest({
+    this.account,
     required this.smtpHost,
     required this.smtpPort,
     required this.smtpSecurity,
@@ -121,6 +155,8 @@ class MailConnectRequest {
     );
   }
 
+  /// Named account label (0.74.4); null means the default mailbox.
+  final String? account;
   final String smtpHost;
   final int smtpPort;
   final MailSecurity smtpSecurity;
@@ -133,7 +169,9 @@ class MailConnectRequest {
 
   Map<String, dynamic> toJson() {
     final f = from?.trim();
+    final a = account?.trim();
     return {
+      if (a != null && a.isNotEmpty) 'account': a,
       'smtp_host': smtpHost,
       'smtp_port': smtpPort,
       'smtp_security': smtpSecurity.apiValue,
@@ -157,6 +195,13 @@ bool _isLoopbackMailHost(String host) =>
 /// (non-TLS) connections are refused unless the host is loopback, so
 /// credentials never cross a network unencrypted.
 String? validateMailConnect(MailConnectRequest req) {
+  final account = req.account?.trim();
+  if (account != null &&
+      account.isNotEmpty &&
+      (account.length > 24 ||
+          !RegExp(r'^[a-z0-9_-]+$').hasMatch(account))) {
+    return "Account name must be 1-24 chars: lowercase letters, digits, '-' or '_'.";
+  }
   for (final entry in [
     ('SMTP host', req.smtpHost.trim()),
     ('IMAP host', req.imapHost.trim()),
@@ -204,6 +249,7 @@ String? validateMailConnect(MailConnectRequest req) {
 class MailConnectResponse {
   const MailConnectResponse({
     this.connected = false,
+    this.account,
     this.smtpHost,
     this.imapHost,
     this.username,
@@ -214,6 +260,7 @@ class MailConnectResponse {
   factory MailConnectResponse.fromJson(Map<String, dynamic> json) {
     return MailConnectResponse(
       connected: json['connected'] as bool? ?? false,
+      account: json['account'] as String?,
       smtpHost: json['smtp_host'] as String?,
       imapHost: json['imap_host'] as String?,
       username: json['username'] as String?,
@@ -223,6 +270,7 @@ class MailConnectResponse {
   }
 
   final bool connected;
+  final String? account;
   final String? smtpHost;
   final String? imapHost;
   final String? username;

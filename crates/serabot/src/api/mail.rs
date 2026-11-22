@@ -1,4 +1,6 @@
-//! Per-user SMTP/IMAP mail connector API (`/v1/mail/*`, feature branch).
+//! Per-user SMTP/IMAP mail connector API (`/v1/mail/*`, 0.74.1; named
+//! accounts since 0.74.4: the default mailbox under provider `mail`, extras
+//! under `mail.<label>`).
 //!
 //! Credentials are stored only in the per-user envelope-encrypted store
 //! (`users`), never logged, and never returned by `GET /v1/mail/status`.
@@ -15,6 +17,9 @@ pub(super) fn routes() -> Router<Arc<ApiState>> {
 
 #[derive(Deserialize)]
 struct ConnectRequest {
+    /// Named account label; omitted means the default mailbox.
+    #[serde(default)]
+    account: Option<String>,
     smtp_host: String,
     #[serde(default = "mail::default_smtp_port")]
     smtp_port: u16,
@@ -36,6 +41,12 @@ async fn connect(
     Extension(user): Extension<ActingUser>,
     Json(body): Json<ConnectRequest>,
 ) -> Result<Json<Value>> {
+    let account_label = body
+        .account
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    mail::account_provider(account_label)?;
     let creds = MailCredentials {
         smtp_host: body.smtp_host,
         smtp_port: body.smtp_port,
@@ -48,7 +59,7 @@ async fn connect(
         from: body.from,
     };
     mail::validate_credentials(&creds)?;
-    mail::store_credentials(&state.users, &user.id, &creds)?;
+    mail::store_credentials(&state.users, &user.id, account_label, &creds)?;
     let smtp = mail::smtp_test(&creds).await.map(|_| "ok".to_owned());
     let imap = mail::imap_test(&creds).await.map(|_| "ok".to_owned());
     let _ = state.store.record_audit(
@@ -60,6 +71,7 @@ async fn connect(
         None,
         None,
         Some(&json!({
+            "account": account_label,
             "smtp_host": creds.smtp_host,
             "smtp_port": creds.smtp_port,
             "imap_host": creds.imap_host,
@@ -70,6 +82,7 @@ async fn connect(
     );
     Ok(Json(json!({
         "connected": true,
+        "account": account_label,
         "smtp_host": creds.smtp_host,
         "imap_host": creds.imap_host,
         "username": creds.username,
@@ -82,20 +95,36 @@ async fn status(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
 ) -> Result<Json<Value>> {
-    let connected = mail::load_credentials(&state.users, &user.id)?;
+    let connected = mail::load_credentials(&state.users, &user.id, None)?;
+    let accounts = mail::list_accounts(&state.users, &user.id)?;
     Ok(Json(json!({
         "connected": connected.is_some(),
         "smtp_host": connected.as_ref().map(|c| c.smtp_host.clone()),
         "imap_host": connected.as_ref().map(|c| c.imap_host.clone()),
         "username": connected.as_ref().map(|c| c.username.clone()),
+        "accounts": accounts,
     })))
+}
+
+#[derive(Deserialize)]
+struct DisconnectQuery {
+    /// Named account label; omitted means the default mailbox.
+    #[serde(default)]
+    account: Option<String>,
 }
 
 async fn disconnect(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
+    Query(query): Query<DisconnectQuery>,
 ) -> Result<Json<Value>> {
-    let removed = mail::delete_credentials(&state.users, &user.id)?;
+    let account_label = query
+        .account
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    mail::account_provider(account_label)?;
+    let removed = mail::delete_credentials(&state.users, &user.id, account_label)?;
     let _ = state.store.record_audit(
         &user.id,
         "mail.disconnect",
@@ -104,7 +133,9 @@ async fn disconnect(
         None,
         None,
         None,
-        Some(&json!({ "removed": removed })),
+        Some(&json!({ "account": account_label, "removed": removed })),
     );
-    Ok(Json(json!({ "connected": false })))
+    Ok(Json(
+        json!({ "connected": false, "account": account_label }),
+    ))
 }
