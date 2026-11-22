@@ -238,9 +238,9 @@ pub fn validate_card_payload(kind: CardKind, payload: &Value) -> Result<()> {
                 return Err(invalid("a question needs options or free text"));
             }
             if let Some(context) = object.get("context")
-                && !context
+                && context
                     .as_str()
-                    .is_some_and(|text| text.chars().count() <= MAX_CONTEXT_CHARS)
+                    .is_none_or(|text| text.chars().count() > MAX_CONTEXT_CHARS)
             {
                 return Err(invalid("context must be at most 500 characters"));
             }
@@ -263,7 +263,7 @@ pub fn validate_card_payload(kind: CardKind, payload: &Value) -> Result<()> {
                 return Err(invalid("name must be 1 to 128 characters"));
             }
             let reason = object.get("reason").and_then(Value::as_str);
-            if !reason.is_some_and(|text| text.chars().count() <= MAX_CONTEXT_CHARS) {
+            if reason.is_none_or(|text| text.chars().count() > MAX_CONTEXT_CHARS) {
                 return Err(invalid("reason must be at most 500 characters"));
             }
             let domains = object

@@ -878,7 +878,7 @@ impl Session {
             || !self.state.history_loaded
             || self.state.unknown_outcome
             || !self.ready()
-            || !(self.state.route_events_stale || !self.state.route_events_asked)
+            || !self.state.route_events_stale && self.state.route_events_asked
         {
             return;
         }

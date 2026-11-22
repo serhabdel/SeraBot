@@ -339,7 +339,7 @@ impl LocalRelay {
         let id = new_id();
         let (sender, receiver) = oneshot::channel();
         self.with_slot(user_id, |slot| -> Result<()> {
-            if !slot.last_seen.is_some_and(|t| t.elapsed() < ONLINE_WINDOW) {
+            if slot.last_seen.is_none_or(|t| t.elapsed() >= ONLINE_WINDOW) {
                 return Err(SeraError::External(OFFLINE_MESSAGE.into()));
             }
             let Some(entry) = slot.roots.iter().find(|entry| entry.id == root) else {

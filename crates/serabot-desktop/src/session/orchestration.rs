@@ -18,7 +18,7 @@ impl Session {
             || !self.state.history_loaded
             || self.state.unknown_outcome
             || !self.ready()
-            || !(self.state.runs.stale || !self.state.runs.asked)
+            || !self.state.runs.stale && self.state.runs.asked
             || self
                 .runs_last_read
                 .is_some_and(|at| at.elapsed() < RUNS_MIN_INTERVAL)

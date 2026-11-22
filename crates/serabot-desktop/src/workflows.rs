@@ -570,7 +570,7 @@ pub fn compute_overview_stats(
     let healthy_sources = snapshot
         .sources
         .iter()
-        .filter(|s| s.enabled && !s.last_run.as_ref().is_some_and(|r| !r.ok))
+        .filter(|s| s.enabled && s.last_run.as_ref().is_none_or(|r| r.ok))
         .count();
     let total_sources = snapshot.sources.len();
 

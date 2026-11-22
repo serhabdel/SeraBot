@@ -147,7 +147,8 @@ pub fn feed_window_js() -> String {
   new MutationObserver(hook).observe(document.body, { childList: true, subtree: true });
   hook();
 })();
-"#.to_owned()
+"#
+    .to_owned()
 }
 
 /// Starts the sink that receives the first visible row's id from the page.

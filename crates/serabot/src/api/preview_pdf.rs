@@ -81,10 +81,8 @@ fn extract_single_page(doc: &Document, page_num: u32, page_id: ObjectId) -> Valu
 
         for op in content.operations {
             match op.operator.as_str() {
-                "q" => {
-                    if stack.len() < 64 {
-                        stack.push(state.clone());
-                    }
+                "q" if stack.len() < 64 => {
+                    stack.push(state.clone());
                 }
                 "Q" => {
                     if let Some(prev) = stack.pop() {

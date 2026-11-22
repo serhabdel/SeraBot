@@ -395,10 +395,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
         Ok(())
     }
 
-    /// Read a reply and require its code to start with `want` (e.g. "250").
+    /// Read a reply and require it to start with `want` (e.g. "250" for
+    /// SMTP, "* OK" for an IMAP greeting, "a1 OK" for a tagged IMAP reply).
+    /// The whole prefix is compared: an earlier version compared only the
+    /// first 3 bytes, which can never match a 4+-byte `want` and so rejected
+    /// every IMAP greeting ("* OK [CAPABILITY ...] Server ready.") and
+    /// every tagged IMAP reply ("a1 OK ...").
     async fn expect(&mut self, want: &str) -> Result<String> {
         let line = self.read_logical_line().await?;
-        if line.len() >= 3 && line[..3].starts_with(want) {
+        if line.starts_with(want) {
             Ok(line)
         } else {
             Err(SeraError::External(format!(
@@ -1260,5 +1265,51 @@ mod tests {
         );
         assert!(data.contains("Subject: Hi"));
         assert!(!data.contains("\r"), "server saw CRLF-normalized lines");
+    }
+
+    #[tokio::test]
+    async fn imap_connect_accepts_untagged_ok_greeting_with_capability() {
+        // Real-world greeting (e.g. Hostinger): an untagged "* OK" with a
+        // [CAPABILITY ...] bracket. `expect` used to compare only the first
+        // 3 bytes, which can never match "* OK", so every IMAP connect
+        // failed here with "mail server replied unexpectedly: * OK ...".
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            writer
+                .write_all(
+                    b"* OK [CAPABILITY IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE LITERAL+ AUTH=PLAIN AUTH=LOGIN] Server ready.\r\n",
+                )
+                .await
+                .unwrap();
+            let login = lines.next_line().await.unwrap().unwrap();
+            assert!(login.starts_with("a1 LOGIN"), "login line: {login}");
+            writer.write_all(b"a1 OK Logged in\r\n").await.unwrap();
+        });
+        let mut c = creds(Security::None);
+        c.imap_port = port;
+        imap_connect(&c).await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn imap_connect_rejects_non_ok_greeting() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (_reader, mut writer) = socket.into_split();
+            writer
+                .write_all(b"* BYE Server unavailable\r\n")
+                .await
+                .unwrap();
+        });
+        let mut c = creds(Security::None);
+        c.imap_port = port;
+        assert!(imap_connect(&c).await.is_err());
+        server.await.unwrap();
     }
 }

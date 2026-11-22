@@ -1176,7 +1176,8 @@ mod tests {
 
     #[test]
     fn hand_note_parses_closed_and_unclosed_and_keeps_inline_marks() {
-        let blocks = parse_markdown_blocks("Done.\n\n:::hand\nSee you tomorrow\n— Main\n:::\n\nAfter.");
+        let blocks =
+            parse_markdown_blocks("Done.\n\n:::hand\nSee you tomorrow\n— Main\n:::\n\nAfter.");
         assert_eq!(
             blocks,
             vec![
@@ -1198,16 +1199,11 @@ mod tests {
         assert_eq!(blocks, vec![MdBlock::HandNote("***both***".into())]);
         assert_eq!(
             parse_inline("***both***"),
-            vec![InlineSpan::Bold(vec![InlineSpan::Italic(
-                "both".into()
-            )])]
+            vec![InlineSpan::Bold(vec![InlineSpan::Italic("both".into())])]
         );
         // A closing fence that is not exactly `:::` does not close the note.
         let blocks = parse_markdown_blocks(":::hand\none\n::: more\n:::");
-        assert_eq!(
-            blocks,
-            vec![MdBlock::HandNote("one\n::: more".into())]
-        );
+        assert_eq!(blocks, vec![MdBlock::HandNote("one\n::: more".into())]);
     }
 
     #[test]

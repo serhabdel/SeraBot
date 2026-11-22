@@ -1226,13 +1226,23 @@ mod tests {
         // `session.composer` is still "" must keep the in-progress local
         // draft intact rather than resetting to "".
         assert!(!should_sync_external_composer("", 3, 3, true, "h"));
-        assert!(!should_sync_external_composer("", 3, 3, true, "hello world"));
+        assert!(!should_sync_external_composer(
+            "",
+            3,
+            3,
+            true,
+            "hello world"
+        ));
         // Unrelated session ticks after a prior blur (`session.composer == "old"`)
         // must not overwrite a cleared or edited local draft either, even
         // when the text differs from what was last seen.
         assert!(!should_sync_external_composer("old", 3, 3, true, ""));
-        assert!(!should_sync_external_composer("old", 3, 3, true, "new text"));
-        assert!(!should_sync_external_composer("changed", 3, 3, true, "typed"));
+        assert!(!should_sync_external_composer(
+            "old", 3, 3, true, "new text"
+        ));
+        assert!(!should_sync_external_composer(
+            "changed", 3, 3, true, "typed"
+        ));
         // External transitions still take effect as expected, once their
         // generation moved:
         // 1) Failed send asynchronously restores `session.composer`.

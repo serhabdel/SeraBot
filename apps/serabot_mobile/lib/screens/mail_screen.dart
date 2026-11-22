@@ -459,7 +459,7 @@ class _MailScreenState extends State<MailScreen> {
     required ValueChanged<MailSecurity?> onChanged,
   }) {
     return DropdownButtonFormField<MailSecurity>(
-      value: value,
+      initialValue: value,
       decoration: InputDecoration(
         labelText: label,
         border: const OutlineInputBorder(),

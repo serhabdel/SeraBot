@@ -2,6 +2,7 @@
 /// desktop `api.rs` mail types: status never returns the password, connect
 /// runs a live SMTP + IMAP login test per side, disconnect removes the
 /// stored credentials.
+library;
 
 /// Security mode for a mail connection. Wire values are lowercase.
 enum MailSecurity { startTls, ssl, none }

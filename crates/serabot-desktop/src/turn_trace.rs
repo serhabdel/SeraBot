@@ -224,7 +224,9 @@ impl TurnLedger {
     /// turn's context under a newer reply would describe the wrong turn.
     pub fn latest_context(&self) -> Option<&TurnContext> {
         let newest = self.order.back()?;
-        self.turns.get(newest).and_then(|trace| trace.context.as_ref())
+        self.turns
+            .get(newest)
+            .and_then(|trace| trace.context.as_ref())
     }
 
     /// Apply one stream or history event. Returns whether anything changed.

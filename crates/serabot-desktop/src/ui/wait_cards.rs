@@ -19,7 +19,7 @@ use std::time::Instant;
 /// data only: bot and connector names, step counts, elapsed times. No
 /// handoff objectives, tool arguments, queries, file contents or provider
 /// error text ever reach a card.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum LiveCardData {
     /// No step yet, or the running step is the Thinking step: "{Bot} is
     /// thinking…" with the model chip, a live elapsed time and Stop.
@@ -45,7 +45,10 @@ pub enum LiveCardData {
     Delegating { bot: String },
     /// The turn is parked waiting for a model: the existing wait line with
     /// its countdown, plus a reason chip when the last switch gave one.
-    WaitingModel { line: String, reason: Option<String> },
+    WaitingModel {
+        line: String,
+        reason: Option<String>,
+    },
     /// A step waits on the owner: "Needs your approval" with Approve/Deny.
     Approval { label: String, approval_id: String },
     /// A route just failed over (transient, ~6s): "{from} failed — switched
@@ -87,9 +90,7 @@ pub fn derive_live_card(inputs: LiveCardInputs<'_>) -> LiveCardData {
     let now = inputs.now;
     if inputs.failed {
         return LiveCardData::Failed {
-            elapsed: activity
-                .completed_elapsed_ms(now)
-                .map(format_duration),
+            elapsed: activity.completed_elapsed_ms(now).map(format_duration),
             done: activity.done_count(),
         };
     }
@@ -143,9 +144,10 @@ pub fn derive_live_card(inputs: LiveCardInputs<'_>) -> LiveCardData {
         return LiveCardData::UsingTool {
             bot: inputs.bot_name.to_owned(),
             label: step.label.clone(),
-            connector: step.title.clone().or_else(|| {
-                step.tool.as_deref().map(tool_heading)
-            }),
+            connector: step
+                .title
+                .clone()
+                .or_else(|| step.tool.as_deref().map(tool_heading)),
             position,
             elapsed,
         };
@@ -258,10 +260,7 @@ pub(crate) fn LiveCard(
                 }
             }
         },
-        LiveCardData::Approval {
-            label,
-            approval_id,
-        } => rsx! {
+        LiveCardData::Approval { label, approval_id } => rsx! {
             div { class: "live-card", role: "status", "aria-live": "polite",
                 span { class: "live-dot", "aria-hidden": "true" }
                 span { class: "live-text", "Needs your approval" }
@@ -472,8 +471,10 @@ mod tests {
     fn thinking_has_the_model_chip_and_stop_before_any_step() {
         let activity = Activity::default();
         let card = derive_live_card(inputs(&activity, Instant::now()));
-        assert!(matches!(card, LiveCardData::Thinking { bot, model, elapsed }
-            if bot == "Main" && model.as_deref() == Some("Auto") && elapsed.is_none()));
+        assert!(
+            matches!(card, LiveCardData::Thinking { bot, model, elapsed }
+            if bot == "Main" && model.as_deref() == Some("Auto") && elapsed.is_none())
+        );
     }
 
     #[test]

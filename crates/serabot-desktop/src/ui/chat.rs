@@ -595,7 +595,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let mut composer_room = use_signal(|| session.read().conversation.clone());
     let mut prev_gen = use_signal(|| session.read().composer_gen);
     use_effect(move || {
-        let (conversation, external, gen) = {
+        let (conversation, external, generation) = {
             let state = session.read();
             (
                 state.conversation.clone(),
@@ -605,7 +605,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         };
         if *composer_room.peek() != conversation {
             composer_room.set(conversation);
-            prev_gen.set(gen);
+            prev_gen.set(generation);
             composer_draft.set(external);
             return;
         }
@@ -614,15 +614,15 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         // Background session writes while the owner types never erase input.
         if chat_compose::should_sync_external_composer(
             &external,
-            gen,
+            generation,
             *prev_gen.peek(),
             *composer_focused.peek(),
             &composer_draft.peek(),
         ) {
             composer_draft.set(external.clone());
         }
-        if gen != *prev_gen.peek() {
-            prev_gen.set(gen);
+        if generation != *prev_gen.peek() {
+            prev_gen.set(generation);
         }
     });
     // Files pasted into the composer arrive through the JS bridge.
@@ -656,17 +656,16 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             let _ = dioxus::document::eval(&feed_view::feed_window_js());
             let mut sink = dioxus::document::eval(feed_view::FEED_SINK_JS);
             while let Ok(id) = sink.recv::<String>().await {
-                let Some(index) = feed_view::anchor_index(
-                    ids.borrow().iter().map(String::as_str),
-                    id.as_str(),
-                ) else {
+                let Some(index) =
+                    feed_view::anchor_index(ids.borrow().iter().map(String::as_str), id.as_str())
+                else {
                     continue;
                 };
                 if !feed_view::moved_enough(*feed_reported.peek(), index) {
                     continue;
                 }
                 feed_reported.set(Some(index));
-                if *feed_anchor.peek().as_deref() != Some(id.as_str()) {
+                if feed_anchor.peek().as_deref() != Some(id.as_str()) {
                     feed_anchor.set(Some(id));
                 }
             }
@@ -1438,7 +1437,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     data,
                                     failed_card: None,
                                     failed_can_act: false,
-                                    ondismiss: move |_| {},
+                                    failed_ondismiss: move |_| {},
                                 }
                             }
                             if !steps.is_empty() {
@@ -1522,7 +1521,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                 data,
                                 failed_card: Some(card),
                                 failed_can_act: can_send_again,
-                                ondismiss: {
+                                failed_ondismiss: {
                                     let failed = failed_task.clone();
                                     move |_| dismissed_fallback.set(failed.clone())
                                 },

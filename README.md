@@ -37,7 +37,7 @@ SeraBot (`0.74.3`) is an invitation-only, multi-user self-hosted agent built as 
 - **Per-reply turn traces & memory attribution:** Each assistant reply owns its collapsed step trace (`turn_trace.rs`), including recalled, saved, held, and superseded memories (`turn.memory`), auto-expanding on failures or pending approvals.
 - **Context meter & immediate cancellation:** `turn.context` events feed a live context-window meter in the chat header bar; Stop aborts in-flight HTTP model calls, compaction, and queued tasks immediately via `CancellationToken`.
 - **Desktop chat ergonomics:** Virtualized feed, runs sidebar, composer queue with steer and `@bot` mentions, multimodal image vision across all four wire transports + inline Office excerpts, drag-and-drop file uploads, Markdown export, `Ctrl+K` command palette, and per-bot Library tab.
-- **0.74.1–0.74.3 UI redesigns:** Redesigned **Conversation history** (grouped history + full-text message search via `/v1/conversations/search`), alongside redesigned **Workflows**, **Projects**, **Memory**, and **Tasks / Kanban / Calendar** views.
+- **0.74.1–0.74.2 UI redesigns:** Redesigned **Conversation history** (grouped history + full-text message search via `/v1/conversations/search`), alongside redesigned **Workflows**, **Projects**, **Memory**, and **Tasks / Kanban / Calendar** views.
 
 ### Memory
 
@@ -218,7 +218,7 @@ Synthetic starter files in [`config/`](config/): [`brand.example.toml`](config/b
 
 ## Releases & versioning
 
-SeraBot ships as **patch batches** on top of the current minor (`0.74.1`, `0.74.3`, …) until the owner confirms satisfaction, before advancing to the next minor. Each batch updates [`Cargo.toml`](Cargo.toml), [`apps/serabot_mobile/pubspec.yaml`](apps/serabot_mobile/pubspec.yaml), [`tasks/todo.md`](tasks/todo.md), and adds `docs/release-<version>.md`.
+SeraBot ships as **patch batches** on top of the current minor (`0.74.1`, `0.74.2`, …) until the owner confirms satisfaction, before advancing to the next minor. Each batch updates [`Cargo.toml`](Cargo.toml), [`apps/serabot_mobile/pubspec.yaml`](apps/serabot_mobile/pubspec.yaml), [`tasks/todo.md`](tasks/todo.md), and adds `docs/release-<version>.md`.
 
 - **Recent highlights:** [0.74.3](docs/release-0.74.3.md) (LiveCard, chat stability, handwriting, mobile catch-up) · [0.74.0](docs/release-0.74.0.md) (workspace editor & gated project writes) · [0.73.0](docs/release-0.73.0.md) (project check harness, Problems panel & context meter) · [0.71.0](docs/release-0.71.0.md)–[0.72.0](docs/release-0.72.0.md) (UI/UX audit & `--fs-*` token sweep) · [0.70.0](docs/release-0.70.0.md) (JobFinder, browser upgrade, morning brief, email triage, memory review, research reports, plan/cache costs) · [0.68.0](docs/release-0.68.0.md)–[0.69.0](docs/release-0.69.0.md) (alerts, encrypted backups, image tools, budgets) · [0.66.0](docs/release-0.66.0.md)–[0.67.0](docs/release-0.67.0.md) (desktop network relay & usage insights) · [0.50.0](docs/release-0.50.0.md)–[0.65.0](docs/release-0.65.0.md) (orchestration at scale, MCP OAuth marketplace, ACP Claude Code, WhatsApp linked device, semantic memory).
 - **Documentation index & deploy automation:** [`docs/README.md`](docs/README.md), [`docs/deployment.md`](docs/deployment.md), [`docs/deploy-automation.md`](docs/deploy-automation.md), [`tasks/plan.md`](tasks/plan.md).

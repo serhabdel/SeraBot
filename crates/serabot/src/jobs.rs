@@ -642,7 +642,7 @@ pub fn matches_profile(profile: &JobProfile, item: &JobItem, source_sectors: &[S
                     .cities
                     .iter()
                     .any(|wanted| fold(wanted) != "remote" && contains_term(&city, wanted));
-                if !listed && !(remote_ok && is_remote) {
+                if !(listed || remote_ok && is_remote) {
                     return false;
                 }
             }

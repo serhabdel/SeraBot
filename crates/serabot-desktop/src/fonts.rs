@@ -45,6 +45,9 @@ mod tests {
             .decode(payload)
             .expect("bundled font is valid base64");
         assert_eq!(&bytes[..4], b"wOF2", "bundled font is a woff2");
-        assert!(!payload.contains('\n'), "one line: no whitespace in the data URI");
+        assert!(
+            !payload.contains('\n'),
+            "one line: no whitespace in the data URI"
+        );
     }
 }

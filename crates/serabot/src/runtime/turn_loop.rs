@@ -41,6 +41,7 @@ impl Runtime {
     /// failover moved the turn to another route, the meter the turn start sent
     /// is stale. Best-effort like the turn-start emission: a failed append
     /// never fails the turn.
+    #[allow(clippy::too_many_arguments)]
     fn emit_turn_context(
         &self,
         user: &str,

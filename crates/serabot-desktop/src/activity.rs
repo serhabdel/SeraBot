@@ -364,11 +364,7 @@ impl Activity {
                 },
                 duration_ms,
                 cards,
-                started_at: if phase.spinning() {
-                    Some(now)
-                } else {
-                    None
-                },
+                started_at: if phase.spinning() { Some(now) } else { None },
             });
         }
         true
