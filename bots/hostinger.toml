@@ -8,6 +8,11 @@ tools = [
   "mail_list",
   "mail_read",
   "mail_send",
+  "mail_folders",
+  "mail_search",
+  "mail_flag",
+  "mail_move",
+  "mail_delete",
   "ask_user",
   "skill_list",
   "skill_search",
@@ -18,5 +23,5 @@ tools = [
   "conversation_library",
   "ask_teammate",
 ]
-require_approval = ["mail_send"]
+require_approval = ["mail_send", "mail_flag", "mail_move", "mail_delete"]
 enabled = true

@@ -1115,6 +1115,8 @@ pub(crate) fn MailConnectorCard(
     let mut password = use_signal(String::new);
     let mut from_addr = use_signal(String::new);
     let mut account_name = use_signal(String::new);
+    let mut signature = use_signal(String::new);
+    let mut mail_window = use_signal(|| false);
 
     let load_status = move || {
         loading.set(true);
@@ -1198,8 +1200,10 @@ pub(crate) fn MailConnectorCard(
         };
         let from_val = from_addr().trim().to_owned();
         let account_val = account_name().trim().to_owned();
+        let sig_val = signature().trim().to_owned();
         let req = MailConnectRequest {
             account: (!account_val.is_empty()).then_some(account_val),
+            signature: (!sig_val.is_empty()).then_some(sig_val),
             smtp_host: smtp_host().trim().to_owned(),
             smtp_port: sp,
             smtp_security: smtp_security(),
@@ -1338,6 +1342,13 @@ pub(crate) fn MailConnectorCard(
                     }
                 } else {
                     div { class: "card-actions",
+                        button {
+                            class: "btn ghost",
+                            r#type: "button",
+                            disabled: busy(),
+                            onclick: move |_| mail_window.set(true),
+                            "Open inbox"
+                        }
                         button {
                             class: "btn ghost",
                             r#type: "button",
@@ -1515,6 +1526,18 @@ pub(crate) fn MailConnectorCard(
                         oninput: move |e| from_addr.set(e.value()),
                     }
                 }
+                div { class: "field mail-from-field",
+                    label { class: "field-label", r#for: "mail-signature", "Signature (optional, appended to every send)" }
+                    textarea {
+                        id: "mail-signature",
+                        class: "input",
+                        rows: 3,
+                        placeholder: "Jane Doe — Acme",
+                        disabled: busy(),
+                        value: "{signature}",
+                        oninput: move |e| signature.set(e.value()),
+                    }
+                }
             }
 
             p { class: "tiny muted",
@@ -1533,6 +1556,212 @@ pub(crate) fn MailConnectorCard(
                         "Update & test"
                     } else {
                         "Connect & test"
+                    }
+                }
+            }
+
+            if mail_window() && connected {
+                MailWindow {
+                    session,
+                    accounts: status().map(|s| s.accounts.clone()).unwrap_or_default(),
+                    on_close: move |_| mail_window.set(false),
+                }
+            }
+        }
+    }
+}
+
+/// Load folders + messages for one account/folder into the window signals.
+#[allow(clippy::too_many_arguments)]
+fn reload_mail_window(
+    session: Signal<Session>,
+    acct: Option<String>,
+    fold: String,
+    mut folders: Signal<Vec<String>>,
+    mut messages: Signal<Vec<serabot_desktop::MailMessageInfo>>,
+    mut open_msg: Signal<Option<serabot_desktop::MailMessageInfo>>,
+    mut loading: Signal<bool>,
+    mut error: Signal<Option<String>>,
+) {
+    loading.set(true);
+    error.set(None);
+    open_msg.set(None);
+    spawn(async move {
+        let folders_acct = acct.clone();
+        if let Ok(list) =
+            run_mail_job(session, move |c| c.mail_folders(folders_acct.as_deref())).await
+        {
+            folders.set(list);
+        }
+        let res = run_mail_job(session, move |c| {
+            c.mail_messages(acct.as_deref(), &fold, 30)
+        })
+        .await;
+        loading.set(false);
+        match res {
+            Ok(list) => messages.set(list),
+            Err(msg) => error.set(Some(msg)),
+        }
+    });
+}
+
+/// Fetch one full message into the reading pane.
+fn open_mail_message(
+    session: Signal<Session>,
+    acct: Option<String>,
+    fold: String,
+    uid: u32,
+    mut open_msg: Signal<Option<serabot_desktop::MailMessageInfo>>,
+    mut error: Signal<Option<String>>,
+) {
+    error.set(None);
+    spawn(async move {
+        match run_mail_job(session, move |c| {
+            c.mail_message(acct.as_deref(), &fold, uid)
+        })
+        .await
+        {
+            Ok(msg) => open_msg.set(Some(msg)),
+            Err(msg) => error.set(Some(msg)),
+        }
+    });
+}
+
+/// Mail reading window (0.74.5). Rendered only while a mailbox is connected,
+/// so the window exists exactly when the mail integration is in use.
+#[component]
+pub(crate) fn MailWindow(
+    session: Signal<Session>,
+    accounts: Vec<serabot_desktop::MailAccountStatus>,
+    on_close: EventHandler<()>,
+) -> Element {
+    use serabot_desktop::MailMessageInfo;
+    let mut account = use_signal(|| Option::<String>::None);
+    let folders = use_signal(Vec::<String>::new);
+    let mut folder = use_signal(|| "INBOX".to_owned());
+    let messages = use_signal(Vec::<MailMessageInfo>::new);
+    let open_msg = use_signal(|| Option::<MailMessageInfo>::None);
+    let loading = use_signal(|| true);
+    let error = use_signal(|| Option::<String>::None);
+
+    use_hook(move || {
+        reload_mail_window(
+            session,
+            account(),
+            folder(),
+            folders,
+            messages,
+            open_msg,
+            loading,
+            error,
+        )
+    });
+
+    rsx! {
+        div { class: "mp-sheet-scrim", onclick: move |_| on_close.call(()),
+        }
+        aside {
+            class: "mp-sheet mail-window",
+            role: "dialog",
+            "aria-modal": "true",
+            "aria-label": "Mail",
+            div { class: "mp-sheet-head",
+                h2 { class: "mp-sheet-title", "Mail" }
+                button {
+                    class: "icon-btn",
+                    r#type: "button",
+                    title: "Close",
+                    "aria-label": "Close",
+                    onclick: move |_| on_close.call(()),
+                    Icon { name: "x", size: 16 }
+                }
+            }
+            div { class: "mp-sheet-body mail-window-body",
+                div { class: "row mail-window-controls",
+                    select {
+                        class: "input",
+                        "aria-label": "Mailbox account",
+                        value: "{account().clone().unwrap_or_default()}",
+                        onchange: move |e| {
+                            let v = e.value();
+                            let a = if v.is_empty() { None } else { Some(v) };
+                            account.set(a.clone());
+                            reload_mail_window(session, a, folder(), folders, messages, open_msg, loading, error);
+                        },
+                        option { value: "", "default" }
+                        for a in accounts.iter() {
+                            option {
+                                key: "{a.account}",
+                                value: "{a.account}",
+                                "{a.account} ({a.username.clone().unwrap_or_default()})"
+                            }
+                        }
+                    }
+                    select {
+                        class: "input",
+                        "aria-label": "Folder",
+                        value: "{folder}",
+                        onchange: move |e| {
+                            let f = e.value();
+                            folder.set(f.clone());
+                            reload_mail_window(session, account(), f, folders, messages, open_msg, loading, error);
+                        },
+                        option { value: "INBOX", "INBOX" }
+                        for f in folders().iter().filter(|f| f.as_str() != "INBOX") {
+                            option { key: "{f}", value: "{f}", "{f}" }
+                        }
+                    }
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        onclick: move |_| reload_mail_window(session, account(), folder(), folders, messages, open_msg, loading, error),
+                        Icon { name: "refresh", size: 14 }
+                        "Refresh"
+                    }
+                }
+                if let Some(msg) = error() {
+                    div { class: "banner err", role: "alert", span { class: "grow", "{msg}" } }
+                }
+                div { class: "mail-window-cols",
+                    div { class: "mail-list", role: "list",
+                        if loading() {
+                            p { class: "tiny muted", "Loading…" }
+                        } else if messages().is_empty() {
+                            p { class: "tiny muted", "No messages." }
+                        }
+                        for m in messages() {
+                            {
+                                let uid = m.uid;
+                                let selected = open_msg().is_some_and(|o| o.uid == uid);
+                                rsx! {
+                                    div {
+                                        key: "{uid}",
+                                        class: if selected { "mail-list-item selected" } else { "mail-list-item" },
+                                        role: "listitem",
+                                        onclick: move |_| open_mail_message(session, account(), folder(), uid, open_msg, error),
+                                        div { class: "mail-list-subject", "{m.subject}" }
+                                        div { class: "tiny muted", "{m.from} · {m.date} {m.flags.join(\" \")}" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    div { class: "mail-read",
+                        if let Some(m) = open_msg() {
+                            h3 { class: "mail-read-subject", "{m.subject}" }
+                            p { class: "tiny muted", "From: {m.from} · {m.date} · {m.flags.join(\" \")}" }
+                            if !m.attachments.is_empty() {
+                                p { class: "tiny",
+                                    "Attachments: "
+                                    for a in m.attachments.iter() {
+                                        span { class: "mono", "{a.name} ({a.size} B) " }
+                                    }
+                                }
+                            }
+                            div { class: "mail-body", "{m.body}" }
+                        } else {
+                            p { class: "tiny muted", "Select a message to read it." }
+                        }
                     }
                 }
             }

@@ -1788,6 +1788,9 @@ pub struct MailConnectRequest {
     pub imap_security: MailSecurity,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
+    /// Signature appended to every sent message (0.74.5).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 impl Drop for MailConnectRequest {
@@ -1845,6 +1848,39 @@ pub struct MailConnectResponse {
 pub struct MailDisconnectResponse {
     #[serde(default)]
     pub connected: bool,
+}
+
+/// One attachment of a read mail message (`GET /v1/mail/messages/{uid}`, 0.74.5).
+/// `data_base64` is only present for small attachments.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct MailAttachmentInfo {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub content_type: String,
+    #[serde(default)]
+    pub size: usize,
+    #[serde(default)]
+    pub data_base64: Option<String>,
+}
+
+/// One mail message as returned by `GET /v1/mail/messages*` (0.74.1, attachments 0.74.5).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct MailMessageInfo {
+    #[serde(default)]
+    pub uid: u32,
+    #[serde(default)]
+    pub subject: String,
+    #[serde(default)]
+    pub from: String,
+    #[serde(default)]
+    pub date: String,
+    #[serde(default)]
+    pub flags: Vec<String>,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub attachments: Vec<MailAttachmentInfo>,
 }
 
 fn is_loopback_mail_host(host: &str) -> bool {
@@ -1918,6 +1954,20 @@ pub fn validate_mail_connect(req: &MailConnectRequest) -> Result<(), ApiError> {
         {
             return Err(ApiError::Validation("Enter a valid From address."));
         }
+    }
+    if let Some(sig) = req
+        .signature
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        && (sig.chars().count() > 4096
+            || sig
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t'))
+    {
+        return Err(ApiError::Validation(
+            "Signature must be at most 4096 characters without control characters.",
+        ));
     }
     Ok(())
 }
@@ -4910,6 +4960,47 @@ impl ApiClient {
             None => &[],
         };
         self.request::<_, ()>(Method::DELETE, &["v1", "mail"], query, None)
+    }
+
+    /// `GET /v1/mail/folders?account=`: folder names of one mailbox (0.74.5).
+    pub fn mail_folders(&self, account: Option<&str>) -> Result<Vec<String>, ApiError> {
+        let query: &[(&str, &str)] = match account.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(label) => &[("account", label)],
+            None => &[],
+        };
+        let reply: serde_json::Value = self.get(&["v1", "mail", "folders"], query)?;
+        Ok(serde_json::from_value(reply["folders"].clone()).unwrap_or_default())
+    }
+
+    /// `GET /v1/mail/messages?account=&folder=&limit=`: newest messages (0.74.5).
+    pub fn mail_messages(
+        &self,
+        account: Option<&str>,
+        folder: &str,
+        limit: u32,
+    ) -> Result<Vec<MailMessageInfo>, ApiError> {
+        let mut query: Vec<(&str, String)> =
+            vec![("folder", folder.to_owned()), ("limit", limit.to_string())];
+        if let Some(label) = account.map(str::trim).filter(|s| !s.is_empty()) {
+            query.push(("account", label.to_owned()));
+        }
+        let query: Vec<(&str, &str)> = query.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let reply: serde_json::Value = self.get(&["v1", "mail", "messages"], &query)?;
+        Ok(serde_json::from_value(reply["messages"].clone()).unwrap_or_default())
+    }
+
+    /// `GET /v1/mail/messages/{uid}?account=&folder=`: one full message (0.74.5).
+    pub fn mail_message(
+        &self,
+        account: Option<&str>,
+        folder: &str,
+        uid: u32,
+    ) -> Result<MailMessageInfo, ApiError> {
+        let mut query: Vec<(&str, &str)> = vec![("folder", folder)];
+        if let Some(label) = account.map(str::trim).filter(|s| !s.is_empty()) {
+            query.push(("account", label));
+        }
+        self.get(&["v1", "mail", "messages", &uid.to_string()], &query)
     }
 
     /// `GET /v1/conversations/search?q=...&bot=...&limit=15`: full-text message search.
@@ -8214,6 +8305,7 @@ mod mail_and_search_tests {
             imap_port: 993,
             imap_security: MailSecurity::Ssl,
             from: None,
+            signature: None,
         };
         assert!(matches!(
             validate_mail_connect(&req),

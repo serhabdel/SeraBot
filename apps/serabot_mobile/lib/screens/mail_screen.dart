@@ -28,6 +28,7 @@ class _MailScreenState extends State<MailScreen> {
   final _username = TextEditingController();
   final _password = TextEditingController();
   final _from = TextEditingController();
+  final _account = TextEditingController();
 
   MailSecurity _smtpSecurity = MailSecurity.startTls;
   MailSecurity _imapSecurity = MailSecurity.ssl;
@@ -53,6 +54,7 @@ class _MailScreenState extends State<MailScreen> {
     _username.dispose();
     _password.dispose();
     _from.dispose();
+    _account.dispose();
     super.dispose();
   }
 
@@ -116,6 +118,7 @@ class _MailScreenState extends State<MailScreen> {
       imapPort: imapPort,
       imapSecurity: _imapSecurity,
       from: _from.text.trim().isEmpty ? null : _from.text.trim(),
+      account: _account.text.trim().isEmpty ? null : _account.text.trim(),
     );
     setState(() {
       _busy = true;
@@ -127,17 +130,13 @@ class _MailScreenState extends State<MailScreen> {
       if (!mounted) return;
       setState(() {
         _lastConnect = resp;
-        _status = MailStatus(
-          connected: resp.connected,
-          smtpHost: resp.smtpHost,
-          imapHost: resp.imapHost,
-          username: resp.username,
-        );
         _busy = false;
         // Write-only: the server never returns the password, and the
         // phone stops holding it once the save succeeds.
         _password.clear();
       });
+      // Re-fetch so the accounts list includes the newly connected mailbox.
+      await _load();
       messenger.showSnackBar(
         SnackBar(
           content: Text(
@@ -171,14 +170,17 @@ class _MailScreenState extends State<MailScreen> {
     setState(() => _busy = true);
     final messenger = ScaffoldMessenger.of(context);
     try {
-      await widget.app.client.mailDisconnect();
+      final acct = _account.text.trim();
+      await widget.app.client.mailDisconnect(
+        account: acct.isEmpty ? null : acct,
+      );
       if (!mounted) return;
       setState(() {
-        _status = const MailStatus(connected: false);
         _lastConnect = null;
         _password.clear();
         _busy = false;
       });
+      await _load();
       messenger.showSnackBar(
         const SnackBar(content: Text('Mail disconnected')),
       );
@@ -245,6 +247,10 @@ class _MailScreenState extends State<MailScreen> {
                             Text('SMTP: ${_status!.smtpHost}'),
                           if (_status!.imapHost != null)
                             Text('IMAP: ${_status!.imapHost}'),
+                          if (_status!.accounts.length > 1)
+                            Text(
+                              'Mailboxes: ${_status!.accounts.map((a) => a.account.isEmpty ? 'default (${a.username})' : '${a.account} (${a.username})').join(', ')}',
+                            ),
                         ] else
                           const SizedBox(height: 8),
                         if (!connected)
@@ -368,6 +374,16 @@ class _MailScreenState extends State<MailScreen> {
                       ),
                     ),
                   ],
+                ),
+                const SizedBox(height: 16),
+                TextField(
+                  key: const Key('mail-account'),
+                  controller: _account,
+                  autocorrect: false,
+                  decoration: const InputDecoration(
+                    labelText: 'Account name (optional — default mailbox when empty)',
+                    border: OutlineInputBorder(),
+                  ),
                 ),
                 const SizedBox(height: 16),
                 Text('Account', style: Theme.of(context).textTheme.titleSmall),

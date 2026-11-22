@@ -61,8 +61,12 @@ pub const DESTRUCTIVE_TOOLS: &[&str] = &[
     "browser_upload",
     // 0.73: runs the project's configured check command (starts a process).
     "project_check",
-    // mail feature branch: sends email to third parties via the member's own SMTP mailbox.
+    // 0.74.1: sends email to third parties via the member's own SMTP mailbox.
     "mail_send",
+    // 0.74.5: change or destroy mailbox contents (flags, move, delete).
+    "mail_flag",
+    "mail_move",
+    "mail_delete",
     // 0.64: `whatsapp_link_send` is not here. It only reaches the member's own
     // allowed chats, under per-minute and daily caps (owner decision).
 ];
