@@ -438,8 +438,10 @@ never merge without the owner's OK.
   disconnect (`ui_connectors.rs`, `api.rs`); mobile models/api client
   (`mail_models.dart`, `api_client.dart`).
 - [x] Bots: `hostinger` (full Hostinger mailbox) + `mailbox` (multi-account)
-  in `bots/`, `prompts/`, `shipped.rs` (fleet 22); `skills/mail/SKILL.md`
-  updated.
+  in `bots/`, `prompts/`, `shipped.rs` (fleet 22), default avatars
+  (`assets/bots/hostinger.png`, `mailbox.png`), desktop starter prompts
+  (`chat_feed.rs`); fleet-count tests updated (22 templates / 15 seeded);
+  `skills/mail/SKILL.md` updated.
 - [x] Version bump 0.74.4 (Cargo.toml), mobile 0.74.4+78, `docs/release-0.74.4.md`, README, AGENTS.md.
 - [ ] Owner: live verification on Windows — Hostinger preset connect in
   Integrations → Mail (the `* FLAGS` error should be gone), second named

@@ -1511,7 +1511,7 @@ mod tests {
         );
 
         let bots = crate::config::load_bots_with_builtin(&config, &config.fleet.bots_dir).unwrap();
-        assert_eq!(bots.len(), 20);
+        assert_eq!(bots.len(), 22);
         catalog.validate_bot_skills(&bots).unwrap();
     }
 }

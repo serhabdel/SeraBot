@@ -52,7 +52,9 @@ multi-account mailboxes, and ships two dedicated mail bots.
 - `mailbox` (`bots/mailbox.toml`, `prompts/mailbox.txt`): custom multi-account
   manager — passes `account` to the mail tools to triage/read/send across the
   default mailbox plus named accounts.
-- Both registered in `shipped.rs` (fleet now 22 bots; README updated).
+- Both registered in `shipped.rs` (fleet now 22 bots; README updated), with
+  bundled 256×256 default avatars (`assets/bots/hostinger.png`,
+  `mailbox.png`) and per-bot desktop starter prompts (`chat_feed.rs`).
 - `skills/mail/SKILL.md` documents the `account` argument, the Hostinger
   preset, and the multi-account workflow.
 

@@ -298,6 +298,16 @@ const INBOX_SUGGESTIONS: &[&str] = &[
     "Summarize the thread about the delayed delivery",
     "Draft a polite reply to my latest invoice question",
 ];
+const HOSTINGER_SUGGESTIONS: &[&str] = &[
+    "Triage my Hostinger inbox and summarize what needs a reply",
+    "Read my latest client message and draft a reply",
+    "Check my Hostinger mailbox for new invoices",
+];
+const MAILBOX_SUGGESTIONS: &[&str] = &[
+    "Triage all my connected mailboxes at once",
+    "What needs a reply in my work account today?",
+    "Draft a reply to the latest message in the shop mailbox",
+];
 const WHATSAPP_SUGGESTIONS: &[&str] = &[
     "Draft a reminder about tomorrow's appointment",
     "Write a short follow-up for a supplier who has not replied",
@@ -365,6 +375,8 @@ pub fn suggestions(bot_id: Option<&str>) -> &'static [&'static str] {
         Some("markets") => MARKETS_SUGGESTIONS,
         Some("courier") => COURIER_SUGGESTIONS,
         Some("inbox") => INBOX_SUGGESTIONS,
+        Some("hostinger") => HOSTINGER_SUGGESTIONS,
+        Some("mailbox") => MAILBOX_SUGGESTIONS,
         Some("whatsapp") => WHATSAPP_SUGGESTIONS,
         Some("jobfinder") => JOBFINDER_SUGGESTIONS,
         Some("researcher") => RESEARCHER_SUGGESTIONS,

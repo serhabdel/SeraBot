@@ -4242,11 +4242,11 @@ tasks_per_user_per_day = 500
             ..Default::default()
         };
         let loaded = load_bots_with_builtin(&config, &config.fleet.bots_dir).unwrap();
-        assert_eq!(loaded.len(), 20);
+        assert_eq!(loaded.len(), 22);
         let main = loaded.iter().find(|b| b.config.name == "main").unwrap();
         assert_eq!(main.config.title.as_deref(), Some("Custom Main"));
 
-        // Missing bots/ directory also falls back cleanly to all 20 built-ins.
+        // Missing bots/ directory also falls back cleanly to all 22 built-ins.
         let empty_base = tempfile::tempdir().unwrap();
         let empty_config = Config {
             base_dir: empty_base.path().canonicalize().unwrap(),
@@ -4254,7 +4254,7 @@ tasks_per_user_per_day = 500
         };
         let all_builtin =
             load_bots_with_builtin(&empty_config, &empty_config.fleet.bots_dir).unwrap();
-        assert_eq!(all_builtin.len(), 20);
+        assert_eq!(all_builtin.len(), 22);
     }
 
     #[test]
