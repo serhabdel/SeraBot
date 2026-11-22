@@ -1571,6 +1571,62 @@ pub(crate) fn MailConnectorCard(
     }
 }
 
+/// Load folders + messages for one account/folder into the window signals.
+#[allow(clippy::too_many_arguments)]
+fn reload_mail_window(
+    session: Signal<Session>,
+    acct: Option<String>,
+    fold: String,
+    mut folders: Signal<Vec<String>>,
+    mut messages: Signal<Vec<serabot_desktop::MailMessageInfo>>,
+    mut open_msg: Signal<Option<serabot_desktop::MailMessageInfo>>,
+    mut loading: Signal<bool>,
+    mut error: Signal<Option<String>>,
+) {
+    loading.set(true);
+    error.set(None);
+    open_msg.set(None);
+    spawn(async move {
+        let folders_acct = acct.clone();
+        if let Ok(list) =
+            run_mail_job(session, move |c| c.mail_folders(folders_acct.as_deref())).await
+        {
+            folders.set(list);
+        }
+        let res = run_mail_job(session, move |c| {
+            c.mail_messages(acct.as_deref(), &fold, 30)
+        })
+        .await;
+        loading.set(false);
+        match res {
+            Ok(list) => messages.set(list),
+            Err(msg) => error.set(Some(msg)),
+        }
+    });
+}
+
+/// Fetch one full message into the reading pane.
+fn open_mail_message(
+    session: Signal<Session>,
+    acct: Option<String>,
+    fold: String,
+    uid: u32,
+    mut open_msg: Signal<Option<serabot_desktop::MailMessageInfo>>,
+    mut error: Signal<Option<String>>,
+) {
+    error.set(None);
+    spawn(async move {
+        match run_mail_job(session, move |c| {
+            c.mail_message(acct.as_deref(), &fold, uid)
+        })
+        .await
+        {
+            Ok(msg) => open_msg.set(Some(msg)),
+            Err(msg) => error.set(Some(msg)),
+        }
+    });
+}
+
 /// Mail reading window (0.74.5). Rendered only while a mailbox is connected,
 /// so the window exists exactly when the mail integration is in use.
 #[component]
@@ -1581,51 +1637,25 @@ pub(crate) fn MailWindow(
 ) -> Element {
     use serabot_desktop::MailMessageInfo;
     let mut account = use_signal(|| Option::<String>::None);
-    let mut folders = use_signal(Vec::<String>::new);
+    let folders = use_signal(Vec::<String>::new);
     let mut folder = use_signal(|| "INBOX".to_owned());
-    let mut messages = use_signal(Vec::<MailMessageInfo>::new);
-    let mut open_msg = use_signal(|| Option::<MailMessageInfo>::None);
-    let mut loading = use_signal(|| true);
-    let mut error = use_signal(|| Option::<String>::None);
+    let messages = use_signal(Vec::<MailMessageInfo>::new);
+    let open_msg = use_signal(|| Option::<MailMessageInfo>::None);
+    let loading = use_signal(|| true);
+    let error = use_signal(|| Option::<String>::None);
 
-    let reload = move |acct: Option<String>, fold: String| {
-        loading.set(true);
-        error.set(None);
-        open_msg.set(None);
-        spawn(async move {
-            if let Ok(list) =
-                run_mail_job(session, move |c| c.mail_folders(acct.clone().as_deref())).await
-            {
-                folders.set(list);
-            }
-            let res = run_mail_job(session, move |c| {
-                c.mail_messages(acct.as_deref(), &fold, 30)
-            })
-            .await;
-            loading.set(false);
-            match res {
-                Ok(list) => messages.set(list),
-                Err(msg) => error.set(Some(msg)),
-            }
-        });
-    };
-    use_hook(move || reload(account(), folder()));
-
-    let open_message = move |uid: u32| {
-        let acct = account();
-        let fold = folder();
-        error.set(None);
-        spawn(async move {
-            match run_mail_job(session, move |c| {
-                c.mail_message(acct.as_deref(), &fold, uid)
-            })
-            .await
-            {
-                Ok(msg) => open_msg.set(Some(msg)),
-                Err(msg) => error.set(Some(msg)),
-            }
-        });
-    };
+    use_hook(move || {
+        reload_mail_window(
+            session,
+            account(),
+            folder(),
+            folders,
+            messages,
+            open_msg,
+            loading,
+            error,
+        )
+    });
 
     rsx! {
         div { class: "mp-sheet-scrim", onclick: move |_| on_close.call(()),
@@ -1656,7 +1686,7 @@ pub(crate) fn MailWindow(
                             let v = e.value();
                             let a = if v.is_empty() { None } else { Some(v) };
                             account.set(a.clone());
-                            reload(a, folder());
+                            reload_mail_window(session, a, folder(), folders, messages, open_msg, loading, error);
                         },
                         option { value: "", "default" }
                         for a in accounts.iter() {
@@ -1674,7 +1704,7 @@ pub(crate) fn MailWindow(
                         onchange: move |e| {
                             let f = e.value();
                             folder.set(f.clone());
-                            reload(account(), f);
+                            reload_mail_window(session, account(), f, folders, messages, open_msg, loading, error);
                         },
                         option { value: "INBOX", "INBOX" }
                         for f in folders().iter().filter(|f| f.as_str() != "INBOX") {
@@ -1684,7 +1714,7 @@ pub(crate) fn MailWindow(
                     button {
                         class: "btn ghost sm",
                         r#type: "button",
-                        onclick: move |_| reload(account(), folder()),
+                        onclick: move |_| reload_mail_window(session, account(), folder(), folders, messages, open_msg, loading, error),
                         Icon { name: "refresh", size: 14 }
                         "Refresh"
                     }
@@ -1708,7 +1738,7 @@ pub(crate) fn MailWindow(
                                         key: "{uid}",
                                         class: if selected { "mail-list-item selected" } else { "mail-list-item" },
                                         role: "listitem",
-                                        onclick: move |_| open_message(uid),
+                                        onclick: move |_| open_mail_message(session, account(), folder(), uid, open_msg, error),
                                         div { class: "mail-list-subject", "{m.subject}" }
                                         div { class: "tiny muted", "{m.from} · {m.date} {m.flags.join(\" \")}" }
                                     }
