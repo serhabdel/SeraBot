@@ -78,6 +78,7 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
                         Section::Logs => rsx! { crate::ui_logs::LogsView { session } },
                         Section::Workflows => rsx! { crate::ui_workflows::WorkflowsView { session } },
                         Section::Integrations => rsx! { crate::ui_integrations::IntegrationsView { session } },
+                        Section::Library => rsx! { crate::ui_library::LibraryView { session } },
                         Section::Settings => rsx! { SettingsView { session } },
                     }}
                 }
@@ -167,10 +168,11 @@ pub(super) fn IconRail(
         (Section::Workflows, "workflows", "Workflows"),
         (Section::Tasks, "list", "Tasks"),
     ];
-    let data: [(Section, &str, &str); 4] = [
+    let data: [(Section, &str, &str); 5] = [
         (Section::Projects, "folder", "Projects"),
         (Section::Browser, "globe", "Browser"),
         (Section::Memory, "memory", "Memory"),
+        (Section::Library, "library", "Library"),
         (Section::Vault, "lock", "Vault"),
     ];
     let connect: [(Section, &str, &str); 2] = [

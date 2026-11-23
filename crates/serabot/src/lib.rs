@@ -48,6 +48,7 @@ pub mod job_parse;
 pub mod job_tools;
 pub mod job_watch;
 pub mod jobs;
+pub mod library;
 pub mod llm;
 pub mod llm_failure;
 pub mod local_bulk;

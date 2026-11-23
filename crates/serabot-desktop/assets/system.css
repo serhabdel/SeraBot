@@ -1082,6 +1082,21 @@ html[data-reduce-transparency="true"] .sheet.sheet-palette {
   gap: 8px;
 }
 
+/* Library page (0.74.8): the global cross-chat library. */
+.library-page {
+  gap: 10px;
+  overflow-y: auto;
+}
+
+.library-page .seg {
+  align-self: flex-start;
+}
+
+.library-page .library-list {
+  border-top: 1px solid var(--hairline);
+  padding-top: 4px;
+}
+
 .library-toolbar {
   display: flex;
   align-items: center;

@@ -24,6 +24,7 @@ mod files_api;
 mod github_connector_api;
 mod handoffs_api;
 mod jobs_api;
+mod library_api;
 mod logs_api;
 mod marketplace_api;
 mod marketplace_oauth_api;

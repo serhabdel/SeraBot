@@ -140,6 +140,16 @@ impl ArtifactStore {
         Ok(removed)
     }
 
+    /// Size of the stored bytes, without loading them — for library listings (0.74.8).
+    pub fn size(&self, hash: &str) -> Result<u64> {
+        validate_hash(hash)?;
+        let meta = self.meta(hash)?;
+        let data_path = artifact_bytes_path(&self.root, hash, &meta.filename);
+        Ok(std::fs::metadata(&data_path)
+            .map_err(|_| SeraError::NotFound(format!("artifact {hash}")))?
+            .len())
+    }
+
     /// Metadata only, without loading the artifact bytes — for listings.
     pub fn meta(&self, hash: &str) -> Result<ArtifactMeta> {
         validate_hash(hash)?;
