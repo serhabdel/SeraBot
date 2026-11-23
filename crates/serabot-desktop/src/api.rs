@@ -1864,6 +1864,41 @@ pub struct MailAttachmentInfo {
     pub data_base64: Option<String>,
 }
 
+/// OneDrive mirror status in `GET /v1/library` (0.74.8).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct LibraryOnedriveStatus {
+    #[serde(default)]
+    pub mirror: bool,
+    #[serde(default)]
+    pub folder: String,
+    #[serde(default)]
+    pub connected: bool,
+}
+
+/// `GET /v1/library`: the member's Library (0.74.8) — every file a bot made
+/// in any of the member's chats plus the member's own uploads, and the
+/// OneDrive mirror status for this account.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct LibraryStatus {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub onedrive: LibraryOnedriveStatus,
+    #[serde(default)]
+    pub items: Vec<crate::bot_library::LibraryItem>,
+}
+
+/// Reply of `POST /v1/library/upload` (0.74.8).
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct LibraryUploadReply {
+    #[serde(default)]
+    pub item: Option<crate::bot_library::LibraryItem>,
+    /// Best-effort mirror outcome: "uploaded", "off", a not-connected note,
+    /// or "failed: …".
+    #[serde(default)]
+    pub onedrive: String,
+}
+
 /// One mail message as returned by `GET /v1/mail/messages*` (0.74.1, attachments 0.74.5).
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct MailMessageInfo {
@@ -2479,6 +2514,8 @@ pub struct AttachmentInfo {
 pub const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 /// Attachments per message.
 pub const MAX_ATTACHMENTS: usize = 10;
+/// Library upload ceiling (0.74.8): the server artifact-store limit.
+pub const MAX_LIBRARY_FILE_BYTES: usize = 100 * 1024 * 1024;
 /// Extensions the server accepts for chat attachments.
 pub const ATTACHMENT_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "pdf", "docx", "xlsx", "pptx", "txt", "md", "markdown",
@@ -5001,6 +5038,79 @@ impl ApiClient {
             query.push(("account", label));
         }
         self.get(&["v1", "mail", "messages", &uid.to_string()], &query)
+    }
+
+    /// `GET /v1/library`: the member's global Library — bot-made files from
+    /// every chat plus the member's uploads, and the OneDrive mirror status
+    /// (0.74.8). Distinct from the per-conversation [`Self::library`].
+    pub fn global_library(&self) -> Result<LibraryStatus, ApiError> {
+        self.get(&["v1", "library"], &[])
+    }
+
+    /// `POST /v1/library/upload`: one library file (raw body, `X-Filename`).
+    /// Any file type up to the 100 MB artifact limit; the server blocklist
+    /// still applies to the name.
+    pub fn library_upload(
+        &self,
+        filename: &str,
+        bytes: &[u8],
+    ) -> Result<LibraryUploadReply, ApiError> {
+        let name = filename.trim();
+        if name.is_empty()
+            || name.len() > 255
+            || name
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '/' | '\\'))
+        {
+            return Err(ApiError::Validation(
+                "Pick a file with a plain name (no path separators).",
+            ));
+        }
+        if bytes.is_empty() {
+            return Err(ApiError::Validation("That file is empty."));
+        }
+        if bytes.len() > MAX_LIBRARY_FILE_BYTES {
+            return Err(ApiError::Validation(
+                "Library files must be 100 MB or smaller.",
+            ));
+        }
+        let mut url = self.endpoint.clone();
+        url.path_segments_mut()
+            .map_err(|_| ApiError::InvalidResponse)?
+            .clear()
+            .extend(["v1", "library", "upload"]);
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(self.token.expose_secret())
+            .timeout(crate::net_policy::SLOW_TIMEOUT)
+            .header("X-Filename", name)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(bytes.to_vec())
+            .send()
+            .map_err(|_| ApiError::Transport)?;
+        let status = response.status();
+        let mut body = Zeroizing::new(Vec::new());
+        response
+            .take(MAX_RESPONSE + 1)
+            .read_to_end(&mut body)
+            .map_err(|_| ApiError::Transport)?;
+        if body.len() as u64 > MAX_RESPONSE {
+            return Err(ApiError::TooLarge);
+        }
+        if !status.is_success() {
+            if matches!(status.as_u16(), 400 | 413 | 422)
+                && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body)
+                && let Some(message) = value.get("error").and_then(|value| value.as_str())
+                && !message.is_empty()
+                && message.len() <= 512
+                && !message.chars().any(char::is_control)
+            {
+                return Err(ApiError::Rejected(message.to_owned()));
+            }
+            return Err(ApiError::Http(status.as_u16()));
+        }
+        serde_json::from_slice(&body).map_err(|_| ApiError::InvalidResponse)
     }
 
     /// `GET /v1/conversations/search?q=...&bot=...&limit=15`: full-text message search.

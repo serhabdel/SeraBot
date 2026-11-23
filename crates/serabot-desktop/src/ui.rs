@@ -907,6 +907,8 @@ pub(crate) fn Icon(name: String, #[props(default = 20)] size: u32) -> Element {
         }
         "shield" => "M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6l8-3zM9 12l2 2 4-4",
         "folder" => "M3 6h6l2 2h10v10H3z",
+        "library" => "M4 4h4v16H4zM10 4h4v16h-4zM16 5l4 15M16 5l3.5 13.5M17.2 9h3.4M18 13h3",
+        "upload" => "M12 20V6M8 9l4-4 4 4M5 4h14",
         "bolt" => "M13 3L5 14h6l-1 7 8-11h-6l1-7z",
         "refresh" => {
             "M4 12a8 8 0 0 1 13.5-5.8L20 8M20 4v4h-4M20 12a8 8 0 0 1-13.5 5.8L4 16M4 20v-4h4"

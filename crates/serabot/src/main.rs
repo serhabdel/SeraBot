@@ -758,17 +758,14 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     registry.register(FetchUrlTool::new(fetcher.clone()))?;
     registry.register(WatchNowTool::new(store.clone(), fetcher, config.clone()))?;
     // 0.74.6: social_extract fetches any public HTTPS page (still SSRF-safe),
-    // so it gets its own fetcher without the watcher host allowlist.
+    // so it gets its own fetcher without the watcher host allowlist. The tool
+    // itself is registered once the OneDrive registry exists, so its image
+    // downloads can also mirror into the member's Library (0.74.8).
     let social_fetcher = SafeFetcher::new(
         config.watcher.user_agent.clone(),
         config.watcher.timeout_secs,
         config.watcher.max_response_bytes,
     )?;
-    registry.register(serabot::social_extract::SocialExtractTool::new(
-        social_fetcher,
-        artifacts.clone(),
-        store.clone(),
-    ))?;
     if config.audio.enabled {
         let provider = resolve_audio_provider(&config.llm, &config.audio)?;
         let api_key = secrets.require(&provider.api_key_secret).map_err(|error| {
@@ -1048,6 +1045,16 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         registry.register(OneDriveInfoTool::new(onedrive_clients.clone()))?;
         onedrive_registry = Some(onedrive_clients);
     }
+    // 0.74.8: the Library's OneDrive mirror; social_extract downloads ride on
+    // it so extracted images land in the member's library folder too.
+    let library_mirror =
+        serabot::library::LibraryMirror::new((*config).clone(), onedrive_registry.clone());
+    registry.register(serabot::social_extract::SocialExtractTool::new(
+        social_fetcher,
+        artifacts.clone(),
+        store.clone(),
+        library_mirror,
+    ))?;
     if config.api.enabled {
         notifiers.push(Arc::new(ApiNotifier::new(store.clone())));
     }

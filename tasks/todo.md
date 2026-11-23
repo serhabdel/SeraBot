@@ -500,3 +500,28 @@ never merge without the owner's OK.
 - [x] Version bump 0.74.7 (Cargo.toml), mobile 0.74.7+81,
   `docs/release-0.74.7.md`, README, AGENTS.md.
 - [ ] Owner: approve or amend `docs/specs/tool-packs.md` before 0.75 code.
+
+## Release 0.74.8 — Library page (cross-chat files + uploads) with OneDrive mirror
+
+- [x] Server: `library.rs` (`LIBRARY_SCOPE`, `LibraryMirror` best-effort
+  OneDrive mirror), `[library]` config (`enabled`, `onedrive_mirror`,
+  `onedrive_folder` = "SeraBot Library"); `store.list_library_items`
+  (generated + uploaded, UID-scoped, conversation titles);
+  `ArtifactStore::size`; `api/library.rs` (`GET /v1/library`,
+  `POST /v1/library/upload` raw body + X-Filename, blocklist on the name,
+  audit `library.upload`, mirror status in the reply).
+- [x] `social_extract` downloads mirrored through `LibraryMirror`
+  (`main.rs` registers the tool once the OneDrive registry exists); tool
+  output reports the mirror outcome.
+- [x] Desktop: `api.rs` `global_library()`/`library_upload()` +
+  `LibraryStatus`/`LibraryUploadReply`/`LibraryOnedriveStatus`; new
+  `ui_library.rs` Library page (nav rail, tabs/search/date/sort, upload via
+  rfd, item dialog) reusing `bot_library` view rules; `Section::Library`;
+  icons `library`/`upload`; CSS.
+- [x] Tests: `api/tests/library_api.rs` (validation, scoping, audit, mirror
+  status string) + `library.rs` mirror unit tests + store scoping test.
+- [x] Version bump 0.74.8 (Cargo.toml), mobile 0.74.8+82,
+  `docs/release-0.74.8.md`, README, AGENTS.md.
+- [ ] Owner: live pass on Windows — Library page, upload a file, connect
+  OneDrive and confirm the `SeraBot Library` mirror, `social_extract` image
+  download mirroring.

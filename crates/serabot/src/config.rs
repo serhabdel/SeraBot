@@ -46,6 +46,10 @@ pub struct Config {
     /// Alerts and scheduled backups (0.68).
     #[serde(default)]
     pub ops: OpsConfig,
+    /// The member Library (0.74.8): one cross-chat file library per user, with
+    /// an optional OneDrive mirror.
+    #[serde(default)]
+    pub library: LibraryConfig,
     #[serde(default)]
     pub policy: PolicyConfig,
     #[serde(default)]
@@ -120,6 +124,7 @@ impl Default for Config {
             logging: LoggingConfig::default(),
             whatsapp_link: WhatsappLinkConfig::default(),
             ops: OpsConfig::default(),
+            library: LibraryConfig::default(),
             policy: PolicyConfig::default(),
             watcher: WatcherConfig::default(),
             onedrive: OneDriveConfig::default(),
@@ -4457,6 +4462,35 @@ fn default_ops_review_hour() -> u8 {
 
 fn default_ops_backup_folder() -> String {
     "Backups".into()
+}
+
+/// `[library]` (0.74.8): the member's Library — every file a bot made in any
+/// of the member's chats plus the member's own uploads, in one list
+/// (`/v1/library`), optionally mirrored to the member's OneDrive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LibraryConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Mirror every library file to the member's own connected OneDrive.
+    #[serde(default = "default_true")]
+    pub onedrive_mirror: bool,
+    /// OneDrive folder (under the OneDrive base folder) for the mirror.
+    #[serde(default = "default_library_onedrive_folder")]
+    pub onedrive_folder: String,
+}
+
+impl Default for LibraryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            onedrive_mirror: true,
+            onedrive_folder: default_library_onedrive_folder(),
+        }
+    }
+}
+
+fn default_library_onedrive_folder() -> String {
+    "SeraBot Library".into()
 }
 
 impl Default for WhatsappLinkConfig {

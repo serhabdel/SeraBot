@@ -315,16 +315,20 @@ pub enum Section {
     /// Connectors, Composio and plugins in one place (v0.38): tabs for
     /// Installed, Marketplace and Composio.
     Integrations,
+    /// The Library (0.74.8): every file the bots made plus the member's own
+    /// uploads, with tabs and upload; mirrored to OneDrive when connected.
+    Library,
 }
 
 impl Section {
-    pub const NAV: [Self; 12] = [
+    pub const NAV: [Self; 13] = [
         Self::Chat,
         Self::Conversations,
         Self::Projects,
         Self::Browser,
         Self::Tasks,
         Self::Memory,
+        Self::Library,
         Self::Providers,
         Self::Integrations,
         Self::Vault,
@@ -348,6 +352,7 @@ impl Section {
             Self::Logs => "Logs",
             Self::Workflows => "Workflows",
             Self::Integrations => "Integrations",
+            Self::Library => "Library",
         }
     }
 }
@@ -5527,7 +5532,12 @@ impl Session {
                     None
                 }
             }
-            Section::Browser | Section::Vault | Section::Usage | Section::Settings => None,
+            // The Library page loads itself through its own API jobs.
+            Section::Browser
+            | Section::Vault
+            | Section::Usage
+            | Section::Settings
+            | Section::Library => None,
         }
     }
 

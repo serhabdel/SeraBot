@@ -2871,6 +2871,40 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// The member's global Library (0.74.8): every artifact recorded in any
+    /// of the acting user's conversations (`generated`), plus the member's
+    /// own uploads recorded under [`crate::library::LIBRARY_SCOPE`]
+    /// (`uploaded`), newest first. Scoped to the acting user, so one member's
+    /// library never lists another's files.
+    pub fn list_library_items(&self, user_id: &str, limit: usize) -> Result<Vec<LibraryItemRow>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT CASE WHEN a.conversation_id = ?2 THEN 'uploaded' ELSE 'generated' END,
+                    a.hash, a.tool, a.filename, a.title, a.conversation_id, c.title, a.created_at
+             FROM conversation_artifacts a
+             LEFT JOIN conversations c ON c.id = a.conversation_id AND c.user_id = a.user_id
+             WHERE a.user_id = ?1
+             ORDER BY a.created_at DESC, a.rowid DESC
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![user_id, crate::library::LIBRARY_SCOPE, limit as i64],
+            |row| {
+                Ok(LibraryItemRow {
+                    kind: row.get(0)?,
+                    hash: row.get(1)?,
+                    tool: row.get(2)?,
+                    filename: row.get(3)?,
+                    title: row.get(4)?,
+                    conversation_id: row.get(5)?,
+                    conversation_title: row.get(6)?,
+                    created_at: parse_datetime(&row.get::<_, String>(7)?),
+                })
+            },
+        )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// Destinations on the owner's PC that tools wrote to in the acting
     /// user's conversation (`local:<root>/<path>`), newest first (0.27). A
     /// PC write is not an artifact-store file, so the library tool reports the
@@ -5865,6 +5899,21 @@ pub struct ConversationLibraryArtifact {
     pub tool: String,
     pub filename: String,
     pub title: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// One row of the member's global Library (0.74.8): `kind` is `generated` (a
+/// file a bot made in one of the member's conversations) or `uploaded` (the
+/// member's own upload, recorded under `crate::library::LIBRARY_SCOPE`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LibraryItemRow {
+    pub kind: String,
+    pub hash: String,
+    pub tool: String,
+    pub filename: String,
+    pub title: Option<String>,
+    pub conversation_id: String,
+    pub conversation_title: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
