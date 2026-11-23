@@ -103,8 +103,9 @@ Each shipped bot allowlists the skill ids below in `bots/*.toml`. Bodies live in
 | `social-posts` | marketer | Platform lengths, batch variants, claims check, approval draft. |
 | `social-extract` | all bots (SHARED_TOOLS) | Extract social posts: caption, author, metrics, image/video URLs, optional artifact download. Untrusted content. |
 | `equity-research` | markets | Fundamentals, multiples, DCF sketch, risks, source log. Information only. |
-| `email-triage` | inbox | Priority rules, scoring, reply templates, phishing check. Drafts only. |
-| `messaging-etiquette` | courier, whatsapp, inbox | Approval flow, tone, timing, privacy for outbound messages. |
+| `email-triage` | inbox, hostinger, mailbox | Priority rules, scoring, reply templates, phishing check. Drafts only. |
+| `messaging-etiquette` | courier, whatsapp, inbox, hostinger, mailbox | Approval flow, tone, timing, privacy for outbound messages. |
+| `mail` | inbox, hostinger, mailbox | SMTP/IMAP tools incl. multi-account `account`, signature auto-append, folders/search/flag/move/delete, caps, untrusted content. |
 | `contract-review` | legal | Clause review procedure and red flags. Not legal advice. |
 | `monitoring-playbook` | watcher | Source registry, change classes, failure handling, brief order. |
 | `design-brief` | maker | Design brief, colour and type roles, contrast checks, hand-off. |
