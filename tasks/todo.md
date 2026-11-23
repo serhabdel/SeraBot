@@ -484,7 +484,19 @@ never merge without the owner's OK.
   `docs/release-0.74.6.md`, README, AGENTS.md.
 - [ ] Owner: try real posts (Instagram/X may need login for full media —
   extraction is best-effort); check artifacts land in the Library.
-- [ ] Later (owner's redesign idea, not started): on-demand tool packs —
-  group tools into loadable packs loaded per task instead of listing every
-  tool per bot; would touch `bots/*.toml`, `gateway`, `runtime/prompts.rs`,
-  and the SHARED_TOOLS grant path. Needs a design note first.
+- [ ] 0.75 on-demand tool packs: spec drafted in `docs/specs/tool-packs.md`
+  (0.74.7) — **needs owner approval before any code**, like the LSP spec.
+  Phase 1: `TOOL_PACKS` + `pack_list`/`pack_load` + prompt hint + migrate
+  `hostinger`/`mailbox`/`inbox` to `packs = ["mail"]`; phase 2: desktop
+  editor checkboxes + optional per-conversation persistence.
+
+## Release 0.74.7 — proposed tool-packs spec + doc polish (no runtime changes)
+
+- [x] `docs/specs/tool-packs.md` (proposed, not approved): pack registry,
+  `pack_list`/`pack_load`, manifest `packs`, prompt/UX, security invariants,
+  phases, risks.
+- [x] `docs/skills.md`: `mail` row; `hostinger`/`mailbox` added to
+  `email-triage`/`messaging-etiquette` rows. README note next to the LSP one.
+- [x] Version bump 0.74.7 (Cargo.toml), mobile 0.74.7+81,
+  `docs/release-0.74.7.md`, README, AGENTS.md.
+- [ ] Owner: approve or amend `docs/specs/tool-packs.md` before 0.75 code.
