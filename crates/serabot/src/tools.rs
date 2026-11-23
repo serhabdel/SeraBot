@@ -952,6 +952,7 @@ pub fn known_tool_names() -> Vec<&'static str> {
         "mail_flag",
         "mail_move",
         "mail_delete",
+        "social_extract",
         "whatsapp_link_send",
         "whatsapp_link_reply_file",
         "whatsapp_link_chats",

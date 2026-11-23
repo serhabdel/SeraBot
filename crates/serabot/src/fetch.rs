@@ -84,6 +84,20 @@ pub struct FetchedPage {
     pub body: String,
 }
 
+/// A successfully retrieved HTTP response with its raw body bytes (media
+/// downloads; bytes are never serialized).
+#[derive(Debug, Clone)]
+pub struct FetchedBytes {
+    /// URL after all manually followed redirects, with any fragment removed.
+    pub final_url: String,
+    /// HTTP status code of the final response.
+    pub status: u16,
+    /// `Content-Type` header of the final response, when present and valid.
+    pub content_type: Option<String>,
+    /// Raw response body, capped at the fetcher's byte limit.
+    pub bytes: Vec<u8>,
+}
+
 /// HTTP client that refuses non-public targets before issuing a request.
 #[derive(Debug, Clone)]
 pub struct SafeFetcher {
@@ -155,11 +169,26 @@ impl SafeFetcher {
         self
     }
 
-    /// Fetch `url` and return the bounded response.
+    /// Fetch `url` and return the bounded response as text.
     ///
     /// Non-success status codes are returned rather than treated as transport
     /// errors; callers decide whether a 404/500 page is useful.
     pub async fn fetch(&self, url: &str) -> Result<FetchedPage> {
+        let raw = self.fetch_raw(url).await?;
+        Ok(FetchedPage {
+            final_url: raw.final_url,
+            status: raw.status,
+            content_type: raw.content_type,
+            body: String::from_utf8_lossy(&raw.bytes).into_owned(),
+        })
+    }
+
+    /// Fetch `url` and return the bounded raw body (for media downloads).
+    pub async fn fetch_bytes(&self, url: &str) -> Result<FetchedBytes> {
+        self.fetch_raw(url).await
+    }
+
+    async fn fetch_raw(&self, url: &str) -> Result<FetchedBytes> {
         let mut current = self.validate(url).await?;
         let mut redirects = 0usize;
 
@@ -239,11 +268,11 @@ impl SafeFetcher {
                 body.extend_from_slice(&chunk);
             }
 
-            return Ok(FetchedPage {
+            return Ok(FetchedBytes {
                 final_url: current.to_string(),
                 status: status.as_u16(),
                 content_type,
-                body: String::from_utf8_lossy(&body).into_owned(),
+                bytes: body,
             });
         }
     }

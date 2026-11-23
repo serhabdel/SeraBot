@@ -101,6 +101,7 @@ pub const BUILTIN_SKILLS: &[BuiltinSkill] = &[
     builtin_skill!("pcm-cgnc"),
     builtin_skill!("scheduler"),
     builtin_skill!("skill-creator"),
+    builtin_skill!("social-extract"),
     builtin_skill!("social-posts"),
     builtin_skill!("synthesis"),
     builtin_skill!("timesheets"),
@@ -186,6 +187,6 @@ mod tests {
             "duplicate builtin skill"
         );
         assert_eq!(embedded, on_disk, "BUILTIN_SKILLS out of sync with skills/");
-        assert_eq!(BUILTIN_SKILLS.len(), 38);
+        assert_eq!(BUILTIN_SKILLS.len(), 39);
     }
 }

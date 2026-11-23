@@ -77,6 +77,8 @@ pub const SHARED_TOOLS: &[&str] = &[
     "firecrawl_search",
     "firecrawl_scrape",
     "fetch_url",
+    // 0.74.6: every bot can extract social media posts (metadata + media).
+    "social_extract",
     "ask_user",
     "memory_save",
     "memory_list",
@@ -304,6 +306,7 @@ mod tests {
             "firecrawl_search",
             "firecrawl_scrape",
             "fetch_url",
+            "social_extract",
             "ask_user",
             "memory_save",
             "memory_search",

@@ -1503,7 +1503,7 @@ mod tests {
         );
         let config = test_config(base.path());
         let catalog = SkillCatalog::load_with_builtin(&config).unwrap();
-        assert_eq!(catalog.skill_ids().len(), 38);
+        assert_eq!(catalog.skill_ids().len(), 39);
         assert_eq!(catalog.skills["ask"].summary.name, "Custom Ask");
         assert_eq!(
             catalog.skills["xlsx"].summary.pack.as_deref(),
