@@ -467,3 +467,24 @@ never merge without the owner's OK.
   `docs/release-0.74.5.md`, README, AGENTS.md.
 - [ ] Owner: live pass on Windows — Hostinger preset, Open inbox window,
   flag/move/delete with approval cards, signature on sent mail.
+
+## Release 0.74.6 — social media extractor (`social_extract`), fleet-wide
+
+- [x] Server: `social_extract.rs` — platform detect, OG/Twitter cards, JSON-LD
+  (VideoObject/SocialMediaPosting/…), `<img>`/`<video>` scan (largest srcset),
+  metrics; optional artifact download (image/* only, ≤20 MiB each, ≤50 MiB
+  per call, UID-scoped conversation artifacts); `fetch.rs` gained
+  `fetch_bytes`/`FetchedBytes`; registered in `main.rs` with its own
+  SSRF-safe public fetcher.
+- [x] Fleet-wide grant: `SHARED_TOOLS` + `known_tool_names`; skill
+  `skills/social-extract` (+ `shipped.rs` 39, `docs/skills.md`, README).
+- [x] Tests: unit (platform/meta/JSON-LD/srcset/filename) + wiremock end-to-end
+  (extract + download + caps + no-download default).
+- [x] Version bump 0.74.6 (Cargo.toml), mobile 0.74.6+80,
+  `docs/release-0.74.6.md`, README, AGENTS.md.
+- [ ] Owner: try real posts (Instagram/X may need login for full media —
+  extraction is best-effort); check artifacts land in the Library.
+- [ ] Later (owner's redesign idea, not started): on-demand tool packs —
+  group tools into loadable packs loaded per task instead of listing every
+  tool per bot; would touch `bots/*.toml`, `gateway`, `runtime/prompts.rs`,
+  and the SHARED_TOOLS grant path. Needs a design note first.

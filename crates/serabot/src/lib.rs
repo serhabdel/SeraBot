@@ -98,6 +98,7 @@ pub mod scheduler;
 pub mod secrets;
 pub mod shipped;
 pub mod skills;
+pub mod social_extract;
 pub mod sources;
 pub mod spreadsheets;
 pub mod store;

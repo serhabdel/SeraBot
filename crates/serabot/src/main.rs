@@ -757,6 +757,18 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     let fetcher = fetcher.allow_hosts(source_hosts);
     registry.register(FetchUrlTool::new(fetcher.clone()))?;
     registry.register(WatchNowTool::new(store.clone(), fetcher, config.clone()))?;
+    // 0.74.6: social_extract fetches any public HTTPS page (still SSRF-safe),
+    // so it gets its own fetcher without the watcher host allowlist.
+    let social_fetcher = SafeFetcher::new(
+        config.watcher.user_agent.clone(),
+        config.watcher.timeout_secs,
+        config.watcher.max_response_bytes,
+    )?;
+    registry.register(serabot::social_extract::SocialExtractTool::new(
+        social_fetcher,
+        artifacts.clone(),
+        store.clone(),
+    ))?;
     if config.audio.enabled {
         let provider = resolve_audio_provider(&config.llm, &config.audio)?;
         let api_key = secrets.require(&provider.api_key_secret).map_err(|error| {
