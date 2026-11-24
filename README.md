@@ -11,13 +11,13 @@ Deterministic Rust around bounded LLM calls.</p>
 
 ## What it is
 
-SeraBot (`0.74.3`) is an invitation-only, multi-user self-hosted agent built as **one Rust binary** and **one SQLite/WAL database**. Each invited member signs in with Microsoft OIDC and gets an isolated, UID-scoped workspace—chats, bot fleet, skills, memory, documents, project folders, AI provider accounts, connectors, and an encrypted vault. Nobody can read another member's data or credentials.
+SeraBot (`0.74.11`) is an invitation-only, multi-user self-hosted agent built as **one Rust binary** and **one SQLite/WAL database**. Each invited member signs in with Microsoft OIDC and gets an isolated, UID-scoped workspace—chats, bot fleet, skills, memory, documents, project folders, AI provider accounts, connectors, and an encrypted vault. Nobody can read another member's data or credentials.
 
 | Part | Stack | What it does |
 | --- | --- | --- |
 | **Server** ([`crates/serabot`](crates/serabot)) | Rust + Axum + SQLite/WAL | Multi-user API, bot runtime & handoffs, tool gateway, approvals, audit log, scheduler, document/browser/RAG pipelines |
-| **Windows desktop** ([`crates/serabot-desktop`](crates/serabot-desktop)) | Rust + Dioxus Desktop (WebView2) | Primary console: chats, turn traces, Projects code workspace, live browser view, Vault, Usage Insights, local folders, ACP Claude Code, network relay |
-| **Android app** ([`apps/serabot_mobile`](apps/serabot_mobile)) | Flutter | Mobile console: chat, approvals, fleet management, bot Library, reply traces, costs, job search, alert & brief settings |
+| **Windows desktop** ([`crates/serabot-desktop`](crates/serabot-desktop)) | Rust + Dioxus Desktop (WebView2) | Primary console: chats, turn traces, unified approval cards, Library with Attach to chat, Projects code workspace, live browser view, Vault, Usage Insights, local folders, ACP Claude Code, network relay |
+| **Android app** ([`apps/serabot_mobile`](apps/serabot_mobile)) | Flutter | Mobile console: chat with live heartbeat & `needs_review` recovery, approvals, fleet management, global & per-bot Library with upload, reply traces, costs, job search, alert & brief settings |
 | **Telegram** | Bot API (long-poll) | Per-user linked chat (`/start <code>`), voice notes, `/auto` · `/voice` · `/text` replies, file delivery, and ops alerts |
 | **WhatsApp linked device** | `whatsapp-rust` (unofficial) | Opt-in spare-number linked device per member (`enabled = true` by default); allowlisted 1:1 chats routed to the `whatsapp` bot |
 
@@ -35,9 +35,9 @@ SeraBot (`0.74.3`) is an invitation-only, multi-user self-hosted agent built as 
 ### Chat experience
 
 - **Per-reply turn traces & memory attribution:** Each assistant reply owns its collapsed step trace (`turn_trace.rs`), including recalled, saved, held, and superseded memories (`turn.memory`), auto-expanding on failures or pending approvals.
-- **Context meter & immediate cancellation:** `turn.context` events feed a live context-window meter in the chat header bar; Stop aborts in-flight HTTP model calls, compaction, and queued tasks immediately via `CancellationToken`.
-- **Desktop chat ergonomics:** Virtualized feed, runs sidebar, composer queue with steer and `@bot` mentions, multimodal image vision across all four wire transports + inline Office excerpts, drag-and-drop file uploads, Markdown export, `Ctrl+K` command palette, and per-bot Library tab.
-- **0.74.1–0.74.2 UI redesigns:** Redesigned **Conversation history** (grouped history + full-text message search via `/v1/conversations/search`), alongside redesigned **Workflows**, **Projects**, **Memory**, and **Tasks / Kanban / Calendar** views.
+- **Live heartbeat, `needs_review` recovery & context meter:** `turn.progress` (15 s heartbeat) keeps Desktop and Mobile indicators live during slow reasoning turns, `needs_review` surfaces explicit recovery actions without blind retries, `turn.context` drives a live context-window meter, and Stop aborts in-flight calls immediately via `CancellationToken`.
+- **Desktop chat ergonomics:** Virtualized feed, runs sidebar, composer queue with persisted drafts/steer/`@bot` mentions, multimodal image vision across all four wire transports + inline Office excerpts, drag-and-drop uploads, unified `ApprovalCard`, Markdown export, `Ctrl+K` command palette, and cross-chat + per-bot Library (`Attach to chat`).
+- **0.74.1–0.74.11 UI redesigns:** Redesigned **Conversation history** (grouped history + full-text message search via `/v1/conversations/search`), **Workflows**, **Projects**, **Memory**, **Tasks / Kanban / Calendar**, **Library** (Desktop + Mobile), and unified **ApprovalCard**.
 
 ### Memory
 

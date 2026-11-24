@@ -26,6 +26,13 @@ abstract class DeviceActions {
   /// skipped by the caller; this only reads the bytes.
   Future<List<PickedFile>> pickFiles({bool imagesOnly = false});
 
+  /// Pick one arbitrary file for the global Library upload (bounded by
+  /// [maxBytes]). Returns null when cancelled; throws [FormatException] or
+  /// [FileSystemException] if the chosen file exceeds [maxBytes] or cannot be
+  /// read.
+  Future<PickedFile?> pickAnyFile({int maxBytes = maxAttachmentBytes}) async =>
+      null;
+
   /// False when microphone permission is missing.
   Future<bool> startRecording();
   Future<RecordedAudio?> stopRecording();
@@ -55,6 +62,24 @@ class PlatformDeviceActions implements DeviceActions {
       out.add(PickedFile(f.name, await f.readAsBytes()));
     }
     return out;
+  }
+
+  @override
+  Future<PickedFile?> pickAnyFile({int maxBytes = maxAttachmentBytes}) async {
+    final picked = await FilePicker.pickFiles(type: FileType.any);
+    if (picked.isEmpty) {
+      return null;
+    }
+    final f = picked.first;
+    final len = await f.length();
+    if (len != null && len > maxBytes) {
+      throw const FormatException('file_too_large');
+    }
+    final bytes = await f.readAsBytes();
+    if (bytes.length > maxBytes) {
+      throw const FormatException('file_too_large');
+    }
+    return PickedFile(f.name, bytes);
   }
 
   @override

@@ -155,7 +155,7 @@ class _BotLibraryScreenState extends State<BotLibraryScreen> {
     Navigator.of(context).push(
       MaterialPageRoute<void>(
         fullscreenDialog: true,
-        builder: (_) => _LibraryImageViewer(
+        builder: (_) => LibraryImageViewer(
           client: widget.app.client,
           device: _device,
           items: images,
@@ -169,90 +169,11 @@ class _BotLibraryScreenState extends State<BotLibraryScreen> {
   /// an empty preview shows "open the file instead" with a share button;
   /// nothing here throws.
   Future<void> _showDocPreview(BotLibraryItem item) async {
-    final kind = item.docPreviewKind;
-    if (kind == null || !item.isArtifactHash) {
-      return;
-    }
-    final future = widget.app.client.libraryDocPreview(item.id, kind);
-    await showModalBottomSheet<void>(
-      context: context,
-      showDragHandle: true,
-      isScrollControlled: true,
-      builder: (ctx) {
-        final theme = Theme.of(ctx);
-        return SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  item.label,
-                  style: theme.textTheme.titleMedium,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  kind == 'pptx' ? 'Slides' : 'Sheets',
-                  style: theme.textTheme.bodySmall,
-                ),
-                const SizedBox(height: 8),
-                ConstrainedBox(
-                  constraints: BoxConstraints(
-                    maxHeight: MediaQuery.of(ctx).size.height * 0.7,
-                  ),
-                  child: FutureBuilder<LibraryDocPreview?>(
-                    future: future,
-                    builder: (context, snap) {
-                      if (snap.connectionState != ConnectionState.done) {
-                        return const Padding(
-                          padding: EdgeInsets.all(32),
-                          child: Center(child: CircularProgressIndicator()),
-                        );
-                      }
-                      final preview = snap.data;
-                      if (snap.hasError || preview == null) {
-                        return _DocPreviewUnavailable(
-                          onOpenFile: () {
-                            Navigator.of(ctx).pop();
-                            _shareItem(item);
-                          },
-                        );
-                      }
-                      if (kind == 'pptx') {
-                        if (preview.slides.isEmpty) {
-                          return _DocPreviewUnavailable(
-                            message:
-                                'This file has no slides to show — open the file instead.',
-                            onOpenFile: () {
-                              Navigator.of(ctx).pop();
-                              _shareItem(item);
-                            },
-                          );
-                        }
-                        return _DocPreviewSlides(slides: preview.slides);
-                      }
-                      if (preview.sheets.isEmpty) {
-                        return _DocPreviewUnavailable(
-                          message:
-                              'This file has no sheets to show — open the file instead.',
-                          onOpenFile: () {
-                            Navigator.of(ctx).pop();
-                            _shareItem(item);
-                          },
-                        );
-                      }
-                      return _DocPreviewSheets(sheets: preview.sheets);
-                    },
-                  ),
-                ),
-              ],
-            ),
-          ),
-        );
-      },
+    await showLibraryDocPreviewSheet(
+      context,
+      client: widget.app.client,
+      item: item,
+      onOpenFile: () => _shareItem(item),
     );
   }
 
@@ -469,7 +390,7 @@ class _LibraryTile extends StatelessWidget {
       onTap: onTap,
       contentPadding: const EdgeInsets.symmetric(horizontal: 4),
       leading: item.isImage
-          ? _LibraryThumbnail(client: client, item: item)
+          ? LibraryThumbnail(client: client, item: item)
           : Icon(icon),
       title: Text(item.label, maxLines: 1, overflow: TextOverflow.ellipsis),
       subtitle: Column(
@@ -480,15 +401,15 @@ class _LibraryTile extends StatelessWidget {
           Text(metaLine, maxLines: 1, overflow: TextOverflow.ellipsis),
         ],
       ),
-      trailing: _TypeBadge(item: item),
+      trailing: LibraryTypeBadge(item: item),
     );
   }
 }
 
 /// Small type badge for a tile: the extension in caps, or a media/file
 /// fallback when the name carries none.
-class _TypeBadge extends StatelessWidget {
-  const _TypeBadge({required this.item});
+class LibraryTypeBadge extends StatelessWidget {
+  const LibraryTypeBadge({super.key, required this.item});
 
   final BotLibraryItem item;
 
@@ -516,19 +437,27 @@ class _TypeBadge extends StatelessWidget {
 }
 
 /// Real thumbnail for one image item, fetched once from the authenticated
-/// client (artifact preview, falling back to the download). Loading and
+/// client (thumbnail endpoint -> artifact preview -> download). Loading and
 /// failure both show the plain image icon, never a broken tile.
-class _LibraryThumbnail extends StatefulWidget {
-  const _LibraryThumbnail({required this.client, required this.item});
+class LibraryThumbnail extends StatefulWidget {
+  const LibraryThumbnail({
+    super.key,
+    required this.client,
+    required this.item,
+    this.size = 56,
+    this.fit = BoxFit.cover,
+  });
 
   final ApiClient client;
   final BotLibraryItem item;
+  final double size;
+  final BoxFit fit;
 
   @override
-  State<_LibraryThumbnail> createState() => _LibraryThumbnailState();
+  State<LibraryThumbnail> createState() => _LibraryThumbnailState();
 }
 
-class _LibraryThumbnailState extends State<_LibraryThumbnail> {
+class _LibraryThumbnailState extends State<LibraryThumbnail> {
   late final Future<List<int>?> _future;
 
   @override
@@ -549,29 +478,127 @@ class _LibraryThumbnailState extends State<_LibraryThumbnail> {
             bytes.isNotEmpty) {
           child = Image.memory(
             Uint8List.fromList(bytes),
-            width: 56,
-            height: 56,
-            fit: BoxFit.cover,
-            cacheWidth: 160,
+            width: widget.size.isFinite ? widget.size : null,
+            height: widget.size.isFinite ? widget.size : null,
+            fit: widget.fit,
+            cacheWidth: 320,
             errorBuilder: (_, _, _) => const Icon(Icons.broken_image_outlined),
           );
         } else {
-          child = const Icon(Icons.image_outlined);
+          child = const Center(child: Icon(Icons.image_outlined));
+        }
+        if (!widget.size.isFinite) {
+          return child;
         }
         return ClipRRect(
           borderRadius: BorderRadius.circular(8),
-          child: SizedBox(width: 56, height: 56, child: child),
+          child: SizedBox(width: widget.size, height: widget.size, child: child),
         );
       },
     );
   }
 }
 
+/// Opens the structured PPTX/XLSX preview modal (`GET /v1/library/preview-doc`).
+Future<void> showLibraryDocPreviewSheet(
+  BuildContext context, {
+  required ApiClient client,
+  required BotLibraryItem item,
+  required VoidCallback onOpenFile,
+}) async {
+  final kind = item.docPreviewKind;
+  if (kind == null || !item.isArtifactHash) {
+    return;
+  }
+  final future = client.libraryDocPreview(item.id, kind);
+  await showModalBottomSheet<void>(
+    context: context,
+    showDragHandle: true,
+    isScrollControlled: true,
+    builder: (ctx) {
+      final theme = Theme.of(ctx);
+      return SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                item.label,
+                style: theme.textTheme.titleMedium,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              const SizedBox(height: 4),
+              Text(
+                kind == 'pptx' ? 'Slides' : 'Sheets',
+                style: theme.textTheme.bodySmall,
+              ),
+              const SizedBox(height: 8),
+              ConstrainedBox(
+                constraints: BoxConstraints(
+                  maxHeight: MediaQuery.of(ctx).size.height * 0.7,
+                ),
+                child: FutureBuilder<LibraryDocPreview?>(
+                  future: future,
+                  builder: (context, snap) {
+                    if (snap.connectionState != ConnectionState.done) {
+                      return const Padding(
+                        padding: EdgeInsets.all(32),
+                        child: Center(child: CircularProgressIndicator()),
+                      );
+                    }
+                    final preview = snap.data;
+                    if (snap.hasError || preview == null) {
+                      return _DocPreviewUnavailable(
+                        onOpenFile: () {
+                          Navigator.of(ctx).pop();
+                          onOpenFile();
+                        },
+                      );
+                    }
+                    if (kind == 'pptx') {
+                      if (preview.slides.isEmpty) {
+                        return _DocPreviewUnavailable(
+                          message:
+                              'This file has no slides to show — open the file instead.',
+                          onOpenFile: () {
+                            Navigator.of(ctx).pop();
+                            onOpenFile();
+                          },
+                        );
+                      }
+                      return _DocPreviewSlides(slides: preview.slides);
+                    }
+                    if (preview.sheets.isEmpty) {
+                      return _DocPreviewUnavailable(
+                        message:
+                            'This file has no sheets to show — open the file instead.',
+                        onOpenFile: () {
+                          Navigator.of(ctx).pop();
+                          onOpenFile();
+                        },
+                      );
+                    }
+                    return _DocPreviewSheets(sheets: preview.sheets);
+                  },
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    },
+  );
+}
+
 /// Full-screen image viewer: pinch zoom, prev/next through the visible
 /// images, share (system sheet) and close. Bytes are fetched per item
 /// through the authenticated client and memoized per index.
-class _LibraryImageViewer extends StatefulWidget {
-  const _LibraryImageViewer({
+class LibraryImageViewer extends StatefulWidget {
+  const LibraryImageViewer({
+    super.key,
     required this.client,
     required this.device,
     required this.items,
@@ -584,10 +611,10 @@ class _LibraryImageViewer extends StatefulWidget {
   final int startIndex;
 
   @override
-  State<_LibraryImageViewer> createState() => _LibraryImageViewerState();
+  State<LibraryImageViewer> createState() => _LibraryImageViewerState();
 }
 
-class _LibraryImageViewerState extends State<_LibraryImageViewer> {
+class _LibraryImageViewerState extends State<LibraryImageViewer> {
   late int _index;
   final _futures = <int, Future<List<int>>>{};
 

@@ -230,13 +230,35 @@ class ChatController extends ChangeNotifier {
   int acceptedSends = 0;
   ChatPlan? plan;
   String? runningTaskId;
+
+  /// Elapsed seconds reported by the latest `turn.progress` heartbeat for the
+  /// running turn, or null before the first beat / once a turn finishes.
+  int? progressElapsedSecs;
+
+  /// True when the active task entered `needs_review` (uncertain effect; do
+  /// not auto-retry or show a spinner). Cleared by [dismissNeedsReview] or
+  /// starting a new turn.
+  bool needsReview = false;
+
   Timer? _poll;
   DateTime _lastPoll = DateTime.fromMillisecondsSinceEpoch(0);
   StreamSubscription<ServerEvent>? _sub;
   bool _disposed = false;
 
-  bool get running => runningTaskId != null;
+  bool get running => runningTaskId != null && !needsReview;
   bool get canAddAttachment => attachments.length < maxAttachments;
+
+  /// Dismisses the `needs_review` banner once the owner has checked the result.
+  void dismissNeedsReview() {
+    if (!needsReview) {
+      return;
+    }
+    needsReview = false;
+    runningTaskId = null;
+    progressElapsedSecs = null;
+    _poll?.cancel();
+    _notify();
+  }
 
   /// Messages typed while a reply runs, in order. They go out one at a time
   /// when the chat is idle.
@@ -506,6 +528,8 @@ class ChatController extends ChangeNotifier {
       attachments.clear();
       activity.clear();
       runningTaskId = task.id;
+      progressElapsedSecs = null;
+      needsReview = false;
       _lastTaskId = task.id;
       acceptedSends++;
       draft = '';
@@ -564,10 +588,31 @@ class ChatController extends ChangeNotifier {
             _notify();
           }
         }
+      case 'turn.progress':
+        if (runningTaskId != null && e.taskId == runningTaskId) {
+          final raw = e.payload['elapsed_secs'];
+          final secs = raw is num && raw.isFinite && raw >= 0
+              ? raw.toInt().clamp(0, 86400)
+              : null;
+          if (secs != null && secs != progressElapsedSecs) {
+            progressElapsedSecs = secs;
+            _notify();
+          }
+        }
       case 'turn.completed':
       case 'task.failed':
         if (runningTaskId == null || e.taskId == runningTaskId) {
-          _finish(failed: e.kind == 'task.failed', detail: _errorOf(e));
+          final statusRaw = e.payload['status'];
+          if (e.kind == 'task.failed' && statusRaw == 'needs_review') {
+            _markNeedsReview();
+          } else if (e.kind == 'task.failed' && runningTaskId != null) {
+            unawaited(_checkNeedsReviewOnFailure(
+              runningTaskId!,
+              detail: _errorOf(e),
+            ));
+          } else {
+            _finish(failed: e.kind == 'task.failed', detail: _errorOf(e));
+          }
         }
       case 'turn.memory':
         final taskId = e.taskId;
@@ -601,6 +646,40 @@ class ChatController extends ChangeNotifier {
     }
   }
 
+  Future<void> _checkNeedsReviewOnFailure(
+    String taskId, {
+    String? detail,
+  }) async {
+    try {
+      final t = await client.task(taskId);
+      if (_disposed || runningTaskId != taskId) {
+        return;
+      }
+      if (t.status == TaskStatus.needsReview) {
+        _markNeedsReview();
+        return;
+      }
+    } on ApiException {
+      // Fall back to standard failure handling when the task lookup fails
+      // (e.g. older server or stub without GET /v1/tasks/{id}).
+    }
+    if (!_disposed && runningTaskId == taskId) {
+      await _finish(failed: true, detail: detail);
+    }
+  }
+
+  void _markNeedsReview() {
+    if (_disposed || needsReview) {
+      return;
+    }
+    needsReview = true;
+    progressElapsedSecs = null;
+    _poll?.cancel();
+    _notify();
+    unawaited(_reload());
+    unawaited(loadLibrary());
+  }
+
   String? _errorOf(ServerEvent e) {
     final v = e.payload['error'];
     return v is String && v.isNotEmpty && v.length <= 300 ? v : null;
@@ -620,7 +699,7 @@ class ChatController extends ChangeNotifier {
   /// live it only runs as a slow safety net. [force] is for a resume.
   Future<void> _pollTask({bool force = false}) async {
     final id = runningTaskId;
-    if (id == null || _disposed) {
+    if (id == null || needsReview || _disposed) {
       return;
     }
     if (!force) {
@@ -635,7 +714,12 @@ class ChatController extends ChangeNotifier {
     _lastPoll = DateTime.now();
     try {
       final t = await client.task(id);
-      if (t.status.terminal && runningTaskId == id) {
+      if (runningTaskId != id || _disposed) {
+        return;
+      }
+      if (t.status == TaskStatus.needsReview) {
+        _markNeedsReview();
+      } else if (t.status.terminal) {
         _finish(failed: t.status == TaskStatus.failed);
       }
     } on ApiException {
@@ -648,6 +732,7 @@ class ChatController extends ChangeNotifier {
       return;
     }
     runningTaskId = null;
+    progressElapsedSecs = null;
     _poll?.cancel();
     if (failed) {
       final text =

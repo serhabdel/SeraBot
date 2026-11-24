@@ -88,11 +88,59 @@ pub fn calendar_lines(reply: &serde_json::Value, today: NaiveDate, tz: Tz) -> Ve
     events.into_iter().map(|(_, line)| line).collect()
 }
 
-/// New Outlook mail (`value`: `subject`, `receivedDateTime`) in the 24 hours
-/// before `now`.
-pub fn mail_peek(reply: &serde_json::Value, now: DateTime<Utc>) -> MailPeek {
+/// Read-only constants for native IMAP peek in the morning brief.
+const IMAP_BRIEF_MAX_ACCOUNTS: usize = 5;
+const IMAP_BRIEF_FETCH_LIMIT: u32 = 15;
+const IMAP_BRIEF_ACCOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn parse_mail_date(raw: &str) -> Option<DateTime<Utc>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(dt) = parse_utc(trimmed) {
+        return Some(dt);
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc2822(trimmed) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    // Some mailers append a trailing comment like `(UTC)` or `(CEST)` after the offset.
+    if let Some((head, _)) = trimmed.rsplit_once('(')
+        && let Ok(dt) = DateTime::parse_from_rfc2822(head.trim())
+    {
+        return Some(dt.with_timezone(&Utc));
+    }
+    for format in [
+        "%a, %d %b %Y %H:%M:%S %z",
+        "%d %b %Y %H:%M:%S %z",
+        "%Y-%m-%d %H:%M:%S %z",
+        "%Y-%m-%dT%H:%M:%S%.f",
+    ] {
+        if let Ok(dt) = DateTime::parse_from_str(trimmed, format) {
+            return Some(dt.with_timezone(&Utc));
+        }
+        if let Ok(naive) = NaiveDateTime::parse_from_str(trimmed, format) {
+            return Some(naive.and_utc());
+        }
+    }
+    None
+}
+
+fn account_display_name(account: &str, username: &str) -> String {
+    let label = account.trim();
+    if !label.is_empty() {
+        feed_line(label, 24)
+    } else if !username.trim().is_empty() {
+        feed_line(username.trim(), 32)
+    } else {
+        "default".to_owned()
+    }
+}
+
+/// Extract dated, bounded subjects from one Outlook reply within the last 24 hours.
+fn outlook_rows(reply: &serde_json::Value, now: DateTime<Utc>) -> Vec<(DateTime<Utc>, String)> {
     let since = now - Duration::hours(24);
-    let mut rows: Vec<(DateTime<Utc>, String)> = Vec::new();
+    let mut rows = Vec::new();
     for item in reply
         .get("value")
         .and_then(serde_json::Value::as_array)
@@ -113,8 +161,94 @@ pub fn mail_peek(reply: &serde_json::Value, now: DateTime<Utc>) -> MailPeek {
             .get("subject")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("(no subject)");
-        rows.push((received, feed_line(subject, 80)));
+        let cleaned = feed_line(subject, 80);
+        let subject = if cleaned.is_empty() {
+            "(no subject)".to_owned()
+        } else {
+            cleaned
+        };
+        rows.push((received, subject));
     }
+    rows
+}
+
+/// Extract dated, bounded subjects from one native IMAP account's header list
+/// within the last 24 hours.
+fn imap_rows(
+    messages: &[crate::mail::MailMessage],
+    now: DateTime<Utc>,
+) -> Vec<(DateTime<Utc>, String)> {
+    let since = now - Duration::hours(24);
+    let mut rows = Vec::new();
+    for msg in messages {
+        let Some(received) = parse_mail_date(&msg.date) else {
+            continue;
+        };
+        if received < since || received > now + Duration::minutes(5) {
+            continue;
+        }
+        let cleaned = feed_line(&msg.subject, 80);
+        let subject = if cleaned.is_empty() {
+            "(no subject)".to_owned()
+        } else {
+            cleaned
+        };
+        rows.push((received, subject));
+    }
+    rows
+}
+
+type ImapAccountHeaders = (String, Vec<(DateTime<Utc>, String)>);
+
+/// Merge Outlook rows (if any) and native IMAP per-account rows into one
+/// [`MailPeek`]. Subjects are prefixed with `[account_name]` whenever multiple
+/// mail sources are present (more than one IMAP account, or Outlook plus IMAP).
+fn merge_mail_sources(
+    outlook: Option<Vec<(DateTime<Utc>, String)>>,
+    imap_accounts: Vec<ImapAccountHeaders>,
+) -> Option<MailPeek> {
+    let total_sources = usize::from(outlook.is_some()) + imap_accounts.len();
+    if total_sources == 0 {
+        return None;
+    }
+    let prefix_accounts =
+        imap_accounts.len() > 1 || (outlook.is_some() && !imap_accounts.is_empty());
+    let mut rows: Vec<(DateTime<Utc>, String)> = Vec::new();
+    if let Some(outlook_items) = outlook {
+        for (at, subject) in outlook_items {
+            let line = if prefix_accounts {
+                feed_line(&format!("[Outlook] {subject}"), 80)
+            } else {
+                subject
+            };
+            rows.push((at, line));
+        }
+    }
+    for (account_name, items) in imap_accounts {
+        for (at, subject) in items {
+            let line = if prefix_accounts {
+                feed_line(&format!("[{account_name}] {subject}"), 80)
+            } else {
+                subject
+            };
+            rows.push((at, line));
+        }
+    }
+    rows.sort_by_key(|row| std::cmp::Reverse(row.0));
+    Some(MailPeek {
+        new_count: rows.len(),
+        subjects: rows
+            .into_iter()
+            .take(BRIEF_SECTION_ITEMS)
+            .map(|(_, subject)| subject)
+            .collect(),
+    })
+}
+
+/// New Outlook mail (`value`: `subject`, `receivedDateTime`) in the 24 hours
+/// before `now`.
+pub fn mail_peek(reply: &serde_json::Value, now: DateTime<Utc>) -> MailPeek {
+    let mut rows = outlook_rows(reply, now);
     rows.sort_by_key(|row| std::cmp::Reverse(row.0));
     MailPeek {
         new_count: rows.len(),
@@ -126,11 +260,52 @@ pub fn mail_peek(reply: &serde_json::Value, now: DateTime<Utc>) -> MailPeek {
     }
 }
 
+/// Read recent INBOX headers for up to 5 configured native IMAP accounts for
+/// `user_id`. Each account is bounded by `timeout` and degrades silently on
+/// error or timeout.
+async fn collect_imap_accounts_with_timeout(
+    users: &crate::user_secrets::UserSecrets,
+    user_id: &str,
+    now: DateTime<Utc>,
+    timeout: std::time::Duration,
+) -> Vec<ImapAccountHeaders> {
+    let Ok(accounts) = crate::mail::list_accounts(users, user_id) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for info in accounts.into_iter().take(IMAP_BRIEF_MAX_ACCOUNTS) {
+        let lookup = (!info.account.is_empty()).then_some(info.account.as_str());
+        let Ok(Some(creds)) = crate::mail::load_credentials(users, user_id, lookup) else {
+            continue;
+        };
+        let label = account_display_name(&info.account, &info.username);
+        if let Ok(Ok(messages)) = tokio::time::timeout(
+            timeout,
+            crate::mail::imap_list_headers(&creds, "INBOX", IMAP_BRIEF_FETCH_LIMIT),
+        )
+        .await
+        {
+            out.push((label, imap_rows(&messages, now)));
+        }
+    }
+    out
+}
+
+async fn collect_imap_accounts(
+    users: &crate::user_secrets::UserSecrets,
+    user_id: &str,
+    now: DateTime<Utc>,
+) -> Vec<ImapAccountHeaders> {
+    collect_imap_accounts_with_timeout(users, user_id, now, IMAP_BRIEF_ACCOUNT_TIMEOUT).await
+}
+
 /// Read today's events and recent mail for one member from the connectors
-/// they connected themselves. Failures and missing connections leave the
-/// field `None`; nothing here writes or sends.
+/// they connected themselves (and any configured native IMAP mailboxes).
+/// Failures and missing connections leave the field `None`; nothing here
+/// writes or sends.
 pub async fn collect_feeds(
-    personal: &crate::personal::PersonalConnectors,
+    personal: Option<&crate::personal::PersonalConnectors>,
+    users: Option<&crate::user_secrets::UserSecrets>,
     user_id: &str,
     now: DateTime<Utc>,
     tz: Tz,
@@ -139,30 +314,41 @@ pub async fn collect_feeds(
     let today = now.with_timezone(&tz).date_naive();
     let args = serde_json::json!({"page_size": 25});
     let mut feeds = BriefFeeds::default();
-    for kind in [
-        ConnectorKind::GoogleCalendar,
-        ConnectorKind::OutlookCalendar,
-    ] {
-        if !personal.connected(user_id, kind).unwrap_or(false) {
-            continue;
+    let mut outlook: Option<Vec<(DateTime<Utc>, String)>> = None;
+
+    if let Some(personal) = personal {
+        for kind in [
+            ConnectorKind::GoogleCalendar,
+            ConnectorKind::OutlookCalendar,
+        ] {
+            if !personal.connected(user_id, kind).unwrap_or(false) {
+                continue;
+            }
+            if let Ok(reply) = personal.read(user_id, kind, &args).await {
+                let lines = calendar_lines(&reply, today, tz);
+                feeds.calendar.get_or_insert_with(Vec::new).extend(lines);
+            }
         }
-        if let Ok(reply) = personal.read(user_id, kind, &args).await {
-            let lines = calendar_lines(&reply, today, tz);
-            feeds.calendar.get_or_insert_with(Vec::new).extend(lines);
+        if let Some(lines) = feeds.calendar.as_mut() {
+            lines.sort();
+        }
+        if personal
+            .connected(user_id, ConnectorKind::OutlookMail)
+            .unwrap_or(false)
+            && let Ok(reply) = personal
+                .read(user_id, ConnectorKind::OutlookMail, &args)
+                .await
+        {
+            outlook = Some(outlook_rows(&reply, now));
         }
     }
-    if let Some(lines) = feeds.calendar.as_mut() {
-        lines.sort();
-    }
-    if personal
-        .connected(user_id, ConnectorKind::OutlookMail)
-        .unwrap_or(false)
-        && let Ok(reply) = personal
-            .read(user_id, ConnectorKind::OutlookMail, &args)
-            .await
-    {
-        feeds.mail = Some(mail_peek(&reply, now));
-    }
+
+    let imap_accounts = match users {
+        Some(users) => collect_imap_accounts(users, user_id, now).await,
+        None => Vec::new(),
+    };
+
+    feeds.mail = merge_mail_sources(outlook, imap_accounts);
     feeds
 }
 
@@ -546,5 +732,206 @@ mod tests {
         let peek = mail_peek(&mail, now());
         assert_eq!(peek.new_count, 1);
         assert_eq!(peek.subjects, vec!["Fresh".to_string()]);
+    }
+
+    fn mail_msg(uid: u32, subject: &str, date: &str) -> crate::mail::MailMessage {
+        crate::mail::MailMessage {
+            uid,
+            subject: subject.into(),
+            from: "sender@example.com".into(),
+            date: date.into(),
+            flags: Vec::new(),
+            body: String::new(),
+            attachments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn imap_rows_filters_by_24h_cutoff_and_bounds_untrusted_subjects() {
+        let now = now(); // 2026-11-20T06:00:00Z
+        let long_subject = format!("Urgent:\n\t{}  \x07end", "a".repeat(120));
+        let msgs = vec![
+            mail_msg(1, &long_subject, "Fri, 20 Nov 2026 05:30:00 +0000"),
+            mail_msg(
+                2,
+                "Within 24h with comment",
+                "Thu, 19 Nov 2026 07:00:00 +0100 (CET)",
+            ),
+            mail_msg(3, "Too old", "Thu, 19 Nov 2026 05:59:00 +0000"),
+            mail_msg(4, "Future spoofed", "Fri, 20 Nov 2026 07:00:00 +0000"),
+            mail_msg(5, "Bad date", "not-a-date"),
+            mail_msg(6, "   ", "2026-11-20T04:00:00Z"),
+        ];
+        let rows = imap_rows(&msgs, now);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].1.chars().count(), 80);
+        assert!(!rows[0].1.contains('\n'));
+        assert!(!rows[0].1.contains('\x07'));
+        assert_eq!(rows[1].1, "Within 24h with comment");
+        assert_eq!(rows[2].1, "(no subject)");
+    }
+
+    #[test]
+    fn multi_account_merge_prefixes_sorts_and_caps_subjects() {
+        let now = now();
+        // Single IMAP account without Outlook: no prefix.
+        let single = merge_mail_sources(
+            None,
+            vec![(
+                "work".into(),
+                vec![(now - Duration::minutes(10), "Solo mail".into())],
+            )],
+        )
+        .unwrap();
+        assert_eq!(single.new_count, 1);
+        assert_eq!(single.subjects, vec!["Solo mail".to_string()]);
+
+        // Multiple IMAP accounts + Outlook: prefixes applied, newest first, max 3 subjects.
+        let long = "x".repeat(95);
+        let merged = merge_mail_sources(
+            Some(vec![(now - Duration::minutes(15), "From Outlook".into())]),
+            vec![
+                (
+                    "work".into(),
+                    vec![
+                        (now - Duration::minutes(5), long),
+                        (now - Duration::hours(3), "Older work".into()),
+                    ],
+                ),
+                (
+                    "personal".into(),
+                    vec![(now - Duration::minutes(1), "Newest personal".into())],
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(merged.new_count, 4);
+        assert_eq!(merged.subjects.len(), 3);
+        assert_eq!(merged.subjects[0], "[personal] Newest personal");
+        assert!(merged.subjects[1].starts_with("[work] "));
+        assert!(merged.subjects[1].chars().count() <= 80);
+        assert_eq!(merged.subjects[2], "[Outlook] From Outlook");
+
+        // No mail sources at all -> None.
+        assert_eq!(merge_mail_sources(None, Vec::new()), None);
+    }
+
+    #[tokio::test]
+    async fn collect_imap_accounts_degrades_silently_on_error_and_timeout() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let users = crate::user_secrets::UserSecrets::with_master_key(store, [7u8; 32]).unwrap();
+
+        // Server 1: stalls after accepting so it triggers the timeout.
+        let stalled_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stalled_port = stalled_listener.local_addr().unwrap().port();
+        let _stalled_guard = tokio::spawn(async move {
+            let (_sock, _) = stalled_listener.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+
+        // Server 2: immediately closes / rejects greeting (error).
+        let err_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let err_port = err_listener.local_addr().unwrap().port();
+        let err_server = tokio::spawn(async move {
+            let (sock, _) = err_listener.accept().await.unwrap();
+            let (_r, mut w) = sock.into_split();
+            let _ = w.write_all(b"* BYE unavailable\r\n").await;
+        });
+
+        // Server 3: healthy IMAP server returning 1 recent header and 1 old header.
+        let ok_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ok_port = ok_listener.local_addr().unwrap().port();
+        let now = Utc::now();
+        let fresh_date = (now - Duration::minutes(10)).to_rfc2822();
+        let old_date = (now - Duration::hours(48)).to_rfc2822();
+        let ok_server = tokio::spawn(async move {
+            let (sock, _) = ok_listener.accept().await.unwrap();
+            let (r, mut w) = sock.into_split();
+            let mut lines = BufReader::new(r).lines();
+            w.write_all(b"* OK ready\r\n").await.unwrap();
+            let _ = lines.next_line().await.unwrap().unwrap(); // a1 LOGIN
+            w.write_all(b"a1 OK logged in\r\n").await.unwrap();
+            let cmd = lines.next_line().await.unwrap().unwrap();
+            assert!(cmd.starts_with("a2 EXAMINE"), "{cmd}");
+            w.write_all(b"* 2 EXISTS\r\na2 OK examined\r\n")
+                .await
+                .unwrap();
+            let _ = lines.next_line().await.unwrap().unwrap(); // a3 UID SEARCH ALL
+            w.write_all(b"* SEARCH 1 2\r\na3 OK search\r\n")
+                .await
+                .unwrap();
+            for (uid, subj, date) in [
+                (2u32, "Fresh IMAP", fresh_date.as_str()),
+                (1u32, "Stale IMAP", old_date.as_str()),
+            ] {
+                let fetch = lines.next_line().await.unwrap().unwrap();
+                assert!(fetch.contains("BODY.PEEK[HEADER]"), "{fetch}");
+                let hdr = format!("Subject: {subj}\r\nFrom: a@b.example\r\nDate: {date}\r\n\r\n");
+                w.write_all(
+                    format!(
+                        "* {uid} FETCH (FLAGS (\\Seen) UID {uid} BODY[HEADER] {{{}}}\r\n{})\r\na4 OK ok\r\n",
+                        hdr.len(),
+                        hdr
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            }
+            let _ = lines.next_line().await; // a9 LOGOUT
+        });
+
+        let make_creds = |port: u16, user: &str| crate::mail::MailCredentials {
+            smtp_host: "127.0.0.1".into(),
+            smtp_port: 2525,
+            smtp_security: crate::mail::Security::None,
+            username: user.into(),
+            password: "pw".into(),
+            imap_host: "127.0.0.1".into(),
+            imap_port: port,
+            imap_security: crate::mail::Security::None,
+            from: None,
+            signature: None,
+        };
+        crate::mail::store_credentials(
+            &users,
+            &admin,
+            Some("slow"),
+            &make_creds(stalled_port, "slow@example.com"),
+        )
+        .unwrap();
+        crate::mail::store_credentials(
+            &users,
+            &admin,
+            Some("broken"),
+            &make_creds(err_port, "broken@example.com"),
+        )
+        .unwrap();
+        crate::mail::store_credentials(
+            &users,
+            &admin,
+            Some("healthy"),
+            &make_creds(ok_port, "ok@example.com"),
+        )
+        .unwrap();
+
+        let accounts = collect_imap_accounts_with_timeout(
+            &users,
+            &admin,
+            now,
+            std::time::Duration::from_millis(80),
+        )
+        .await;
+        err_server.await.unwrap();
+        ok_server.await.unwrap();
+
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].0, "healthy");
+        assert_eq!(accounts[0].1.len(), 1);
+        assert_eq!(accounts[0].1[0].1, "Fresh IMAP");
     }
 }

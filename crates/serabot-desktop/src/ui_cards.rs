@@ -345,6 +345,93 @@ fn SecretPrompt(
     }
 }
 
+/// Tool category badge shown on approval cards.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolCategory {
+    Mail,
+    OneDrive,
+    Browser,
+    ProjectCheck,
+    Tool,
+}
+
+impl ToolCategory {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Mail => "Mail",
+            Self::OneDrive => "OneDrive",
+            Self::Browser => "Browser",
+            Self::ProjectCheck => "Project Check",
+            Self::Tool => "Tool",
+        }
+    }
+
+    pub(crate) fn class_suffix(self) -> &'static str {
+        match self {
+            Self::Mail => "mail",
+            Self::OneDrive => "onedrive",
+            Self::Browser => "browser",
+            Self::ProjectCheck => "project-check",
+            Self::Tool => "tool",
+        }
+    }
+}
+
+/// Map a tool identifier (e.g. `mail_send`, `onedrive_upload`, `browser_upload`,
+/// `project_check`) to a short category badge.
+pub(crate) fn tool_category_badge(tool: &str) -> ToolCategory {
+    let lower = tool.trim().to_ascii_lowercase();
+    if lower == "project_check" || lower.starts_with("project_") {
+        ToolCategory::ProjectCheck
+    } else if lower.starts_with("mail_")
+        || lower.starts_with("agentmail_")
+        || lower.starts_with("outlook.")
+        || lower.starts_with("gmail.")
+    {
+        ToolCategory::Mail
+    } else if lower.starts_with("onedrive_") || lower.contains("onedrive") {
+        ToolCategory::OneDrive
+    } else if lower.starts_with("browser_") || lower.starts_with("web_") {
+        ToolCategory::Browser
+    } else {
+        ToolCategory::Tool
+    }
+}
+
+/// Tools that must never offer "Always allow" in the UI (AGENTS.md +
+/// destructive/vault/upload/mail_send policy).
+pub(crate) fn tool_allows_standing_grant(tool: &str, summary: &str) -> bool {
+    let lower = tool.trim().to_ascii_lowercase();
+    !(matches!(
+        lower.as_str(),
+        "memory_delete"
+            | "agentmail_send"
+            | "telegram_send_document"
+            | "onedrive_upload"
+            | "local_write"
+            | "local_export"
+            | "github_create_issue"
+            | "github_comment_issue"
+            | "todoist_add_task"
+            | "todoist_complete_task"
+            | "slack_post_message"
+            | "whatsapp_send_message"
+            | "whatsapp_send_template"
+            | "browser_upload"
+            | "browser_forget_logins"
+            | "project_check"
+            | "mail_send"
+            | "mail_flag"
+            | "mail_move"
+            | "mail_delete"
+    ) || lower.starts_with("vault_")
+        || lower.starts_with("plugin.")
+        || lower.starts_with("github_")
+        || lower.contains("upload")
+        || lower.contains("secret")
+        || (lower == "browser_type" && summary.to_ascii_lowercase().contains("secret '")))
+}
+
 /// Partition pending approvals into `(for_current_conversation, global_other)`
 /// so the active conversation shows full inline cards and Main also surfaces
 /// any other pending approvals as compact cards.
@@ -368,21 +455,430 @@ pub(crate) fn partition_inline_approvals<'a>(
     (local, global)
 }
 
-/// Extract an optional destination hint from an approval summary (e.g. URL or
-/// recipient after " to " / " -> "), if present.
-fn approval_destination(summary: &str) -> Option<&str> {
-    summary
+/// Extract an optional destination chip from an approval summary (host, email,
+/// OneDrive path, or target after " -> " / " to " / " into " / " in ").
+pub(crate) fn approval_destination(summary: &str) -> Option<String> {
+    if let Some((_, dest)) = summary
         .split_once(" -> ")
         .or_else(|| summary.split_once(" to "))
-        .map(|(_, dest)| dest.trim())
-        .filter(|dest| !dest.is_empty())
+        .or_else(|| summary.split_once(" into "))
+    {
+        let cleaned = clean_destination(dest);
+        if !cleaned.is_empty() {
+            return Some(cleaned);
+        }
+    }
+    // Fall back to scanning tokens for an explicit URL host, email, or path.
+    for token in summary.split_whitespace() {
+        let trimmed = token.trim_matches(|c: char| {
+            matches!(c, ',' | ';' | ')' | '(' | '"' | '\'' | '<' | '>' | '.')
+        });
+        if trimmed.contains("://") {
+            let host = trimmed
+                .split_once("://")
+                .map(|(_, rest)| rest.split(&['/', '?', '#'][..]).next().unwrap_or(rest))
+                .unwrap_or(trimmed);
+            if !host.is_empty() {
+                return Some(host.to_owned());
+            }
+        }
+        if let Some((local, domain)) = trimmed.split_once('@')
+            && !local.is_empty()
+            && domain.contains('.')
+        {
+            return Some(trimmed.to_owned());
+        }
+    }
+    None
+}
+
+fn clean_destination(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let first = trimmed.split(['\n', '\r']).next().unwrap_or(trimmed).trim();
+    // Strip trailing prose clauses like " in OneDrive" or " on the current page"
+    // only when preceded by a standalone token, otherwise keep full path/target.
+    if first.starts_with("http://") || first.starts_with("https://") {
+        let token = first.split_whitespace().next().unwrap_or(first);
+        return token
+            .split_once("://")
+            .map(|(_, rest)| rest.split(&['/', '?', '#'][..]).next().unwrap_or(rest))
+            .unwrap_or(token)
+            .to_owned();
+    }
+    first.trim_end_matches(['.', ',', ';']).to_owned()
+}
+
+/// Extract a 64-char SHA-256 artifact hash if mentioned in an approval summary
+/// (for older/compact approvals before `Approval.artifact_hash` is populated).
+pub(crate) fn approval_artifact_hash(summary: &str) -> Option<String> {
+    for token in summary.split(|c: char| !c.is_ascii_hexdigit()) {
+        if token.len() == 64 {
+            return Some(token.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+fn current_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Format an expiry timestamp into a short countdown pill label relative to
+/// `now_secs` (e.g. `"Expires in 14m"`, `"Expires in 45s"`, `"Expired"`),
+/// falling back to a compact UTC stamp if `expires_at` cannot be parsed.
+pub(crate) fn format_expiry_countdown(expires_at: &str, now_secs: i64) -> String {
+    let trimmed = expires_at.trim();
+    if trimmed.is_empty() {
+        return "Pending approval".to_owned();
+    }
+    if let Some(exp_secs) = serabot_desktop::workflows::epoch_secs(trimmed) {
+        let remaining = exp_secs - now_secs;
+        if remaining <= 0 {
+            return "Expired".to_owned();
+        }
+        if remaining < 60 {
+            return format!("Expires in {remaining}s");
+        }
+        if remaining < 3_600 {
+            let mins = remaining / 60;
+            return format!("Expires in {mins}m");
+        }
+        if remaining < 86_400 {
+            let hours = remaining / 3_600;
+            let mins = (remaining % 3_600) / 60;
+            if mins > 0 {
+                return format!("Expires in {hours}h {mins}m");
+            }
+            return format!("Expires in {hours}h");
+        }
+        let days = remaining / 86_400;
+        return format!("Expires in {days}d");
+    }
+    let fallback = stamp(trimmed);
+    if fallback.is_empty() {
+        "Pending approval".to_owned()
+    } else {
+        format!("Expires {fallback}")
+    }
+}
+
+fn trigger_decision(
+    mut session: Signal<Session>,
+    mut confirm_always: Signal<bool>,
+    mut local_busy: Signal<bool>,
+    on_decide: Option<EventHandler<ApprovalDecision>>,
+    id: String,
+    decision: ApprovalDecision,
+) {
+    confirm_always.set(false);
+    if let Some(handler) = on_decide {
+        handler.call(decision);
+    } else {
+        local_busy.set(true);
+        session.write().decide(id, decision);
+    }
+}
+
+/// Unified approval card used in both inline chat approvals and the Approvals
+/// page. Supports a `compact` mode for secondary/global approvals.
+#[component]
+pub(crate) fn ApprovalCard(
+    mut session: Signal<Session>,
+    id: String,
+    tool: String,
+    summary: String,
+    expires_at: String,
+    #[props(default = false)] compact: bool,
+    #[props(default)] bot_id: Option<String>,
+    #[props(default)] artifact_hash: Option<String>,
+    #[props(default = false)] allow_standing_grant: bool,
+    #[props(default = false)] busy: bool,
+    #[props(default)] on_decide: Option<EventHandler<ApprovalDecision>>,
+) -> Element {
+    let mut confirm_always = use_signal(|| false);
+    let local_busy = use_signal(|| false);
+    let is_busy = busy || local_busy();
+
+    let (bot_name, bot_avatar, bot_style) = {
+        let state = session.read();
+        let resolved_bot = bot_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .map(str::to_owned)
+            .or_else(|| state.conversation_bot(&state.conversation))
+            .unwrap_or_else(|| "main".to_owned());
+        (
+            state.bot_display_name(&resolved_bot),
+            state.bot_avatar(&resolved_bot),
+            avatar_style(&resolved_bot),
+        )
+    };
+
+    let category = tool_category_badge(&tool);
+    let category_label = category.label();
+    let category_class = format!("chip ap-cat ap-cat-{}", category.class_suffix());
+    let countdown = format_expiry_countdown(&expires_at, current_epoch_secs());
+    let expired = countdown == "Expired";
+    let dest = approval_destination(&summary);
+    let hash = artifact_hash
+        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .or_else(|| approval_artifact_hash(&summary));
+    let can_always = allow_standing_grant && tool_allows_standing_grant(&tool, &summary);
+
+    let card_class = if compact {
+        "chat-card approval-card compact"
+    } else {
+        "chat-card approval-card"
+    };
+
+    if compact {
+        return rsx! {
+            section { class: "{card_class}", key: "approval-{id}", "aria-label": "Pending approval from {bot_name}",
+                div { class: "approval-card-compact-row",
+                    span { class: "avatar bot sm", style: "{bot_style}", title: "{bot_name}", "{bot_avatar}" }
+                    span { class: "approval-card-bot", "{bot_name}" }
+                    span { class: "{category_class}", "{category_label}" }
+                    span { class: "chip accent ap-tool", "{tool}" }
+                    span { class: "approval-card-summary", title: "{summary}", "{summary}" }
+                    if let Some(dest) = dest {
+                        span { class: "chip mono ap-dest-chip", title: "{dest}", "{dest}" }
+                    }
+                    if let Some(hash) = hash {
+                        button {
+                            class: "btn ghost sm ap-artifact-link",
+                            r#type: "button",
+                            title: "Preview artifact {hash}",
+                            onclick: move |_| session.write().open_preview_dock(&hash),
+                            Icon { name: "external", size: 12 }
+                            "Preview"
+                        }
+                    }
+                    span {
+                        class: if expired { "pill ap-expiry expired" } else { "pill ap-expiry" },
+                        title: "{expires_at}",
+                        "{countdown}"
+                    }
+                    div { class: "approval-card-actions",
+                        button {
+                            class: "btn primary sm",
+                            r#type: "button",
+                            disabled: is_busy,
+                            onclick: {
+                                let id = id.clone();
+                                move |_| {
+                                    trigger_decision(
+                                        session,
+                                        confirm_always,
+                                        local_busy,
+                                        on_decide,
+                                        id.clone(),
+                                        ApprovalDecision::Once,
+                                    );
+                                }
+                            },
+                            "Approve"
+                        }
+                        if can_always {
+                            if confirm_always() {
+                                div { class: "conv-confirm",
+                                    button {
+                                        class: "btn primary sm",
+                                        r#type: "button",
+                                        disabled: is_busy,
+                                        onclick: {
+                                            let id = id.clone();
+                                            move |_| {
+                                                trigger_decision(
+                                                    session,
+                                                    confirm_always,
+                                                    local_busy,
+                                                    on_decide,
+                                                    id.clone(),
+                                                    ApprovalDecision::Always,
+                                                );
+                                            }
+                                        },
+                                        "Confirm Always"
+                                    }
+                                    button {
+                                        class: "btn ghost sm",
+                                        r#type: "button",
+                                        disabled: is_busy,
+                                        onclick: move |_| confirm_always.set(false),
+                                        "Cancel"
+                                    }
+                                }
+                            } else {
+                                button {
+                                    class: "btn ghost sm",
+                                    r#type: "button",
+                                    disabled: is_busy,
+                                    onclick: move |_| confirm_always.set(true),
+                                    "Always allow"
+                                }
+                            }
+                        }
+                        button {
+                            class: "btn danger sm",
+                            r#type: "button",
+                            disabled: is_busy,
+                            onclick: {
+                                let id = id.clone();
+                                move |_| {
+                                    trigger_decision(
+                                        session,
+                                        confirm_always,
+                                        local_busy,
+                                        on_decide,
+                                        id.clone(),
+                                        ApprovalDecision::Deny,
+                                    );
+                                }
+                            },
+                            "Reject"
+                        }
+                    }
+                }
+            }
+        };
+    }
+
+    rsx! {
+        section { class: "{card_class}", key: "approval-{id}", "aria-label": "Pending approval from {bot_name}",
+            div { class: "approval-card-head",
+                div { class: "approval-card-who",
+                    span { class: "avatar bot sm", style: "{bot_style}", "{bot_avatar}" }
+                    span { class: "approval-card-bot", "{bot_name}" }
+                    span { class: "{category_class}", "{category_label}" }
+                    span { class: "chip accent ap-tool", "{tool}" }
+                }
+                span {
+                    class: if expired { "pill ap-expiry expired" } else { "pill ap-expiry" },
+                    title: "{expires_at}",
+                    "{countdown}"
+                }
+            }
+            p { class: "approval-card-summary", "{summary}" }
+            if dest.is_some() || hash.is_some() {
+                div { class: "approval-card-meta",
+                    if let Some(dest) = dest {
+                        div { class: "approval-card-dest",
+                            span { class: "tiny muted", "Destination" }
+                            span { class: "chip mono ap-dest-chip", title: "{dest}", "{dest}" }
+                        }
+                    }
+                    if let Some(hash) = hash {
+                        {
+                            let short = format!("{}\u{2026}", &hash[..12.min(hash.len())]);
+                            rsx! {
+                                button {
+                                    class: "btn ghost sm ap-artifact-link",
+                                    r#type: "button",
+                                    title: "Preview artifact {hash}",
+                                    onclick: move |_| session.write().open_preview_dock(&hash),
+                                    Icon { name: "external", size: 13 }
+                                    "Preview artifact ({short})"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            div { class: "approval-card-actions",
+                button {
+                    class: "btn primary sm",
+                    r#type: "button",
+                    disabled: is_busy,
+                    onclick: {
+                        let id = id.clone();
+                        move |_| {
+                            trigger_decision(
+                                session,
+                                confirm_always,
+                                local_busy,
+                                on_decide,
+                                id.clone(),
+                                ApprovalDecision::Once,
+                            );
+                        }
+                    },
+                    "Approve"
+                }
+                if can_always {
+                    if confirm_always() {
+                        div { class: "conv-confirm",
+                            button {
+                                class: "btn primary sm",
+                                r#type: "button",
+                                disabled: is_busy,
+                                onclick: {
+                                    let id = id.clone();
+                                    move |_| {
+                                        trigger_decision(
+                                            session,
+                                            confirm_always,
+                                            local_busy,
+                                            on_decide,
+                                            id.clone(),
+                                            ApprovalDecision::Always,
+                                        );
+                                    }
+                                },
+                                "Confirm Always"
+                            }
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                disabled: is_busy,
+                                onclick: move |_| confirm_always.set(false),
+                                "Cancel"
+                            }
+                        }
+                    } else {
+                        button {
+                            class: "btn ghost sm",
+                            r#type: "button",
+                            disabled: is_busy,
+                            onclick: move |_| confirm_always.set(true),
+                            "Always allow"
+                        }
+                    }
+                }
+                button {
+                    class: "btn danger sm",
+                    r#type: "button",
+                    disabled: is_busy,
+                    onclick: {
+                        let id = id.clone();
+                        move |_| {
+                            trigger_decision(
+                                session,
+                                confirm_always,
+                                local_busy,
+                                on_decide,
+                                id.clone(),
+                                ApprovalDecision::Deny,
+                            );
+                        }
+                    },
+                    "Reject"
+                }
+            }
+        }
+    }
 }
 
 /// Rich inline approval cards rendered directly above the composer in ChatView.
 #[component]
 pub(crate) fn InlineApprovals(mut session: Signal<Session>) -> Element {
     let busy_id = use_signal(|| Option::<String>::None);
-    let (local_approvals, global_approvals) = {
+    let (local_approvals, global_approvals, active_bot) = {
         let state = session.read();
         if state.state.approvals.is_empty() {
             return rsx! {};
@@ -404,9 +900,17 @@ pub(crate) fn InlineApprovals(mut session: Signal<Session>) -> Element {
             is_main,
             active_task_awaiting,
         );
+        let active_bot = state
+            .state
+            .task
+            .as_ref()
+            .filter(|task| task.status == TaskStatus::AwaitingApproval)
+            .map(|task| task.bot.clone())
+            .or_else(|| state.conversation_bot(conv));
         (
             local.into_iter().cloned().collect::<Vec<_>>(),
             global.into_iter().cloned().collect::<Vec<_>>(),
+            active_bot,
         )
     };
     if local_approvals.is_empty() && global_approvals.is_empty() {
@@ -419,53 +923,27 @@ pub(crate) fn InlineApprovals(mut session: Signal<Session>) -> Element {
                 {
                     let id = approval.id.clone();
                     let row_busy = active_busy.as_deref() == Some(id.as_str());
-                    let exp_label = stamp(&approval.expires_at);
-                    let dest = approval_destination(&approval.summary).map(str::to_owned);
+                    let bot_id = active_bot.clone();
                     rsx! {
-                        section { class: "chat-card approval-card", key: "{id}",
-                            div { class: "approval-card-head",
-                                span { class: "chip accent ap-tool", "{approval.tool}" }
-                                span { class: "tiny muted", title: "{approval.expires_at}",
-                                    if exp_label.is_empty() { "Pending approval" } else { "Expires {exp_label}" }
+                        ApprovalCard {
+                            key: "{id}",
+                            session,
+                            id: approval.id,
+                            tool: approval.tool,
+                            summary: approval.summary,
+                            expires_at: approval.expires_at,
+                            compact: false,
+                            bot_id,
+                            allow_standing_grant: false,
+                            busy: row_busy,
+                            on_decide: {
+                                let id = id.clone();
+                                let mut busy_id = busy_id;
+                                move |decision| {
+                                    busy_id.set(Some(id.clone()));
+                                    session.write().decide(id.clone(), decision);
                                 }
-                            }
-                            p { class: "approval-card-summary", "{approval.summary}" }
-                            if let Some(dest) = dest {
-                                div { class: "approval-card-dest",
-                                    span { class: "tiny muted", "Destination:" }
-                                    span { class: "tiny mono", "{dest}" }
-                                }
-                            }
-                            div { class: "approval-card-actions",
-                                button {
-                                    class: "btn primary sm",
-                                    r#type: "button",
-                                    disabled: row_busy,
-                                    onclick: {
-                                        let id = id.clone();
-                                        let mut busy_id = busy_id;
-                                        move |_| {
-                                            busy_id.set(Some(id.clone()));
-                                            session.write().decide(id.clone(), ApprovalDecision::Once);
-                                        }
-                                    },
-                                    "Approve"
-                                }
-                                button {
-                                    class: "btn danger sm",
-                                    r#type: "button",
-                                    disabled: row_busy,
-                                    onclick: {
-                                        let id = id.clone();
-                                        let mut busy_id = busy_id;
-                                        move |_| {
-                                            busy_id.set(Some(id.clone()));
-                                            session.write().decide(id.clone(), ApprovalDecision::Deny);
-                                        }
-                                    },
-                                    "Deny"
-                                }
-                            }
+                            },
                         }
                     }
                 }
@@ -474,46 +952,25 @@ pub(crate) fn InlineApprovals(mut session: Signal<Session>) -> Element {
                 {
                     let id = approval.id.clone();
                     let row_busy = active_busy.as_deref() == Some(id.as_str());
-                    let exp_label = stamp(&approval.expires_at);
                     rsx! {
-                        section { class: "chat-card approval-card compact", key: "global-{id}",
-                            div { class: "approval-card-compact-row",
-                                span { class: "chip accent ap-tool", "{approval.tool}" }
-                                span { class: "approval-card-summary", title: "{approval.summary}", "{approval.summary}" }
-                                if !exp_label.is_empty() {
-                                    span { class: "tiny muted", title: "{approval.expires_at}", "Expires {exp_label}" }
+                        ApprovalCard {
+                            key: "global-{id}",
+                            session,
+                            id: approval.id,
+                            tool: approval.tool,
+                            summary: approval.summary,
+                            expires_at: approval.expires_at,
+                            compact: true,
+                            allow_standing_grant: false,
+                            busy: row_busy,
+                            on_decide: {
+                                let id = id.clone();
+                                let mut busy_id = busy_id;
+                                move |decision| {
+                                    busy_id.set(Some(id.clone()));
+                                    session.write().decide(id.clone(), decision);
                                 }
-                                div { class: "approval-card-actions",
-                                    button {
-                                        class: "btn primary sm",
-                                        r#type: "button",
-                                        disabled: row_busy,
-                                        onclick: {
-                                            let id = id.clone();
-                                            let mut busy_id = busy_id;
-                                            move |_| {
-                                                busy_id.set(Some(id.clone()));
-                                                session.write().decide(id.clone(), ApprovalDecision::Once);
-                                            }
-                                        },
-                                        "Approve"
-                                    }
-                                    button {
-                                        class: "btn danger sm",
-                                        r#type: "button",
-                                        disabled: row_busy,
-                                        onclick: {
-                                            let id = id.clone();
-                                            let mut busy_id = busy_id;
-                                            move |_| {
-                                                busy_id.set(Some(id.clone()));
-                                                session.write().decide(id.clone(), ApprovalDecision::Deny);
-                                            }
-                                        },
-                                        "Deny"
-                                    }
-                                }
-                            }
+                            },
                         }
                     }
                 }
@@ -552,12 +1009,107 @@ mod tests {
     }
 
     #[test]
+    fn tool_category_badge_maps_known_tools() {
+        assert_eq!(tool_category_badge("mail_send"), ToolCategory::Mail);
+        assert_eq!(tool_category_badge("mail_delete"), ToolCategory::Mail);
+        assert_eq!(tool_category_badge("agentmail_send"), ToolCategory::Mail);
+        assert_eq!(
+            tool_category_badge("onedrive_upload"),
+            ToolCategory::OneDrive
+        );
+        assert_eq!(tool_category_badge("browser_upload"), ToolCategory::Browser);
+        assert_eq!(tool_category_badge("browser_type"), ToolCategory::Browser);
+        assert_eq!(
+            tool_category_badge("project_check"),
+            ToolCategory::ProjectCheck
+        );
+        assert_eq!(
+            tool_category_badge("slack_post_message"),
+            ToolCategory::Tool
+        );
+        assert_eq!(ToolCategory::ProjectCheck.label(), "Project Check");
+    }
+
+    #[test]
     fn approval_destination_extracts_target() {
         assert_eq!(
-            approval_destination("Send email to ops@example.com"),
+            approval_destination("Send email to ops@example.com").as_deref(),
             Some("ops@example.com")
         );
-        assert_eq!(approval_destination("Post -> #general"), Some("#general"));
+        assert_eq!(
+            approval_destination("Post -> #general").as_deref(),
+            Some("#general")
+        );
+        assert_eq!(
+            approval_destination("Send report to https://api.example.com/v1/hook").as_deref(),
+            Some("api.example.com")
+        );
+        assert_eq!(
+            approval_destination("Upload report.pdf to /SeraBot Library/Q4").as_deref(),
+            Some("/SeraBot Library/Q4")
+        );
+        assert_eq!(
+            approval_destination("Notify alice@example.com about invoice").as_deref(),
+            Some("alice@example.com")
+        );
         assert_eq!(approval_destination("Run local check"), None);
+    }
+
+    #[test]
+    fn format_expiry_countdown_handles_future_expired_and_fallback() {
+        let target = "2026-11-24T20:00:00Z";
+        let target_secs = serabot_desktop::workflows::epoch_secs(target).unwrap();
+
+        assert_eq!(
+            format_expiry_countdown(target, target_secs - 45),
+            "Expires in 45s"
+        );
+        assert_eq!(
+            format_expiry_countdown(target, target_secs - 15 * 60),
+            "Expires in 15m"
+        );
+        assert_eq!(
+            format_expiry_countdown(target, target_secs - (2 * 3_600 + 5 * 60)),
+            "Expires in 2h 5m"
+        );
+        assert_eq!(format_expiry_countdown(target, target_secs + 1), "Expired");
+        assert_eq!(format_expiry_countdown("", target_secs), "Pending approval");
+        assert_eq!(
+            format_expiry_countdown("not-a-timestamp", target_secs),
+            "Expires not-a-timestamp"
+        );
+    }
+
+    #[test]
+    fn destructive_vault_upload_and_mail_send_never_allow_standing_grant() {
+        assert!(!tool_allows_standing_grant(
+            "mail_send",
+            "Send email to a@b.com"
+        ));
+        assert!(!tool_allows_standing_grant("browser_upload", "Upload file"));
+        assert!(!tool_allows_standing_grant(
+            "onedrive_upload",
+            "Upload to /Docs"
+        ));
+        assert!(!tool_allows_standing_grant(
+            "project_check",
+            "Run cargo test"
+        ));
+        assert!(!tool_allows_standing_grant("vault_get", "Read secret"));
+        assert!(!tool_allows_standing_grant(
+            "browser_type",
+            "Type vault secret 'bank' into e1"
+        ));
+        assert!(tool_allows_standing_grant("browser_click", "Click submit"));
+    }
+
+    #[test]
+    fn approval_artifact_hash_finds_sha256() {
+        let hash = "a".repeat(64);
+        assert_eq!(
+            approval_artifact_hash(&format!("Upload artifact {hash} to OneDrive")),
+            Some(hash)
+        );
+        assert_eq!(approval_artifact_hash("No hash here"), None);
     }
 }

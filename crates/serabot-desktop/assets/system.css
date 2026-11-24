@@ -2277,3 +2277,117 @@ html[data-reduce-transparency="true"] .sheet.sheet-palette {
 .root[data-motion="reduce"] .live-card .live-dot {
   animation: none;
 }
+
+/* Unified ApprovalCard (0.74.11): inline chat and Approvals page. */
+.ap-cards-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.approval-card-who {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.approval-card-bot {
+  font-size: var(--fs-body-2);
+  font-weight: 600;
+  color: var(--label-1);
+}
+
+.ap-cat {
+  font-size: var(--fs-micro);
+  font-weight: 600;
+}
+
+.ap-cat-mail {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+
+.ap-cat-onedrive {
+  background: color-mix(in srgb, #2563eb 14%, transparent);
+  color: var(--label-1);
+}
+
+.ap-cat-browser {
+  background: color-mix(in srgb, #7c3aed 14%, transparent);
+  color: var(--label-1);
+}
+
+.ap-cat-project-check {
+  background: color-mix(in srgb, #d97706 16%, transparent);
+  color: var(--label-1);
+}
+
+.ap-expiry {
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.ap-expiry.expired {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.approval-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.ap-dest-chip {
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ap-artifact-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* Library Attach to chat row + OneDrive status pill (0.74.11). */
+.library-row-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.library-row-wrap .library-row {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.library-row-attach {
+  flex: none;
+  white-space: nowrap;
+}
+
+.library-card-actions {
+  flex-wrap: wrap;
+}
+
+.pill.onedrive-status.ok {
+  border-color: var(--accent);
+  color: var(--label-1);
+}
+
+.pill.onedrive-status.warn {
+  border-color: var(--warn);
+  color: var(--label-1);
+}
+
+.pill.onedrive-status.muted {
+  color: var(--label-3);
+}
+

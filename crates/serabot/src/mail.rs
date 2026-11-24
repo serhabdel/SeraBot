@@ -1008,7 +1008,7 @@ fn decode_rfc2047(value: &str) -> String {
     clean_header(value)
 }
 
-/// Extract flags and the BODY[] literal from an untagged FETCH response block.
+/// Extract flags and the BODY[...] literal from an untagged FETCH response block.
 fn parse_fetch_block(block: &str) -> (Vec<String>, Option<String>) {
     let mut flags = Vec::new();
     if let Some(start) = block.find("FLAGS (")
@@ -1021,7 +1021,7 @@ fn parse_fetch_block(block: &str) -> (Vec<String>, Option<String>) {
             .collect();
     }
     let body = block
-        .find("BODY[]")
+        .find("BODY[")
         .and_then(|pos| block[pos..].find('{').map(|b| pos + b))
         .and_then(|brace| {
             let rest = &block[brace..];
@@ -1121,6 +1121,36 @@ pub async fn imap_list(
     wire.send_line("a3 UID SEARCH ALL").await?;
     let (_, untagged) = wire.expect_tagged("a3").await?;
     let out = fetch_search_results(&mut wire, untagged, limit).await?;
+    let _ = wire.send_line("a9 LOGOUT").await;
+    Ok(out)
+}
+
+/// List the newest `limit` message headers (subject, from, date, flags; empty
+/// body) of a folder read-only using `EXAMINE` and `BODY.PEEK[HEADER]`.
+pub async fn imap_list_headers(
+    creds: &MailCredentials,
+    folder: &str,
+    limit: u32,
+) -> Result<Vec<MailMessage>> {
+    let limit = limit.clamp(1, MAX_LIST);
+    let mut wire = imap_connect(creds).await?;
+    let folder = normalize_folder(folder)?;
+    wire.send_line(&format!("a2 EXAMINE {}", imap_quote(&folder)))
+        .await?;
+    wire.expect_tagged("a2").await?;
+    wire.send_line("a3 UID SEARCH ALL").await?;
+    let (_, untagged) = wire.expect_tagged("a3").await?;
+    let uids: Vec<u32> = parse_search_uids(&untagged)
+        .into_iter()
+        .rev()
+        .take(limit as usize)
+        .collect();
+    let mut out = Vec::new();
+    for uid in uids {
+        if let Ok(msg) = imap_fetch_headers(&mut wire, uid).await {
+            out.push(msg);
+        }
+    }
     let _ = wire.send_line("a9 LOGOUT").await;
     Ok(out)
 }
@@ -1263,7 +1293,22 @@ async fn imap_fetch<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut Wire<S>,
     uid: u32,
 ) -> Result<MailMessage> {
-    wire.send_line(&format!("a4 UID FETCH {uid} (FLAGS BODY.PEEK[])"))
+    imap_fetch_section(wire, uid, "BODY.PEEK[]").await
+}
+
+async fn imap_fetch_headers<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut Wire<S>,
+    uid: u32,
+) -> Result<MailMessage> {
+    imap_fetch_section(wire, uid, "BODY.PEEK[HEADER]").await
+}
+
+async fn imap_fetch_section<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut Wire<S>,
+    uid: u32,
+    section: &str,
+) -> Result<MailMessage> {
+    wire.send_line(&format!("a4 UID FETCH {uid} (FLAGS {section})"))
         .await?;
     let mut block = String::new();
     loop {

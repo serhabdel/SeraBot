@@ -1072,29 +1072,87 @@ class ApiClient {
     return parseBotLibrary(json);
   }
 
+  /// Member's cross-chat global Library (`GET /v1/library`, 0.74.8): every
+  /// file made by bots across chats plus direct uploads, and OneDrive mirror
+  /// status.
+  Future<GlobalLibraryResponse> getGlobalLibrary() async {
+    final json = await _request('GET', ['v1', 'library']);
+    return GlobalLibraryResponse.fromJson(json);
+  }
+
+  /// Upload one file to the member's global Library (`POST /v1/library/upload`,
+  /// raw bytes + `X-Filename` header). Enforces the 25 MiB mobile ceiling and
+  /// returns the created item plus OneDrive mirror status.
+  Future<LibraryUploadResponse> uploadToLibrary(
+    String filename,
+    List<int> bytes,
+  ) async {
+    final clean = safeUploadName(filename);
+    if (clean.isEmpty) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Pick a file with a valid name.',
+      );
+    }
+    if (bytes.isEmpty) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'That file is empty.',
+      );
+    }
+    if (bytes.length > maxAttachmentBytes) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Files must be 25 MB or smaller.',
+      );
+    }
+    final response = await _send(
+      'POST',
+      _uri(['v1', 'library', 'upload']),
+      bodyBytes: bytes,
+      extraHeaders: {
+        'X-Filename': clean,
+        'Content-Type': 'application/octet-stream',
+      },
+      timeout: const Duration(minutes: 2),
+    );
+    final json = _decode(response);
+    return LibraryUploadResponse.fromJson(json);
+  }
+
   /// Raw bytes of one bot-library item (0.74.9): generated items are
   /// artifacts addressed by their hash, uploaded items are attachments
   /// addressed by their id.
   Future<List<int>> libraryItemBytes(BotLibraryItem item) async {
-    if (item.generated) {
+    if (item.generated || item.isArtifactHash) {
       return artifactBytes(item.id);
     }
     return attachmentBytes(item.id);
   }
 
-  /// Thumbnail bytes for one image library item (0.74.9). There is no
-  /// `GET /v1/library/thumbnail` route on 0.74.8 servers, so the thumbnail
-  /// comes from the authenticated artifact preview (`image_b64`) for
-  /// generated images — falling back to the full download — and from the
-  /// attachment download for uploads. Null when the bytes are not a
-  /// renderable image or the server has none. Best-effort: any API failure
-  /// reads as "no thumbnail" and the caller shows the file icon instead.
+  /// Thumbnail bytes for one image library item (0.74.9). Tries
+  /// `GET /v1/library/thumbnail?hash=...&w=320` first for hash-addressed
+  /// items, then falls back to `GET /v1/artifacts/{hash}/preview` (`image_b64`),
+  /// then to the full download. Null when the bytes are not a renderable
+  /// image or the server has none. Best-effort: any API failure reads as
+  /// "no thumbnail" and the caller shows the file icon instead.
   Future<List<int>?> libraryThumbnailBytes(BotLibraryItem item) async {
     if (!item.isImage) {
       return null;
     }
     try {
-      if (item.generated && item.isArtifactHash) {
+      if (item.isArtifactHash) {
+        final thumbRes = await _send(
+          'GET',
+          _uri(['v1', 'library', 'thumbnail'], {'hash': item.id, 'w': '320'}),
+          accept: 'image/*',
+        );
+        if (thumbRes.statusCode >= 200 &&
+            thumbRes.statusCode < 300 &&
+            thumbRes.bodyBytes.isNotEmpty &&
+            thumbRes.bodyBytes.length <= _maxThumbnailBytes) {
+          return thumbRes.bodyBytes;
+        }
         final preview = await artifactPreview(item.id);
         final b64 = preview?.imageB64;
         if (b64 != null) {

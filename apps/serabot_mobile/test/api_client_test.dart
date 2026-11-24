@@ -1,4 +1,4 @@
-﻿import 'dart:convert';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -487,5 +487,128 @@ void main() {
       ),
       isNull,
     );
+  });
+
+  test('getGlobalLibrary and uploadToLibrary round-trip and validate inputs', () async {
+    String? uploadedName;
+    List<int>? uploadedBody;
+    server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final port = server!.port;
+    server!.listen((request) async {
+      if (request.uri.path == '/v1/library' && request.method == 'GET') {
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..write(jsonEncode({
+            'enabled': true,
+            'onedrive': {
+              'mirror': true,
+              'folder': 'SeraBot Library',
+              'connected': true,
+            },
+            'items': [
+              {
+                'kind': 'generated',
+                'id': 'a' * 64,
+                'tool': 'deck_build',
+                'name': 'Quarterly deck',
+                'filename': 'deck.pptx',
+                'mime': 'application/vnd.openxmlformats',
+                'size_bytes': 4096,
+                'conversation_id': 'dir:main',
+                'conversation_title': 'Main chat',
+                'created_at': '2026-11-20T08:00:00Z',
+              },
+              {
+                'kind': 'uploaded',
+                'id': 'b' * 64,
+                'tool': 'library_upload',
+                'name': 'notes.md',
+                'filename': 'notes.md',
+                'mime': 'text/plain; charset=utf-8',
+                'size_bytes': 12,
+                'conversation_id': 'library',
+                'created_at': '2026-11-21T08:00:00Z',
+              },
+            ],
+          }));
+      } else if (request.uri.path == '/v1/library/upload' &&
+          request.method == 'POST') {
+        uploadedName = request.headers.value('x-filename');
+        uploadedBody = await request.fold<List<int>>(
+          <int>[],
+          (acc, chunk) => acc..addAll(chunk),
+        );
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..write(jsonEncode({
+            'item': {
+              'kind': 'uploaded',
+              'id': 'c' * 64,
+              'tool': 'library_upload',
+              'name': uploadedName,
+              'filename': uploadedName,
+              'mime': 'text/plain',
+              'size_bytes': uploadedBody!.length,
+              'conversation_id': 'library',
+              'created_at': '2026-11-22T08:00:00Z',
+            },
+            'onedrive': 'uploaded',
+          }));
+      } else {
+        request.response.statusCode = HttpStatus.notFound;
+      }
+      await request.response.close();
+    });
+
+    final client = ApiClient.connect('http://127.0.0.1:$port', 'f' * 32);
+    addTearDown(client.close);
+
+    final lib = await client.getGlobalLibrary();
+    expect(lib.enabled, isTrue);
+    expect(lib.onedrive.mirror, isTrue);
+    expect(lib.onedrive.connected, isTrue);
+    expect(lib.onedrive.folder, 'SeraBot Library');
+    expect(lib.items, hasLength(2));
+    expect(lib.items.first.generated, isTrue);
+    expect(lib.items.last.generated, isFalse);
+
+    final reply = await client.uploadToLibrary('hello.txt', [104, 105]);
+    expect(uploadedName, 'hello.txt');
+    expect(uploadedBody, [104, 105]);
+    expect(reply.onedrive, 'uploaded');
+    expect(reply.item?.id, 'c' * 64);
+
+    await expectLater(
+      client.uploadToLibrary('empty.txt', const []),
+      throwsA(
+        isA<ApiException>().having(
+          (e) => e.kind,
+          'kind',
+          ApiErrorKind.validation,
+        ),
+      ),
+    );
+    await expectLater(
+      client.uploadToLibrary('huge.bin', List<int>.filled(25 * 1024 * 1024 + 1, 1)),
+      throwsA(
+        isA<ApiException>().having(
+          (e) => e.kind,
+          'kind',
+          ApiErrorKind.validation,
+        ),
+      ),
+    );
+  });
+
+  test('needs_review task status parses and is not terminal', () {
+    final task = TaskInfo.fromJson({
+      'id': 't1',
+      'kind': 'turn',
+      'bot': 'main',
+      'status': 'needs_review',
+    });
+    expect(task.status, TaskStatus.needsReview);
+    expect(task.status.terminal, isFalse);
+    expect(task.status.label, 'Needs review');
   });
 }

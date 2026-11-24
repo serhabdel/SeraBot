@@ -92,6 +92,7 @@ impl WorkingBots {
     pub fn apply(&mut self, kind: &str, payload: &Value, now: Instant) -> bool {
         match kind {
             "turn.step" => self.apply_step(payload, now),
+            "turn.progress" => self.apply_progress(payload, now),
             "turn.completed" | "task.failed" => {
                 let Some(task_id) = clean(payload, "task_id", MAX_ID) else {
                     return false;
@@ -102,6 +103,50 @@ impl WorkingBots {
             }
             _ => false,
         }
+    }
+
+    fn apply_progress(&mut self, payload: &Value, now: Instant) -> bool {
+        let Some(task_id) = clean(payload, "task_id", MAX_ID) else {
+            return false;
+        };
+        let phase = payload.get("phase").and_then(Value::as_str);
+        let elapsed_secs = payload.get("elapsed_secs").and_then(Value::as_u64);
+        self.prune(now);
+        let Some(entry) = self.entries.iter_mut().find(|e| e.task_id == task_id) else {
+            // If no turn.step was seen yet (e.g. long initial model reasoning),
+            // register the bot if `bot` is provided so the rail ring stays alive.
+            if phase == Some("waiting_model")
+                && let Some(bot) = clean(payload, "bot", MAX_ID)
+            {
+                let conversation = clean(payload, "conversation_id", MAX_ID).unwrap_or_default();
+                let label = elapsed_secs.map(|s| format!("Thinking… ({s}s)"));
+                if self.entries.len() >= MAX_ENTRIES {
+                    self.entries.remove(0);
+                }
+                self.entries.push(Entry {
+                    task_id,
+                    bot,
+                    conversation,
+                    activity: BotActivity::Working(label),
+                    seen: now,
+                });
+                return true;
+            }
+            return false;
+        };
+        let mut changed = entry.seen != now;
+        entry.seen = now;
+        if phase == Some("waiting_model")
+            && matches!(&entry.activity, BotActivity::Working(label) if label.is_none() || label.as_deref().is_some_and(|l| l.starts_with("Thinking…")))
+        {
+            let next_label = elapsed_secs.map(|s| format!("Thinking… ({s}s)"));
+            let next_activity = BotActivity::Working(next_label);
+            if entry.activity != next_activity {
+                entry.activity = next_activity;
+                changed = true;
+            }
+        }
+        changed
     }
 
     fn apply_step(&mut self, payload: &Value, now: Instant) -> bool {
@@ -361,5 +406,100 @@ mod tests {
             );
         }
         assert_eq!(w.entries.len(), MAX_ENTRIES);
+    }
+
+    #[test]
+    fn turn_progress_refreshes_seen_and_updates_waiting_model_label() {
+        let start = Instant::now();
+        let mut w = WorkingBots::default();
+        // Start with a completed step (no named tool step currently running).
+        w.apply(
+            "turn.step",
+            &step("t1", "analyst", "dir:analyst", "done", "Reading"),
+            start,
+        );
+        assert_eq!(
+            w.activity_of("analyst", start),
+            Some(BotActivity::Working(None))
+        );
+
+        // Halfway to STALE_AFTER, turn.progress arrives: updates seen and sets Thinking label.
+        let mid = start + Duration::from_secs(10 * 60);
+        assert!(w.apply(
+            "turn.progress",
+            &json!({
+                "task_id": "t1",
+                "bot": "analyst",
+                "conversation_id": "dir:analyst",
+                "phase": "waiting_model",
+                "elapsed_secs": 45,
+                "beat": 3
+            }),
+            mid
+        ));
+        assert_eq!(
+            w.activity_of("analyst", mid).unwrap().label(),
+            "Thinking… (45s)"
+        );
+
+        // Past STALE_AFTER from `start`, but still within STALE_AFTER from `mid`: entry stays live!
+        let after_original_stale = start + STALE_AFTER + Duration::from_secs(60);
+        assert_eq!(
+            w.activity_of("analyst", after_original_stale)
+                .unwrap()
+                .label(),
+            "Thinking… (45s)"
+        );
+
+        // Another beat updates the elapsed seconds.
+        let later = mid + Duration::from_secs(15);
+        assert!(w.apply(
+            "turn.progress",
+            &json!({
+                "task_id": "t1",
+                "phase": "waiting_model",
+                "elapsed_secs": 60,
+                "beat": 4
+            }),
+            later
+        ));
+        assert_eq!(
+            w.activity_of("analyst", later).unwrap().label(),
+            "Thinking… (60s)"
+        );
+
+        // If a named tool step is active, turn.progress refreshes `seen` without overwriting the tool label.
+        let mut w2 = WorkingBots::default();
+        w2.apply(
+            "turn.step",
+            &step("t2", "writer", "dir:writer", "running", "Drafting"),
+            start,
+        );
+        assert!(w2.apply(
+            "turn.progress",
+            &json!({"task_id": "t2", "phase": "waiting_model", "elapsed_secs": 30}),
+            mid
+        ));
+        assert_eq!(w2.activity_of("writer", mid).unwrap().label(), "Drafting");
+        assert!(w2.activity_of("writer", after_original_stale).is_some());
+
+        // A turn.progress before any turn.step also registers the bot if `bot` is present.
+        let mut w3 = WorkingBots::default();
+        assert!(w3.apply(
+            "turn.progress",
+            &json!({
+                "task_id": "t3",
+                "bot": "main",
+                "conversation_id": "dir:main",
+                "phase": "waiting_model",
+                "elapsed_secs": 15,
+                "beat": 1
+            }),
+            start
+        ));
+        assert_eq!(
+            w3.activity_of("main", start).unwrap().label(),
+            "Thinking… (15s)"
+        );
     }
 }

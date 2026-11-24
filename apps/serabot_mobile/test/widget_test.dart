@@ -30,12 +30,16 @@ class MemoryStore implements TokenStore {
 
 class FakeDevice implements DeviceActions {
   List<PickedFile> files = [];
+  PickedFile? anyFile;
   bool micAllowed = true;
   bool recording = false;
   final shared = <String>[];
 
   @override
   Future<List<PickedFile>> pickFiles({bool imagesOnly = false}) async => files;
+  @override
+  Future<PickedFile?> pickAnyFile({int maxBytes = 25 * 1024 * 1024}) async =>
+      anyFile;
   @override
   Future<bool> startRecording() async => recording = micAllowed;
   @override
@@ -149,6 +153,12 @@ class FakeServer {
         return _json({'messages': []});
       case 'GET /v1/conversations/room:sera/library':
         return _json({'artifacts': []});
+      case 'GET /v1/library':
+        return _json({
+          'enabled': true,
+          'onedrive': {'mirror': false, 'folder': 'SeraBot Library', 'connected': false},
+          'items': [],
+        });
       case 'POST /v1/auth/logout':
         return _json({});
     }

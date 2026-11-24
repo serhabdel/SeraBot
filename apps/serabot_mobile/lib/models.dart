@@ -174,6 +174,7 @@ enum TaskStatus {
   queued,
   running,
   awaitingApproval,
+  needsReview,
   done,
   failed,
   cancelled,
@@ -187,6 +188,8 @@ TaskStatus parseTaskStatus(String raw) {
       return TaskStatus.running;
     case 'awaiting_approval':
       return TaskStatus.awaitingApproval;
+    case 'needs_review':
+      return TaskStatus.needsReview;
     case 'done':
       return TaskStatus.done;
     case 'failed':
@@ -212,6 +215,8 @@ extension TaskStatusX on TaskStatus {
         return 'Working';
       case TaskStatus.awaitingApproval:
         return 'Awaiting approval';
+      case TaskStatus.needsReview:
+        return 'Needs review';
       case TaskStatus.done:
         return 'Done';
       case TaskStatus.failed:
