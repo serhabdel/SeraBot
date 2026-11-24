@@ -221,7 +221,10 @@ void main() {
     );
     expect(find.text('Made by a bot'), findsWidgets);
 
-    await tester.tap(find.byType(ModalBarrier).last, warnIfMissed: false);
+    // Tap the scrim above the sheet: tapping the barrier's center no
+    // longer works now the details sheet (file row + share button) is
+    // tall enough to cover the middle of the 600px test viewport.
+    await tester.tapAt(const Offset(400, 40));
     await tester.pumpAndSettle();
 
     await tester.tap(find.byType(ChoiceChip).at(2));

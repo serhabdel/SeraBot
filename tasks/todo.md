@@ -525,3 +525,35 @@ never merge without the owner's OK.
 - [ ] Owner: live pass on Windows — Library page, upload a file, connect
   OneDrive and confirm the `SeraBot Library` mirror, `social_extract` image
   download mirroring.
+
+## Release 0.74.9 — Library big upgrade (image cards + viewer, PDF/PPTX/XLSX previews, Open with default app)
+
+- [x] Server: `api/library.rs` `GET /v1/library/thumbnail?hash=&w=`
+  (UID-scoped, w clamps 16–1024, never upscales, JPEG q82 / PNG on alpha,
+  EXIF dropped, GIF/BMP/SVG as-is, `private, max-age=86400`) and
+  `GET /v1/library/preview-doc?hash=&kind=pptx|xlsx` (UID-scoped, 404 when
+  `[library]` off / foreign hash, 400 on kind mismatch; PPTX max 50 slides,
+  2000 chars/slide via new `pptx_ops::slide_preview()`; XLSX max 5 sheets,
+  20×20 rows/cols via `workbooks`, formulas never evaluated).
+- [x] Desktop: `ui_library.rs` Grid/List toggle, image cards with real
+  thumbnails (authenticated fetch, data URLs, 48-image cap, fallback to
+  artifact preview), full image viewer (zoom 25–400%, prev/next, keyboard),
+  in-app previews in the item dialog (PDF via PreviewDock, PPTX slides,
+  XLSX sheet tables, DOCX/MD/TXT/CSV text — Dioxus text nodes only),
+  "Open with default app" as the primary button (existing
+  `session.open_artifact` flow; Windows `explorer` launches the default
+  app) + Show in Explorer / Save to Downloads; CSS in `system.css`.
+- [x] Mobile: per-bot Library screen (no separate main Library screen
+  exists) — thumbnail tiles via authenticated preview, full-screen
+  `InteractiveViewer` image viewer, PPTX/XLSX preview sheet over
+  `preview-doc` with a friendly unavailable state on 404, PDF via the
+  existing preview pane, share via `DeviceActions.shareFile` (no
+  `url_launcher`/`open_file` in pubspec — direct open needs that dep).
+- [x] Tests: server `library_api.rs` (5 new), desktop
+  `library_doc_preview_parses_and_bounds`, mobile `bot_library_test.dart`,
+  `api_client_test.dart`, `bot_library_screen_test.dart`.
+- [x] Version bump 0.74.9 (Cargo.toml), mobile 0.74.9+83,
+  `docs/release-0.74.9.md`, README, AGENTS.md.
+- [ ] Owner: live pass on Windows — Library grid + image viewer, open a
+  real PDF/PPTX/XLSX in-app, Open with default app, and on mobile open an
+  image and a PPTX/XLSX preview against a 0.74.9 server.

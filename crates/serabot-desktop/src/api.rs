@@ -1899,6 +1899,179 @@ pub struct LibraryUploadReply {
     pub onedrive: String,
 }
 
+/// One slide from `GET /v1/library/preview-doc` (0.74.9).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct LibraryDocSlide {
+    #[serde(default)]
+    pub index: usize,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub text: String,
+}
+
+/// One sheet from `GET /v1/library/preview-doc` (0.74.9).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct LibraryDocSheet {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub rows: Vec<Vec<String>>,
+}
+
+/// Most slides kept from one deck preview.
+pub const MAX_DOC_SLIDES: usize = 200;
+/// Most sheets kept from one workbook preview.
+pub const MAX_DOC_SHEETS: usize = 32;
+/// Most rows kept per sheet.
+pub const MAX_DOC_ROWS_PER_SHEET: usize = 100;
+/// Most cells kept per row.
+pub const MAX_DOC_CELLS_PER_ROW: usize = 24;
+/// Longest cell text kept (chars).
+pub const MAX_DOC_CELL_CHARS: usize = 2_000;
+/// Longest slide text kept (chars).
+pub const MAX_DOC_SLIDE_CHARS: usize = 8_000;
+/// Longest slide title / sheet name kept (chars).
+pub const MAX_DOC_TITLE_CHARS: usize = 500;
+/// Largest thumbnail body accepted (bytes).
+pub const MAX_THUMBNAIL_BYTES: u64 = 2 * 1024 * 1024;
+
+/// `GET /v1/library/preview-doc` (0.74.9): extracted text of a deck or a
+/// workbook — `{kind, slide_count, slides:[{slide,title,text}], truncated}`
+/// for `kind=pptx`, `{kind, sheet_count, sheets:[{name, rows:[[cell,...]]}],
+/// truncated}` for `kind=xlsx`.
+/// Extracted text is untrusted data: it is only ever rendered as plain text
+/// nodes, never as HTML, and it is bounded here before any UI sees it.
+///
+/// Server shape (verified against the server agent's implementation):
+/// slides carry their number under `slide` (not `index`), the totals arrive
+/// as `slide_count` / `sheet_count` (the lists themselves are capped — 50
+/// slides, 5 sheets, 20 rows × 20 columns), and `truncated` says whether
+/// any cap cut something off.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct LibraryDocPreview {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub slide_count: Option<usize>,
+    #[serde(default)]
+    pub sheet_count: Option<usize>,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub slides: Vec<LibraryDocSlide>,
+    #[serde(default)]
+    pub sheets: Vec<LibraryDocSheet>,
+}
+
+/// Drop control characters (except `\n` and `\t`) and cap length.
+fn clean_doc_text(raw: &str, max_chars: usize) -> String {
+    raw.chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .take(max_chars)
+        .collect()
+}
+
+impl LibraryDocPreview {
+    /// Parse the server shape, refusing anything that is not a `pptx` or
+    /// `xlsx` preview, and bound every string and collection first. Sheet
+    /// cells arrive as JSON values (strings, numbers, booleans, null), so
+    /// they are stringified here instead of requiring string cells.
+    pub fn parse(value: &serde_json::Value) -> Option<Self> {
+        let kind = value
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .filter(|kind| matches!(kind.as_str(), "pptx" | "xlsx"))?;
+        let slide_count = value
+            .get("slide_count")
+            .and_then(serde_json::Value::as_u64)
+            .map(|n| n as usize);
+        let sheet_count = value
+            .get("sheet_count")
+            .and_then(serde_json::Value::as_u64)
+            .map(|n| n as usize);
+        let truncated = value
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let mut slides = Vec::new();
+        if let Some(raw) = value.get("slides").and_then(serde_json::Value::as_array) {
+            for (idx, slide) in raw.iter().enumerate() {
+                if slides.len() >= MAX_DOC_SLIDES {
+                    break;
+                }
+                let index = slide
+                    .get("slide")
+                    .or_else(|| slide.get("index"))
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|n| n as usize)
+                    .unwrap_or(idx + 1);
+                let title = slide
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|title| clean_doc_text(title.trim(), MAX_DOC_TITLE_CHARS))
+                    .filter(|title| !title.is_empty());
+                let text = slide
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|text| clean_doc_text(text, MAX_DOC_SLIDE_CHARS))
+                    .unwrap_or_default();
+                slides.push(LibraryDocSlide { index, title, text });
+            }
+        }
+        let mut sheets = Vec::new();
+        if let Some(raw) = value.get("sheets").and_then(serde_json::Value::as_array) {
+            for (idx, sheet) in raw.iter().enumerate() {
+                if sheets.len() >= MAX_DOC_SHEETS {
+                    break;
+                }
+                let name = sheet
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|name| clean_doc_text(name.trim(), MAX_DOC_TITLE_CHARS))
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| format!("Sheet {}", idx + 1));
+                let mut rows = Vec::new();
+                if let Some(raw_rows) = sheet.get("rows").and_then(serde_json::Value::as_array) {
+                    for raw_row in raw_rows.iter() {
+                        if rows.len() >= MAX_DOC_ROWS_PER_SHEET {
+                            break;
+                        }
+                        let Some(cells) = raw_row.as_array() else {
+                            continue;
+                        };
+                        let row: Vec<String> = cells
+                            .iter()
+                            .take(MAX_DOC_CELLS_PER_ROW)
+                            .map(|cell| match cell {
+                                serde_json::Value::Null => String::new(),
+                                serde_json::Value::String(text) => {
+                                    clean_doc_text(text, MAX_DOC_CELL_CHARS)
+                                }
+                                serde_json::Value::Number(number) => number.to_string(),
+                                serde_json::Value::Bool(flag) => flag.to_string(),
+                                other => clean_doc_text(&other.to_string(), MAX_DOC_CELL_CHARS),
+                            })
+                            .collect();
+                        rows.push(row);
+                    }
+                }
+                sheets.push(LibraryDocSheet { name, rows });
+            }
+        }
+        Some(Self {
+            kind,
+            slide_count,
+            sheet_count,
+            truncated,
+            slides,
+            sheets,
+        })
+    }
+}
+
 /// One mail message as returned by `GET /v1/mail/messages*` (0.74.1, attachments 0.74.5).
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct MailMessageInfo {
@@ -5113,6 +5286,99 @@ impl ApiClient {
         serde_json::from_slice(&body).map_err(|_| ApiError::InvalidResponse)
     }
 
+    /// `GET /v1/library/preview-doc?hash=...&kind=pptx|xlsx` (0.74.9):
+    /// extracted text of a deck (`{kind, slide_count, slides:[{slide,title,text}], truncated}`)
+    /// or a workbook (`{kind, sheet_count, sheets:[{name, rows:[[cell,...]]}], truncated}`).
+    /// not shipped yet) is `Ok(None)` so the caller falls back to the
+    /// artifact preview endpoint, which already renders slides and sheets.
+    pub fn library_preview_doc(
+        &self,
+        hash: &str,
+        kind: &str,
+    ) -> Result<Option<LibraryDocPreview>, ApiError> {
+        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ApiError::Validation("Invalid artifact hash."));
+        }
+        let kind = kind.trim().to_ascii_lowercase();
+        if !matches!(kind.as_str(), "pptx" | "xlsx") {
+            return Err(ApiError::Validation(
+                "Document previews cover pptx and xlsx files.",
+            ));
+        }
+        match self.get::<serde_json::Value>(
+            &["v1", "library", "preview-doc"],
+            &[("hash", hash), ("kind", kind.as_str())],
+        ) {
+            Ok(value) => LibraryDocPreview::parse(&value)
+                .map(Some)
+                .ok_or(ApiError::InvalidResponse),
+            Err(ApiError::Http(404)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// `GET /v1/library/thumbnail?hash=...&w=320` (0.74.9): a small
+    /// server-rendered thumbnail of an image artifact, as
+    /// `(content_type, bytes)`. A 404 (route not shipped yet) is `Ok(None)`
+    /// so the caller falls back to the artifact preview endpoint. The bytes
+    /// travel over the authenticated client and are rendered as a data URL:
+    /// a bare `<img src>` cannot carry the bearer token, so no raw
+    /// thumbnail URL is exposed.
+    pub fn library_thumbnail(
+        &self,
+        hash: &str,
+        width: u32,
+    ) -> Result<Option<(String, Vec<u8>)>, ApiError> {
+        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ApiError::Validation("Invalid artifact hash."));
+        }
+        let width = width.clamp(64, 1024);
+        let mut url = self.endpoint.clone();
+        url.path_segments_mut()
+            .map_err(|_| ApiError::InvalidResponse)?
+            .clear()
+            .extend(["v1", "library", "thumbnail"]);
+        url.query_pairs_mut()
+            .append_pair("hash", hash)
+            .append_pair("w", &width.to_string());
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(self.token.expose_secret())
+            .send()
+            .map_err(|_| ApiError::Transport)?;
+        let status = response.status();
+        if status.as_u16() == 404 {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(ApiError::Http(status.as_u16()));
+        }
+        if response
+            .content_length()
+            .is_some_and(|len| len > MAX_THUMBNAIL_BYTES)
+        {
+            return Err(ApiError::TooLarge);
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| value.to_ascii_lowercase().starts_with("image/"))
+            .map(str::to_owned)
+            .ok_or(ApiError::InvalidResponse)?;
+        let mut bytes = Vec::new();
+        response
+            .take(MAX_THUMBNAIL_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| ApiError::Transport)?;
+        if bytes.len() as u64 > MAX_THUMBNAIL_BYTES {
+            return Err(ApiError::TooLarge);
+        }
+        Ok(Some((content_type, bytes)))
+    }
+
     /// `GET /v1/conversations/search?q=...&bot=...&limit=15`: full-text message search.
     /// Gracefully returns an empty hit list when an older server returns 404.
     pub fn search_conversations(
@@ -7741,6 +8007,53 @@ mod tests {
         assert_eq!(parsed.artifacts.len(), 1);
         assert_eq!(parsed.artifacts[0].tool, "deck_render");
         assert_eq!(parsed.artifacts[0].filename.as_deref(), Some("deck.pdf"));
+    }
+
+    #[test]
+    fn library_doc_preview_parses_and_bounds() {
+        let pptx = LibraryDocPreview::parse(&serde_json::json!({
+            "kind": "pptx",
+            "slide_count": 2,
+            "truncated": false,
+            "slides": [
+                {"slide": 1, "title": "Cover\u{7}", "text": "Hello\nworld"},
+                {"slide": 2, "title": "  ", "text": "x".repeat(MAX_DOC_SLIDE_CHARS + 100)}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(pptx.kind, "pptx");
+        assert_eq!(pptx.slide_count, Some(2));
+        assert!(!pptx.truncated);
+        assert_eq!(pptx.slides.len(), 2);
+        assert_eq!(pptx.slides[0].index, 1);
+        assert_eq!(pptx.slides[0].title.as_deref(), Some("Cover"));
+        assert_eq!(pptx.slides[0].text, "Hello\nworld");
+        assert!(pptx.slides[1].title.is_none());
+        assert_eq!(pptx.slides[1].text.chars().count(), MAX_DOC_SLIDE_CHARS);
+
+        let xlsx = LibraryDocPreview::parse(&serde_json::json!({
+            "kind": "xlsx",
+            "sheets": [
+                {"name": "Revenue", "rows": [["Month", "Amount"], ["Jan", 1200]]}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(xlsx.sheets.len(), 1);
+        assert_eq!(xlsx.sheets[0].name, "Revenue");
+        assert_eq!(xlsx.sheets[0].rows[1][1], "1200");
+
+        // Wrong kind, missing kind, and oversized collections are refused
+        // or capped, never passed through unbounded.
+        assert!(LibraryDocPreview::parse(&serde_json::json!({"kind": "pdf"})).is_none());
+        assert!(LibraryDocPreview::parse(&serde_json::json!({"slides": []})).is_none());
+        let many = LibraryDocPreview::parse(&serde_json::json!({
+            "kind": "pptx",
+            "slides": (0..MAX_DOC_SLIDES + 50)
+                .map(|i| serde_json::json!({"index": i, "text": "s"}))
+                .collect::<Vec<_>>()
+        }))
+        .unwrap();
+        assert_eq!(many.slides.len(), MAX_DOC_SLIDES);
     }
 
     #[test]

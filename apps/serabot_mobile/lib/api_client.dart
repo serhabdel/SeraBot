@@ -17,6 +17,10 @@ import 'workflows_models.dart';
 
 const _maxResponseBytes = 2 * 1024 * 1024;
 
+/// A thumbnail that would need more than this is refused rather than
+/// rendered (0.74.9 library thumbnails).
+const _maxThumbnailBytes = 20 * 1024 * 1024;
+
 enum ApiErrorKind { validation, http, transport, invalidResponse, tooLarge }
 
 class ApiException implements Exception {
@@ -1066,6 +1070,83 @@ class ApiClient {
     _checkId(botId);
     final json = await _request('GET', ['v1', 'bots', botId, 'library']);
     return parseBotLibrary(json);
+  }
+
+  /// Raw bytes of one bot-library item (0.74.9): generated items are
+  /// artifacts addressed by their hash, uploaded items are attachments
+  /// addressed by their id.
+  Future<List<int>> libraryItemBytes(BotLibraryItem item) async {
+    if (item.generated) {
+      return artifactBytes(item.id);
+    }
+    return attachmentBytes(item.id);
+  }
+
+  /// Thumbnail bytes for one image library item (0.74.9). There is no
+  /// `GET /v1/library/thumbnail` route on 0.74.8 servers, so the thumbnail
+  /// comes from the authenticated artifact preview (`image_b64`) for
+  /// generated images — falling back to the full download — and from the
+  /// attachment download for uploads. Null when the bytes are not a
+  /// renderable image or the server has none. Best-effort: any API failure
+  /// reads as "no thumbnail" and the caller shows the file icon instead.
+  Future<List<int>?> libraryThumbnailBytes(BotLibraryItem item) async {
+    if (!item.isImage) {
+      return null;
+    }
+    try {
+      if (item.generated && item.isArtifactHash) {
+        final preview = await artifactPreview(item.id);
+        final b64 = preview?.imageB64;
+        if (b64 != null) {
+          try {
+            final bytes = base64Decode(b64);
+            if (bytes.isNotEmpty) {
+              return bytes;
+            }
+          } catch (_) {
+            // Bad base64 from the server: fall through to the download.
+          }
+        }
+      }
+      final bytes = await libraryItemBytes(item);
+      return bytes.length <= _maxThumbnailBytes ? bytes : null;
+    } on ApiException {
+      return null;
+    }
+  }
+
+  /// Structured PPTX/XLSX preview (0.74.9):
+  /// `GET /v1/library/preview-doc?hash=...&kind=pptx|xlsx` ->
+  /// `{kind, slides: [{index, title, text}]}` or
+  /// `{kind, sheets: [{name, rows: [[cell, ...]]}]}`.
+  /// Null when the server has no such route yet (404) or no preview for
+  /// the file; the caller shows "open the file instead". Only artifact
+  /// hashes are accepted: uploaded items carry attachment ids, not hashes.
+  Future<LibraryDocPreview?> libraryDocPreview(
+    String hash,
+    String kind,
+  ) async {
+    if (!validHash(hash)) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Invalid artifact hash.',
+      );
+    }
+    if (kind != 'pptx' && kind != 'xlsx') {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Document kind must be pptx or xlsx.',
+      );
+    }
+    final response = await _send(
+      'GET',
+      _uri(['v1', 'library', 'preview-doc'], {'hash': hash, 'kind': kind}),
+    );
+    if (response.statusCode == 404) {
+      return null;
+    }
+    final json = _decode(response);
+    return LibraryDocPreview.fromJson(json);
   }
 
   /// Stored `turn.memory` events of one chat, oldest first (0.61), so a reply's

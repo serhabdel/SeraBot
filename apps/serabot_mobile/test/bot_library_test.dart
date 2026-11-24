@@ -169,4 +169,114 @@ void main() {
   test('today is a UTC calendar day', () {
     expect(RegExp(r'^\d{4}-\d{2}-\d{2}$').hasMatch(todayUtcDay()), isTrue);
   });
+
+  test('0.74.9 type helpers: image, pdf, doc preview kind, hash', () {
+    final hash = 'a' * 64;
+    final image = BotLibraryItem.fromJson(
+      _row(id: hash, filename: 'photo.png', mime: 'image/png'),
+    )!;
+    expect(image.isImage, isTrue);
+    expect(image.isPdf, isFalse);
+    expect(image.docPreviewKind, isNull);
+    expect(image.isArtifactHash, isTrue);
+    expect(image.downloadName, 'photo.png');
+
+    final deck = BotLibraryItem.fromJson(
+      _row(id: hash, filename: 'deck.pptx', mime: 'application/vnd.ms'),
+    )!;
+    expect(deck.isImage, isFalse);
+    expect(deck.docPreviewKind, 'pptx');
+
+    final sheet = BotLibraryItem.fromJson(
+      _row(id: hash, filename: 'Budget.XLSX', mime: 'application/vnd.ms'),
+    )!;
+    expect(sheet.docPreviewKind, 'xlsx');
+
+    final pdf = BotLibraryItem.fromJson(
+      _row(id: hash, filename: 'report.pdf', mime: 'application/pdf'),
+    )!;
+    expect(pdf.isPdf, isTrue);
+    expect(pdf.docPreviewKind, isNull);
+
+    final upload = BotLibraryItem.fromJson(
+      _row(
+        kind: 'uploaded',
+        id: 'att_upload_1',
+        filename: 'photo.png',
+        mime: 'image/png',
+      ),
+    )!;
+    expect(upload.isImage, isTrue);
+    expect(upload.isArtifactHash, isFalse);
+    expect(upload.downloadName, 'photo.png');
+
+    final svg = BotLibraryItem.fromJson(
+      _row(id: hash, filename: 'logo.svg', mime: 'image/svg+xml'),
+    )!;
+    expect(svg.isImage, isFalse, reason: 'SVG needs a vector renderer');
+
+    final nameless = BotLibraryItem.fromJson(
+      _row(id: hash, name: 'Title only', filename: null),
+    )!;
+    expect(nameless.downloadName, 'Title only');
+  });
+
+  test('0.74.9 doc preview parses pptx slides and xlsx sheets', () {
+    final deck = LibraryDocPreview.fromJson({
+      'kind': 'pptx',
+      'slides': [
+        {'index': 1, 'title': 'Intro', 'text': 'Hello'},
+        {'index': 2, 'title': 'Next', 'text': 'More text'},
+        {'title': '', 'text': ''},
+        'not an object',
+      ],
+    })!;
+    expect(deck.kind, 'pptx');
+    expect(deck.slides.map((s) => s.index), [1, 2]);
+    expect(deck.slides.first.title, 'Intro');
+    expect(deck.slides.last.text, 'More text');
+    expect(deck.sheets, isEmpty);
+
+    final book = LibraryDocPreview.fromJson({
+      'kind': 'xlsx',
+      'sheets': [
+        {
+          'name': 'Budget',
+          'rows': [
+            ['Item', 'Cost'],
+            ['Rent', 1200],
+            ['Food', true],
+          ],
+        },
+        {'name': 'Empty', 'rows': []},
+      ],
+    })!;
+    expect(book.kind, 'xlsx');
+    expect(book.sheets, hasLength(1));
+    expect(book.sheets.first.name, 'Budget');
+    expect(book.sheets.first.rows, [
+      ['Item', 'Cost'],
+      ['Rent', '1200'],
+      ['Food', 'true'],
+    ]);
+    expect(book.slides, isEmpty);
+  });
+
+  test('0.74.9 doc preview rejects a wrong kind and caps rows', () {
+    expect(LibraryDocPreview.fromJson({'kind': 'docx'}), isNull);
+    expect(LibraryDocPreview.fromJson({'kind': 'pptx', 'slides': 'nope'})!
+        .slides, isEmpty);
+    final many = LibraryDocPreview.fromJson({
+      'kind': 'xlsx',
+      'sheets': [
+        {
+          'name': 'Big',
+          'rows': [
+            for (var i = 0; i < 500; i++) ['r$i'],
+          ],
+        },
+      ],
+    })!;
+    expect(many.sheets.first.rows.length, LibraryDocPreview.maxRows);
+  });
 }
