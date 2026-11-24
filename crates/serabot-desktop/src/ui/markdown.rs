@@ -345,6 +345,19 @@ fn parse_table_row(row: &str) -> Vec<String> {
 }
 
 pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
+    parse_markdown_blocks_inner(content, false)
+}
+
+/// Parse markdown as it streams in (0.74.10): a trailing construct the
+/// model has not finished yet — an unclosed fence, an unclosed `:::hand`
+/// note, a table header whose separator row has not arrived — renders as
+/// plain text with its fence hidden, instead of a half-built code block or
+/// a visible opener. The finished parse replaces it once the reply lands.
+pub fn parse_markdown_blocks_streaming(content: &str) -> Vec<MdBlock> {
+    parse_markdown_blocks_inner(content, true)
+}
+
+fn parse_markdown_blocks_inner(content: &str, streaming: bool) -> Vec<MdBlock> {
     let mut blocks = Vec::new();
     let lines: Vec<&str> = content.lines().collect();
     let mut i = 0;
@@ -376,6 +389,15 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
                 blocks.push(MdBlock::HandNote(note_lines.join("\n")));
                 continue;
             }
+            if streaming {
+                // Still arriving: hide the opener and show the lines so far
+                // as plain text.
+                if !note_lines.is_empty() {
+                    blocks.push(MdBlock::Paragraph(note_lines.join(" ")));
+                }
+                i = lines.len();
+                continue;
+            }
             // Unclosed: fall through so `:::hand` and its lines are parsed
             // as an ordinary paragraph.
         }
@@ -383,14 +405,24 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
         // Fenced code block (``` or ~~~, supporting longer outer fences)
         if let Some((fence_ch, fence_len, lang)) = parse_fence_open(trimmed) {
             let mut code_lines = Vec::new();
+            let mut closed = false;
             i += 1;
             while i < lines.len() {
                 if is_fence_close(lines[i].trim(), fence_ch, fence_len) {
+                    closed = true;
                     i += 1;
                     break;
                 }
                 code_lines.push(lines[i]);
                 i += 1;
+            }
+            if streaming && !closed {
+                // Still arriving: hide the fence and show the code so far
+                // as plain text, not a half-built code block.
+                if !code_lines.is_empty() {
+                    blocks.push(MdBlock::Paragraph(code_lines.join(" ")));
+                }
+                continue;
             }
             blocks.push(MdBlock::CodeBlock {
                 lang,
@@ -863,15 +895,21 @@ fn parse_inline_with_opts(text: &str, allow_italic: bool, allow_links: bool) -> 
 }
 
 /// A fenced code block: the language label, a Copy button that confirms on
-/// the button itself, and token colours from `ui_highlight`.
+/// the button itself, and token colours from `ui_highlight`. While the reply
+/// is still streaming the code is unfinished, so the Copy button is hidden:
+/// copying a half-written block would hand the owner a broken snippet.
 #[component]
-pub(super) fn CodeBlock(lang: String, code: String) -> Element {
+pub(super) fn CodeBlock(
+    lang: String,
+    code: String,
+    #[props(default = false)] streaming: bool,
+) -> Element {
     let mut copied = use_signal(|| false);
     let label = match lang.trim() {
         "" => "text".to_owned(),
         name => name.to_owned(),
     };
-    let tokens = ui_highlight::tokenize(&lang, &code);
+    let tokens = tokenize_cached(&lang, &code);
     let mut expanded = use_signal(|| false);
     let long = code_is_long(&code);
     let capped = long && !expanded();
@@ -883,28 +921,30 @@ pub(super) fn CodeBlock(lang: String, code: String) -> Element {
                 span { class: "md-code-meta",
                     if lines == 1 { "1 line" } else { "{lines} lines" }
                 }
-                button {
-                    class: if copied() { "md-code-copy copied" } else { "md-code-copy" },
-                    r#type: "button",
-                    "aria-label": "Copy code",
-                    onclick: {
-                        let code = code.clone();
-                        move |_| {
-                            let _ = dioxus::document::eval(&copy_script(&code));
-                            copied.set(true);
-                            spawn(async move {
-                                let mut done = dioxus::document::eval(CONFIRM_RESET_JS);
-                                let _ = done.recv::<bool>().await;
-                                copied.set(false);
-                            });
+                if !streaming {
+                    button {
+                        class: if copied() { "md-code-copy copied" } else { "md-code-copy" },
+                        r#type: "button",
+                        "aria-label": "Copy code",
+                        onclick: {
+                            let code = code.clone();
+                            move |_| {
+                                let _ = dioxus::document::eval(&copy_script(&code));
+                                copied.set(true);
+                                spawn(async move {
+                                    let mut done = dioxus::document::eval(CONFIRM_RESET_JS);
+                                    let _ = done.recv::<bool>().await;
+                                    copied.set(false);
+                                });
+                            }
+                        },
+                        if copied() {
+                            Icon { name: "check", size: 12 }
+                            " Copied"
+                        } else {
+                            Icon { name: "copy", size: 12 }
+                            " Copy"
                         }
-                    },
-                    if copied() {
-                        Icon { name: "check", size: 12 }
-                        " Copied"
-                    } else {
-                        Icon { name: "copy", size: 12 }
-                        " Copy"
                     }
                 }
             }
@@ -928,13 +968,65 @@ pub(super) fn CodeBlock(lang: String, code: String) -> Element {
     }
 }
 
+/// Highlight tokens for one code block, memoised on `(language, code hash)`
+/// (0.74.10): a streaming reply re-renders its code block on every token,
+/// and re-tokenizing the whole block each time was the bulk of that work.
+/// A finished block tokenizes once and hits the cache on every later render.
+fn tokenize_cached(lang: &str, code: &str) -> Vec<ui_highlight::Token> {
+    use std::collections::{HashMap, VecDeque};
+    use std::hash::{Hash, Hasher};
+    use std::sync::{Arc, Mutex, OnceLock};
+    const TOKENIZE_CACHE_MAX: usize = 128;
+    type TokenizeKey = (String, u64);
+    #[derive(Default)]
+    struct TokenizeCache {
+        order: VecDeque<TokenizeKey>,
+        entries: HashMap<TokenizeKey, Arc<Vec<ui_highlight::Token>>>,
+    }
+    static CACHE: OnceLock<Mutex<TokenizeCache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(TokenizeCache::default()));
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    code.hash(&mut hasher);
+    let key: TokenizeKey = (lang.to_owned(), hasher.finish());
+    let mut guard = cache.lock().expect("tokenize cache");
+    if let Some(hit) = guard.entries.get(&key) {
+        return (**hit).clone();
+    }
+    let tokens = Arc::new(ui_highlight::tokenize(lang, code));
+    while guard.entries.len() >= TOKENIZE_CACHE_MAX {
+        if let Some(oldest) = guard.order.pop_front() {
+            guard.entries.remove(&oldest);
+        } else {
+            guard.entries.clear();
+            break;
+        }
+    }
+    guard.order.push_back(key.clone());
+    guard.entries.insert(key, Arc::clone(&tokens));
+    (*tokens).clone()
+}
+
 #[component]
 pub fn MarkdownBody(
     message_id: String,
     content: String,
     #[props(default = true)] handwritten: bool,
+    /// The reply is still streaming: parse without touching the parse
+    /// cache (every token would otherwise mint and evict a cache entry)
+    /// and render trailing unfinished constructs as plain text.
+    #[props(default = false)]
+    streaming: bool,
 ) -> Element {
-    let blocks = use_memo(move || parse_markdown_cached(message_id.as_str(), content.as_str()));
+    // While streaming the parse is not cached: keying the cache by message
+    // id alone would serve a stale half-parsed reply, and keying by content
+    // hash would churn the bounded cache once per token.
+    let blocks = use_memo(move || {
+        if streaming {
+            std::sync::Arc::new(parse_markdown_blocks_streaming(content.as_str()))
+        } else {
+            parse_markdown_cached(message_id.as_str(), content.as_str())
+        }
+    });
     rsx! {
         div { class: "md-body",
             for (idx, block) in blocks().iter().cloned().enumerate() {
@@ -978,7 +1070,7 @@ pub fn MarkdownBody(
                         _ => rsx! { h4 { key: "{idx}", class: "md-h4", InlineMarkdown { text } } },
                     },
                     MdBlock::CodeBlock { lang, code } => rsx! {
-                        CodeBlock { key: "{idx}", lang, code }
+                        CodeBlock { key: "{idx}", lang, code, streaming }
                     },
                     MdBlock::Rule => rsx! {
                         hr { key: "{idx}", class: "md-hr" }
@@ -1305,5 +1397,58 @@ mod tests {
             let parsed = parse_markdown_cached(&id, &format!("msg {idx}"));
             assert_eq!(*parsed, vec![MdBlock::Paragraph(format!("msg {idx}"))]);
         }
+    }
+
+    #[test]
+    fn streaming_renders_unfinished_constructs_as_plain_text() {
+        // An unclosed fence: the fence is hidden, the code so far is plain text.
+        let blocks = parse_markdown_blocks_streaming("```rust\nfn main() {}");
+        assert_eq!(blocks, vec![MdBlock::Paragraph("fn main() {}".into())]);
+        // A closed fence still renders as a code block while streaming.
+        let blocks = parse_markdown_blocks_streaming("```rust\nfn main() {}\n```");
+        assert_eq!(
+            blocks,
+            vec![MdBlock::CodeBlock {
+                lang: "rust".into(),
+                code: "fn main() {}".into(),
+            }]
+        );
+        // An unclosed hand note: the opener is hidden, the lines are plain text.
+        let blocks = parse_markdown_blocks_streaming(":::hand\nSee you soon");
+        assert_eq!(blocks, vec![MdBlock::Paragraph("See you soon".into())]);
+        // A table header whose separator row has not arrived yet is plain
+        // text, not a half-built table.
+        let blocks = parse_markdown_blocks_streaming("| Name | Age |\n");
+        assert_eq!(blocks, vec![MdBlock::Paragraph("| Name | Age |".into())]);
+        // The finished parse keeps the old behaviour for all three.
+        assert_eq!(
+            parse_markdown_blocks("```rust\nfn main() {}"),
+            vec![MdBlock::CodeBlock {
+                lang: "rust".into(),
+                code: "fn main() {}".into(),
+            }]
+        );
+        assert_eq!(
+            parse_markdown_blocks(":::hand\nSee you soon"),
+            vec![MdBlock::Paragraph(":::hand See you soon".into())]
+        );
+    }
+
+    #[test]
+    fn tokenize_is_memoised_on_language_and_code_hash() {
+        let first = tokenize_cached("rust", "fn main() {}");
+        let second = tokenize_cached("rust", "fn main() {}");
+        assert_eq!(first, second);
+        assert!(!first.is_empty());
+        let other_lang = tokenize_cached("not-a-language", "fn main() {}");
+        assert_eq!(
+            other_lang,
+            vec![ui_highlight::Token {
+                kind: ui_highlight::TokenKind::Plain,
+                text: "fn main() {}".into(),
+            }]
+        );
+        let changed = tokenize_cached("rust", "fn other() {}");
+        assert_ne!(first, changed);
     }
 }

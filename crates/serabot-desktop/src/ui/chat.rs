@@ -30,23 +30,24 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         .task
         .as_ref()
         .is_none_or(|task| task.status.terminal());
-    let assigned_library = {
-        let state = session.read();
-        chat_feed::assign_library_to_messages(&state.state.messages, &state.state.library)
-    };
     let awaiting_approval = session
         .read()
         .state
         .task
         .as_ref()
         .is_some_and(|task| task.status == TaskStatus::AwaitingApproval);
+    // Library artifacts per message, cached like the rows below: assigning
+    // them sorts the whole library, so it runs only when the transcript
+    // fingerprint or the library itself changed — never on a streamed token.
+    let library_cache =
+        use_hook(|| Rc::new(RefCell::new(None::<(u64, u64, chat_feed::AssignedLibrary)>)));
     // One prepared row per message: what the transcript draws, the day
     // heading where a new day starts, and which actions it offers. Rows are
     // rebuilt only when something they are drawn from changed: the session
     // signal is written on every poll and streamed token, and most of those
     // writes leave the transcript as it was.
     let row_cache = use_hook(|| Rc::new(RefCell::new(None::<(u64, Rc<Vec<Rc<MsgView>>>)>)));
-    let messages: Rc<Vec<Rc<MsgView>>> = {
+    let (fingerprint, messages): (u64, Rc<Vec<Rc<MsgView>>>) = {
         let state = session.read();
         let fingerprint = chat_feed::transcript_fingerprint(
             &state.state.messages,
@@ -80,7 +81,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             .filter(|(key, _)| *key == fingerprint)
             .map(|(_, rows)| Rc::clone(rows));
         match cached {
-            Some(rows) => rows,
+            Some(rows) => (fingerprint, rows),
             None => {
                 let last_user = state
                     .state
@@ -139,7 +140,11 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     rows.push(Rc::new(MsgView {
                         id: message.id.clone(),
                         user,
-                        haystack: chat_feed::search_haystack(&message.content, &speaker),
+                        haystack: chat_feed::cached_search_haystack(
+                            &message.id,
+                            &message.content,
+                            &speaker,
+                        ),
                         speaker,
                         avatar,
                         bot,
@@ -164,7 +169,40 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                 }
                 let rows = Rc::new(rows);
                 *row_cache.borrow_mut() = Some((fingerprint, Rc::clone(&rows)));
-                rows
+                (fingerprint, rows)
+            }
+        }
+    };
+    // Library assignment behind the row-cache hit (0.74.10): the fingerprint
+    // is the transcript's, the digest is the library's (its entries' hashes
+    // and stamps), so a new artifact still re-assigns while a streamed
+    // token does not.
+    let assigned_library = {
+        let state = session.read();
+        let library_digest = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            state.state.library.len().hash(&mut hasher);
+            for entry in &state.state.library {
+                entry.hash.hash(&mut hasher);
+                entry.created_at.hash(&mut hasher);
+            }
+            hasher.finish()
+        };
+        let cached = library_cache
+            .borrow()
+            .as_ref()
+            .filter(|(key, digest, _)| *key == fingerprint && *digest == library_digest)
+            .map(|(_, _, assigned)| assigned.clone());
+        match cached {
+            Some(assigned) => assigned,
+            None => {
+                let assigned = chat_feed::assign_library_to_messages(
+                    &state.state.messages,
+                    &state.state.library,
+                );
+                *library_cache.borrow_mut() = Some((fingerprint, library_digest, assigned.clone()));
+                assigned
             }
         }
     };
@@ -413,30 +451,76 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let waiting_reason = latest_switch
         .as_ref()
         .map(|event| serabot_desktop::route_editor::reason_text(&event.reason).to_owned());
-    // Another bot working in this conversation is a handoff: the Jobs panel
-    // already decides what counts, so the card reuses its rule and its name.
-    let delegate_bot: Option<String> = {
+    // Another bot working in this conversation is a handoff, derived from
+    // the handoff ledger (`runs.rows`): a row that started and has not
+    // completed yet. Never from the WorkingBots rings, which also fire for
+    // the chat's own turn. The card names the first handoff and counts the
+    // rest, so parallel handoffs stay visible as one card.
+    let (delegate_bot, delegate_count): (Option<String>, usize) = {
         let state = session.read();
-        let items = serabot_desktop::jobs::build(
-            state.state.task.as_ref(),
-            &state.state.media_jobs,
-            &state.state.working,
-            &state.state.activity,
-            &state.conversation,
-            &state.state.jobs_reliability,
-            Instant::now(),
-        );
-        items
-            .iter()
-            .find(|item| item.kind == serabot_desktop::jobs::JobKind::Handoff)
-            .map(|item| state.bot_display_name(&item.bot))
+        let own = state
+            .conversation
+            .strip_prefix("dir:")
+            .unwrap_or(&state.conversation);
+        let bots: Vec<String> = serabot_desktop::runs::active_handoff_bots(&state.state.runs.rows)
+            .into_iter()
+            .filter(|bot| bot != own)
+            .collect();
+        let count = bots.len();
+        let first = bots
+            .into_iter()
+            .next()
+            .map(|bot| state.bot_display_name(&bot));
+        (first, count)
     };
+    let needs_review = session
+        .read()
+        .state
+        .task
+        .as_ref()
+        .is_some_and(|task| task.status == TaskStatus::NeedsReview);
     let streaming_reply = session
         .read()
         .state
         .messages
         .last()
         .is_some_and(|message| message.role != Role::User);
+    // The message still being written, if any: its markdown renders in
+    // streaming mode (unfinished constructs as plain text, no Copy button).
+    let streaming_message_id: Option<String> = live_task
+        .is_some()
+        .then(|| {
+            session
+                .read()
+                .state
+                .messages
+                .last()
+                .filter(|message| message.role != Role::User)
+                .map(|message| message.id.clone())
+        })
+        .flatten();
+    // Context fill of the latest turn, shown in the chat itself (not only
+    // in the model popover). The ledger already skips child turns: a child
+    // turn's context never becomes the latest one.
+    let (chat_ctx_percent, chat_ctx_title) = {
+        let state = session.read();
+        match state.state.turns.latest_context() {
+            Some(context) if context.percent.is_some() => {
+                let window = context
+                    .window
+                    .map(|w| w.to_string())
+                    .unwrap_or_else(|| "unknown".to_owned());
+                (
+                    context.percent,
+                    format!(
+                        "~{} chars of {} context used by the latest turn",
+                        context.prompt_chars_est, window
+                    ),
+                )
+            }
+            _ => (None, String::new()),
+        }
+    };
     let live_card: Option<LiveCardData> = (live_task.is_some() || wait_line.is_some()).then(|| {
         let activity = session.read().state.activity.clone();
         derive_live_card(LiveCardInputs {
@@ -449,6 +533,8 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                 .as_ref()
                 .map(|(from, to)| (from.as_str(), to.as_str())),
             delegate_bot: delegate_bot.as_deref(),
+            delegate_count,
+            needs_review,
             streaming_reply,
             failed: false,
             now: Instant::now(),
@@ -464,6 +550,8 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             waiting_reason: None,
             failover: None,
             delegate_bot: None,
+            delegate_count: 0,
+            needs_review: false,
             streaming_reply: false,
             failed: true,
             now: Instant::now(),
@@ -516,6 +604,20 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     // The recorder is owned by the signal but taken out for every capture, so
     // no borrow of the signal is alive across an await point.
     let mut recorder = use_signal(MicRecorder::new);
+    // One tick a second while recording, for the elapsed timer. `record_tick`
+    // counts ticks since the page loaded; the value at the start of a take is
+    // remembered so the label shows only this recording's time.
+    let mut record_tick = use_signal(|| 0u64);
+    let mut record_tick_start = use_signal(|| 0u64);
+    use_future(move || async move {
+        let mut sink = dioxus::document::eval(crate::ui_files::RECORD_TICK_JS);
+        while let Ok(true) = sink.recv::<bool>().await {
+            record_tick.set(record_tick() + 1);
+        }
+    });
+    // Up/Down history cycling: the index into the owner's messages already
+    // recalled into the box (`None` while nothing is recalled).
+    let mut recall_idx = use_signal(|| Option::<usize>::None);
     // Composer pickers: `Some(query)` while a bare `@query` (mention) or a
     // line-leading `/query` (skill/tool) is being typed.
     let mut mention = use_signal(|| Option::<String>::None);
@@ -531,6 +633,11 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let mut feed_anchor = use_signal(|| Option::<String>::None);
     let feed_ids = use_hook(|| Rc::new(RefCell::new(Vec::<String>::new())));
     let feed_ids_sink = Rc::clone(&feed_ids);
+    // Start of the window as last drawn: with no anchor reported yet, the
+    // window keeps this instead of jumping to the tail.
+    let last_feed_start = use_hook(|| Rc::new(RefCell::new(None::<usize>)));
+    let last_feed_start_render = Rc::clone(&last_feed_start);
+    let last_feed_start_reset = Rc::clone(&last_feed_start);
     let mut feed_reported = use_signal(|| Option::<usize>::None);
     let mut last_count = use_signal(|| 0usize);
     // The conversation the scroll state was last reset for, and the last
@@ -556,6 +663,9 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let ChatFindOpen(mut search_open) = use_context::<ChatFindOpen>();
     use_drop(move || search_open.set(false));
     let mut search_query = use_signal(String::new);
+    // Which search match the jump buttons are on (0-based, into the
+    // matching rows in transcript order).
+    let mut search_idx = use_signal(|| 0usize);
     // Keyed by (message, attempt): the same sentence after another failed
     // send is a new failure and shows again.
     let mut dismissed_failure = use_signal(|| Option::<(String, u64)>::None);
@@ -675,6 +785,8 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     // is keyed by conversation, so this runs once per switch.
     use_effect(focus_composer);
     let transcript_error = session.read().state.transcript_error.clone();
+    let transcript_loading = session.read().state.transcript_loading;
+    let last_audio_kept = session.read().last_audio.is_some();
     let chat_failure = session.read().state.chat_failure.clone();
     let held_draft = session.read().state.held_draft.is_some();
     let failure_attempt = session.read().state.failure_attempt;
@@ -715,6 +827,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         let mut session = session;
         let mut composer = session.write();
         composer.state.transcript = None;
+        composer.clear_last_audio();
         let next = if composer.composer.trim().is_empty() {
             text
         } else {
@@ -742,13 +855,16 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         at_bottom.set(true);
         unseen.set(0);
         feed_anchor.set(None);
+        *last_feed_start_reset.borrow_mut() = None;
         feed_reported.set(None);
         mention.set(None);
         mention_idx.set(0);
         slash.set(None);
         slash_idx.set(0);
+        recall_idx.set(None);
         confirm_regen.set(None);
         search_query.set(String::new());
+        search_idx.set(0);
         search_open.set(false);
         dismissed_failure.set(None);
         dismissed_held.set(false);
@@ -838,7 +954,12 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         } else if let Some(force_pin) =
             chat_scroll::transcript_pin_action(previous, count, own_send, streaming_growth)
         {
-            let _ = dioxus::document::eval(&chat_scroll::pin_messages_js(force_pin));
+            // While following, the bridge already snaps to the bottom on
+            // growth: a soft pin from Rust is a redundant eval per streamed
+            // token. A forced pin (the owner's own send) still goes through.
+            if force_pin || !*at_bottom.peek() {
+                let _ = dioxus::document::eval(&chat_scroll::pin_messages_js(force_pin));
+            }
         }
     });
     {
@@ -939,6 +1060,15 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     };
     let slash_total = slash_skills.len() + slash_tools.len() + slash_actions.len();
     let slash_active = slash_idx().min(slash_total.saturating_sub(1));
+    // The picker row keyboard focus is on, for the textarea's
+    // `aria-activedescendant`.
+    let active_descendant = if show_mention && mention_total > 0 {
+        Some(format!("mention-item-{mention_active}"))
+    } else if show_slash && slash_total > 0 {
+        Some(format!("slash-item-{slash_active}"))
+    } else {
+        None
+    };
     // Copies for the key handler closures (they move their captures).
     let key_mention_bots = mention_bots.clone();
     let key_mention_conns = mention_conns.clone();
@@ -949,6 +1079,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let composer_chars = composer_text.chars().count();
     let length_note = chat_compose::length_message(composer_chars);
     let over_limit = composer_chars > chat_compose::MAX_TEXT_CHARS;
+    let record_elapsed = record_tick().saturating_sub(record_tick_start());
     let composer_file_count = session.read().composer_files.len();
     let busy = session.read().uploading || session.read().upload_pending() > 0;
     let send_ready = chat_compose::can_submit(&composer_text, composer_file_count, busy);
@@ -956,13 +1087,42 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let message_count = messages.len();
     let search_needle = search_query().trim().to_lowercase();
     let search_active = search_open() && !search_needle.is_empty();
-    let search_match_count = if search_active {
+    // The ids of the matching rows, in transcript order: next/prev jumps
+    // walk this list and set the feed anchor to the match.
+    let search_match_ids: Vec<String> = if search_active {
         messages
             .iter()
             .filter(|row| chat_feed::row_matches(&row.haystack, &search_needle))
-            .count()
+            .map(|row| row.id.clone())
+            .collect()
     } else {
-        0
+        Vec::new()
+    };
+    let search_match_count = search_match_ids.len();
+    // Copies for the search key/button closures (they move their captures).
+    let search_ids_for_keys = search_match_ids.clone();
+    let search_ids_for_prev = search_match_ids.clone();
+    let search_ids_for_next = search_match_ids.clone();
+    // Jump to one match: the feed anchor centres the window on it, follow
+    // turns off, and the page scrolls the row into view once it is drawn.
+    // Takes the signals as arguments so the closure captures nothing and
+    // stays Fn — it is called from three separate event handlers.
+    let jump_to_search_match = |index: usize,
+                                ids: Vec<String>,
+                                mut search_idx: Signal<usize>,
+                                mut feed_anchor: Signal<Option<String>>,
+                                mut at_bottom: Signal<bool>| {
+        let Some(id) = ids.get(index).cloned() else {
+            return;
+        };
+        search_idx.set(index);
+        feed_anchor.set(Some(id.clone()));
+        at_bottom.set(false);
+        if let Ok(id_json) = serde_json::to_string(&id) {
+            let _ = dioxus::document::eval(&format!(
+                "requestAnimationFrame(() => requestAnimationFrame(() => {{ const el = document.querySelector('.msg[data-row-id=' + {id_json} + ']'); if (el) el.scrollIntoView({{ block: 'center' }}); }}));"
+            ));
+        }
     };
     // Each row with the class it is drawn with this time (entrance animation
     // once per row, search highlight), its bot chips and its media cards.
@@ -1015,7 +1175,14 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         let anchor = feed_anchor.read().as_deref().and_then(|id| {
             feed_view::anchor_index(row_views.iter().map(|view| view.row.id.as_str()), id)
         });
-        feed_view::feed_window(row_views.len(), anchor, at_bottom())
+        let window = feed_view::feed_window(
+            row_views.len(),
+            anchor,
+            at_bottom(),
+            *last_feed_start_render.borrow(),
+        );
+        *last_feed_start_render.borrow_mut() = Some(window.start);
+        window
     };
     if is_one_to_one
         && let Some(bot_id) = active_bot.clone()
@@ -1114,12 +1281,25 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                 r#type: "text",
                                 placeholder: "Search in conversation\u{2026}",
                                 value: "{search_query()}",
-                                oninput: move |event| search_query.set(event.value()),
+                                oninput: move |event| {
+                                    search_query.set(event.value());
+                                    search_idx.set(0);
+                                },
                                 onkeydown: move |event: KeyboardEvent| {
                                     if event.key() == Key::Escape {
                                         event.prevent_default();
                                         search_query.set(String::new());
                                         search_open.set(false);
+                                    } else if event.key() == Key::Enter && search_match_count > 0 {
+                                        event.prevent_default();
+                                        let total = search_match_count;
+                                        let ids = search_ids_for_keys.clone();
+                                        let next = if event.modifiers().contains(Modifiers::SHIFT) {
+                                            (search_idx() + total - 1) % total
+                                        } else {
+                                            (search_idx() + 1) % total
+                                        };
+                                        jump_to_search_match(next, ids, search_idx, feed_anchor, at_bottom);
                                     }
                                 },
                             }
@@ -1130,6 +1310,38 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     } else {
                                         "{search_match_count} matches"
                                     }
+                                }
+                                button {
+                                    class: "btn ghost sm chat-find-jump",
+                                    r#type: "button",
+                                    title: "Previous match (Shift+Enter)",
+                                    "aria-label": "Previous match",
+                                    onclick: move |_| {
+                                        let total = search_match_count;
+                                        if total == 0 {
+                                            return;
+                                        }
+                                        let ids = search_ids_for_prev.clone();
+                                        let prev = (search_idx() + total - 1) % total;
+                                        jump_to_search_match(prev, ids, search_idx, feed_anchor, at_bottom);
+                                    },
+                                    Icon { name: "chevron-up", size: 13 }
+                                }
+                                button {
+                                    class: "btn ghost sm chat-find-jump",
+                                    r#type: "button",
+                                    title: "Next match (Enter)",
+                                    "aria-label": "Next match",
+                                    onclick: move |_| {
+                                        let total = search_match_count;
+                                        if total == 0 {
+                                            return;
+                                        }
+                                        let ids = search_ids_for_next.clone();
+                                        let next = (search_idx() + 1) % total;
+                                        jump_to_search_match(next, ids, search_idx, feed_anchor, at_bottom);
+                                    },
+                                    Icon { name: "chevron-down", size: 13 }
                                 }
                             }
                             button {
@@ -1349,6 +1561,8 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     .turn
                                     .as_deref()
                                     .and_then(|turn| traced_turn(&session.read(), turn)),
+                                streaming: streaming_message_id.as_deref()
+                                    == Some(view.row.id.as_str()),
                                 row: view.row,
                                 class: view.class,
                                 bot_meta: view.bot_meta,
@@ -1489,6 +1703,23 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     // is at the end of the conversation.
                     div { id: "messages-end", class: "messages-end", "aria-hidden": "true" }
                 }
+                // Context used by the latest turn, visible in the chat itself
+                // (not only in the model popover): a thin meter above the
+                // composer, so a reply that is about to run out of room is
+                // obvious before the next message is sent.
+                if let Some(p) = chat_ctx_percent {
+                    div {
+                        class: "ctx-meter chat-ctx-meter",
+                        role: "progressbar",
+                        "aria-label": "Context used by the latest turn",
+                        "aria-valuemin": "0",
+                        "aria-valuemax": "100",
+                        "aria-valuenow": "{p}",
+                        title: "{chat_ctx_title}",
+                        div { class: "ctx-fill", style: "width: {p}%;" }
+                        span { class: "tiny muted", "Context {p}%" }
+                    }
+                }
                 div { class: "composer-wrap",
                     // Inside the composer block, so it always sits just above it, at
                     // any composer height.
@@ -1605,6 +1836,15 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     if let Some(message) = show_transcript_error {
                         div { class: "banner err", role: "alert",
                             span { "{message}" }
+                            if last_audio_kept {
+                                button {
+                                    class: "btn ghost sm",
+                                    r#type: "button",
+                                    "aria-label": "Try transcribing the voice note again",
+                                    onclick: move |_| session.write().retry_transcribe(),
+                                    "Retry transcription"
+                                }
+                            }
                             button {
                                 class: "btn ghost sm chat-banner-close",
                                 r#type: "button",
@@ -1613,6 +1853,12 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                 onclick: move |_| dismissed_transcript_err.set(Some(message.clone())),
                                 Icon { name: "x", size: 13 }
                             }
+                        }
+                    }
+                    if transcript_loading {
+                        div { class: "composer-count", role: "status",
+                            span { class: "spinner", "aria-hidden": "true" }
+                            "Transcribing voice note\u{2026}"
                         }
                     }
                     if let Some(matched) = sensitive_draft.clone() {
@@ -1653,6 +1899,8 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                             id: "composer-input",
                             rows: 1,
                             "aria-label": "Message",
+                            "aria-describedby": if length_note.is_some() { Some("composer-count") } else { None },
+                            "aria-activedescendant": active_descendant,
                             value: "{composer_text}",
                             placeholder: if accepts { format!("Message {active_name}…") } else { "This node does not accept turns".into() },
                             disabled: !accepts,
@@ -1661,13 +1909,22 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                 composer_focused.set(false);
                                 let draft = composer_draft();
                                 if session.peek().composer != draft {
-                                    session.write().composer = draft;
+                                    let mut session = session.write();
+                                    session.composer = draft.clone();
+                                    // Clone the conversation first: store()
+                                    // takes &mut self, so the conversation
+                                    // cannot be borrowed from the same guard
+                                    // in the same call.
+                                    let conversation = session.conversation.clone();
+                                    session.drafts.store(&conversation, &draft);
+                                    session.persist_composer_state();
                                 }
                             },
                             oninput: move |event| {
                                 let value = event.value();
                                 confirm_regen.set(None);
                                 composer_draft.set(value.clone());
+                                recall_idx.set(None);
                                 mention.set(mention_query(&value));
                                 mention_idx.set(0);
                                 slash.set(slash_query(&value));
@@ -1712,6 +1969,20 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                 let mention_open = mention().is_some() && slash().is_none();
                                 let slash_open = slash().is_some();
                                 if (mention_open || slash_open) && !event.is_composing() {
+                                    let total = if mention_open {
+                                        key_mention_bots.len() + key_mention_conns.len()
+                                    } else {
+                                        key_slash_actions.len()
+                                            + key_slash_skills.len()
+                                            + key_slash_tools.len()
+                                    };
+                                    if total == 0 {
+                                        // No match: close the picker and let the
+                                        // key behave as usual — Enter sends,
+                                        // Tab moves focus — instead of swallowing it.
+                                        mention.set(None);
+                                        slash.set(None);
+                                    } else {
                                     match event.key() {
                                         Key::ArrowDown => {
                                             event.prevent_default();
@@ -1807,6 +2078,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                         _ => {}
                                     }
                                     return;
+                                    }
                                 }
                                 // Esc stops a running reply, like the Stop button.
                                 if event.key() == Key::Escape
@@ -1817,8 +2089,12 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     session.write().stop_turn_or_runs();
                                     return;
                                 }
-                                // Up in an empty composer recalls the last message.
-                                if event.key() == Key::ArrowUp && composer_draft().is_empty() {
+                                // Up/Down cycles through the owner's messages:
+                                // Up to older ones, Down back toward newer,
+                                // and past the newest the box is empty again.
+                                if (event.key() == Key::ArrowUp && composer_draft().is_empty())
+                                    || (event.key() == Key::ArrowDown && recall_idx().is_some())
+                                {
                                     let texts: Vec<String> = session
                                         .read()
                                         .state
@@ -1826,10 +2102,18 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                         .iter()
                                         .filter(|message| message.role == Role::User)
                                         .map(|message| message.content.clone())
+                                        .filter(|text| !text.trim().is_empty())
                                         .collect();
                                     let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-                                    if let Some(text) = chat_compose::recall_text(&refs) {
+                                    let (index, text) = if event.key() == Key::ArrowUp {
+                                        chat_compose::recall_up(&refs, recall_idx())
+                                    } else {
+                                        chat_compose::recall_down(&refs, recall_idx())
+                                    };
+                                    if index.is_some() || event.key() == Key::ArrowDown {
                                         event.prevent_default();
+                                        recall_idx.set(index);
+                                        let text = text.unwrap_or_default();
                                         composer_draft.set(text.clone());
                                         session.write().replace_composer(text);
                                     }
@@ -1847,6 +2131,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     ) {
                                         event.prevent_default();
                                         // While a reply runs, Enter queues the message.
+                                        recall_idx.set(None);
                                         let mut s = session.write();
                                         s.composer = composer_draft();
                                         s.send_or_queue();
@@ -1858,8 +2143,22 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                         if let Some(note) = length_note.clone() {
                             div {
                                 class: if over_limit { "composer-count over" } else { "composer-count" },
+                                id: "composer-count",
                                 role: "status",
                                 "{note}"
+                            }
+                            if over_limit {
+                                button {
+                                    class: "btn ghost sm",
+                                    r#type: "button",
+                                    title: "Send the text as a message.txt file instead",
+                                    "aria-label": "Attach the message text as a file",
+                                    onclick: move |_| {
+                                        session.write().attach_composer_as_file();
+                                        composer_draft.set(session.read().composer.clone());
+                                    },
+                                    "Attach as file"
+                                }
                             }
                         }
                         div { class: "composer-row",
@@ -1916,6 +2215,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                             let filename = device.filename().to_owned();
                                             recorder.set(device);
                                             recording.set(false);
+                                            let _ = dioxus::document::eval(crate::ui_files::record_tick_stop_script()).await;
                                             match result {
                                                 Ok(bytes) => {
                                                     session.write().transcribe_audio(filename, bytes);
@@ -1931,6 +2231,8 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                             match result {
                                                 Ok(()) => {
                                                     recording.set(true);
+                                                    record_tick_start.set(record_tick());
+                                                    let _ = dioxus::document::eval(crate::ui_files::record_tick_start_script()).await;
                                                     session.write().state.transcript_error = None;
                                                 }
                                                 Err(message) => {
@@ -1940,6 +2242,24 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                         }
                                     },
                                     Icon { name: if recording() { "check" } else { "mic" }, size: 16 }
+                                }
+                                if recording() {
+                                    span { class: "recording-timer", role: "timer",
+                                        "Recording {record_elapsed / 60}:{record_elapsed % 60:02}"
+                                    }
+                                    button {
+                                        class: "composer-mic",
+                                        title: "Cancel recording",
+                                        "aria-label": "Cancel recording",
+                                        onclick: move |_| async move {
+                                            let mut device = recorder.take();
+                                            device.cancel().await;
+                                            recorder.set(device);
+                                            recording.set(false);
+                                            let _ = dioxus::document::eval(crate::ui_files::record_tick_stop_script()).await;
+                                        },
+                                        Icon { name: "x", size: 16 }
+                                    }
                                 }
                                 button {
                                     class: "composer-mic",
@@ -2035,7 +2355,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     mention_idx.set(0);
                                 },
                             }
-                            div { class: "pop-list",
+                            div { class: "pop-list", role: "listbox", "aria-label": "Mention a bot or connector",
                                 if mention_total == 0 {
                                     div { class: "pop-empty", "No bots or connectors match." }
                                 }
@@ -2044,6 +2364,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     for (index, (id, name, avatar)) in mention_bots.iter().enumerate() {
                                         button {
                                             key: "{id}",
+                                            id: "mention-item-{index}",
                                             class: if index == mention_active { "pop-item active" } else { "pop-item" },
                                             onclick: {
                                                 let id = id.clone();
@@ -2067,6 +2388,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     for (offset, cid) in mention_conns.iter().enumerate() {
                                         button {
                                             key: "{cid}",
+                                            id: "mention-item-{mention_bots.len() + offset}",
                                             class: if mention_bots.len() + offset == mention_active { "pop-item active" } else { "pop-item" },
                                             onclick: {
                                                 let cid = cid.clone();
@@ -2098,7 +2420,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     slash_idx.set(0);
                                 },
                             }
-                            div { class: "pop-list",
+                            div { class: "pop-list", role: "listbox", "aria-label": "Commands, skills and tools",
                                 if slash_total == 0 {
                                     div { class: "pop-empty", "No commands, skills or tools match." }
                                 }
@@ -2107,6 +2429,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     for (index, (command, description, _)) in slash_actions.iter().enumerate() {
                                         button {
                                             key: "{command}",
+                                            id: "slash-item-{index}",
                                             class: if index == slash_active { "pop-item active" } else { "pop-item" },
                                             onclick: {
                                                 let command = (*command).to_owned();
@@ -2129,6 +2452,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     for (index, (id, name, description)) in slash_skills.iter().enumerate() {
                                         button {
                                             key: "{id}",
+                                            id: "slash-item-{slash_actions.len() + index}",
                                             class: if slash_actions.len() + index == slash_active { "pop-item active" } else { "pop-item" },
                                             onclick: {
                                                 let id = id.clone();
@@ -2157,6 +2481,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     for (offset, tool) in slash_tools.iter().enumerate() {
                                         button {
                                             key: "{tool}",
+                                            id: "slash-item-{slash_actions.len() + slash_skills.len() + offset}",
                                             class: if slash_actions.len() + slash_skills.len() + offset == slash_active { "pop-item active" } else { "pop-item" },
                                             onclick: {
                                                 let tool = tool.to_string();
@@ -2201,6 +2526,9 @@ fn MessageRow(
     media: Vec<serabot_desktop::LibraryEntry>,
     accepts: bool,
     handwritten: bool,
+    /// This row is the reply still streaming in: unfinished markdown
+    /// renders as plain text and code blocks hide their Copy button.
+    streaming: bool,
     mut copied: Signal<Option<String>>,
     mut confirm_regen: Signal<Option<String>>,
     mut task_added_ids: Signal<HashSet<String>>,
@@ -2238,7 +2566,7 @@ fn MessageRow(
                     TurnTraceBlock { session, trace }
                 }
                 div { class: "msg-body", title: "{row.stamp}",
-                    MarkdownBody { message_id: row.id.clone(), content: row.content.clone(), handwritten }
+                    MarkdownBody { message_id: row.id.clone(), content: row.content.clone(), handwritten, streaming }
                     if row.user {
                         MessageFiles { session, id: row.id.clone() }
                     }

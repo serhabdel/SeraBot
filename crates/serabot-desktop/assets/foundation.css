@@ -300,6 +300,12 @@
   text-align: right;
 }
 
+.composer-wrap .recording-timer {
+  align-self: center;
+  font-variant-numeric: tabular-nums;
+  color: var(--label-2);
+}
+
 /* Chats per bot in the sidebar (PR-F). */
 .thread .row-chevron {
   flex: 0 0 20px;

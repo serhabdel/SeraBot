@@ -57,17 +57,21 @@ pub fn conversation_switched(current: &str, seen: &str) -> bool {
 /// Whether the chat view should call the scroll pin bridge after a transcript or
 /// activity change, and whether to force stick-to-bottom.
 ///
-/// Only the owner's own send or a freshly opened conversation forces a jump.
-/// Streaming growth pins softly: the bridge follows only while it still knows
-/// the reader is at the bottom, so scrolling up is never overridden by a stale
-/// Rust-side flag.
+/// Only the owner's own send forces a jump. A first load does NOT force a
+/// pin: the JS bridge may hold a saved non-following position for this chat
+/// (`pending` restore in [`CHAT_SCROLL_BRIDGE_JS`]), and a forced pin would
+/// clear it and drag the reader to the bottom. The bridge already snaps to
+/// the bottom on a fresh conversation with no saved position, so a soft pin
+/// here is enough. Streaming growth pins softly: the bridge follows only
+/// while it still knows the reader is at the bottom, so scrolling up is
+/// never overridden by a stale Rust-side flag.
 pub fn transcript_pin_action(
     previous_count: usize,
     count: usize,
     own_send: bool,
     streaming_growth: bool,
 ) -> Option<bool> {
-    let force_pin = own_send || previous_count == 0;
+    let force_pin = own_send;
     if force_pin || count != previous_count || streaming_growth {
         Some(force_pin)
     } else {
@@ -143,6 +147,11 @@ pub const CHAT_SCROLL_BRIDGE_JS: &str = r#"
 
   // Put a remembered position back once the page is tall enough; wait while the
   // transcript is still empty so network history arrival has time to render.
+  // There is no cap on waiting for the first rows: history can take a while
+  // to arrive, and capping the wait dropped the
+  // restore and left the reader at the bottom instead. Once rows exist, the
+  // restore waits at most 40 frames for the page to grow tall enough, then
+  // puts the position back anyway.
   const tryRestore = () => {
     const b = box();
     if (!b || !pending) return;
@@ -152,9 +161,8 @@ pub const CHAT_SCROLL_BRIDGE_JS: &str = r#"
     }
     const hasRows = b.querySelector(':scope > .msg') !== null;
     if (hasRows) pending.tries += 1;
-    else pending.waitTries = (pending.waitTries || 0) + 1;
     const room = b.scrollHeight - b.clientHeight;
-    if ((hasRows && room >= pending.top) || pending.tries > 40 || pending.waitTries > 180) {
+    if ((hasRows && room >= pending.top) || pending.tries > 40) {
       b.scrollTop = Math.min(pending.top, Math.max(0, room));
       lastTop = b.scrollTop;
       lastHeight = b.scrollHeight;
@@ -193,7 +201,7 @@ pub const CHAT_SCROLL_BRIDGE_JS: &str = r#"
     lastHeight = b.scrollHeight;
     const memory = saved[nextConv];
     if (memory && memory.stick === false) {
-      pending = { conv: nextConv, top: memory.top, tries: 0, waitTries: 0 };
+      pending = { conv: nextConv, top: memory.top, tries: 0 };
       follow = false;
     } else {
       pending = null;
@@ -492,9 +500,12 @@ mod tests {
     }
 
     #[test]
-    fn own_send_and_first_load_force_a_jump() {
+    fn own_send_forces_a_jump_first_load_does_not() {
         assert_eq!(transcript_pin_action(3, 4, true, false), Some(true));
-        assert_eq!(transcript_pin_action(0, 5, false, false), Some(true));
+        // A first load is a soft pin at most: the bridge may be restoring a
+        // saved non-following position, and a force would clear it.
+        assert_eq!(transcript_pin_action(0, 5, false, false), Some(false));
+        assert_eq!(transcript_pin_action(0, 0, false, false), None);
     }
 
     #[test]
@@ -569,6 +580,14 @@ mod tests {
     fn switch_is_detected_only_on_a_different_conversation() {
         assert!(!conversation_switched("dir:main", "dir:main"));
         assert!(conversation_switched("dir:legal", "dir:main"));
+    }
+
+    #[test]
+    fn bridge_restore_waits_for_history_without_a_frame_cap() {
+        // While the transcript is still empty the restore must not give up:
+        // no waitTries counter on the pending restore.
+        assert!(!CHAT_SCROLL_BRIDGE_JS.contains("waitTries"));
+        assert!(CHAT_SCROLL_BRIDGE_JS.contains("pending.tries > 40"));
     }
 
     #[test]

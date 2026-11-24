@@ -3,7 +3,9 @@
 //! policy and the length counter. Pure functions, so the rules are tested
 //! without a window.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+
+use serde::{Deserialize, Serialize};
 
 use crate::{MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS, valid_attachment_name};
 
@@ -81,7 +83,8 @@ pub fn admit_files(held: Held, incoming: &[(&str, u64)]) -> Admission {
 /// Text drafts keyed by conversation id. Memory only: a draft lasts for the
 /// running app and follows the conversation it was typed in. Files are never
 /// kept here; they belong to the upload that produced them.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Drafts {
     texts: HashMap<String, String>,
 }
@@ -703,8 +706,16 @@ pub fn task_title_from_message(content: &str) -> String {
 /// Most messages one conversation's queue holds.
 pub const MAX_QUEUED: usize = 8;
 
+/// Most characters one persisted draft keeps (a pathological paste is cut,
+/// not lost entirely, and the file stays small).
+pub const MAX_PERSISTED_DRAFT_CHARS: usize = 32_768;
+
+/// Most conversations whose drafts and queues are kept on disk.
+pub const MAX_PERSISTED_CONVERSATIONS: usize = 64;
+
 /// A message waiting for the running reply to end.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct QueuedMessage {
     pub id: u64,
     pub text: String,
@@ -712,6 +723,9 @@ pub struct QueuedMessage {
     pub target: Option<String>,
     /// "Steer": the running reply is stopped so this goes next.
     pub steer: bool,
+    /// Files already uploaded for this message. The bytes live on the
+    /// server, so a queued message can carry them like a sent one.
+    pub attachments: Vec<crate::AttachmentInfo>,
 }
 
 /// Why a message did not enter the queue.
@@ -735,7 +749,8 @@ impl QueueRefusal {
 /// Messages typed while a reply runs. They go out one at a time, in order,
 /// when the conversation is idle. While one is being edited the queue holds:
 /// the front message is never sent from under the owner's cursor.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SendQueue {
     items: Vec<QueuedMessage>,
     next_id: u64,
@@ -745,6 +760,10 @@ pub struct SendQueue {
 impl SendQueue {
     pub fn items(&self) -> &[QueuedMessage] {
         &self.items
+    }
+
+    pub fn items_mut(&mut self) -> &mut [QueuedMessage] {
+        &mut self.items
     }
 
     pub fn len(&self) -> usize {
@@ -776,6 +795,17 @@ impl SendQueue {
     }
 
     pub fn push(&mut self, text: &str, target: Option<String>) -> Result<u64, QueueRefusal> {
+        self.push_with_attachments(text, target, Vec::new())
+    }
+
+    /// Queue text with files already uploaded for it. Files still
+    /// uploading are never queued: only finished uploads have an id.
+    pub fn push_with_attachments(
+        &mut self,
+        text: &str,
+        target: Option<String>,
+        attachments: Vec<crate::AttachmentInfo>,
+    ) -> Result<u64, QueueRefusal> {
         let text = Self::check(text)?;
         if self.items.len() >= MAX_QUEUED {
             return Err(QueueRefusal::Full);
@@ -787,6 +817,7 @@ impl SendQueue {
             text,
             target,
             steer: false,
+            attachments: attachments.into_iter().take(MAX_ATTACHMENTS).collect(),
         });
         Ok(id)
     }
@@ -879,7 +910,8 @@ impl SendQueue {
 }
 
 /// Queues by conversation id, kept while the app runs like the drafts.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Queues {
     by_conversation: HashMap<String, SendQueue>,
 }
@@ -905,6 +937,167 @@ impl Queues {
     pub fn waiting(&self) -> Vec<&str> {
         self.by_conversation.keys().map(String::as_str).collect()
     }
+}
+
+/// One conversation's composer files: uploaded attachments plus the bytes
+/// still waiting to upload.
+pub type ComposerFilesEntry = (Vec<crate::AttachmentInfo>, VecDeque<(String, Vec<u8>)>);
+
+/// Uploaded files and files still waiting to upload, held per conversation
+/// while the app runs: switching chats no longer drops the composer's files.
+/// In memory only — the bytes are never written to disk by this stash.
+#[derive(Debug, Default)]
+pub struct ComposerFilesStash {
+    by_conversation: HashMap<String, ComposerFilesEntry>,
+}
+
+impl ComposerFilesStash {
+    /// Put a conversation's files away (empty sets are not kept).
+    pub fn stash(
+        &mut self,
+        conversation: &str,
+        files: Vec<crate::AttachmentInfo>,
+        pending: VecDeque<(String, Vec<u8>)>,
+    ) {
+        if files.is_empty() && pending.is_empty() {
+            self.by_conversation.remove(conversation);
+        } else {
+            self.by_conversation
+                .insert(conversation.to_owned(), (files, pending));
+        }
+    }
+
+    /// Take a conversation's files back (empty when nothing was stashed).
+    pub fn restore(&mut self, conversation: &str) -> ComposerFilesEntry {
+        self.by_conversation
+            .remove(conversation)
+            .unwrap_or_default()
+    }
+}
+
+/// Up/Down history cycling: `texts` are the owner's non-blank messages,
+/// oldest to newest, and `current` is the index already recalled (`None`
+/// while nothing is recalled). Up moves to an older message, Down moves
+/// toward newer ones and past the newest clears the box again. Returns the
+/// new index and the text to show (`None` means an empty composer).
+pub fn recall_up(texts: &[&str], current: Option<usize>) -> (Option<usize>, Option<String>) {
+    if texts.is_empty() {
+        return (None, None);
+    }
+    let index = match current {
+        None => texts.len() - 1,
+        Some(index) => index.saturating_sub(1),
+    };
+    (Some(index), Some(texts[index].to_owned()))
+}
+
+pub fn recall_down(texts: &[&str], current: Option<usize>) -> (Option<usize>, Option<String>) {
+    let Some(index) = current else {
+        return (None, None);
+    };
+    if index + 1 < texts.len() {
+        let next = index + 1;
+        (Some(next), Some(texts[next].to_owned()))
+    } else {
+        (None, None)
+    }
+}
+
+/// Drafts and queues as they are written to disk: text only, never secrets.
+/// A draft holding a raw credential is left out entirely rather than
+/// persisted with the secret in it; over-long drafts are cut and the file is
+/// capped at [`MAX_PERSISTED_CONVERSATIONS`] conversations.
+pub fn encode_persisted(drafts: &Drafts, queues: &Queues) -> String {
+    let mut clean_drafts = Drafts::default();
+    for (conversation, text) in drafts.texts.iter() {
+        if clean_drafts.texts.len() >= MAX_PERSISTED_CONVERSATIONS {
+            break;
+        }
+        if detect_sensitive_draft(text).is_some() {
+            continue;
+        }
+        let kept: String = text.chars().take(MAX_PERSISTED_DRAFT_CHARS).collect();
+        if !kept.trim().is_empty() {
+            clean_drafts.texts.insert(conversation.clone(), kept);
+        }
+    }
+    let mut clean_queues = Queues::default();
+    for (conversation, queue) in queues.by_conversation.iter() {
+        if clean_queues.by_conversation.len() >= MAX_PERSISTED_CONVERSATIONS {
+            break;
+        }
+        if queue.is_empty() {
+            continue;
+        }
+        let mut kept = queue.clone();
+        kept.cancel_edit();
+        clean_queues
+            .by_conversation
+            .insert(conversation.clone(), kept);
+    }
+    serde_json::to_string(&PersistedComposer {
+        drafts: clean_drafts,
+        queues: clean_queues,
+    })
+    .unwrap_or_else(|_| "{\"drafts\":{},\"queues\":{}}".into())
+}
+
+/// Read back what [`encode_persisted`] wrote. Bad input, unknown fields and
+/// over-long entries all fall back to empty rather than failing the launch.
+pub fn decode_persisted(text: &str) -> (Drafts, Queues) {
+    let Ok(mut persisted) = serde_json::from_str::<PersistedComposer>(text) else {
+        return (Drafts::default(), Queues::default());
+    };
+    persisted.drafts.texts.retain(|_, text| {
+        !text.trim().is_empty()
+            && text.chars().count() <= MAX_PERSISTED_DRAFT_CHARS
+            && detect_sensitive_draft(text).is_none()
+    });
+    if persisted.drafts.texts.len() > MAX_PERSISTED_CONVERSATIONS {
+        let extra: Vec<String> = persisted
+            .drafts
+            .texts
+            .keys()
+            .skip(MAX_PERSISTED_CONVERSATIONS)
+            .cloned()
+            .collect();
+        for key in extra {
+            persisted.drafts.texts.remove(&key);
+        }
+    }
+    persisted.queues.by_conversation.retain(|_, queue| {
+        !queue.is_empty()
+            && queue
+                .items()
+                .iter()
+                .all(|item| item.text.chars().count() <= MAX_TEXT_CHARS)
+    });
+    if persisted.queues.by_conversation.len() > MAX_PERSISTED_CONVERSATIONS {
+        let extra: Vec<String> = persisted
+            .queues
+            .by_conversation
+            .keys()
+            .skip(MAX_PERSISTED_CONVERSATIONS)
+            .cloned()
+            .collect();
+        for key in extra {
+            persisted.queues.by_conversation.remove(&key);
+        }
+    }
+    for queue in persisted.queues.by_conversation.values_mut() {
+        queue.cancel_edit();
+        for item in queue.items_mut() {
+            item.attachments.truncate(MAX_ATTACHMENTS);
+        }
+    }
+    (persisted.drafts, persisted.queues)
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct PersistedComposer {
+    drafts: Drafts,
+    queues: Queues,
 }
 
 /// A message after delegate routing.
@@ -964,7 +1157,11 @@ pub fn shortcut_rows(enter_sends_pref: bool) -> Vec<ShortcutRow> {
             send,
             "While a reply is running: add the message to the queue",
         ),
-        ("Writing", "Up", "Bring back your last message (empty box)"),
+        (
+            "Writing",
+            "Up/Down",
+            "Cycle through your messages (empty box)",
+        ),
         ("Writing", "/", "Commands, skills and tools"),
         ("Writing", "@", "Mention a bot: it answers that message"),
         ("Runs", "Esc", "Stop the reply that is running"),
@@ -1528,6 +1725,123 @@ mod tests {
         let room = route_mention("@analyst hello", &bots, Some("main"), true);
         assert_eq!(room.target, None);
         assert_eq!(room.text, "@analyst hello");
+    }
+
+    #[test]
+    fn queued_messages_can_carry_already_uploaded_files() {
+        let file = crate::AttachmentInfo {
+            id: "a1".into(),
+            filename: "n.txt".into(),
+            mime: "text/plain".into(),
+            size_bytes: 3,
+            is_image: false,
+        };
+        let mut queue = SendQueue::default();
+        let id = queue
+            .push_with_attachments("see this", None, vec![file])
+            .unwrap();
+        let sent = queue.take_next(false).unwrap();
+        assert_eq!(sent.id, id);
+        assert_eq!(sent.attachments.len(), 1);
+        assert_eq!(sent.attachments[0].id, "a1");
+        // Plain pushes still carry no files.
+        queue.push("plain", None).unwrap();
+        assert!(queue.take_next(false).unwrap().attachments.is_empty());
+    }
+
+    #[test]
+    fn history_cycles_up_to_older_messages_and_down_to_empty() {
+        let texts = ["first", "second", "third"];
+        let (index, text) = recall_up(&texts, None);
+        assert_eq!((index, text.as_deref()), (Some(2), Some("third")));
+        let (index, text) = recall_up(&texts, index);
+        assert_eq!((index, text.as_deref()), (Some(1), Some("second")));
+        let (index, text) = recall_up(&texts, index);
+        assert_eq!((index, text.as_deref()), (Some(0), Some("first")));
+        // Up stays on the oldest message.
+        let (index, text) = recall_up(&texts, index);
+        assert_eq!((index, text.as_deref()), (Some(0), Some("first")));
+        let (index, text) = recall_down(&texts, index);
+        assert_eq!((index, text.as_deref()), (Some(1), Some("second")));
+        let (index, text) = recall_down(&texts, index);
+        assert_eq!((index, text.as_deref()), (Some(2), Some("third")));
+        // Down past the newest clears the box.
+        let (index, text) = recall_down(&texts, index);
+        assert_eq!((index, text), (None, None));
+        assert_eq!(recall_up(&[], None), (None, None));
+        assert_eq!(recall_down(&texts, None), (None, None));
+    }
+
+    #[test]
+    fn composer_files_follow_their_conversation() {
+        let mut stash = ComposerFilesStash::default();
+        let files = vec![crate::AttachmentInfo {
+            id: "a1".into(),
+            filename: "n.txt".into(),
+            mime: "text/plain".into(),
+            size_bytes: 3,
+            is_image: false,
+        }];
+        let mut pending = VecDeque::new();
+        pending.push_back(("late.pdf".to_owned(), vec![1, 2]));
+        stash.stash("dir:main", files, pending);
+        stash.stash("dir:other", Vec::new(), VecDeque::new());
+        let (got_files, got_pending) = stash.restore("dir:main");
+        assert_eq!(got_files.len(), 1);
+        assert_eq!(got_files[0].id, "a1");
+        assert_eq!(got_pending.len(), 1);
+        assert_eq!(got_pending[0].0, "late.pdf");
+        assert!(stash.restore("dir:main").0.is_empty(), "taken once");
+    }
+
+    #[test]
+    fn persisted_drafts_round_trip_but_never_carry_secrets() {
+        let mut drafts = Drafts::default();
+        drafts.store("dir:main", "keep this draft");
+        drafts.store("dir:secret", "key sk-proj-abcdef1234567890xyz here");
+        let mut queues = Queues::default();
+        let mut queue = SendQueue::default();
+        queue
+            .push_with_attachments(
+                "queued",
+                None,
+                vec![crate::AttachmentInfo {
+                    id: "a9".into(),
+                    filename: "n.txt".into(),
+                    mime: "text/plain".into(),
+                    size_bytes: 1,
+                    is_image: false,
+                }],
+            )
+            .unwrap();
+        queue.begin_edit(queue.items()[0].id);
+        queues.stash("dir:main", queue);
+        let encoded = encode_persisted(&drafts, &queues);
+        let (restored_drafts, mut restored_queues) = decode_persisted(&encoded);
+        assert_eq!(restored_drafts.restore("dir:main"), "keep this draft");
+        assert_eq!(
+            restored_drafts.restore("dir:secret"),
+            "",
+            "a draft holding a raw token is never written to disk"
+        );
+        let mut restored = restored_queues.restore("dir:main");
+        let sent = restored.take_next(false).unwrap();
+        assert_eq!(sent.text, "queued");
+        assert_eq!(sent.attachments.len(), 1);
+        assert_eq!(sent.attachments[0].id, "a9");
+        assert_eq!(
+            restored.editing(),
+            None,
+            "an edit hold never survives a relaunch"
+        );
+        // Bad input and unknown fields fall back to empty, never panic.
+        assert_eq!(decode_persisted("not json").0.restore("dir:main"), "");
+        assert_eq!(
+            decode_persisted("{\"drafts\":{},\"queues\":{},\"future\":1}")
+                .0
+                .restore("dir:main"),
+            ""
+        );
     }
 
     #[test]

@@ -52,7 +52,15 @@ impl FeedWindow {
 
 /// The rows to draw. While the reader follows the newest message the window is
 /// the tail; otherwise it is centred on the first visible row (`anchor`).
-pub fn feed_window(total: usize, anchor: Option<usize>, following: bool) -> FeedWindow {
+/// With no anchor and not following, the window keeps its last known start
+/// (`last_start`): a transcript reload must not drag the reader to the tail
+/// just because the page has not reported a first visible row yet.
+pub fn feed_window(
+    total: usize,
+    anchor: Option<usize>,
+    following: bool,
+    last_start: Option<usize>,
+) -> FeedWindow {
     let size = VIEWPORT_ROWS + 2 * OVERSCAN_ROWS;
     if total <= size {
         return FeedWindow {
@@ -65,6 +73,9 @@ pub fn feed_window(total: usize, anchor: Option<usize>, following: bool) -> Feed
         Some(index) if !following => index
             .saturating_sub(OVERSCAN_ROWS)
             .min(total.saturating_sub(size)),
+        _ if !following => last_start
+            .map(|start| start.min(total.saturating_sub(size)))
+            .unwrap_or(total - size),
         _ => total - size,
     };
     FeedWindow {
@@ -162,7 +173,7 @@ mod tests {
 
     #[test]
     fn small_transcript_is_drawn_whole() {
-        let w = feed_window(30, None, true);
+        let w = feed_window(30, None, true, None);
         assert_eq!((w.start, w.end), (0, 30));
         assert_eq!(w.top_spacer_px() + w.bottom_spacer_px(), 0);
     }
@@ -179,7 +190,7 @@ mod tests {
             (Some(4_999), false),
             (Some(9_999), false),
         ] {
-            let w = feed_window(total, anchor, following);
+            let w = feed_window(total, anchor, following, None);
             assert!(
                 w.end - w.start <= cap,
                 "{anchor:?} drew {} rows",
@@ -192,9 +203,27 @@ mod tests {
                 total * EST_ROW_PX
             );
         }
-        let tail = feed_window(total, None, true);
+        let tail = feed_window(total, None, true, None);
         assert_eq!(tail.end, total);
         assert_eq!(tail.bottom_spacer_px(), 0);
+    }
+
+    #[test]
+    fn no_anchor_keeps_the_last_window_instead_of_the_tail() {
+        // Scrolled up with no anchor reported yet: the window stays where it
+        // was instead of jumping to the newest messages.
+        let w = feed_window(5_000, None, false, Some(1_000));
+        assert_eq!(w.start, 1_000);
+        assert_eq!(w.end, 1_000 + VIEWPORT_ROWS + 2 * OVERSCAN_ROWS);
+        // Following still takes the tail even with a last window remembered.
+        let w = feed_window(5_000, None, true, Some(1_000));
+        assert_eq!(w.end, 5_000);
+        // A last start past the end (rows removed) clamps to the tail.
+        let w = feed_window(5_000, None, false, Some(9_999));
+        assert_eq!(w.end, 5_000);
+        // No last window at all falls back to the tail.
+        let w = feed_window(5_000, None, false, None);
+        assert_eq!(w.end, 5_000);
     }
 
     #[test]
@@ -202,14 +231,14 @@ mod tests {
         let page: Vec<String> = (100..400).map(|i| format!("m{i}")).collect();
         let first_visible = "m250";
         let before = anchor_index(page.iter().map(String::as_str), first_visible).unwrap();
-        let w_before = feed_window(page.len(), Some(before), false);
+        let w_before = feed_window(page.len(), Some(before), false, None);
         assert!(w_before.contains(before));
 
         // 100 older messages land in front.
         let mut grown: Vec<String> = (0..100).map(|i| format!("m{i}")).collect();
         grown.extend(page.iter().cloned());
         let after = anchor_index(grown.iter().map(String::as_str), first_visible).unwrap();
-        let w_after = feed_window(grown.len(), Some(after), false);
+        let w_after = feed_window(grown.len(), Some(after), false, None);
         assert_eq!(after, before + 100);
         assert!(w_after.contains(after));
         // The same messages are drawn: the window moved with the ids.

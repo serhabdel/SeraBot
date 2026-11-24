@@ -168,7 +168,21 @@ impl Runtime {
             // A pool account whose credential cannot be opened is that
             // account's problem, not the turn's.
             let kind = match classify_llm(&error) {
-                Ok(FailKind::ContextTooLong) => return Err(error),
+                Ok(FailKind::ContextTooLong) => {
+                    // Too long for this candidate is not too long for every
+                    // candidate: try the ones ahead with a strictly larger
+                    // known window before failing. A candidate whose window
+                    // is unknown counts as zero, so any known window beats it.
+                    let current = self
+                        .window_for_selection(call.user, &candidate.selection)
+                        .unwrap_or(0);
+                    if has_larger_window_ahead(self, call.user, &candidates, attempt, current) {
+                        reasons.push(format!("{label}: context_too_long"));
+                        last_failed = Some((candidate.clone(), "context_too_long"));
+                        continue;
+                    }
+                    return Err(error);
+                }
                 Ok(kind) => kind,
                 Err(_) if is_unusable_account(&error, candidate) => FailKind::CredentialsRejected,
                 Err(_) => return Err(error),
@@ -327,6 +341,22 @@ fn strip_provider_reasoning(messages: &[LlmMessage]) -> Vec<LlmMessage> {
             message
         })
         .collect()
+}
+
+/// Whether any candidate after `attempt` has a known window strictly larger
+/// than `current`. Unknown windows count as zero.
+fn has_larger_window_ahead(
+    runtime: &Runtime,
+    user: &str,
+    candidates: &[Candidate],
+    attempt: usize,
+    current: u64,
+) -> bool {
+    candidates[attempt + 1..].iter().any(|next| {
+        runtime
+            .window_for_selection(user, &next.selection)
+            .is_some_and(|window| window > current)
+    })
 }
 
 /// Every candidate failed or none was ready. The message carries stable

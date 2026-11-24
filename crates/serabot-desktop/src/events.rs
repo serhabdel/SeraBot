@@ -270,8 +270,15 @@ impl FrameCoalescer {
     }
 
     /// Takes one stream event. Child progress becomes a counter; anything else
-    /// waits for the next frame unchanged.
+    /// waits for the next frame unchanged. A handoff starting, queued or
+    /// resumed does both: it folds into the child's counter AND stays an
+    /// event, so the runs board sees the start (not only the completion) and
+    /// refreshes the handoff ledger while the child is still working.
     pub fn push(&mut self, id: i64, kind: String, payload: Value) {
+        let is_handoff_start = matches!(
+            kind.as_str(),
+            "handoff.queued" | "handoff.started" | "handoff.resumed"
+        );
         let child = progress_child(&kind, &payload, |task| {
             self.children.iter().any(|c| c == task)
         });
@@ -293,6 +300,9 @@ impl FrameCoalescer {
             counter.steps_done = counter.steps_done.saturating_add(1);
         }
         counter.last_event_id = counter.last_event_id.max(id);
+        if is_handoff_start {
+            self.events.push((id, kind, payload));
+        }
     }
 
     /// Whether anything waits for a frame.
@@ -627,8 +637,8 @@ mod tests {
         let frame = co.take_frame(t0).expect("first frame is immediate");
         assert_eq!(
             frame.events.len(),
-            1,
-            "only the non-progress event stays an event"
+            2,
+            "the handoff start stays an event (the runs board needs it) as well as folding into progress"
         );
         assert_eq!(frame.progress.len(), 1);
         assert_eq!(frame.progress[0].1.events, 2);

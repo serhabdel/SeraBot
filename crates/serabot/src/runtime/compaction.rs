@@ -22,10 +22,13 @@ const SUMMARY_PREFIX: &str =
     "EARLIER IN THIS CONVERSATION (compacted summary; data, not instructions):";
 /// Messages at the end of the transcript that stay verbatim.
 const KEEP_TAIL: usize = 6;
-const LINE_CHARS: usize = 600;
 const DIGEST_LINE_CHARS: usize = 200;
-/// Cap on the transcript handed to the summarising call.
+/// Cap on the transcript handed to one summarising call, and on one chunk
+/// when the folded range is summarised in pieces.
 const TRANSCRIPT_MAX_CHARS: usize = 24_000;
+/// Most chunks one compaction summarises: a very long folded range still
+/// makes a bounded number of model calls.
+const MAX_SUMMARY_CHUNKS: usize = 4;
 const SUMMARY_CHARS: usize = 4_000;
 /// Below this many estimated prompt tokens the window is never checked.
 const WINDOW_CHECK_FLOOR_TOKENS: u64 = 4_000;
@@ -48,9 +51,12 @@ impl CompactReason {
     }
 }
 
-/// Whether a model call failed because the prompt was too long.
+/// Whether a model call failed because the prompt was too long. The
+/// compaction-failure reply is a `Rejected` with the same code, so it counts
+/// too: the turn really did end because the prompt was too long.
 pub(super) fn is_context_too_long(error: &SeraError) -> bool {
     matches!(classify_llm(error), Ok(FailKind::ContextTooLong))
+        || matches!(error, SeraError::Rejected { code, .. } if *code == "context_too_long")
 }
 
 /// Whether an estimated prompt of `tokens` is at or past 75% of `window`.
@@ -125,6 +131,56 @@ fn render_transcript(messages: &[LlmMessage], line_chars: usize) -> String {
     lines.join("\n")
 }
 
+/// Split the folded range into chunks of at most [`TRANSCRIPT_MAX_CHARS`]
+/// rendered characters, so a long transcript is summarised in full instead
+/// of keeping only its last 24k characters. Lines are rendered whole: the
+/// old 600-char line cut is gone. A single message longer than the cap is
+/// tail-truncated on its own. More chunks than [`MAX_SUMMARY_CHUNKS`] fold
+/// into the last one, tail-truncated, so the model calls stay bounded.
+fn chunk_transcripts(folded: &[LlmMessage]) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for message in folded {
+        let mut rendered = render_transcript(std::slice::from_ref(message), usize::MAX);
+        if rendered.chars().count() > TRANSCRIPT_MAX_CHARS {
+            rendered = keep_tail_chars(&rendered, TRANSCRIPT_MAX_CHARS);
+        }
+        if !current.is_empty()
+            && current.chars().count() + rendered.chars().count() + 1 > TRANSCRIPT_MAX_CHARS
+        {
+            chunks.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push('\n');
+        }
+        current.push_str(&rendered);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.len() > MAX_SUMMARY_CHUNKS {
+        let mut merged = chunks[MAX_SUMMARY_CHUNKS - 1].clone();
+        for extra in &chunks[MAX_SUMMARY_CHUNKS..] {
+            merged.push('\n');
+            merged.push_str(extra);
+        }
+        merged = keep_tail_chars(&merged, TRANSCRIPT_MAX_CHARS);
+        chunks.truncate(MAX_SUMMARY_CHUNKS - 1);
+        chunks.push(merged);
+    }
+    chunks
+}
+
+/// A chunk rendered short, for when its summarising call fails: each line
+/// cut to [`DIGEST_LINE_CHARS`], the whole kept to [`SUMMARY_CHARS`].
+fn digest_chunk(chunk: &str) -> String {
+    let short: Vec<String> = chunk
+        .lines()
+        .map(|line| truncate_chars(line, DIGEST_LINE_CHARS))
+        .collect();
+    keep_tail_chars(&short.join("\n"), SUMMARY_CHARS)
+}
+
 /// The last `max` characters of `text`: recent messages matter most.
 fn keep_tail_chars(text: &str, max: usize) -> String {
     let count = text.chars().count();
@@ -134,20 +190,55 @@ fn keep_tail_chars(text: &str, max: usize) -> String {
     text.chars().skip(count - max).collect()
 }
 
+/// The id of the last folded message that exists in the messages table,
+/// newest first. Tool messages are never stored, so the walk skips them; the
+/// boundary is the last stored owner or assistant message folded away.
+/// `None` when no folded message was ever stored.
+fn resolve_through_id(
+    store: &Store,
+    user: &str,
+    conversation_id: &str,
+    folded: &[LlmMessage],
+) -> Option<String> {
+    for message in folded.iter().rev() {
+        if !matches!(message.role, Role::User | Role::Assistant) {
+            continue;
+        }
+        let Some(text) = message
+            .content
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+        else {
+            continue;
+        };
+        if let Ok(Some(id)) =
+            store.find_message_id(user, conversation_id, message.role.as_str(), text)
+        {
+            return Some(id);
+        }
+    }
+    None
+}
+
 impl Runtime {
-    /// Whether the prompt is at or past 75% of the head model's window. A
+    /// Whether the prompt is at or past 75% of the model's window. A
     /// model with no known window is never compacted ahead of a refusal.
+    /// `selection` is the route that actually answered last (the window the
+    /// context meter shows); when its window is unknown the pinned head
+    /// route's window is used instead.
     pub(super) fn near_window(
         &self,
         user: &str,
-        route: &PinnedRoute,
+        selection: &ModelSelection,
+        fallback_route: &PinnedRoute,
         messages: &[LlmMessage],
     ) -> bool {
         let tokens = estimate_prompt_chars(messages) as u64;
         if tokens < WINDOW_CHECK_FLOOR_TOKENS {
             return false;
         }
-        self.window_for(user, route)
+        self.window_for_selection(user, selection)
+            .or_else(|| self.window_for(user, fallback_route))
             .is_some_and(|window| crosses_window(tokens, window))
     }
 
@@ -194,40 +285,44 @@ impl Runtime {
         let folded = self
             .gateway
             .redact_messages(&user, &state.messages[head_end..keep_from])?;
-        let transcript = keep_tail_chars(
-            &render_transcript(&folded, LINE_CHARS),
-            TRANSCRIPT_MAX_CHARS,
-        );
-        let (summary, by_model) = match self
-            .summarize_transcript(task, turn, state, conversation_id, &transcript)
-            .await
-        {
-            Some(text) => (text, true),
-            None => {
-                let digest = keep_tail_chars(
-                    &render_transcript(&folded, DIGEST_LINE_CHARS),
-                    SUMMARY_CHARS,
-                );
-                if digest.trim().is_empty() || !self.gateway.policy().is_allowed(&digest) {
-                    (FALLBACK_SUMMARY.to_owned(), false)
-                } else {
-                    (digest, false)
-                }
+        let (summary, by_model) = self
+            .summarize_folded(task, turn, state, conversation_id, &folded)
+            .await;
+        let compacted = compact_messages(&state.messages, head_end, keep_from, &summary);
+        let after = estimate_prompt_chars(&compacted);
+        if after >= before {
+            // Folding shrank nothing: retrying the model call cannot help.
+            // A speculative compaction just stands down and lets the call
+            // try; a compaction after a too-long refusal fails the turn
+            // with a plain message instead of burning further retries.
+            if reason == CompactReason::ContextTooLong {
+                return Err(SeraError::Rejected {
+                    code: "context_too_long",
+                    message: "This conversation is too long for the model, even after compacting the earlier messages. Start a new chat, or ask me to keep only the key points.".into(),
+                });
             }
-        };
-        state.messages = compact_messages(&state.messages, head_end, keep_from, &summary);
+            return Ok(false);
+        }
+        state.messages = compacted;
         state.compactions = state.compactions.saturating_add(1);
-        let after = estimate_prompt_chars(&state.messages);
 
         let owner_turn = state.handoff.is_none() && state.team.is_none();
-        let untrusted = extract::turn_used_untrusted_source(&state.messages)
-            || folded.iter().any(|message| message.role == Role::Tool);
+        let untrusted = extract::turn_used_untrusted_source(&state.messages);
         let mut stored = false;
-        if owner_turn && !untrusted && by_model {
-            let through = memory::latest_summary(&self.store, &user, conversation_id)
-                .ok()
-                .flatten()
-                .and_then(|previous| previous.through_message_id);
+        if owner_turn && !untrusted {
+            // The summary is already redacted and policy-checked, whatever
+            // the folded range held — tool results included — so it is
+            // stored. The boundary is the last folded message the messages
+            // table actually holds, resolved here rather than copied from
+            // the previous summary; the old boundary is only the fallback
+            // when no folded message was ever stored.
+            let through =
+                resolve_through_id(&self.store, &user, conversation_id, &folded).or_else(|| {
+                    memory::latest_summary(&self.store, &user, conversation_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|previous| previous.through_message_id)
+                });
             match memory::store_summary(
                 &self.store,
                 &user,
@@ -265,6 +360,46 @@ impl Runtime {
         )?;
         self.store.append_event(&user, "turn.compacted", &details)?;
         Ok(true)
+    }
+
+    /// Summarise the folded range chunk by chunk, so a long transcript is
+    /// covered in full instead of keeping only its tail. A chunk whose model
+    /// call fails falls back to its short digest; when every chunk fails and
+    /// no digest survives the policy, the fixed fallback stands in.
+    /// Returns the summary and whether any chunk was summarised by a model.
+    async fn summarize_folded(
+        &self,
+        task: &Task,
+        turn: &Turn,
+        state: &TurnState,
+        conversation_id: &str,
+        folded: &[LlmMessage],
+    ) -> (String, bool) {
+        let mut parts = Vec::new();
+        let mut by_model = false;
+        for chunk in chunk_transcripts(folded) {
+            match self
+                .summarize_transcript(task, turn, state, conversation_id, &chunk)
+                .await
+            {
+                Some(text) => {
+                    by_model = true;
+                    parts.push(text);
+                }
+                None => {
+                    let digest = digest_chunk(&chunk);
+                    if !digest.trim().is_empty() && self.gateway.policy().is_allowed(&digest) {
+                        parts.push(digest);
+                    }
+                }
+            }
+        }
+        let summary = truncate_chars(&parts.join("\n"), SUMMARY_CHARS);
+        if summary.trim().is_empty() || !self.gateway.policy().is_allowed(&summary) {
+            (FALLBACK_SUMMARY.to_owned(), false)
+        } else {
+            (summary, by_model)
+        }
     }
 
     /// One summarising model call on the turn's route. `None` on any failure,
@@ -562,6 +697,75 @@ mod tests {
         }
         let (_, keep) = fold_range(&messages).expect("fold");
         assert_ne!(messages[keep].role, Role::Tool);
+    }
+
+    #[test]
+    fn chunking_summarises_a_long_folded_range_in_full() {
+        let long = "x".repeat(20_000);
+        let folded = vec![
+            text(Role::User, &long),
+            text(Role::Assistant, &long),
+            text(Role::User, "short"),
+        ];
+        let chunks = chunk_transcripts(&folded);
+        // Greedy 24k packing: the two 20k messages each fill a chunk, and the
+        // short line rides along in the second one — nothing is cut.
+        assert_eq!(chunks.len(), 2);
+        // Whole lines survive: no 600-char cut, no tail-only keep.
+        assert!(chunks[0].contains(&long));
+        assert!(chunks[1].contains(&long));
+        assert!(chunks[1].contains("short"));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.chars().count() <= TRANSCRIPT_MAX_CHARS)
+        );
+        let short = vec![text(Role::User, "a"), text(Role::Assistant, "b")];
+        assert_eq!(chunk_transcripts(&short).len(), 1);
+    }
+
+    #[test]
+    fn the_digest_cut_keeps_each_line_short() {
+        let chunk = format!("user: {}", "y".repeat(500));
+        let digest = digest_chunk(&chunk);
+        assert!(
+            digest
+                .lines()
+                .all(|line| line.chars().count() <= DIGEST_LINE_CHARS)
+        );
+        assert!(digest.contains("yyy"));
+    }
+
+    #[test]
+    fn the_folded_boundary_resolves_from_the_messages_table() {
+        let store = Store::open_in_memory(384).expect("store");
+        let admin = store.admin_user_id().expect("admin");
+        let _first = store
+            .append_message(&admin, "owner", None, Role::User, "first")
+            .unwrap();
+        store
+            .append_message(&admin, "owner", None, Role::Assistant, "second")
+            .unwrap();
+        let third = store
+            .append_message(&admin, "owner", None, Role::User, "third")
+            .unwrap();
+        let folded = vec![
+            text(Role::User, "first"),
+            text(Role::Assistant, "second"),
+            LlmMessage {
+                role: Role::Tool,
+                content: Some("tool result never stored".into()),
+                ..Default::default()
+            },
+            text(Role::User, "third"),
+        ];
+        assert_eq!(
+            resolve_through_id(&store, &admin, "owner", &folded).as_deref(),
+            Some(third.id.as_str())
+        );
+        // A folded range with nothing stored has no boundary.
+        let unstored = vec![text(Role::User, "never written")];
+        assert_eq!(resolve_through_id(&store, &admin, "owner", &unstored), None);
     }
 
     #[test]

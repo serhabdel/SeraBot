@@ -64,7 +64,66 @@ pub(crate) fn handoff_failed_payload(
     payload
 }
 
-/// Payload of `model.failover`.
+/// `turn.progress` heartbeat (0.74.10): while a model call is in flight the
+/// client cannot tell alive-but-slow from dead, so the turn emits one small
+/// event every [`HEARTBEAT_SECS`] seconds until the call returns. It rides
+/// the same event stream and SSE feed as `turn.step`; the payload carries
+/// ids and an elapsed count only.
+pub(crate) const EVENT_TURN_PROGRESS: &str = "turn.progress";
+/// Seconds between heartbeat events while a model call is in flight.
+const HEARTBEAT_SECS: u64 = 15;
+/// Most heartbeat events per model call: a very slow call goes quiet rather
+/// than flooding the event stream.
+const HEARTBEAT_MAX: usize = 40;
+
+/// A heartbeat that lives only while a model call is in flight: started
+/// before the call, dropped when it returns. The spawned task appends
+/// `turn.progress` events; dropping aborts it.
+pub(crate) struct ModelHeartbeat {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl ModelHeartbeat {
+    pub(crate) fn start(
+        store: &Store,
+        user: &str,
+        task_id: &str,
+        turn_id: &str,
+        conversation_id: &str,
+        bot: &str,
+    ) -> Self {
+        let store = store.clone();
+        let user = user.to_owned();
+        let base = json!({
+            "task_id": task_id,
+            "turn_id": turn_id,
+            "conversation_id": conversation_id,
+            "bot": bot,
+            "phase": "waiting_model",
+        });
+        let handle = tokio::spawn(async move {
+            for beat in 1..=HEARTBEAT_MAX {
+                tokio::time::sleep(std::time::Duration::from_secs(HEARTBEAT_SECS)).await;
+                let mut payload = base.clone();
+                payload["elapsed_secs"] = json!(beat as u64 * HEARTBEAT_SECS);
+                payload["beat"] = json!(beat);
+                if store
+                    .append_event(&user, EVENT_TURN_PROGRESS, &payload)
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Self { handle }
+    }
+}
+
+impl Drop for ModelHeartbeat {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
 pub(crate) fn failover_payload(
     conversation_id: &str,
     task_id: Option<&str>,

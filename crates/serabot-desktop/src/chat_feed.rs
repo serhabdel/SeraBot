@@ -131,6 +131,51 @@ pub fn search_haystack(content: &str, speaker: &str) -> String {
     text
 }
 
+/// The search haystack for one row, cached by message id. Row rebuilds run
+/// on every streamed token, and re-lower-casing every row each time was the
+/// bulk of that work; stable rows now hit the cache. The key carries the
+/// content hash and length, so an edited or still-streaming row misses and
+/// is rebuilt, and the cache is bounded so a long chat cannot grow it
+/// without limit.
+pub fn cached_search_haystack(message_id: &str, content: &str, speaker: &str) -> String {
+    use std::collections::{HashMap, VecDeque};
+    use std::hash::{Hash, Hasher};
+    use std::sync::{Mutex, OnceLock};
+    const HAYSTACK_CACHE_MAX: usize = 512;
+    type HaystackKey = (String, u64, usize, String);
+    #[derive(Default)]
+    struct HaystackCache {
+        order: VecDeque<HaystackKey>,
+        entries: HashMap<HaystackKey, String>,
+    }
+    static CACHE: OnceLock<Mutex<HaystackCache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HaystackCache::default()));
+    let mut content_hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut content_hasher);
+    let key: HaystackKey = (
+        message_id.to_owned(),
+        content_hasher.finish(),
+        content.len(),
+        speaker.to_owned(),
+    );
+    let mut guard = cache.lock().expect("haystack cache");
+    if let Some(hit) = guard.entries.get(&key) {
+        return hit.clone();
+    }
+    let haystack = search_haystack(content, speaker);
+    while guard.entries.len() >= HAYSTACK_CACHE_MAX {
+        if let Some(oldest) = guard.order.pop_front() {
+            guard.entries.remove(&oldest);
+        } else {
+            guard.entries.clear();
+            break;
+        }
+    }
+    guard.order.push_back(key.clone());
+    guard.entries.insert(key, haystack.clone());
+    haystack
+}
+
 /// Whether a row matches a trimmed, lower-cased search needle.
 pub fn row_matches(haystack: &str, needle: &str) -> bool {
     !needle.is_empty() && haystack.contains(needle)
@@ -154,13 +199,44 @@ pub fn trim_entered<'a>(
 /// How far the entrance-animation set may run ahead of the rows on screen.
 const ENTERED_SLACK: usize = 64;
 
+/// A cheap digest of the live turn's activity: the task, how many steps
+/// there are, how many were dropped, and the last step only (its id, label,
+/// phase and duration). A step starting, finishing or changing its label
+/// changes the digest; re-hashing every step's every field on every streamed
+/// token is what this replaces.
+fn activity_digest(activity: &crate::activity::Activity) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    activity.task_id.hash(&mut hasher);
+    activity.steps.len().hash(&mut hasher);
+    activity.dropped.hash(&mut hasher);
+    if let Some(step) = activity.steps.last() {
+        step.call_id.hash(&mut hasher);
+        step.label.hash(&mut hasher);
+        (match step.phase {
+            crate::activity::StepPhase::Running => 0u8,
+            crate::activity::StepPhase::Progress => 1u8,
+            crate::activity::StepPhase::Done => 2u8,
+            crate::activity::StepPhase::Failed => 3u8,
+            crate::activity::StepPhase::WaitingApproval => 4u8,
+        })
+        .hash(&mut hasher);
+        step.duration_ms.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// A fingerprint of everything a transcript row is drawn from, so the view
-/// rebuilds its rows only when one of them changed. `context` carries what
-/// the rows depend on besides the messages (speaker names, group mode, ...).
-/// `ledger_revision` is the [`TurnLedger`](crate::turn_trace::TurnLedger)
-/// revision, and `activity` the live turn's steps: a finished turn's trace
-/// attaches to its reply, and a step starting, running or finishing changes
-/// what the rows show, so both must invalidate the cache (0.74.3).
+/// rebuilds its rows only when one of them changed. It hashes only the
+/// count, the head id, the tail (id and content length, so streamed tokens
+/// count), the [`TurnLedger`](crate::turn_trace::TurnLedger) revision and
+/// the activity digest — never the full content of every row or every step.
+/// That is a deliberate trade-off: a change to a middle row's text alone
+/// (not the tail, not the head id, not the ledger) does not invalidate the
+/// rows; middle rows change only through a reload or an edit, both of which
+/// replace the row cache through the conversation switch or a new tail.
+/// `context` carries what the rows depend on besides the messages (speaker
+/// names, group mode, ...).
 pub fn transcript_fingerprint(
     messages: &[crate::Message],
     context: impl std::hash::Hash,
@@ -171,39 +247,16 @@ pub fn transcript_fingerprint(
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     context.hash(&mut hasher);
     messages.len().hash(&mut hasher);
-    for message in messages {
-        message.id.hash(&mut hasher);
-        (message.role == crate::Role::User).hash(&mut hasher);
-        message.content.hash(&mut hasher);
-        message.created_at.hash(&mut hasher);
-        message.name.hash(&mut hasher);
-        message.bot.hash(&mut hasher);
-        message.limit_reached.hash(&mut hasher);
-        message.turn_id.hash(&mut hasher);
-        message.attachments.len().hash(&mut hasher);
-    }
-    ledger_revision.hash(&mut hasher);
-    activity.task_id.hash(&mut hasher);
-    activity.steps.len().hash(&mut hasher);
-    activity.dropped.hash(&mut hasher);
-    for step in &activity.steps {
-        step.call_id.hash(&mut hasher);
-        step.label.hash(&mut hasher);
-        step.icon.hash(&mut hasher);
-        // `StepPhase` has no `Hash`: its discriminant stands in.
-        (match step.phase {
-            crate::activity::StepPhase::Running => 0u8,
-            crate::activity::StepPhase::Progress => 1u8,
-            crate::activity::StepPhase::Done => 2u8,
-            crate::activity::StepPhase::Failed => 3u8,
-            crate::activity::StepPhase::WaitingApproval => 4u8,
-        })
+    messages
+        .first()
+        .map(|message| &message.id)
         .hash(&mut hasher);
-        step.duration_ms.hash(&mut hasher);
-        step.approval_id.hash(&mut hasher);
-        step.error.hash(&mut hasher);
-        step.cards.len().hash(&mut hasher);
-    }
+    messages
+        .last()
+        .map(|message| (&message.id, message.content.len()))
+        .hash(&mut hasher);
+    ledger_revision.hash(&mut hasher);
+    activity_digest(activity).hash(&mut hasher);
     hasher.finish()
 }
 
@@ -548,7 +601,7 @@ mod tests {
     }
 
     #[test]
-    fn the_fingerprint_changes_with_content_rows_and_context_only() {
+    fn the_fingerprint_changes_with_tail_rows_and_context_only() {
         let rows = vec![synthetic("m1", "hello"), synthetic("m2", "world")];
         let activity = crate::activity::Activity::default();
         let base = transcript_fingerprint(&rows, ("dir:main", true), 7, &activity);
@@ -560,7 +613,8 @@ mod tests {
         grown[1].content.push_str(" and more");
         assert_ne!(
             base,
-            transcript_fingerprint(&grown, ("dir:main", true), 7, &activity)
+            transcript_fingerprint(&grown, ("dir:main", true), 7, &activity),
+            "a streamed token on the tail changes the mark"
         );
         let mut longer = rows.clone();
         longer.push(synthetic("m3", "x"));
@@ -572,11 +626,15 @@ mod tests {
             base,
             transcript_fingerprint(&rows, ("dir:main", false), 7, &activity)
         );
-        let mut limited = rows.clone();
-        limited[0].limit_reached = true;
-        assert_ne!(
+        // Deliberate: only the tail's length is hashed, so a middle row's
+        // text alone does not invalidate the rows (middle rows change only
+        // through a reload or an edit, which rebuilds the cache another way).
+        let mut middle = rows.clone();
+        middle[0].content.push_str(" edited");
+        middle[0].limit_reached = true;
+        assert_eq!(
             base,
-            transcript_fingerprint(&limited, ("dir:main", true), 7, &activity)
+            transcript_fingerprint(&middle, ("dir:main", true), 7, &activity)
         );
         // A turn-ledger change (a finished turn's trace landing) and a step
         // starting or changing phase both invalidate the rows.
@@ -629,6 +687,21 @@ mod tests {
         assert!(row_matches(&hay, "analyst"));
         assert!(!row_matches(&hay, "invoice"));
         assert!(!row_matches(&hay, ""), "an empty needle matches nothing");
+    }
+
+    #[test]
+    fn cached_haystacks_hit_for_stable_rows_and_miss_on_edit() {
+        let first = cached_search_haystack("row-1", "Hello World", "Main");
+        let second = cached_search_haystack("row-1", "Hello World", "Main");
+        assert_eq!(first, second);
+        assert!(row_matches(&first, "hello"));
+        let edited = cached_search_haystack("row-1", "Hello Mars!", "Main");
+        assert_ne!(first, edited);
+        assert!(row_matches(&edited, "mars"));
+        assert!(!row_matches(&edited, "world"));
+        // Same text under another id is its own entry.
+        let other = cached_search_haystack("row-2", "Hello World", "Main");
+        assert_eq!(first, other);
     }
 
     #[test]

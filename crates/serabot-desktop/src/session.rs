@@ -76,6 +76,13 @@ enum PersistTask {
     },
     LocalFolders(Vec<crate::local_folders::LocalFolder>),
     ClaudeAgent(creds::ClaudeAgentPrefs),
+    /// Composer drafts and queues as JSON text, written atomically to `dir`
+    /// next to the settings. The encoder already left out any draft holding
+    /// a raw credential, so this payload never carries a secret.
+    ComposerDrafts {
+        dir: std::path::PathBuf,
+        json: String,
+    },
 }
 
 enum PersistOutcome {
@@ -86,6 +93,7 @@ enum PersistOutcome {
     },
     LocalFoldersFailed(String),
     ClaudeAgentFailed(String),
+    ComposerDraftsFailed(String),
 }
 
 struct PersistWorker {
@@ -175,8 +183,36 @@ impl PersistWorker {
             PersistTask::ClaudeAgent(prefs) => creds::save_claude_agent(&prefs)
                 .err()
                 .map(PersistOutcome::ClaudeAgentFailed),
+            PersistTask::ComposerDrafts { dir, json } => write_composer_drafts(&dir, &json)
+                .err()
+                .map(PersistOutcome::ComposerDraftsFailed),
         }
     }
+}
+
+/// File holding the persisted composer drafts and queues, next to settings.
+const COMPOSER_DRAFTS_FILE: &str = "composer_drafts.json";
+const TEMP_COMPOSER_DRAFTS_FILE: &str = "composer_drafts.json.tmp";
+
+/// Drafts and queues saved on disk, or empty when nothing was saved yet.
+fn load_composer_drafts(
+    dir: &std::path::Path,
+) -> (crate::chat_compose::Drafts, crate::chat_compose::Queues) {
+    let Ok(text) = std::fs::read_to_string(dir.join(COMPOSER_DRAFTS_FILE)) else {
+        return Default::default();
+    };
+    crate::chat_compose::decode_persisted(&text)
+}
+
+/// Write already-encoded drafts and queues atomically.
+fn write_composer_drafts(dir: &std::path::Path, json: &str) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+    let temp = dir.join(TEMP_COMPOSER_DRAFTS_FILE);
+    std::fs::write(&temp, json).map_err(|error| error.to_string())?;
+    std::fs::rename(&temp, dir.join(COMPOSER_DRAFTS_FILE)).map_err(|error| {
+        let _ = std::fs::remove_file(&temp);
+        error.to_string()
+    })
 }
 
 pub const REQUEST_GAP: Duration = Duration::from_millis(0);
@@ -887,12 +923,23 @@ pub struct Session {
     folder_stats_chan: Option<FolderStatsChannel>,
     /// Files already uploaded and attached to the composer draft.
     pub composer_files: Vec<crate::AttachmentInfo>,
+    /// Uploaded files and pending uploads of the chats that are not open,
+    /// so switching chats no longer drops the composer's files.
+    composer_files_stash: crate::chat_compose::ComposerFilesStash,
     /// Text drafts per conversation, kept while the app runs (0.19).
     pub drafts: crate::chat_compose::Drafts,
+    /// Test-only override for where drafts and queues are persisted. `None`
+    /// means the platform settings directory.
+    composer_dir_override: Option<std::path::PathBuf>,
     /// Messages typed while a reply runs, for the open chat (v0.50).
     pub queue: crate::chat_compose::SendQueue,
     /// Queues of the chats that are not open.
     queues: crate::chat_compose::Queues,
+    /// Unsent messages held per conversation after a send whose outcome is
+    /// unknown, so switching chats no longer drops them.
+    held_drafts: std::collections::HashMap<String, String>,
+    /// The last recorded voice note, kept for one transcription retry.
+    pub last_audio: Option<(String, Vec<u8>)>,
     /// Collapsed run groups the owner opened.
     pub runs_open: std::collections::HashSet<String>,
     runs_last_read: Option<Instant>,
@@ -1024,6 +1071,11 @@ impl Session {
         let persist_worker = worker
             .as_ref()
             .and_then(|_| PersistWorker::start(Arc::clone(&ui_wake)));
+        // Drafts and queues saved on disk come back with the launch; a draft
+        // holding a raw credential was never written, so nothing secret loads.
+        let (drafts, queues) = creds::settings_dir()
+            .map(|dir| load_composer_drafts(&dir))
+            .unwrap_or_default();
         Self {
             state: State::default(),
             worker,
@@ -1107,9 +1159,13 @@ impl Session {
             folder_stats_wanted: false,
             folder_stats_chan: None,
             composer_files: Vec::new(),
-            drafts: crate::chat_compose::Drafts::default(),
+            composer_files_stash: crate::chat_compose::ComposerFilesStash::default(),
+            drafts,
+            composer_dir_override: None,
             queue: crate::chat_compose::SendQueue::default(),
-            queues: crate::chat_compose::Queues::default(),
+            queues,
+            held_drafts: std::collections::HashMap::new(),
+            last_audio: None,
             runs_open: std::collections::HashSet::new(),
             runs_last_read: None,
             attach_notice: None,
@@ -1489,6 +1545,9 @@ impl Session {
             PersistOutcome::ClaudeAgentFailed(error) => {
                 self.toast = Some(format!("Could not save local agent mode: {error}"));
             }
+            PersistOutcome::ComposerDraftsFailed(error) => {
+                self.toast = Some(format!("Drafts could not be saved: {error}"));
+            }
         }
     }
 
@@ -1540,6 +1599,30 @@ impl Session {
     pub fn set_prefs(&mut self, prefs: creds::UiPrefs) {
         self.prefs = prefs.sanitized();
         self.save_ui_settings();
+    }
+
+    /// Save the composer drafts and queues to disk, off the UI thread.
+    /// Text only; the encoder leaves out any draft holding a raw
+    /// credential, so no secret ever reaches the file.
+    pub fn persist_composer_state(&mut self) {
+        let Some(dir) = self.composer_drafts_dir() else {
+            return;
+        };
+        // The open chat's draft and queue live outside the stashed maps:
+        // fold them in so a relaunch restores the chat that was open, too.
+        self.drafts.store(&self.conversation, &self.composer);
+        let mut queues = self.queues.clone();
+        queues.stash(&self.conversation, self.queue.clone());
+        let json = crate::chat_compose::encode_persisted(&self.drafts, &queues);
+        self.enqueue_persist(PersistTask::ComposerDrafts { dir, json });
+    }
+
+    /// Where drafts and queues are persisted: the override in tests, the
+    /// platform settings directory in the app.
+    fn composer_drafts_dir(&self) -> Option<std::path::PathBuf> {
+        self.composer_dir_override
+            .clone()
+            .or_else(creds::settings_dir)
     }
 
     /// Toast when a new approval request appears, if the user asked for it.
@@ -2635,16 +2718,23 @@ impl Session {
         if !valid_id(&id) {
             return;
         }
-        // The draft of the conversation being left waits for its return.
+        // The draft of the conversation being left waits for its return,
+        // along with its queue, its composer's files and any held draft.
         self.drafts.store(&self.conversation, &self.composer);
         let left = std::mem::take(&mut self.queue);
         self.queues.stash(&self.conversation, left);
+        let files = std::mem::take(&mut self.composer_files);
+        let pending = std::mem::take(&mut self.upload_queue);
+        self.composer_files_stash
+            .stash(&self.conversation, files, pending);
+        if let Some(held) = self.state.held_draft.take() {
+            self.held_drafts.insert(self.conversation.clone(), held);
+        }
         self.runs_open.clear();
         self.runs_last_read = None;
         self.conversation = id;
         self.queue = self.queues.restore(&self.conversation);
         self.state.chat_failure = None;
-        self.state.held_draft = None;
         self.section = Section::Chat;
         self.panel.set_page_open(false);
         if self.bot_settings.open {
@@ -2658,7 +2748,14 @@ impl Session {
                 .as_ref()
                 .is_some_and(|c| !c.providers.is_empty());
         self.reset_scope(true);
+        let (files, pending) = self.composer_files_stash.restore(&self.conversation);
+        self.composer_files = files;
+        self.upload_queue = pending;
+        // After `reset_scope`: `new_scope` rebuilds the state, so the held
+        // draft is restored here, not before.
+        self.state.held_draft = self.held_drafts.remove(&self.conversation);
         self.replace_composer(self.drafts.restore(&self.conversation));
+        self.persist_composer_state();
         self.auto_approve_confirming = false;
         self.state.error = None;
         // Opening a chat is reading it: its badge goes now, not when the
@@ -3036,15 +3133,35 @@ impl Session {
         }
     }
 
+    /// Send the composer as the next turn. Every guard that stops a send
+    /// says why in a toast instead of silently doing nothing.
     pub fn submit(&mut self) {
         let has_files = !self.composer_files.is_empty();
         let text_ok = valid_text(&self.composer) || (has_files && self.composer.trim().is_empty());
-        if !self.state.can_send()
-            || !text_ok
-            || !self.ready()
-            || self.uploading
-            || !self.upload_queue.is_empty()
-        {
+        if self.uploading || !self.upload_queue.is_empty() {
+            self.toast = Some("Still uploading…".into());
+            return;
+        }
+        if !self.state.connected {
+            self.toast = Some("Waiting for connection".into());
+            return;
+        }
+        if !self.ready() {
+            self.toast = Some("Waiting for the current request to finish.".into());
+            return;
+        }
+        if !self.state.can_send() {
+            self.toast = Some(self.send_blocked_reason());
+            return;
+        }
+        if !text_ok {
+            self.toast = Some(
+                if self.composer.chars().count() > crate::chat_compose::MAX_TEXT_CHARS {
+                    "Message is over the limit".into()
+                } else {
+                    "Type a message first.".into()
+                },
+            );
             return;
         }
         self.state.error = None;
@@ -3059,6 +3176,7 @@ impl Session {
             self.composer_gen = self.composer_gen.wrapping_add(1);
         }
         self.drafts.clear(&self.conversation);
+        self.persist_composer_state();
         self.attach_notice = None;
         self.regenerating = false;
         let files = std::mem::take(&mut self.composer_files);
@@ -3089,6 +3207,46 @@ impl Session {
                 attachments: files.into_iter().map(|file| file.id).collect(),
             });
         }
+    }
+
+    /// Why a send is refused while the connection is up.
+    fn send_blocked_reason(&self) -> String {
+        if !self.state.history_loaded {
+            "Still loading this conversation…".into()
+        } else if self.state.unknown_outcome {
+            "The last message may not have arrived. Check the transcript first.".into()
+        } else if self.main_run_active() || self.has_optimistic_pending() {
+            "A reply is still running.".into()
+        } else {
+            "Pick a model for this chat first.".into()
+        }
+    }
+
+    /// Attach the over-long composer text as a `message.txt` file instead of
+    /// sending it as text, so a long draft can still go out. The box is
+    /// cleared; the file is sent with the next send.
+    pub fn attach_composer_as_file(&mut self) {
+        let text = self.composer.trim().to_owned();
+        if text.is_empty() {
+            self.toast = Some("Type a message first.".into());
+            return;
+        }
+        // Refused (for example the message already holds the maximum files):
+        // keep the text in the box and say why.
+        let admission = crate::chat_compose::admit_files(
+            self.attachments_held(),
+            &[("message.txt", text.len() as u64)],
+        );
+        if admission.accepted.is_empty() {
+            self.attach_notice = Some(admission.refused.join(" "));
+            return;
+        }
+        self.queue_files(vec![("message.txt".to_owned(), text.into_bytes())]);
+        self.composer.zeroize();
+        self.composer = String::new();
+        self.composer_gen = self.composer_gen.wrapping_add(1);
+        self.drafts.clear(&self.conversation);
+        self.persist_composer_state();
     }
 
     /// Continue under a reply that a tool limit ended (0.24). Sends the fixed
@@ -3632,6 +3790,7 @@ impl Session {
         {
             self.replace_composer(text.clone());
             self.drafts.store(&self.conversation, &self.composer);
+            self.persist_composer_state();
             self.state.messages.pop();
             self.state.held_draft = Some(text);
         }
@@ -5260,6 +5419,7 @@ impl Session {
                             // The transcript is untrusted model output: it goes
                             // into the composer as a draft and is never sent.
                             self.state.transcript_loading = false;
+                            self.last_audio = None;
                             if let Some(text) = self.state.transcript.clone() {
                                 if !self.composer.trim().is_empty() {
                                     self.composer.push('\n');
@@ -6693,10 +6853,35 @@ impl Session {
         }
         self.state.transcript_error = None;
         self.state.transcript_loading = true;
+        // Kept for one retry: a failed transcription can be sent again
+        // without recording the note a second time.
+        self.last_audio = Some((filename.clone(), bytes.clone()));
         self.start_request(Operation::TranscribeAudio { filename, bytes });
         if self.pending.is_none() {
             self.state.transcript_loading = false;
         }
+    }
+
+    /// Send the last voice note for transcription again, after a failure.
+    /// Does nothing when there is no note to retry or one is already running.
+    pub fn retry_transcribe(&mut self) {
+        let Some((filename, bytes)) = self.last_audio.clone() else {
+            return;
+        };
+        if self.state.transcript_loading {
+            return;
+        }
+        self.state.transcript_error = None;
+        self.state.transcript_loading = true;
+        self.start_request(Operation::TranscribeAudio { filename, bytes });
+        if self.pending.is_none() {
+            self.state.transcript_loading = false;
+        }
+    }
+
+    /// Forget the last voice note, for example once its text has landed.
+    pub fn clear_last_audio(&mut self) {
+        self.last_audio = None;
     }
 
     /// True when the open conversation may carry a team.
@@ -7019,7 +7204,7 @@ mod tests {
     use super::SettingsSection;
     use super::{
         AtomicBool, Duration, EventRefresh, Instant, Ordering, Session, SignInPhase, SignInUi,
-        Theme, event_refresh, scope_event_kind, telegram_error,
+        Theme, event_refresh, load_composer_drafts, scope_event_kind, telegram_error,
     };
     use crate::ApiError;
     use crate::worker::{Credentials, Operation};
@@ -7448,6 +7633,186 @@ mod tests {
         assert!(ApiError::Transport.to_string().contains("Retrying"));
         assert!(!ApiError::Transport.to_string().contains("TLS"));
         assert!(ApiError::Transport.sign_in_text().contains("TLS"));
+    }
+
+    /// A fresh empty directory for a test that writes drafts to disk.
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("serabot-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn sendable_session() -> Session {
+        let mut session = Session::assemble(
+            String::new(),
+            Theme::Dark,
+            Vec::new(),
+            String::new(),
+            crate::worker::Worker::start().ok(),
+        );
+        session.state.connected = true;
+        session.state.history_loaded = true;
+        let selection = crate::Selection {
+            provider: "p".into(),
+            model: "m".into(),
+            account: None,
+        };
+        session.state.draft = selection.clone();
+        session.state.catalog = Some(crate::Catalog {
+            providers: vec![crate::Provider {
+                id: "p".into(),
+                models: vec!["m".into()],
+                data_egress_approved: true,
+            }],
+            entries: Vec::new(),
+            selection,
+            effective_selection: None,
+            thinking: crate::ThinkingInfo::default(),
+        });
+        assert!(session.state.can_send(), "the test chat must be sendable");
+        session
+    }
+
+    #[test]
+    fn submit_names_the_reason_instead_of_failing_silently() {
+        // Offline: the connection is the reason.
+        let mut session = plain_session();
+        session.composer = "hello".into();
+        session.submit();
+        assert_eq!(
+            session.toast.as_deref(),
+            Some("Waiting for connection"),
+            "a send with no connection must say so"
+        );
+        assert_eq!(session.state.messages.len(), 0, "nothing was sent");
+
+        // Still uploading: the upload is the reason.
+        let mut session = sendable_session();
+        session.uploading = true;
+        session.composer = "hello".into();
+        session.submit();
+        assert_eq!(session.toast.as_deref(), Some("Still uploading…"));
+        session.uploading = false;
+        session.upload_queue.push_back(("late.pdf".into(), vec![1]));
+        session.submit();
+        assert_eq!(session.toast.as_deref(), Some("Still uploading…"));
+
+        // Over the limit: the length is the reason.
+        let mut session = sendable_session();
+        session.composer = "x".repeat(crate::chat_compose::MAX_TEXT_CHARS + 1);
+        session.submit();
+        assert_eq!(session.toast.as_deref(), Some("Message is over the limit"));
+
+        // Empty: the empty box is the reason.
+        let mut session = sendable_session();
+        session.composer = "   ".into();
+        session.submit();
+        assert_eq!(session.toast.as_deref(), Some("Type a message first."));
+    }
+
+    #[test]
+    fn composer_files_and_held_drafts_survive_a_chat_switch() {
+        let dir = temp_dir("switch");
+        let mut session = Session::assemble(
+            String::new(),
+            Theme::Dark,
+            Vec::new(),
+            String::new(),
+            crate::worker::Worker::start().ok(),
+        );
+        session.persist_worker = None;
+        session.composer_dir_override = Some(dir);
+        session.state.connected = true;
+        session.open_conversation("dir:main".into());
+        session.composer = "draft for main".into();
+        session.composer_files.push(crate::AttachmentInfo {
+            id: "a1".into(),
+            filename: "n.txt".into(),
+            mime: "text/plain".into(),
+            size_bytes: 3,
+            is_image: false,
+        });
+        session
+            .upload_queue
+            .push_back(("late.pdf".into(), vec![1, 2]));
+        session.state.held_draft = Some("held for main".into());
+        session.open_conversation("dir:other".into());
+        assert!(
+            session.composer_files.is_empty(),
+            "the new chat starts clean"
+        );
+        assert!(session.upload_queue.is_empty());
+        assert_eq!(session.state.held_draft, None);
+        assert_eq!(session.composer, "", "no draft was typed in the other chat");
+
+        session.open_conversation("dir:main".into());
+        assert_eq!(session.composer, "draft for main");
+        assert_eq!(session.composer_files.len(), 1);
+        assert_eq!(session.composer_files[0].id, "a1");
+        assert_eq!(session.upload_queue.len(), 1);
+        assert_eq!(session.state.held_draft.as_deref(), Some("held for main"));
+    }
+
+    #[test]
+    fn over_long_composer_text_attaches_as_a_file() {
+        let dir = temp_dir("attach-as-file");
+        let mut session = plain_session();
+        session.persist_worker = None;
+        session.composer_dir_override = Some(dir);
+        session.composer = "x".repeat(crate::chat_compose::MAX_TEXT_CHARS + 5);
+        session.attach_composer_as_file();
+        assert!(session.composer.is_empty(), "the box is cleared");
+        assert_eq!(session.upload_queue.len(), 1);
+        assert_eq!(session.upload_queue[0].0, "message.txt");
+        assert_eq!(
+            session.upload_queue[0].1.len(),
+            crate::chat_compose::MAX_TEXT_CHARS + 5
+        );
+
+        // Empty: nothing to attach, and the draft stays put.
+        session.composer = "   ".into();
+        session.attach_composer_as_file();
+        assert_eq!(session.toast.as_deref(), Some("Type a message first."));
+        assert_eq!(session.upload_queue.len(), 1, "no file was queued");
+    }
+
+    #[test]
+    fn persisted_drafts_and_queues_come_back_with_the_launch() {
+        let dir = temp_dir("persist");
+        let mut session = plain_session();
+        session.persist_worker = None;
+        session.composer_dir_override = Some(dir.clone());
+        // The open chat's draft and queue are what a relaunch restores.
+        session.conversation = "dir:main".into();
+        session.composer = "keep me".into();
+        session.queue.push("queued", None).unwrap();
+        session.persist_composer_state();
+        let (drafts, mut queues) = load_composer_drafts(&dir);
+        assert_eq!(drafts.restore("dir:main"), "keep me");
+        assert_eq!(queues.restore("dir:main").len(), 1);
+    }
+
+    #[test]
+    fn a_failed_transcription_keeps_the_audio_for_one_retry() {
+        let mut session = plain_session();
+        session.last_audio = Some(("note.webm".into(), vec![1, 2, 3]));
+        session.state.transcript_error = Some("Transcription failed.".into());
+        session.retry_transcribe();
+        assert!(
+            session.last_audio.is_some(),
+            "the bytes stay until a transcription lands"
+        );
+        assert_eq!(
+            session.state.transcript_error, None,
+            "the retry clears the error"
+        );
+        assert!(!session.state.transcript_loading);
+        session.clear_last_audio();
+        assert!(session.last_audio.is_none());
+        // Nothing to retry: a no-op, not a request.
+        session.retry_transcribe();
+        assert!(session.pending.is_none());
     }
 
     #[test]

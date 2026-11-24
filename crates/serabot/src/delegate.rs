@@ -332,7 +332,7 @@ pub fn handoff_key_hash(parent_turn_id: &str, to_bot: &str, objective: &str) -> 
     sha256_hex(format!("{parent_turn_id}\0{to_bot}\0{objective}"))
 }
 
-fn duplicate_output(existing: &HandoffRow) -> ToolOutput {
+pub(crate) fn duplicate_output(existing: &HandoffRow) -> ToolOutput {
     ToolOutput {
         content: format!(
             "Handoff {id} to {to_bot} was already queued for this request; not queued again.",
@@ -494,7 +494,7 @@ fn child_tasks_today(connection: &rusqlite::Connection, user_id: &str) -> Result
     Ok(connection.query_row(
         "SELECT COUNT(*) FROM tasks
          WHERE user_id = ?1 AND created_at >= ?2
-           AND json_extract(payload_json, '$.source') = 'handoff'",
+           AND json_extract(payload_json, '$.source') IN ('handoff', 'help')",
         params![user_id, to_string(day_start)],
         |row| row.get(0),
     )?)
@@ -580,6 +580,27 @@ impl Store {
         )?;
         transaction.commit()?;
         Ok((row, true))
+    }
+
+    /// The acting user's handoff whose child task this is, if one exists.
+    /// `ask_teammate` children carry no handoff context in their payload, so
+    /// failure reporting finds their ledger row this way.
+    pub fn find_handoff_by_child_task(
+        &self,
+        user_id: &str,
+        child_task_id: &str,
+    ) -> Result<Option<HandoffRow>> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                &format!(
+                    "SELECT {HANDOFF_COLUMNS} FROM handoffs WHERE child_task_id = ?1 AND user_id = ?2"
+                ),
+                params![child_task_id, user_id],
+                handoff_from_row,
+            )
+            .optional()
+            .map_err(SeraError::from)
     }
 
     /// One of the acting user's handoffs. Another user's is a plain 404.

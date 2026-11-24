@@ -75,7 +75,7 @@ const MAX_QUERY_TOKENS: usize = 16;
 /// Upper bound on the rows scanned for a near-duplicate on write.
 const SUPERSEDE_SCAN: usize = 500;
 /// Rolling summaries are capped at this many characters.
-pub const SUMMARY_MAX_CHARS: usize = 800;
+pub const SUMMARY_MAX_CHARS: usize = 2_000;
 
 const COLUMNS: &str = "id, kind, content, source, created_at, updated_at, origin, status, \
     bot, conversation_id, importance, last_recalled_at, recall_count, superseded_by, pinned";
@@ -106,7 +106,9 @@ pub struct Memory {
     pub recall_count: i64,
     #[serde(default)]
     pub superseded_by: Option<String>,
-    /// Kept at the top of the Memory page. Recall does not prefer it.
+    /// Kept at the top of the Memory page. Recall always includes up to
+    /// [`PINNED_RECALL_MAX`] pinned active facts outside the recall limit
+    /// (see [`recall_hybrid`]).
     #[serde(default)]
     pub pinned: bool,
 }
@@ -514,7 +516,7 @@ pub fn recall_hybrid(
     semantic: &HashMap<String, f64>,
 ) -> Result<Vec<Recalled>> {
     let filter = MemoryFilter::default();
-    let ranked = if query_tokens(query).is_empty() {
+    let mut ranked = if query_tokens(query).is_empty() {
         list_page(store, user_id, &filter, 0, k)?
             .into_iter()
             .map(|memory| Recalled { memory, score: 0.0 })
@@ -531,9 +533,46 @@ pub fn recall_hybrid(
             semantic,
         )?
     };
+    // Pinned facts ride outside the recall limit: a fact the owner pinned
+    // is one they always want in context, even when it scores below the cut.
+    include_pinned(store, user_id, &mut ranked, bot)?;
     let ids: Vec<String> = ranked.iter().map(|item| item.memory.id.clone()).collect();
     touch(store, user_id, &ids)?;
     Ok(ranked)
+}
+
+/// Most pinned facts recall adds outside the recall limit.
+pub const PINNED_RECALL_MAX: usize = 2;
+
+/// The acting user's newest pinned active facts, newest first.
+pub fn pinned_memories(store: &Store, user_id: &str, limit: usize) -> Result<Vec<Memory>> {
+    let connection = store.connection()?;
+    let mut statement = connection.prepare(&format!(
+        "SELECT {COLUMNS} FROM memories
+         WHERE user_id = ?1 AND status = 'active' AND pinned = 1
+         ORDER BY updated_at DESC, id DESC LIMIT ?2"
+    ))?;
+    let rows = statement.query_map(params![user_id, limit.max(1) as i64], row_to_memory)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Append up to [`PINNED_RECALL_MAX`] pinned facts that are not already
+/// recalled, outside the recall limit.
+fn include_pinned(
+    store: &Store,
+    user_id: &str,
+    recalled: &mut Vec<Recalled>,
+    bot: Option<&str>,
+) -> Result<()> {
+    let now = Utc::now();
+    for memory in pinned_memories(store, user_id, PINNED_RECALL_MAX)? {
+        if recalled.iter().any(|item| item.memory.id == memory.id) {
+            continue;
+        }
+        let score = score_of(&memory, 0.0, bot, now);
+        recalled.push(Recalled { memory, score });
+    }
+    Ok(())
 }
 
 /// Update one memory of the acting user. Absent fields keep their stored
@@ -1111,7 +1150,11 @@ impl MemoryProvider for MemoryHub {
                 Vec::new()
             }
         };
-        Ok(merge_by_score(local, hits, &self.gateway, k))
+        // Merging with remote hits truncates to `k`, which can drop the
+        // pinned facts `recall_hybrid` added; put them back outside the cut.
+        let mut merged = merge_by_score(local, hits, &self.gateway, k);
+        include_pinned(self.gateway.store(), user_id, &mut merged, bot)?;
+        Ok(merged)
     }
 
     async fn search(
@@ -1816,6 +1859,43 @@ mod tests {
         let found = search(&store, &admin, "dentist", &MemoryFilter::default(), 5).expect("search");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].memory.id, old.id);
+    }
+
+    #[test]
+    fn recall_always_includes_up_to_two_pinned_facts_outside_the_limit() {
+        let store = store();
+        let admin = admin(&store);
+        let pin = |store: &Store, id: &str| {
+            store
+                .connection()
+                .unwrap()
+                .execute("UPDATE memories SET pinned = 1 WHERE id = ?1", params![id])
+                .unwrap();
+        };
+        for index in 0..5 {
+            at(
+                &store,
+                &admin,
+                &format!("Unrelated note number {index} about groceries"),
+            );
+        }
+        let first = at(&store, &admin, "Pinned zebra fact one");
+        let second = at(&store, &admin, "Pinned zebra fact two");
+        let third = at(&store, &admin, "Pinned zebra fact three");
+        pin(&store, &first.id);
+        pin(&store, &second.id);
+        pin(&store, &third.id);
+        // The oldest pinned fact must lose the cut even on a tie of the rest.
+        age(&store, &first.id, 1);
+        let recalled = recall(&store, &admin, "groceries", 2, None).expect("recall");
+        let ids: Vec<&str> = recalled
+            .iter()
+            .map(|item| item.memory.id.as_str())
+            .collect();
+        // Only the two newest pinned facts ride outside the limit of 2.
+        assert_eq!(recalled.len(), 4);
+        assert!(ids.contains(&second.id.as_str()) && ids.contains(&third.id.as_str()));
+        assert!(!ids.contains(&first.id.as_str()));
     }
 
     #[test]

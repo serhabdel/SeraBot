@@ -69,7 +69,7 @@ impl Runtime {
             tokio::select! {
                 _ = self.shutdown.cancelled() => break,
                 _ = maintenance.tick() => {
-                    self.maintenance();
+                    self.maintenance().await;
                 }
                 permit = self.semaphore.clone().acquire_owned() => {
                     let permit = match permit { Ok(permit) => permit, Err(_) => break };
@@ -202,9 +202,25 @@ impl Runtime {
         }
     }
 
-    fn maintenance(&self) {
-        if let Err(error) = self.store.expire_approvals() {
-            error!(%error, "failed to expire approvals");
+    async fn maintenance(&self) {
+        match self.store.expire_approvals() {
+            Ok(expired) => {
+                // A parked turn whose approval expired gets a plain-language
+                // notice in its conversation: nothing was sent, ask again.
+                for notice in expired {
+                    if let Some(conversation_id) = &notice.conversation_id {
+                        let _ = self
+                            .notifier
+                            .send_text(
+                                &notice.user_id,
+                                conversation_id,
+                                "That approval expired before it was answered, so nothing was sent. Ask again if you still want it.",
+                            )
+                            .await;
+                    }
+                }
+            }
+            Err(error) => error!(%error, "failed to expire approvals"),
         }
         if let Err(error) = self.store.recover_expired_tasks() {
             error!(%error, "failed to recover expired tasks");
@@ -417,6 +433,9 @@ pub(super) fn failure_notice(error: &SeraError, retrying: bool) -> String {
                 code.replace('_', " ")
             )
         }
+        // Rejected errors carry a server-authored message that is safe to
+        // show (for example the too-long reply after a failed compaction).
+        SeraError::Rejected { message, .. } => message.clone(),
         _ => "This request failed.".to_owned(),
     };
     if retrying {

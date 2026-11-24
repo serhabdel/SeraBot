@@ -570,17 +570,27 @@ fn tool_sentence(tool: &str, summary: &str, done: bool) -> Option<String> {
 }
 
 /// The `@mention` query being typed at the end of `text`, if any: the last
-/// `@` whose tail contains no whitespace, is at most 32 chars and matches
-/// `[a-z0-9-_]*`. A bare `@` yields `Some("")`.
+/// `@` that starts the text or follows whitespace, whose tail contains no
+/// whitespace, is at most 32 chars and matches `[A-Za-z0-9-_]*`. A bare `@`
+/// yields `Some("")`. The tail is kept as typed; matching lowercases it, so
+/// `@Analyst` finds `analyst`. An `@` inside a word or address (`a@b`) never
+/// opens the picker.
 fn mention_query(text: &str) -> Option<String> {
     let at = text.rfind('@')?;
+    if at > 0
+        && !text
+            .get(..at)
+            .is_some_and(|head| head.ends_with(char::is_whitespace))
+    {
+        return None;
+    }
     let tail = text.get(at + 1..)?;
     if tail.len() > 32 || tail.chars().any(char::is_whitespace) {
         return None;
     }
     if !tail
         .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
         return None;
     }
@@ -1065,9 +1075,23 @@ mod tests {
         assert_eq!(
             mention_query("mail a@b.example"),
             None,
-            "non-slug tail rejected"
+            "an @ inside a word or address never opens the picker"
         );
-        assert_eq!(mention_query("ping @Analyst"), None, "uppercase rejected");
+        assert_eq!(
+            mention_query("ping @Analyst"),
+            Some("Analyst".into()),
+            "uppercase is accepted and matched case-insensitively"
+        );
+        assert_eq!(
+            mention_query("ask @analyst about this @maker"),
+            Some("maker".into()),
+            "mid-sentence mentions open on the last @"
+        );
+        assert_eq!(
+            mention_query("email me at a@b"),
+            None,
+            "an @ glued to a word is an address, not a mention"
+        );
         assert_eq!(
             mention_query(&format!("@{}", "a".repeat(33))),
             None,

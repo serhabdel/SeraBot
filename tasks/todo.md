@@ -557,3 +557,40 @@ never merge without the owner's OK.
 - [ ] Owner: live pass on Windows — Library grid + image viewer, open a
   real PDF/PPTX/XLSX in-app, Open with default app, and on mobile open an
   image and a PPTX/XLSX preview against a 0.74.9 server.
+
+## Release 0.74.10 — Chat, composer & core (scroll restore, streaming perf, Delegating card, needs_review, mobile composer catch-up, persisted drafts, compaction persistence, heartbeat, duplicate-send guard, tool digest, honest context meter)
+
+- [x] Chat view: scroll restore (no first-load force-pin, feed window keeps
+  last start, uncapped bridge restore wait), slim transcript fingerprint +
+  cached haystacks + streaming parse-cache bypass + memoised tokenize,
+  Delegating card from the handoff ledger with parallel count, `NeedsReview`
+  TaskStatus + LiveCard state (non-terminal, never auto-retried), streaming
+  markdown (unclosed fence/`:::hand`/table header as plain text, Copy hidden
+  while streaming), search next/prev jump-to-match, in-chat context meter.
+- [x] Composer: mobile queue while running + @// pickers + draft restore +
+  send action, files/uploads/held draft stashed per conversation, Enter
+  falls through on empty picker, submit() reason toasts, drafts+queue
+  persisted to `composer_drafts.json` (text only, secrets dropped), voice
+  cancel + timer + transcribing state + one retry, Up/Down history cycling,
+  queue with already-uploaded files, over-limit "Attach as file", picker
+  a11y, paste/drop gating, auto-grow JS fallback. Server 8000-char cap
+  already existed in `runtime/routing.rs` — no change needed.
+- [x] Core: chunked compaction summaries stored regardless of folded Tool
+  messages, durable folded boundary, fail-fast when compaction cannot shrink
+  the prompt, summary cap 800→2000, FACTS_MAX_CHARS 1200→2500, `turn.progress`
+  heartbeat every 15 s during model calls, uncertain flag before every
+  effectful tool call + completed-effects replay skip + batch validation,
+  per-turn tool digest persisted for `history_for_llm`, history char cap
+  (60,000), `turn.context` after full prompt build + re-emit per round +
+  no 100% clamp + tool-arg/image-aware estimator, `ContextTooLong` tries
+  larger-window candidates, expired-approval recovery notice, `ask_teammate`
+  ledger row + quota + child-failure summary to parent, pinned recall (up
+  to 2 outside recall_k).
+- [x] Tests: chat, composer (desktop + mobile), and core slices as listed in
+  `docs/release-0.74.10.md`.
+- [x] Version bump 0.74.10 (Cargo.toml), mobile 0.74.10+84,
+  `docs/release-0.74.10.md`, README, AGENTS.md.
+- [ ] Owner: live pass on Windows — scroll restore in a long chat, streaming
+  reply smoothness, Delegating card on a multi-bot handoff, mobile queue +
+  pickers + draft restore, and a long conversation against a 0.74.10 server
+  (compaction keeps earlier facts, heartbeat shows while the model thinks).

@@ -525,6 +525,28 @@ impl std::fmt::Debug for Store {
     }
 }
 
+/// A parked turn whose approval expired: the owner must be told, in plain
+/// language, that nothing was sent and to ask again.
+#[derive(Debug, Clone)]
+pub struct ExpiredApproval {
+    pub user_id: String,
+    pub approval_id: String,
+    pub task_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub conversation_id: Option<String>,
+}
+
+/// One row read by the expiry sweep: approval id, action id, task id, user
+/// id, turn id, conversation id.
+type ExpiringApprovalRow = (
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
 impl Store {
     pub fn open(path: impl AsRef<Path>, dimension: usize, busy_timeout_ms: u32) -> Result<Self> {
         init_sqlite_vec();
@@ -3141,13 +3163,18 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// History for the model: the newest `limit` messages, further trimmed
+    /// from the oldest end until their content fits `max_chars` (the newest
+    /// message always survives). System messages are dropped: the turn builds
+    /// its own prompt.
     pub fn history_for_llm(
         &self,
         user_id: &str,
         conversation_id: &str,
         limit: usize,
+        max_chars: usize,
     ) -> Result<Vec<LlmMessage>> {
-        Ok(self
+        let mut messages: Vec<LlmMessage> = self
             .list_messages(user_id, conversation_id, limit)?
             .into_iter()
             .filter(|message| message.role != Role::System)
@@ -3160,7 +3187,41 @@ impl Store {
                 is_error: false,
                 images: Vec::new(),
             })
-            .collect())
+            .collect();
+        let mut total: usize = messages
+            .iter()
+            .map(|message| message.content.as_deref().map_or(0, str::len))
+            .sum();
+        while messages.len() > 1 && total > max_chars {
+            if let Some(dropped) = messages.first() {
+                total = total.saturating_sub(dropped.content.as_deref().map_or(0, str::len));
+            }
+            messages.remove(0);
+        }
+        Ok(messages)
+    }
+
+    /// The id of the newest stored message in this conversation with this
+    /// role and exact content, if one exists. The compaction boundary is
+    /// resolved through it, never copied from a previous summary.
+    pub fn find_message_id(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        role: &str,
+        content: &str,
+    ) -> Result<Option<String>> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT id FROM messages
+                 WHERE user_id = ?1 AND conversation_id = ?2 AND role = ?3 AND content = ?4
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                params![user_id, conversation_id, role, content],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(SeraError::from)
     }
 
     /// Record the turn of the acting user's task in the acting user's
@@ -4566,23 +4627,34 @@ impl Store {
     /// Expiry cascade over every user's pending approvals. Cross-user by
     /// design: expiry is a time-driven maintenance sweep (an approval past
     /// its expiry is dead regardless of whose it is), and the cascade also
-    /// fails the suspended task and turn of the owning user.
-    pub fn expire_approvals(&self) -> Result<usize> {
+    /// fails the suspended task and turn of the owning user. Returns one
+    /// notice per parked turn that expired, so the worker can tell the owner
+    /// nothing was sent.
+    pub fn expire_approvals(&self) -> Result<Vec<ExpiredApproval>> {
         let connection = self.connection()?;
         let now = now_string();
         let transaction = connection.unchecked_transaction()?;
-        let expiring: Vec<(String, String, Option<String>)> = {
+        let expiring: Vec<ExpiringApprovalRow> = {
             let mut statement = transaction.prepare(
-                "SELECT ap.id, ap.action_id, ac.task_id
+                "SELECT ap.id, ap.action_id, ac.task_id, ac.user_id, ac.turn_id, t.conversation_id
                  FROM approvals ap JOIN actions ac ON ac.id = ap.action_id
+                 LEFT JOIN turns t ON t.id = ac.turn_id AND t.status = 'awaiting_approval'
                  WHERE ap.state='pending' AND ap.expires_at <= ?1",
             )?;
             let rows = statement.query_map(params![now], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
             })?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
-        for (approval_id, action_id, task_id) in &expiring {
+        let mut notices = Vec::new();
+        for (approval_id, action_id, task_id, user_id, turn_id, conversation_id) in &expiring {
             transaction.execute(
                 "UPDATE approvals SET state='expired', decided_at=?1 WHERE id=?2 AND state='pending'",
                 params![now, approval_id],
@@ -4603,9 +4675,34 @@ impl Store {
                     params![now, task_id],
                 )?;
             }
+            // Every expired approval is reported, whether or not its turn
+            // still has a conversation to notify in; the worker only sends
+            // the plain-language notice where one exists.
+            notices.push(ExpiredApproval {
+                user_id: user_id.clone(),
+                approval_id: approval_id.clone(),
+                task_id: task_id.clone(),
+                turn_id: turn_id.clone(),
+                conversation_id: conversation_id.clone(),
+            });
         }
         transaction.commit()?;
-        Ok(expiring.len())
+        for notice in &notices {
+            if notice.conversation_id.is_none() {
+                continue;
+            }
+            let _ = self.append_event(
+                &notice.user_id,
+                "approval.expired",
+                &serde_json::json!({
+                    "approval_id": notice.approval_id,
+                    "task_id": notice.task_id,
+                    "turn_id": notice.turn_id,
+                    "conversation_id": notice.conversation_id,
+                }),
+            );
+        }
+        Ok(notices)
     }
 
     /// Invalidate pending approvals bound to an outdated policy version.
@@ -6459,6 +6556,33 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn history_for_llm_trims_oldest_messages_to_the_char_cap() {
+        let store = store();
+        let admin = admin(&store);
+        store
+            .append_message(&admin, "owner", None, Role::User, "old and long")
+            .unwrap();
+        store
+            .append_message(&admin, "owner", None, Role::Assistant, "middle")
+            .unwrap();
+        store
+            .append_message(&admin, "owner", None, Role::User, "new")
+            .unwrap();
+        // 12 chars of budget: "middle" (6) + "new" (3) fit, "old and long" does not.
+        let messages = store.history_for_llm(&admin, "owner", 50, 12).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[1].content.as_deref(),
+            Some("new"),
+            "the newest message always survives the trim"
+        );
+        // A zero budget still keeps the newest message.
+        let messages = store.history_for_llm(&admin, "owner", 50, 0).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content.as_deref(), Some("new"));
     }
 
     #[test]
@@ -8389,7 +8513,7 @@ mod tests {
                 utc_now() - chrono::Duration::minutes(1),
             )
             .unwrap();
-        assert_eq!(store.expire_approvals().unwrap(), 1);
+        assert_eq!(store.expire_approvals().unwrap().len(), 1);
         assert_eq!(
             store.get_approval(&admin, &approval.id).unwrap().state,
             "expired"
@@ -8491,6 +8615,39 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(store.get_task(&admin, &plain.id).unwrap().status, "queued");
+    }
+
+    #[test]
+    fn an_uncertain_final_failure_goes_to_review_and_a_plain_one_fails() {
+        // `fail_task_final` (no more retries) round-trips the same status:
+        // an uncertain effect is never replayed, it waits for the owner.
+        let store = store();
+        let admin = admin(&store);
+        let flagged = store
+            .enqueue_task(&admin, "turn", "main", &serde_json::json!({}), 0, utc_now())
+            .unwrap();
+        let claimed = store.claim_task("worker", 60).unwrap().unwrap();
+        assert!(store.mark_task_uncertain(&admin, &flagged.id).unwrap());
+        assert!(
+            store
+                .fail_task_final(&admin, &flagged.id, claimed.fencing_token, "lost")
+                .unwrap()
+        );
+        assert_eq!(
+            store.get_task(&admin, &flagged.id).unwrap().status,
+            "needs_review"
+        );
+
+        let plain = store
+            .enqueue_task(&admin, "turn", "main", &serde_json::json!({}), 0, utc_now())
+            .unwrap();
+        let claimed = store.claim_task("worker", 60).unwrap().unwrap();
+        assert!(
+            store
+                .fail_task_final(&admin, &plain.id, claimed.fencing_token, "flaky")
+                .unwrap()
+        );
+        assert_eq!(store.get_task(&admin, &plain.id).unwrap().status, "failed");
     }
 
     #[test]
@@ -8822,7 +8979,7 @@ mod tests {
         );
         assert!(
             store
-                .history_for_llm(&member.id, "dir:main", 100)
+                .history_for_llm(&member.id, "dir:main", 100, 60_000)
                 .unwrap()
                 .is_empty()
         );

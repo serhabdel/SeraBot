@@ -43,8 +43,15 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
-    chat = ChatController(widget.conversation.id, widget.app.client, widget.app)
-      ..load();
+    chat =
+        ChatController(
+            widget.conversation.id,
+            widget.app.client,
+            widget.app,
+            draftStore: DraftStore(),
+          )
+          ..load()
+          ..restoreDraft();
     _scroll.addListener(_onScroll);
     chat.addListener(_onChat);
   }
@@ -89,7 +96,10 @@ class _ChatScreenState extends State<ChatScreen> {
 
   void _jumpToLatest() {
     if (_scroll.hasClients) {
-      final duration = motionDuration(context, const Duration(milliseconds: 250));
+      final duration = motionDuration(
+        context,
+        const Duration(milliseconds: 250),
+      );
       if (duration == Duration.zero) {
         _scroll.jumpTo(0);
       } else {
@@ -103,11 +113,11 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   String? _actionLabel(ChatAction action) => switch (action) {
-        ChatAction.retry => 'Retry',
-        ChatAction.reconnect => 'Reconnect',
-        ChatAction.keys => 'AI keys',
-        ChatAction.none => null,
-      };
+    ChatAction.retry => 'Retry',
+    ChatAction.reconnect => 'Reconnect',
+    ChatAction.keys => 'AI keys',
+    ChatAction.none => null,
+  };
 
   Future<void> _onErrorAction(BuildContext context) async {
     switch (chat.errorAction) {
@@ -131,7 +141,10 @@ class _ChatScreenState extends State<ChatScreen> {
               'Provider keys are saved in the Windows app, under AI keys. Add or replace the key there, then try this message again.',
             ),
             actions: [
-              TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK')),
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('OK'),
+              ),
             ],
           ),
         );
@@ -140,7 +153,10 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  Future<void> _download(String name, Future<List<int>> Function() fetch) async {
+  Future<void> _download(
+    String name,
+    Future<List<int>> Function() fetch,
+  ) async {
     final messenger = ScaffoldMessenger.of(context);
     try {
       final bytes = await fetch();
@@ -148,7 +164,9 @@ class _ChatScreenState extends State<ChatScreen> {
     } on ApiException catch (e) {
       messenger.showSnackBar(SnackBar(content: Text(e.messageForUser())));
     } catch (_) {
-      messenger.showSnackBar(const SnackBar(content: Text('Could not open the file.')));
+      messenger.showSnackBar(
+        const SnackBar(content: Text('Could not open the file.')),
+      );
     }
   }
 
@@ -173,10 +191,8 @@ class _ChatScreenState extends State<ChatScreen> {
         listenable: chat,
         builder: (context, _) => FilesSheet(
           entries: chat.library,
-          onOpen: (e) => _download(
-            e.label,
-            () => widget.app.client.artifactBytes(e.hash),
-          ),
+          onOpen: (e) =>
+              _download(e.label, () => widget.app.client.artifactBytes(e.hash)),
           // 0.28.0: documents the server can render open in a preview pane;
           // the share action stays as the fallback.
           onPreview: (e) => showArtifactPreviewSheet(
@@ -219,9 +235,11 @@ class _ChatScreenState extends State<ChatScreen> {
         .whereType<String>()
         .toSet();
     final inThread = all
-        .where((a) =>
-            a.conversationId == widget.conversation.id ||
-            stepIds.contains(a.id))
+        .where(
+          (a) =>
+              a.conversationId == widget.conversation.id ||
+              stepIds.contains(a.id),
+        )
         .toList();
     final other = all.where((a) => !inThread.contains(a)).toList();
 
@@ -264,34 +282,44 @@ class _ChatScreenState extends State<ChatScreen> {
         return Scaffold(
           appBar: AppBar(
             titleSpacing: 0,
-            title: Row(children: [
-              SeraAvatar(
-                label: c.displayTitle,
-                app: widget.app,
-                kind: 'conversations',
-                id: c.id,
-                version: c.avatarVersion,
-                radius: 16,
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(c.displayTitle, maxLines: 1, overflow: TextOverflow.ellipsis),
-                    if (chat.running)
-                      Text('Working\u2026',
-                          style: Theme.of(context).textTheme.bodySmall),
-                  ],
+            title: Row(
+              children: [
+                SeraAvatar(
+                  label: c.displayTitle,
+                  app: widget.app,
+                  kind: 'conversations',
+                  id: c.id,
+                  version: c.avatarVersion,
+                  radius: 16,
                 ),
-              ),
-            ]),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        c.displayTitle,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      if (chat.running)
+                        Text(
+                          'Working\u2026',
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
             actions: [
               ActionChip(
                 key: const Key('model-chip'),
                 avatar: const Icon(Icons.auto_awesome, size: 16),
-                label: Text(sel == null ? 'Model' : (sel.isAuto ? 'Auto' : sel.model),
-                    overflow: TextOverflow.ellipsis),
+                label: Text(
+                  sel == null ? 'Model' : (sel.isAuto ? 'Auto' : sel.model),
+                  overflow: TextOverflow.ellipsis,
+                ),
                 onPressed: _modelSheet,
               ),
               IconButton(
@@ -368,9 +396,8 @@ class _ChatScreenState extends State<ChatScreen> {
       return const Center(child: CircularProgressIndicator());
     }
     final items = chat.messages.reversed.toList();
-    final showActivity = chat.running ||
-        !chat.activity.isEmpty ||
-        !chat.currentMemory.isEmpty;
+    final showActivity =
+        chat.running || !chat.activity.isEmpty || !chat.currentMemory.isEmpty;
     return ListView.builder(
       controller: _scroll,
       reverse: true,
@@ -410,7 +437,9 @@ class _JumpToLatestPill extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final reduced = MediaQuery.disableAnimationsOf(context);
-    final label = badge == null ? 'Jump to latest' : 'Jump to latest \u00b7 $badge';
+    final label = badge == null
+        ? 'Jump to latest'
+        : 'Jump to latest \u00b7 $badge';
     return FilledButton.tonalIcon(
       key: const Key('jump-to-latest'),
       onPressed: onPressed,
@@ -454,7 +483,9 @@ class MessageBubble extends StatelessWidget {
     final mine = message.role == MessageRole.user;
     final bot = app.botById(message.speaker);
     final bubble = Container(
-      constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.82),
+      constraints: BoxConstraints(
+        maxWidth: MediaQuery.of(context).size.width * 0.82,
+      ),
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
       decoration: BoxDecoration(
         color: mine ? scheme.primaryContainer : scheme.surfaceContainerHigh,
@@ -473,9 +504,7 @@ class MessageBubble extends StatelessWidget {
               padding: const EdgeInsets.only(bottom: 4),
               child: Text(
                 bot?.name ?? message.speaker!,
-                style: Theme.of(context)
-                    .textTheme
-                    .labelMedium
+                style: Theme.of(context).textTheme.labelMedium
                     ?.copyWith(color: scheme.primary),
               ),
             ),
@@ -487,7 +516,10 @@ class MessageBubble extends StatelessWidget {
             Padding(
               padding: const EdgeInsets.only(top: 6),
               child: ActionChip(
-                avatar: Icon(a.isImage ? Icons.image_outlined : Icons.attach_file, size: 16),
+                avatar: Icon(
+                  a.isImage ? Icons.image_outlined : Icons.attach_file,
+                  size: 16,
+                ),
                 label: Text(a.filename, overflow: TextOverflow.ellipsis),
                 onPressed: onAttachment == null ? null : () => onAttachment!(a),
               ),
@@ -499,7 +531,9 @@ class MessageBubble extends StatelessWidget {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
       child: Row(
-        mainAxisAlignment: mine ? MainAxisAlignment.end : MainAxisAlignment.start,
+        mainAxisAlignment: mine
+            ? MainAxisAlignment.end
+            : MainAxisAlignment.start,
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
           if (!mine) ...[
@@ -540,12 +574,12 @@ class _BubbleFooter extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         children: [
           if (time.isNotEmpty)
-            Text(time,
-                key: const Key('bubble-time'),
-                style: Theme.of(context)
-                    .textTheme
-                    .labelSmall
-                    ?.copyWith(color: muted)),
+            Text(
+              time,
+              key: const Key('bubble-time'),
+              style: Theme.of(context).textTheme.labelSmall
+                  ?.copyWith(color: muted),
+            ),
           if (canCopy)
             IconButton(
               key: const Key('copy-message'),
@@ -557,9 +591,7 @@ class _BubbleFooter extends StatelessWidget {
               onPressed: () async {
                 final messenger = ScaffoldMessenger.of(context);
                 await Clipboard.setData(ClipboardData(text: message.content));
-                messenger.showSnackBar(
-                  const SnackBar(content: Text('Copied')),
-                );
+                messenger.showSnackBar(const SnackBar(content: Text('Copied')));
               },
             ),
         ],
@@ -624,7 +656,9 @@ class _StepCard extends StatelessWidget {
     final scheme = Theme.of(context).colorScheme;
     final reduced = MediaQuery.disableAnimationsOf(context);
     final heading = step.heading;
-    final subtitle = step.title != null && step.label != heading ? step.label : null;
+    final subtitle = step.title != null && step.label != heading
+        ? step.label
+        : null;
     final status = switch (step.phase) {
       StepPhase.running => 'Running',
       StepPhase.progress => 'Still working',
@@ -632,7 +666,9 @@ class _StepCard extends StatelessWidget {
       StepPhase.failed => 'Failed',
       StepPhase.waitingApproval => 'Waiting for your approval',
     };
-    final duration = step.durationMs == null ? null : formatDuration(step.durationMs!);
+    final duration = step.durationMs == null
+        ? null
+        : formatDuration(step.durationMs!);
     final waiting = step.phase == StepPhase.waitingApproval;
     return Semantics(
       label: '$heading, $status',
@@ -643,55 +679,81 @@ class _StepCard extends StatelessWidget {
             color: waiting
                 ? scheme.tertiaryContainer
                 : step.phase == StepPhase.failed
-                    ? scheme.errorContainer
-                    : null,
+                ? scheme.errorContainer
+                : null,
             borderRadius: BorderRadius.circular(12),
           ),
           child: Padding(
-            padding: EdgeInsets.all(waiting || step.phase == StepPhase.failed ? 8 : 0),
+            padding: EdgeInsets.all(
+              waiting || step.phase == StepPhase.failed ? 8 : 0,
+            ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Row(children: [
-                  _statusMark(step.phase, reduced, scheme),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(heading, style: Theme.of(context).textTheme.titleSmall),
-                        if (subtitle != null)
-                          Text(subtitle, style: Theme.of(context).textTheme.bodySmall),
-                      ],
+                Row(
+                  children: [
+                    _statusMark(step.phase, reduced, scheme),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            heading,
+                            style: Theme.of(context).textTheme.titleSmall,
+                          ),
+                          if (subtitle != null)
+                            Text(
+                              subtitle,
+                              style: Theme.of(context).textTheme.bodySmall,
+                            ),
+                        ],
+                      ),
                     ),
-                  ),
-                  if (duration != null)
-                    Text(duration, style: Theme.of(context).textTheme.labelSmall),
-                ]),
+                    if (duration != null)
+                      Text(
+                        duration,
+                        style: Theme.of(context).textTheme.labelSmall,
+                      ),
+                  ],
+                ),
                 if (waiting) ...[
                   const Padding(
                     padding: EdgeInsets.only(top: 6),
                     child: Text('Waiting for your approval'),
                   ),
                   if (step.approvalId != null)
-                    Row(children: [
-                      TextButton(
-                        onPressed: () => chat.decide(step.approvalId!, ApprovalDecision.deny),
-                        child: const Text('Deny'),
-                      ),
-                      FilledButton(
-                        onPressed: () => chat.decide(step.approvalId!, ApprovalDecision.once),
-                        child: const Text('Approve'),
-                      ),
-                    ]),
+                    Row(
+                      children: [
+                        TextButton(
+                          onPressed: () => chat.decide(
+                            step.approvalId!,
+                            ApprovalDecision.deny,
+                          ),
+                          child: const Text('Deny'),
+                        ),
+                        FilledButton(
+                          onPressed: () => chat.decide(
+                            step.approvalId!,
+                            ApprovalDecision.once,
+                          ),
+                          child: const Text('Approve'),
+                        ),
+                      ],
+                    ),
                 ],
                 if (step.phase == StepPhase.failed && step.error != null)
                   Padding(
                     padding: const EdgeInsets.only(top: 4),
-                    child: Text(step.error!, style: TextStyle(color: scheme.onErrorContainer)),
+                    child: Text(
+                      step.error!,
+                      style: TextStyle(color: scheme.onErrorContainer),
+                    ),
                   ),
                 if (step.phase == StepPhase.failed) _stepAction(context),
-                if (step.inputSummary != null || step.result != null || step.resultSummary != null)
+                if (step.inputSummary != null ||
+                    step.result != null ||
+                    step.resultSummary != null)
                   ExpansionTile(
                     tilePadding: EdgeInsets.zero,
                     title: const Text('Details'),
@@ -744,40 +806,45 @@ class _StepCard extends StatelessWidget {
   }
 
   Widget _stepAction(BuildContext context) {
-    final last = chat.messages.where((m) => m.role == MessageRole.user).toList();
+    final last = chat.messages
+        .where((m) => m.role == MessageRole.user)
+        .toList();
     final text = last.isEmpty ? null : last.last.content;
     return switch (step.action) {
       StepAction.retry => Align(
-          alignment: Alignment.centerLeft,
-          child: TextButton(
-            onPressed: text == null || text.isEmpty || chat.running
-                ? null
-                : () => chat.send(text),
-            child: const Text('Retry'),
-          ),
+        alignment: Alignment.centerLeft,
+        child: TextButton(
+          onPressed: text == null || text.isEmpty || chat.running
+              ? null
+              : () => chat.send(text),
+          child: const Text('Retry'),
         ),
+      ),
       StepAction.keys => Align(
-          alignment: Alignment.centerLeft,
-          child: TextButton(
-            onPressed: () => showDialog<void>(
-              context: context,
-              builder: (context) => AlertDialog(
-                title: const Text('AI keys'),
-                content: const Text(
-                  'Provider keys are saved in the Windows app, under AI keys.',
-                ),
-                actions: [
-                  TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK')),
-                ],
+        alignment: Alignment.centerLeft,
+        child: TextButton(
+          onPressed: () => showDialog<void>(
+            context: context,
+            builder: (context) => AlertDialog(
+              title: const Text('AI keys'),
+              content: const Text(
+                'Provider keys are saved in the Windows app, under AI keys.',
               ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('OK'),
+                ),
+              ],
             ),
-            child: const Text('AI keys'),
           ),
+          child: const Text('AI keys'),
         ),
+      ),
       StepAction.reconnect => Align(
-          alignment: Alignment.centerLeft,
-          child: TextButton(onPressed: chat.load, child: const Text('Reconnect')),
-        ),
+        alignment: Alignment.centerLeft,
+        child: TextButton(onPressed: chat.load, child: const Text('Reconnect')),
+      ),
       StepAction.none => const SizedBox.shrink(),
     };
   }
@@ -798,14 +865,15 @@ class _ResultBody extends StatelessWidget {
       alignment: Alignment.centerLeft,
       child: switch (result.kind) {
         ResultKind.audio => Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text('Audio'),
-              if (caption.isNotEmpty) Text(caption),
-              if (result.name != null) Text(result.name!),
-              if (result.artifact != null) const Text('Saved in this chat. Open it from Files.'),
-            ],
-          ),
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Audio'),
+            if (caption.isNotEmpty) Text(caption),
+            if (result.name != null) Text(result.name!),
+            if (result.artifact != null)
+              const Text('Saved in this chat. Open it from Files.'),
+          ],
+        ),
         ResultKind.image => _ImageResult(result: result),
         ResultKind.file => _FileResult(result: result),
         ResultKind.table => _table(context),
@@ -819,7 +887,9 @@ class _ResultBody extends StatelessWidget {
     return SingleChildScrollView(
       scrollDirection: Axis.horizontal,
       child: Table(
-        border: TableBorder.all(color: Theme.of(context).colorScheme.outlineVariant),
+        border: TableBorder.all(
+          color: Theme.of(context).colorScheme.outlineVariant,
+        ),
         defaultColumnWidth: const IntrinsicColumnWidth(),
         children: [
           TableRow(
@@ -865,7 +935,9 @@ class _ImageResult extends StatelessWidget {
       );
     }
     if (result.artifact != null) {
-      return Text(result.name ?? 'Image saved in this chat. Open it from Files.');
+      return Text(
+        result.name ?? 'Image saved in this chat. Open it from Files.',
+      );
     }
     return const Text('Image');
   }
@@ -913,19 +985,60 @@ class _ComposerState extends State<Composer> {
   bool _recording = false;
   bool _transcribing = false;
   int _seenSends = 0;
+  bool _draftRestored = false;
+  bool _limitToastShown = false;
 
   ChatController get chat => widget.chat;
 
   @override
+  void initState() {
+    super.initState();
+    // A draft the controller already holds (a failed send, or a draft
+    // restored from this device) belongs in the box from the start.
+    if (chat.draft.isNotEmpty) {
+      _text.text = chat.draft;
+      _draftRestored = true;
+    }
+    _text.addListener(_onTextChanged);
+  }
+
+  @override
   void dispose() {
+    _text.removeListener(_onTextChanged);
     _text.dispose();
     super.dispose();
+  }
+
+  void _onTextChanged() {
+    // The counter near the limit and the truncation toast live off the
+    // text itself; the listener keeps them in step with every edit.
+    if (_text.text.length >= maxMessageChars && !_limitToastShown) {
+      _limitToastShown = true;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Message is at the 8,000 character limit. Shorten it or attach it as a file.',
+          ),
+        ),
+      );
+    } else if (_text.text.length < maxMessageChars) {
+      _limitToastShown = false;
+    }
   }
 
   Future<void> _send() async {
     final text = _text.text;
     chat.noteDraft(text);
     final ok = await chat.send(text);
+    if (ok && mounted) {
+      _text.clear();
+      chat.noteDraft('');
+    }
+  }
+
+  Future<void> _queue() async {
+    final text = _text.text;
+    final ok = await chat.queueSend(text);
     if (ok && mounted) {
       _text.clear();
       chat.noteDraft('');
@@ -948,25 +1061,30 @@ class _ComposerState extends State<Composer> {
       context: context,
       showDragHandle: true,
       builder: (ctx) => SafeArea(
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          ListTile(
-            leading: const Icon(Icons.image_outlined),
-            title: const Text('Photo'),
-            onTap: () {
-              Navigator.pop(ctx);
-              _attach(images: true);
-            },
-          ),
-          ListTile(
-            leading: const Icon(Icons.attach_file),
-            title: const Text('File'),
-            subtitle: const Text('PDF, Office, text, CSV or image, up to 25 MB'),
-            onTap: () {
-              Navigator.pop(ctx);
-              _attach(images: false);
-            },
-          ),
-        ]),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.image_outlined),
+              title: const Text('Photo'),
+              onTap: () {
+                Navigator.pop(ctx);
+                _attach(images: true);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.attach_file),
+              title: const Text('File'),
+              subtitle: const Text(
+                'PDF, Office, text, CSV or image, up to 25 MB',
+              ),
+              onTap: () {
+                Navigator.pop(ctx);
+                _attach(images: false);
+              },
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -977,7 +1095,9 @@ class _ComposerState extends State<Composer> {
       final ok = await widget.device.startRecording();
       if (!ok) {
         messenger.showSnackBar(
-          const SnackBar(content: Text('Allow microphone access to record a voice note.')),
+          const SnackBar(
+            content: Text('Allow microphone access to record a voice note.'),
+          ),
         );
         return;
       }
@@ -1007,6 +1127,33 @@ class _ComposerState extends State<Composer> {
     }
   }
 
+  void _insertMention(String id) {
+    final text = _text.text;
+    final at = text.lastIndexOf('@');
+    if (at < 0) {
+      return;
+    }
+    final next = '${text.substring(0, at)}@$id ';
+    _text.text = next;
+    _text.selection = TextSelection.collapsed(offset: next.length);
+    chat.noteDraft(next);
+  }
+
+  void _runSlash(String command) {
+    // The slash token on the last line goes away; the rest stays.
+    final text = _text.text;
+    final lineStart = text.lastIndexOf('\n') + 1;
+    final next = text.substring(0, lineStart);
+    _text.text = next;
+    _text.selection = TextSelection.collapsed(offset: next.length);
+    chat.noteDraft(next);
+    if (command == 'attach') {
+      _attachMenu();
+    } else if (command == 'stop') {
+      chat.stop();
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return ListenableBuilder(
@@ -1016,7 +1163,9 @@ class _ComposerState extends State<Composer> {
           final generation = chat.acceptedSends;
           if (generation > _seenSends) {
             WidgetsBinding.instance.addPostFrameCallback((_) {
-              if (mounted && chat.acceptedSends == generation && _text.text.isNotEmpty) {
+              if (mounted &&
+                  chat.acceptedSends == generation &&
+                  _text.text.isNotEmpty) {
                 _text.clear();
                 chat.noteDraft('');
               }
@@ -1024,10 +1173,53 @@ class _ComposerState extends State<Composer> {
           }
           _seenSends = generation;
         }
-        final canSend = !chat.sending &&
+        // A draft restored from this device lands in the box once the
+        // controller has read it.
+        if (chat.draftLoaded && !_draftRestored) {
+          _draftRestored = true;
+          if (_text.text.isEmpty && chat.draft.isNotEmpty) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (mounted && _text.text.isEmpty) {
+                _text.text = chat.draft;
+              }
+            });
+          }
+        }
+        final canSend =
+            !chat.sending &&
             !chat.running &&
             !chat.uploading &&
             (_text.text.trim().isNotEmpty || chat.attachments.isNotEmpty);
+        final canQueue =
+            !chat.sending &&
+            chat.running &&
+            !chat.uploading &&
+            chat.queued.length < maxQueuedMessages &&
+            (_text.text.trim().isNotEmpty || chat.attachments.isNotEmpty);
+        // The @ and / pickers, like the desktop: a trailing @token lists
+        // bots, a line-leading /token lists commands. The slash picker
+        // wins when both triggers are present.
+        final mentionQ = mentionQuery(_text.text);
+        final slashQ = mentionQ == null ? slashQuery(_text.text) : null;
+        final mentionBots = mentionQ == null
+            ? const <BotSummary>[]
+            : chat.app.bots
+                  .where(
+                    (b) =>
+                        b.enabled &&
+                        (mentionQ.isEmpty ||
+                            b.id.toLowerCase().contains(
+                              mentionQ.toLowerCase(),
+                            ) ||
+                            (b.displayName ?? '').toLowerCase().contains(
+                              mentionQ.toLowerCase(),
+                            )),
+                  )
+                  .take(5)
+                  .toList();
+        final slashActions = slashQ == null
+            ? const <MobileSlashAction>[]
+            : mobileSlashMatches(slashQ);
         return SafeArea(
           top: false,
           child: Padding(
@@ -1035,18 +1227,76 @@ class _ComposerState extends State<Composer> {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
+                if (chat.queued.isNotEmpty)
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: Wrap(
+                      spacing: 6,
+                      children: [
+                        for (var i = 0; i < chat.queued.length; i++)
+                          InputChip(
+                            label: Text(
+                              chat.queued[i].text,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            avatar: chat.queued[i].attachmentIds.isNotEmpty
+                                ? const Icon(Icons.attach_file, size: 16)
+                                : null,
+                            onDeleted: () => chat.removeQueued(i),
+                          ),
+                      ],
+                    ),
+                  ),
+                if (mentionQ != null && mentionBots.isNotEmpty)
+                  Card(
+                    margin: const EdgeInsets.only(bottom: 4),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        for (final b in mentionBots)
+                          ListTile(
+                            dense: true,
+                            title: Text(b.displayName ?? b.id),
+                            subtitle: Text('@${b.id}'),
+                            onTap: () => _insertMention(b.id),
+                          ),
+                      ],
+                    ),
+                  ),
+                if (slashQ != null && slashActions.isNotEmpty)
+                  Card(
+                    margin: const EdgeInsets.only(bottom: 4),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        for (final a in slashActions)
+                          ListTile(
+                            dense: true,
+                            title: Text('/${a.command}'),
+                            subtitle: Text(a.description),
+                            onTap: () => _runSlash(a.command),
+                          ),
+                      ],
+                    ),
+                  ),
                 if (chat.attachments.isNotEmpty || chat.uploading)
                   Align(
                     alignment: Alignment.centerLeft,
-                    child: Wrap(spacing: 6, children: [
-                      for (final a in chat.attachments)
-                        InputChip(
-                          label: Text(a.filename, overflow: TextOverflow.ellipsis),
-                          onDeleted: () => chat.removeAttachment(a),
-                        ),
-                      if (chat.uploading)
-                        const Chip(label: Text('Uploading\u2026')),
-                    ]),
+                    child: Wrap(
+                      spacing: 6,
+                      children: [
+                        for (final a in chat.attachments)
+                          InputChip(
+                            label: Text(
+                              a.filename,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            onDeleted: () => chat.removeAttachment(a),
+                          ),
+                        if (chat.uploading)
+                          const Chip(label: Text('Uploading\u2026')),
+                      ],
+                    ),
                   ),
                 Row(
                   crossAxisAlignment: CrossAxisAlignment.end,
@@ -1063,11 +1313,16 @@ class _ComposerState extends State<Composer> {
                         controller: _text,
                         minLines: 1,
                         maxLines: 6,
-                        maxLength: 8000,
+                        maxLength: maxMessageChars,
+                        textInputAction: TextInputAction.send,
+                        onSubmitted: (_) => _send(),
                         textCapitalization: TextCapitalization.sentences,
                         decoration: InputDecoration(
-                          hintText: _recording ? 'Recording\u2026' : 'Message',
-                          counterText: '',
+                          hintText: _recording ? 'Recording…' : 'Message',
+                          counterText:
+                              _text.text.length >= maxMessageChars - 800
+                              ? '${_text.text.length} / $maxMessageChars'
+                              : '',
                           isDense: true,
                           filled: true,
                         ),
@@ -1076,23 +1331,40 @@ class _ComposerState extends State<Composer> {
                     ),
                     IconButton(
                       key: const Key('mic-button'),
-                      tooltip: _recording ? 'Stop and transcribe' : 'Voice note',
+                      tooltip: _recording
+                          ? 'Stop and transcribe'
+                          : 'Voice note',
                       onPressed: _transcribing ? null : _toggleMic,
-                      color: _recording ? Theme.of(context).colorScheme.error : null,
+                      color: _recording
+                          ? Theme.of(context).colorScheme.error
+                          : null,
                       icon: _transcribing
                           ? const SizedBox(
                               width: 20,
                               height: 20,
                               child: CircularProgressIndicator(strokeWidth: 2),
                             )
-                          : Icon(_recording ? Icons.stop_circle : Icons.mic_none),
+                          : Icon(
+                              _recording ? Icons.stop_circle : Icons.mic_none,
+                            ),
                     ),
                     chat.running
-                        ? IconButton.filledTonal(
-                            key: const Key('stop-button'),
-                            tooltip: 'Stop',
-                            onPressed: chat.stop,
-                            icon: const Icon(Icons.stop),
+                        ? Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              IconButton(
+                                key: const Key('queue-button'),
+                                tooltip: 'Queue for when the reply is done',
+                                onPressed: canQueue ? _queue : null,
+                                icon: const Icon(Icons.playlist_add),
+                              ),
+                              IconButton.filledTonal(
+                                key: const Key('stop-button'),
+                                tooltip: 'Stop',
+                                onPressed: chat.stop,
+                                icon: const Icon(Icons.stop),
+                              ),
+                            ],
                           )
                         : IconButton.filled(
                             key: const Key('send-button'),
@@ -1161,9 +1433,16 @@ class _ModelSheetState extends State<ModelSheet> {
         shrinkWrap: true,
         children: [
           if (_error != null)
-            Padding(padding: const EdgeInsets.all(12), child: ErrorBanner(_error!)),
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: ErrorBanner(_error!),
+            ),
           ListTile(
-            leading: Icon(current.isAuto ? Icons.radio_button_checked : Icons.radio_button_off),
+            leading: Icon(
+              current.isAuto
+                  ? Icons.radio_button_checked
+                  : Icons.radio_button_off,
+            ),
             title: const Text('Auto'),
             subtitle: const Text('The server chooses per turn'),
             onTap: _busy ? null : () => _pick(Selection.auto()),
@@ -1171,7 +1450,9 @@ class _ModelSheetState extends State<ModelSheet> {
           for (final p in cat.providers)
             ExpansionTile(
               title: Text(p.id),
-              subtitle: p.dataEgressApproved ? null : const Text('Needs data-egress approval'),
+              subtitle: p.dataEgressApproved
+                  ? null
+                  : const Text('Needs data-egress approval'),
               initiallyExpanded: p.id == current.provider,
               children: [
                 for (final m in p.models)
@@ -1204,6 +1485,7 @@ class FilesSheet extends StatelessWidget {
   });
   final List<LibraryEntry> entries;
   final void Function(LibraryEntry) onOpen;
+
   /// 0.28.0: opens the server-rendered preview for pdf/pptx/xlsx/docx/md.
   final void Function(LibraryEntry)? onPreview;
 
@@ -1222,7 +1504,11 @@ class FilesSheet extends StatelessWidget {
           for (final e in entries)
             ListTile(
               leading: const Icon(Icons.insert_drive_file_outlined),
-              title: Text(e.label, maxLines: 1, overflow: TextOverflow.ellipsis),
+              title: Text(
+                e.label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
               subtitle: Text(shortTime(e.createdAt)),
               trailing: Row(
                 mainAxisSize: MainAxisSize.min,
@@ -1264,7 +1550,11 @@ class _PlanCard extends StatelessWidget {
           color: scheme.surfaceContainerHigh,
           borderRadius: BorderRadius.circular(12),
           child: ExpansionTile(
-            title: Text(plan.goal, maxLines: 1, overflow: TextOverflow.ellipsis),
+            title: Text(
+              plan.goal,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
             subtitle: Text(plan.progress),
             children: [
               for (final item in plan.items)
@@ -1274,8 +1564,8 @@ class _PlanCard extends StatelessWidget {
                     item.status == 'done'
                         ? Icons.check_circle_outline
                         : item.status == 'doing'
-                            ? Icons.radio_button_checked
-                            : Icons.radio_button_unchecked,
+                        ? Icons.radio_button_checked
+                        : Icons.radio_button_unchecked,
                     size: 18,
                   ),
                   title: Text(item.text),
@@ -1303,26 +1593,28 @@ class _ReconnectBanner extends StatelessWidget {
         borderRadius: BorderRadius.circular(12),
         child: Padding(
           padding: const EdgeInsets.all(12),
-          child: Row(children: [
-            if (reduced)
-              Icon(Icons.sync, color: scheme.onTertiaryContainer)
-            else
-              SizedBox(
-                width: 16,
-                height: 16,
-                child: CircularProgressIndicator(
-                  strokeWidth: 2,
-                  color: scheme.onTertiaryContainer,
+          child: Row(
+            children: [
+              if (reduced)
+                Icon(Icons.sync, color: scheme.onTertiaryContainer)
+              else
+                SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: scheme.onTertiaryContainer,
+                  ),
+                ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Reconnecting to live updates…',
+                  style: TextStyle(color: scheme.onTertiaryContainer),
                 ),
               ),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                'Reconnecting to live updates…',
-                style: TextStyle(color: scheme.onTertiaryContainer),
-              ),
-            ),
-          ]),
+            ],
+          ),
         ),
       ),
     );
@@ -1360,8 +1652,10 @@ class _InlineApprovalCard extends StatelessWidget {
             Row(
               children: [
                 Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 3,
+                  ),
                   decoration: BoxDecoration(
                     color: scheme.tertiary,
                     borderRadius: BorderRadius.circular(8),
@@ -1369,15 +1663,18 @@ class _InlineApprovalCard extends StatelessWidget {
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Icon(Icons.gavel_rounded,
-                          size: 13, color: scheme.onTertiary),
+                      Icon(
+                        Icons.gavel_rounded,
+                        size: 13,
+                        color: scheme.onTertiary,
+                      ),
                       const SizedBox(width: 4),
                       Text(
                         item.tool,
                         style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                              color: scheme.onTertiary,
-                              fontWeight: FontWeight.w700,
-                            ),
+                          color: scheme.onTertiary,
+                          fontWeight: FontWeight.w700,
+                        ),
                       ),
                     ],
                   ),
@@ -1386,9 +1683,8 @@ class _InlineApprovalCard extends StatelessWidget {
                 if (exp.isNotEmpty)
                   Text(
                     'Expires $exp',
-                    style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                          color: scheme.onSurfaceVariant,
-                        ),
+                    style: Theme.of(context).textTheme.labelSmall
+                        ?.copyWith(color: scheme.onSurfaceVariant),
                   ),
               ],
             ),
@@ -1398,17 +1694,19 @@ class _InlineApprovalCard extends StatelessWidget {
               const SizedBox(height: 4),
               Row(
                 children: [
-                  Icon(Icons.arrow_outward_rounded,
-                      size: 14, color: scheme.onSurfaceVariant),
+                  Icon(
+                    Icons.arrow_outward_rounded,
+                    size: 14,
+                    color: scheme.onSurfaceVariant,
+                  ),
                   const SizedBox(width: 4),
                   Expanded(
                     child: Text(
                       item.destination!,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
-                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                            color: scheme.onSurfaceVariant,
-                          ),
+                      style: Theme.of(context).textTheme.bodySmall
+                          ?.copyWith(color: scheme.onSurfaceVariant),
                     ),
                   ),
                 ],
@@ -1420,19 +1718,22 @@ class _InlineApprovalCard extends StatelessWidget {
               runSpacing: 6,
               children: [
                 FilledButton.tonalIcon(
-                  onPressed:
-                      busy ? null : () => onDecide(ApprovalDecision.once),
+                  onPressed: busy
+                      ? null
+                      : () => onDecide(ApprovalDecision.once),
                   icon: const Icon(Icons.check_rounded, size: 16),
                   label: const Text('Approve'),
                 ),
                 OutlinedButton(
-                  onPressed:
-                      busy ? null : () => onDecide(ApprovalDecision.always),
+                  onPressed: busy
+                      ? null
+                      : () => onDecide(ApprovalDecision.always),
                   child: const Text('Always'),
                 ),
                 TextButton(
-                  onPressed:
-                      busy ? null : () => onDecide(ApprovalDecision.deny),
+                  onPressed: busy
+                      ? null
+                      : () => onDecide(ApprovalDecision.deny),
                   child: const Text('Deny'),
                 ),
               ],
@@ -1478,8 +1779,11 @@ class _OtherApprovalsBanner extends StatelessWidget {
             ),
             child: Row(
               children: [
-                Icon(Icons.gavel_rounded,
-                    size: 16, color: scheme.onSecondaryContainer),
+                Icon(
+                  Icons.gavel_rounded,
+                  size: 16,
+                  color: scheme.onSecondaryContainer,
+                ),
                 const SizedBox(width: 8),
                 Expanded(
                   child: Text(
@@ -1487,9 +1791,9 @@ class _OtherApprovalsBanner extends StatelessWidget {
                         ? '1 pending approval waiting'
                         : '$count pending approvals waiting',
                     style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                          color: scheme.onSecondaryContainer,
-                          fontWeight: FontWeight.w600,
-                        ),
+                      color: scheme.onSecondaryContainer,
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
                 ),
                 Icon(

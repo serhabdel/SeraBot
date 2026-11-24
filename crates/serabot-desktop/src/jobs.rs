@@ -11,8 +11,7 @@ use crate::activity::Activity;
 use crate::api::{MediaJob, Task, TaskStatus};
 use crate::jobs_reliability::JobsReliabilitySnapshot;
 use crate::media_view::placeholder_label;
-use crate::working::WorkingBots;
-use std::time::Instant;
+use crate::runs::{ChipKind, RunRow};
 
 /// Most rows the panel keeps.
 pub const MAX_ITEMS: usize = 24;
@@ -111,14 +110,18 @@ fn media_state(status: &str) -> Option<JobState> {
 /// Build the panel's rows from the live state. Active work sorts first
 /// (running, waiting, finishing, queued), then finished rows; the list is
 /// capped at [`MAX_ITEMS`].
+///
+/// Handoffs come from the handoff ledger rows (`runs`), never from the
+/// WorkingBots rings: a ring also fires for the chat's own turn and for
+/// steps that already ended, while a ledger row is a handoff that started
+/// and has not completed yet.
 pub fn build(
     task: Option<&Task>,
     media_jobs: &[MediaJob],
-    working: &WorkingBots,
+    runs: &[RunRow],
     activity: &Activity,
     conversation: &str,
     reliability: &JobsReliabilitySnapshot,
-    now: Instant,
 ) -> Vec<JobItem> {
     let mut items: Vec<JobItem> = Vec::new();
 
@@ -126,7 +129,9 @@ pub fn build(
         let state = match task.status {
             TaskStatus::Queued => JobState::Queued,
             TaskStatus::Running => JobState::Running,
-            TaskStatus::AwaitingApproval | TaskStatus::WaitingModel => JobState::Waiting,
+            TaskStatus::AwaitingApproval | TaskStatus::WaitingModel | TaskStatus::NeedsReview => {
+                JobState::Waiting
+            }
             TaskStatus::Done => JobState::Done,
             TaskStatus::Failed | TaskStatus::Cancelled => JobState::Failed,
         };
@@ -172,22 +177,25 @@ pub fn build(
         });
     }
 
-    // Handoffs: bots working in this conversation right now, other than the
-    // one the chat is addressed to.
+    // Handoffs: ledger rows that started and have not completed yet, other
+    // than the one the chat is addressed to. One row per handoff, so
+    // parallel handoffs to the same bot stay visible as separate rows.
     let own = conversation.strip_prefix("dir:").unwrap_or(conversation);
-    for (bot, activity_state) in working.conversation_entries(conversation, now) {
-        if bot == own {
+    for row in runs {
+        let state = match row.chip.kind() {
+            ChipKind::Queued => JobState::Queued,
+            ChipKind::Running | ChipKind::Resumed => JobState::Running,
+            ChipKind::WaitingApproval | ChipKind::WaitingModel => JobState::Waiting,
+            ChipKind::FailedResumable | ChipKind::Failed | ChipKind::Completed => continue,
+        };
+        if row.bot == own {
             continue;
         }
-        let state = match activity_state {
-            crate::working::BotActivity::WaitingApproval => JobState::Waiting,
-            crate::working::BotActivity::Working(_) => JobState::Running,
-        };
         items.push(JobItem {
             kind: JobKind::Handoff,
-            id: format!("handoff:{bot}"),
-            bot: bot.clone(),
-            title: format!("Handed off to {bot}"),
+            id: format!("handoff:{}", row.child_task_id),
+            bot: row.bot.clone(),
+            title: format!("Handed off to {}", row.bot),
             state,
             detail: None,
             trace_conversation: None,
@@ -303,16 +311,23 @@ mod tests {
         json!({"task_id": task_id, "call_id": call, "phase": phase, "label": label, "icon": "bolt"})
     }
 
+    fn handoff_row(child: &str, bot: &str, status: &str) -> RunRow {
+        crate::runs::row_of(
+            &crate::runs::Handoff {
+                id: format!("h-{child}"),
+                parent_task_id: "p".into(),
+                child_task_id: child.into(),
+                to_bot: bot.into(),
+                status: status.into(),
+                ..Default::default()
+            },
+            None,
+        )
+    }
+
     #[test]
     fn running_task_media_and_handoffs_merge_active_first() {
-        let now = Instant::now();
-        let mut working = WorkingBots::default();
-        working.apply(
-            "turn.step",
-            &json!({"task_id": "t9", "bot": "analyst", "conversation_id": "room:ops",
-                    "phase": "running", "label": "Reading the ledger", "call_id": "c1"}),
-            now,
-        );
+        let runs = vec![handoff_row("t9", "analyst", "running")];
         let mut activity = Activity::default();
         activity.apply(
             "turn.step",
@@ -326,11 +341,10 @@ mod tests {
                 job("m1", "maker", "image", "pending"),
                 job("m3", "maker", "audio", "failed"),
             ],
-            &working,
+            &runs,
             &activity,
             "room:ops",
             &JobsReliabilitySnapshot::default(),
-            now,
         );
         let states: Vec<JobState> = items.iter().map(|i| i.state).collect();
         assert_eq!(
@@ -356,25 +370,55 @@ mod tests {
 
     #[test]
     fn the_conversations_own_bot_is_not_a_handoff() {
-        let now = Instant::now();
-        let mut working = WorkingBots::default();
-        working.apply(
-            "turn.step",
-            &json!({"task_id": "t1", "bot": "main", "conversation_id": "dir:main",
-                    "phase": "running", "label": "Thinking", "call_id": "c1"}),
-            now,
-        );
+        // A ledger row to the chat's own bot is the turn itself, not a handoff.
+        let runs = vec![handoff_row("t1", "main", "running")];
         let items = build(
             Some(&task("t1", "main", TaskStatus::Running)),
             &[],
-            &working,
+            &runs,
             &Activity::default(),
             "dir:main",
             &JobsReliabilitySnapshot::default(),
-            now,
         );
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind, JobKind::Task);
+    }
+
+    #[test]
+    fn finished_handoffs_leave_the_panel_and_parallel_ones_stay() {
+        let runs = vec![
+            handoff_row("c1", "analyst", "running"),
+            handoff_row("c2", "analyst", "running"),
+            handoff_row("c3", "writer", "completed"),
+            handoff_row("c4", "legal", "failed"),
+        ];
+        let items = build(
+            None,
+            &[],
+            &runs,
+            &Activity::default(),
+            "dir:main",
+            &JobsReliabilitySnapshot::default(),
+        );
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|item| item.kind == JobKind::Handoff));
+        assert_eq!(items[0].id, "handoff:c1");
+        assert_eq!(items[1].id, "handoff:c2");
+    }
+
+    #[test]
+    fn a_task_needing_review_waits_for_the_owner_not_a_retry() {
+        let items = build(
+            Some(&task("t1", "main", TaskStatus::NeedsReview)),
+            &[],
+            &[],
+            &Activity::default(),
+            "dir:main",
+            &JobsReliabilitySnapshot::default(),
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].state, JobState::Waiting);
+        assert_eq!(items[0].title, "Needs review");
     }
 
     #[test]
@@ -385,11 +429,10 @@ mod tests {
                 job("m1", "maker", "video", "finishing"),
                 job("m2", "maker", "image", "done"),
             ],
-            &WorkingBots::default(),
+            &[],
             &Activity::default(),
             "dir:main",
             &JobsReliabilitySnapshot::default(),
-            Instant::now(),
         );
         let states: Vec<JobState> = items.iter().map(|i| i.state).collect();
         assert_eq!(
@@ -409,11 +452,10 @@ mod tests {
         let items = build(
             None,
             &jobs,
-            &WorkingBots::default(),
+            &[],
             &Activity::default(),
             "dir:main",
             &JobsReliabilitySnapshot::default(),
-            Instant::now(),
         );
         // 30 valid pending jobs, capped at MAX_ITEMS.
         assert_eq!(items.len(), MAX_ITEMS);
@@ -479,15 +521,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let items = build(
-            None,
-            &[],
-            &WorkingBots::default(),
-            &Activity::default(),
-            "dir:main",
-            &snap,
-            Instant::now(),
-        );
+        let items = build(None, &[], &[], &Activity::default(), "dir:main", &snap);
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].detail.as_deref(), Some("gateway timed out"));
         assert_eq!(
@@ -506,11 +540,10 @@ mod tests {
         let items = build(
             Some(&task("t1", "main", TaskStatus::Running)),
             &[],
-            &WorkingBots::default(),
+            &[],
             &activity,
             "dir:main",
             &JobsReliabilitySnapshot::default(),
-            Instant::now(),
         );
         assert_eq!(items[0].title, "Working");
         assert_eq!(items[0].state, JobState::Running);
