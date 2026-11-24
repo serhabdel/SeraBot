@@ -376,3 +376,89 @@ class LibraryDocPreview {
     return '';
   }
 }
+
+/// OneDrive mirror status reported by `GET /v1/library` (0.74.8).
+class LibraryOnedriveStatus {
+  const LibraryOnedriveStatus({
+    this.mirror = false,
+    this.folder = '',
+    this.connected = false,
+  });
+
+  factory LibraryOnedriveStatus.fromJson(Object? raw) {
+    final json = raw is Map<String, dynamic> ? raw : const <String, dynamic>{};
+    return LibraryOnedriveStatus(
+      mirror: json['mirror'] as bool? ?? false,
+      folder: insightText(json['folder'], 256),
+      connected: json['connected'] as bool? ?? false,
+    );
+  }
+
+  final bool mirror;
+  final String folder;
+  final bool connected;
+
+  String get statusLabel {
+    if (!mirror) {
+      return 'OneDrive mirror off';
+    }
+    if (!connected) {
+      return 'OneDrive: not connected';
+    }
+    return folder.isEmpty ? 'OneDrive: connected' : 'OneDrive: $folder';
+  }
+}
+
+/// Parsed `GET /v1/library` payload: all items across chats + uploads, and
+/// the per-account OneDrive mirror status.
+class GlobalLibraryResponse {
+  const GlobalLibraryResponse({
+    this.enabled = true,
+    this.onedrive = const LibraryOnedriveStatus(),
+    this.items = const [],
+  });
+
+  factory GlobalLibraryResponse.fromJson(Map<String, dynamic> json) {
+    return GlobalLibraryResponse(
+      enabled: json['enabled'] as bool? ?? true,
+      onedrive: LibraryOnedriveStatus.fromJson(json['onedrive']),
+      items: parseBotLibrary(json),
+    );
+  }
+
+  final bool enabled;
+  final LibraryOnedriveStatus onedrive;
+  final List<BotLibraryItem> items;
+}
+
+/// Parsed `POST /v1/library/upload` reply: the created item (if present) and
+/// the best-effort OneDrive mirror outcome ("uploaded", "off",
+/// "OneDrive is not connected...", or "failed: ...").
+class LibraryUploadResponse {
+  const LibraryUploadResponse({this.item, this.onedrive = ''});
+
+  factory LibraryUploadResponse.fromJson(Map<String, dynamic> json) {
+    final rawItem = json['item'];
+    return LibraryUploadResponse(
+      item: rawItem is Map<String, dynamic>
+          ? BotLibraryItem.fromJson(rawItem)
+          : null,
+      onedrive: insightText(json['onedrive'], 256),
+    );
+  }
+
+  final BotLibraryItem? item;
+  final String onedrive;
+
+  String get onedriveSummary {
+    final s = onedrive.trim();
+    if (s.isEmpty || s == 'off') {
+      return 'Saved to Library (OneDrive mirror off).';
+    }
+    if (s == 'uploaded') {
+      return 'Saved to Library and mirrored to OneDrive.';
+    }
+    return 'Saved to Library. OneDrive: $s';
+  }
+}
+

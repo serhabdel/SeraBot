@@ -940,6 +940,8 @@ pub struct Session {
     held_drafts: std::collections::HashMap<String, String>,
     /// The last recorded voice note, kept for one transcription retry.
     pub last_audio: Option<(String, Vec<u8>)>,
+    /// Task ids whose `needs_review` banner the owner explicitly dismissed locally.
+    pub dismissed_needs_review: std::collections::HashSet<String>,
     /// Collapsed run groups the owner opened.
     pub runs_open: std::collections::HashSet<String>,
     runs_last_read: Option<Instant>,
@@ -1166,6 +1168,7 @@ impl Session {
             queues,
             held_drafts: std::collections::HashMap::new(),
             last_audio: None,
+            dismissed_needs_review: std::collections::HashSet::new(),
             runs_open: std::collections::HashSet::new(),
             runs_last_read: None,
             attach_notice: None,
@@ -3839,6 +3842,63 @@ impl Session {
             });
     }
 
+    /// True when the open chat has a `needs_review` task that the owner has
+    /// not dismissed yet.
+    pub fn needs_review_active(&self) -> bool {
+        self.state.task.as_ref().is_some_and(|task| {
+            task.status == TaskStatus::NeedsReview
+                && !self.dismissed_needs_review.contains(&task.id)
+        })
+    }
+
+    /// Mark the parked `needs_review` task as reviewed locally, clearing the
+    /// card and unblocking the chat composer.
+    pub fn dismiss_needs_review(&mut self) {
+        if let Some(task) = self.state.task.take() {
+            if task.status == TaskStatus::NeedsReview {
+                self.dismissed_needs_review.insert(task.id);
+            } else {
+                self.state.task = Some(task);
+                return;
+            }
+        }
+        self.state.stopping = false;
+        self.state.unknown_outcome = false;
+        self.state.activity.clear();
+        self.toast = Some("Marked as reviewed.".into());
+    }
+
+    /// Dismiss the parked `needs_review` state and re-send the last user
+    /// message on explicit user confirmation.
+    pub fn retry_needs_review(&mut self) {
+        let last_user = self
+            .state
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::User && !message.id.starts_with("opt-"))
+            .map(|message| message.content.clone());
+        let Some(text) = last_user.filter(|t| !t.trim().is_empty()) else {
+            self.dismiss_needs_review();
+            self.toast = Some("Nothing to send again.".into());
+            return;
+        };
+        if let Some(task) = self.state.task.take() {
+            if task.status == TaskStatus::NeedsReview {
+                self.dismissed_needs_review.insert(task.id);
+            } else {
+                self.state.task = Some(task);
+                return;
+            }
+        }
+        self.state.stopping = false;
+        self.state.unknown_outcome = false;
+        self.state.error = None;
+        self.state.chat_failure = None;
+        self.composer = text;
+        self.submit();
+    }
+
     /// Drain the file picker and feed the upload queue one request at a time.
     fn poll_attachments(&mut self) {
         if let Some(receiver) = &self.pick_rx
@@ -3972,6 +4032,8 @@ impl Session {
         }
         self.state.cards.len().hash(&mut h);
         self.state.activity.task_id.hash(&mut h);
+        self.state.activity.heartbeat_secs.hash(&mut h);
+        self.state.activity.heartbeat_beat.hash(&mut h);
         self.state.activity.steps.len().hash(&mut h);
         for step in &self.state.activity.steps {
             step.call_id.hash(&mut h);
@@ -3985,6 +4047,7 @@ impl Session {
             task.id.hash(&mut h);
             format!("{:?}", task.status).hash(&mut h);
         }
+        self.dismissed_needs_review.len().hash(&mut h);
         self.events_active.hash(&mut h);
         self.events_seen.hash(&mut h);
         self.state
@@ -4315,7 +4378,23 @@ impl Session {
             self.state.turns.reset(&self.conversation);
         }
         let traced = self.state.turns.apply(&kind, &payload);
-        let stepped = self.state.activity.apply(&kind, &payload) || traced;
+        // `turn.progress` heartbeats are global on the user's SSE stream; only
+        // apply them to the open chat's Activity when they match it (or lack
+        // `conversation_id`, e.g. in unit fixtures), and never reload history.
+        let progress_here = kind == "turn.progress"
+            && payload.get("parent_task_id").is_none()
+            && payload
+                .get("conversation_id")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|cid| cid == self.conversation.as_str());
+        let stepped = if kind == "turn.progress" {
+            if progress_here {
+                self.state.activity.apply(&kind, &payload);
+            }
+            true
+        } else {
+            self.state.activity.apply(&kind, &payload) || traced
+        };
         if kind == "turn.step"
             && payload
                 .get("conversation_id")
@@ -7643,7 +7722,7 @@ mod tests {
         dir
     }
 
-    fn sendable_session() -> Session {
+    pub(super) fn sendable_session() -> Session {
         let mut session = Session::assemble(
             String::new(),
             Theme::Dark,
@@ -8418,5 +8497,125 @@ mod backlog_tests {
         assert!(md.starts_with("# Q4 Review\n\n"));
         assert!(md.contains("### You\n\nSummarize the deck."));
         assert!(md.contains("Here is the summary."));
+    }
+
+    #[test]
+    fn turn_progress_routes_to_working_and_activity_without_dirtying_events() {
+        use serde_json::json;
+        let mut session = super::tests::sendable_session();
+        session.conversation = "dir:main".into();
+        let fp_before = session.ui_fingerprint();
+
+        session.apply_event(
+            "turn.progress".into(),
+            json!({
+                "task_id": "t-hb",
+                "conversation_id": "dir:main",
+                "bot": "main",
+                "phase": "waiting_model",
+                "elapsed_secs": 30,
+                "beat": 2
+            }),
+        );
+        assert!(
+            !session.events_dirty,
+            "heartbeat must not trigger a history reload"
+        );
+        assert_eq!(
+            session.state.activity.heartbeat_label().as_deref(),
+            Some("Still thinking · 30s")
+        );
+        assert_eq!(
+            session
+                .state
+                .working
+                .activity_of("main", Instant::now())
+                .map(|a| a.label()),
+            Some("Thinking… (30s)".into())
+        );
+        assert_ne!(
+            session.ui_fingerprint(),
+            fp_before,
+            "ui_fingerprint must reflect heartbeat updates"
+        );
+
+        // Heartbeat for a different conversation updates WorkingBots but not open Activity.
+        session.apply_event(
+            "turn.progress".into(),
+            json!({
+                "task_id": "t-other",
+                "conversation_id": "dir:analyst",
+                "bot": "analyst",
+                "phase": "waiting_model",
+                "elapsed_secs": 15,
+                "beat": 1
+            }),
+        );
+        assert_eq!(
+            session.state.activity.heartbeat_label().as_deref(),
+            Some("Still thinking · 30s")
+        );
+        assert_eq!(
+            session
+                .state
+                .working
+                .activity_of("analyst", Instant::now())
+                .map(|a| a.label()),
+            Some("Thinking… (15s)".into())
+        );
+    }
+
+    #[test]
+    fn needs_review_dismiss_and_retry_recover_the_parked_chat() {
+        let mut session = super::tests::sendable_session();
+        session.conversation = "dir:main".into();
+        session.state.messages.push(Message {
+            id: "m1".into(),
+            role: Role::User,
+            content: "Check invoice #42".into(),
+            created_at: "Now".into(),
+            name: None,
+            bot: None,
+            attachments: Vec::new(),
+            limit_reached: false,
+            turn_id: None,
+        });
+        session.state.task = Some(crate::Task {
+            id: "t-nr".into(),
+            kind: "turn".into(),
+            bot: "main".into(),
+            status: TaskStatus::NeedsReview,
+        });
+        assert!(session.needs_review_active());
+        assert!(!session.state.can_send());
+
+        // "Mark reviewed" clears the parked task and remembers its id.
+        session.dismiss_needs_review();
+        assert!(!session.needs_review_active());
+        assert!(session.state.task.is_none());
+        assert!(session.dismissed_needs_review.contains("t-nr"));
+        assert!(session.state.can_send());
+        assert_eq!(session.toast.as_deref(), Some("Marked as reviewed."));
+
+        // "Send again" clears another parked NeedsReview task and re-submits the last user message.
+        session.state.task = Some(crate::Task {
+            id: "t-nr-2".into(),
+            kind: "turn".into(),
+            bot: "main".into(),
+            status: TaskStatus::NeedsReview,
+        });
+        assert!(session.needs_review_active());
+        session.retry_needs_review();
+        assert!(!session.needs_review_active());
+        assert!(session.dismissed_needs_review.contains("t-nr-2"));
+        assert!(
+            session
+                .state
+                .messages
+                .last()
+                .is_some_and(|m| m.role == Role::User
+                    && m.id.starts_with("opt-")
+                    && m.content == "Check invoice #42")
+        );
     }
 }

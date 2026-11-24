@@ -594,3 +594,13 @@ never merge without the owner's OK.
   reply smoothness, Delegating card on a multi-bot handoff, mobile queue +
   pickers + draft restore, and a long conversation against a 0.74.10 server
   (compaction keeps earlier facts, heartbeat shows while the model thinks).
+
+## Release 0.74.11 — Heartbeat & needs_review UX, native IMAP in brief/triage, unified ApprovalCard & Library actionability
+
+- [x] Live heartbeat (`turn.progress`) & `needs_review` recovery: wired on Desktop (`working.rs`, `activity.rs`, `session.rs`, `ui/wait_cards.rs`, `ui/chat.rs` with Mark reviewed + confirmed Send again) and Mobile (`models.dart`, `chat_controller.dart`, `chat_screen.dart`).
+- [x] Morning Brief & Daily Email Triage (`brief/morning.rs`, `ops.rs`): reads up to 5 native multi-account IMAP mailboxes per user (10 s timeout, silent degradation) and qualifies native IMAP accounts for daily `inbox` triage.
+- [x] Unified `ApprovalCard` (`ui_cards.rs`, `ui/approvals.rs`, `assets/system.css`): shared card across inline chat and Approvals page with tool badge, destination chip, expiry countdown, artifact link, and strict `tool_allows_standing_grant` gating.
+- [x] Library actionability: Desktop **Attach to chat** (`ui_library.rs`) and Mobile global `LibraryScreen` with `GET /v1/library` + `POST /v1/library/upload` (`library_screen.dart`, `api_client.dart`, `device.dart`, `home_screen.dart`).
+- [x] Version bump `0.74.11` (`Cargo.toml`), mobile `0.74.11+85`, `docs/release-0.74.11.md`, `README.md`, `tasks/todo.md`.
+- [ ] Owner: live pass on Windows & Android (slow reasoning heartbeat, Hostinger IMAP in morning brief/triage, unified ApprovalCard, Library Attach to chat & Mobile Library upload).
+

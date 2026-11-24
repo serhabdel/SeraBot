@@ -11,13 +11,14 @@ import '../theme.dart';
 import 'approvals_screen.dart';
 import 'bots_screen.dart';
 import 'chats_screen.dart';
+import 'library_screen.dart';
 import 'settings_screen.dart';
 import 'tasks_screen.dart';
 import 'workflows_screen.dart';
 
-/// Signed-in shell: Chats, Tasks, Workflows, Bots, Settings. It owns the
-/// [AppState] so the conversation list, unread counts, approvals, and event
-/// stream live as long as the user is signed in.
+/// Signed-in shell: Chats, Tasks, Workflows, Library, Bots, Settings. It owns
+/// the [AppState] so the conversation list, unread counts, approvals, and
+/// event stream live as long as the user is signed in.
 class HomeScreen extends StatefulWidget {
   const HomeScreen({
     super.key,
@@ -127,6 +128,7 @@ class _HomeScreenState extends State<HomeScreen> {
                           ChatsScreen(app: _app, device: _device),
                           TasksScreen(app: _app),
                           WorkflowsScreen(app: _app),
+                          LibraryScreen(app: _app, device: _device),
                           BotsScreen(app: _app, device: _device),
                           SettingsScreen(
                             session: widget.session,
@@ -216,6 +218,13 @@ class _HomeScreenState extends State<HomeScreen> {
                   label: 'Workflows',
                 ),
                 const NavigationDestination(
+                  icon: _NavVectorIcon(
+                      glyph: _NavGlyph.library, selected: false),
+                  selectedIcon: _NavVectorIcon(
+                      glyph: _NavGlyph.library, selected: true),
+                  label: 'Library',
+                ),
+                const NavigationDestination(
                   icon: _NavVectorIcon(glyph: _NavGlyph.bots, selected: false),
                   selectedIcon:
                       _NavVectorIcon(glyph: _NavGlyph.bots, selected: true),
@@ -237,9 +246,9 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 }
 
-enum _NavGlyph { chats, tasks, workflows, bots, settings }
+enum _NavGlyph { chats, tasks, workflows, library, bots, settings }
 
-/// Crisp custom-drawn 24x24 vector icons for the 5 bottom navigation tabs.
+/// Crisp custom-drawn 24x24 vector icons for the bottom navigation tabs.
 class _NavVectorIcon extends StatelessWidget {
   const _NavVectorIcon({required this.glyph, required this.selected});
 
@@ -357,6 +366,26 @@ class _NavGlyphPainter extends CustomPainter {
               ..color = selected ? accent : color
               ..style = selected ? PaintingStyle.fill : PaintingStyle.stroke
               ..strokeWidth = 1.6 * s);
+
+      case _NavGlyph.library:
+        final folder = Path()
+          ..moveTo(4 * s, 7.5 * s)
+          ..quadraticBezierTo(4 * s, 5.5 * s, 6 * s, 5.5 * s)
+          ..lineTo(10.2 * s, 5.5 * s)
+          ..lineTo(12 * s, 7.5 * s)
+          ..lineTo(18 * s, 7.5 * s)
+          ..quadraticBezierTo(20 * s, 7.5 * s, 20 * s, 9.5 * s)
+          ..lineTo(20 * s, 17 * s)
+          ..quadraticBezierTo(20 * s, 19 * s, 18 * s, 19 * s)
+          ..lineTo(6 * s, 19 * s)
+          ..quadraticBezierTo(4 * s, 19 * s, 4 * s, 17 * s)
+          ..close();
+        if (selected) canvas.drawPath(folder, fill);
+        canvas.drawPath(folder, stroke);
+        canvas.drawLine(
+            Offset(8 * s, 12.2 * s), Offset(16 * s, 12.2 * s), stroke);
+        canvas.drawLine(
+            Offset(8 * s, 15.2 * s), Offset(13.5 * s, 15.2 * s), stroke);
 
       case _NavGlyph.bots:
         final head = RRect.fromRectAndRadius(

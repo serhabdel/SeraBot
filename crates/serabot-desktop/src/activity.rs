@@ -225,6 +225,12 @@ pub struct Activity {
     /// turn's start for live elapsed times while no single step is running
     /// (the Thinking card). Client-side only.
     pub started_at: Option<Instant>,
+    /// Elapsed seconds reported by the latest `turn.progress` heartbeat while
+    /// a model call is in flight (0.74.11). Cleared when a tool step starts
+    /// or the turn finishes.
+    pub heartbeat_secs: Option<u64>,
+    /// Beat counter from the latest `turn.progress` heartbeat (0.74.11).
+    pub heartbeat_beat: u32,
     /// Steps past `MAX_STEPS` that were counted but not kept.
     pub dropped: usize,
     /// Call ids already counted in `dropped` (a step's later events must not
@@ -264,10 +270,41 @@ impl Activity {
         self.steps.is_empty()
     }
 
+    /// Clear any active model-call heartbeat.
+    fn clear_heartbeat(&mut self) -> bool {
+        let had = self.heartbeat_secs.is_some() || self.heartbeat_beat != 0;
+        self.heartbeat_secs = None;
+        self.heartbeat_beat = 0;
+        had
+    }
+
+    /// Short live heartbeat note while a model call is in flight (e.g.
+    /// `"Still thinking · 45s"` when `beat >= 1`).
+    pub fn heartbeat_label(&self) -> Option<String> {
+        if self.heartbeat_beat >= 1
+            && let Some(secs) = self.heartbeat_secs
+        {
+            Some(format!("Still thinking \u{b7} {}s", secs))
+        } else {
+            None
+        }
+    }
+
     /// Apply one event. Returns whether anything changed.
     pub fn apply(&mut self, kind: &str, payload: &Value) -> bool {
-        if kind != "turn.step" {
-            return false;
+        match kind {
+            "turn.progress" => return self.apply_progress(payload),
+            "turn.completed" | "task.failed" | "task.cancelled" => {
+                let Some(task_id) = clean(payload, "task_id") else {
+                    return false;
+                };
+                if self.task_id == task_id {
+                    return self.clear_heartbeat();
+                }
+                return false;
+            }
+            "turn.step" => {}
+            _ => return false,
         }
         let (Some(task_id), Some(call_id), Some(label), Some(phase)) = (
             clean(payload, "task_id"),
@@ -286,6 +323,10 @@ impl Activity {
             self.dropped_calls.clear();
             self.task_id = task_id;
             self.started_at = Some(Instant::now());
+            self.clear_heartbeat();
+        } else if phase.spinning() && !label.trim().eq_ignore_ascii_case("thinking") {
+            // A tool step started: the model call returned.
+            self.clear_heartbeat();
         }
         let now = Instant::now();
         let icon = clean(payload, "icon").unwrap_or_else(|| "bolt".into());
@@ -368,6 +409,34 @@ impl Activity {
             });
         }
         true
+    }
+
+    fn apply_progress(&mut self, payload: &Value) -> bool {
+        let Some(task_id) = clean(payload, "task_id") else {
+            return false;
+        };
+        let elapsed_secs = payload.get("elapsed_secs").and_then(Value::as_u64);
+        let beat = payload
+            .get("beat")
+            .and_then(Value::as_u64)
+            .and_then(|b| u32::try_from(b).ok());
+        if elapsed_secs.is_none() && beat.is_none() {
+            return false;
+        }
+        if self.task_id != task_id {
+            self.steps.clear();
+            self.dropped = 0;
+            self.dropped_calls.clear();
+            self.task_id = task_id;
+            self.started_at = Some(Instant::now());
+            self.clear_heartbeat();
+        }
+        let next_secs = elapsed_secs.or(self.heartbeat_secs);
+        let next_beat = beat.unwrap_or(self.heartbeat_beat);
+        let changed = self.heartbeat_secs != next_secs || self.heartbeat_beat != next_beat;
+        self.heartbeat_secs = next_secs;
+        self.heartbeat_beat = next_beat;
+        changed
     }
 
     /// The step that waits on the owner, if any.
@@ -885,5 +954,60 @@ mod tests {
         assert_eq!(result.kind, ResultKind::Table);
         assert!(result.rows.len() <= 12);
         assert!(!result.rows[0][1].contains('\u{7}'));
+    }
+
+    #[test]
+    fn turn_progress_tracks_heartbeat_and_clears_on_tool_or_finish() {
+        let mut a = Activity::default();
+        assert_eq!(a.heartbeat_label(), None);
+
+        // Beat 0 without beat >= 1 does not show the label yet.
+        assert!(a.apply(
+            "turn.progress",
+            &json!({"task_id": "t1", "phase": "waiting_model", "elapsed_secs": 0, "beat": 0})
+        ));
+        assert_eq!(a.heartbeat_secs, Some(0));
+        assert_eq!(a.heartbeat_beat, 0);
+        assert_eq!(a.heartbeat_label(), None);
+
+        // Beat 3 -> "Still thinking · 45s".
+        assert!(a.apply(
+            "turn.progress",
+            &json!({"task_id": "t1", "phase": "waiting_model", "elapsed_secs": 45, "beat": 3})
+        ));
+        assert_eq!(a.heartbeat_secs, Some(45));
+        assert_eq!(a.heartbeat_beat, 3);
+        assert_eq!(a.heartbeat_label().as_deref(), Some("Still thinking · 45s"));
+
+        // A Thinking step does not clear the heartbeat.
+        let mut thinking = ev("t1", "c-think", "running");
+        thinking["label"] = json!("Thinking");
+        assert!(a.apply("turn.step", &thinking));
+        assert_eq!(a.heartbeat_label().as_deref(), Some("Still thinking · 45s"));
+
+        // A running tool step clears the heartbeat.
+        assert!(a.apply("turn.step", &ev("t1", "c1", "running")));
+        assert_eq!(a.heartbeat_secs, None);
+        assert_eq!(a.heartbeat_beat, 0);
+        assert_eq!(a.heartbeat_label(), None);
+
+        // Heartbeat resumes during next model call, then clears on turn.completed.
+        assert!(a.apply(
+            "turn.progress",
+            &json!({"task_id": "t1", "phase": "waiting_model", "elapsed_secs": 15, "beat": 1})
+        ));
+        assert_eq!(a.heartbeat_label().as_deref(), Some("Still thinking · 15s"));
+        assert!(a.apply("turn.completed", &json!({"task_id": "t1"})));
+        assert_eq!(a.heartbeat_secs, None);
+        assert_eq!(a.heartbeat_beat, 0);
+        assert_eq!(a.heartbeat_label(), None);
+
+        // task.failed also clears it.
+        assert!(a.apply(
+            "turn.progress",
+            &json!({"task_id": "t1", "phase": "waiting_model", "elapsed_secs": 30, "beat": 2})
+        ));
+        assert!(a.apply("task.failed", &json!({"task_id": "t1"})));
+        assert_eq!(a.heartbeat_label(), None);
     }
 }

@@ -22,11 +22,13 @@ use std::time::Instant;
 #[derive(Clone, Debug, PartialEq)]
 pub enum LiveCardData {
     /// No step yet, or the running step is the Thinking step: "{Bot} is
-    /// thinking…" with the model chip, a live elapsed time and Stop.
+    /// thinking…" with the model chip, optional heartbeat note, live elapsed
+    /// time and Stop.
     Thinking {
         bot: String,
         model: Option<String>,
         elapsed: Option<String>,
+        heartbeat: Option<String>,
     },
     /// A tool or connection step is running: "{Bot} is {label}" with the
     /// connector chip, "Step n" or "n/total", and a live elapsed time.
@@ -46,8 +48,7 @@ pub enum LiveCardData {
     /// counts the rest.
     Delegating { bot: String, count: usize },
     /// The turn parked with an uncertain effect (0.74.10): the owner reviews
-    /// it before anything is retried. No retry, no approve: only a way to
-    /// open Runs and check what happened.
+    /// it before anything is retried or dismisses / explicitly confirms a resend.
     NeedsReview,
     /// The turn is parked waiting for a model: the existing wait line with
     /// its countdown, plus a reason chip when the last switch gave one.
@@ -132,6 +133,7 @@ pub fn derive_live_card(inputs: LiveCardInputs<'_>) -> LiveCardData {
             count: inputs.delegate_count.max(1),
         };
     }
+    let heartbeat = activity.heartbeat_label();
     if let Some(step) = activity.running_step() {
         let elapsed = step
             .elapsed_ms(now)
@@ -142,6 +144,7 @@ pub fn derive_live_card(inputs: LiveCardInputs<'_>) -> LiveCardData {
                 bot: inputs.bot_name.to_owned(),
                 model: inputs.model_label.map(str::to_owned),
                 elapsed,
+                heartbeat,
             };
         }
         let total = activity.steps.len().saturating_add(activity.dropped);
@@ -177,6 +180,7 @@ pub fn derive_live_card(inputs: LiveCardInputs<'_>) -> LiveCardData {
         bot: inputs.bot_name.to_owned(),
         model: inputs.model_label.map(str::to_owned),
         elapsed: activity.elapsed_ms(now).map(format_duration),
+        heartbeat,
     }
 }
 
@@ -196,17 +200,22 @@ pub(crate) fn LiveCard(
     failed_can_act: bool,
     failed_ondismiss: EventHandler<()>,
 ) -> Element {
+    let mut confirm_needs_review_resend = use_signal(|| false);
     match data {
         LiveCardData::Thinking {
             bot,
             model,
             elapsed,
+            heartbeat,
         } => rsx! {
             div { class: "live-card", role: "status", "aria-live": "polite",
                 span { class: "live-dot", "aria-hidden": "true" }
                 span { class: "live-text", "{bot} is thinking\u{2026}" }
                 if let Some(model) = model {
                     span { class: "chip live-chip", "{model}" }
+                }
+                if let Some(hb) = heartbeat {
+                    span { class: "live-sub", "{hb}" }
                 }
                 if let Some(elapsed) = elapsed {
                     span { class: "live-time", "{elapsed}" }
@@ -273,21 +282,47 @@ pub(crate) fn LiveCard(
                 }
             }
         },
-        LiveCardData::NeedsReview => rsx! {
-            div { class: "live-card", role: "status", "aria-live": "polite",
-                span { class: "live-dot", "aria-hidden": "true" }
-                span { class: "live-text", "Needs your review" }
-                span { class: "live-sub", "Something may already have happened \u{2014} check the result before trying again." }
-                button {
-                    class: "btn ghost sm",
-                    r#type: "button",
-                    onclick: move |_| {
-                        let _ = dioxus::document::eval(RUNS_OPEN_JS);
-                    },
-                    "Open Runs"
+        LiveCardData::NeedsReview => {
+            let confirming = confirm_needs_review_resend();
+            rsx! {
+                div { class: "live-card", role: "status", "aria-live": "polite",
+                    span { class: "live-dot", "aria-hidden": "true" }
+                    span { class: "live-text", "Needs your review" }
+                    span { class: "live-sub", "Something may already have happened \u{2014} check the result before trying again." }
+                    button {
+                        class: "btn primary sm",
+                        r#type: "button",
+                        onclick: move |_| {
+                            confirm_needs_review_resend.set(false);
+                            session.write().dismiss_needs_review();
+                        },
+                        "Mark reviewed"
+                    }
+                    button {
+                        class: if confirming { "btn danger sm" } else { "btn ghost sm" },
+                        r#type: "button",
+                        title: if confirming { "Click again to send your last message again" } else { "Send your last message again" },
+                        onclick: move |_| {
+                            if confirming {
+                                confirm_needs_review_resend.set(false);
+                                session.write().retry_needs_review();
+                            } else {
+                                confirm_needs_review_resend.set(true);
+                            }
+                        },
+                        if confirming { "Confirm resend?" } else { "Send again" }
+                    }
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        onclick: move |_| {
+                            let _ = dioxus::document::eval(RUNS_OPEN_JS);
+                        },
+                        "Open Runs"
+                    }
                 }
             }
-        },
+        }
         LiveCardData::WaitingModel { line, reason } => rsx! {
             div { class: "live-card", role: "status", "aria-live": "polite",
                 WaitBanner { line }
@@ -510,8 +545,22 @@ mod tests {
         let activity = Activity::default();
         let card = derive_live_card(inputs(&activity, Instant::now()));
         assert!(
-            matches!(card, LiveCardData::Thinking { bot, model, elapsed }
-            if bot == "Main" && model.as_deref() == Some("Auto") && elapsed.is_none())
+            matches!(card, LiveCardData::Thinking { bot, model, elapsed, heartbeat }
+            if bot == "Main" && model.as_deref() == Some("Auto") && elapsed.is_none() && heartbeat.is_none())
+        );
+    }
+
+    #[test]
+    fn thinking_shows_heartbeat_label_when_present() {
+        let mut activity = Activity::default();
+        activity.apply(
+            "turn.progress",
+            &json!({"task_id": "t1", "phase": "waiting_model", "elapsed_secs": 45, "beat": 3}),
+        );
+        let card = derive_live_card(inputs(&activity, Instant::now()));
+        assert!(
+            matches!(card, LiveCardData::Thinking { heartbeat: Some(hb), .. }
+            if hb == "Still thinking · 45s")
         );
     }
 

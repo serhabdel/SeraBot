@@ -577,23 +577,39 @@ impl OpsWatch {
         Ok(text)
     }
 
+    fn has_readable_mailbox(
+        personal: Option<&crate::personal::PersonalConnectors>,
+        users: Option<&crate::user_secrets::UserSecrets>,
+        user_id: &str,
+    ) -> bool {
+        let oauth_connected = personal.is_some_and(|personal| {
+            use crate::connectors::ConnectorKind;
+            [ConnectorKind::OutlookMail, ConnectorKind::Gmail]
+                .into_iter()
+                .any(|kind| personal.connected(user_id, kind).unwrap_or(false))
+        });
+        if oauth_connected {
+            return true;
+        }
+        users.is_some_and(|users| {
+            !crate::mail::list_accounts(users, user_id)
+                .unwrap_or_default()
+                .is_empty()
+        })
+    }
+
     fn submit_due_triage(&self, now: DateTime<Utc>) -> Result<usize> {
         let Some(runtime) = self.runtime.get() else {
             return Ok(0);
         };
-        let personal = self.personal.get();
+        let personal = self.personal.get().map(|p| p.as_ref());
+        let user_secrets = runtime.gateway().user_secrets();
+        let users = user_secrets.as_deref();
         triage_sweep(
             &self.store,
             &self.config,
             now,
-            &|user| {
-                personal.is_some_and(|personal| {
-                    use crate::connectors::ConnectorKind;
-                    [ConnectorKind::OutlookMail, ConnectorKind::Gmail]
-                        .into_iter()
-                        .any(|kind| personal.connected(user, kind).unwrap_or(false))
-                })
-            },
+            &|user| Self::has_readable_mailbox(personal, users, user),
             &mut |user| {
                 runtime
                     .submit_text(user, TRIAGE_CONVERSATION, TRIAGE_PROMPT, Some(TRIAGE_BOT))
@@ -1112,7 +1128,9 @@ pub const TRIAGE_CONVERSATION: &str = "dir:inbox";
 pub const TRIAGE_BOT: &str = "inbox";
 /// The scheduled turn. The normal gateway applies: drafts are shown, and
 /// sending anything stays approval-gated.
-pub const TRIAGE_PROMPT: &str = "Daily inbox triage: look at my mail from the last 24 hours. \
+pub const TRIAGE_PROMPT: &str = "Daily inbox triage: look at my mail from the last 24 hours across \
+my connected mailboxes (Outlook/Gmail when connected, and any connected native IMAP accounts via \
+mail_list — omit account for the default mailbox or pass each connected account name). \
 Group it as Important, Needs reply, FYI and Noise, one line each (sender, subject, the ask). \
 For the Needs reply group, draft a short reply for each, shown in full for my approval. \
 Do not send, archive or delete anything.";
@@ -1192,10 +1210,9 @@ pub async fn member_brief(
         .timezone
         .parse()
         .map_err(|_| SeraError::Config("invalid schedule timezone".into()))?;
-    let feeds = match personal {
-        Some(personal) => crate::brief::collect_feeds(personal, user_id, now, tz).await,
-        None => crate::brief::BriefFeeds::default(),
-    };
+    let user_secrets = runtime.and_then(|rt| rt.gateway().user_secrets());
+    let feeds =
+        crate::brief::collect_feeds(personal, user_secrets.as_deref(), user_id, now, tz).await;
     let text = crate::brief::morning_brief_text(store, user_id, now, tz, &feeds)?;
     if let Some(runtime) = runtime
         && runtime.scan_owner_output(user_id, &text).is_err()
@@ -1686,6 +1703,74 @@ mod tests {
             .unwrap();
         let later = tomorrow + chrono::Duration::days(1);
         assert_eq!(run(&store, later, true, &mut submitted), 0);
+    }
+
+    #[test]
+    fn triage_triggers_with_only_native_imap_account() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let bob = store
+            .create_user("microsoft:bob", "bob@example.example", "Bob")
+            .unwrap()
+            .id;
+        let users =
+            crate::user_secrets::UserSecrets::with_master_key(store.clone(), [7u8; 32]).unwrap();
+        let config = Config::default();
+
+        for user in [&admin, &bob] {
+            store
+                .set_helper_settings(
+                    user,
+                    &HelperPatch {
+                        email_triage: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+
+        // Neither Outlook/Gmail nor native IMAP: nothing qualifies.
+        assert!(!OpsWatch::has_readable_mailbox(None, Some(&users), &admin));
+        assert!(!OpsWatch::has_readable_mailbox(None, Some(&users), &bob));
+
+        // Configure only a native IMAP account for `admin` (not `bob`).
+        crate::mail::store_credentials(
+            &users,
+            &admin,
+            Some("work"),
+            &crate::mail::MailCredentials {
+                smtp_host: "127.0.0.1".into(),
+                smtp_port: 2525,
+                smtp_security: crate::mail::Security::None,
+                username: "admin@example.com".into(),
+                password: "pw".into(),
+                imap_host: "127.0.0.1".into(),
+                imap_port: 1143,
+                imap_security: crate::mail::Security::None,
+                from: None,
+                signature: None,
+            },
+        )
+        .unwrap();
+
+        assert!(OpsWatch::has_readable_mailbox(None, Some(&users), &admin));
+        assert!(!OpsWatch::has_readable_mailbox(None, Some(&users), &bob));
+
+        let mut submitted = Vec::new();
+        let count = triage_sweep(
+            &store,
+            &config,
+            at(7),
+            &|user| OpsWatch::has_readable_mailbox(None, Some(&users), user),
+            &mut |user| {
+                submitted.push(user.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(submitted, vec![admin]);
+        assert!(TRIAGE_PROMPT.contains("mail_list"));
     }
 
     #[test]

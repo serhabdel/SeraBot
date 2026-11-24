@@ -302,9 +302,19 @@ class _ChatScreenState extends State<ChatScreen> {
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                       ),
-                      if (chat.running)
+                      if (chat.needsReview)
                         Text(
-                          'Working\u2026',
+                          'Needs review',
+                          style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                            color: Theme.of(context).colorScheme.tertiary,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        )
+                      else if (chat.running)
+                        Text(
+                          chat.progressElapsedSecs != null
+                              ? 'Thinking \u00b7 ${chat.progressElapsedSecs}s'
+                              : 'Working\u2026',
                           style: Theme.of(context).textTheme.bodySmall,
                         ),
                     ],
@@ -371,6 +381,13 @@ class _ChatScreenState extends State<ChatScreen> {
                   padding: EdgeInsets.fromLTRB(12, 0, 12, 8),
                   child: _ReconnectBanner(),
                 ),
+              if (chat.needsReview)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                  child: _NeedsReviewBanner(
+                    onDismiss: chat.dismissNeedsReview,
+                  ),
+                ),
               if (chat.error != null)
                 Padding(
                   padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
@@ -397,7 +414,10 @@ class _ChatScreenState extends State<ChatScreen> {
     }
     final items = chat.messages.reversed.toList();
     final showActivity =
-        chat.running || !chat.activity.isEmpty || !chat.currentMemory.isEmpty;
+        chat.running ||
+        chat.needsReview ||
+        !chat.activity.isEmpty ||
+        !chat.currentMemory.isEmpty;
     return ListView.builder(
       controller: _scroll,
       reverse: true,
@@ -611,17 +631,34 @@ class ActivityPanel extends StatelessWidget {
     final a = chat.activity;
     final memory = chat.currentMemory;
     final waiting = a.steps.where((s) => s.phase == StepPhase.waitingApproval);
-    final title = chat.running
-        ? (a.isEmpty ? 'Working\u2026' : 'Working \u00b7 ${a.summary}')
-        : (a.isEmpty ? 'Memories for the last reply' : a.summary);
+    final elapsed = chat.progressElapsedSecs;
+    final String title;
+    if (chat.needsReview) {
+      title = a.isEmpty
+          ? 'Needs review'
+          : 'Needs review \u00b7 ${a.summary}';
+    } else if (chat.running) {
+      if (elapsed != null) {
+        title = a.isEmpty
+            ? 'Thinking \u00b7 ${elapsed}s'
+            : 'Thinking \u00b7 ${elapsed}s \u00b7 ${a.summary}';
+      } else {
+        title = a.isEmpty ? 'Working\u2026' : 'Working \u00b7 ${a.summary}';
+      }
+    } else {
+      title = a.isEmpty ? 'Memories for the last reply' : a.summary;
+    }
     final reduced = MediaQuery.disableAnimationsOf(context);
+    final scheme = Theme.of(context).colorScheme;
     return Card(
       margin: const EdgeInsets.symmetric(vertical: 6),
       child: Semantics(
         liveRegion: chat.running,
         child: ExpansionTile(
           key: const Key('activity-panel'),
-          leading: chat.running
+          leading: chat.needsReview
+              ? Icon(Icons.warning_amber_rounded, color: scheme.tertiary)
+              : chat.running
               ? SizedBox(
                   width: 18,
                   height: 18,
@@ -631,7 +668,8 @@ class ActivityPanel extends StatelessWidget {
                 )
               : const Icon(Icons.checklist),
           title: Text(title),
-          initiallyExpanded: chat.running || waiting.isNotEmpty,
+          initiallyExpanded:
+              chat.running || chat.needsReview || waiting.isNotEmpty,
           children: [
             for (final s in a.steps) _StepCard(chat: chat, step: s),
             if (!memory.isEmpty)
@@ -1611,6 +1649,85 @@ class _ReconnectBanner extends StatelessWidget {
                 child: Text(
                   'Reconnecting to live updates…',
                   style: TextStyle(color: scheme.onTertiaryContainer),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Amber warning banner for tasks parked in `needs_review` (0.74.10): an
+/// outbound effect may already have happened, so there is no spinner and no
+/// automatic retry — only a prompt to check the result and dismiss once
+/// reviewed.
+class _NeedsReviewBanner extends StatelessWidget {
+  const _NeedsReviewBanner({required this.onDismiss});
+
+  final VoidCallback onDismiss;
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final bg = isDark ? const Color(0xFF3E2D0C) : const Color(0xFFFEF3C7);
+    final border = isDark ? const Color(0xFFD97706) : const Color(0xFFF59E0B);
+    final fg = isDark ? const Color(0xFFFDE68A) : const Color(0xFF78350F);
+    return Semantics(
+      liveRegion: true,
+      label:
+          'Needs review. Something may have happened — check the result before trying again.',
+      child: Material(
+        key: const Key('needs-review-banner'),
+        color: bg,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: BorderSide(color: border),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Padding(
+                padding: const EdgeInsets.only(top: 2),
+                child: Icon(Icons.warning_amber_rounded, color: fg),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Needs your review',
+                      style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                        color: fg,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      'Something may have happened — check the result before trying again.',
+                      style: Theme.of(
+                        context,
+                      ).textTheme.bodySmall?.copyWith(color: fg),
+                    ),
+                    const SizedBox(height: 6),
+                    Align(
+                      alignment: Alignment.centerRight,
+                      child: OutlinedButton(
+                        key: const Key('needs-review-dismiss'),
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: fg,
+                          side: BorderSide(color: border),
+                          visualDensity: VisualDensity.compact,
+                        ),
+                        onPressed: onDismiss,
+                        child: const Text('Dismiss / Reviewed'),
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ],

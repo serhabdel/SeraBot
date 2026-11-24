@@ -297,6 +297,85 @@ fn open_viewer(
     }));
 }
 
+/// Download an artifact by hash and attach it to the active conversation's
+/// composer (`POST /v1/conversations/{id}/attachments`), then navigate to Chat.
+fn attach_item_to_chat(
+    mut session: Signal<Session>,
+    item: lib::LibraryItem,
+    mut attaching: Signal<Option<String>>,
+    mut error: Signal<Option<String>>,
+    mut selected: Signal<Option<lib::LibraryItem>>,
+) {
+    if attaching.read().is_some() {
+        return;
+    }
+    if !valid_hash(&item.id) {
+        error.set(Some("This file has no artifact hash to attach.".into()));
+        return;
+    }
+    let conversation = {
+        let s = session.read();
+        if s.composer_files.len() >= serabot_desktop::MAX_ATTACHMENTS {
+            error.set(Some(format!(
+                "The active chat already holds {} files. Remove one first.",
+                serabot_desktop::MAX_ATTACHMENTS
+            )));
+            return;
+        }
+        s.conversation.clone()
+    };
+    let hash = item.id.clone();
+    let fallback_name = item
+        .filename
+        .clone()
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| item.label());
+    if !serabot_desktop::valid_attachment_name(&fallback_name) {
+        error.set(Some(format!(
+            "{fallback_name}: only image, PDF, DOCX, XLSX, PPTX, TXT, MD or CSV files can be attached to chat."
+        )));
+        return;
+    }
+    attaching.set(Some(hash.clone()));
+    error.set(None);
+    spawn(async move {
+        let attach_hash = hash.clone();
+        let attach_conv = conversation.clone();
+        let attach_name = fallback_name.clone();
+        let res = run_library_job(session, move |client| {
+            let (server_name, bytes) = client
+                .artifact_capped(&attach_hash, serabot_desktop::MAX_ATTACHMENT_BYTES as u64)?;
+            let name = if serabot_desktop::valid_attachment_name(&server_name) {
+                server_name
+            } else {
+                attach_name
+            };
+            client.upload_attachment(&attach_conv, &name, &bytes)
+        })
+        .await;
+        attaching.set(None);
+        match res {
+            Ok(attached) => {
+                let mut s = session.write();
+                if s.conversation != conversation {
+                    s.open_conversation(conversation);
+                }
+                if s.composer_files.len() < serabot_desktop::MAX_ATTACHMENTS
+                    && !s.composer_files.iter().any(|f| f.id == attached.id)
+                {
+                    s.composer_files.push(attached);
+                }
+                s.attach_notice = None;
+                s.open_section(serabot_desktop::session::Section::Chat);
+                selected.set(None);
+            }
+            Err(msg) => {
+                error.set(Some(format!("Could not attach to chat: {msg}")));
+            }
+        }
+    });
+}
+
 /// The Library page: tabs, search, date/sort filters, upload, and the items.
 #[component]
 pub fn LibraryView(session: Signal<Session>) -> Element {
@@ -305,6 +384,7 @@ pub fn LibraryView(session: Signal<Session>) -> Element {
     let mut onedrive = use_signal(|| Option::<LibraryOnedriveStatus>::None);
     let mut loading = use_signal(|| true);
     let mut uploading = use_signal(|| false);
+    let attaching = use_signal(|| Option::<String>::None);
     let mut error = use_signal(|| Option::<String>::None);
     let mut notice = use_signal(|| Option::<String>::None);
     let mut tab = use_signal(KindFilter::default);
@@ -433,10 +513,27 @@ pub fn LibraryView(session: Signal<Session>) -> Element {
     }
     let downloading = session.read().downloading;
     let od = onedrive();
-    let mirror_label = match od.as_ref() {
-        Some(o) if o.mirror && o.connected => format!("OneDrive: {}", o.folder),
-        Some(o) if o.mirror => "OneDrive: not connected".to_owned(),
-        _ => "OneDrive mirror off".to_owned(),
+    let (mirror_label, mirror_tone, mirror_title) = match od.as_ref() {
+        Some(o) if o.mirror && o.connected => (
+            format!("OneDrive mirror: on ({})", o.folder),
+            "pill onedrive-status ok",
+            format!("Files here are automatically mirrored to OneDrive folder \"{}\".", o.folder),
+        ),
+        Some(o) if o.mirror => (
+            "OneDrive mirror: not connected".to_owned(),
+            "pill onedrive-status warn",
+            "Mirroring is enabled, but your OneDrive account is not connected yet. Connect it under Integrations.".to_owned(),
+        ),
+        Some(_) => (
+            "OneDrive mirror: off".to_owned(),
+            "pill onedrive-status muted",
+            "OneDrive mirroring is turned off on this server.".to_owned(),
+        ),
+        None => (
+            "OneDrive mirror: checking\u{2026}".to_owned(),
+            "pill onedrive-status muted",
+            "Checking OneDrive mirror status.".to_owned(),
+        ),
     };
 
     rsx! {
@@ -449,7 +546,7 @@ pub fn LibraryView(session: Signal<Session>) -> Element {
                     }
                 }
                 div { class: "pane-head-actions",
-                    span { class: "pill", title: "Library files are mirrored to your OneDrive when it is connected", "{mirror_label}" }
+                    span { class: "{mirror_tone}", title: "{mirror_title}", "{mirror_label}" }
                     button {
                         class: "btn icon",
                         r#type: "button",
@@ -563,6 +660,8 @@ pub fn LibraryView(session: Signal<Session>) -> Element {
                                         downloading,
                                         fetch_thumb: thumb_ids.contains(&item.id)
                                             && item.size_bytes.is_none_or(|size| size <= MAX_THUMBNAIL_IMAGE_BYTES),
+                                        attaching,
+                                        error,
                                     }
                                 }
                             }
@@ -576,20 +675,37 @@ pub fn LibraryView(session: Signal<Session>) -> Element {
                         if let Some(heading) = heading {
                             div { class: "library-day", "{heading}" }
                         }
-                        button {
-                            class: "library-row",
-                            r#type: "button",
-                            role: "listitem",
-                            onclick: {
-                                let item = item.clone();
-                                move |_| selected.set(Some(item.clone()))
-                            },
-                            span { class: "library-ext", "{item.extension()}" }
-                            span { class: "library-copy",
-                                span { class: "library-name", "{item.label()}" }
-                                span { class: "library-meta",
-                                    if item.generated() { "Made by bots" } else { "Uploaded" }
-                                    " \u{b7} {item.day()}"
+                        div { class: "library-row-wrap", role: "listitem",
+                            button {
+                                class: "library-row",
+                                r#type: "button",
+                                onclick: {
+                                    let item = item.clone();
+                                    move |_| selected.set(Some(item.clone()))
+                                },
+                                span { class: "library-ext", "{item.extension()}" }
+                                span { class: "library-copy",
+                                    span { class: "library-name", "{item.label()}" }
+                                    span { class: "library-meta",
+                                        if item.generated() { "Made by bots" } else { "Uploaded" }
+                                        " \u{b7} {item.day()}"
+                                    }
+                                }
+                            }
+                            button {
+                                class: "btn ghost sm library-row-attach",
+                                r#type: "button",
+                                title: "Attach to active chat composer",
+                                disabled: attaching().as_deref() == Some(item.id.as_str()),
+                                onclick: {
+                                    let item = item.clone();
+                                    move |_| attach_item_to_chat(session, item.clone(), attaching, error, selected)
+                                },
+                                Icon { name: "paperclip", size: 13 }
+                                if attaching().as_deref() == Some(item.id.as_str()) {
+                                    "Attaching\u{2026}"
+                                } else {
+                                    "Attach to chat"
                                 }
                             }
                         }
@@ -598,7 +714,7 @@ pub fn LibraryView(session: Signal<Session>) -> Element {
                 }
             }
             if let Some(item) = selected() {
-                LibraryItemDialog { session, item, downloading, selected, images: images.clone(), viewer }
+                LibraryItemDialog { session, item, downloading, selected, images: images.clone(), viewer, onedrive: od.clone(), attaching, error }
             }
             if viewer().is_some() {
                 ImageViewer { session, viewer, downloading }
@@ -608,7 +724,7 @@ pub fn LibraryView(session: Signal<Session>) -> Element {
 }
 
 /// One grid card: a real thumbnail for images, a type badge otherwise, plus
-/// filename, size, date, bot/chat, and a clear Open action.
+/// filename, size, date, bot/chat, and clear Open / Attach actions.
 #[component]
 fn LibraryCard(
     session: Signal<Session>,
@@ -620,6 +736,8 @@ fn LibraryCard(
     thumb_failed: Signal<BTreeSet<String>>,
     downloading: bool,
     fetch_thumb: bool,
+    attaching: Signal<Option<String>>,
+    error: Signal<Option<String>>,
 ) -> Element {
     let item_image = is_image(&item);
     let thumb_url = thumbs.read().get(&item.id).cloned();
@@ -640,6 +758,8 @@ fn LibraryCard(
         .clone()
         .filter(|title| !title.trim().is_empty());
     let open_id = item.id.clone();
+    let attach_item = item.clone();
+    let is_attaching = attaching().as_deref() == Some(item.id.as_str());
     let details_item = item.clone();
     let media_item = item.clone();
     let images_for_media = images.clone();
@@ -692,6 +812,15 @@ fn LibraryCard(
                     disabled: downloading,
                     onclick: move |_| session.write().open_artifact(open_id.clone()),
                     "Open"
+                }
+                button {
+                    class: "btn ghost sm",
+                    r#type: "button",
+                    title: "Attach to active chat composer",
+                    disabled: is_attaching,
+                    onclick: move |_| attach_item_to_chat(session, attach_item.clone(), attaching, error, selected),
+                    Icon { name: "paperclip", size: 12 }
+                    if is_attaching { "Attaching\u{2026}" } else { "Attach" }
                 }
                 button {
                     class: "btn ghost sm",
@@ -1027,6 +1156,9 @@ fn LibraryItemDialog(
     selected: Signal<Option<lib::LibraryItem>>,
     images: Vec<lib::LibraryItem>,
     viewer: Signal<Option<ViewerState>>,
+    onedrive: Option<LibraryOnedriveStatus>,
+    attaching: Signal<Option<String>>,
+    error: Signal<Option<String>>,
 ) -> Element {
     let mut session = session;
     let mut selected = selected;
@@ -1043,6 +1175,14 @@ fn LibraryItemDialog(
     let generated = item.generated();
     let id = item.id.clone();
     let conversation = item.conversation_id.clone();
+    let mirror_status = match onedrive.as_ref() {
+        Some(o) if o.mirror && o.connected => format!("Mirrored to OneDrive ({})", o.folder),
+        Some(o) if o.mirror => "OneDrive not connected".to_owned(),
+        Some(_) => "Off".to_owned(),
+        None => "Checking\u{2026}".to_owned(),
+    };
+    let is_attaching = attaching().as_deref() == Some(id.as_str());
+    let attach_item = item.clone();
     let ext = item.extension();
     let previewable = is_image(&item)
         || matches!(
@@ -1245,11 +1385,21 @@ fn LibraryItemDialog(
                     dt { "Size" }
                     dd { "{size}" }
                 }
+                dt { "OneDrive" }
+                dd { "{mirror_status}" }
             }
             {preview_view}
             div { class: "library-actions",
                 button {
                     class: "btn primary sm",
+                    r#type: "button",
+                    disabled: is_attaching,
+                    onclick: move |_| attach_item_to_chat(session, attach_item.clone(), attaching, error, selected),
+                    Icon { name: "paperclip", size: 14 }
+                    if is_attaching { "Attaching\u{2026}" } else { "Attach to chat" }
+                }
+                button {
+                    class: "btn ghost sm",
                     r#type: "button",
                     disabled: downloading,
                     onclick: {

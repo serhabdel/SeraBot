@@ -473,12 +473,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             .map(|bot| state.bot_display_name(&bot));
         (first, count)
     };
-    let needs_review = session
-        .read()
-        .state
-        .task
-        .as_ref()
-        .is_some_and(|task| task.status == TaskStatus::NeedsReview);
+    let needs_review = session.read().needs_review_active();
     let streaming_reply = session
         .read()
         .state

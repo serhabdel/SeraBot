@@ -4,19 +4,17 @@ use serabot_desktop::standing_grants::{
     grant_matches, short_hash,
 };
 
-type ApprovalRow = (String, String, String, String);
-
 fn filter_items(
-    approvals: Vec<ApprovalRow>,
+    approvals: Vec<Approval>,
     snapshot: &StandingGrantsSnapshot,
     needle: &str,
-) -> (Vec<ApprovalRow>, Vec<StandingGrantRow>) {
+) -> (Vec<Approval>, Vec<StandingGrantRow>) {
     let filtered_approvals = approvals
         .into_iter()
-        .filter(|(_, tool, summary, _)| {
+        .filter(|approval| {
             needle.is_empty()
-                || tool.to_lowercase().contains(needle)
-                || summary.to_lowercase().contains(needle)
+                || approval.tool.to_lowercase().contains(needle)
+                || approval.summary.to_lowercase().contains(needle)
         })
         .collect();
     let filtered_grants = active_grants(snapshot)
@@ -41,25 +39,11 @@ fn pulse_busy(mut busy: Signal<Option<String>>, id: String) {
 #[component]
 pub(super) fn ApprovalsView(session: Signal<Session>) -> Element {
     let mut filter = use_signal(String::new);
-    let mut confirm_always = use_signal(|| None::<String>);
     let mut confirm_revoke = use_signal(|| None::<String>);
     let busy_id = use_signal(|| None::<String>);
 
     let approvals_loaded = session.read().state.approvals_loaded;
-    let approvals: Vec<(String, String, String, String)> = session
-        .read()
-        .state
-        .approvals
-        .iter()
-        .map(|approval| {
-            (
-                approval.id.clone(),
-                approval.tool.clone(),
-                approval.summary.clone(),
-                approval.expires_at.clone(),
-            )
-        })
-        .collect();
+    let approvals = session.read().state.approvals.clone();
     let grants_snapshot = session.read().state.standing_grants.clone();
     let grants_loaded = session.read().state.standing_grants_loaded;
 
@@ -68,7 +52,6 @@ pub(super) fn ApprovalsView(session: Signal<Session>) -> Element {
 
     let approvals_empty = filtered_approvals.is_empty();
     let grants_empty = filtered_grants.is_empty();
-    let confirm_id = confirm_always();
     let confirm_revoke_id = confirm_revoke();
     let active_busy = busy_id();
     let has_any = !approvals_loaded
@@ -105,9 +88,6 @@ pub(super) fn ApprovalsView(session: Signal<Session>) -> Element {
                             oninput: move |event| filter.set(event.value()),
                             onkeydown: move |event: KeyboardEvent| {
                                 if event.key() == Key::Escape {
-                                    if confirm_always.read().is_some() {
-                                        confirm_always.set(None);
-                                    }
                                     if confirm_revoke.read().is_some() {
                                         confirm_revoke.set(None);
                                     }
@@ -155,87 +135,30 @@ pub(super) fn ApprovalsView(session: Signal<Session>) -> Element {
                             }
                         }
                     } else {
-                        div { class: "ap-list", role: "list",
-                            for (id, tool, summary, expires) in filtered_approvals {
+                        div { class: "ap-cards-list", role: "list",
+                            for approval in filtered_approvals {
                                 {
+                                    let id = approval.id.clone();
                                     let row_busy = active_busy.as_deref() == Some(id.as_str());
-                                    let confirming = confirm_id.as_deref() == Some(id.as_str());
-                                    let exp_label = stamp(&expires);
                                     rsx! {
-                                        div { class: "ap-row", key: "{id}", role: "listitem",
-                                            span { class: "chip accent ap-tool", "{tool}" }
-                                            div { class: "ap-body",
-                                                p { class: "ap-summary", title: "{summary}", "{summary}" }
-                                                span { class: "tiny muted", title: "{expires}", "Expires {exp_label}" }
-                                            }
-                                            div { class: "ap-actions",
-                                                button {
-                                                    class: "btn primary sm",
-                                                    r#type: "button",
-                                                    disabled: row_busy,
-                                                    onclick: {
-                                                        let id = id.clone();
-                                                        move |_| {
-                                                            confirm_always.set(None);
-                                                            pulse_busy(busy_id, id.clone());
-                                                            session.write().decide(id.clone(), ApprovalDecision::Once);
-                                                        }
-                                                    },
-                                                    "Approve once"
-                                                }
-                                                if confirming {
-                                                    div { class: "conv-confirm",
-                                                        button {
-                                                            class: "btn primary sm",
-                                                            r#type: "button",
-                                                            disabled: row_busy,
-                                                            onclick: {
-                                                                let id = id.clone();
-                                                                move |_| {
-                                                                    confirm_always.set(None);
-                                                                    pulse_busy(busy_id, id.clone());
-                                                                    session.write().decide(id.clone(), ApprovalDecision::Always);
-                                                                }
-                                                            },
-                                                            "Confirm Always"
-                                                        }
-                                                        button {
-                                                            class: "btn ghost sm",
-                                                            r#type: "button",
-                                                            disabled: row_busy,
-                                                            onclick: move |_| confirm_always.set(None),
-                                                            "Cancel"
-                                                        }
+                                        div { key: "{id}", role: "listitem",
+                                            crate::ui_cards::ApprovalCard {
+                                                session,
+                                                id: approval.id,
+                                                tool: approval.tool,
+                                                summary: approval.summary,
+                                                expires_at: approval.expires_at,
+                                                compact: false,
+                                                allow_standing_grant: true,
+                                                busy: row_busy,
+                                                on_decide: {
+                                                    let id = id.clone();
+                                                    move |decision| {
+                                                        confirm_revoke.set(None);
+                                                        pulse_busy(busy_id, id.clone());
+                                                        session.write().decide(id.clone(), decision);
                                                     }
-                                                } else {
-                                                    button {
-                                                        class: "btn ghost sm",
-                                                        r#type: "button",
-                                                        disabled: row_busy,
-                                                        onclick: {
-                                                            let id = id.clone();
-                                                            move |_| {
-                                                                confirm_revoke.set(None);
-                                                                confirm_always.set(Some(id.clone()));
-                                                            }
-                                                        },
-                                                        "Always"
-                                                    }
-                                                }
-                                                button {
-                                                    class: "btn danger sm",
-                                                    r#type: "button",
-                                                    disabled: row_busy,
-                                                    onclick: {
-                                                        let id = id.clone();
-                                                        move |_| {
-                                                            confirm_always.set(None);
-                                                            pulse_busy(busy_id, id.clone());
-                                                            session.write().decide(id.clone(), ApprovalDecision::Deny);
-                                                        }
-                                                    },
-                                                    "Deny"
-                                                }
+                                                },
                                             }
                                         }
                                     }
@@ -314,7 +237,6 @@ pub(super) fn ApprovalsView(session: Signal<Session>) -> Element {
                                                         onclick: {
                                                             let id = grant.id.clone();
                                                             move |_| {
-                                                                confirm_always.set(None);
                                                                 confirm_revoke.set(Some(id.clone()));
                                                             }
                                                         },
