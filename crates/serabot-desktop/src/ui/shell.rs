@@ -26,10 +26,19 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
     // A sign-in the session starts by itself (right after a save, or when an
     // error asks for one) opens its sheet here.
     let mut overlay_for_signin = overlay;
+    let mut toast_for_session = toast;
     use_effect(move || {
         let wants = session.read().accounts_ui.sheet_provider.is_some();
         if wants && overlay_for_signin() == Overlay::None {
             overlay_for_signin.set(Overlay::AddAccount);
+        }
+        let pending_toast = session.read().toast.clone();
+        if let Some(msg) = pending_toast {
+            let is_err = msg.to_ascii_lowercase().contains("fail")
+                || msg.to_ascii_lowercase().contains("error")
+                || msg.to_ascii_lowercase().contains("could not");
+            toast_for_session.set(Some((msg, is_err)));
+            session.write().toast = None;
         }
     });
     let onboarding_open = chat && session.read().onboarding_ui.open;
@@ -66,6 +75,7 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
                         Section::Chat => rsx! {
                             ChatView { session, overlay }
                         },
+                        Section::Mail => rsx! { crate::ui_mail::MailView { session } },
                         Section::Conversations => rsx! { ConversationsView { session } },
                         Section::Projects => rsx! { crate::ui_projects::ProjectsView { session } },
                         Section::Memory => rsx! { MemoryView { session } },
@@ -79,7 +89,7 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
                         Section::Workflows => rsx! { crate::ui_workflows::WorkflowsView { session } },
                         Section::Integrations => rsx! { crate::ui_integrations::IntegrationsView { session } },
                         Section::Library => rsx! { crate::ui_library::LibraryView { session } },
-                        Section::Settings => rsx! { SettingsView { session } },
+                        Section::Settings => rsx! { SettingsView { session, overlay } },
                     }}
                 }
                 }
@@ -152,8 +162,8 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
     }
 }
 
-/// The 58 px studio navigation rail: quick command jump on top, grouped
-/// destinations (Work, Data, Connect, System), Settings and the account below.
+/// The 58 px studio navigation rail: quick command jump on top, the 7 focused
+/// workspace destinations, Settings and the account below.
 #[component]
 pub(super) fn IconRail(
     session: Signal<Session>,
@@ -165,23 +175,14 @@ pub(super) fn IconRail(
     let section = session.read().section;
     let work: [(Section, &str, &str); 3] = [
         (Section::Chat, "chat", "Chats"),
-        (Section::Workflows, "workflows", "Workflows"),
+        (Section::Mail, "send", "Mail"),
         (Section::Tasks, "list", "Tasks"),
     ];
-    let data: [(Section, &str, &str); 5] = [
+    let workspace: [(Section, &str, &str); 4] = [
         (Section::Projects, "folder", "Projects"),
-        (Section::Browser, "globe", "Browser"),
-        (Section::Memory, "memory", "Memory"),
         (Section::Library, "library", "Library"),
-        (Section::Vault, "lock", "Vault"),
-    ];
-    let connect: [(Section, &str, &str); 2] = [
-        (Section::Integrations, "connectors", "Integrations"),
-        (Section::Providers, "providers", "AI providers"),
-    ];
-    let system: [(Section, &str, &str); 2] = [
-        (Section::Usage, "usage", "Usage"),
-        (Section::Logs, "logs", "Logs"),
+        (Section::Workflows, "workflows", "Workflows"),
+        (Section::Browser, "globe", "Browser"),
     ];
     rsx! {
         nav { class: "rail", "aria-label": "Main navigation",
@@ -203,7 +204,7 @@ pub(super) fn IconRail(
                 span { class: "rail-label", "Jump" }
             }
             div { class: "rail-divider", "aria-hidden": "true" }
-            for group in [work.as_slice(), data.as_slice(), connect.as_slice(), system.as_slice()] {
+            for group in [work.as_slice(), workspace.as_slice()] {
                 for (target, icon, label) in group.iter().copied() {
                     button {
                         key: "{label}",

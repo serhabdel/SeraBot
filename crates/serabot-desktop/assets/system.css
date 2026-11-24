@@ -2391,3 +2391,48 @@ html[data-reduce-transparency="true"] .sheet.sheet-palette {
   color: var(--label-3);
 }
 
+/* Grouped Settings navigation (0.74.12). */
+.settings-nav-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.settings-nav-group + .settings-nav-group {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--sep);
+}
+
+.settings-nav-group-label {
+  padding: 4px 12px 2px;
+  font-size: var(--fs-micro, 11px);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--label-3);
+  user-select: none;
+}
+
+.settings-content:has(> .pane) {
+  max-width: none;
+}
+
+.settings-content > .pane {
+  height: auto;
+  min-height: 0;
+  overflow: visible;
+}
+
+.settings-content > .pane > .pane-head {
+  padding: 0 0 12px;
+  border-bottom: 1px solid var(--sep);
+  margin-bottom: 16px;
+}
+
+.settings-content > .pane > .pane-body {
+  padding: 0;
+  overflow: visible;
+}
+
+

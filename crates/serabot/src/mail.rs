@@ -710,11 +710,11 @@ pub async fn smtp_send(
     wire.send_line(&base64::engine::general_purpose::STANDARD.encode(creds.password.as_bytes()))
         .await?;
     wire.expect("235").await?;
-    wire.send_line(&format!("MAIL FROM:<{}>", clean_header(from)))
+    wire.send_line(&format!("MAIL FROM:<{}>", extract_envelope_address(from)))
         .await?;
     wire.expect("250").await?;
     for rcpt in to {
-        wire.send_line(&format!("RCPT TO:<{}>", clean_header(rcpt)))
+        wire.send_line(&format!("RCPT TO:<{}>", extract_envelope_address(rcpt)))
             .await?;
         wire.expect("250").await?;
     }
@@ -996,6 +996,109 @@ fn extract_body_and_attachments(head: &str, body: &str) -> (String, Vec<MailAtta
     (text, attachments)
 }
 
+fn extract_envelope_address(raw: &str) -> String {
+    let cleaned = clean_header(raw);
+    if let (Some(start), Some(end)) = (cleaned.rfind('<'), cleaned.rfind('>'))
+        && start < end
+    {
+        return cleaned[start + 1..end].trim().to_owned();
+    }
+    cleaned.trim().to_owned()
+}
+
+fn extract_raw_attachment(raw: &str, index: usize) -> Result<(String, String, Vec<u8>)> {
+    let (head, body) = match raw.find("\r\n\r\n") {
+        Some(pos) => (&raw[..pos], &raw[pos + 4..]),
+        None => match raw.find("\n\n") {
+            Some(pos) => (&raw[..pos], &raw[pos + 2..]),
+            None => (raw, ""),
+        },
+    };
+    let boundary = head.replace("\r\n", "\n").split('\n').find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        if key.trim().eq_ignore_ascii_case("content-type") {
+            value.split(';').find_map(|param| {
+                let (k, v) = param.split_once('=')?;
+                if k.trim().eq_ignore_ascii_case("boundary") {
+                    return Some(v.trim().trim_matches('"').to_owned());
+                }
+                None
+            })
+        } else {
+            None
+        }
+    });
+    let Some(boundary) = boundary else {
+        return Err(SeraError::NotFound("attachment".into()));
+    };
+    let delimiter = format!("--{boundary}");
+    let mut att_idx = 0usize;
+    for part in body.split(&delimiter).skip(1) {
+        let part = part
+            .strip_prefix("\r\n")
+            .or_else(|| part.strip_prefix('\n'))
+            .unwrap_or(part);
+        if part.starts_with("--") {
+            break;
+        }
+        let part = part
+            .strip_suffix("\r\n")
+            .or_else(|| part.strip_suffix('\n'))
+            .unwrap_or(part);
+        let (part_head, part_body) = match part.find("\r\n\r\n") {
+            Some(pos) => (&part[..pos], &part[pos + 4..]),
+            None => match part.find("\n\n") {
+                Some(pos) => (&part[..pos], &part[pos + 2..]),
+                None => (part, ""),
+            },
+        };
+        let head_lc = part_head.to_ascii_lowercase();
+        let content_type = head_lc
+            .split('\n')
+            .find_map(|l| {
+                l.split_once(':')
+                    .filter(|(k, _)| k.trim() == "content-type")
+            })
+            .map(|(_, v)| v.split(';').next().unwrap_or("").trim().to_owned())
+            .unwrap_or_else(|| "application/octet-stream".to_owned());
+        let filename = part_head.split('\n').find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            if !k.trim().eq_ignore_ascii_case("content-disposition") {
+                return None;
+            }
+            v.split(';').find_map(|p| {
+                let (k, v) = p.split_once('=')?;
+                if k.trim().eq_ignore_ascii_case("filename") {
+                    Some(v.trim().trim_matches('"').to_owned())
+                } else {
+                    None
+                }
+            })
+        });
+        if let Some(name) = filename {
+            if att_idx == index {
+                let decoded = if head_lc.contains("content-transfer-encoding: base64") {
+                    let compact: String =
+                        part_body.chars().filter(|c| !c.is_whitespace()).collect();
+                    base64::engine::general_purpose::STANDARD
+                        .decode(compact)
+                        .map_err(|_| SeraError::External("invalid attachment base64".into()))?
+                } else {
+                    part_body.as_bytes().to_vec()
+                };
+                if decoded.len() > MAX_ATTACHMENT_BYTES {
+                    return Err(SeraError::Validation(
+                        "attachment exceeds 20 MiB limit".into(),
+                    ));
+                }
+                return Ok((name, content_type, decoded));
+            }
+            att_idx += 1;
+        }
+    }
+    Err(SeraError::NotFound("attachment".into()))
+}
+
 fn decode_rfc2047(value: &str) -> String {
     // =?UTF-8?B?...?= (one encoded word is enough for subjects)
     if let Some(rest) = value
@@ -1251,6 +1354,58 @@ pub async fn imap_store_flags(
     Ok(())
 }
 
+/// Set or clear `\Seen` and/or `\Flagged` on one message.
+pub async fn imap_flag(
+    creds: &MailCredentials,
+    folder: &str,
+    uid: u32,
+    seen: Option<bool>,
+    flagged: Option<bool>,
+) -> Result<()> {
+    let mut add = Vec::new();
+    let mut remove = Vec::new();
+    if let Some(s) = seen {
+        if s {
+            add.push("\\Seen".to_owned());
+        } else {
+            remove.push("\\Seen".to_owned());
+        }
+    }
+    if let Some(f) = flagged {
+        if f {
+            add.push("\\Flagged".to_owned());
+        } else {
+            remove.push("\\Flagged".to_owned());
+        }
+    }
+    if add.is_empty() && remove.is_empty() {
+        return Err(SeraError::Validation(
+            "at least one of seen or flagged is required".into(),
+        ));
+    }
+    let mut wire = imap_connect(creds).await?;
+    let folder = normalize_folder(folder)?;
+    select_folder(&mut wire, &folder).await?;
+    if !add.is_empty() {
+        wire.send_line(&format!(
+            "a4 UID STORE {uid} +FLAGS.SILENT ({})",
+            add.join(" ")
+        ))
+        .await?;
+        wire.expect_tagged("a4").await?;
+    }
+    if !remove.is_empty() {
+        wire.send_line(&format!(
+            "a5 UID STORE {uid} -FLAGS.SILENT ({})",
+            remove.join(" ")
+        ))
+        .await?;
+        wire.expect_tagged("a5").await?;
+    }
+    let _ = wire.send_line("a9 LOGOUT").await;
+    Ok(())
+}
+
 /// Move one message to another folder (`UID MOVE`, IMAP4rev1 extension that
 /// Hostinger/Dovecot support).
 pub async fn imap_move(creds: &MailCredentials, folder: &str, uid: u32, dest: &str) -> Result<()> {
@@ -1289,6 +1444,22 @@ pub async fn imap_read(creds: &MailCredentials, folder: &str, uid: u32) -> Resul
     Ok(msg)
 }
 
+/// Read one attachment's raw bytes (up to `MAX_ATTACHMENT_BYTES`) by UID and
+/// attachment index, bypassing the 512 KiB inline preview cap.
+pub async fn imap_read_attachment(
+    creds: &MailCredentials,
+    folder: &str,
+    uid: u32,
+    index: usize,
+) -> Result<(String, String, Vec<u8>)> {
+    let mut wire = imap_connect(creds).await?;
+    let folder = normalize_folder(folder)?;
+    select_folder(&mut wire, &folder).await?;
+    let (_flags, raw) = imap_fetch_raw(&mut wire, uid, "BODY.PEEK[]").await?;
+    let _ = wire.send_line("a9 LOGOUT").await;
+    extract_raw_attachment(&raw, index)
+}
+
 async fn imap_fetch<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut Wire<S>,
     uid: u32,
@@ -1303,11 +1474,11 @@ async fn imap_fetch_headers<S: AsyncRead + AsyncWrite + Unpin>(
     imap_fetch_section(wire, uid, "BODY.PEEK[HEADER]").await
 }
 
-async fn imap_fetch_section<S: AsyncRead + AsyncWrite + Unpin>(
+async fn imap_fetch_raw<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut Wire<S>,
     uid: u32,
     section: &str,
-) -> Result<MailMessage> {
+) -> Result<(Vec<String>, String)> {
     wire.send_line(&format!("a4 UID FETCH {uid} (FLAGS {section})"))
         .await?;
     let mut block = String::new();
@@ -1332,6 +1503,15 @@ async fn imap_fetch_section<S: AsyncRead + AsyncWrite + Unpin>(
     if raw.is_empty() {
         return Err(SeraError::NotFound(format!("message {uid} has no body")));
     }
+    Ok((flags, raw))
+}
+
+async fn imap_fetch_section<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut Wire<S>,
+    uid: u32,
+    section: &str,
+) -> Result<MailMessage> {
+    let (flags, raw) = imap_fetch_raw(wire, uid, section).await?;
     Ok(parse_message(uid, flags, &raw))
 }
 

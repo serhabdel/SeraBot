@@ -290,3 +290,146 @@ class MailDisconnectResponse {
 
   final bool connected;
 }
+
+/// One attachment of a read mail message (`GET /v1/mail/messages/{uid}`, 0.74.5).
+class MailAttachmentInfo {
+  const MailAttachmentInfo({
+    required this.name,
+    this.contentType = 'application/octet-stream',
+    this.size = 0,
+    this.dataBase64,
+  });
+
+  factory MailAttachmentInfo.fromJson(Map<String, dynamic> json) {
+    return MailAttachmentInfo(
+      name: (json['name'] as String? ?? 'attachment').trim(),
+      contentType:
+          (json['content_type'] as String? ?? 'application/octet-stream').trim(),
+      size: (json['size'] as num?)?.toInt() ?? 0,
+      dataBase64: json['data_base64'] as String?,
+    );
+  }
+
+  final String name;
+  final String contentType;
+  final int size;
+  final String? dataBase64;
+}
+
+/// One mail message as returned by `GET /v1/mail/messages*` and
+/// `GET /v1/mail/search`.
+class MailMessageInfo {
+  const MailMessageInfo({
+    required this.uid,
+    this.subject = '',
+    this.from = '',
+    this.date = '',
+    this.flags = const [],
+    this.body = '',
+    this.attachments = const [],
+  });
+
+  factory MailMessageInfo.fromJson(Map<String, dynamic> json) {
+    final rawFlags = json['flags'] as List? ?? const [];
+    final rawAttachments = json['attachments'] as List? ?? const [];
+    return MailMessageInfo(
+      uid: (json['uid'] as num?)?.toInt() ?? 0,
+      subject: json['subject'] as String? ?? '',
+      from: json['from'] as String? ?? '',
+      date: json['date'] as String? ?? '',
+      flags: rawFlags.whereType<String>().toList(),
+      body: json['body'] as String? ?? '',
+      attachments: rawAttachments
+          .whereType<Map<String, dynamic>>()
+          .map(MailAttachmentInfo.fromJson)
+          .toList(),
+    );
+  }
+
+  final int uid;
+  final String subject;
+  final String from;
+  final String date;
+  final List<String> flags;
+  final String body;
+  final List<MailAttachmentInfo> attachments;
+
+  bool get isSeen => flags.any((f) {
+    final lower = f.toLowerCase();
+    return lower == r'\seen' || lower == 'seen';
+  });
+
+  bool get isFlagged => flags.any((f) {
+    final lower = f.toLowerCase();
+    return lower == r'\flagged' || lower == 'flagged';
+  });
+
+  MailMessageInfo copyWith({
+    List<String>? flags,
+    String? body,
+    List<MailAttachmentInfo>? attachments,
+  }) {
+    return MailMessageInfo(
+      uid: uid,
+      subject: subject,
+      from: from,
+      date: date,
+      flags: flags ?? this.flags,
+      body: body ?? this.body,
+      attachments: attachments ?? this.attachments,
+    );
+  }
+
+  /// Returns a copy with `\Seen` and/or `\Flagged` updated locally.
+  MailMessageInfo withUpdatedFlags({bool? seen, bool? flagged}) {
+    final next = List<String>.from(flags);
+    if (seen != null) {
+      next.removeWhere((f) {
+        final l = f.toLowerCase();
+        return l == r'\seen' || l == 'seen';
+      });
+      if (seen) {
+        next.add(r'\Seen');
+      }
+    }
+    if (flagged != null) {
+      next.removeWhere((f) {
+        final l = f.toLowerCase();
+        return l == r'\flagged' || l == 'flagged';
+      });
+      if (flagged) {
+        next.add(r'\Flagged');
+      }
+    }
+    return copyWith(flags: next);
+  }
+}
+
+/// Reply of `POST /v1/mail/messages/{uid}/attachments/{index}/save-to-library`.
+class MailSavedAttachment {
+  const MailSavedAttachment({
+    this.filename,
+    this.hash,
+    this.onedrive,
+  });
+
+  factory MailSavedAttachment.fromJson(Map<String, dynamic> json) {
+    final item = json['item'];
+    String? filename = json['filename'] as String? ?? json['name'] as String?;
+    String? hash = json['hash'] as String? ?? json['id'] as String?;
+    if (item is Map<String, dynamic>) {
+      filename ??= item['filename'] as String? ?? item['name'] as String?;
+      hash ??= item['id'] as String? ?? item['hash'] as String?;
+    }
+    return MailSavedAttachment(
+      filename: filename,
+      hash: hash,
+      onedrive: json['onedrive'] as String?,
+    );
+  }
+
+  final String? filename;
+  final String? hash;
+  final String? onedrive;
+}
+

@@ -1343,6 +1343,13 @@ pub(crate) fn MailConnectorCard(
                 } else {
                     div { class: "card-actions",
                         button {
+                            class: "btn primary",
+                            r#type: "button",
+                            disabled: busy(),
+                            onclick: move |_| session.write().open_section(serabot_desktop::session::Section::Mail),
+                            "Open Mail"
+                        }
+                        button {
                             class: "btn ghost",
                             r#type: "button",
                             disabled: busy(),

@@ -1297,6 +1297,251 @@ class ApiClient {
     }
   }
 
+  /// Folder names of one connected mailbox (`GET /v1/mail/folders`).
+  /// Returns `['INBOX']` when an older server returns 404.
+  Future<List<String>> mailFolders({String? account}) async {
+    final a = account?.trim();
+    final json = await _requestOptional(
+      'GET',
+      ['v1', 'mail', 'folders'],
+      query: (a != null && a.isNotEmpty) ? {'account': a} : null,
+    );
+    if (json == null) {
+      return const ['INBOX'];
+    }
+    final list = json['folders'];
+    if (list is! List) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
+    return list.whereType<String>().toList();
+  }
+
+  /// Newest messages in [folder] (`GET /v1/mail/messages`).
+  Future<List<MailMessageInfo>> mailMessages({
+    String? account,
+    String folder = 'INBOX',
+    int limit = 25,
+  }) async {
+    final a = account?.trim();
+    final f = folder.trim().isEmpty ? 'INBOX' : folder.trim();
+    final json = await _request(
+      'GET',
+      ['v1', 'mail', 'messages'],
+      query: {
+        if (a != null && a.isNotEmpty) 'account': a,
+        'folder': f,
+        'limit': '${limit.clamp(1, 100)}',
+      },
+    );
+    final list = json['messages'];
+    if (list is! List) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
+    return list
+        .whereType<Map<String, dynamic>>()
+        .map(MailMessageInfo.fromJson)
+        .toList();
+  }
+
+  /// Full message by UID (`GET /v1/mail/messages/{uid}`).
+  Future<MailMessageInfo> mailMessage({
+    String? account,
+    String folder = 'INBOX',
+    required int uid,
+  }) async {
+    if (uid < 1) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Invalid message UID.',
+      );
+    }
+    final a = account?.trim();
+    final f = folder.trim().isEmpty ? 'INBOX' : folder.trim();
+    final json = await _request(
+      'GET',
+      ['v1', 'mail', 'messages', '$uid'],
+      query: {
+        if (a != null && a.isNotEmpty) 'account': a,
+        'folder': f,
+      },
+    );
+    final raw = json['message'];
+    if (raw is Map<String, dynamic>) {
+      return MailMessageInfo.fromJson(raw);
+    }
+    if (json.containsKey('uid')) {
+      return MailMessageInfo.fromJson(json);
+    }
+    throw ApiException(ApiErrorKind.invalidResponse);
+  }
+
+  /// Server-side IMAP search (`GET /v1/mail/search`).
+  Future<List<MailMessageInfo>> mailSearch({
+    String? account,
+    String folder = 'INBOX',
+    required String query,
+    int limit = 25,
+  }) async {
+    final q = query.trim();
+    if (q.isEmpty || q.runes.length > 256) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Enter a search query of 1–256 characters.',
+      );
+    }
+    final a = account?.trim();
+    final f = folder.trim().isEmpty ? 'INBOX' : folder.trim();
+    final json = await _request(
+      'GET',
+      ['v1', 'mail', 'search'],
+      query: {
+        if (a != null && a.isNotEmpty) 'account': a,
+        'folder': f,
+        'q': q,
+        'limit': '${limit.clamp(1, 100)}',
+      },
+    );
+    final list = json['messages'] ?? json['hits'];
+    if (list is! List) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
+    return list
+        .whereType<Map<String, dynamic>>()
+        .map(MailMessageInfo.fromJson)
+        .toList();
+  }
+
+  /// Updates `\Seen` and/or `\Flagged` on one message
+  /// (`POST /v1/mail/messages/{uid}/flag`).
+  Future<void> mailFlag({
+    String? account,
+    String folder = 'INBOX',
+    required int uid,
+    bool? seen,
+    bool? flagged,
+  }) async {
+    if (uid < 1) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Invalid message UID.',
+      );
+    }
+    if (seen == null && flagged == null) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Specify seen or flagged.',
+      );
+    }
+    final a = account?.trim();
+    final f = folder.trim().isEmpty ? 'INBOX' : folder.trim();
+    await _request(
+      'POST',
+      ['v1', 'mail', 'messages', '$uid', 'flag'],
+      body: {
+        if (a != null && a.isNotEmpty) 'account': a,
+        'folder': f,
+        'seen': ?seen,
+        'flagged': ?flagged,
+      },
+    );
+  }
+
+  /// Permanently deletes one message (`DELETE /v1/mail/messages/{uid}`).
+  Future<void> mailDelete({
+    String? account,
+    String folder = 'INBOX',
+    required int uid,
+  }) async {
+    if (uid < 1) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Invalid message UID.',
+      );
+    }
+    final a = account?.trim();
+    final f = folder.trim().isEmpty ? 'INBOX' : folder.trim();
+    await _request(
+      'DELETE',
+      ['v1', 'mail', 'messages', '$uid'],
+      query: {
+        if (a != null && a.isNotEmpty) 'account': a,
+        'folder': f,
+      },
+    );
+  }
+
+  /// Sends an email (`POST /v1/mail/send`).
+  Future<void> mailSend({
+    String? account,
+    required List<String> to,
+    required String subject,
+    required String body,
+    List<String> artifactHashes = const [],
+  }) async {
+    final recipients =
+        to.map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+    if (recipients.isEmpty) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Enter at least one recipient.',
+      );
+    }
+    final cleanSubject = subject.trim();
+    if (cleanSubject.isEmpty && body.trim().isEmpty) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Enter a subject or message body.',
+      );
+    }
+    if (artifactHashes.any((h) => !validHash(h))) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Invalid artifact hash.',
+      );
+    }
+    final a = account?.trim();
+    await _request(
+      'POST',
+      ['v1', 'mail', 'send'],
+      body: {
+        if (a != null && a.isNotEmpty) 'account': a,
+        'to': recipients,
+        'subject': cleanSubject,
+        'body': body,
+        if (artifactHashes.isNotEmpty) 'artifact_hashes': artifactHashes,
+      },
+    );
+  }
+
+  /// Saves an attachment from a message into the member's Library
+  /// (`POST /v1/mail/messages/{uid}/attachments/{index}/save-to-library`).
+  Future<MailSavedAttachment> mailSaveAttachmentToLibrary({
+    String? account,
+    String folder = 'INBOX',
+    required int uid,
+    int index = 0,
+  }) async {
+    if (uid < 1 || index < 0) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Invalid message or attachment index.',
+      );
+    }
+    final a = account?.trim();
+    final f = folder.trim().isEmpty ? 'INBOX' : folder.trim();
+    final query = {
+      if (a != null && a.isNotEmpty) 'account': a,
+      'folder': f,
+    };
+    final json = await _request(
+      'POST',
+      ['v1', 'mail', 'messages', '$uid', 'attachments', '$index', 'save-to-library'],
+      query: query,
+      body: query,
+    );
+    return MailSavedAttachment.fromJson(json);
+  }
+
   /// Server events after [after] (`GET /v1/events`, Server-Sent Events). With
   /// no cursor the stream starts at the newest event (`after=latest`): current
   /// state comes from the normal loads, not from replaying retained history.

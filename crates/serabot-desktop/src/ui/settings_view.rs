@@ -1,7 +1,7 @@
 use super::*;
 
 #[component]
-pub(super) fn SettingsView(session: Signal<Session>) -> Element {
+pub(super) fn SettingsView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
     let mut confirm_sign_out = use_signal(|| false);
     let mut copied_telegram = use_signal(|| false);
     let mut voice_auto_requested = use_signal(|| false);
@@ -35,6 +35,12 @@ pub(super) fn SettingsView(session: Signal<Session>) -> Element {
     let audio_transcription = session.read().audio.transcription_model.clone();
     let audio_understanding = session.read().audio.understanding_model.clone();
     let can_admin = session.read().can_admin();
+    let mem0_available = session
+        .read()
+        .state
+        .memory_settings
+        .as_ref()
+        .is_some_and(|view| view.mem0.available);
     // Voice/OCR surface. Read-only status comes from the server; the editable
     // fields are the draft the Save button writes.
     let voice_loaded = session.read().voice.loaded;
@@ -151,7 +157,25 @@ pub(super) fn SettingsView(session: Signal<Session>) -> Element {
             WebSearchCard { session }
         }
         if sel == SettingsSection::Memory {
-            Mem0RecallCard { session }
+            MemoryView { session }
+            if mem0_available {
+                Mem0RecallCard { session }
+            }
+        }
+        if sel == SettingsSection::Integrations {
+            crate::ui_integrations::IntegrationsView { session }
+        }
+        if sel == SettingsSection::Providers {
+            ProvidersView { session, overlay }
+        }
+        if sel == SettingsSection::Vault {
+            VaultPage { session }
+        }
+        if sel == SettingsSection::Usage {
+            UsagePage { session }
+        }
+        if sel == SettingsSection::Logs {
+            crate::ui_logs::LogsView { session }
         }
         if sel == SettingsSection::LocalFolders {
             LocalFoldersCard { session }
