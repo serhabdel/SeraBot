@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:serabot_mobile/api_client.dart';
+import 'package:serabot_mobile/bot_library_models.dart';
 import 'package:serabot_mobile/models.dart';
 
 void main() {
@@ -380,6 +381,111 @@ void main() {
           ApiErrorKind.invalidResponse,
         ),
       ),
+    );
+  });
+
+  test('0.74.9 libraryDocPreview parses slides and is null on 404', () async {
+    server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final port = server!.port;
+    server!.listen((request) async {
+      final kind = request.uri.queryParameters['kind'];
+      if (request.uri.path == '/v1/library/preview-doc' && kind == 'pptx') {
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..write(jsonEncode({
+            'kind': 'pptx',
+            'slides': [
+              {'index': 1, 'title': 'Intro', 'text': 'Hello'},
+            ],
+          }));
+      } else {
+        request.response.statusCode = HttpStatus.notFound;
+      }
+      await request.response.close();
+    });
+
+    final client = ApiClient.connect('http://127.0.0.1:$port', 'd' * 32);
+    addTearDown(client.close);
+
+    final deck = await client.libraryDocPreview('a' * 64, 'pptx');
+    expect(deck!.slides.single.title, 'Intro');
+    // A server without preview-doc answers 404: null, never a throw.
+    expect(await client.libraryDocPreview('a' * 64, 'xlsx'), isNull);
+    await expectLater(
+      client.libraryDocPreview('not-a-hash', 'pptx'),
+      throwsA(
+        isA<ApiException>().having(
+          (error) => error.kind,
+          'kind',
+          ApiErrorKind.validation,
+        ),
+      ),
+    );
+    await expectLater(
+      client.libraryDocPreview('a' * 64, 'docx'),
+      throwsA(
+        isA<ApiException>().having(
+          (error) => error.kind,
+          'kind',
+          ApiErrorKind.validation,
+        ),
+      ),
+    );
+  });
+
+  test('0.74.9 libraryThumbnailBytes uses the artifact preview', () async {
+    const pngB64 =
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC';
+    server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final port = server!.port;
+    server!.listen((request) async {
+      if (request.uri.path == '/v1/artifacts/${'a' * 64}/preview') {
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..write(jsonEncode({
+            'content_type': 'image/png',
+            'image_b64': pngB64,
+          }));
+      } else if (request.uri.path == '/v1/artifacts/${'b' * 64}') {
+        // No preview for this one: the thumbnail falls back to the download.
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..add([1, 2, 3]);
+      } else {
+        request.response.statusCode = HttpStatus.notFound;
+      }
+      await request.response.close();
+    });
+
+    final client = ApiClient.connect('http://127.0.0.1:$port', 'e' * 32);
+    addTearDown(client.close);
+
+    BotLibraryItem item(String id, String filename, String mime) =>
+        BotLibraryItem.fromJson({
+          'kind': 'generated',
+          'id': id,
+          'tool': 'make_image',
+          'filename': filename,
+          'mime': mime,
+          'conversation_id': 'dir:synthetic',
+          'created_at': '2026-11-20T08:00:00Z',
+        })!;
+
+    final thumb = await client.libraryThumbnailBytes(
+      item('a' * 64, 'photo.png', 'image/png'),
+    );
+    expect(thumb, base64Decode(pngB64));
+
+    final fallback = await client.libraryThumbnailBytes(
+      item('b' * 64, 'photo.png', 'image/png'),
+    );
+    expect(fallback, [1, 2, 3]);
+
+    expect(
+      await client.libraryThumbnailBytes(
+        item('a' * 64, 'report.pdf', 'application/pdf'),
+      ),
+      isNull,
     );
   });
 }

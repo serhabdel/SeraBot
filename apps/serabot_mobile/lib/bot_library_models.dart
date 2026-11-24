@@ -1,12 +1,20 @@
 // Bot library (0.63): parsing and view rules for GET /v1/bots/{bot}/library.
 // Mirrors crates/serabot-desktop/src/bot_library.rs: the same kind filters and
 // search, grouped by date. Counts, names and dates only.
+//
+// 0.74.9: type helpers for thumbnails/viewer/doc preview (isImage, isPdf,
+// docPreviewKind, isArtifactHash) and the parsed
+// `GET /v1/library/preview-doc` body ([LibraryDocPreview]).
 
 import 'usage_insights_models.dart';
 import 'validation.dart';
 
 /// Most items the phone keeps from one library response.
 const maxLibraryItems = 3500;
+
+/// Image extensions Flutter can render from bytes (no SVG: it needs a
+/// vector renderer the app does not ship).
+const libraryImageExtensions = {'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'};
 
 /// Which items the library shows.
 enum LibraryKind {
@@ -94,6 +102,39 @@ class BotLibraryItem {
       mime.startsWith('image/') ||
       mime.startsWith('audio/') ||
       mime.startsWith('video/');
+
+  /// True for images Flutter can render from bytes. SVG is excluded: it
+  /// needs a vector renderer the app does not ship.
+  bool get isImage {
+    if (libraryImageExtensions.contains(extension)) {
+      return true;
+    }
+    return mime.startsWith('image/') && extension != 'svg';
+  }
+
+  bool get isPdf => extension == 'pdf';
+
+  /// `'pptx'` or `'xlsx'` when the file is one the doc-preview endpoint
+  /// covers, otherwise null.
+  String? get docPreviewKind {
+    final ext = extension;
+    return ext == 'pptx' || ext == 'xlsx' ? ext : null;
+  }
+
+  /// True when [id] is a 64-hex artifact hash (generated items). Uploaded
+  /// items carry an attachment id instead, which the artifact endpoints
+  /// (preview, preview-doc, download by hash) do not accept.
+  bool get isArtifactHash => RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(id);
+
+  /// File name for a download/share. Never empty.
+  String get downloadName {
+    final name = filename?.trim();
+    if (name != null && name.isNotEmpty) {
+      return name;
+    }
+    final shown = label.trim();
+    return shown.isNotEmpty ? shown : 'file';
+  }
 
   /// "pptx", "pdf" and so on, for the type chip. Empty when unknown.
   String get extension {
@@ -220,4 +261,118 @@ DateTime? _utcDay(String day) {
     return null;
   }
   return DateTime.utc(year, month, date);
+}
+
+/// One slide of a PPTX doc preview (`GET /v1/library/preview-doc`, 0.74.9).
+class LibraryDocSlide {
+  const LibraryDocSlide({
+    required this.index,
+    required this.title,
+    required this.text,
+  });
+
+  final int index;
+  final String title;
+  final String text;
+}
+
+/// One sheet of an XLSX doc preview. Rows are raw cell strings; the first
+/// row is the header when the server sent one.
+class LibraryDocSheet {
+  const LibraryDocSheet({required this.name, required this.rows});
+
+  final String name;
+  final List<List<String>> rows;
+}
+
+/// Parsed `GET /v1/library/preview-doc?hash=...&kind=pptx|xlsx` body:
+/// `{kind: 'pptx', slides: [{index, title, text}]}` or
+/// `{kind: 'xlsx', sheets: [{name, rows: [[cell, ...]]}]}`.
+///
+/// Parsing is defensive and bounded: a wrong `kind` reads as null, bad rows
+/// are skipped, and slides/rows/cells are capped, so one odd body never
+/// crashes the preview sheet.
+class LibraryDocPreview {
+  const LibraryDocPreview({
+    required this.kind,
+    this.slides = const [],
+    this.sheets = const [],
+  });
+
+  static const maxSlides = 200;
+  static const maxSheets = 50;
+  static const maxRows = 200;
+  static const maxCells = 50;
+
+  final String kind;
+  final List<LibraryDocSlide> slides;
+  final List<LibraryDocSheet> sheets;
+
+  static LibraryDocPreview? fromJson(Map<String, dynamic> json) {
+    final kind = insightText(json['kind'], 16);
+    if (kind != 'pptx' && kind != 'xlsx') {
+      return null;
+    }
+    final slides = <LibraryDocSlide>[];
+    if (kind == 'pptx' && json['slides'] is List) {
+      var position = 0;
+      for (final row in (json['slides'] as List).take(maxSlides)) {
+        position++;
+        if (row is! Map<String, dynamic>) {
+          continue;
+        }
+        final index = row['index'];
+        final title = insightText(row['title'], 500);
+        final text = insightText(row['text'], 4000);
+        if (title.isEmpty && text.isEmpty) {
+          continue;
+        }
+        slides.add(
+          LibraryDocSlide(
+            index: index is num && index.isFinite ? index.toInt() : position,
+            title: title,
+            text: text,
+          ),
+        );
+      }
+    }
+    final sheets = <LibraryDocSheet>[];
+    if (kind == 'xlsx' && json['sheets'] is List) {
+      var position = 0;
+      for (final row in (json['sheets'] as List).take(maxSheets)) {
+        position++;
+        if (row is! Map<String, dynamic>) {
+          continue;
+        }
+        final name =
+            insightOptText(row['name'], 200) ?? 'Sheet $position';
+        final rows = <List<String>>[];
+        if (row['rows'] is List) {
+          for (final cells in (row['rows'] as List).take(maxRows)) {
+            if (cells is! List) {
+              continue;
+            }
+            rows.add([
+              for (final cell in cells.take(maxCells)) _docCell(cell),
+            ]);
+          }
+        }
+        if (rows.isEmpty) {
+          continue;
+        }
+        sheets.add(LibraryDocSheet(name: name, rows: rows));
+      }
+    }
+    return LibraryDocPreview(kind: kind, slides: slides, sheets: sheets);
+  }
+
+  static String _docCell(Object? cell) {
+    if (cell is String) {
+      return insightText(cell, 1000);
+    }
+    if (cell is num || cell is bool) {
+      return cell.toString();
+    }
+    return '';
+  }
 }

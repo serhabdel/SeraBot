@@ -378,6 +378,7 @@ class _BotSettingsScreenState extends State<BotSettingsScreen> {
                             app: widget.app,
                             botId: d.id,
                             botName: d.displayName,
+                            device: widget.device,
                           ),
                         ),
                       ),

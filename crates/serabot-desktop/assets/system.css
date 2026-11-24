@@ -1277,6 +1277,241 @@ html[data-reduce-transparency="true"] .sheet.sheet-palette {
   display: contents;
 }
 
+/* Library grid view (0.74.9). */
+.library-toolbar .library-view-toggle {
+  flex: none;
+}
+
+.library-grid-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.library-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 10px;
+  padding: 2px 0 8px;
+}
+
+.library-card {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+}
+
+.library-card-media {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  background: var(--surface-2);
+  cursor: pointer;
+}
+
+.library-card-media:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.library-card-thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.library-card-ext {
+  width: 56px;
+  height: 40px;
+  font-size: var(--fs-body-2);
+}
+
+.library-card-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding: 8px 10px 4px;
+}
+
+.library-card-name {
+  font-weight: 600;
+}
+
+.library-card-actions {
+  display: flex;
+  gap: 6px;
+  padding: 4px 10px 10px;
+}
+
+/* Library item dialog: wide form for previews (0.74.9). */
+.library-dialog.wide {
+  width: min(680px, calc(100vw - 32px));
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+}
+
+.library-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--hairline);
+}
+
+.library-preview-head {
+  margin: 0;
+  color: var(--label-2);
+  font-size: var(--fs-body-2);
+  font-weight: 600;
+}
+
+.library-preview-text {
+  max-height: 320px;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  font-size: var(--fs-body-2);
+}
+
+.library-dialog-image {
+  width: 100%;
+  max-height: 320px;
+  object-fit: contain;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+}
+
+.library-slide {
+  padding: 8px 10px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+}
+
+.library-slide-head {
+  margin: 0 0 4px;
+  font-size: var(--fs-body-2);
+  font-weight: 600;
+}
+
+.library-slide-text {
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  font-size: var(--fs-body-2);
+}
+
+.library-sheet-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.library-preview-table-wrap {
+  max-height: 320px;
+  overflow: auto;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+}
+
+.library-sheet-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-caption);
+}
+
+.library-sheet-table td {
+  max-width: 220px;
+  padding: 4px 6px;
+  overflow: hidden;
+  border-bottom: 1px solid var(--hairline);
+  overflow-wrap: anywhere;
+  text-align: left;
+  vertical-align: top;
+}
+
+/* Full image viewer overlay (0.74.9). */
+.library-viewer-scrim {
+  z-index: 69;
+}
+
+.library-viewer {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  z-index: 70;
+  display: flex;
+  flex-direction: column;
+  width: min(960px, calc(100vw - 32px));
+  height: min(720px, calc(100vh - 32px));
+  overflow: hidden;
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-2);
+  translate: -50% -50%;
+}
+
+.library-viewer-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 14px 8px;
+}
+
+.library-viewer-title {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.library-viewer-title h3 {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: var(--fs-title);
+}
+
+.library-viewer-stage {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+  overflow: auto;
+  background: var(--surface-2);
+}
+
+.library-viewer-img {
+  max-width: none;
+  transform-origin: center center;
+}
+
+.library-viewer-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--hairline);
+}
+
+.library-viewer-zoom {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
 /* 0.73: context meter in the model bar (turn.context). */
 .ctx-meter {
   width: 72px;

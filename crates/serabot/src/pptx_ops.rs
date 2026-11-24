@@ -524,6 +524,96 @@ pub fn slide_plain_text(bytes: &[u8], max_chars: usize) -> Result<String> {
     Ok(out)
 }
 
+/// One slide's title and text for a read-only preview.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PptxSlideText {
+    /// 1-based slide number.
+    pub slide: usize,
+    /// The title placeholder's text, or the first non-empty text line.
+    pub title: String,
+    /// Shape and table text plus speaker notes, control characters stripped.
+    /// Capped at `max_chars_per_slide` by [`slide_preview`].
+    pub text: String,
+    /// True when `text` was capped.
+    pub truncated: bool,
+}
+
+/// A bounded per-slide text preview of a package.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PptxTextPreview {
+    /// Total slides in the package; `slides` is capped at `max_slides`.
+    pub slide_count: usize,
+    pub slides: Vec<PptxSlideText>,
+    /// True when the slide list was capped.
+    pub truncated: bool,
+}
+
+/// Per-slide title + text for a read-only preview.
+///
+/// Reuses the [`open`] preflight (32 MiB, 500 slides, no macros, no
+/// encryption), so a hostile package is rejected before parsing. The text is
+/// the owner's own file content, returned as data: control characters are
+/// stripped and the caller caps the length, exactly as the artifact preview
+/// does — it is never executed, rendered as HTML, or passed to the model.
+pub fn slide_preview(
+    bytes: &[u8],
+    max_slides: usize,
+    max_chars_per_slide: usize,
+) -> Result<PptxTextPreview> {
+    let presentation = open(bytes)?;
+    let slide_count = presentation.slides.len();
+    let mut slides = Vec::with_capacity(slide_count.min(max_slides));
+    for (index, slide) in presentation.slides.iter().take(max_slides).enumerate() {
+        let mut parts: Vec<String> = Vec::new();
+        walk(&slide.shapes, &mut |shape, _| {
+            if let Some(body) = &shape.text {
+                let text = body.text();
+                if !text.trim().is_empty() {
+                    parts.push(text.trim().to_owned());
+                }
+            }
+            if let ShapeKind::Table(table) = &shape.kind {
+                for row in &table.rows {
+                    let cells: Vec<String> = row
+                        .cells
+                        .iter()
+                        .map(|cell| cell.text.text().trim().to_owned())
+                        .filter(|cell| !cell.is_empty())
+                        .collect();
+                    if !cells.is_empty() {
+                        parts.push(cells.join(" | "));
+                    }
+                }
+            }
+        });
+        let mut text = parts.join("\n");
+        let notes = slide.notes.text();
+        if !notes.trim().is_empty() {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&format!("speaker notes:\n{}", notes.trim()));
+        }
+        let text: String = text
+            .chars()
+            .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+            .collect();
+        let truncated = text.chars().count() > max_chars_per_slide;
+        let text = truncate_chars(&text, max_chars_per_slide);
+        slides.push(PptxSlideText {
+            slide: index + 1,
+            title: slide_title(slide),
+            text,
+            truncated,
+        });
+    }
+    Ok(PptxTextPreview {
+        slide_count,
+        truncated: slide_count > slides.len(),
+        slides,
+    })
+}
+
 /// Human-readable summary.
 ///
 /// This is the text the model actually reads, so it carries the shape indices
