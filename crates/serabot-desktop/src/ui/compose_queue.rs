@@ -87,6 +87,15 @@ pub(crate) fn QueuePanel(session: Signal<Session>) -> Element {
                                     if let Some(bot) = item.target.as_deref() {
                                         span { class: "chip muted queue-target", "to @{bot}" }
                                     }
+                                    if !item.attachments.is_empty() {
+                                        span { class: "chip muted queue-target",
+                                            if item.attachments.len() == 1 {
+                                                "1 file"
+                                            } else {
+                                                "{item.attachments.len()} files"
+                                            }
+                                        }
+                                    }
                                     if item.steer {
                                         span { class: "chip accent queue-target", "next" }
                                     }

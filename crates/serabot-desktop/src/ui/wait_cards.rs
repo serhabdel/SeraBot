@@ -41,8 +41,14 @@ pub enum LiveCardData {
     /// your reply…" with "Drafting from N steps".
     Writing { bot: String, steps: usize },
     /// Another bot is working in this conversation: "Handed off to {bot}"
-    /// with "Running in Runs — tap to open". No objective.
-    Delegating { bot: String },
+    /// with "Running in Runs — tap to open". No objective. `count` is how
+    /// many parallel handoffs are running; the card names the first and
+    /// counts the rest.
+    Delegating { bot: String, count: usize },
+    /// The turn parked with an uncertain effect (0.74.10): the owner reviews
+    /// it before anything is retried. No retry, no approve: only a way to
+    /// open Runs and check what happened.
+    NeedsReview,
     /// The turn is parked waiting for a model: the existing wait line with
     /// its countdown, plus a reason chip when the last switch gave one.
     WaitingModel {
@@ -74,6 +80,11 @@ pub struct LiveCardInputs<'a> {
     pub failover: Option<(&'a str, &'a str)>,
     /// Display name of another bot working in this conversation, if any.
     pub delegate_bot: Option<&'a str>,
+    /// How many parallel handoffs are running (1 when only one is).
+    pub delegate_count: usize,
+    /// The turn parked with an uncertain effect: it needs the owner's
+    /// review, never an automatic retry.
+    pub needs_review: bool,
     /// The reply is already streaming (a live assistant message exists).
     pub streaming_reply: bool,
     /// The turn failed.
@@ -82,9 +93,9 @@ pub struct LiveCardInputs<'a> {
 }
 
 /// Derive the one live card from the live turn (0.74.3). Priority, so two
-/// states never show at once: Failed, Approval, Waiting for a model,
-/// Failover, Delegating, the running step (Thinking or Using tool), Writing,
-/// then Thinking while nothing has started yet.
+/// states never show at once: Failed, Needs review, Approval, Waiting for a
+/// model, Failover, Delegating, the running step (Thinking or Using tool),
+/// Writing, then Thinking while nothing has started yet.
 pub fn derive_live_card(inputs: LiveCardInputs<'_>) -> LiveCardData {
     let activity = inputs.activity;
     let now = inputs.now;
@@ -93,6 +104,9 @@ pub fn derive_live_card(inputs: LiveCardInputs<'_>) -> LiveCardData {
             elapsed: activity.completed_elapsed_ms(now).map(format_duration),
             done: activity.done_count(),
         };
+    }
+    if inputs.needs_review {
+        return LiveCardData::NeedsReview;
     }
     if let Some(step) = activity.waiting() {
         return LiveCardData::Approval {
@@ -115,6 +129,7 @@ pub fn derive_live_card(inputs: LiveCardInputs<'_>) -> LiveCardData {
     if let Some(bot) = inputs.delegate_bot {
         return LiveCardData::Delegating {
             bot: bot.to_owned(),
+            count: inputs.delegate_count.max(1),
         };
     }
     if let Some(step) = activity.running_step() {
@@ -238,10 +253,16 @@ pub(crate) fn LiveCard(
                 }
             }
         },
-        LiveCardData::Delegating { bot } => rsx! {
+        LiveCardData::Delegating { bot, count } => rsx! {
             div { class: "live-card", role: "status", "aria-live": "polite",
                 span { class: "live-dot", "aria-hidden": "true" }
-                span { class: "live-text", "Handed off to {bot}" }
+                span { class: "live-text",
+                    if count > 1 {
+                        "Handed off to {bot} and {count - 1} more"
+                    } else {
+                        "Handed off to {bot}"
+                    }
+                }
                 button {
                     class: "btn ghost sm",
                     r#type: "button",
@@ -249,6 +270,21 @@ pub(crate) fn LiveCard(
                         let _ = dioxus::document::eval(RUNS_OPEN_JS);
                     },
                     "Running in Runs \u{2014} tap to open"
+                }
+            }
+        },
+        LiveCardData::NeedsReview => rsx! {
+            div { class: "live-card", role: "status", "aria-live": "polite",
+                span { class: "live-dot", "aria-hidden": "true" }
+                span { class: "live-text", "Needs your review" }
+                span { class: "live-sub", "Something may already have happened \u{2014} check the result before trying again." }
+                button {
+                    class: "btn ghost sm",
+                    r#type: "button",
+                    onclick: move |_| {
+                        let _ = dioxus::document::eval(RUNS_OPEN_JS);
+                    },
+                    "Open Runs"
                 }
             }
         },
@@ -461,6 +497,8 @@ mod tests {
             waiting_reason: None,
             failover: None,
             delegate_bot: None,
+            delegate_count: 0,
+            needs_review: false,
             streaming_reply: false,
             failed: false,
             now,
@@ -567,7 +605,26 @@ mod tests {
         with_delegate.delegate_bot = Some("Analyst");
         assert!(matches!(
             derive_live_card(with_delegate),
-            LiveCardData::Delegating { bot } if bot == "Analyst"
+            LiveCardData::Delegating { bot, count } if bot == "Analyst" && count == 1
+        ));
+        // Parallel handoffs count: the card names the first and counts the rest.
+        let mut with_parallel = inputs(&activity, Instant::now());
+        with_parallel.delegate_bot = Some("Analyst");
+        with_parallel.delegate_count = 3;
+        assert!(matches!(
+            derive_live_card(with_parallel),
+            LiveCardData::Delegating { bot, count } if bot == "Analyst" && count == 3
+        ));
+    }
+
+    #[test]
+    fn needs_review_beats_the_running_step_and_offers_no_retry() {
+        let activity = activity_with(&[("c1", "running", "Searching the web")]);
+        let mut with_review = inputs(&activity, Instant::now());
+        with_review.needs_review = true;
+        assert!(matches!(
+            derive_live_card(with_review),
+            LiveCardData::NeedsReview
         ));
     }
 

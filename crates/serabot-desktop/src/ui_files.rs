@@ -43,6 +43,8 @@ if (!window.__serabotPasteBridge) {
   document.addEventListener('paste', async (event) => {
     const target = event.target;
     if (!target || target.id !== 'composer-input') return;
+    // A chat that does not accept turns takes no files either.
+    if (target.disabled) return;
     const files = Array.from((event.clipboardData && event.clipboardData.files) || []);
     if (files.length === 0) return;
     event.preventDefault();
@@ -72,12 +74,54 @@ if (!window.__serabotPasteBridge) {
     setDropActive(false);
     const files = Array.from((event.dataTransfer && event.dataTransfer.files) || []);
     if (files.length === 0) return;
-    if (!document.getElementById('composer-input')) return;
+    const input = document.getElementById('composer-input');
+    if (!input || input.disabled) return;
     event.preventDefault();
     await forwardFiles(files);
   });
 }
 "#;
+
+/// Ticks once a second while a voice note records, so the composer can show
+/// the elapsed time. The interval only exists between the start/stop calls:
+/// `window.__serabotStartRecordTick` arms it, `window.__serabotStopRecordTick`
+/// clears it. Installed once per page; the Rust side reads the ticks from the
+/// same eval channel.
+pub const RECORD_TICK_JS: &str = r#"
+(function () {
+  if (window.__serabotRecordTick) return;
+  window.__serabotRecordTick = true;
+  // This eval's own channel: never touch `window.__serabotDx`, which
+  // belongs to the paste bridge's eval.
+  const dx = dioxus;
+  window.__serabotRecordTimer = null;
+  window.__serabotStartRecordTick = () => {
+    if (window.__serabotRecordTimer) return;
+    window.__serabotRecordTimer = setInterval(() => dx.send(true), 1000);
+  };
+  window.__serabotStopRecordTick = () => {
+    if (window.__serabotRecordTimer) {
+      clearInterval(window.__serabotRecordTimer);
+      window.__serabotRecordTimer = null;
+    }
+  };
+})();
+"#;
+
+const RECORD_TICK_START_JS: &str =
+    "if (window.__serabotStartRecordTick) window.__serabotStartRecordTick();";
+const RECORD_TICK_STOP_JS: &str =
+    "if (window.__serabotStopRecordTick) window.__serabotStopRecordTick();";
+
+/// Start the one-second recording ticker (no-op when the bridge is absent).
+pub fn record_tick_start_script() -> &'static str {
+    RECORD_TICK_START_JS
+}
+
+/// Stop the one-second recording ticker (no-op when the bridge is absent).
+pub fn record_tick_stop_script() -> &'static str {
+    RECORD_TICK_STOP_JS
+}
 
 /// Remembers the composer caret across streaming repaints.
 /// Save the composer's caret before a repaint, so it can be put back after.
@@ -110,6 +154,26 @@ pub const COMPOSER_CARET_SETUP_JS: &str = r#"
       window.__serabotComposerGen = (window.__serabotComposerGen || 0) + 1;
     }
   }, true);
+  // Auto-grow fallback for engines without `field-sizing: content`: size the
+  // box from its content, capped by the CSS max-height. Chromium grows it
+  // natively and this listener is a no-op there.
+  const autogrowSupported = typeof CSS !== 'undefined'
+    && CSS.supports
+    && CSS.supports('field-sizing', 'content');
+  if (!autogrowSupported) {
+    const resize = () => {
+      const el = document.getElementById('composer-input');
+      if (!el) return;
+      el.style.height = 'auto';
+      el.style.height = el.scrollHeight + 'px';
+    };
+    document.addEventListener('input', (e) => {
+      if (e.target && e.target.id === 'composer-input') resize();
+    }, true);
+    document.addEventListener('focusin', (e) => {
+      if (e.target && e.target.id === 'composer-input') resize();
+    });
+  }
 })();
 "#;
 
@@ -1407,5 +1471,27 @@ mod tests {
             data: "!!!".into(),
         });
         assert!(bad.1.is_empty());
+    }
+
+    #[test]
+    fn paste_and_drop_are_gated_on_a_composer_that_accepts_turns() {
+        // A disabled composer (a node that does not accept turns) takes no
+        // pasted or dropped files.
+        assert!(PASTE_BRIDGE_JS.contains("if (target.disabled) return;"));
+        assert!(PASTE_BRIDGE_JS.contains("if (!input || input.disabled) return;"));
+        // Oversized files are still refused before their bytes are read.
+        assert!(PASTE_BRIDGE_JS.contains("file.size > 25 * 1024 * 1024"));
+    }
+
+    #[test]
+    fn recording_ticker_keeps_its_own_channel_and_caret_setup_grows_without_field_sizing() {
+        // The ticker must not overwrite the paste bridge's channel.
+        assert!(RECORD_TICK_JS.contains("const dx = dioxus;"));
+        assert!(!RECORD_TICK_JS.contains("window.__serabotDx = dioxus;"));
+        assert!(RECORD_TICK_JS.contains("setInterval(() => dx.send(true), 1000)"));
+        assert!(RECORD_TICK_JS.contains("clearInterval(window.__serabotRecordTimer)"));
+        // The auto-grow fallback only runs where `field-sizing` is missing.
+        assert!(COMPOSER_CARET_SETUP_JS.contains("CSS.supports('field-sizing', 'content')"));
+        assert!(COMPOSER_CARET_SETUP_JS.contains("el.style.height = el.scrollHeight + 'px'"));
     }
 }

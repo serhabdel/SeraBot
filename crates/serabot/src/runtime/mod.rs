@@ -176,6 +176,23 @@ struct TurnState {
     /// Seconds this turn has spent parked in `waiting_model`.
     #[serde(default)]
     waited_secs: u64,
+    /// Effectful tool calls that already ran, with their stored outcome: a
+    /// retried turn replays the stored result instead of repeating the effect.
+    #[serde(default)]
+    completed_effects: Vec<CompletedEffect>,
+    /// One short line per tool step this turn ran, for the persisted digest.
+    #[serde(default)]
+    tool_digest: Vec<String>,
+}
+
+/// One effectful tool call whose outcome is already stored, so a retried turn
+/// can skip it without repeating the effect.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompletedEffect {
+    call_id: String,
+    tool: String,
+    content: String,
+    is_error: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -581,11 +598,24 @@ fn watch_run_is_silent(silent_when_empty: bool, reports: &[crate::watcher::Watch
 
 /// Rough prompt-size estimate recorded on `model.used` audit rows: the summed
 /// content chars of the messages sent this round, divided by 4, rounded up.
+/// Tool-call arguments and signed reasoning count too (a call with a huge
+/// argument list is a huge prompt), and each inline image carries a flat
+/// allowance: the provider charges vision tokens the text never shows.
 /// Pure metadata; it never changes routing or payloads.
 pub(crate) fn estimate_prompt_chars(messages: &[LlmMessage]) -> usize {
+    const IMAGE_TOKENS_EST: usize = 1_000;
     let chars: usize = messages
         .iter()
-        .map(|message| message.content.as_deref().map_or(0, str::len))
+        .map(|message| {
+            let mut chars = message.content.as_deref().map_or(0, str::len);
+            for call in &message.tool_calls {
+                chars += call.name.len();
+                chars += serde_json::to_string(&call.arguments).map_or(0, |text| text.len());
+                chars += call.reasoning_signature.as_deref().map_or(0, str::len);
+            }
+            chars += message.images.len() * IMAGE_TOKENS_EST * 4;
+            chars
+        })
         .sum();
     chars.div_ceil(4)
 }

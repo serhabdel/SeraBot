@@ -1697,6 +1697,10 @@ pub struct RuntimeConfig {
     pub worker_poll_ms: u64,
     #[serde(default = "default_history_limit")]
     pub history_limit: usize,
+    /// Most history characters a turn loads, on top of `history_limit`: a
+    /// few very long messages must not crowd out the whole transcript.
+    #[serde(default = "default_history_max_chars")]
+    pub history_max_chars: usize,
     #[serde(default)]
     pub owner_standing_consent: bool,
 }
@@ -1714,6 +1718,7 @@ impl Default for RuntimeConfig {
             turn_max_secs: default_turn_max_secs(),
             worker_poll_ms: default_poll(),
             history_limit: default_history_limit(),
+            history_max_chars: default_history_max_chars(),
             owner_standing_consent: false,
         }
     }
@@ -3147,6 +3152,9 @@ fn default_poll() -> u64 {
 }
 fn default_history_limit() -> usize {
     50
+}
+fn default_history_max_chars() -> usize {
+    60_000
 }
 fn default_tick() -> u64 {
     30

@@ -607,6 +607,17 @@ impl Gateway {
                 .await;
         }
 
+        // 0.74.10: an outbound effect on the direct path flags the task
+        // uncertain before it goes out, exactly like the approved path: a
+        // crash or a lost lease before the outcome is stored must route the
+        // task to needs_review instead of silently requeueing it.
+        let effectful = own_chat || tool.spec().destructive();
+        if effectful
+            && let Some(task_id) = context.task_id.as_deref()
+            && let Err(error) = self.store.mark_task_uncertain(&context.user_id, task_id)
+        {
+            return Err(error);
+        }
         let started = std::time::Instant::now();
         let (output, listed) = run_tool_call(tool.as_ref(), args, context).await;
         let output = self.redact_output(context, output);
@@ -622,6 +633,20 @@ impl Gateway {
                 %error,
                 "gateway tool failed"
             );
+        }
+        // The outcome is known (or known not to have been sent), so a retry
+        // can no longer repeat the effect. An ambiguous outcome keeps the
+        // flag and the task is never replayed.
+        let known_outcome = match &output {
+            Ok(_) => true,
+            Err(error) => !is_ambiguous(error),
+        };
+        if effectful
+            && known_outcome
+            && let Some(task_id) = context.task_id.as_deref()
+            && let Err(error) = self.store.clear_task_uncertain(&context.user_id, task_id)
+        {
+            warn!(%error, "task uncertainty flag was not cleared");
         }
         self.finish_tool_call(tool.as_ref(), &output, &listed, context, started.elapsed())?;
         output.map(ToolOutcome::Completed)
@@ -823,9 +848,30 @@ impl Gateway {
             tool = %tool.spec().name,
             "gateway tool dispatch"
         );
+        // A standing grant runs without a fresh approval, so the uncertain
+        // flag is the only thing keeping a destructive dispatch from being
+        // replayed after a crash: same rule as the approved path.
+        let effectful = tool.spec().destructive();
+        if effectful
+            && let Some(task_id) = context.task_id.as_deref()
+            && let Err(error) = self.store.mark_task_uncertain(&context.user_id, task_id)
+        {
+            return Err(error);
+        }
         let started = std::time::Instant::now();
         let (output, listed) = run_tool_call(tool, args, context).await;
         let output = self.redact_output(context, output);
+        let known_outcome = match &output {
+            Ok(_) => true,
+            Err(error) => !is_ambiguous(error),
+        };
+        if effectful
+            && known_outcome
+            && let Some(task_id) = context.task_id.as_deref()
+            && let Err(error) = self.store.clear_task_uncertain(&context.user_id, task_id)
+        {
+            warn!(%error, "task uncertainty flag was not cleared");
+        }
         self.finish_tool_call(tool, &output, &listed, context, started.elapsed())?;
         output.map(ToolOutcome::Completed)
     }
@@ -1580,6 +1626,106 @@ mod tests {
             .unwrap();
         assert!(matches!(outcome, ToolOutcome::PendingApproval { .. }));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A stand-in for `telegram_send_document` that records whether its task
+    /// was flagged uncertain while it ran.
+    struct FakeOwnChatProbe {
+        store: Store,
+        user: String,
+        task_id: String,
+        seen: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Tool for FakeOwnChatProbe {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "telegram_send_document".into(),
+                description: "fake own-chat delivery".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                external_effect: true,
+            }
+        }
+
+        async fn execute(&self, _args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+            if self
+                .store
+                .get_task(&self.user, &self.task_id)
+                .map(|task| task.uncertain)
+                .unwrap_or(false)
+            {
+                self.seen.store(true, Ordering::SeqCst);
+            }
+            Ok(ToolOutput {
+                content: "delivered".into(),
+                ..ToolOutput::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_direct_own_chat_dispatch_flags_its_task_and_clears_it() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let task = store
+            .enqueue_task(
+                &admin,
+                "turn",
+                "main",
+                &serde_json::json!({"conversation_id": "owner", "text": "hi", "bot": "main"}),
+                0,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'running' WHERE id = ?1",
+                rusqlite::params![task.id],
+            )
+            .unwrap();
+        let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(FakeOwnChatProbe {
+                store: store.clone(),
+                user: admin.clone(),
+                task_id: task.id.clone(),
+                seen: seen.clone(),
+            })
+            .unwrap();
+        let gateway = Gateway::new(
+            store.clone(),
+            Arc::new(Policy::from_text("TopSecret")),
+            registry,
+            1,
+            false,
+        );
+        let context = ToolContext {
+            user_id: admin.clone(),
+            actor: admin.clone(),
+            bot: "main".into(),
+            task_id: Some(task.id.clone()),
+            turn_id: None,
+            conversation_id: None,
+            allowed_tools: ["telegram_send_document".to_string()].into_iter().collect(),
+            require_approval: HashSet::new(),
+        };
+        let outcome = gateway
+            .execute("telegram_send_document", serde_json::json!({}), &context)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ToolOutcome::Completed(_)));
+        assert!(
+            seen.load(Ordering::SeqCst),
+            "the direct path must flag the task before the effect"
+        );
+        assert!(
+            !store.get_task(&admin, &task.id).unwrap().uncertain,
+            "a known outcome clears the flag"
+        );
     }
 
     #[tokio::test]

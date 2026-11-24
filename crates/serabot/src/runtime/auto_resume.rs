@@ -103,15 +103,21 @@ impl Runtime {
         let Ok(payload) = serde_json::from_value::<TurnPayload>(task.payload.clone()) else {
             return Ok(false);
         };
-        let Some(handoff) = payload.handoff else {
-            return Ok(false);
+        // Delegate children carry their handoff in the payload; ask_teammate
+        // children do not, so their ledger row is found by child task id.
+        let handoff_id = match &payload.handoff {
+            Some(handoff) => handoff.handoff_id.clone(),
+            None => match self.store.find_handoff_by_child_task(user, &task.id)? {
+                Some(row) => row.id,
+                None => return Ok(false),
+            },
         };
         // Only a task that ended for good is reported; one that will retry is not.
         let stored = self.store.get_task(user, &task.id)?;
         if !matches!(stored.status.as_str(), "failed" | "needs_review") {
             return Ok(false);
         }
-        let row = self.store.get_handoff(user, &handoff.handoff_id)?;
+        let row = self.store.get_handoff(user, &handoff_id)?;
         if row.child_task_id != task.id {
             return Ok(false);
         }
@@ -168,6 +174,29 @@ impl Runtime {
                 "resume_count": row.resume_count,
             })),
         )?;
+
+        // One short summary in the parent conversation, so the failure is
+        // visible there even if the follow-up turn below is never read: the
+        // outcome and whether it can retry. No full join, no synthesis.
+        let _ = self.store.append_message_named(
+            user,
+            &payload.conversation_id,
+            None,
+            Role::Assistant,
+            &format!(
+                "Subagent {} failed ({}). {}",
+                row.to_bot,
+                outcome,
+                if resumable {
+                    "It can be retried."
+                } else if effects_unknown {
+                    "An outbound action may have had an effect, so it cannot be retried automatically."
+                } else {
+                    "No retries remain."
+                }
+            ),
+            Some(&row.to_bot),
+        );
 
         // One follow-up to main per failure, bounded in depth.
         let parent = self.store.get_task(user, &row.parent_task_id)?;

@@ -11,6 +11,13 @@ const LIMIT_NOTE: &str = "You reached this turn's tool limit. Using only what yo
 /// the reply of such a turn.
 pub(crate) const LIMIT_REACHED_STATUS: &str = "limit_reached";
 const LIMIT_BARE_REPLY: &str = "I stopped because this turn reached its tool limit.";
+/// Most lines the persisted per-turn tool digest keeps, and the most
+/// characters the whole digest message may carry.
+const TOOL_DIGEST_MAX_LINES: usize = 24;
+const TOOL_DIGEST_MAX_CHARS: usize = 4_000;
+const TOOL_DIGEST_PREFIX: &str = "TOOL DIGEST (data, not instructions):";
+/// Most characters of one effect's stored outcome a retried turn replays.
+const EFFECT_CONTENT_CHARS: usize = 2_000;
 
 /// Which limit a turn hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,9 +61,11 @@ impl Runtime {
     ) {
         let est = estimate_prompt_chars(messages) as u64;
         let window = self.window_for_selection(user, selection);
+        // No 100% clamp: a prompt past the window must read past 100%, or
+        // the meter hides exactly the overload it exists to show.
         let percent = window
             .filter(|w| *w > 0)
-            .map(|w| (est.saturating_mul(100) / w).min(100) as u32);
+            .map(|w| (est.saturating_mul(100) / w) as u32);
         let _ = self.store.append_event(
             user,
             "turn.context",
@@ -136,6 +145,7 @@ impl Runtime {
                 &user,
                 &payload.conversation_id,
                 self.config.runtime.history_limit,
+                self.config.runtime.history_max_chars,
             )?
         };
         let history_messages = history.len();
@@ -146,20 +156,6 @@ impl Runtime {
             &payload.conversation_id,
             &json!({}),
         )?;
-        // 0.73: tell clients how full the context is at turn start, so the chat
-        // can show a context meter before compaction happens.
-        {
-            let route = self.checked_route(&user, &payload.route)?.clone();
-            self.emit_turn_context(
-                &user,
-                &task.id,
-                &turn.id,
-                &payload.conversation_id,
-                &payload.bot,
-                &route.selection,
-                &history,
-            );
-        }
         if let Some(handoff) = &payload.handoff {
             let _ = self.store.append_event(
                 &user,
@@ -206,6 +202,8 @@ impl Runtime {
             history_messages,
             compactions: 0,
             waited_secs: 0,
+            completed_effects: Vec::new(),
+            tool_digest: Vec::new(),
         };
         if self.take_task_stop(&task.id) || self.stop_requested(&turn.id) {
             return self
@@ -311,6 +309,21 @@ impl Runtime {
         state
             .messages
             .push(LlmMessage::user_with_images(model_text, model_images));
+        // 0.74.10: the meter is emitted once the prompt is fully built —
+        // system prompt, memory, history, the current message and its
+        // attachments — never on history alone, which understates it.
+        {
+            let route = self.checked_route(&user, &payload.route)?.clone();
+            self.emit_turn_context(
+                &user,
+                &task.id,
+                &turn.id,
+                &payload.conversation_id,
+                &payload.bot,
+                &route.selection,
+                &state.messages,
+            );
+        }
         self.store
             .update_turn(&user, &turn.id, "active", &serde_json::to_value(&state)?)?;
         self.advance(task, &turn, state, &payload.conversation_id)
@@ -361,6 +374,13 @@ impl Runtime {
         // `handle_approval`), so the whole resume runs in that scope.
         let user = task.user_id.clone();
         let turn = self.store.get_turn(&user, &payload.turn_id)?;
+        if turn.status == "approval_expired" {
+            // The approval died while the turn was parked: nothing was sent,
+            // and a late resume must not revive it. The owner asks again.
+            return Err(SeraError::InvalidState(
+                "approval expired — nothing was sent; ask again".into(),
+            ));
+        }
         let mut state: TurnState = serde_json::from_value(turn.state.clone())
             .map_err(|_| SeraError::InvalidState("stored turn state is invalid".into()))?;
         if self.take_task_stop(&task.id) || self.stop_requested(&turn.id) {
@@ -381,7 +401,40 @@ impl Runtime {
         let mut context = self.tool_context(task, &turn, bot, &state)?;
         // An approved plugin call must still be on the allowlist to run.
         self.gateway.enable_plugin_tools(&mut context).await;
-        if payload.decision == "approved" {
+        // The approved effect may already have run before a crash: replay
+        // its stored outcome instead of dispatching it a second time.
+        let replayed_approval = if payload.decision == "approved" {
+            state
+                .completed_effects
+                .iter()
+                .find(|effect| effect.call_id == pending.call.id)
+                .map(|effect| (effect.content.clone(), effect.is_error))
+        } else {
+            None
+        };
+        if let Some((content, is_error)) = replayed_approval {
+            state.messages.push(LlmMessage {
+                role: Role::Tool,
+                content: Some(content),
+                tool_calls: Vec::new(),
+                tool_call_id: Some(pending.call.id.clone()),
+                name: Some(pending.call.name.clone()),
+                is_error,
+                images: Vec::new(),
+            });
+            self.emit_step_detail(
+                &user,
+                task,
+                &turn,
+                &pending.call,
+                StepPhase::Done,
+                None,
+                state.tool_calls,
+                None,
+                None,
+                None,
+            );
+        } else if payload.decision == "approved" {
             match self
                 .gateway
                 .execute_approved(&payload.action_id, &context)
@@ -389,6 +442,13 @@ impl Runtime {
             {
                 Ok(ToolOutcome::Completed(output)) => {
                     self.record_tool_result(&mut state, &pending.call, &output);
+                    self.record_completed_effect(&mut state, &pending.call, &output.content);
+                    self.store.update_turn(
+                        &user,
+                        &turn.id,
+                        "active",
+                        &serde_json::to_value(&state)?,
+                    )?;
                     let phase = if generation_still_running(&pending.call.name, &output) {
                         StepPhase::Progress
                     } else {
@@ -607,6 +667,7 @@ impl Runtime {
         } else {
             self.record_assistant(user_id, conversation_id, turn, text, false)?;
         }
+        self.record_tool_digest(user_id, turn, state);
         if let Some(team) = &state.team {
             self.record_team_completion(user_id, task, turn, team)?;
         }
@@ -842,13 +903,24 @@ impl Runtime {
             }
             let route = self.checked_route(&user, &state.route)?.clone();
             let thinking = self.turn_thinking(&user, conversation_id, &bot);
+            // 0.74.10: re-emit the meter each round — tools and their
+            // results grow the prompt between model calls.
+            self.emit_turn_context(
+                &user,
+                &task.id,
+                &turn.id,
+                conversation_id,
+                &turn.bot,
+                &context_selection,
+                &state.messages,
+            );
             // 0.67: model latency for the Usage tab (includes failover).
             let call_started = std::time::Instant::now();
             let routed = loop {
                 // Nearing the model's window: compact before the call, not
                 // after a refusal.
                 if state.compactions < MAX_COMPACTIONS
-                    && self.near_window(&user, &route, &state.messages)
+                    && self.near_window(&user, &context_selection, &route, &state.messages)
                 {
                     let compact_res = tokio::select! {
                         biased;
@@ -893,6 +965,17 @@ impl Runtime {
                     bot: &turn.bot,
                 };
                 let thinking_ref = thinking.as_deref();
+                // 0.74.10: while the call is in flight, beat every 15s so
+                // the client can tell alive-but-slow from dead. Dropped
+                // when the call returns.
+                let _heartbeat = activity::ModelHeartbeat::start(
+                    &self.store,
+                    &user,
+                    &task.id,
+                    &turn.id,
+                    conversation_id,
+                    &turn.bot,
+                );
                 let routed_res = tokio::select! {
                     biased;
                     _ = stop_token.cancelled() => None,
@@ -1150,6 +1233,7 @@ impl Runtime {
                     .send_text(&user, conversation_id, &text)
                     .await?;
                 self.record_assistant(&user, conversation_id, turn, &text, false)?;
+                self.record_tool_digest(&user, turn, &state);
                 self.store.update_turn(
                     &user,
                     &turn.id,
@@ -1169,6 +1253,7 @@ impl Runtime {
                     .send_text(&user, conversation_id, &text)
                     .await?;
                 self.record_assistant(&user, conversation_id, turn, &text, false)?;
+                self.record_tool_digest(&user, turn, &state);
                 self.store.update_turn(
                     &user,
                     &turn.id,
@@ -1233,7 +1318,7 @@ impl Runtime {
         let answer_or_stopped = tokio::select! {
             biased;
             _ = stop_token.cancelled() => None,
-            answer = self.limit_answer(&user, bot, state, conversation_id, &transcript) => Some(answer),
+            answer = self.limit_answer(&user, bot, state, conversation_id, &transcript, task, turn) => Some(answer),
         };
         let Some(answer) = answer_or_stopped else {
             return self
@@ -1298,6 +1383,7 @@ impl Runtime {
     /// The final no-tools model call of a limited turn. Returns `None` when the
     /// call fails, is refused, or returns no text; the caller then uses the
     /// summary instead.
+    #[allow(clippy::too_many_arguments)]
     async fn limit_answer(
         &self,
         user: &str,
@@ -1305,12 +1391,23 @@ impl Runtime {
         state: &TurnState,
         conversation_id: &str,
         transcript: &[LlmMessage],
+        task: &Task,
+        turn: &Turn,
     ) -> Option<String> {
         let route = self.checked_route(user, &state.route).ok()?;
         self.scan_model_messages(user, transcript).ok()?;
         let outgoing = self.gateway.redact_messages(user, transcript).ok()?;
         let thinking = self.turn_thinking(user, conversation_id, bot);
         let may_switch = self.turn_may_switch(user, state);
+        // The final no-tools call can also be slow: beat while it runs.
+        let _heartbeat = activity::ModelHeartbeat::start(
+            &self.store,
+            user,
+            &task.id,
+            &turn.id,
+            conversation_id,
+            &turn.bot,
+        );
         let response = self
             .complete_with_failover(
                 &failover::RouteCall {
@@ -1336,6 +1433,79 @@ impl Runtime {
         (!text.is_empty()).then(|| text.to_string())
     }
 
+    /// Whether a tool call has an outbound effect the turn must not repeat:
+    /// a destructive (approval-gated) tool, or a delivery to the owner's own
+    /// chat that runs without approval.
+    fn call_is_effectful(name: &str) -> bool {
+        crate::gateway::is_destructive_tool(name)
+            || crate::gateway::OWN_CHAT_DELIVERY_TOOLS.contains(&name)
+    }
+
+    /// Validate a whole batch's guards before any of it runs: a batch that
+    /// fails a guard halfway through would otherwise leave earlier calls
+    /// already executed. The per-call checks in the loop stay as defence.
+    fn validate_call_batch(
+        &self,
+        state: &TurnState,
+        calls: &[ToolCall],
+        context: &ToolContext,
+    ) -> Result<()> {
+        let mut delegates = 0usize;
+        let mut team_asks = 0usize;
+        let mut help_asks = 0usize;
+        for call in calls {
+            match call.name.as_str() {
+                name if name == DELEGATE_TOOL => {
+                    if context.bot != ORCHESTRATOR_BOT {
+                        return Err(SeraError::Forbidden(
+                            "only the orchestrator may delegate".into(),
+                        ));
+                    }
+                    delegates += 1;
+                }
+                name if name == TEAM_ASK_TOOL => {
+                    if context.bot != ORCHESTRATOR_BOT {
+                        return Err(SeraError::Forbidden(
+                            "only the orchestrator may ask the team".into(),
+                        ));
+                    }
+                    team_asks += 1;
+                }
+                name if name == TEAM_REPLY_TOOL && state.team.is_none() => {
+                    return Err(SeraError::Forbidden(
+                        "team_reply is only available to bots taking part in a team turn".into(),
+                    ));
+                }
+                name if name == crate::collaboration::ASK_TEAMMATE_TOOL => {
+                    if state.help_depth >= crate::collaboration::MAX_HELP_DEPTH {
+                        return Err(SeraError::Validation(
+                            "this turn already came from a teammate; finish it with the tools you have"
+                                .into(),
+                        ));
+                    }
+                    help_asks += 1;
+                }
+                _ => {}
+            }
+        }
+        if state.handoffs.len() + delegates > MAX_HANDOFFS_PER_TURN {
+            return Err(SeraError::Validation(format!(
+                "at most {MAX_HANDOFFS_PER_TURN} handoffs are allowed per turn"
+            )));
+        }
+        if team_asks > 0 && (state.team_asked || team_asks > 1) {
+            return Err(SeraError::Validation(
+                "only one team_ask is allowed per turn".into(),
+            ));
+        }
+        if help_asks > 0 && (state.help_asked || help_asks > 1) {
+            return Err(SeraError::Validation(
+                "only one ask_teammate is allowed per turn".into(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn execute_calls(
         &self,
         task: &Task,
@@ -1346,6 +1516,8 @@ impl Runtime {
         context: &ToolContext,
     ) -> Result<Option<PendingTool>> {
         let max_calls = self.turn_limits_for(&task.user_id)?.max_tool_calls_per_turn;
+        // The whole batch's guards are validated before any of it runs.
+        self.validate_call_batch(state, &calls, context)?;
         for (index, call) in calls.iter().enumerate() {
             if state.tool_calls >= max_calls {
                 break;
@@ -1353,6 +1525,25 @@ impl Runtime {
             // Calls not yet started are dropped: the owner stopped the turn.
             if self.stop_requested(&turn.id) {
                 break;
+            }
+            // An effectful call that already ran replays its stored outcome
+            // instead of repeating the effect.
+            if let Some((content, tool, is_error)) = state
+                .completed_effects
+                .iter()
+                .find(|effect| effect.call_id == call.id)
+                .map(|effect| (effect.content.clone(), effect.tool.clone(), effect.is_error))
+            {
+                state.messages.push(LlmMessage {
+                    role: Role::Tool,
+                    content: Some(content),
+                    tool_calls: Vec::new(),
+                    tool_call_id: Some(call.id.clone()),
+                    name: Some(tool),
+                    is_error,
+                    images: Vec::new(),
+                });
+                continue;
             }
             if call.name == DELEGATE_TOOL {
                 if context.bot != ORCHESTRATOR_BOT {
@@ -1454,6 +1645,17 @@ impl Runtime {
                         state.help_asked = true;
                     }
                     self.record_tool_result(state, call, &output);
+                    if Self::call_is_effectful(&call.name) {
+                        self.record_completed_effect(state, call, &output.content);
+                        // Persist now: a crash after this point must not
+                        // replay the effect.
+                        self.store.update_turn(
+                            &task.user_id,
+                            &turn.id,
+                            "active",
+                            &serde_json::to_value(&*state)?,
+                        )?;
+                    }
                     let phase = if generation_still_running(&call.name, &output) {
                         StepPhase::Progress
                     } else {
@@ -1556,6 +1758,11 @@ impl Runtime {
     }
 
     fn record_tool_result(&self, state: &mut TurnState, call: &ToolCall, output: &ToolOutput) {
+        // One short digest line per step, bounded: the next turn reads what
+        // ran without re-reading the activity feed.
+        if state.tool_digest.len() < TOOL_DIGEST_MAX_LINES {
+            state.tool_digest.push(digest_line(call, output));
+        }
         if call.name == "rag_search"
             && let Some(chunks) = output
                 .data
@@ -1583,6 +1790,46 @@ impl Runtime {
             is_error: false,
             images: Vec::new(),
         });
+    }
+
+    /// Record an effectful call's stored outcome in the turn state, so a
+    /// retried turn replays it instead of repeating the effect.
+    fn record_completed_effect(&self, state: &mut TurnState, call: &ToolCall, content: &str) {
+        if state
+            .completed_effects
+            .iter()
+            .any(|effect| effect.call_id == call.id)
+        {
+            return;
+        }
+        state.completed_effects.push(CompletedEffect {
+            call_id: call.id.clone(),
+            tool: call.name.clone(),
+            content: truncate_chars(content, EFFECT_CONTENT_CHARS),
+            is_error: false,
+        });
+    }
+
+    /// Persist the turn's tool digest as one Tool-role message, so the next
+    /// turn's `history_for_llm` carries what ran. Tool messages are not
+    /// shown in the chat transcript. Best effort: a failure never touches
+    /// the turn.
+    fn record_tool_digest(&self, user_id: &str, turn: &Turn, state: &TurnState) {
+        if state.tool_digest.is_empty() {
+            return;
+        }
+        let text = truncate_chars(
+            &format!("{TOOL_DIGEST_PREFIX}\n{}", state.tool_digest.join("\n")),
+            TOOL_DIGEST_MAX_CHARS,
+        );
+        let _ = self.store.append_message_named(
+            user_id,
+            &turn.conversation_id,
+            Some(&turn.id),
+            Role::Tool,
+            &text,
+            Some("tool_digest"),
+        );
     }
 
     async fn suspend_for_approval(
@@ -1677,6 +1924,22 @@ fn limit_summary(state: &TurnState, skipped: &[String]) -> String {
     }
     text.push_str(" Use Continue to pick up from here.");
     text
+}
+
+/// One digest line for a tool step: the tool name and the first line of its
+/// output, control characters stripped. Full arguments are never shown.
+fn digest_line(call: &ToolCall, output: &crate::gateway::ToolOutput) -> String {
+    let first = output
+        .content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("Finished");
+    let cleaned: String = first
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    format!("- {}: {}", call.name, truncate_chars(cleaned.trim(), 120))
 }
 
 /// A short target for a tool call: its first non-empty string argument,

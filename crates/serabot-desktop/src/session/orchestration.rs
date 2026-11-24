@@ -145,24 +145,34 @@ impl Session {
         }
     }
 
-    /// Move the composer text into the queue. Attachments wait for their own
-    /// send: they are uploaded to the conversation, not to the queue.
+    /// Move the composer text into the queue. Files already uploaded for
+    /// the draft travel with the queued message; files still uploading
+    /// cannot be queued yet.
     pub fn queue_composer(&mut self) {
-        if !self.composer_files.is_empty() || !self.upload_queue.is_empty() || self.uploading {
-            self.toast = Some("Files can't be queued. Send them when the reply is done.".into());
+        if self.uploading || !self.upload_queue.is_empty() {
+            self.toast = Some("Still uploading…".into());
             return;
         }
         let routed = self.route_for(&self.composer);
         // The owner's own words are queued; routing is decided at send time too.
-        match self.queue.push(&self.composer, routed.target) {
+        match self.queue.push_with_attachments(
+            &self.composer,
+            routed.target,
+            self.composer_files.clone(),
+        ) {
             Ok(_) => {
+                self.composer_files.clear();
                 self.composer.zeroize();
                 self.composer = String::new();
                 // Queuing consumes the draft, like sending: the view clears.
                 self.composer_gen = self.composer_gen.wrapping_add(1);
                 self.drafts.clear(&self.conversation);
+                self.persist_composer_state();
             }
-            Err(refusal) => self.toast = Some(refusal.message().into()),
+            Err(refusal) => {
+                // The text and its files stay in the composer.
+                self.toast = Some(refusal.message().into());
+            }
         }
     }
 
@@ -231,12 +241,22 @@ impl Session {
             return;
         };
         let routed = self.route_for(&next.text);
-        self.dispatch_text(next.text, routed.target.map(|bot| (bot, routed.text)));
+        self.dispatch_text(
+            next.text,
+            routed.target.map(|bot| (bot, routed.text)),
+            next.attachments,
+        );
     }
 
     /// Put an owner message in the transcript and send it. `delegate` is the
     /// bot that answers and the text it gets, when a mention routed it.
-    pub(super) fn dispatch_text(&mut self, shown: String, delegate: Option<(String, String)>) {
+    /// `attachments` are files already uploaded for this message.
+    pub(super) fn dispatch_text(
+        &mut self,
+        shown: String,
+        delegate: Option<(String, String)>,
+        attachments: Vec<crate::AttachmentInfo>,
+    ) {
         self.state.error = None;
         self.state.chat_failure = None;
         self.state.held_draft = None;
@@ -249,16 +269,26 @@ impl Session {
             created_at: "Just now".into(),
             name: None,
             bot: None,
-            attachments: Vec::new(),
+            attachments: attachments.clone(),
             limit_reached: false,
             turn_id: None,
         });
-        match delegate {
-            Some((bot, text)) => self.start_request(Operation::SubmitTo {
-                text: Zeroizing::new(text),
-                bot,
-            }),
-            None => self.start_request(Operation::Submit(Zeroizing::new(shown))),
+        if attachments.is_empty() {
+            match delegate {
+                Some((bot, text)) => self.start_request(Operation::SubmitTo {
+                    text: Zeroizing::new(text),
+                    bot,
+                }),
+                None => self.start_request(Operation::Submit(Zeroizing::new(shown))),
+            }
+        } else {
+            // A queued message with files goes out like a sent one; a
+            // delegate mention and attachments do not mix, so the text
+            // goes to the current bot as typed.
+            self.start_request(Operation::SubmitWith {
+                text: Zeroizing::new(shown),
+                attachments: attachments.into_iter().map(|file| file.id).collect(),
+            });
         }
     }
 
@@ -288,7 +318,7 @@ impl Session {
         let current = self.conversation_bot(&self.conversation);
         let delegate =
             (!room && current.as_deref() != Some(main.as_str())).then(|| (main, text.clone()));
-        self.dispatch_text(text, delegate);
+        self.dispatch_text(text, delegate, Vec::new());
     }
 }
 
@@ -299,6 +329,10 @@ mod tests {
     fn session() -> Session {
         let mut session = Session::new();
         session.state.connected = true;
+        // Keep the persist worker away from the real settings dir: tests
+        // must never write into the user's own config.
+        session.composer_dir_override =
+            Some(std::env::temp_dir().join(format!("serabot-test-{}-orch", std::process::id())));
         session
     }
 
@@ -330,25 +364,71 @@ mod tests {
         assert!(session.queue.is_empty());
         assert!(session.toast.is_some());
 
+        // Files still uploading cannot be queued yet.
         session.toast = None;
         session.composer = "with a file".into();
+        session.upload_queue.push_back(("late.pdf".into(), vec![1]));
+        session.queue_composer();
+        assert!(session.queue.is_empty());
+        assert_eq!(
+            session.toast.as_deref(),
+            Some("Still uploading…"),
+            "an in-flight upload blocks the queue"
+        );
+        assert_eq!(session.composer, "with a file", "the draft is kept");
+        assert_eq!(session.upload_queue.len(), 1, "the upload is kept too");
+    }
+
+    #[test]
+    fn an_uploaded_file_travels_with_its_queued_message() {
+        let mut session = session();
+        session.state.history_loaded = true;
+        let selection = crate::Selection {
+            provider: "p".into(),
+            model: "m".into(),
+            account: None,
+        };
+        session.state.draft = selection.clone();
+        session.state.catalog = Some(crate::Catalog {
+            providers: vec![crate::Provider {
+                id: "p".into(),
+                models: vec!["m".into()],
+                data_egress_approved: true,
+            }],
+            entries: Vec::new(),
+            selection,
+            effective_selection: None,
+            thinking: crate::ThinkingInfo::default(),
+        });
+        assert!(session.state.can_send());
+        session.composer = "see this".into();
         session.composer_files.push(crate::AttachmentInfo {
             id: "a1".into(),
             filename: "n.txt".into(),
             mime: "text/plain".into(),
-            size_bytes: 1,
+            size_bytes: 3,
             is_image: false,
         });
         session.queue_composer();
-        assert!(session.queue.is_empty());
+        assert_eq!(session.queue.len(), 1);
+        assert!(session.composer.is_empty(), "the box is free");
         assert!(
-            session
-                .toast
-                .as_deref()
-                .unwrap()
-                .contains("Files can't be queued")
+            session.composer_files.is_empty(),
+            "the file left with the queue"
         );
-        assert_eq!(session.composer, "with a file", "the draft is kept");
+        let queued = &session.queue.items()[0];
+        assert_eq!(queued.text, "see this");
+        assert_eq!(queued.attachments.len(), 1);
+        assert_eq!(queued.attachments[0].id, "a1");
+
+        // The pump sends it once the chat is idle, with the file on the
+        // optimistic message.
+        session.pump_queue();
+        assert!(session.queue.is_empty());
+        let sent = session.state.messages.last().unwrap();
+        assert_eq!(sent.content, "see this");
+        assert_eq!(sent.attachments.len(), 1);
+        assert_eq!(sent.attachments[0].id, "a1");
     }
 
     #[test]

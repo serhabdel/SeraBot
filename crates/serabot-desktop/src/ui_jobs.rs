@@ -12,7 +12,6 @@ use crate::ui::Icon;
 use dioxus::prelude::*;
 use serabot_desktop::jobs::{self, JobItem, JobState};
 use serabot_desktop::session::Session;
-use std::time::Instant;
 
 fn state_class(state: JobState) -> &'static str {
     match state {
@@ -86,11 +85,10 @@ pub fn JobsPanel(session: Signal<Session>) -> Element {
         jobs::build(
             state.state.task.as_ref(),
             &state.state.media_jobs,
-            &state.state.working,
+            &state.state.runs.rows,
             &state.state.activity,
             &state.conversation,
             &state.state.jobs_reliability,
-            Instant::now(),
         )
     };
     let active = items.iter().filter(|item| item.is_active()).count();

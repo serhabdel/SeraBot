@@ -2671,7 +2671,7 @@ pub struct Message {
 }
 
 /// One uploaded chat attachment as the server reports it. No server path.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AttachmentInfo {
     pub id: String,
     pub filename: String,
@@ -2858,6 +2858,11 @@ pub enum TaskStatus {
     AwaitingApproval,
     /// Parked until a model route is available again (v0.50).
     WaitingModel,
+    /// An effect may already have happened and its outcome is uncertain
+    /// (0.74.10): the owner reviews it before anything is retried. Not
+    /// terminal — the turn is parked, not finished — and it is never
+    /// auto-retried.
+    NeedsReview,
     Done,
     Failed,
     Cancelled,
@@ -2873,6 +2878,7 @@ impl TaskStatus {
             Self::Running => "Working",
             Self::AwaitingApproval => "Awaiting approval",
             Self::WaitingModel => "Waiting for a model",
+            Self::NeedsReview => "Needs review",
             Self::Done => "Done",
             Self::Failed => "Failed",
             Self::Cancelled => "Cancelled",
@@ -8760,5 +8766,19 @@ mod mail_and_search_tests {
             .search_conversations("invoice", Some("main"), 15)
             .unwrap();
         assert!(older.is_empty());
+    }
+
+    #[test]
+    fn needs_review_round_trips_from_the_server_and_is_not_terminal() {
+        // The server writes `needs_review` for an uncertain failure; the
+        // desktop must parse it instead of failing the whole task payload,
+        // and must never treat it as finished or retryable.
+        let task: Task = serde_json::from_str(
+            r#"{"id":"t1","kind":"turn","bot":"main","status":"needs_review"}"#,
+        )
+        .unwrap();
+        assert_eq!(task.status, TaskStatus::NeedsReview);
+        assert_eq!(task.status.label(), "Needs review");
+        assert!(!task.status.terminal());
     }
 }

@@ -19,7 +19,6 @@ use crate::fleet::FleetRegistry;
 use crate::gateway::{Tool, ToolContext, ToolOutput, ToolSpec};
 use crate::model_router::RouterHandle;
 use crate::store::Store;
-use crate::teams::enqueue_turn_task_with_id;
 use crate::util::truncate_chars;
 
 pub const ASK_QUEUED_KEY: &str = "ask_queued";
@@ -185,6 +184,29 @@ impl Tool for AskTeammateTool {
             "help_depth": help_depth + 1,
             "help_from": context.bot,
         });
+        // The ledger row and the child task are written in one transaction,
+        // like `delegate`: the same ask from the same turn hashes the same
+        // key and is not queued twice, and the daily child quota applies.
+        let key_hash = crate::delegate::handoff_key_hash(turn_id, &to_bot, &objective);
+        let handoff_id = new_id();
+        let route_json = serde_json::to_value(&route)?;
+        let (row, created) = self.store.create_subagent_handoff(
+            &context.user_id,
+            &crate::delegate::NewHandoff {
+                id: &handoff_id,
+                parent_task_id: task_id,
+                parent_turn_id: Some(turn_id),
+                child_task_id: &child_task_id,
+                to_bot: &to_bot,
+                key_hash: &key_hash,
+                route: Some(&route_json),
+            },
+            &payload,
+            crate::delegate::DEFAULT_CHILD_DAILY_LIMIT,
+        )?;
+        if !created {
+            return Ok(crate::delegate::duplicate_output(&row));
+        }
         self.store.record_audit(
             &context.actor,
             "help.queued",
@@ -194,6 +216,7 @@ impl Tool for AskTeammateTool {
             None,
             None,
             Some(&json!({
+                "handoff_id": row.id,
                 "child_task_id": child_task_id,
                 "parent_turn_id": turn_id,
                 "conversation_id": conversation_id,
@@ -205,18 +228,12 @@ impl Tool for AskTeammateTool {
             &context.user_id,
             "help.queued",
             &json!({
+                "handoff_id": row.id,
                 "parent_task_id": task_id,
                 "child_task_id": child_task_id,
                 "from_bot": context.bot,
                 "to_bot": to_bot,
             }),
-        )?;
-        enqueue_turn_task_with_id(
-            &self.store,
-            &context.user_id,
-            &child_task_id,
-            &to_bot,
-            &payload,
         )?;
         Ok(ToolOutput {
             content: format!(
@@ -224,6 +241,7 @@ impl Tool for AskTeammateTool {
             ),
             data: Some(json!({
                 ASK_QUEUED_KEY: true,
+                "handoff_id": row.id,
                 "child_task_id": child_task_id,
                 "to_bot": to_bot,
             })),
@@ -378,6 +396,49 @@ mod tests {
                 .unwrap()
                 .contains("public statute")
         );
+    }
+
+    #[tokio::test]
+    async fn the_same_ask_from_the_same_turn_is_queued_only_once() {
+        let (store, parent) = store();
+        let tool = AskTeammateTool::new(store.clone(), fleet(&store), router());
+        let turn = store
+            .create_turn(&admin(&store), &parent, "legal", ROOM, &json!({}))
+            .unwrap();
+        let args = json!({"to_bot": "main", "objective": "Search the public statute.", "reason": "no browser"});
+        let first = tool
+            .execute(args.clone(), &context(&store, &parent, &turn.id))
+            .await
+            .unwrap();
+        let second = tool
+            .execute(args, &context(&store, &parent, &turn.id))
+            .await
+            .unwrap();
+        assert_eq!(
+            second.data.as_ref().and_then(|data| data.get("duplicate")),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            second
+                .data
+                .as_ref()
+                .and_then(|data| data.get("child_task_id")),
+            first
+                .data
+                .as_ref()
+                .and_then(|data| data.get("child_task_id")),
+            "the duplicate points at the same child task"
+        );
+        // And the ledger row exists for failure reporting.
+        let handoff_id = first
+            .data
+            .as_ref()
+            .and_then(|data| data.get("handoff_id"))
+            .and_then(Value::as_str)
+            .unwrap();
+        let row = store.get_handoff(&admin(&store), handoff_id).unwrap();
+        assert_eq!(row.status, "queued");
+        assert_eq!(row.to_bot, "main");
     }
 
     #[tokio::test]

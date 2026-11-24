@@ -440,6 +440,27 @@ pub fn active_count(rows: &[RunRow]) -> usize {
         .count()
 }
 
+/// The bots of the handoffs that started and have not completed yet, in
+/// ledger order, one entry per active run (parallel handoffs to the same bot
+/// count twice). This is what the Delegating card and the Jobs panel derive
+/// from — the handoff ledger (`runs.rows`), never the WorkingBots rings,
+/// which also fire for the chat's own turn and for steps that already ended.
+pub fn active_handoff_bots(rows: &[RunRow]) -> Vec<String> {
+    rows.iter()
+        .filter(|row| {
+            matches!(
+                row.chip.kind(),
+                ChipKind::Queued
+                    | ChipKind::Running
+                    | ChipKind::WaitingApproval
+                    | ChipKind::WaitingModel
+                    | ChipKind::Resumed
+            )
+        })
+        .map(|row| row.bot.clone())
+        .collect()
+}
+
 /// Runs the owner can act on (a failed run that can resume).
 pub fn needs_attention(rows: &[RunRow]) -> usize {
     rows.iter()
@@ -1022,6 +1043,27 @@ mod tests {
         ]);
         assert_eq!(active_count(&list), 1);
         assert_eq!(needs_attention(&list), 1);
+    }
+
+    #[test]
+    fn active_handoffs_come_from_the_ledger_not_the_working_rings() {
+        let list = rows(&[
+            handoff("a", "p", "ca", "analyst", "running"),
+            handoff("b", "p", "cb", "maker", "queued"),
+            handoff("c", "p", "cc", "analyst", "running"),
+            handoff("d", "p", "cd", "writer", "completed"),
+            handoff("e", "p", "ce", "legal", "failed"),
+        ]);
+        // Started, not yet completed — including a second parallel run to
+        // the same bot — and nothing finished or failed.
+        assert_eq!(
+            active_handoff_bots(&list),
+            vec![
+                "analyst".to_owned(),
+                "maker".to_owned(),
+                "analyst".to_owned()
+            ]
+        );
     }
 
     #[test]
