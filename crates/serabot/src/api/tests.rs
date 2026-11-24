@@ -26,6 +26,7 @@ mod handoffs_api;
 mod jobs_api;
 mod library_api;
 mod logs_api;
+mod mail_api;
 mod marketplace_api;
 mod marketplace_oauth_api;
 mod memory_settings_api;

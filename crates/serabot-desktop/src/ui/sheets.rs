@@ -722,6 +722,12 @@ pub(super) fn CommandPaletteSheet(session: Signal<Session>, overlay: Signal<Over
                 "Conversations & live agents",
             ),
             (
+                Section::Mail,
+                "send",
+                "Mail",
+                "Inbox, search, compose & attachments",
+            ),
+            (
                 Section::Workflows,
                 "workflows",
                 "Workflows",

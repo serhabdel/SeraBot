@@ -604,3 +604,13 @@ never merge without the owner's OK.
 - [x] Version bump `0.74.11` (`Cargo.toml`), mobile `0.74.11+85`, `docs/release-0.74.11.md`, `README.md`, `tasks/todo.md`.
 - [ ] Owner: live pass on Windows & Android (slow reasoning heartbeat, Hostinger IMAP in morning brief/triage, unified ApprovalCard, Library Attach to chat & Mobile Library upload).
 
+## Release 0.74.12 — Streamlined sidebar + Settings hub, 3-pane Desktop Mail workspace, interactive Mail API & Mobile parity
+
+- [x] Streamlined Desktop sidebar & grouped Settings hub (`session.rs`, `ui/shell.rs`, `ui/settings_view.rs`, `ui_settings_page.rs`, `ui/sheets.rs`, `system.css`): 7-item main rail (`Chats`, `Mail`, `Tasks`, `Projects`, `Library`, `Workflows`, `Browser`) + Settings housing `Memory`, `Integrations`, `Providers`, `Vault`, `Usage`, `Logs` with deep-linking and `Ctrl+K` support.
+- [x] Server Interactive Mail API (`api/mail.rs`, `mail.rs`, `api/tests/mail_api.rs`): `GET /v1/mail/search`, `POST /v1/mail/messages/{uid}/flag`, `POST /v1/mail/messages/{uid}/move`, `DELETE /v1/mail/messages/{uid}`, `POST /v1/mail/send` (blocklist + UID-scoped Library attachments + signature), `GET .../attachments/{index}`, `POST .../save-to-library`.
+- [x] Desktop 3-pane Mail workspace (`ui_mail.rs`, `api.rs`, `ui_connectors.rs`, `pages-work.css`): multi-account & folder pane, IMAP search & unread/starred filters, full reader (Reply/Forward/Star/Read/Move/Delete/Ask bot/Save to Library), Compose modal with Library picker.
+- [x] Mobile Mail interactive parity (`apps/serabot_mobile/`): server-side search, Star / Mark Read-Unread, Delete, Save attachment to Library, Compose / Reply bottom sheet (`flutter analyze` + `242` tests).
+- [x] Pro security & code review pass, `docs/release-0.74.12.md`, `README.md`, `Cargo.toml` (`0.74.12`), mobile `0.74.12+86`.
+- [ ] Owner: live pass on Windows & Android (7-item rail + Settings hub, 3-pane Mail workspace, Hostinger IMAP search/flag/move/delete/send, Save attachment to Library).
+
+

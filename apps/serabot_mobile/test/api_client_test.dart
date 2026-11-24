@@ -611,4 +611,175 @@ void main() {
     expect(task.status.terminal, isFalse);
     expect(task.status.label, 'Needs review');
   });
+
+  test('mail interactive endpoints: folders, messages, search, flag, delete, send, save-to-library', () async {
+    final calls = <String>[];
+    Map<String, dynamic>? lastFlagBody;
+    Map<String, dynamic>? lastSendBody;
+    server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final port = server!.port;
+    server!.listen((request) async {
+      final path = request.uri.path;
+      final method = request.method;
+      calls.add('$method $path');
+      final body = await utf8.decoder.bind(request).join();
+      if (path == '/v1/mail/folders' && method == 'GET') {
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..write(jsonEncode({'folders': ['INBOX', 'Sent']}));
+      } else if (path == '/v1/mail/messages' && method == 'GET') {
+        expect(request.uri.queryParameters['folder'], 'INBOX');
+        expect(request.uri.queryParameters['limit'], '25');
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..write(jsonEncode({
+            'messages': [
+              {
+                'uid': 10,
+                'subject': 'Invoice #42',
+                'from': 'billing@example.test',
+                'date': '2026-11-24',
+                'flags': <String>[],
+                'body': '',
+                'attachments': <Object>[],
+              },
+            ],
+          }));
+      } else if (path == '/v1/mail/messages/10' && method == 'GET') {
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..write(jsonEncode({
+            'message': {
+              'uid': 10,
+              'subject': 'Invoice #42',
+              'from': 'billing@example.test',
+              'date': '2026-11-24',
+              'flags': [r'\Seen'],
+              'body': 'Please see attached.',
+              'attachments': [
+                {
+                  'name': 'invoice.pdf',
+                  'content_type': 'application/pdf',
+                  'size': 2048,
+                },
+              ],
+            },
+          }));
+      } else if (path == '/v1/mail/search' && method == 'GET') {
+        expect(request.uri.queryParameters['q'], 'invoice');
+        expect(request.uri.queryParameters['folder'], 'INBOX');
+        expect(request.uri.queryParameters['account'], 'work');
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..write(jsonEncode({
+            'messages': [
+              {
+                'uid': 10,
+                'subject': 'Invoice #42',
+                'from': 'billing@example.test',
+                'date': '2026-11-24',
+                'flags': [r'\Flagged'],
+              },
+            ],
+          }));
+      } else if (path == '/v1/mail/messages/10/flag' && method == 'POST') {
+        lastFlagBody = jsonDecode(body) as Map<String, dynamic>;
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..write(jsonEncode({'ok': true}));
+      } else if (path == '/v1/mail/messages/10' && method == 'DELETE') {
+        expect(request.uri.queryParameters['folder'], 'INBOX');
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..write(jsonEncode({'deleted': true}));
+      } else if (path == '/v1/mail/send' && method == 'POST') {
+        lastSendBody = jsonDecode(body) as Map<String, dynamic>;
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..write(jsonEncode({'sent': true}));
+      } else if (path == '/v1/mail/messages/10/attachments/0/save-to-library' &&
+          method == 'POST') {
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..write(jsonEncode({
+            'item': {
+              'id': 'a' * 64,
+              'filename': 'invoice.pdf',
+            },
+            'onedrive': 'uploaded',
+          }));
+      } else {
+        request.response.statusCode = HttpStatus.notFound;
+      }
+      await request.response.close();
+    });
+
+    final client = ApiClient.connect('http://127.0.0.1:$port', 'm' * 32);
+    addTearDown(client.close);
+
+    expect(await client.mailFolders(), ['INBOX', 'Sent']);
+    final msgs = await client.mailMessages();
+    expect(msgs, hasLength(1));
+    expect(msgs.first.uid, 10);
+
+    final full = await client.mailMessage(uid: 10);
+    expect(full.body, 'Please see attached.');
+    expect(full.attachments.single.name, 'invoice.pdf');
+
+    final hits = await client.mailSearch(account: 'work', query: 'invoice');
+    expect(hits, hasLength(1));
+    expect(hits.first.isFlagged, isTrue);
+
+    await client.mailFlag(account: 'work', uid: 10, seen: true, flagged: false);
+    expect(lastFlagBody, {
+      'account': 'work',
+      'folder': 'INBOX',
+      'seen': true,
+      'flagged': false,
+    });
+
+    await client.mailDelete(uid: 10);
+    await client.mailSend(
+      account: 'work',
+      to: ['alice@example.test'],
+      subject: 'Hello',
+      body: 'World',
+      artifactHashes: ['a' * 64],
+    );
+    expect(lastSendBody, {
+      'account': 'work',
+      'to': ['alice@example.test'],
+      'subject': 'Hello',
+      'body': 'World',
+      'artifact_hashes': ['a' * 64],
+    });
+
+    final saved = await client.mailSaveAttachmentToLibrary(uid: 10, index: 0);
+    expect(saved.filename, 'invoice.pdf');
+    expect(saved.hash, 'a' * 64);
+    expect(saved.onedrive, 'uploaded');
+
+    // Validation checks stay local
+    await expectLater(
+      client.mailSearch(query: '   '),
+      throwsA(isA<ApiException>().having((e) => e.kind, 'kind', ApiErrorKind.validation)),
+    );
+    await expectLater(
+      client.mailFlag(uid: 10),
+      throwsA(isA<ApiException>().having((e) => e.kind, 'kind', ApiErrorKind.validation)),
+    );
+    await expectLater(
+      client.mailSend(to: const [], subject: 'Hi', body: 'There'),
+      throwsA(isA<ApiException>().having((e) => e.kind, 'kind', ApiErrorKind.validation)),
+    );
+    await expectLater(
+      client.mailSend(
+        to: const ['a@b.c'],
+        subject: 'Hi',
+        body: 'There',
+        artifactHashes: const ['bad-hash'],
+      ),
+      throwsA(isA<ApiException>().having((e) => e.kind, 'kind', ApiErrorKind.validation)),
+    );
+  });
 }

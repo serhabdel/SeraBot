@@ -7,12 +7,13 @@
 use crate::ui::Icon;
 use dioxus::prelude::*;
 use serabot_desktop::local_folders::BotScope;
-use serabot_desktop::session::{Session, SettingsSection, Theme};
+use serabot_desktop::session::{Session, SettingsGroup, SettingsSection, Theme};
 use serabot_desktop::theme::Tone;
 
 use crate::ui_widgets::{SecretField, StatusChip};
 
-/// The list of sections on the left. Admin only shows for admins.
+/// The list of sections on the left, grouped under Preferences, Connections &
+/// Data, and System. Admin only shows for admins.
 #[component]
 pub fn SettingsNav(session: Signal<Session>) -> Element {
     let mut session = session;
@@ -27,15 +28,28 @@ pub fn SettingsNav(session: Signal<Session>) -> Element {
     };
     rsx! {
         nav { class: "settings-nav", "aria-label": "Settings sections",
-            for section in SettingsSection::ALL.into_iter().filter(|s| {
-                s.visible_with_memory(is_admin, mem0_available)
-            }) {
-                button {
-                    key: "{section.label()}",
-                    class: if current == section { "settings-nav-item on" } else { "settings-nav-item" },
-                    "aria-current": if current == section { "page" } else { "false" },
-                    onclick: move |_| session.write().settings_section = section,
-                    "{section.label()}"
+            for group in SettingsGroup::ALL {
+                {
+                    let items: Vec<SettingsSection> = SettingsSection::ALL
+                        .into_iter()
+                        .filter(|s| s.group() == group && s.visible_with_memory(is_admin, mem0_available))
+                        .collect();
+                    rsx! {
+                        if !items.is_empty() {
+                            div { key: "{group.label()}", class: "settings-nav-group",
+                                div { class: "settings-nav-group-label", "{group.label()}" }
+                                for section in items {
+                                    button {
+                                        key: "{section.label()}",
+                                        class: if current == section { "settings-nav-item on" } else { "settings-nav-item" },
+                                        "aria-current": if current == section { "page" } else { "false" },
+                                        onclick: move |_| session.write().open_settings_section(section),
+                                        "{section.label()}"
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

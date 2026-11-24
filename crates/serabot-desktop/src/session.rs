@@ -335,6 +335,7 @@ fn choose_event_kind(current: &mut String, dirty: &mut bool, conversation: &str,
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     Chat,
+    Mail,
     Conversations,
     Projects,
     Memory,
@@ -357,25 +358,20 @@ pub enum Section {
 }
 
 impl Section {
-    pub const NAV: [Self; 13] = [
+    pub const NAV: [Self; 7] = [
         Self::Chat,
-        Self::Conversations,
-        Self::Projects,
-        Self::Browser,
+        Self::Mail,
         Self::Tasks,
-        Self::Memory,
+        Self::Projects,
         Self::Library,
-        Self::Providers,
-        Self::Integrations,
-        Self::Vault,
-        Self::Usage,
         Self::Workflows,
-        Self::Logs,
+        Self::Browser,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Chat => "Chat",
+            Self::Mail => "Mail",
             Self::Conversations => "Conversations",
             Self::Projects => "Projects",
             Self::Memory => "Memory",
@@ -393,6 +389,26 @@ impl Section {
     }
 }
 
+/// Visual groupings for the Settings navigation sidebar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsGroup {
+    Preferences,
+    ConnectionsAndData,
+    System,
+}
+
+impl SettingsGroup {
+    pub const ALL: [Self; 3] = [Self::Preferences, Self::ConnectionsAndData, Self::System];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Preferences => "Preferences",
+            Self::ConnectionsAndData => "Connections & Data",
+            Self::System => "System",
+        }
+    }
+}
+
 /// The sections of the Settings page, in list order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsSection {
@@ -400,28 +416,38 @@ pub enum SettingsSection {
     Appearance,
     Notifications,
     Chat,
-    Telegram,
     Voice,
+    LocalFolders,
+    /// Saved facts, retrieval & optional Mem0 recall.
+    Memory,
+    Integrations,
+    Providers,
+    Vault,
+    Telegram,
     /// Web search/crawl switches (Tavily, Firecrawl) with API key status (0.28.0).
     WebSearch,
-    /// Mem0 recall toggle when the server uses `memory.provider = "mem0"`.
-    Memory,
-    LocalFolders,
+    Usage,
+    Logs,
     Admin,
     About,
 }
 
 impl SettingsSection {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 16] = [
         Self::Account,
         Self::Appearance,
         Self::Notifications,
         Self::Chat,
-        Self::Telegram,
         Self::Voice,
-        Self::WebSearch,
-        Self::Memory,
         Self::LocalFolders,
+        Self::Memory,
+        Self::Integrations,
+        Self::Providers,
+        Self::Vault,
+        Self::Telegram,
+        Self::WebSearch,
+        Self::Usage,
+        Self::Logs,
         Self::Admin,
         Self::About,
     ];
@@ -432,26 +458,47 @@ impl SettingsSection {
             Self::Appearance => "Appearance",
             Self::Notifications => "Notifications",
             Self::Chat => "Chat",
-            Self::Telegram => "Telegram",
             Self::Voice => "Voice",
-            Self::WebSearch => "Web search",
-            Self::Memory => "Memory",
             Self::LocalFolders => "Local folders",
+            Self::Memory => "Memory",
+            Self::Integrations => "Integrations",
+            Self::Providers => "AI providers",
+            Self::Vault => "Vault",
+            Self::Telegram => "Telegram",
+            Self::WebSearch => "Web search",
+            Self::Usage => "Usage",
+            Self::Logs => "Logs",
             Self::Admin => "Admin",
             Self::About => "About",
         }
     }
 
-    /// Only admins see the Admin section; Memory appears when Mem0 is enabled
-    /// on the server (see [`SettingsSection::visible_with_memory`]).
+    pub fn group(self) -> SettingsGroup {
+        match self {
+            Self::Account
+            | Self::Appearance
+            | Self::Notifications
+            | Self::Chat
+            | Self::Voice
+            | Self::LocalFolders => SettingsGroup::Preferences,
+            Self::Memory
+            | Self::Integrations
+            | Self::Providers
+            | Self::Vault
+            | Self::Telegram
+            | Self::WebSearch => SettingsGroup::ConnectionsAndData,
+            Self::Usage | Self::Logs | Self::Admin | Self::About => SettingsGroup::System,
+        }
+    }
+
+    /// Only admins see the Admin section.
     pub fn visible(self, is_admin: bool) -> bool {
         self.visible_with_memory(is_admin, false)
     }
 
-    pub fn visible_with_memory(self, is_admin: bool, mem0_available: bool) -> bool {
+    pub fn visible_with_memory(self, is_admin: bool, _mem0_available: bool) -> bool {
         match self {
             Self::Admin => is_admin,
-            Self::Memory => mem0_available,
             _ => true,
         }
     }
@@ -1776,31 +1823,68 @@ impl Session {
     }
 
     pub fn open_section(&mut self, section: Section) {
+        let mapped_settings = match section {
+            Section::Memory => Some(SettingsSection::Memory),
+            Section::Integrations => Some(SettingsSection::Integrations),
+            Section::Providers => Some(SettingsSection::Providers),
+            Section::Vault => Some(SettingsSection::Vault),
+            Section::Usage => Some(SettingsSection::Usage),
+            Section::Logs => Some(SettingsSection::Logs),
+            _ => None,
+        };
+        if let Some(settings_section) = mapped_settings {
+            self.section = Section::Settings;
+            self.panel.set_page_open(false);
+            self.refresh_status();
+            self.refresh_telegram();
+            self.load_memory_settings();
+            self.open_settings_section(settings_section);
+            return;
+        }
         self.section = section;
         self.panel.set_page_open(section == Section::Browser);
-        if section == Section::Vault {
-            self.panel.ask_vault_list();
-            self.panel.ask_password_managers();
-        }
-        if section == Section::Usage {
-            self.load_usage_days(self.usage_days);
-            self.refresh_server_health();
-        }
         if section == Section::Settings {
             self.refresh_status();
             self.refresh_telegram();
             self.load_memory_settings();
-        }
-        if section == Section::Logs {
-            self.refresh_logs();
+            self.trigger_settings_section_load(self.settings_section);
         }
         if section == Section::Workflows {
             self.refresh_workflows();
         }
-        if section == Section::Integrations {
-            self.refresh_marketplace();
-        }
         self.ensure_section_data();
+    }
+
+    pub fn open_settings_section(&mut self, settings_section: SettingsSection) {
+        self.settings_section = settings_section;
+        self.trigger_settings_section_load(settings_section);
+        self.ensure_section_data();
+    }
+
+    fn trigger_settings_section_load(&mut self, settings_section: SettingsSection) {
+        match settings_section {
+            SettingsSection::Vault => {
+                self.panel.ask_vault_list();
+                self.panel.ask_password_managers();
+            }
+            SettingsSection::Usage => {
+                self.load_usage_days(self.usage_days);
+                self.refresh_server_health();
+            }
+            SettingsSection::Logs => {
+                self.refresh_logs();
+            }
+            SettingsSection::Integrations => {
+                self.refresh_marketplace();
+            }
+            SettingsSection::Memory => {
+                self.load_memory_settings();
+            }
+            SettingsSection::Voice => {
+                self.load_voice();
+            }
+            _ => {}
+        }
     }
 
     /// Read `GET /v1/logs` with the tab's current filter (0.28.0). A manual
@@ -5771,12 +5855,35 @@ impl Session {
                     None
                 }
             }
-            // The Library page loads itself through its own API jobs.
+            // The Library and Mail pages load themselves through their own API jobs.
             Section::Browser
             | Section::Vault
             | Section::Usage
-            | Section::Settings
-            | Section::Library => None,
+            | Section::Library
+            | Section::Mail => None,
+            Section::Settings => match self.settings_section {
+                SettingsSection::Memory => {
+                    (!self.state.memories_loaded).then(|| self.memory_list_operation())
+                }
+                SettingsSection::Providers => {
+                    (!self.state.providers_loaded).then_some(Operation::Providers)
+                }
+                SettingsSection::Logs => (!self.state.logs_loaded).then(|| Operation::Logs {
+                    level: self.logs_level.clone(),
+                    query: self.logs_query.clone(),
+                }),
+                SettingsSection::Integrations => {
+                    if !self.state.connectors_loaded {
+                        Some(Operation::Connectors)
+                    } else if !self.state.marketplace_loaded && !self.state.marketplace_unavailable
+                    {
+                        Some(Operation::MarketplaceList)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            },
         }
     }
 
@@ -7280,26 +7387,116 @@ fn parse_rfc3339_unix(stamp: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::SettingsSection;
     use super::{
         AtomicBool, Duration, EventRefresh, Instant, Ordering, Session, SignInPhase, SignInUi,
         Theme, event_refresh, load_composer_drafts, scope_event_kind, telegram_error,
     };
+    use super::{Section, SettingsGroup, SettingsSection};
     use crate::ApiError;
     use crate::worker::{Credentials, Operation};
     use std::sync::Arc;
 
     #[test]
-    fn admin_settings_section_is_hidden_from_members() {
-        let count = |admin| {
+    fn admin_settings_section_is_hidden_from_members_and_memory_is_always_visible() {
+        let count = |admin, mem0| {
             SettingsSection::ALL
                 .iter()
-                .filter(|section| section.visible(admin))
+                .filter(|section| section.visible_with_memory(admin, mem0))
                 .count()
         };
-        assert_eq!(count(true), 10);
-        assert_eq!(count(false), 9);
+        assert_eq!(count(true, false), 16);
+        assert_eq!(count(false, false), 15);
+        assert_eq!(count(false, true), 15);
         assert!(!SettingsSection::Admin.visible(false));
+        assert!(SettingsSection::Memory.visible(false));
+        assert!(SettingsSection::Memory.visible_with_memory(false, false));
+    }
+
+    #[test]
+    fn nav_has_seven_focused_sections() {
+        assert_eq!(Section::NAV.len(), 7);
+        assert!(
+            Section::NAV
+                == [
+                    Section::Chat,
+                    Section::Mail,
+                    Section::Tasks,
+                    Section::Projects,
+                    Section::Library,
+                    Section::Workflows,
+                    Section::Browser,
+                ]
+        );
+        assert_eq!(Section::Mail.label(), "Mail");
+    }
+
+    #[test]
+    fn settings_sections_map_to_expected_groups() {
+        assert_eq!(SettingsSection::Account.group(), SettingsGroup::Preferences);
+        assert_eq!(
+            SettingsSection::Appearance.group(),
+            SettingsGroup::Preferences
+        );
+        assert_eq!(
+            SettingsSection::Notifications.group(),
+            SettingsGroup::Preferences
+        );
+        assert_eq!(SettingsSection::Chat.group(), SettingsGroup::Preferences);
+        assert_eq!(SettingsSection::Voice.group(), SettingsGroup::Preferences);
+        assert_eq!(
+            SettingsSection::LocalFolders.group(),
+            SettingsGroup::Preferences
+        );
+
+        assert_eq!(
+            SettingsSection::Memory.group(),
+            SettingsGroup::ConnectionsAndData
+        );
+        assert_eq!(
+            SettingsSection::Integrations.group(),
+            SettingsGroup::ConnectionsAndData
+        );
+        assert_eq!(
+            SettingsSection::Providers.group(),
+            SettingsGroup::ConnectionsAndData
+        );
+        assert_eq!(
+            SettingsSection::Vault.group(),
+            SettingsGroup::ConnectionsAndData
+        );
+        assert_eq!(
+            SettingsSection::Telegram.group(),
+            SettingsGroup::ConnectionsAndData
+        );
+        assert_eq!(
+            SettingsSection::WebSearch.group(),
+            SettingsGroup::ConnectionsAndData
+        );
+
+        assert_eq!(SettingsSection::Usage.group(), SettingsGroup::System);
+        assert_eq!(SettingsSection::Logs.group(), SettingsGroup::System);
+        assert_eq!(SettingsSection::Admin.group(), SettingsGroup::System);
+        assert_eq!(SettingsSection::About.group(), SettingsGroup::System);
+    }
+
+    #[test]
+    fn open_section_deep_links_settings_subsections() {
+        let mut session = Session::new();
+        for (section, expected) in [
+            (Section::Memory, SettingsSection::Memory),
+            (Section::Integrations, SettingsSection::Integrations),
+            (Section::Providers, SettingsSection::Providers),
+            (Section::Vault, SettingsSection::Vault),
+            (Section::Usage, SettingsSection::Usage),
+            (Section::Logs, SettingsSection::Logs),
+        ] {
+            session.open_section(section);
+            assert!(session.section == Section::Settings);
+            assert_eq!(session.settings_section, expected);
+        }
+
+        session.open_section(Section::Mail);
+        assert!(session.section == Section::Mail);
     }
 
     #[test]

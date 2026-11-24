@@ -2082,6 +2082,8 @@ pub struct MailMessageInfo {
     #[serde(default)]
     pub from: String,
     #[serde(default)]
+    pub to: String,
+    #[serde(default)]
     pub date: String,
     #[serde(default)]
     pub flags: Vec<String>,
@@ -2089,6 +2091,38 @@ pub struct MailMessageInfo {
     pub body: String,
     #[serde(default)]
     pub attachments: Vec<MailAttachmentInfo>,
+}
+
+/// Alias matching the 0.74.12 mail workspace API.
+pub type MailMessage = MailMessageInfo;
+
+/// Request body for `POST /v1/mail/messages/{uid}/flag`.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct MailFlagRequest {
+    pub folder: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seen: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flagged: Option<bool>,
+}
+
+/// Request body for `POST /v1/mail/messages/{uid}/move`.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct MailMoveRequest {
+    pub folder: String,
+    pub dest: String,
+}
+
+/// Request body for `POST /v1/mail/send`.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct MailSendRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    pub to: Vec<String>,
+    pub subject: String,
+    pub body: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub artifact_hashes: Vec<String>,
 }
 
 fn is_loopback_mail_host(host: &str) -> bool {
@@ -5216,7 +5250,223 @@ impl ApiClient {
         if let Some(label) = account.map(str::trim).filter(|s| !s.is_empty()) {
             query.push(("account", label));
         }
-        self.get(&["v1", "mail", "messages", &uid.to_string()], &query)
+        let reply: serde_json::Value =
+            self.get(&["v1", "mail", "messages", &uid.to_string()], &query)?;
+        let inner = reply.get("message").unwrap_or(&reply);
+        serde_json::from_value(inner.clone()).map_err(|_| ApiError::InvalidResponse)
+    }
+
+    /// `GET /v1/mail/search?account=&folder=&q=&limit=`: search messages in a folder (0.74.12).
+    pub fn mail_search(
+        &self,
+        account: Option<&str>,
+        folder: &str,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<MailMessage>, ApiError> {
+        let mut params: Vec<(&str, String)> = vec![
+            ("folder", folder.to_owned()),
+            ("q", query.to_owned()),
+            ("limit", limit.to_string()),
+        ];
+        if let Some(label) = account.map(str::trim).filter(|s| !s.is_empty()) {
+            params.push(("account", label.to_owned()));
+        }
+        let params: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let reply: serde_json::Value = self.get(&["v1", "mail", "search"], &params)?;
+        let arr = reply.get("messages").unwrap_or(&reply);
+        serde_json::from_value(arr.clone()).map_err(|_| ApiError::InvalidResponse)
+    }
+
+    /// `POST /v1/mail/messages/{uid}/flag`: update `\Seen` / `\Flagged` on a message (0.74.12).
+    pub fn mail_flag(
+        &self,
+        account: Option<&str>,
+        folder: &str,
+        uid: u32,
+        seen: Option<bool>,
+        flagged: Option<bool>,
+    ) -> Result<(), ApiError> {
+        let mut query: Vec<(&str, &str)> = vec![("folder", folder)];
+        if let Some(label) = account.map(str::trim).filter(|s| !s.is_empty()) {
+            query.push(("account", label));
+        }
+        let body = MailFlagRequest {
+            folder: folder.to_owned(),
+            seen,
+            flagged,
+        };
+        let uid_str = uid.to_string();
+        let _: serde_json::Value = self.request(
+            Method::POST,
+            &["v1", "mail", "messages", &uid_str, "flag"],
+            &query,
+            Some(&body),
+        )?;
+        Ok(())
+    }
+
+    /// `POST /v1/mail/messages/{uid}/move`: move a message to another folder (0.74.12).
+    pub fn mail_move(
+        &self,
+        account: Option<&str>,
+        folder: &str,
+        uid: u32,
+        dest: &str,
+    ) -> Result<(), ApiError> {
+        let dest = dest.trim();
+        if dest.is_empty() {
+            return Err(ApiError::Validation("Pick a destination folder."));
+        }
+        let mut query: Vec<(&str, &str)> = vec![("folder", folder)];
+        if let Some(label) = account.map(str::trim).filter(|s| !s.is_empty()) {
+            query.push(("account", label));
+        }
+        let body = MailMoveRequest {
+            folder: folder.to_owned(),
+            dest: dest.to_owned(),
+        };
+        let uid_str = uid.to_string();
+        let _: serde_json::Value = self.request(
+            Method::POST,
+            &["v1", "mail", "messages", &uid_str, "move"],
+            &query,
+            Some(&body),
+        )?;
+        Ok(())
+    }
+
+    /// `DELETE /v1/mail/messages/{uid}`: delete a message (0.74.12).
+    pub fn mail_delete(
+        &self,
+        account: Option<&str>,
+        folder: &str,
+        uid: u32,
+    ) -> Result<(), ApiError> {
+        let mut query: Vec<(&str, &str)> = vec![("folder", folder)];
+        if let Some(label) = account.map(str::trim).filter(|s| !s.is_empty()) {
+            query.push(("account", label));
+        }
+        let uid_str = uid.to_string();
+        let _: serde_json::Value = self.request::<_, ()>(
+            Method::DELETE,
+            &["v1", "mail", "messages", &uid_str],
+            &query,
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// `POST /v1/mail/send`: send an email via the connected SMTP account (0.74.12).
+    pub fn mail_send(
+        &self,
+        account: Option<&str>,
+        to: &[String],
+        subject: &str,
+        body: &str,
+        artifact_hashes: &[String],
+    ) -> Result<(), ApiError> {
+        let recipients: Vec<String> = to
+            .iter()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if recipients.is_empty() {
+            return Err(ApiError::Validation("Add at least one recipient."));
+        }
+        let req = MailSendRequest {
+            account: account
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+            to: recipients,
+            subject: subject.to_owned(),
+            body: body.to_owned(),
+            artifact_hashes: artifact_hashes
+                .iter()
+                .map(|h| h.trim().to_owned())
+                .filter(|h| !h.is_empty())
+                .collect(),
+        };
+        let _: serde_json::Value =
+            self.request(Method::POST, &["v1", "mail", "send"], &[], Some(&req))?;
+        Ok(())
+    }
+
+    /// `GET /v1/mail/messages/{uid}/attachments/{index}`: download raw attachment bytes (0.74.12).
+    pub fn mail_attachment_bytes(
+        &self,
+        account: Option<&str>,
+        folder: &str,
+        uid: u32,
+        index: usize,
+    ) -> Result<Vec<u8>, ApiError> {
+        let mut url = self.endpoint.clone();
+        {
+            let uid_str = uid.to_string();
+            let idx_str = index.to_string();
+            url.path_segments_mut()
+                .map_err(|_| ApiError::InvalidResponse)?
+                .clear()
+                .extend(["v1", "mail", "messages", &uid_str, "attachments", &idx_str]);
+        }
+        {
+            let mut pairs = url.query_pairs_mut();
+            pairs.append_pair("folder", folder);
+            if let Some(label) = account.map(str::trim).filter(|s| !s.is_empty()) {
+                pairs.append_pair("account", label);
+            }
+        }
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(self.token.expose_secret())
+            .timeout(crate::net_policy::SLOW_TIMEOUT)
+            .send()
+            .map_err(|_| ApiError::Transport)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ApiError::Http(status.as_u16()));
+        }
+        let mut out = Vec::new();
+        response
+            .take(MAX_ATTACHMENT_BYTES as u64 + 1)
+            .read_to_end(&mut out)
+            .map_err(|_| ApiError::Transport)?;
+        if out.len() > MAX_ATTACHMENT_BYTES {
+            return Err(ApiError::TooLarge);
+        }
+        Ok(out)
+    }
+
+    /// `POST /v1/mail/messages/{uid}/attachments/{index}/save-to-library`: save one attachment into the member's Library (0.74.12).
+    pub fn mail_save_attachment_to_library(
+        &self,
+        account: Option<&str>,
+        folder: &str,
+        uid: u32,
+        index: usize,
+    ) -> Result<serde_json::Value, ApiError> {
+        let mut query: Vec<(&str, &str)> = vec![("folder", folder)];
+        if let Some(label) = account.map(str::trim).filter(|s| !s.is_empty()) {
+            query.push(("account", label));
+        }
+        let uid_str = uid.to_string();
+        let idx_str = index.to_string();
+        self.request::<_, ()>(
+            Method::POST,
+            &[
+                "v1",
+                "mail",
+                "messages",
+                &uid_str,
+                "attachments",
+                &idx_str,
+                "save-to-library",
+            ],
+            &query,
+            None,
+        )
     }
 
     /// `GET /v1/library`: the member's global Library — bot-made files from
@@ -8780,5 +9030,121 @@ mod mail_and_search_tests {
         assert_eq!(task.status, TaskStatus::NeedsReview);
         assert_eq!(task.status.label(), "Needs review");
         assert!(!task.status.terminal());
+    }
+
+    #[test]
+    fn mail_search_parses_messages_list() {
+        let json = r#"{"messages":[{"uid":42,"subject":"Invoice","from":"alice@example.test","to":"bob@example.test","date":"2026-11-24","flags":["\\Seen","\\Flagged"],"body":"Hi","attachments":[]}]}"#;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            json.len(),
+            json
+        )
+        .into_bytes();
+        let msgs = client_for(serve_once(resp))
+            .mail_search(Some("work"), "INBOX", "Invoice", 25)
+            .unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].uid, 42);
+        assert_eq!(msgs[0].subject, "Invoice");
+        assert_eq!(msgs[0].to, "bob@example.test");
+        assert_eq!(msgs[0].flags, vec!["\\Seen", "\\Flagged"]);
+    }
+
+    #[test]
+    fn mail_message_unwraps_wrapped_message_object() {
+        let json = r#"{"message":{"uid":7,"subject":"Hello","from":"a@b.test","date":"2026-11-24","flags":[],"body":"Body","attachments":[{"name":"doc.pdf","content_type":"application/pdf","size":123}]}}"#;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            json.len(),
+            json
+        )
+        .into_bytes();
+        let msg = client_for(serve_once(resp))
+            .mail_message(None, "INBOX", 7)
+            .unwrap();
+        assert_eq!(msg.uid, 7);
+        assert_eq!(msg.attachments.len(), 1);
+        assert_eq!(msg.attachments[0].name, "doc.pdf");
+    }
+
+    #[test]
+    fn mail_flag_move_delete_and_send_requests_succeed_and_validate() {
+        let ok = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}".to_vec();
+        client_for(serve_once(ok.clone()))
+            .mail_flag(None, "INBOX", 10, Some(true), Some(false))
+            .unwrap();
+        client_for(serve_once(ok.clone()))
+            .mail_move(Some("work"), "INBOX", 10, "Archive")
+            .unwrap();
+        client_for(serve_once(ok.clone()))
+            .mail_delete(None, "Trash", 10)
+            .unwrap();
+        client_for(serve_once(ok))
+            .mail_send(
+                None,
+                &["alice@example.test".into()],
+                "Subj",
+                "Body",
+                &["abc123".into()],
+            )
+            .unwrap();
+
+        // Validation checks
+        let dummy = client_for(1);
+        assert!(matches!(
+            dummy.mail_move(None, "INBOX", 1, "   "),
+            Err(ApiError::Validation(_))
+        ));
+        assert!(matches!(
+            dummy.mail_send(None, &[], "Subj", "Body", &[]),
+            Err(ApiError::Validation(_))
+        ));
+
+        // Request DTO serialization
+        let flag_json = serde_json::to_value(MailFlagRequest {
+            folder: "INBOX".into(),
+            seen: Some(true),
+            flagged: None,
+        })
+        .unwrap();
+        assert_eq!(
+            flag_json,
+            serde_json::json!({"folder": "INBOX", "seen": true})
+        );
+
+        let send_json = serde_json::to_value(MailSendRequest {
+            account: None,
+            to: vec!["a@b.test".into()],
+            subject: "Hi".into(),
+            body: "Test".into(),
+            artifact_hashes: vec![],
+        })
+        .unwrap();
+        assert_eq!(
+            send_json,
+            serde_json::json!({"to": ["a@b.test"], "subject": "Hi", "body": "Test"})
+        );
+    }
+
+    #[test]
+    fn mail_attachment_bytes_and_save_to_library_parse_responses() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_vec();
+        let bytes = client_for(serve_once(raw))
+            .mail_attachment_bytes(None, "INBOX", 9, 0)
+            .unwrap();
+        assert_eq!(bytes, b"hello");
+
+        let lib_json = r#"{"item":{"id":"h1","filename":"a.txt"}}"#;
+        let lib_resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            lib_json.len(),
+            lib_json
+        )
+        .into_bytes();
+        let val = client_for(serve_once(lib_resp))
+            .mail_save_attachment_to_library(Some("work"), "INBOX", 9, 0)
+            .unwrap();
+        assert_eq!(val["item"]["filename"], "a.txt");
     }
 }
