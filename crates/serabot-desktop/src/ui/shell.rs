@@ -9,6 +9,7 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
     // Archive, move and delete from Mail wait here for their Undo window, even after
     // the Mail page is left.
     crate::ui_mail_actions::use_mail_committer(session);
+    crate::ui_mail_actions::use_mail_unread_poll(session);
     let chat = section == Section::Chat;
     let mut drawer_open = use_signal(|| false);
     let mut toast = use_signal(|| Option::<(String, bool)>::None);
@@ -177,6 +178,7 @@ pub(super) fn IconRail(
     let mut overlay = overlay;
     let section = session.read().section;
     let waiting = session.read().state.approvals.len();
+    let mail_unread = *crate::ui_mail_actions::MAIL_UNREAD.read() as usize;
     let work: [(Section, &str, &str); 3] = [
         (Section::Chat, "chat", "Chats"),
         (Section::Mail, "send", "Mail"),
@@ -211,11 +213,15 @@ pub(super) fn IconRail(
             for group in [work.as_slice(), workspace.as_slice()] {
                 for (target, icon, label) in group.iter().copied() {
                     {
-                        let badge = if target == Section::Chat { waiting } else { 0 };
-                        let tip = if badge > 0 {
-                            format!("{label}: {badge} waiting for your OK")
-                        } else {
-                            label.to_owned()
+                        let badge = match target {
+                            Section::Chat => waiting,
+                            Section::Mail => mail_unread,
+                            _ => 0,
+                        };
+                        let tip = match (target, badge) {
+                            (_, 0) => label.to_owned(),
+                            (Section::Mail, n) => format!("{label}: {n} unread"),
+                            (_, n) => format!("{label}: {n} waiting for your OK"),
                         };
                         rsx! {
                             button {
