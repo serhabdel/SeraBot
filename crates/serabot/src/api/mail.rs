@@ -228,7 +228,7 @@ async fn messages(
         .ok_or_else(|| SeraError::Validation("mail is not connected; connect it first".into()))?;
     let folder = query.folder.as_deref().unwrap_or("");
     let limit = query.limit.unwrap_or(20);
-    let messages = mail::imap_list(&creds, folder, limit).await?;
+    let messages = mail::imap_list_preview(&creds, folder, limit).await?;
     let messages = super::mail_extras::hide_snoozed(&state, &user.id, account, folder, messages);
     super::mail_extras::observe_senders(&state, &user.id, &messages);
     Ok(Json(json!({ "messages": messages })))
@@ -315,7 +315,7 @@ async fn search(
     let folder = query.folder.as_deref().unwrap_or("");
     let q = query.q.as_deref().unwrap_or("");
     let limit = query.limit.unwrap_or(20);
-    let messages = mail::imap_search(&creds, folder, q, limit).await?;
+    let messages = mail::imap_search_preview(&creds, folder, q, limit).await?;
     super::mail_extras::observe_senders(&state, &user.id, &messages);
     Ok(Json(json!({ "messages": messages })))
 }
@@ -597,6 +597,9 @@ struct ScheduleRequest {
     /// `later` (default) or `undo`, the short hold behind Undo send.
     #[serde(default)]
     kind: Option<String>,
+    /// Artifact hashes (Library files) to send with the message.
+    #[serde(default)]
+    attachment_hashes: Vec<String>,
 }
 
 /// Undo send holds a message for a few seconds; anything outside this window is refused.
@@ -670,6 +673,17 @@ async fn schedule_message(
     for rcpt in req.to.iter().chain(req.cc.iter()).chain(req.bcc.iter()) {
         state.runtime.scan_owner_output(&user.id, rcpt)?;
     }
+    if req.attachment_hashes.len() > mail::MAX_ATTACHMENTS {
+        return Err(SeraError::Validation(format!(
+            "at most {} attachments are allowed",
+            mail::MAX_ATTACHMENTS
+        )));
+    }
+    for hash in &req.attachment_hashes {
+        if !state.store.user_owns_artifact(&user.id, hash)? {
+            return Err(SeraError::Forbidden("artifact".into()));
+        }
+    }
     let kind = match req.kind.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
         None | Some("later") => "later",
         Some("undo") => {
@@ -697,6 +711,11 @@ async fn schedule_message(
         req.send_at,
         kind,
     )?;
+    if !req.attachment_hashes.is_empty() {
+        state
+            .store
+            .set_scheduled_mail_attachments(&user.id, &row.id, &req.attachment_hashes)?;
+    }
     super::mail_extras::remember_recipients(
         &state,
         &user.id,

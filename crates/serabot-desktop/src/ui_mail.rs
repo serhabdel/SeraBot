@@ -12,20 +12,25 @@ use base64::Engine as _;
 use dioxus::prelude::*;
 use serabot_desktop::bot_library::LibraryItem;
 use serabot_desktop::mail_view::{
-    DayBucket, MailKey, Selection, apply_suggestion, day_bucket, full_date_label, group_threads,
-    map_key, parse_mail_date, sender_name, suggestion_query,
+    DayBucket, MailKey, Selection, day_bucket, full_date_label, group_threads, map_key,
+    parse_mail_date, sender_name,
 };
 use serabot_desktop::session::{Section, Session};
 use serabot_desktop::{
-    MailAccountStatus, MailContact, MailDraftRequest, MailMessageInfo, MailSnoozeItem, MailStatus,
+    MailAccountStatus, MailDraftRequest, MailMessageInfo, MailSnoozeItem, MailStatus,
     SavedMailSearch, ScheduledMailItem,
 };
 use serde::Deserialize;
 
 use crate::ui::Icon;
+use crate::ui_files::{PastedFile, decode_pasted};
 use crate::ui_mail_actions::{
     FAILED, SEND_HOLD_SECS, UndoEntry, UndoKind, announce, archive_messages, delete_messages,
     queue_draft_delete, restore_failed, run_undo, set_flags, settle, sleep_ms,
+};
+use crate::ui_mail_compose::{
+    AttachedFile, AttachmentTray, DroppedFile, MAIL_DROP_JS, RecipientField, attach, detach,
+    invalid_recipients, pick_local_files, recipient_addresses, upload_attachments,
 };
 use crate::ui_mail_list::{
     BulkBar, DayHeader, MailRow, RowSkeletons, ShortcutsDialog, SnoozeDialog, ThreadInfo, UndoBar,
@@ -2177,45 +2182,6 @@ fn compose_fingerprint(to: &str, cc: &str, subject: &str, body: &str) -> String 
     format!("{to}\u{1}{cc}\u{1}{subject}\u{1}{body}")
 }
 
-/// Recipient suggestions under an address field.
-#[component]
-fn SuggestList(
-    items: Vec<MailContact>,
-    field: Signal<String>,
-    on_pick: EventHandler<()>,
-) -> Element {
-    let mut field = field;
-    rsx! {
-        div { class: "mail-suggest", role: "listbox", "aria-label": "Suggested recipients",
-            for c in items.iter() {
-                {
-                    let email = c.email.clone();
-                    let label = if c.name.trim().is_empty() {
-                        c.email.clone()
-                    } else {
-                        format!("{} <{}>", c.name, c.email)
-                    };
-                    rsx! {
-                        button {
-                            key: "{email}",
-                            class: "mail-suggest-item",
-                            r#type: "button",
-                            role: "option",
-                            onmousedown: move |e: MouseEvent| {
-                                e.prevent_default();
-                                let next = apply_suggestion(&field(), &email);
-                                field.set(next);
-                                on_pick.call(());
-                            },
-                            "{label}"
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 #[component]
 fn MailComposeModal(
     session: Signal<Session>,
@@ -2225,9 +2191,9 @@ fn MailComposeModal(
     on_close: EventHandler<()>,
     on_sent: EventHandler<()>,
 ) -> Element {
-    let mut to = use_signal(|| initial.to.clone());
-    let mut cc = use_signal(|| initial.cc.clone());
-    let mut bcc = use_signal(|| initial.bcc.clone());
+    let to = use_signal(|| initial.to.clone());
+    let cc = use_signal(|| initial.cc.clone());
+    let bcc = use_signal(|| initial.bcc.clone());
     let mut show_cc_bcc = use_signal(|| !initial.cc.is_empty() || !initial.bcc.is_empty());
     let mut subject = use_signal(|| initial.subject.clone());
     let mut body = use_signal(|| initial.body.clone());
@@ -2236,7 +2202,7 @@ fn MailComposeModal(
     let mut link_open = use_signal(|| false);
     let mut link_url = use_signal(|| "https://".to_owned());
     let mut link_label = use_signal(String::new);
-    let mut selected_hashes = use_signal(|| initial.selected_hashes.clone());
+    let selected_hashes = use_signal(|| initial.selected_hashes.clone());
     let mut library_items = use_signal(Vec::<LibraryItem>::new);
     let mut picker_open = use_signal(|| false);
     let mut loading_library = use_signal(|| false);
@@ -2244,9 +2210,9 @@ fn MailComposeModal(
     let mut custom_send_at = use_signal(String::new);
     let mut sending = use_signal(|| false);
     let mut send_error = use_signal(|| Option::<String>::None);
-    let mut suggestions = use_signal(Vec::<MailContact>::new);
-    let mut suggest_field = use_signal(|| 0u8);
-    let mut suggest_seen = use_signal(String::new);
+    let attached = use_signal(Vec::<AttachedFile>::new);
+    let attach_busy = use_signal(|| 0usize);
+    let mut attach_notice = use_signal(|| Option::<String>::None);
     let mut draft_uid = use_signal(|| Option::<u32>::None);
     let mut draft_folder = use_signal(String::new);
     let mut draft_state = use_signal(|| "");
@@ -2283,8 +2249,16 @@ fn MailComposeModal(
     };
 
     let account_for_send = account.clone();
-    let submit_send = move |_| {
-        let recipients = parse_recipients(&to());
+    let submit_send = Callback::new(move |()| {
+        let bad = invalid_recipients(&[&to(), &cc(), &bcc()]);
+        if !bad.is_empty() {
+            send_error.set(Some(format!(
+                "These are not email addresses: {}",
+                bad.join(", ")
+            )));
+            return;
+        }
+        let recipients = recipient_addresses(&to());
         if recipients.is_empty() {
             send_error.set(Some("Enter at least one recipient.".to_owned()));
             return;
@@ -2293,34 +2267,31 @@ fn MailComposeModal(
         send_error.set(None);
         send_later_open.set(false);
         let acct = account_for_send.clone();
-        let cc_list = parse_recipients(&cc());
-        let bcc_list = parse_recipients(&bcc());
+        let cc_list = recipient_addresses(&cc());
+        let bcc_list = recipient_addresses(&bcc());
         let subj = subject();
         let (plain_body, body_html) = compose_to_body_and_html(&body(), html_mode());
         let hashes: Vec<String> = selected_hashes().into_iter().collect();
-        // Attachments cannot ride through the server-side hold, so those send at once.
-        let can_hold = hashes.is_empty();
         let hold_at = now_unix_secs() as i64 + SEND_HOLD_SECS;
         let acct_del = acct.clone();
         let old_draft = draft_uid().map(|uid| (draft_folder(), uid));
         spawn(async move {
             let res = run_mail_job(session, move |c| {
-                if can_hold {
-                    match c.mail_send_with_undo(
-                        acct.as_deref(),
-                        &recipients,
-                        &cc_list,
-                        &bcc_list,
-                        &subj,
-                        &plain_body,
-                        body_html.clone(),
-                        hold_at,
-                    ) {
-                        Ok(item) => return Ok(Some(item.id)),
-                        // A clock that disagrees with the server: send straight away.
-                        Err(e) if e.to_string().contains("hold") => {}
-                        Err(e) => return Err(e),
-                    }
+                match c.mail_send_with_undo(
+                    acct.as_deref(),
+                    &recipients,
+                    &cc_list,
+                    &bcc_list,
+                    &subj,
+                    &plain_body,
+                    body_html.clone(),
+                    hold_at,
+                    &hashes,
+                ) {
+                    Ok(item) => return Ok(Some(item.id)),
+                    // A clock that disagrees with the server: send straight away.
+                    Err(e) if e.to_string().contains("hold") => {}
+                    Err(e) => return Err(e),
                 }
                 c.mail_send(
                     acct.as_deref(),
@@ -2356,11 +2327,19 @@ fn MailComposeModal(
                 Err(err) => send_error.set(Some(err)),
             }
         });
-    };
+    });
 
     let account_for_sched = account.clone();
     let trigger_schedule = Callback::new(move |send_at: i64| {
-        let recipients = parse_recipients(&to());
+        let bad = invalid_recipients(&[&to(), &cc(), &bcc()]);
+        if !bad.is_empty() {
+            send_error.set(Some(format!(
+                "These are not email addresses: {}",
+                bad.join(", ")
+            )));
+            return;
+        }
+        let recipients = recipient_addresses(&to());
         if recipients.is_empty() {
             send_error.set(Some("Enter at least one recipient.".to_owned()));
             return;
@@ -2369,10 +2348,11 @@ fn MailComposeModal(
         send_error.set(None);
         send_later_open.set(false);
         let acct = account_for_sched.clone();
-        let cc_list = parse_recipients(&cc());
-        let bcc_list = parse_recipients(&bcc());
+        let cc_list = recipient_addresses(&cc());
+        let bcc_list = recipient_addresses(&bcc());
         let subj = subject();
         let (plain_body, body_html) = compose_to_body_and_html(&body(), html_mode());
+        let hashes: Vec<String> = selected_hashes().into_iter().collect();
         spawn(async move {
             let res = run_mail_job(session, move |c| {
                 c.mail_schedule(
@@ -2384,6 +2364,7 @@ fn MailComposeModal(
                     &plain_body,
                     body_html,
                     send_at,
+                    &hashes,
                 )
             })
             .await;
@@ -2402,20 +2383,27 @@ fn MailComposeModal(
         });
     });
 
-    let refresh_suggestions = Callback::new(move |(field, value): (u8, String)| {
-        let Some(q) = suggestion_query(&value) else {
-            suggestions.set(Vec::new());
-            return;
-        };
-        suggest_field.set(field);
-        suggest_seen.set(q.clone());
-        spawn(async move {
-            let q_job = q.clone();
-            let res = run_mail_job(session, move |c| c.mail_contacts(&q_job, 6)).await;
-            if suggest_seen() == q {
-                suggestions.set(res.unwrap_or_default());
+    // Files dropped anywhere on the composer are uploaded and attached.
+    use_future(move || async move {
+        let mut bridge = dioxus::document::eval(MAIL_DROP_JS);
+        while let Ok(file) = bridge.recv::<DroppedFile>().await {
+            if file.too_big {
+                attach_notice.set(Some(format!("{}: too large to attach.", file.name)));
+                continue;
             }
-        });
+            let (name, bytes) = decode_pasted(PastedFile {
+                name: file.name,
+                data: file.data,
+            });
+            upload_attachments(
+                session,
+                vec![(name, bytes)],
+                attached,
+                selected_hashes,
+                attach_busy,
+                attach_notice,
+            );
+        }
     });
 
     // Save a draft to the mailbox's Drafts folder once typing has paused for a few
@@ -2446,8 +2434,8 @@ fn MailComposeModal(
                     account: acct.clone(),
                     folder: None,
                     replace_uid: *draft_uid.peek(),
-                    to: parse_recipients(&to.peek()),
-                    cc: parse_recipients(&cc.peek()),
+                    to: recipient_addresses(&to.peek()),
+                    cc: recipient_addresses(&cc.peek()),
                     subject: (*subject.peek()).clone(),
                     body: plain,
                     body_html: html,
@@ -2486,10 +2474,19 @@ fn MailComposeModal(
             "aria-modal": "true",
             "aria-label": "{modal_title}",
             onkeydown: move |e: KeyboardEvent| {
+                let mods = e.modifiers();
+                let ctrl = mods.contains(Modifiers::CONTROL) || mods.contains(Modifiers::META);
                 if e.key() == Key::Escape {
                     on_close.call(());
+                } else if e.key() == Key::Enter && ctrl && !sending() {
+                    e.prevent_default();
+                    submit_send.call(());
                 }
             },
+            div { class: "mail-drop-hint", "aria-hidden": "true",
+                Icon { name: "upload", size: 22 }
+                span { "Drop files to attach them" }
+            }
             div { class: "mp-sheet-head",
                 h2 { class: "mp-sheet-title", "{modal_title}" }
                 button {
@@ -2502,88 +2499,38 @@ fn MailComposeModal(
                 }
             }
             div { class: "mp-sheet-body mail-compose-body",
-                div { class: "field",
-                    div { class: "mail-field-head-row",
-                        label { class: "field-label", r#for: "mail-compose-to", "To" }
-                        button {
-                            class: "btn ghost sm",
-                            r#type: "button",
-                            onclick: move |_| show_cc_bcc.set(!show_cc_bcc()),
-                            if show_cc_bcc() { "Hide Cc/Bcc" } else { "Cc / Bcc" }
-                        }
-                    }
-                    input {
-                        id: "mail-compose-to",
-                        class: "input",
-                        r#type: "text",
-                        placeholder: "alice@example.com, bob@example.com",
+                div { class: "rcpt-head",
+                    RecipientField {
+                        session,
+                        id: "mail-compose-to".to_owned(),
+                        label: "To".to_owned(),
+                        value: to,
+                        placeholder: "Type an address and press Enter".to_owned(),
                         disabled: sending(),
-                        value: "{to}",
-                        oninput: move |e| {
-                            let v = e.value();
-                            to.set(v.clone());
-                            refresh_suggestions.call((1, v));
-                        },
-                        onblur: move |_| suggestions.set(Vec::new()),
                     }
-                    if suggest_field() == 1 && !suggestions().is_empty() {
-                        SuggestList {
-                            items: suggestions(),
-                            field: to,
-                            on_pick: move |_| suggestions.set(Vec::new()),
-                        }
+                    button {
+                        class: "btn ghost sm rcpt-ccbcc",
+                        r#type: "button",
+                        onclick: move |_| show_cc_bcc.set(!show_cc_bcc()),
+                        if show_cc_bcc() { "Hide Cc/Bcc" } else { "Cc / Bcc" }
                     }
                 }
                 if show_cc_bcc() {
-                    div { class: "mail-cc-bcc-grid",
-                        div { class: "field",
-                            label { class: "field-label", r#for: "mail-compose-cc", "Cc" }
-                            input {
-                                id: "mail-compose-cc",
-                                class: "input",
-                                r#type: "text",
-                                placeholder: "cc@example.com",
-                                disabled: sending(),
-                                value: "{cc}",
-                                oninput: move |e| {
-                                    let v = e.value();
-                                    cc.set(v.clone());
-                                    refresh_suggestions.call((2, v));
-                                },
-                                onblur: move |_| suggestions.set(Vec::new()),
-                            }
-                            if suggest_field() == 2 && !suggestions().is_empty() {
-                                SuggestList {
-                                    items: suggestions(),
-                                    field: cc,
-                                    on_pick: move |_| suggestions.set(Vec::new()),
-                                }
-                            }
-                        }
-                        div { class: "field",
-                            label { class: "field-label", r#for: "mail-compose-bcc", "Bcc" }
-                            input {
-                                id: "mail-compose-bcc",
-                                class: "input",
-                                r#type: "text",
-                                placeholder: "bcc@example.com",
-                                disabled: sending(),
-                                value: "{bcc}",
-                                oninput: move |e| {
-                                    let v = e.value();
-                                    bcc.set(v.clone());
-                                    refresh_suggestions.call((3, v));
-                                },
-                                onblur: move |_| suggestions.set(Vec::new()),
-                            }
-                            if suggest_field() == 3 && !suggestions().is_empty() {
-                                SuggestList {
-                                    items: suggestions(),
-                                    field: bcc,
-                                    on_pick: move |_| suggestions.set(Vec::new()),
-                                }
-                            }
-                        }
+                    RecipientField {
+                        session,
+                        id: "mail-compose-cc".to_owned(),
+                        label: "Cc".to_owned(),
+                        value: cc,
+                        placeholder: "Copy".to_owned(),
+                        disabled: sending(),
+                    }
+                    RecipientField {
+                        session,
+                        id: "mail-compose-bcc".to_owned(),
+                        label: "Bcc".to_owned(),
+                        value: bcc,
+                        placeholder: "Hidden copy".to_owned(),
+                        disabled: sending(),
                     }
                 }
                 div { class: "field",
@@ -2743,10 +2690,44 @@ fn MailComposeModal(
                         class: "btn ghost sm",
                         r#type: "button",
                         disabled: sending(),
-                        onclick: load_library,
+                        title: "Choose files from this computer. You can also drop them anywhere here.",
+                        onclick: move |_| match pick_local_files() {
+                            Ok(picked) => {
+                                upload_attachments(
+                                    session,
+                                    picked.files,
+                                    attached,
+                                    selected_hashes,
+                                    attach_busy,
+                                    attach_notice,
+                                );
+                                if !picked.skipped.is_empty() {
+                                    attach_notice.set(Some(format!(
+                                        "Too large to attach: {}",
+                                        picked.skipped.join(", ")
+                                    )));
+                                }
+                            }
+                            Err(err) => attach_notice.set(Some(err)),
+                        },
                         Icon { name: "paperclip", size: 14 }
-                        "Attach from Library ({selected_hashes().len()})"
+                        "Attach files"
                     }
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        disabled: sending(),
+                        onclick: load_library,
+                        Icon { name: "library", size: 14 }
+                        "From Library"
+                    }
+                    span { class: "tiny muted", "or drop files here" }
+                }
+                AttachmentTray {
+                    items: attached(),
+                    busy: attach_busy(),
+                    notice: attach_notice(),
+                    on_remove: move |hash: String| detach(attached, selected_hashes, &hash),
                 }
 
                 if picker_open() {
@@ -2760,6 +2741,8 @@ fn MailComposeModal(
                                 {
                                     let id = item.id.clone();
                                     let id_toggle = item.id.clone();
+                                    let name_toggle = item.label();
+                                    let size_toggle = item.size_bytes.unwrap_or(0);
                                     let checked = selected_hashes().contains(&id);
                                     let label = item.label();
                                     rsx! {
@@ -2768,11 +2751,16 @@ fn MailComposeModal(
                                                 r#type: "checkbox",
                                                 checked,
                                                 onchange: move |_| {
-                                                    let mut set = selected_hashes.write();
-                                                    if set.contains(&id_toggle) {
-                                                        set.remove(&id_toggle);
+                                                    if checked {
+                                                        detach(attached, selected_hashes, &id_toggle);
                                                     } else {
-                                                        set.insert(id_toggle.clone());
+                                                        attach(
+                                                            attached,
+                                                            selected_hashes,
+                                                            id_toggle.clone(),
+                                                            name_toggle.clone(),
+                                                            size_toggle,
+                                                        );
                                                     }
                                                 },
                                             }
@@ -2804,7 +2792,7 @@ fn MailComposeModal(
                             class: "btn primary",
                             r#type: "button",
                             disabled: sending(),
-                            onclick: submit_send,
+                            onclick: move |_| submit_send.call(()),
                             Icon { name: "send", size: 14 }
                             if sending() { "Sending\u{2026}" } else { "Send" }
                         }

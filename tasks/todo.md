@@ -635,3 +635,15 @@ never merge without the owner's OK.
 - [x] Version bump `0.74.14` (`Cargo.toml`, `Cargo.lock`), mobile `0.74.14+88`, `docs/release-0.74.14.md`, `README.md`, `AGENTS.md`.
 - [ ] Owner: live pass on Hostinger (Drafts APPEND, search operators, threading, snooze wake, Undo send, unsubscribe) and on Windows WebView2 (pane resize, density, shortcuts, Undo bar, snooze dialog, picker star).
 - [ ] Deferred: branch/pin chat messages, Send/Stop morph, composer mode chips, picker cost/speed hints and per-chat default toggle, Settings Save/Discard bar, Activity feed, mobile threads/snooze/drafts.
+
+## Release 0.74.15 (proposed) — harness, stability, composer, recall
+
+Plan: `docs/specs/0.74.15-proposal.md`. Version stays `0.74.14` until the batch is cut.
+
+- [x] Mail composer: sticky footer, recipient chips (Enter/comma/Tab/paste, Backspace removes, suggestions with arrows), attach from PC + drag and drop + Library, size/count limits, Ctrl+Enter, address validation.
+- [x] Chat: message action bar below the message instead of floating over its neighbour; a retried message with no reply between shows once.
+- [ ] Owner: try the composer on Windows (drop files, Enter in To, footer in a short window) and the chat bar.
+- [x] Track 1: fake IMAP server + client tests, owner checklist script. Track 2: batched list fetch, task tracing span. Track 3: unread badge, attachments on scheduled/undo sends. Track 6: hostile HTML and header corpora.
+- [ ] Still open: file splits, durable job runner, turn-loop invariant tests, back-pressure audit, restore drill, Settings Save/Discard bar, Activity feed, shared components, audit-coverage test, mobile mail parity.
+- [ ] Track 7b recall and retry-by-reference: **needs owner approval** before code.
+

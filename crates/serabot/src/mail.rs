@@ -2463,6 +2463,80 @@ fn parse_search_uids(untagged: &[String]) -> Vec<u32> {
         .collect()
 }
 
+/// How much of each message a list row needs: the headers and the start of the body.
+const PREVIEW_BYTES: usize = 8192;
+
+/// The UID of one untagged `FETCH` response, read from before its body literal.
+fn fetch_response_uid(block: &str) -> Option<u32> {
+    let head = &block[..block.find("BODY[").unwrap_or(block.len())];
+    let at = head.find("UID ")?;
+    head[at + 4..]
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Fetch the first [`PREVIEW_BYTES`] of several messages with one command and parse
+/// them like full messages. Attachments are not seen in so little text, but a
+/// `multipart/mixed` message still reports `has_attachments`. Order follows `uids`.
+async fn fetch_previews<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut Wire<S>,
+    uids: &[u32],
+) -> Result<Vec<MailMessage>> {
+    if uids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let set = uids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    wire.send_line(&format!(
+        "a5 UID FETCH {set} (UID FLAGS BODY.PEEK[]<0.{PREVIEW_BYTES}>)"
+    ))
+    .await?;
+    let (_, untagged) = wire.expect_tagged("a5").await?;
+    let mut by_uid: HashMap<u32, MailMessage> = HashMap::new();
+    for block in untagged {
+        let Some(uid) = fetch_response_uid(&block) else {
+            continue;
+        };
+        let (flags, body) = parse_fetch_block(&block);
+        let Some(raw) = body.filter(|b| !b.is_empty()) else {
+            continue;
+        };
+        by_uid.insert(uid, parse_message(uid, flags, &raw));
+    }
+    Ok(uids.iter().filter_map(|u| by_uid.remove(u)).collect())
+}
+
+/// Previews for list rows. If the server refuses or garbles the batched partial
+/// fetch, fall back to fetching each message whole, as before.
+async fn fetch_list_rows<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut Wire<S>,
+    untagged: Vec<String>,
+    limit: u32,
+) -> Result<Vec<MailMessage>> {
+    let uids: Vec<u32> = parse_search_uids(&untagged)
+        .into_iter()
+        .rev()
+        .take(limit as usize)
+        .collect();
+    if let Ok(rows) = fetch_previews(wire, &uids).await
+        && (!rows.is_empty() || uids.is_empty())
+    {
+        return Ok(rows);
+    }
+    let mut out = Vec::new();
+    for uid in uids {
+        if let Ok(msg) = imap_fetch(wire, uid).await {
+            out.push(msg);
+        }
+    }
+    Ok(out)
+}
+
 /// Fetch the newest `limit` matching messages of a folder after a SEARCH.
 async fn fetch_search_results<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut Wire<S>,
@@ -2501,6 +2575,25 @@ pub async fn imap_list(
     Ok(out)
 }
 
+/// List the newest `limit` messages for list rows: one batched fetch of the start of
+/// each message (headers, snippet, attachment hint) instead of every message whole.
+pub async fn imap_list_preview(
+    creds: &MailCredentials,
+    folder: &str,
+    limit: u32,
+) -> Result<Vec<MailMessage>> {
+    let limit = limit.clamp(1, MAX_LIST);
+    let mut wire = imap_connect(creds).await?;
+    let folder = normalize_folder(folder)?;
+    select_folder(&mut wire, &folder).await?;
+    wire.send_line("a3 UID SEARCH ALL").await?;
+    let (_, untagged) = wire.expect_tagged("a3").await?;
+    let mut out = fetch_list_rows(&mut wire, untagged, limit).await?;
+    assign_thread_keys(&mut out);
+    let _ = wire.send_line("a9 LOGOUT").await;
+    Ok(out)
+}
+
 /// List the newest `limit` message headers (subject, from, date, flags; empty
 /// body) of a folder read-only using `EXAMINE` and `BODY.PEEK[HEADER]`.
 pub async fn imap_list_headers(
@@ -2532,6 +2625,20 @@ pub async fn imap_list_headers(
     Ok(out)
 }
 
+/// UIDs of the unread messages of a folder. One `SEARCH UNSEEN` on a read-only
+/// `EXAMINE`; nothing is fetched or flagged, so it is cheap enough to poll.
+pub async fn imap_unread_uids(creds: &MailCredentials, folder: &str) -> Result<Vec<u32>> {
+    let mut wire = imap_connect(creds).await?;
+    let folder = normalize_folder(folder)?;
+    wire.send_line(&format!("a2 EXAMINE {}", imap_quote(&folder)))
+        .await?;
+    wire.expect_tagged("a2").await?;
+    wire.send_line("a3 UID SEARCH UNSEEN").await?;
+    let (_, untagged) = wire.expect_tagged("a3").await?;
+    let _ = wire.send_line("a9 LOGOUT").await;
+    Ok(parse_search_uids(&untagged))
+}
+
 /// Search a folder; returns the newest `limit` matches. A bare word searches
 /// subject, sender and body. Operators narrow it (`from:`, `to:`, `subject:`,
 /// `has:attachment`, `is:unread`, `is:starred`, `before:`, `after:`, see
@@ -2541,6 +2648,27 @@ pub async fn imap_search(
     folder: &str,
     query: &str,
     limit: u32,
+) -> Result<Vec<MailMessage>> {
+    search_rows(creds, folder, query, limit, false).await
+}
+
+/// Like [`imap_search`] but for list rows: one batched fetch of the start of each
+/// message instead of every message whole.
+pub async fn imap_search_preview(
+    creds: &MailCredentials,
+    folder: &str,
+    query: &str,
+    limit: u32,
+) -> Result<Vec<MailMessage>> {
+    search_rows(creds, folder, query, limit, true).await
+}
+
+async fn search_rows(
+    creds: &MailCredentials,
+    folder: &str,
+    query: &str,
+    limit: u32,
+    preview: bool,
 ) -> Result<Vec<MailMessage>> {
     let limit = limit.clamp(1, MAX_LIST);
     let parsed = mail_ux::parse_query(query).map_err(SeraError::Validation)?;
@@ -2556,7 +2684,11 @@ pub async fn imap_search(
     } else {
         limit
     };
-    let mut out = fetch_search_results(&mut wire, untagged, fetch_limit).await?;
+    let mut out = if preview {
+        fetch_list_rows(&mut wire, untagged, fetch_limit).await?
+    } else {
+        fetch_search_results(&mut wire, untagged, fetch_limit).await?
+    };
     if parsed.needs_attachment_filter() {
         out.retain(|m| m.has_attachments);
         out.truncate(limit as usize);

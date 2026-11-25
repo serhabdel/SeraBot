@@ -211,6 +211,50 @@ pub(crate) fn queue_draft_delete(account: Option<String>, folder: String, uid: u
     DRAFT_TRASH.write().push((account, folder, uid));
 }
 
+/// Unread messages across the member's mailboxes, refreshed by [`use_mail_unread_poll`].
+pub(crate) static MAIL_UNREAD: GlobalSignal<u32> = Signal::global(|| 0);
+
+/// Checks every connected mailbox for unread inbox mail a few seconds after start and
+/// then every 90 seconds, and keeps [`MAIL_UNREAD`] current for the rail badge. A
+/// check costs one IMAP search per mailbox and never fetches a message. Failures are
+/// ignored: the badge just keeps its last value. Call it from the always-mounted shell.
+pub(crate) fn use_mail_unread_poll(session: Signal<Session>) {
+    use_future(move || async move {
+        sleep_ms(5_000).await;
+        loop {
+            let res = run_mail_job(session, |c| {
+                let status = c.mail_status()?;
+                let labels: Vec<Option<String>> = if status.accounts.is_empty() {
+                    if status.connected {
+                        vec![None]
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    status
+                        .accounts
+                        .iter()
+                        .map(|a| (!a.account.is_empty()).then(|| a.account.clone()))
+                        .collect()
+                };
+                let mut total = 0u32;
+                for label in labels {
+                    total =
+                        total.saturating_add(c.mail_unread(label.as_deref(), "INBOX").unwrap_or(0));
+                }
+                Ok(total)
+            })
+            .await;
+            if let Ok(total) = res
+                && *MAIL_UNREAD.peek() != total
+            {
+                *MAIL_UNREAD.write() = total;
+            }
+            sleep_ms(90_000).await;
+        }
+    });
+}
+
 /// Runs the Undo timer and the remote calls for mail actions. Call it once from a
 /// component that stays mounted for the whole session (the shell).
 pub(crate) fn use_mail_committer(session: Signal<Session>) {

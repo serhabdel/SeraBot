@@ -15,6 +15,7 @@ pub(super) fn routes() -> Router<Arc<ApiState>> {
         )
         .route("/v1/mail/snoozed", get(list_snoozed))
         .route("/v1/mail/contacts", get(search_contacts))
+        .route("/v1/mail/unread", get(unread_count))
         .route(
             "/v1/mail/saved-searches",
             get(list_saved_searches).post(create_saved_search),
@@ -177,6 +178,26 @@ async fn unsnooze_message(
         .store
         .unsnooze_mail(&user.id, account.unwrap_or(""), &folder, uid)?;
     Ok(Json(json!({ "removed": removed })))
+}
+
+/// `GET /v1/mail/unread?account=&folder=`: how many unread messages the folder holds
+/// (the inbox by default). Snoozed messages do not count. Reads nothing but the
+/// message numbers, so clients can poll it.
+async fn unread_count(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Query(query): Query<FolderQuery>,
+) -> Result<Json<Value>> {
+    let account = normalize_account(query.account.as_deref())?;
+    let creds = require_mail_creds(&state, &user.id, account)?;
+    let folder = checked_folder(query.folder.as_deref())?;
+    let uids = mail::imap_unread_uids(&creds, &folder).await?;
+    let hidden = state
+        .store
+        .snoozed_uids(&user.id, account.unwrap_or(""), &folder)
+        .unwrap_or_default();
+    let unread = uids.iter().filter(|uid| !hidden.contains(uid)).count();
+    Ok(Json(json!({ "unread": unread })))
 }
 
 #[derive(Deserialize)]

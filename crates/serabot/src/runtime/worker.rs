@@ -1,6 +1,7 @@
 //! The worker loop, maintenance and task dispatch.
 
 use super::*;
+use tracing::Instrument;
 
 /// Aborts the task it holds when dropped. The lease heartbeat is held this
 /// way, so a panic in the turn cannot leave it renewing a lease nobody runs.
@@ -251,15 +252,29 @@ impl Runtime {
     pub(super) async fn process_task(&self, task: Task) -> Result<()> {
         // The worker executes every task under its owning user (phase 2).
         let user = task.user_id.clone();
-        let outcome = match task.kind.as_str() {
-            "turn" => self.run_turn(&task).await,
-            "resume" => self.resume_turn(&task).await,
-            "brief" => self.run_brief(&task).await,
-            "watch" => self.run_watch(&task).await,
-            other => Err(SeraError::Validation(format!(
-                "unsupported task kind in this build: {other}"
-            ))),
-        };
+        // Every log line written while the task runs carries its id, kind, bot and
+        // attempt, so one turn can be followed through the logs. No user or message
+        // content goes into the span.
+        let span = tracing::info_span!(
+            "task",
+            task = %task.id,
+            kind = %task.kind,
+            bot = %task.bot,
+            attempt = task.attempts,
+        );
+        let outcome = async {
+            match task.kind.as_str() {
+                "turn" => self.run_turn(&task).await,
+                "resume" => self.resume_turn(&task).await,
+                "brief" => self.run_brief(&task).await,
+                "watch" => self.run_watch(&task).await,
+                other => Err(SeraError::Validation(format!(
+                    "unsupported task kind in this build: {other}"
+                ))),
+            }
+        }
+        .instrument(span)
+        .await;
         // Every exit of the task (completed, parked for approval, failed or
         // superseded) drops the turn's stop mark, so a stop that arrived late
         // cannot linger, and a mark set before an approval pause cannot end

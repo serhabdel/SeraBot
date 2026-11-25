@@ -631,22 +631,18 @@ async fn ux_fake_imap(listener: TcpListener, log: std::sync::Arc<std::sync::Mute
                     .await
                     .unwrap();
             } else if line.contains(" UID FETCH ") {
-                let uid: u32 = line
-                    .split_whitespace()
-                    .nth(3)
-                    .and_then(|w| w.parse().ok())
-                    .unwrap_or(1);
-                let raw = ux_raw_message(uid);
-                writer
-                    .write_all(
-                        format!(
-                            "* {uid} FETCH (FLAGS (\\Seen) UID {uid} BODY[] {{{}}}\r\n{raw})\r\n{tag} OK done\r\n",
-                            raw.len()
-                        )
-                        .as_bytes(),
-                    )
-                    .await
-                    .unwrap();
+                // One command may name several UIDs ("3,2,1"); answer each in turn.
+                let set = line.split_whitespace().nth(3).unwrap_or("1");
+                let mut text = String::new();
+                for uid in set.split(',').filter_map(|w| w.parse::<u32>().ok()) {
+                    let raw = ux_raw_message(uid);
+                    text.push_str(&format!(
+                        "* {uid} FETCH (FLAGS (\\Seen) UID {uid} BODY[] {{{}}}\r\n{raw})\r\n",
+                        raw.len()
+                    ));
+                }
+                text.push_str(&format!("{tag} OK done\r\n"));
+                writer.write_all(text.as_bytes()).await.unwrap();
             } else if line.contains(" APPEND ") {
                 writer.write_all(b"+ go ahead\r\n").await.unwrap();
                 // Collect the literal until the client goes quiet, then confirm.
@@ -975,4 +971,122 @@ async fn mail_workspace_threads_snooze_contacts_searches_drafts_and_undo() {
     );
 
     server.abort();
+}
+
+#[tokio::test]
+async fn scheduled_and_undo_mail_keep_owned_attachments_and_refuse_foreign_ones() {
+    let root = temp_base();
+    let (app, _, store) =
+        app_with_root(true, Policy::from_text("synthetic-forbidden-phrase"), root);
+    let alice = store
+        .create_user("att-a", "aa@example.example", "Att A")
+        .unwrap();
+    let bob = store
+        .create_user("att-b", "ab@example.example", "Att B")
+        .unwrap();
+    let alice_token = mint_for(&store, &alice.id, "att-a-tok");
+    let bob_token = mint_for(&store, &bob.id, "att-b-tok");
+
+    let secrets =
+        crate::user_secrets::UserSecrets::with_master_key(store.clone(), [9u8; 32]).unwrap();
+    crate::mail::store_credentials(
+        &secrets,
+        &alice.id,
+        None,
+        &crate::mail::MailCredentials {
+            smtp_host: "127.0.0.1".into(),
+            smtp_port: 2525,
+            smtp_security: crate::mail::Security::None,
+            username: "aa@example.example".into(),
+            password: "app-password".into(),
+            imap_host: "127.0.0.1".into(),
+            imap_port: 1,
+            imap_security: crate::mail::Security::None,
+            from: None,
+            signature: None,
+        },
+    )
+    .unwrap();
+
+    async fn upload(app: &Router, token: &str, name: &str, bytes: &[u8]) -> String {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/library/upload")
+            .header("authorization", format!("Bearer {token}"))
+            .header("x-filename", name)
+            .body(Body::from(bytes.to_vec()))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        read_json(res).await["item"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+    let alice_hash = upload(&app, &alice_token, "mine.txt", b"alice file").await;
+    let bob_hash = upload(&app, &bob_token, "his.txt", b"bob file").await;
+
+    let later = chrono::Utc::now().timestamp() + 3600;
+    let body = |hashes: Vec<String>, kind: Option<&str>, at: i64| {
+        let mut v = json!({
+            "to": ["rcpt@example.com"], "subject": "With files", "body": "b",
+            "send_at": at, "attachment_hashes": hashes
+        });
+        if let Some(kind) = kind {
+            v["kind"] = json!(kind);
+        }
+        v
+    };
+    let res = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/schedule",
+        body(vec![bob_hash.clone()], None, later),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN, "another member's file");
+    let res = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/schedule",
+        body(vec!["x".to_owned(); 11], None, later),
+    )
+    .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "too many files"
+    );
+
+    let res = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/schedule",
+        body(vec![alice_hash.clone()], None, later),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let id = read_json(res).await["item"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        store.scheduled_mail_attachments(&id).unwrap(),
+        vec![alice_hash.clone()]
+    );
+
+    // The undo hold carries files too.
+    let soon = chrono::Utc::now().timestamp() + 10;
+    let res = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/schedule",
+        body(vec![alice_hash.clone()], Some("undo"), soon),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let res = delete_req(&app, &alice_token, &format!("/v1/mail/scheduled/{id}")).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(store.scheduled_mail_attachments(&id).unwrap().is_empty());
 }

@@ -584,6 +584,25 @@ pub fn assign_library_to_messages(
     assigned
 }
 
+/// Which messages to leave out of the transcript because the user message right
+/// after them says the same thing: a message that got no reply and was sent again
+/// (Retry, or a send that failed). Each row is `(is_user, text, attachment count)`.
+/// The later copy stays, so it keeps its actions and its pending state.
+pub fn retry_duplicates(rows: &[(bool, &str, usize)]) -> Vec<bool> {
+    let mut hidden = vec![false; rows.len()];
+    for (i, pair) in rows.windows(2).enumerate() {
+        let (user, text, files) = pair[0];
+        let (next_user, next_text, next_files) = pair[1];
+        hidden[i] = user
+            && next_user
+            && files == 0
+            && next_files == 0
+            && !text.trim().is_empty()
+            && text.trim() == next_text.trim();
+    }
+    hidden
+}
+
 #[cfg(test)]
 mod tests {
     fn synthetic(id: &str, text: &str) -> crate::Message {
@@ -999,5 +1018,30 @@ mod tests {
         let assigned = assign_library_to_messages(&messages, &library);
         assert!(assigned.trailing.is_empty());
         assert_eq!(assigned.by_message.get("a1").unwrap().len(), 1);
+    }
+    #[test]
+    fn a_retried_message_shows_once() {
+        let rows = [
+            (true, "hello", 0),
+            (true, "hello", 0),
+            (false, "hi there", 0),
+            (true, "hello", 0),
+        ];
+        // The unanswered copy is hidden; the answered one and a later repeat stay.
+        assert_eq!(retry_duplicates(&rows), vec![true, false, false, false]);
+        // Three tries in a row leave only the last.
+        let rows = [(true, "x", 0), (true, " x ", 0), (true, "x", 0)];
+        assert_eq!(retry_duplicates(&rows), vec![true, true, false]);
+        // Different text, files, or an empty message are never merged.
+        let rows = [
+            (true, "a", 0),
+            (true, "b", 0),
+            (true, "c", 1),
+            (true, "c", 1),
+            (true, "", 0),
+            (true, "", 0),
+        ];
+        assert!(retry_duplicates(&rows).iter().all(|h| !h));
+        assert!(retry_duplicates(&[]).is_empty());
     }
 }

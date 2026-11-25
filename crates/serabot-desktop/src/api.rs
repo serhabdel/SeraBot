@@ -2331,6 +2331,9 @@ pub struct MailScheduleRequest {
     /// `undo` for the short hold behind Undo send; omitted for Send later.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// Library files to send with the message (0.74.15).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attachment_hashes: Vec<String>,
 }
 
 /// Request body for `PATCH /v1/mail/scheduled/{id}` (0.74.13).
@@ -5669,9 +5672,19 @@ impl ApiClient {
         body: &str,
         body_html: Option<String>,
         send_at: i64,
+        attachment_hashes: &[String],
     ) -> Result<ScheduledMailItem, ApiError> {
         self.mail_schedule_kind(
-            account, to, cc, bcc, subject, body, body_html, send_at, None,
+            account,
+            to,
+            cc,
+            bcc,
+            subject,
+            body,
+            body_html,
+            send_at,
+            attachment_hashes,
+            None,
         )
     }
 
@@ -5689,6 +5702,7 @@ impl ApiClient {
         body: &str,
         body_html: Option<String>,
         send_at: i64,
+        attachment_hashes: &[String],
     ) -> Result<ScheduledMailItem, ApiError> {
         self.mail_schedule_kind(
             account,
@@ -5699,6 +5713,7 @@ impl ApiClient {
             body,
             body_html,
             send_at,
+            attachment_hashes,
             Some("undo"),
         )
     }
@@ -5714,6 +5729,7 @@ impl ApiClient {
         body: &str,
         body_html: Option<String>,
         send_at: i64,
+        attachment_hashes: &[String],
         kind: Option<&str>,
     ) -> Result<ScheduledMailItem, ApiError> {
         let recipients: Vec<String> = to
@@ -5747,6 +5763,7 @@ impl ApiClient {
             body_html: body_html.filter(|h| !h.trim().is_empty()),
             send_at,
             kind: kind.map(str::to_owned),
+            attachment_hashes: attachment_hashes.to_vec(),
         };
         let reply: serde_json::Value =
             self.request(Method::POST, &["v1", "mail", "schedule"], &[], Some(&req))?;
@@ -5871,6 +5888,18 @@ impl ApiClient {
         };
         let reply: serde_json::Value = self.get(&["v1", "mail", "snoozed"], query)?;
         Ok(serde_json::from_value(reply["items"].clone()).unwrap_or_default())
+    }
+
+    /// `GET /v1/mail/unread`: unread messages in a folder, without loading any (0.74.15).
+    pub fn mail_unread(&self, account: Option<&str>, folder: &str) -> Result<u32, ApiError> {
+        let mut query: Vec<(&str, &str)> = vec![("folder", folder)];
+        if let Some(label) = account.map(str::trim).filter(|s| !s.is_empty()) {
+            query.push(("account", label));
+        }
+        let reply: serde_json::Value = self.get(&["v1", "mail", "unread"], &query)?;
+        Ok(reply["unread"]
+            .as_u64()
+            .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX)))
     }
 
     /// `GET /v1/mail/contacts?q=`: recipient suggestions, most used first (0.74.14).
@@ -9772,6 +9801,7 @@ mod mail_and_search_tests {
                 "Hi",
                 Some("<p>Hi</p>".into()),
                 1_750_000_000,
+                &["hash-1".into()],
             )
             .unwrap();
         assert_eq!(created.id, "sched-1");
@@ -9921,6 +9951,18 @@ mod mail_workspace_tests {
     }
 
     #[test]
+    fn unread_count_is_read_from_the_reply() {
+        let n = client_for(serve_once(json_response(r#"{"unread":7}"#)))
+            .mail_unread(Some("work"), "INBOX")
+            .unwrap();
+        assert_eq!(n, 7);
+        let none = client_for(serve_once(json_response(r#"{}"#)))
+            .mail_unread(None, "INBOX")
+            .unwrap();
+        assert_eq!(none, 0);
+    }
+
+    #[test]
     fn drafts_unsubscribe_and_undo_send_round_trip() {
         let saved = client_for(serve_once(json_response(
             r#"{"folder":"INBOX.Drafts","uid":99}"#,
@@ -9956,12 +9998,13 @@ mod mail_workspace_tests {
             "b",
             None,
             1_795_600_010,
+            &["hash-1".into()],
         )
         .unwrap();
         assert_eq!(held.id, "u1");
         assert!(
             client_for(1)
-                .mail_send_with_undo(None, &[], &[], &[], "s", "b", None, 5)
+                .mail_send_with_undo(None, &[], &[], &[], "s", "b", None, 5, &[])
                 .is_err()
         );
     }
