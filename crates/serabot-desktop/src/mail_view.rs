@@ -470,6 +470,146 @@ pub const MAIL_SHORTCUTS: &[(&str, &str)] = &[
     ("?", "Show this list"),
 ];
 
+// -------------------------------------------------------- recipients ----
+
+/// Most files one message may carry.
+pub const MAX_ATTACH_FILES: usize = 10;
+/// Raw size of all attachments together. The message is base64 encoded and the
+/// server caps it at 25 MiB, so this leaves room for the body and encoding.
+pub const MAX_ATTACH_TOTAL_BYTES: u64 = 18 * 1024 * 1024;
+
+/// Split what was typed or pasted into separate recipients at commas, semicolons
+/// and line breaks, but not inside quotes or `<...>` (so `"Doe, Jane" <j@x.example>`
+/// stays one entry).
+pub fn split_recipient_input(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+    let mut angle = false;
+    for c in text.chars() {
+        match c {
+            '"' => {
+                in_quote = !in_quote;
+                current.push(c);
+            }
+            '<' if !in_quote => {
+                angle = true;
+                current.push(c);
+            }
+            '>' if !in_quote => {
+                angle = false;
+                current.push(c);
+            }
+            ',' | ';' | '\n' | '\r' if !in_quote && !angle => {
+                let piece = current.trim();
+                if !piece.is_empty() {
+                    out.push(piece.to_owned());
+                }
+                current.clear();
+            }
+            _ => current.push(c),
+        }
+    }
+    let piece = current.trim();
+    if !piece.is_empty() {
+        out.push(piece.to_owned());
+    }
+    out
+}
+
+fn address_parts(entry: &str) -> Option<(String, String)> {
+    let addr = sender_email(entry);
+    if addr.is_empty()
+        || addr.len() > 254
+        || addr.chars().any(|c| {
+            c.is_whitespace() || c.is_control() || matches!(c, '<' | '>' | ',' | ';' | '"')
+        })
+    {
+        return None;
+    }
+    let (local, domain) = addr.split_once('@')?;
+    (!local.is_empty() && !domain.is_empty() && !domain.contains('@'))
+        .then(|| (local.to_owned(), domain.to_owned()))
+}
+
+/// Something that could be an address (`bob@host`, or `Name <bob@host>`).
+pub fn is_plausible_recipient(entry: &str) -> bool {
+    address_parts(entry).is_some()
+}
+
+/// A plausible address whose domain looks finished (`bob@example.org`), used to
+/// decide whether a space or a pause means "this one is done".
+pub fn is_complete_address(entry: &str) -> bool {
+    address_parts(entry).is_some_and(|(_, domain)| {
+        !domain.starts_with('.')
+            && !domain.ends_with('.')
+            && domain
+                .rsplit_once('.')
+                .is_some_and(|(_, tld)| tld.len() >= 2)
+    })
+}
+
+/// Add one or more recipients from `text`, skipping duplicates (compared by bare
+/// address, case-insensitively). Returns how many were added.
+pub fn add_recipients(list: &mut Vec<String>, text: &str) -> usize {
+    let mut added = 0;
+    for entry in split_recipient_input(text) {
+        let key = sender_email(&entry);
+        if !list.iter().any(|have| sender_email(have) == key) {
+            list.push(entry);
+            added += 1;
+        }
+    }
+    added
+}
+
+/// Entries that can be turned into chips now, and the unfinished rest.
+pub fn drain_plausible(text: &str) -> (Vec<String>, String) {
+    let mut accepted = Vec::new();
+    let mut rest = Vec::new();
+    for entry in split_recipient_input(text) {
+        if is_plausible_recipient(&entry) {
+            accepted.push(entry);
+        } else {
+            rest.push(entry);
+        }
+    }
+    (accepted, rest.join(", "))
+}
+
+pub fn join_recipients(list: &[String]) -> String {
+    list.join(", ")
+}
+
+/// The text of a recipient chip: the name when there is one, else the address.
+pub fn recipient_label(entry: &str) -> String {
+    let name = sender_name(entry);
+    if name.trim().is_empty() {
+        entry.trim().to_owned()
+    } else {
+        name
+    }
+}
+
+/// Whether one more file of `size` bytes fits next to what is already attached.
+pub fn check_attachment(count: usize, total_bytes: u64, size: u64) -> Result<(), String> {
+    if size == 0 {
+        return Err("That file is empty.".to_owned());
+    }
+    if count >= MAX_ATTACH_FILES {
+        return Err(format!(
+            "A message can carry at most {MAX_ATTACH_FILES} files."
+        ));
+    }
+    if total_bytes.saturating_add(size) > MAX_ATTACH_TOTAL_BYTES {
+        return Err(format!(
+            "Attachments are limited to {} MB in total.",
+            MAX_ATTACH_TOTAL_BYTES / (1024 * 1024)
+        ));
+    }
+    Ok(())
+}
+
 // ------------------------------------------------ recipient autocomplete ----
 
 /// Split a recipients field at the entry being typed: `("a@x.example, ", "bo")`.
@@ -765,6 +905,76 @@ mod tests {
         assert_eq!(map_key("j", false, false, true, false), None);
         assert_eq!(map_key("?", true, false, false, false), Some(MailKey::Help));
         assert_eq!(map_key("q", false, false, false, false), None);
+    }
+
+    #[test]
+    fn typed_and_pasted_recipients_split_cleanly() {
+        assert_eq!(
+            split_recipient_input(
+                "a@x.example, \"Doe, Jane\" <j@x.example>; b@y.example\nc@z.example"
+            ),
+            vec![
+                "a@x.example",
+                "\"Doe, Jane\" <j@x.example>",
+                "b@y.example",
+                "c@z.example"
+            ]
+        );
+        assert!(split_recipient_input("  , ; ").is_empty());
+        assert_eq!(
+            split_recipient_input("Name <a@x.example, b@y.example>").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn plausible_versus_complete_addresses() {
+        assert!(is_plausible_recipient("bob@host"));
+        assert!(!is_complete_address("bob@host"));
+        assert!(is_complete_address("bob@example.org"));
+        assert!(is_complete_address("Bob <bob@example.org>"));
+        assert!(!is_complete_address("bob@example."));
+        assert!(!is_plausible_recipient("bob"));
+        assert!(!is_plausible_recipient("a@b@c"));
+        assert!(!is_plausible_recipient("bob @example.org"));
+        assert!(!is_plausible_recipient("@example.org"));
+        assert!(!is_plausible_recipient(""));
+    }
+
+    #[test]
+    fn adding_recipients_skips_duplicates_and_keeps_names() {
+        let mut list = vec!["Bob <bob@example.org>".to_owned()];
+        assert_eq!(
+            add_recipients(&mut list, "BOB@example.org, carol@example.org"),
+            1
+        );
+        assert_eq!(list, vec!["Bob <bob@example.org>", "carol@example.org"]);
+        assert_eq!(add_recipients(&mut list, ""), 0);
+        assert_eq!(
+            join_recipients(&list),
+            "Bob <bob@example.org>, carol@example.org"
+        );
+        assert_eq!(recipient_label("Bob <bob@example.org>"), "Bob");
+        assert_eq!(recipient_label("carol@example.org"), "carol@example.org");
+    }
+
+    #[test]
+    fn draining_keeps_unfinished_text() {
+        let (done, rest) = drain_plausible("a@x.example, b@y.example, ali");
+        assert_eq!(done, vec!["a@x.example", "b@y.example"]);
+        assert_eq!(rest, "ali");
+        let (done, rest) = drain_plausible("");
+        assert!(done.is_empty() && rest.is_empty());
+    }
+
+    #[test]
+    fn attachment_limits() {
+        assert!(check_attachment(0, 0, 1024).is_ok());
+        assert!(check_attachment(0, 0, 0).is_err());
+        assert!(check_attachment(MAX_ATTACH_FILES, 0, 10).is_err());
+        assert!(check_attachment(1, MAX_ATTACH_TOTAL_BYTES - 5, 10).is_err());
+        assert!(check_attachment(1, MAX_ATTACH_TOTAL_BYTES - 10, 10).is_ok());
+        assert!(check_attachment(0, 0, u64::MAX).is_err());
     }
 
     #[test]

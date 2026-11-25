@@ -104,7 +104,25 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                 let mut rows: Vec<Rc<MsgView>> = Vec::with_capacity(state.state.messages.len());
                 let mut prev_user: Option<bool> = None;
                 let mut prev_day: Option<String> = None;
+                // A message sent again with no reply in between shows once.
+                let repeats = chat_feed::retry_duplicates(
+                    &state
+                        .state
+                        .messages
+                        .iter()
+                        .map(|m| {
+                            (
+                                m.role == Role::User,
+                                m.content.as_str(),
+                                m.attachments.len(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                );
                 for (index, message) in state.state.messages.iter().enumerate() {
+                    if repeats[index] {
+                        continue;
+                    }
                     let user = message.role == Role::User;
                     let (speaker, avatar, bot) = state.message_speaker(message);
                     let peer = !user

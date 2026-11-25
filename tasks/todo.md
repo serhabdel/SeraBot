@@ -635,3 +635,14 @@ never merge without the owner's OK.
 - [x] Version bump `0.74.14` (`Cargo.toml`, `Cargo.lock`), mobile `0.74.14+88`, `docs/release-0.74.14.md`, `README.md`, `AGENTS.md`.
 - [ ] Owner: live pass on Hostinger (Drafts APPEND, search operators, threading, snooze wake, Undo send, unsubscribe) and on Windows WebView2 (pane resize, density, shortcuts, Undo bar, snooze dialog, picker star).
 - [ ] Deferred: branch/pin chat messages, Send/Stop morph, composer mode chips, picker cost/speed hints and per-chat default toggle, Settings Save/Discard bar, Activity feed, mobile threads/snooze/drafts.
+
+## Release 0.74.15 (proposed) — harness, stability, composer, recall
+
+Plan: `docs/specs/0.74.15-proposal.md`. Stacked on `release/0.74.14` until that merges. Version stays `0.74.14` until the batch is cut.
+
+- [x] Mail composer: sticky footer, recipient chips (Enter/comma/Tab/paste, Backspace removes, suggestions with arrows), attach from PC + drag and drop + Library, size/count limits, Ctrl+Enter, address validation.
+- [x] Chat: message action bar below the message instead of floating over its neighbour; a retried message with no reply between shows once.
+- [ ] Owner: try the composer on Windows (drop files, Enter in To, footer in a short window) and the chat bar.
+- [ ] Track 1 harness, Track 2 stability, Track 3 mail polish, Track 5 shared components, Track 6 security (see proposal).
+- [ ] Track 7b recall and retry-by-reference: **needs owner approval** before code.
+
