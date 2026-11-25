@@ -388,6 +388,45 @@ impl Store {
         Ok(row)
     }
 
+    /// Remember which artifacts ride along with a queued message.
+    pub fn set_scheduled_mail_attachments(
+        &self,
+        user_id: &str,
+        mail_id: &str,
+        hashes: &[String],
+    ) -> Result<()> {
+        let mut connection = self.connection()?;
+        let tx = connection.transaction()?;
+        tx.execute(
+            "DELETE FROM scheduled_mail_attachments WHERE mail_id = ?1 AND user_id = ?2",
+            params![mail_id, user_id],
+        )?;
+        for (position, hash) in hashes.iter().enumerate() {
+            tx.execute(
+                "INSERT OR IGNORE INTO scheduled_mail_attachments (mail_id, user_id, hash, position)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![mail_id, user_id, hash, position as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The artifact hashes of a queued message, in the order they were attached. The
+    /// background sender calls this with an id it just claimed; the send re-checks
+    /// ownership of every hash.
+    pub fn scheduled_mail_attachments(&self, mail_id: &str) -> Result<Vec<String>> {
+        let connection = self.connection()?;
+        let mut stmt = connection.prepare(
+            "SELECT hash FROM scheduled_mail_attachments WHERE mail_id = ?1 ORDER BY position ASC",
+        )?;
+        let mut out = Vec::new();
+        for row in stmt.query_map(params![mail_id], |r| r.get::<_, String>(0))? {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// Record one failed attempt for a row this process claimed. Transient
     /// failures go back to `pending` after a backoff; the rest, and the last
     /// attempt, become `failed`. Returns the status that was stored.
@@ -680,6 +719,36 @@ mod tests {
             "failed"
         );
         assert!(store.complete_scheduled_mail(&undo.id, 201).is_ok());
+    }
+
+    #[test]
+    fn queued_messages_keep_their_attachments_until_cancelled() {
+        let store = store();
+        let alice = member(&store, "alice");
+        let to = strings(&["a@example.example"]);
+        let row = store
+            .create_scheduled_mail_kind(&alice, "", &to, &[], &[], "s", "b", None, 100, "later")
+            .unwrap();
+        let hashes = strings(&["h2", "h1"]);
+        store
+            .set_scheduled_mail_attachments(&alice, &row.id, &hashes)
+            .unwrap();
+        assert_eq!(store.scheduled_mail_attachments(&row.id).unwrap(), hashes);
+        // Setting again replaces the list.
+        store
+            .set_scheduled_mail_attachments(&alice, &row.id, &strings(&["h3"]))
+            .unwrap();
+        assert_eq!(
+            store.scheduled_mail_attachments(&row.id).unwrap(),
+            strings(&["h3"])
+        );
+        assert!(store.delete_scheduled_mail(&alice, &row.id).unwrap());
+        assert!(
+            store
+                .scheduled_mail_attachments(&row.id)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
