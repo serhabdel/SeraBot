@@ -1753,7 +1753,16 @@ pub struct MailAccountStatus {
     pub imap_host: Option<String>,
     #[serde(default)]
     pub username: Option<String>,
+    #[serde(default)]
+    pub signature: Option<String>,
+    #[serde(default)]
+    pub signature_html: Option<String>,
+    #[serde(default)]
+    pub signature_logo_hash: Option<String>,
 }
+
+/// Alias for `MailAccountStatus` (0.74.13).
+pub type MailAccountSummary = MailAccountStatus;
 
 /// `GET /v1/mail`: per-user SMTP/IMAP connection status (never returns password).
 /// The top-level fields describe the default mailbox; `accounts` lists every
@@ -2072,7 +2081,7 @@ impl LibraryDocPreview {
     }
 }
 
-/// One mail message as returned by `GET /v1/mail/messages*` (0.74.1, attachments 0.74.5).
+/// One mail message as returned by `GET /v1/mail/messages*` (0.74.1, attachments 0.74.5, HTML 0.74.13).
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct MailMessageInfo {
     #[serde(default)]
@@ -2090,11 +2099,18 @@ pub struct MailMessageInfo {
     #[serde(default)]
     pub body: String,
     #[serde(default)]
+    pub body_html: Option<String>,
+    #[serde(default)]
+    pub has_remote_images: bool,
+    #[serde(default)]
     pub attachments: Vec<MailAttachmentInfo>,
 }
 
 /// Alias matching the 0.74.12 mail workspace API.
 pub type MailMessage = MailMessageInfo;
+
+/// Alias matching the 0.74.13 mail detail API.
+pub type MailMessageDetail = MailMessageInfo;
 
 /// Request body for `POST /v1/mail/messages/{uid}/flag`.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -2119,10 +2135,92 @@ pub struct MailSendRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
     pub to: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cc: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub bcc: Vec<String>,
     pub subject: String,
     pub body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_html: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub artifact_hashes: Vec<String>,
+}
+
+/// Request body for `PUT /v1/mail/signature` (0.74.13).
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct MailUpdateSignatureRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    pub signature: String,
+    pub signature_html: Option<String>,
+    pub signature_logo_hash: Option<String>,
+}
+
+fn deserialize_id_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::String(s) => Ok(s),
+        serde_json::Value::Number(n) => Ok(n.to_string()),
+        _ => Ok(String::new()),
+    }
+}
+
+/// Scheduled email item returned by `GET /v1/mail/scheduled` and `POST /v1/mail/schedule` (0.74.13).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct ScheduledMailItem {
+    #[serde(default, deserialize_with = "deserialize_id_string")]
+    pub id: String,
+    #[serde(default)]
+    pub account_label: Option<String>,
+    #[serde(default)]
+    pub to: Vec<String>,
+    #[serde(default)]
+    pub cc: Vec<String>,
+    #[serde(default)]
+    pub bcc: Vec<String>,
+    #[serde(default)]
+    pub subject: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub body_html: Option<String>,
+    #[serde(default)]
+    pub send_at: i64,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub sent_at: Option<i64>,
+}
+
+/// Request body for `POST /v1/mail/schedule` (0.74.13).
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct MailScheduleRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    pub to: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cc: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub bcc: Vec<String>,
+    pub subject: String,
+    pub body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_html: Option<String>,
+    pub send_at: i64,
+}
+
+/// Request body for `PATCH /v1/mail/scheduled/{id}` (0.74.13).
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct MailRescheduleRequest {
+    pub send_at: i64,
 }
 
 fn is_loopback_mail_host(host: &str) -> bool {
@@ -5246,9 +5344,23 @@ impl ApiClient {
         folder: &str,
         uid: u32,
     ) -> Result<MailMessageInfo, ApiError> {
+        self.mail_message_with_options(account, folder, uid, false)
+    }
+
+    /// `GET /v1/mail/messages/{uid}?account=&folder=&allow_remote_images=`: one full message with optional remote image loading (0.74.13).
+    pub fn mail_message_with_options(
+        &self,
+        account: Option<&str>,
+        folder: &str,
+        uid: u32,
+        allow_remote_images: bool,
+    ) -> Result<MailMessageInfo, ApiError> {
         let mut query: Vec<(&str, &str)> = vec![("folder", folder)];
         if let Some(label) = account.map(str::trim).filter(|s| !s.is_empty()) {
             query.push(("account", label));
+        }
+        if allow_remote_images {
+            query.push(("allow_remote_images", "true"));
         }
         let reply: serde_json::Value =
             self.get(&["v1", "mail", "messages", &uid.to_string()], &query)?;
@@ -5357,13 +5469,17 @@ impl ApiClient {
         Ok(())
     }
 
-    /// `POST /v1/mail/send`: send an email via the connected SMTP account (0.74.12).
+    /// `POST /v1/mail/send`: send an email via the connected SMTP account (0.74.12, HTML 0.74.13).
+    #[allow(clippy::too_many_arguments)]
     pub fn mail_send(
         &self,
         account: Option<&str>,
         to: &[String],
+        cc: &[String],
+        bcc: &[String],
         subject: &str,
         body: &str,
+        body_html: Option<String>,
         artifact_hashes: &[String],
     ) -> Result<(), ApiError> {
         let recipients: Vec<String> = to
@@ -5374,14 +5490,24 @@ impl ApiClient {
         if recipients.is_empty() {
             return Err(ApiError::Validation("Add at least one recipient."));
         }
+        let clean_list = |items: &[String]| -> Vec<String> {
+            items
+                .iter()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
         let req = MailSendRequest {
             account: account
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned),
             to: recipients,
+            cc: clean_list(cc),
+            bcc: clean_list(bcc),
             subject: subject.to_owned(),
             body: body.to_owned(),
+            body_html: body_html.filter(|h| !h.trim().is_empty()),
             artifact_hashes: artifact_hashes
                 .iter()
                 .map(|h| h.trim().to_owned())
@@ -5390,6 +5516,129 @@ impl ApiClient {
         };
         let _: serde_json::Value =
             self.request(Method::POST, &["v1", "mail", "send"], &[], Some(&req))?;
+        Ok(())
+    }
+
+    /// `PUT /v1/mail/signature`: update per-account plain/HTML signature and optional logo hash without re-entering credentials (0.74.13).
+    pub fn mail_update_signature(
+        &self,
+        account: Option<&str>,
+        signature: Option<String>,
+        signature_html: Option<String>,
+        signature_logo_hash: Option<String>,
+    ) -> Result<(), ApiError> {
+        let req = MailUpdateSignatureRequest {
+            account: account
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+            signature: signature.map(|s| s.trim().to_owned()).unwrap_or_default(),
+            signature_html: signature_html.filter(|s| !s.trim().is_empty()),
+            signature_logo_hash: signature_logo_hash.filter(|s| !s.trim().is_empty()),
+        };
+        let _: serde_json::Value =
+            self.request(Method::PUT, &["v1", "mail", "signature"], &[], Some(&req))?;
+        Ok(())
+    }
+
+    /// `POST /v1/mail/schedule`: schedule an email for future delivery (0.74.13).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mail_schedule(
+        &self,
+        account: Option<&str>,
+        to: &[String],
+        cc: &[String],
+        bcc: &[String],
+        subject: &str,
+        body: &str,
+        body_html: Option<String>,
+        send_at: i64,
+    ) -> Result<ScheduledMailItem, ApiError> {
+        let recipients: Vec<String> = to
+            .iter()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if recipients.is_empty() {
+            return Err(ApiError::Validation("Add at least one recipient."));
+        }
+        if send_at <= 0 {
+            return Err(ApiError::Validation("Pick a valid send time."));
+        }
+        let clean_list = |items: &[String]| -> Vec<String> {
+            items
+                .iter()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        let req = MailScheduleRequest {
+            account: account
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+            to: recipients,
+            cc: clean_list(cc),
+            bcc: clean_list(bcc),
+            subject: subject.to_owned(),
+            body: body.to_owned(),
+            body_html: body_html.filter(|h| !h.trim().is_empty()),
+            send_at,
+        };
+        let reply: serde_json::Value =
+            self.request(Method::POST, &["v1", "mail", "schedule"], &[], Some(&req))?;
+        let inner = reply
+            .get("item")
+            .or_else(|| reply.get("scheduled"))
+            .unwrap_or(&reply);
+        serde_json::from_value(inner.clone()).map_err(|_| ApiError::InvalidResponse)
+    }
+
+    /// `GET /v1/mail/scheduled`: list scheduled emails for an account (0.74.13).
+    pub fn mail_list_scheduled(
+        &self,
+        account: Option<&str>,
+    ) -> Result<Vec<ScheduledMailItem>, ApiError> {
+        let query: &[(&str, &str)] = match account.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(label) => &[("account", label)],
+            None => &[],
+        };
+        let reply: serde_json::Value = self.get(&["v1", "mail", "scheduled"], query)?;
+        let arr = reply
+            .get("items")
+            .or_else(|| reply.get("scheduled"))
+            .or_else(|| reply.get("messages"))
+            .unwrap_or(&reply);
+        serde_json::from_value(arr.clone()).map_err(|_| ApiError::InvalidResponse)
+    }
+
+    /// `PATCH /v1/mail/scheduled/{id}`: update the send time of a scheduled email (0.74.13).
+    pub fn mail_reschedule(&self, id: &str, send_at: i64) -> Result<(), ApiError> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(ApiError::Validation("Missing scheduled email ID."));
+        }
+        if send_at <= 0 {
+            return Err(ApiError::Validation("Pick a valid send time."));
+        }
+        let req = MailRescheduleRequest { send_at };
+        let _: serde_json::Value = self.request(
+            Method::PATCH,
+            &["v1", "mail", "scheduled", id],
+            &[],
+            Some(&req),
+        )?;
+        Ok(())
+    }
+
+    /// `DELETE /v1/mail/scheduled/{id}`: cancel a pending scheduled email (0.74.13).
+    pub fn mail_cancel_scheduled(&self, id: &str) -> Result<(), ApiError> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(ApiError::Validation("Missing scheduled email ID."));
+        }
+        let _: serde_json::Value =
+            self.request::<_, ()>(Method::DELETE, &["v1", "mail", "scheduled", id], &[], None)?;
         Ok(())
     }
 
@@ -9084,8 +9333,11 @@ mod mail_and_search_tests {
             .mail_send(
                 None,
                 &["alice@example.test".into()],
+                &[],
+                &[],
                 "Subj",
                 "Body",
+                Some("<p>Body</p>".into()),
                 &["abc123".into()],
             )
             .unwrap();
@@ -9097,7 +9349,7 @@ mod mail_and_search_tests {
             Err(ApiError::Validation(_))
         ));
         assert!(matches!(
-            dummy.mail_send(None, &[], "Subj", "Body", &[]),
+            dummy.mail_send(None, &[], &[], &[], "Subj", "Body", None, &[]),
             Err(ApiError::Validation(_))
         ));
 
@@ -9116,8 +9368,11 @@ mod mail_and_search_tests {
         let send_json = serde_json::to_value(MailSendRequest {
             account: None,
             to: vec!["a@b.test".into()],
+            cc: vec![],
+            bcc: vec![],
             subject: "Hi".into(),
             body: "Test".into(),
+            body_html: None,
             artifact_hashes: vec![],
         })
         .unwrap();
@@ -9146,5 +9401,94 @@ mod mail_and_search_tests {
             .mail_save_attachment_to_library(Some("work"), "INBOX", 9, 0)
             .unwrap();
         assert_eq!(val["item"]["filename"], "a.txt");
+    }
+
+    #[test]
+    fn mail_html_signature_and_scheduled_endpoints_parse_and_validate() {
+        let msg_json = r#"{"message":{"uid":8,"subject":"HTML","from":"a@b.test","date":"2026-11-25","flags":[],"body":"Plain","body_html":"<p>HTML</p>","has_remote_images":true,"attachments":[]}}"#;
+        let msg_resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            msg_json.len(),
+            msg_json
+        )
+        .into_bytes();
+        let detail = client_for(serve_once(msg_resp))
+            .mail_message_with_options(None, "INBOX", 8, true)
+            .unwrap();
+        assert_eq!(detail.body_html.as_deref(), Some("<p>HTML</p>"));
+        assert!(detail.has_remote_images);
+
+        let status_json = r#"{"connected":true,"accounts":[{"account":"","username":"me@b.test","signature":"Me","signature_html":"<b>Me</b>","signature_logo_hash":"abc"}]}"#;
+        let status: MailStatus = serde_json::from_str(status_json).unwrap();
+        assert_eq!(
+            status.accounts[0].signature_html.as_deref(),
+            Some("<b>Me</b>")
+        );
+        assert_eq!(
+            status.accounts[0].signature_logo_hash.as_deref(),
+            Some("abc")
+        );
+
+        let ok = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}".to_vec();
+        client_for(serve_once(ok.clone()))
+            .mail_update_signature(
+                Some("work"),
+                Some("Sig".into()),
+                Some("<p>Sig</p>".into()),
+                Some("hash123".into()),
+            )
+            .unwrap();
+        client_for(serve_once(ok.clone()))
+            .mail_reschedule("sched-1", 1_750_000_000)
+            .unwrap();
+        client_for(serve_once(ok))
+            .mail_cancel_scheduled("sched-1")
+            .unwrap();
+
+        let sched_item_json = r#"{"item":{"id":"sched-1","account_label":"work","to":["a@b.test"],"cc":[],"bcc":[],"subject":"Later","body":"Hi","body_html":"<p>Hi</p>","send_at":1750000000,"status":"pending","created_at":1749990000}}"#;
+        let sched_resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            sched_item_json.len(),
+            sched_item_json
+        )
+        .into_bytes();
+        let created = client_for(serve_once(sched_resp))
+            .mail_schedule(
+                Some("work"),
+                &["a@b.test".into()],
+                &[],
+                &[],
+                "Later",
+                "Hi",
+                Some("<p>Hi</p>".into()),
+                1_750_000_000,
+            )
+            .unwrap();
+        assert_eq!(created.id, "sched-1");
+        assert_eq!(created.status, "pending");
+        assert_eq!(created.send_at, 1_750_000_000);
+
+        let list_json = r#"{"items":[{"id":42,"to":["a@b.test"],"subject":"Later","body":"Hi","send_at":1750000000,"status":"pending","created_at":1749990000}]}"#;
+        let list_resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            list_json.len(),
+            list_json
+        )
+        .into_bytes();
+        let list = client_for(serve_once(list_resp))
+            .mail_list_scheduled(None)
+            .unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "42");
+
+        let dummy = client_for(1);
+        assert!(matches!(
+            dummy.mail_reschedule("", 1_750_000_000),
+            Err(ApiError::Validation(_))
+        ));
+        assert!(matches!(
+            dummy.mail_cancel_scheduled("  "),
+            Err(ApiError::Validation(_))
+        ));
     }
 }

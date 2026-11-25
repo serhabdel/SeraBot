@@ -613,4 +613,16 @@ never merge without the owner's OK.
 - [x] Pro security & code review pass, `docs/release-0.74.12.md`, `README.md`, `Cargo.toml` (`0.74.12`), mobile `0.74.12+86`.
 - [ ] Owner: live pass on Windows & Android (7-item rail + Settings hub, 3-pane Mail workspace, Hostinger IMAP search/flag/move/delete/send, Save attachment to Library).
 
+## Release 0.74.13 — Native Mail Upgrade (HTML + Signatures + Send Later), Instant Stop, Browser DNS & 2-Column Model Selector Card
+
+- [x] Native Mail Engine fixes (`mail.rs`): Dovecot/Hostinger `parse_list_name` fix, multi-word RFC 2047 (`?B?` & `?Q?` + UTF-8/ISO-8859-1/Windows-1252), recursive MIME + `quoted-printable`, strict `scraper` HTML sanitizer + `cid:` inline image rewriting, remote images blocked by default.
+- [x] In-House Signature Builder & HTML Sending (`mail.rs`, `api/mail.rs`, `ui_mail.rs`): `PUT /v1/mail/signature` (no password re-entry), `cid:signature-logo@serabot` inline logo from UID-scoped Library, live preview, `multipart/mixed` -> `multipart/related` -> `multipart/alternative` builder.
+- [x] In-House Email Scheduler ("Send Later") (`0051_scheduled_mail.sql`, `store.rs`, `api/mail.rs`, `scheduler.rs`, `ui_mail.rs`): UID-scoped `scheduled_mail` table, `/v1/mail/schedule` + `/v1/mail/scheduled` CRUD, 30s background delivery loop with blocklist re-scan, **Send later** quick presets, and **Scheduled** folder with Reschedule/Cancel.
+- [x] Instant, smooth Agent Stop (`runtime/mod.rs`, `turn_loop.rs`, `session.rs`): Desktop out-of-band `serabot-stop` dispatch without waiting for `self.ready()`, server `request_stop` cascading to active delegated handoffs, and `tokio::select!` mid-tool cancellation preserving `uncertain` / `needs_review` for effectful tools.
+- [x] Browser DNS Resilience (`browser/guard.rs`): 300ms DNS retry + exact-hostname diagnostic error message.
+- [x] 2-Column Chat Model Selector Card (`ui/chat.rs`, `system.css`): downward-anchored `.model-pop` with Providers rail + icons on the left and search, account switcher, model list, and pinned Thinking Level segmented bar on the right.
+- [x] Version bump `0.74.13` (`Cargo.toml`), mobile `0.74.13+87`, `docs/release-0.74.13.md`, `README.md`, `tasks/todo.md`.
+- [ ] Owner: live pass on Hostinger IMAP/SMTP (folders, HTML emails, Signature logo, Send later), instant Stop, browser DNS errors, and 2-column Model Selector card.
+
+
 

@@ -398,6 +398,7 @@ impl Runtime {
             .pending
             .clone()
             .ok_or_else(|| SeraError::InvalidState("turn has no pending approval".into()))?;
+        let (stop_token, stop_guard) = self.register_stop_token(&turn.id);
         let mut context = self.tool_context(task, &turn, bot, &state)?;
         // An approved plugin call must still be on the allowlist to run.
         self.gateway.enable_plugin_tools(&mut context).await;
@@ -435,11 +436,56 @@ impl Runtime {
                 None,
             );
         } else if payload.decision == "approved" {
-            match self
-                .gateway
-                .execute_approved(&payload.action_id, &context)
-                .await
-            {
+            let approved_res = tokio::select! {
+                biased;
+                _ = stop_token.cancelled() => None,
+                res = self.gateway.execute_approved(&payload.action_id, &context) => Some(res),
+            };
+            let Some(approved_res) = approved_res else {
+                let task_uncertain = self
+                    .store
+                    .get_task(&user, &task.id)
+                    .is_ok_and(|stored| stored.uncertain);
+                if task_uncertain {
+                    self.emit_step_detail(
+                        &user,
+                        task,
+                        &turn,
+                        &pending.call,
+                        StepPhase::Failed,
+                        None,
+                        state.tool_calls,
+                        None,
+                        None,
+                        Some("Stopped while an external action had an unknown outcome."),
+                    );
+                    let _ = self.store.update_turn(
+                        &user,
+                        &turn.id,
+                        "active",
+                        &serde_json::to_value(&state)?,
+                    );
+                    return Err(SeraError::External(
+                        "stopped while an external action had an unknown outcome; check whether it ran before retrying".into(),
+                    ));
+                }
+                self.emit_step_detail(
+                    &user,
+                    task,
+                    &turn,
+                    &pending.call,
+                    StepPhase::Failed,
+                    None,
+                    state.tool_calls,
+                    None,
+                    None,
+                    Some("Stopped by user."),
+                );
+                return self
+                    .finish_stopped(task, &turn, &state, &turn.conversation_id)
+                    .await;
+            };
+            match approved_res {
                 Ok(ToolOutcome::Completed(output)) => {
                     self.record_tool_result(&mut state, &pending.call, &output);
                     self.record_completed_effect(&mut state, &pending.call, &output.content);
@@ -541,16 +587,25 @@ impl Runtime {
             }
         } else if !pending.remaining.is_empty()
             && let Some(next) = self
-                .execute_calls(task, &turn, bot, &mut state, pending.remaining, &context)
+                .execute_calls(
+                    task,
+                    &turn,
+                    bot,
+                    &mut state,
+                    pending.remaining,
+                    &context,
+                    &stop_token,
+                )
                 .await?
         {
             return self.suspend_for_approval(task, &turn, state, next).await;
         }
-        if self.stop_requested(&turn.id) {
+        if self.stop_requested(&turn.id) || stop_token.is_cancelled() {
             return self
                 .finish_stopped(task, &turn, &state, &turn.conversation_id)
                 .await;
         }
+        drop(stop_guard);
         self.store
             .update_turn(&user, &turn.id, "active", &serde_json::to_value(&state)?)?;
         self.advance(task, &turn, state, &turn.conversation_id)
@@ -1204,12 +1259,20 @@ impl Runtime {
                 .messages
                 .push(LlmMessage::assistant(assistant.content, tool_calls.clone()));
             if let Some(pending) = self
-                .execute_calls(task, turn, &bot, &mut state, tool_calls, &context)
+                .execute_calls(
+                    task,
+                    turn,
+                    &bot,
+                    &mut state,
+                    tool_calls,
+                    &context,
+                    &stop_token,
+                )
                 .await?
             {
                 return self.suspend_for_approval(task, turn, state, pending).await;
             }
-            if self.stop_requested(&turn.id) {
+            if self.stop_requested(&turn.id) || stop_token.is_cancelled() {
                 return self
                     .finish_stopped(task, turn, &state, conversation_id)
                     .await;
@@ -1433,14 +1496,6 @@ impl Runtime {
         (!text.is_empty()).then(|| text.to_string())
     }
 
-    /// Whether a tool call has an outbound effect the turn must not repeat:
-    /// a destructive (approval-gated) tool, or a delivery to the owner's own
-    /// chat that runs without approval.
-    fn call_is_effectful(name: &str) -> bool {
-        crate::gateway::is_destructive_tool(name)
-            || crate::gateway::OWN_CHAT_DELIVERY_TOOLS.contains(&name)
-    }
-
     /// Validate a whole batch's guards before any of it runs: a batch that
     /// fails a guard halfway through would otherwise leave earlier calls
     /// already executed. The per-call checks in the loop stay as defence.
@@ -1506,6 +1561,7 @@ impl Runtime {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_calls(
         &self,
         task: &Task,
@@ -1514,6 +1570,7 @@ impl Runtime {
         state: &mut TurnState,
         calls: Vec<ToolCall>,
         context: &ToolContext,
+        stop_token: &CancellationToken,
     ) -> Result<Option<PendingTool>> {
         let max_calls = self.turn_limits_for(&task.user_id)?.max_tool_calls_per_turn;
         // The whole batch's guards are validated before any of it runs.
@@ -1523,7 +1580,7 @@ impl Runtime {
                 break;
             }
             // Calls not yet started are dropped: the owner stopped the turn.
-            if self.stop_requested(&turn.id) {
+            if self.stop_requested(&turn.id) || stop_token.is_cancelled() {
                 break;
             }
             // An effectful call that already ran replays its stored outcome
@@ -1599,11 +1656,54 @@ impl Runtime {
                 None,
                 ordinal,
             );
-            match self
-                .gateway
-                .execute(&call.name, call.arguments.clone(), context)
-                .await
-            {
+            let executed = tokio::select! {
+                biased;
+                _ = stop_token.cancelled() => None,
+                res = self.gateway.execute(&call.name, call.arguments.clone(), context) => Some(res),
+            };
+            let Some(result) = executed else {
+                let task_uncertain = self
+                    .store
+                    .get_task(&task.user_id, &task.id)
+                    .is_ok_and(|stored| stored.uncertain);
+                if task_uncertain {
+                    self.emit_step_detail(
+                        &task.user_id,
+                        task,
+                        turn,
+                        call,
+                        StepPhase::Failed,
+                        None,
+                        ordinal,
+                        Some(started.elapsed()),
+                        None,
+                        Some("Stopped while an external action had an unknown outcome."),
+                    );
+                    let _ = self.store.update_turn(
+                        &task.user_id,
+                        &turn.id,
+                        "active",
+                        &serde_json::to_value(&*state)?,
+                    );
+                    return Err(SeraError::External(
+                        "stopped while an external action had an unknown outcome; check whether it ran before retrying".into(),
+                    ));
+                }
+                self.emit_step_detail(
+                    &task.user_id,
+                    task,
+                    turn,
+                    call,
+                    StepPhase::Failed,
+                    None,
+                    ordinal,
+                    Some(started.elapsed()),
+                    None,
+                    Some("Stopped by user."),
+                );
+                break;
+            };
+            match result {
                 Ok(ToolOutcome::Completed(output)) => {
                     if call.name == DELEGATE_TOOL
                         && output
@@ -1645,7 +1745,7 @@ impl Runtime {
                         state.help_asked = true;
                     }
                     self.record_tool_result(state, call, &output);
-                    if Self::call_is_effectful(&call.name) {
+                    if self.gateway.is_effectful_tool(&call.name) {
                         self.record_completed_effect(state, call, &output.content);
                         // Persist now: a crash after this point must not
                         // replay the effect.
@@ -1951,4 +2051,267 @@ fn tool_target(arguments: &Value) -> Option<String> {
         .filter_map(Value::as_str)
         .find(|text| !text.trim().is_empty())?;
     Some(truncate_chars(value.trim(), 60))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::BotConfig;
+    use crate::gateway::ToolRegistry;
+    use crate::llm::LlmClient;
+    use crate::orchestration::BotRole;
+    use std::sync::Mutex;
+    use tokio::sync::Notify;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[derive(Default)]
+    struct TestNotifier {
+        texts: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Notifier for TestNotifier {
+        async fn send_text(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            text: &str,
+        ) -> Result<()> {
+            self.texts.lock().unwrap().push(text.to_owned());
+            Ok(())
+        }
+
+        async fn approval_requested(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            _notice: &crate::runtime::notifier::ApprovalNotice,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct SlowTool {
+        name: &'static str,
+        external_effect: bool,
+        entered: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl Tool for SlowTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name.into(),
+                description: "slow tool for stop test".into(),
+                parameters: json!({"type": "object"}),
+                external_effect: self.external_effect,
+            }
+        }
+
+        async fn execute(&self, _args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+            self.entered.notify_one();
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Ok(ToolOutput {
+                content: "done".into(),
+                ..ToolOutput::default()
+            })
+        }
+    }
+
+    fn test_runtime(
+        server_uri: &str,
+        notifier: Arc<TestNotifier>,
+        tools: Vec<SlowTool>,
+    ) -> (Runtime, Store) {
+        let mut config = Config::default();
+        config.llm.data_egress_approved = true;
+        config.llm.base_url = server_uri.into();
+        config.llm.model = "test".into();
+        config.memory.auto_extract = false;
+        let config = Arc::new(config);
+        let store = Store::open(
+            std::env::temp_dir().join(format!("serabot-turnloop-{}.db", uuid::Uuid::new_v4())),
+            384,
+            5000,
+        )
+        .unwrap();
+        let mut registry = ToolRegistry::default();
+        let mut tool_names = Vec::new();
+        for tool in tools {
+            tool_names.push(tool.name.to_string());
+            registry.register(tool).unwrap();
+        }
+        let gateway = Gateway::new(
+            store.clone(),
+            Arc::new(crate::policy::Policy::empty()),
+            registry,
+            1,
+            false,
+        );
+        let llm = LlmClient::new(server_uri, "test", 10, 100)
+            .unwrap()
+            .with_model("test");
+        let router = ModelRouter::new(
+            &config.llm,
+            std::collections::BTreeMap::from([("default".into(), llm)]),
+        )
+        .unwrap();
+        let bot = LoadedBot {
+            config: BotConfig {
+                title: None,
+                description: None,
+                name: "main".into(),
+                trigger: "command".into(),
+                model: None,
+                system_prompt: "prompts/main.txt".into(),
+                skills: vec![],
+                tools: tool_names,
+                require_approval: vec![],
+                enabled: true,
+                temperature: None,
+                thinking: None,
+                role: BotRole::Orchestrator,
+                delegates: vec![],
+                route: None,
+                fallbacks: Vec::new(),
+                failover: Default::default(),
+                catalog_only: false,
+            },
+            prompt: "test prompt".into(),
+        };
+        let runtime = Runtime::new(
+            config,
+            store.clone(),
+            gateway,
+            router,
+            vec![bot],
+            notifier,
+            CancellationToken::new(),
+        )
+        .unwrap();
+        (runtime, store)
+    }
+
+    #[tokio::test]
+    async fn cancel_interrupts_in_flight_read_only_tool_promptly() {
+        let server = MockServer::start().await;
+        let notifier = Arc::new(TestNotifier::default());
+        let entered = Arc::new(Notify::new());
+        let (runtime, store) = test_runtime(
+            &server.uri(),
+            notifier.clone(),
+            vec![SlowTool {
+                name: "slow_read",
+                external_effect: false,
+                entered: entered.clone(),
+            }],
+        );
+        let owner = store.admin_user_id().unwrap();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "slow_read", "arguments": "{}"}
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        runtime
+            .submit_text(&owner, "owner", "run slow read", None)
+            .unwrap();
+        let task = store.claim_task("test", 30).unwrap().unwrap();
+        let handle = tokio::spawn({
+            let runtime = runtime.clone();
+            let task = task.clone();
+            async move { runtime.process_task(task).await }
+        });
+
+        entered.notified().await;
+        let stopped_at = std::time::Instant::now();
+        assert_eq!(runtime.request_stop(&owner, "owner").unwrap(), 1);
+        handle.await.unwrap().unwrap();
+        assert!(
+            stopped_at.elapsed() < std::time::Duration::from_secs(2),
+            "in-flight read-only tool was not aborted promptly ({:?})",
+            stopped_at.elapsed()
+        );
+        assert_eq!(
+            notifier.texts.lock().unwrap().as_slice(),
+            ["Stopped.".to_string()]
+        );
+        let turn = store.get_turn_by_task(&owner, &task.id).unwrap().unwrap();
+        assert_eq!(turn.status, "stopped");
+        let stored_task = store.get_task(&owner, &task.id).unwrap();
+        assert_eq!(stored_task.status, "done");
+        assert!(!stored_task.uncertain);
+    }
+
+    #[tokio::test]
+    async fn cancel_mid_flight_effectful_tool_preserves_needs_review() {
+        let server = MockServer::start().await;
+        let notifier = Arc::new(TestNotifier::default());
+        let entered = Arc::new(Notify::new());
+        let (runtime, store) = test_runtime(
+            &server.uri(),
+            notifier.clone(),
+            vec![SlowTool {
+                name: "slow_effect",
+                external_effect: true,
+                entered: entered.clone(),
+            }],
+        );
+        let owner = store.admin_user_id().unwrap();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "slow_effect", "arguments": "{}"}
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        runtime
+            .submit_text(&owner, "owner", "run slow effect", None)
+            .unwrap();
+        let task = store.claim_task("test", 30).unwrap().unwrap();
+        let handle = tokio::spawn({
+            let runtime = runtime.clone();
+            let task = task.clone();
+            async move { runtime.process_task(task).await }
+        });
+
+        entered.notified().await;
+        let stopped_at = std::time::Instant::now();
+        assert_eq!(runtime.request_stop(&owner, "owner").unwrap(), 1);
+        handle.await.unwrap().unwrap();
+        assert!(
+            stopped_at.elapsed() < std::time::Duration::from_secs(2),
+            "in-flight effectful tool was not aborted promptly ({:?})",
+            stopped_at.elapsed()
+        );
+        let stored_task = store.get_task(&owner, &task.id).unwrap();
+        assert!(stored_task.uncertain);
+        assert_eq!(stored_task.status, crate::store::TASK_NEEDS_REVIEW);
+    }
 }

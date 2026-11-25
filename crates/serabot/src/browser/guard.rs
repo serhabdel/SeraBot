@@ -19,7 +19,7 @@ use crate::error::{Result, SeraError};
 
 pub const MAX_URL_LEN: usize = 2048;
 
-fn denied(reason: &str) -> SeraError {
+fn denied(reason: impl std::fmt::Display) -> SeraError {
     SeraError::Validation(format!("browser navigation refused: {reason}"))
 }
 
@@ -130,7 +130,7 @@ pub fn validate_navigation_url(raw: &str) -> Result<Url> {
 /// Every resolved address must be public; an empty answer is refused.
 pub fn check_resolved(host: &str, addrs: &[IpAddr]) -> Result<()> {
     if addrs.is_empty() {
-        return Err(denied(&format!("{host} did not resolve")));
+        return Err(denied(format!("{host} did not resolve")));
     }
     if addrs.iter().any(|ip| ip_is_forbidden(*ip)) {
         return Err(denied("host resolves to a non-public address"));
@@ -143,17 +143,44 @@ pub async fn validate_resolved(raw: &str) -> Result<Url> {
     let url = validate_navigation_url(raw)?;
     if let Some(Host::Domain(name)) = url.host() {
         let port = url.port_or_known_default().unwrap_or(443);
-        let addrs: Vec<IpAddr> = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::net::lookup_host((name, port))
-                .await
-                .map(|iter| iter.map(|addr| addr.ip()).collect::<Vec<_>>())
-        })
-        .await
-        .map_err(|_| denied("DNS lookup timed out"))?
-        .map_err(|_| denied("DNS lookup failed"))?;
+        let addrs = resolve_host(name, port).await?;
         check_resolved(name, &addrs)?;
     }
     Ok(url)
+}
+
+async fn resolve_host(name: &str, port: u16) -> Result<Vec<IpAddr>> {
+    for attempt in 0..2 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::net::lookup_host((name, port)),
+        )
+        .await
+        {
+            Ok(Ok(iter)) => {
+                let addrs: Vec<IpAddr> = iter.map(|addr| addr.ip()).collect();
+                if !addrs.is_empty() || attempt == 1 {
+                    return Ok(addrs);
+                }
+            }
+            Ok(Err(_)) => {
+                if attempt == 1 {
+                    return Err(denied(format!(
+                        "DNS lookup failed for '{name}' — this domain does not resolve. Check the spelling or use web search to find the real URL instead of retrying."
+                    )));
+                }
+            }
+            Err(_) => {
+                if attempt == 1 {
+                    return Err(denied(format!("DNS lookup timed out for '{name}'")));
+                }
+            }
+        }
+    }
+    unreachable!()
 }
 
 /// Decision for a subresource or redirect hop seen by `Fetch.requestPaused`.
@@ -290,5 +317,33 @@ mod tests {
             Some("login.example.com")
         );
         assert_eq!(host_of("nonsense"), None);
+    }
+
+    #[tokio::test]
+    async fn dns_failure_error_includes_hostname_and_guidance() {
+        let started = std::time::Instant::now();
+        let err = validate_resolved("https://nonexistent.example.invalid/")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(250),
+            "expected DNS retry delay before failing, elapsed {:?}",
+            started.elapsed()
+        );
+        assert!(err.contains("nonexistent.example.invalid"), "{err}");
+        assert!(
+            err.contains(
+                "Check the spelling or use web search to find the real URL instead of retrying."
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn dns_timeout_error_includes_hostname() {
+        let err = denied("DNS lookup timed out for 'slow.example.com'").to_string();
+        assert!(err.contains("slow.example.com"), "{err}");
+        assert!(err.contains("DNS lookup timed out"), "{err}");
     }
 }

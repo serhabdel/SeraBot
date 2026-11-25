@@ -335,7 +335,12 @@ impl Runtime {
                 let payload: Option<TurnPayload> =
                     serde_json::from_value(task.payload.clone()).ok();
                 if let Some(payload) = payload.filter(|_| !reported) {
-                    let retrying = !permanent && task.attempts < task.max_attempts;
+                    let uncertain = self
+                        .store
+                        .get_task(&user, &task.id)
+                        .ok()
+                        .is_some_and(|t| t.uncertain);
+                    let retrying = !permanent && !uncertain && task.attempts < task.max_attempts;
                     let _ = self
                         .notifier
                         .send_text(

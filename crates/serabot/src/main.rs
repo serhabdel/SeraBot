@@ -1367,6 +1367,15 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         }));
     }
 
+    // 0.74.13: 30-second background loop for scheduled outgoing emails ("Send Later").
+    services.push(tokio::spawn(serabot::scheduler::run_scheduled_mail_loop(
+        store.clone(),
+        users.clone(),
+        artifacts.clone(),
+        runtime.policy().clone(),
+        shutdown.clone(),
+    )));
+
     tokio::signal::ctrl_c().await?;
     tracing::info!("shutdown requested");
     shutdown.cancel();

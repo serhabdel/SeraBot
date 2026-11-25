@@ -12,6 +12,7 @@
 //! I/O timeout. Tests use a fake in-process SMTP server and canned IMAP
 //! fixtures; nothing here ran against a real mailbox.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,11 +27,15 @@ use tokio_rustls::TlsConnector;
 
 use crate::error::{Result, SeraError};
 use crate::gateway::{Tool, ToolContext, ToolOutput, ToolRegistry, ToolSpec};
+use crate::maker::ArtifactStore;
+use crate::policy::Policy;
+use crate::store::Store;
 use crate::user_secrets::UserSecrets;
 
 pub const MAIL_PROVIDER: &str = "mail";
 /// Prefix of the secret-store provider ids for named mail accounts.
 pub const MAIL_ACCOUNT_PREFIX: &str = "mail.";
+const MAIL_SIG_PROVIDER: &str = "mail_sig";
 const MAX_ACCOUNT_LABEL_CHARS: usize = 24;
 pub const MAIL_SEND_TOOL: &str = "mail_send";
 pub const MAIL_LIST_TOOL: &str = "mail_list";
@@ -48,6 +53,7 @@ pub const MAX_LIST: u32 = 50;
 pub const MAX_BODY_CHARS: usize = 256 * 1024;
 pub const MAX_SUBJECT_CHARS: usize = 500;
 pub const MAX_SIGNATURE_CHARS: usize = 4096;
+pub const MAX_SIGNATURE_HTML_CHARS: usize = 16384;
 const MAX_INLINE_ATTACHMENT_BYTES: usize = 512 * 1024;
 const MAX_INLINE_ATTACHMENTS_TOTAL: usize = 2 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -84,6 +90,18 @@ pub struct MailCredentials {
     /// stored per account (0.74.5).
     #[serde(default)]
     pub signature: Option<String>,
+}
+
+/// Extended per-account signature settings (HTML signature + inline logo hash),
+/// stored alongside `MailCredentials` under `mail_sig` / `mail_sig.<label>`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MailSignatureConfig {
+    #[serde(default)]
+    pub signature: String,
+    #[serde(default)]
+    pub signature_html: Option<String>,
+    #[serde(default)]
+    pub signature_logo_hash: Option<String>,
 }
 
 pub fn default_smtp_port() -> u16 {
@@ -138,16 +156,40 @@ pub fn validate_credentials(creds: &MailCredentials) -> Result<()> {
         return Err(SeraError::Validation("invalid from address".into()));
     }
     if let Some(sig) = &creds.signature {
-        let bad = sig.is_empty()
-            || sig.len() > MAX_SIGNATURE_CHARS
-            || sig
-                .chars()
-                .any(|c| c.is_control() && c != '\n' && c != '\t');
-        if bad {
-            return Err(SeraError::Validation(
-                "signature must be 1-4096 chars without control characters".into(),
-            ));
-        }
+        validate_plain_signature(sig, true)?;
+    }
+    Ok(())
+}
+
+fn validate_plain_signature(sig: &str, reject_empty: bool) -> Result<()> {
+    let bad = (reject_empty && sig.is_empty())
+        || sig.len() > MAX_SIGNATURE_CHARS
+        || sig
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\t');
+    if bad {
+        return Err(SeraError::Validation(
+            "signature must be 1-4096 chars without control characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_signature_config(cfg: &MailSignatureConfig) -> Result<()> {
+    validate_plain_signature(&cfg.signature, false)?;
+    if let Some(html) = &cfg.signature_html
+        && (html.len() > MAX_SIGNATURE_HTML_CHARS || html.contains('\0'))
+    {
+        return Err(SeraError::Validation(format!(
+            "signature_html must be at most {MAX_SIGNATURE_HTML_CHARS} chars without NUL bytes"
+        )));
+    }
+    if let Some(hash) = &cfg.signature_logo_hash
+        && (hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err(SeraError::Validation(
+            "signature_logo_hash must be a 64-char hex artifact hash".into(),
+        ));
     }
     Ok(())
 }
@@ -171,6 +213,15 @@ pub fn account_provider(account: Option<&str>) -> Result<String> {
             }
             Ok(format!("{MAIL_PROVIDER}.{label}"))
         }
+    }
+}
+
+fn signature_provider(account: Option<&str>) -> Result<String> {
+    let base = account_provider(account)?;
+    if base == MAIL_PROVIDER {
+        Ok(MAIL_SIG_PROVIDER.to_owned())
+    } else {
+        Ok(base.replacen(MAIL_PROVIDER, MAIL_SIG_PROVIDER, 1))
     }
 }
 
@@ -200,11 +251,70 @@ pub fn load_credentials(
     Ok(Some(creds))
 }
 
+pub fn store_signature_config(
+    secrets: &UserSecrets,
+    user_id: &str,
+    account: Option<&str>,
+    cfg: &MailSignatureConfig,
+) -> Result<()> {
+    validate_signature_config(cfg)?;
+    let mut creds = load_credentials(secrets, user_id, account)?
+        .ok_or_else(|| SeraError::Validation("mail is not connected; connect it first".into()))?;
+    creds.signature = if cfg.signature.trim().is_empty() {
+        None
+    } else {
+        Some(cfg.signature.clone())
+    };
+    store_credentials(secrets, user_id, account, &creds)?;
+    let normalized = MailSignatureConfig {
+        signature: cfg.signature.clone(),
+        signature_html: cfg
+            .signature_html
+            .as_ref()
+            .filter(|s| !s.trim().is_empty())
+            .cloned(),
+        signature_logo_hash: cfg
+            .signature_logo_hash
+            .as_ref()
+            .filter(|s| !s.trim().is_empty())
+            .cloned(),
+    };
+    let json = serde_json::to_string(&normalized)
+        .map_err(|e| SeraError::Internal(format!("mail sig serialise: {e}")))?;
+    secrets.set(user_id, &signature_provider(account)?, &json)
+}
+
+pub fn load_signature_config(
+    secrets: &UserSecrets,
+    user_id: &str,
+    account: Option<&str>,
+) -> Result<MailSignatureConfig> {
+    let Some(raw) = secrets.get(user_id, &signature_provider(account)?)? else {
+        let plain = load_credentials(secrets, user_id, account)?
+            .and_then(|c| c.signature)
+            .unwrap_or_default();
+        return Ok(MailSignatureConfig {
+            signature: plain,
+            signature_html: None,
+            signature_logo_hash: None,
+        });
+    };
+    let mut cfg: MailSignatureConfig = serde_json::from_str(raw.expose_secret())
+        .map_err(|e| SeraError::Internal(format!("stored mail signature is invalid: {e}")))?;
+    if cfg.signature.is_empty()
+        && let Some(plain) = load_credentials(secrets, user_id, account)?.and_then(|c| c.signature)
+    {
+        cfg.signature = plain;
+    }
+    Ok(cfg)
+}
+
 pub fn delete_credentials(
     secrets: &UserSecrets,
     user_id: &str,
     account: Option<&str>,
 ) -> Result<bool> {
+    let _ = secrets.delete(user_id, &signature_provider(account)?);
     secrets.delete(user_id, &account_provider(account)?)
 }
 
@@ -216,6 +326,9 @@ pub struct MailAccountInfo {
     pub username: String,
     pub smtp_host: String,
     pub imap_host: String,
+    pub signature: Option<String>,
+    pub signature_html: Option<String>,
+    pub signature_logo_hash: Option<String>,
 }
 
 /// All mail accounts the user has connected (`mail` plus every `mail.*`).
@@ -234,11 +347,20 @@ pub fn list_accounts(secrets: &UserSecrets, user_id: &str) -> Result<Vec<MailAcc
             Some(account)
         };
         if let Some(creds) = load_credentials(secrets, user_id, lookup)? {
+            let sig_cfg = load_signature_config(secrets, user_id, lookup).unwrap_or_default();
+            let signature = if !sig_cfg.signature.trim().is_empty() {
+                Some(sig_cfg.signature)
+            } else {
+                creds.signature
+            };
             out.push(MailAccountInfo {
                 account: account.to_owned(),
                 username: creds.username,
                 smtp_host: creds.smtp_host,
                 imap_host: creds.imap_host,
+                signature,
+                signature_html: sig_cfg.signature_html,
+                signature_logo_hash: sig_cfg.signature_logo_hash,
             });
         }
     }
@@ -263,6 +385,69 @@ pub fn body_with_signature(creds: &MailCredentials, body: String) -> Result<Stri
             Ok(out)
         }
     }
+}
+
+fn escape_html_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn plain_to_basic_html(plain: &str) -> String {
+    escape_html_text(plain)
+        .replace("\r\n", "\n")
+        .replace('\n', "<br>\n")
+}
+
+/// Build the final HTML body (with signature HTML / plain signature / inline
+/// logo reference) if any HTML component is present.
+pub fn html_with_signature(
+    creds: &MailCredentials,
+    sig_cfg: &MailSignatureConfig,
+    body_plain: &str,
+    body_html: Option<&str>,
+    has_inline_logo: bool,
+) -> Result<Option<String>> {
+    let sig_html = sig_cfg
+        .signature_html
+        .as_deref()
+        .filter(|s| !s.trim().is_empty());
+    let body_html_clean = body_html.filter(|s| !s.trim().is_empty());
+    if body_html_clean.is_none() && sig_html.is_none() && !has_inline_logo {
+        return Ok(None);
+    }
+    let mut html = match body_html_clean {
+        Some(h) => h.to_owned(),
+        None => format!("<div>{}</div>", plain_to_basic_html(body_plain)),
+    };
+    if let Some(sh) = sig_html {
+        html.push_str("\n<br><div class=\"serabot-signature\">");
+        html.push_str(sh);
+        html.push_str("</div>");
+    } else if let Some(sig) = creds.signature.as_deref().filter(|s| !s.trim().is_empty()) {
+        html.push_str("\n<br><div class=\"serabot-signature\">-- <br>");
+        html.push_str(&plain_to_basic_html(sig));
+        html.push_str("</div>");
+    }
+    if has_inline_logo && !html.contains("cid:signature-logo@serabot") {
+        html.push_str(
+            "\n<br><img src=\"cid:signature-logo@serabot\" alt=\"Signature logo\" style=\"max-height:80px;\">",
+        );
+    }
+    if html.chars().count() > MAX_BODY_CHARS {
+        return Err(SeraError::Validation(format!(
+            "HTML body plus signature must stay under {MAX_BODY_CHARS} characters"
+        )));
+    }
+    Ok(Some(html))
 }
 
 // ---------------------------------------------------------------- MIME ----
@@ -304,12 +489,11 @@ pub fn build_message(
     body: &str,
     attachments: &[Attachment],
 ) -> Result<Vec<u8>> {
-    if to.is_empty() || to.len() > MAX_RECIPIENTS {
-        return Err(SeraError::Validation(format!(
-            "1 to {MAX_RECIPIENTS} recipients are allowed"
-        )));
-    }
-    for addr in to {
+    build_message_full(from, to, &[], subject, body, None, None, attachments)
+}
+
+fn validate_recipient_list(addrs: &[String]) -> Result<()> {
+    for addr in addrs {
         if addr.is_empty()
             || addr.len() > 254
             || addr.chars().any(|c| c == '\r' || c == '\n' || c == ',')
@@ -317,11 +501,102 @@ pub fn build_message(
             return Err(SeraError::Validation(format!("invalid recipient {addr:?}")));
         }
     }
+    Ok(())
+}
+
+fn write_alternative_body(out: &mut String, body_text: &str, body_html: &str) {
+    let alt_bnd = format!("serabot-alt-{}", uuid::Uuid::now_v7().simple());
+    out.push_str(&format!(
+        "Content-Type: multipart/alternative; boundary=\"{alt_bnd}\"\r\n\r\n"
+    ));
+    out.push_str(&format!("--{alt_bnd}\r\n"));
+    out.push_str(
+        "Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n",
+    );
+    out.push_str(body_text);
+    if !body_text.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!("\r\n--{alt_bnd}\r\n"));
+    out.push_str(
+        "Content-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n",
+    );
+    out.push_str(body_html);
+    if !body_html.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!("\r\n--{alt_bnd}--\r\n"));
+}
+
+fn write_related_or_alternative(
+    out: &mut String,
+    body_text: &str,
+    body_html: &str,
+    inline_logo: Option<(&str, &[u8])>,
+) {
+    if let Some((logo_mime, logo_bytes)) = inline_logo {
+        let rel_bnd = format!("serabot-rel-{}", uuid::Uuid::now_v7().simple());
+        out.push_str(&format!(
+            "Content-Type: multipart/related; boundary=\"{rel_bnd}\"\r\n\r\n"
+        ));
+        out.push_str(&format!("--{rel_bnd}\r\n"));
+        write_alternative_body(out, body_text, body_html);
+        out.push_str(&format!("--{rel_bnd}\r\n"));
+        let ext = match logo_mime {
+            "image/png" => "png",
+            "image/jpeg" => "jpg",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            _ => "bin",
+        };
+        out.push_str(&format!("Content-Type: {logo_mime}\r\n"));
+        out.push_str("Content-Transfer-Encoding: base64\r\n");
+        out.push_str("Content-ID: <signature-logo@serabot>\r\n");
+        out.push_str(&format!(
+            "Content-Disposition: inline; filename=\"signature-logo.{ext}\"\r\n\r\n"
+        ));
+        let encoded = base64::engine::general_purpose::STANDARD.encode(logo_bytes);
+        for chunk in encoded.as_bytes().chunks(76) {
+            out.push_str(std::str::from_utf8(chunk).unwrap_or(""));
+            out.push_str("\r\n");
+        }
+        out.push_str(&format!("--{rel_bnd}--\r\n"));
+    } else {
+        write_alternative_body(out, body_text, body_html);
+    }
+}
+
+/// Build a MIME message supporting `cc`, `body_html`, inline `cid:signature-logo@serabot`,
+/// and regular attachments (`multipart/mixed` -> `multipart/related` -> `multipart/alternative`).
+/// `Bcc` recipients are passed to `smtp_send` envelope `RCPT TO` and never written to headers.
+#[allow(clippy::too_many_arguments)]
+pub fn build_message_full(
+    from: &str,
+    to: &[String],
+    cc: &[String],
+    subject: &str,
+    body: &str,
+    body_html: Option<&str>,
+    inline_logo: Option<(&str, &[u8])>,
+    attachments: &[Attachment],
+) -> Result<Vec<u8>> {
+    if to.is_empty() || to.len() + cc.len() > MAX_RECIPIENTS {
+        return Err(SeraError::Validation(format!(
+            "1 to {MAX_RECIPIENTS} recipients are allowed"
+        )));
+    }
+    validate_recipient_list(to)?;
+    validate_recipient_list(cc)?;
     if subject.chars().count() > MAX_SUBJECT_CHARS {
         return Err(SeraError::Validation("subject is too long".into()));
     }
     if body.chars().count() > MAX_BODY_CHARS {
         return Err(SeraError::Validation("body is too long".into()));
+    }
+    if let Some(html) = body_html
+        && html.chars().count() > MAX_BODY_CHARS
+    {
+        return Err(SeraError::Validation("HTML body is too long".into()));
     }
     if attachments.len() > MAX_ATTACHMENTS {
         return Err(SeraError::Validation(format!(
@@ -347,7 +622,10 @@ pub fn build_message(
             ));
         }
     }
+    let logo_overhead = inline_logo.map(|(_, b)| b.len() * 4 / 3 + 200).unwrap_or(0);
     let total: usize = body.len()
+        + body_html.map_or(0, str::len)
+        + logo_overhead
         + attachments
             .iter()
             .map(|a| a.bytes.len() * 4 / 3 + 200)
@@ -357,7 +635,6 @@ pub fn build_message(
             "the whole message must stay under 25 MiB".into(),
         ));
     }
-    let boundary = format!("serabot-{}", uuid::Uuid::now_v7().simple());
     let mut out = String::new();
     out.push_str(&format!("From: {}\r\n", clean_header(from)));
     out.push_str(&format!(
@@ -367,6 +644,15 @@ pub fn build_message(
             .collect::<Vec<_>>()
             .join(", ")
     ));
+    if !cc.is_empty() {
+        out.push_str(&format!(
+            "Cc: {}\r\n",
+            cc.iter()
+                .map(|a| clean_header(a))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     out.push_str(&format!("Subject: {}\r\n", encode_header(subject)));
     out.push_str(&format!("Date: {}\r\n", chrono::Utc::now().to_rfc2822()));
     out.push_str(&format!(
@@ -374,28 +660,39 @@ pub fn build_message(
         uuid::Uuid::now_v7().simple()
     ));
     out.push_str("MIME-Version: 1.0\r\n");
+
     if attachments.is_empty() {
-        out.push_str(
-            "Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n",
-        );
-        out.push_str(body);
-        if !body.ends_with('\n') {
-            out.push('\n');
+        if let Some(html) = body_html {
+            write_related_or_alternative(&mut out, body, html, inline_logo);
+        } else {
+            out.push_str(
+                "Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n",
+            );
+            out.push_str(body);
+            if !body.ends_with('\n') {
+                out.push('\n');
+            }
         }
     } else {
+        let boundary = format!("serabot-{}", uuid::Uuid::now_v7().simple());
         out.push_str(&format!(
             "Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n"
         ));
         out.push_str(&format!("--{boundary}\r\n"));
-        out.push_str(
-            "Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n",
-        );
-        out.push_str(body);
-        if !body.ends_with('\n') {
-            out.push('\n');
+        if let Some(html) = body_html {
+            write_related_or_alternative(&mut out, body, html, inline_logo);
+            out.push_str(&format!("\r\n--{boundary}\r\n"));
+        } else {
+            out.push_str(
+                "Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n",
+            );
+            out.push_str(body);
+            if !body.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&format!("\r\n--{boundary}\r\n"));
         }
-        out.push_str(&format!("\r\n--{boundary}\r\n"));
-        for att in attachments {
+        for (idx, att) in attachments.iter().enumerate() {
             out.push_str(&format!("Content-Type: {}\r\n", att.content_type));
             out.push_str("Content-Transfer-Encoding: base64\r\n");
             out.push_str(&format!(
@@ -407,11 +704,197 @@ pub fn build_message(
                 out.push_str(std::str::from_utf8(chunk).unwrap_or(""));
                 out.push_str("\r\n");
             }
-            out.push_str(&format!("--{boundary}\r\n"));
+            if idx + 1 < attachments.len() {
+                out.push_str(&format!("--{boundary}\r\n"));
+            }
         }
         out.push_str(&format!("--{boundary}--\r\n"));
     }
     Ok(out.into_bytes())
+}
+
+pub struct SendAccountMailParams<'a> {
+    pub user_id: &'a str,
+    pub account: Option<&'a str>,
+    pub to: &'a [String],
+    pub cc: &'a [String],
+    pub bcc: &'a [String],
+    pub subject: &'a str,
+    pub body: &'a str,
+    pub body_html: Option<&'a str>,
+    pub attachment_hashes: &'a [String],
+}
+
+#[derive(Clone, Debug)]
+pub struct SendMailResult {
+    pub to_count: usize,
+    pub attachments: usize,
+    pub bytes: usize,
+}
+
+fn scan_mail_text(store: &Store, policy: &Policy, user_id: &str, text: &str) -> Result<()> {
+    if !policy.is_allowed(text) {
+        let _ = store.record_audit(
+            user_id,
+            "policy.blocked_egress",
+            None,
+            None,
+            None,
+            None,
+            Some(policy.version()),
+            None,
+        );
+        return Err(SeraError::PolicyViolation);
+    }
+    Ok(())
+}
+
+pub fn is_safe_inline_image_mime(mime: &str) -> bool {
+    matches!(
+        mime.to_ascii_lowercase().as_str(),
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    )
+}
+
+pub(crate) fn inline_image_mime_for_filename(filename: &str) -> &'static str {
+    let ext = std::path::Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        _ => crate::util::mime_for_filename(filename),
+    }
+}
+
+/// Validate policy, load attachments & signature logo from the user's artifact
+/// store, build the MIME message, and send via SMTP. Shared by `/v1/mail/send`
+/// and the 30-second scheduled-mail background loop.
+pub async fn send_account_mail(
+    secrets: &UserSecrets,
+    store: &Store,
+    artifacts: &ArtifactStore,
+    policy: &Policy,
+    params: SendAccountMailParams<'_>,
+) -> Result<SendMailResult> {
+    let account = params.account.map(str::trim).filter(|s| !s.is_empty());
+    account_provider(account)?;
+    if params.to.is_empty() || params.to.len() + params.cc.len() + params.bcc.len() > MAX_RECIPIENTS
+    {
+        return Err(SeraError::Validation(format!(
+            "1 to {MAX_RECIPIENTS} recipients are allowed"
+        )));
+    }
+    validate_recipient_list(params.to)?;
+    validate_recipient_list(params.cc)?;
+    validate_recipient_list(params.bcc)?;
+
+    scan_mail_text(store, policy, params.user_id, params.subject)?;
+    scan_mail_text(store, policy, params.user_id, params.body)?;
+    if let Some(html) = params.body_html {
+        scan_mail_text(store, policy, params.user_id, html)?;
+    }
+    for rcpt in params
+        .to
+        .iter()
+        .chain(params.cc.iter())
+        .chain(params.bcc.iter())
+    {
+        scan_mail_text(store, policy, params.user_id, rcpt)?;
+    }
+    if params.attachment_hashes.len() > MAX_ATTACHMENTS {
+        return Err(SeraError::Validation(format!(
+            "at most {MAX_ATTACHMENTS} attachments are allowed"
+        )));
+    }
+    let mut attachments = Vec::with_capacity(params.attachment_hashes.len());
+    for hash in params.attachment_hashes {
+        if !store.user_owns_artifact(params.user_id, hash)? {
+            return Err(SeraError::Forbidden("artifact".into()));
+        }
+        let stored = artifacts.load(hash)?;
+        if !policy.is_allowed(&stored.filename) {
+            return Err(SeraError::PolicyViolation);
+        }
+        if stored.bytes.is_empty() || stored.bytes.len() > MAX_ATTACHMENT_BYTES {
+            return Err(SeraError::Validation(
+                "each attachment must be 1 byte to 20 MiB".into(),
+            ));
+        }
+        let content_type = crate::util::mime_for_filename(&stored.filename).to_owned();
+        attachments.push(Attachment {
+            name: stored.filename,
+            content_type,
+            bytes: stored.bytes,
+        });
+    }
+
+    let creds = require_creds(secrets, params.user_id, account)?;
+    let sig_cfg = load_signature_config(secrets, params.user_id, account).unwrap_or_default();
+    let mut inline_logo: Option<(String, Vec<u8>)> = None;
+    if let Some(logo_hash) = sig_cfg
+        .signature_logo_hash
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        if !store.user_owns_artifact(params.user_id, logo_hash)? {
+            return Err(SeraError::Forbidden("artifact".into()));
+        }
+        let stored = artifacts.load(logo_hash)?;
+        let mime = inline_image_mime_for_filename(&stored.filename).to_owned();
+        if !is_safe_inline_image_mime(&mime) {
+            return Err(SeraError::Validation(
+                "signature logo must be png, jpeg, gif, or webp".into(),
+            ));
+        }
+        if stored.bytes.is_empty() || stored.bytes.len() > MAX_INLINE_ATTACHMENT_BYTES {
+            return Err(SeraError::Validation(
+                "signature logo must be 1 byte to 512 KiB".into(),
+            ));
+        }
+        inline_logo = Some((mime, stored.bytes));
+    }
+
+    let from = from_address(&creds);
+    let final_plain = body_with_signature(&creds, params.body.to_owned())?;
+    scan_mail_text(store, policy, params.user_id, &final_plain)?;
+    let final_html = html_with_signature(
+        &creds,
+        &sig_cfg,
+        params.body,
+        params.body_html,
+        inline_logo.is_some(),
+    )?;
+    if let Some(html) = &final_html {
+        scan_mail_text(store, policy, params.user_id, html)?;
+    }
+
+    let logo_ref = inline_logo
+        .as_ref()
+        .map(|(m, b)| (m.as_str(), b.as_slice()));
+    let msg = build_message_full(
+        &from,
+        params.to,
+        params.cc,
+        params.subject,
+        &final_plain,
+        final_html.as_deref(),
+        logo_ref,
+        &attachments,
+    )?;
+    let mut all_rcpts = Vec::with_capacity(params.to.len() + params.cc.len() + params.bcc.len());
+    all_rcpts.extend(params.to.iter().cloned());
+    all_rcpts.extend(params.cc.iter().cloned());
+    all_rcpts.extend(params.bcc.iter().cloned());
+    smtp_send(&creds, &from, &all_rcpts, &msg).await?;
+    Ok(SendMailResult {
+        to_count: all_rcpts.len(),
+        attachments: attachments.len(),
+        bytes: msg.len(),
+    })
 }
 
 // ------------------------------------------------------------- wire I/O ----
@@ -815,6 +1298,22 @@ pub struct MailMessage {
     pub attachments: Vec<MailAttachment>,
 }
 
+/// Full parsed message for `GET /v1/mail/messages/{uid}`, including sanitized
+/// HTML body, `cid:` inline images, and remote-image indicator.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct MailMessageDetail {
+    pub uid: u32,
+    pub subject: String,
+    pub from: String,
+    pub date: String,
+    pub flags: Vec<String>,
+    pub body: String,
+    pub body_text: String,
+    pub body_html: Option<String>,
+    pub has_remote_images: bool,
+    pub attachments: Vec<MailAttachment>,
+}
+
 /// Quote an IMAP string literal.
 fn imap_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
@@ -845,155 +1344,810 @@ async fn imap_connect(creds: &MailCredentials) -> Result<Wire<MailStream>> {
     Ok(wire)
 }
 
-/// Parse one raw RFC822 message into a MailMessage (header unfold + minimal
-/// RFC 2047 subject decode + raw body).
-pub fn parse_message(uid: u32, flags: Vec<String>, raw: &str) -> MailMessage {
-    let (head, body) = match raw.find("\r\n\r\n") {
+fn unfold_headers(head: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in head.replace("\r\n", "\n").split('\n') {
+        if (line.starts_with(' ') || line.starts_with('\t')) && !out.is_empty() {
+            if let Some((_, val)) = out.last_mut() {
+                val.push(' ');
+                val.push_str(line.trim());
+            }
+            continue;
+        }
+        if let Some((key, value)) = line.split_once(':') {
+            out.push((key.trim().to_ascii_lowercase(), value.trim().to_owned()));
+        }
+    }
+    out
+}
+
+fn split_head_body(raw: &str) -> (&str, &str) {
+    match raw.find("\r\n\r\n") {
         Some(pos) => (&raw[..pos], &raw[pos + 4..]),
         None => match raw.find("\n\n") {
             Some(pos) => (&raw[..pos], &raw[pos + 2..]),
             None => (raw, ""),
         },
-    };
+    }
+}
+
+/// Parse one raw RFC822 message into a MailMessage.
+pub fn parse_message(uid: u32, flags: Vec<String>, raw: &str) -> MailMessage {
+    let detail = parse_message_detail(uid, flags, raw, false);
+    MailMessage {
+        uid: detail.uid,
+        subject: detail.subject,
+        from: detail.from,
+        date: detail.date,
+        flags: detail.flags,
+        body: detail.body,
+        attachments: detail.attachments,
+    }
+}
+
+/// Parse one raw RFC822 message into a `MailMessageDetail` with recursive MIME
+/// traversal, charset/transfer-encoding decoding, `cid:` inline image rewriting,
+/// and strict HTML sanitization.
+pub fn parse_message_detail(
+    uid: u32,
+    flags: Vec<String>,
+    raw: &str,
+    allow_remote_images: bool,
+) -> MailMessageDetail {
+    let (head, body) = split_head_body(raw);
+    let headers = unfold_headers(head);
     let mut subject = String::new();
     let mut from = String::new();
     let mut date = String::new();
-    let mut last_key = String::new();
-    for line in head.replace("\r\n", "\n").split('\n') {
-        if (line.starts_with(' ') || line.starts_with('\t')) && !last_key.is_empty() {
-            let target = match last_key.as_str() {
-                "subject" => &mut subject,
-                "from" => &mut from,
-                "date" => &mut date,
-                _ => continue,
-            };
-            target.push(' ');
-            target.push_str(line.trim());
-            continue;
-        }
-        if let Some((key, value)) = line.split_once(':') {
-            last_key = key.trim().to_ascii_lowercase();
-            let value = value.trim();
-            match last_key.as_str() {
-                "subject" => subject = decode_rfc2047(value),
-                "from" => from = clean_header(value),
-                "date" => date = clean_header(value),
-                _ => {}
-            }
+    for (k, v) in &headers {
+        match k.as_str() {
+            "subject" if subject.is_empty() => subject = decode_rfc2047(v),
+            "from" if from.is_empty() => from = decode_rfc2047(v),
+            "date" if date.is_empty() => date = clean_header(v),
+            _ => {}
         }
     }
-    let (text_body, attachments) = extract_body_and_attachments(head, body);
-    MailMessage {
+    let mut walk = MimeWalkState::default();
+    walk_mime(head, body, 0, &mut walk);
+
+    let (sanitized_html, has_remote_images) = match walk.html {
+        Some(raw_html) => {
+            let (clean, remote) =
+                sanitize_email_html(&raw_html, &walk.inline_parts, allow_remote_images);
+            (Some(clean), remote)
+        }
+        None => (None, false),
+    };
+    let body_text = walk
+        .plain
+        .unwrap_or_else(|| {
+            sanitized_html
+                .as_deref()
+                .map(html_to_plain_fallback)
+                .unwrap_or_default()
+        })
+        .replace("\r\n", "\n");
+    MailMessageDetail {
         uid,
         subject,
         from,
         date,
         flags,
-        body: text_body.replace("\r\n", "\n"),
-        attachments,
+        body: body_text.clone(),
+        body_text,
+        body_html: sanitized_html,
+        has_remote_images,
+        attachments: walk.attachments,
     }
 }
 
-/// Split a message body into the readable text and its attachments. For
-/// multipart messages the parts are split on the boundary from the
-/// Content-Type header; single-part messages keep the raw body.
-fn extract_body_and_attachments(head: &str, body: &str) -> (String, Vec<MailAttachment>) {
-    let boundary = head.replace("\r\n", "\n").split('\n').find_map(|line| {
-        let (key, value) = line.split_once(':')?;
-        if key.trim().eq_ignore_ascii_case("content-type") {
-            value.split(';').find_map(|param| {
-                let (k, v) = param.split_once('=')?;
-                if k.trim().eq_ignore_ascii_case("boundary") {
-                    return Some(v.trim().trim_matches('"').to_owned());
-                }
-                None
-            })
-        } else {
-            None
+const MAX_MIME_DEPTH: usize = 16;
+
+#[derive(Clone, Debug)]
+struct InlinePart {
+    content_type: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(Default)]
+struct MimeWalkState {
+    plain: Option<String>,
+    html: Option<String>,
+    inline_parts: HashMap<String, InlinePart>,
+    attachments: Vec<MailAttachment>,
+    raw_attachments: Vec<(String, String, Vec<u8>)>,
+    inline_total: usize,
+}
+
+fn header_param(header_val: &str, param_name: &str) -> Option<String> {
+    let mut rest = header_val;
+    // Skip main value before first ';'
+    let semi = rest.find(';')?;
+    rest = &rest[semi + 1..];
+    while !rest.is_empty() {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
         }
-    });
-    let Some(boundary) = boundary else {
-        return (body.to_owned(), Vec::new());
-    };
-    let delimiter = format!("--{boundary}");
-    let mut plain: Option<String> = None;
-    let mut html: Option<String> = None;
-    let mut attachments = Vec::new();
-    let mut inline_total = 0usize;
-    for part in body.split(&delimiter).skip(1) {
-        let part = part
-            .strip_prefix("\r\n")
-            .or_else(|| part.strip_prefix('\n'))
-            .unwrap_or(part);
-        if part.starts_with("--") {
-            break; // closing delimiter
-        }
-        let part = part
-            .strip_suffix("\r\n")
-            .or_else(|| part.strip_suffix('\n'))
-            .unwrap_or(part);
-        let (part_head, part_body) = match part.find("\r\n\r\n") {
-            Some(pos) => (&part[..pos], &part[pos + 4..]),
-            None => match part.find("\n\n") {
-                Some(pos) => (&part[..pos], &part[pos + 2..]),
-                None => (part, ""),
-            },
+        let eq = match rest.find('=') {
+            Some(i) => i,
+            None => break,
         };
-        let head_lc = part_head.to_ascii_lowercase();
-        let content_type = head_lc
-            .split('\n')
-            .find_map(|l| {
-                l.split_once(':')
-                    .filter(|(k, _)| k.trim() == "content-type")
-            })
-            .map(|(_, v)| v.split(';').next().unwrap_or("").trim().to_owned())
-            .unwrap_or_else(|| "text/plain".to_owned());
-        let filename = part_head.split('\n').find_map(|l| {
-            let (k, v) = l.split_once(':')?;
-            if !k.trim().eq_ignore_ascii_case("content-disposition") {
-                return None;
-            }
-            v.split(';').find_map(|p| {
-                let (k, v) = p.split_once('=')?;
-                if k.trim().eq_ignore_ascii_case("filename") {
-                    Some(v.trim().trim_matches('"').to_owned())
+        let key = rest[..eq].trim();
+        let after_eq = rest[eq + 1..].trim_start();
+        let (val, next_rest) = if let Some(quoted) = after_eq.strip_prefix('"') {
+            let mut v = String::new();
+            let mut chars = quoted.char_indices();
+            let mut end_idx = quoted.len();
+            while let Some((i, ch)) = chars.next() {
+                if ch == '\\' {
+                    if let Some((_, esc)) = chars.next() {
+                        v.push(esc);
+                    }
+                } else if ch == '"' {
+                    end_idx = i + 1;
+                    break;
                 } else {
-                    None
+                    v.push(ch);
                 }
-            })
-        });
-        let decoded = if head_lc.contains("content-transfer-encoding: base64") {
-            let compact: String = part_body.chars().filter(|c| !c.is_whitespace()).collect();
+            }
+            let tail = &quoted[end_idx..];
+            let next = tail.find(';').map(|s| &tail[s + 1..]).unwrap_or("");
+            (v, next)
+        } else if let Some(s) = after_eq.find(';') {
+            (after_eq[..s].trim().to_owned(), &after_eq[s + 1..])
+        } else {
+            (after_eq.trim().to_owned(), "")
+        };
+        if key.eq_ignore_ascii_case(param_name) {
+            return Some(decode_rfc2047(&val));
+        }
+        rest = next_rest;
+    }
+    None
+}
+
+fn decode_quoted_printable(input: &str) -> Vec<u8> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'=' {
+            if i + 2 < bytes.len() && bytes[i + 1] == b'\r' && bytes[i + 2] == b'\n' {
+                i += 3;
+                continue;
+            }
+            if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                i += 2;
+                continue;
+            }
+            if i + 2 < bytes.len()
+                && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+            {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_charset(bytes: &[u8], charset: &str) -> String {
+    let cs = charset
+        .split('*')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match cs.as_str() {
+        "" | "utf-8" | "utf8" | "us-ascii" | "ascii" => String::from_utf8_lossy(bytes).into_owned(),
+        "iso-8859-1" | "iso_8859-1" | "latin1" | "latin-1" => {
+            bytes.iter().map(|&b| b as char).collect()
+        }
+        "windows-1252" | "cp1252" => bytes.iter().map(|&b| win1252_char(b)).collect(),
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+fn win1252_char(b: u8) -> char {
+    const TABLE: [char; 32] = [
+        '\u{20AC}', '\u{FFFD}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}', '\u{2020}',
+        '\u{2021}', '\u{02C6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{FFFD}',
+        '\u{017D}', '\u{FFFD}', '\u{FFFD}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}',
+        '\u{2022}', '\u{2013}', '\u{2014}', '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}',
+        '\u{0153}', '\u{FFFD}', '\u{017E}', '\u{0178}',
+    ];
+    if (0x80..=0x9F).contains(&b) {
+        TABLE[(b - 0x80) as usize]
+    } else {
+        b as char
+    }
+}
+
+fn decode_part_bytes(encoding: &str, body: &str) -> Vec<u8> {
+    match encoding.trim().to_ascii_lowercase().as_str() {
+        "base64" => {
+            let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
             base64::engine::general_purpose::STANDARD
                 .decode(compact)
                 .unwrap_or_default()
-        } else {
-            part_body.as_bytes().to_vec()
-        };
-        if let Some(name) = filename {
-            let size = decoded.len();
-            let data_base64 = if size <= MAX_INLINE_ATTACHMENT_BYTES
-                && inline_total + size <= MAX_INLINE_ATTACHMENTS_TOTAL
-            {
-                inline_total += size;
-                Some(base64::engine::general_purpose::STANDARD.encode(&decoded))
-            } else {
-                None
-            };
-            attachments.push(MailAttachment {
-                name,
+        }
+        "quoted-printable" => decode_quoted_printable(body),
+        _ => body.as_bytes().to_vec(),
+    }
+}
+
+fn walk_mime(head: &str, body: &str, depth: usize, state: &mut MimeWalkState) {
+    if depth > MAX_MIME_DEPTH {
+        return;
+    }
+    let headers = unfold_headers(head);
+    let ct_raw = headers
+        .iter()
+        .find(|(k, _)| k == "content-type")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("text/plain; charset=utf-8");
+    let content_type = ct_raw
+        .split(';')
+        .next()
+        .unwrap_or("text/plain")
+        .trim()
+        .to_ascii_lowercase();
+    let charset = header_param(ct_raw, "charset").unwrap_or_else(|| "utf-8".to_owned());
+
+    if content_type.starts_with("multipart/")
+        && let Some(boundary) = header_param(ct_raw, "boundary")
+        && !boundary.is_empty()
+    {
+        let delimiter = format!("--{boundary}");
+        for part in body.split(&delimiter).skip(1) {
+            let part = part
+                .strip_prefix("\r\n")
+                .or_else(|| part.strip_prefix('\n'))
+                .unwrap_or(part);
+            if part.starts_with("--") {
+                break;
+            }
+            let part = part
+                .strip_suffix("\r\n")
+                .or_else(|| part.strip_suffix('\n'))
+                .unwrap_or(part);
+            let (part_head, part_body) = split_head_body(part);
+            walk_mime(part_head, part_body, depth + 1, state);
+        }
+        return;
+    }
+
+    let encoding = headers
+        .iter()
+        .find(|(k, _)| k == "content-transfer-encoding")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("7bit");
+    let decoded = decode_part_bytes(encoding, body);
+
+    let cd_raw = headers
+        .iter()
+        .find(|(k, _)| k == "content-disposition")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let disposition = cd_raw
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let filename = header_param(cd_raw, "filename").or_else(|| header_param(ct_raw, "name"));
+    let content_id = headers
+        .iter()
+        .find(|(k, _)| k == "content-id")
+        .map(|(_, v)| {
+            v.trim()
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .filter(|s| !s.is_empty());
+
+    if let Some(cid) = content_id
+        && disposition != "attachment"
+    {
+        state.inline_parts.insert(
+            cid,
+            InlinePart {
                 content_type,
-                size,
-                data_base64,
-            });
-        } else if content_type.starts_with("text/plain") && plain.is_none() {
-            plain = Some(String::from_utf8_lossy(&decoded).into_owned());
-        } else if content_type.starts_with("text/html") && html.is_none() {
-            html = Some(String::from_utf8_lossy(&decoded).into_owned());
+                bytes: decoded,
+            },
+        );
+        return;
+    }
+
+    if disposition == "attachment" || (filename.is_some() && !content_type.starts_with("text/")) {
+        let name = filename.unwrap_or_else(|| "attachment.bin".to_owned());
+        let size = decoded.len();
+        let data_base64 = if size <= MAX_INLINE_ATTACHMENT_BYTES
+            && state.inline_total + size <= MAX_INLINE_ATTACHMENTS_TOTAL
+        {
+            state.inline_total += size;
+            Some(base64::engine::general_purpose::STANDARD.encode(&decoded))
+        } else {
+            None
+        };
+        state.attachments.push(MailAttachment {
+            name: name.clone(),
+            content_type: content_type.clone(),
+            size,
+            data_base64,
+        });
+        state.raw_attachments.push((name, content_type, decoded));
+        return;
+    }
+
+    if content_type == "text/plain" && state.plain.is_none() {
+        state.plain = Some(decode_charset(&decoded, &charset));
+    } else if content_type == "text/html" && state.html.is_none() {
+        state.html = Some(decode_charset(&decoded, &charset));
+    }
+}
+
+fn html_to_plain_fallback(html: &str) -> String {
+    let doc = scraper::Html::parse_document(html);
+    let mut out = String::new();
+    for node in doc.tree.nodes() {
+        if let scraper::Node::Text(t) = node.value() {
+            let trimmed = t.trim();
+            if !trimmed.is_empty() {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(trimmed);
+            }
         }
     }
-    let text = plain.or(html).unwrap_or_default();
-    (text, attachments)
+    out
+}
+
+fn sanitize_url_scheme(val: &str) -> String {
+    val.chars()
+        .filter(|c| !c.is_control() && !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+fn is_safe_data_image_url(val: &str) -> bool {
+    let compact = sanitize_url_scheme(val);
+    let Some(rest) = compact.strip_prefix("data:") else {
+        return false;
+    };
+    let Some((meta, payload)) = rest.split_once(',') else {
+        return false;
+    };
+    let meta_ok = matches!(
+        meta,
+        "image/png;base64" | "image/jpeg;base64" | "image/gif;base64" | "image/webp;base64"
+    );
+    meta_ok && !payload.is_empty()
+}
+
+fn normalize_css_for_scan(input: &str) -> String {
+    // 1. Strip CSS comments /* ... */
+    let mut no_comments = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            while let Some(inner) = chars.next() {
+                if inner == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    break;
+                }
+            }
+            continue;
+        }
+        no_comments.push(c);
+    }
+    // 2. Decode CSS backslash escapes and strip whitespace/control chars for matching.
+    let mut out = String::with_capacity(no_comments.len());
+    let bytes = no_comments.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            i += 1;
+            let start = i;
+            while i < bytes.len() && i - start < 6 && bytes[i].is_ascii_hexdigit() {
+                i += 1;
+            }
+            if i > start {
+                if let Ok(hex) = std::str::from_utf8(&bytes[start..i])
+                    && let Ok(code) = u32::from_str_radix(hex, 16)
+                    && let Some(ch) = char::from_u32(code)
+                    && !ch.is_whitespace()
+                    && !ch.is_control()
+                {
+                    out.push(ch.to_ascii_lowercase());
+                }
+                if i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+            } else {
+                let ch = bytes[i] as char;
+                if !ch.is_whitespace() && !ch.is_control() {
+                    out.push(ch.to_ascii_lowercase());
+                }
+                i += 1;
+            }
+            continue;
+        }
+        let ch = no_comments[i..].chars().next().unwrap();
+        let len = ch.len_utf8();
+        if !ch.is_whitespace() && !ch.is_control() {
+            for lc in ch.to_lowercase() {
+                out.push(lc);
+            }
+        }
+        i += len;
+    }
+    out
+}
+
+fn sanitize_inline_style(
+    style: &str,
+    allow_remote_images: bool,
+    has_remote_images: &mut bool,
+) -> Option<String> {
+    let norm_all = normalize_css_for_scan(style);
+    if norm_all.contains("expression(")
+        || norm_all.contains("behavior:")
+        || norm_all.contains("-moz-binding")
+        || norm_all.contains("@import")
+        || norm_all.contains("javascript:")
+        || norm_all.contains("vbscript:")
+    {
+        return None;
+    }
+
+    let mut cleaned = Vec::new();
+    for decl in style.split(';') {
+        let trimmed = decl.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let norm = normalize_css_for_scan(trimmed);
+        if norm.contains("url(") {
+            let is_remote = norm.contains("http://")
+                || norm.contains("https://")
+                || norm.contains("url(//")
+                || norm.contains("url(\"//")
+                || norm.contains("url('//");
+            if is_remote {
+                *has_remote_images = true;
+                if !allow_remote_images {
+                    continue;
+                }
+                cleaned.push(trimmed);
+            } else if let Some(data_pos) = norm.find("data:") {
+                let data_slice = &norm[data_pos..];
+                let data_end = data_slice
+                    .find([')', '"', '\''])
+                    .unwrap_or(data_slice.len());
+                if is_safe_data_image_url(&data_slice[..data_end]) {
+                    cleaned.push(trimmed);
+                }
+            }
+            continue;
+        }
+        cleaned.push(trimmed);
+    }
+
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.join("; "))
+    }
+}
+
+fn sanitize_email_html(
+    html: &str,
+    inline_parts: &HashMap<String, InlinePart>,
+    allow_remote_images: bool,
+) -> (String, bool) {
+    let doc = scraper::Html::parse_document(html);
+    let mut out = String::with_capacity(html.len());
+    let mut has_remote_images = false;
+    sanitize_element(
+        doc.root_element(),
+        inline_parts,
+        allow_remote_images,
+        &mut has_remote_images,
+        &mut out,
+    );
+    (out, has_remote_images)
+}
+
+fn sanitize_element(
+    el_ref: scraper::ElementRef<'_>,
+    inline_parts: &HashMap<String, InlinePart>,
+    allow_remote_images: bool,
+    has_remote_images: &mut bool,
+    out: &mut String,
+) {
+    let el = el_ref.value();
+    let tag = el.name();
+    // Strip dangerous tags and their entire subtrees.
+    if matches!(
+        tag,
+        "script"
+            | "style"
+            | "iframe"
+            | "object"
+            | "embed"
+            | "form"
+            | "input"
+            | "button"
+            | "textarea"
+            | "select"
+            | "meta"
+            | "link"
+            | "base"
+            | "noscript"
+            | "template"
+            | "svg"
+            | "math"
+            | "head"
+            | "title"
+    ) {
+        return;
+    }
+    // Unwrap document-level wrappers so email HTML embeds cleanly.
+    if matches!(tag, "html" | "body") {
+        for child in el_ref.children() {
+            match child.value() {
+                scraper::Node::Text(text) => out.push_str(&escape_html_text(text)),
+                scraper::Node::Element(_) => {
+                    if let Some(child_el) = scraper::ElementRef::wrap(child) {
+                        sanitize_element(
+                            child_el,
+                            inline_parts,
+                            allow_remote_images,
+                            has_remote_images,
+                            out,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        return;
+    }
+    let allowed_tag = matches!(
+        tag,
+        "p" | "div"
+            | "span"
+            | "br"
+            | "hr"
+            | "a"
+            | "img"
+            | "b"
+            | "strong"
+            | "i"
+            | "em"
+            | "u"
+            | "s"
+            | "strike"
+            | "del"
+            | "ins"
+            | "sub"
+            | "sup"
+            | "small"
+            | "big"
+            | "code"
+            | "pre"
+            | "blockquote"
+            | "q"
+            | "cite"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "ul"
+            | "ol"
+            | "li"
+            | "dl"
+            | "dt"
+            | "dd"
+            | "table"
+            | "thead"
+            | "tbody"
+            | "tfoot"
+            | "tr"
+            | "th"
+            | "td"
+            | "caption"
+            | "colgroup"
+            | "col"
+            | "font"
+            | "center"
+            | "article"
+            | "section"
+            | "header"
+            | "footer"
+            | "main"
+            | "nav"
+            | "aside"
+            | "figure"
+            | "figcaption"
+            | "address"
+            | "time"
+            | "mark"
+            | "abbr"
+            | "details"
+            | "summary"
+            | "wbr"
+    );
+    if !allowed_tag {
+        for child in el_ref.children() {
+            match child.value() {
+                scraper::Node::Text(text) => out.push_str(&escape_html_text(text)),
+                scraper::Node::Element(_) => {
+                    if let Some(child_el) = scraper::ElementRef::wrap(child) {
+                        sanitize_element(
+                            child_el,
+                            inline_parts,
+                            allow_remote_images,
+                            has_remote_images,
+                            out,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        return;
+    }
+
+    out.push('<');
+    out.push_str(tag);
+    for (attr, val) in el.attrs() {
+        let attr_lc = attr.to_ascii_lowercase();
+        if attr_lc.starts_with("on")
+            || matches!(
+                attr_lc.as_str(),
+                "srcdoc" | "formaction" | "action" | "ping" | "xlink:href" | "xmlns"
+            )
+        {
+            continue;
+        }
+        match attr_lc.as_str() {
+            "src" => {
+                let scheme_check = sanitize_url_scheme(val);
+                if let Some(cid_raw) = val.trim().strip_prefix("cid:").or_else(|| {
+                    val.trim()
+                        .get(..4)
+                        .filter(|p| p.eq_ignore_ascii_case("cid:"))
+                        .map(|_| &val.trim()[4..])
+                }) {
+                    let cid = cid_raw
+                        .trim()
+                        .trim_start_matches('<')
+                        .trim_end_matches('>')
+                        .to_ascii_lowercase();
+                    if tag == "img"
+                        && let Some(part) = inline_parts.get(&cid)
+                        && is_safe_inline_image_mime(&part.content_type)
+                    {
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&part.bytes);
+                        out.push_str(&format!(
+                            " src=\"data:{};base64,{}\"",
+                            part.content_type, b64
+                        ));
+                    }
+                } else if scheme_check.starts_with("https://")
+                    || scheme_check.starts_with("http://")
+                {
+                    *has_remote_images = true;
+                    if allow_remote_images && tag == "img" {
+                        out.push_str(" src=\"");
+                        out.push_str(&escape_html_text(val.trim()));
+                        out.push('"');
+                    }
+                } else if tag == "img" && is_safe_data_image_url(val) {
+                    out.push_str(" src=\"");
+                    out.push_str(&escape_html_text(val.trim()));
+                    out.push('"');
+                }
+            }
+            "href" => {
+                let scheme_check = sanitize_url_scheme(val);
+                if scheme_check.starts_with("https://")
+                    || scheme_check.starts_with("http://")
+                    || scheme_check.starts_with("mailto:")
+                    || scheme_check.starts_with("tel:")
+                    || scheme_check.starts_with('#')
+                {
+                    out.push_str(" href=\"");
+                    out.push_str(&escape_html_text(val.trim()));
+                    out.push('"');
+                }
+            }
+            "background" => {
+                let scheme_check = sanitize_url_scheme(val);
+                if scheme_check.starts_with("https://") || scheme_check.starts_with("http://") {
+                    *has_remote_images = true;
+                    if allow_remote_images {
+                        out.push_str(" background=\"");
+                        out.push_str(&escape_html_text(val.trim()));
+                        out.push('"');
+                    }
+                }
+            }
+            "style" => {
+                if let Some(clean_style) =
+                    sanitize_inline_style(val, allow_remote_images, has_remote_images)
+                {
+                    out.push_str(" style=\"");
+                    out.push_str(&escape_html_text(&clean_style));
+                    out.push('"');
+                }
+            }
+            "alt" | "title" | "width" | "height" | "align" | "valign" | "bgcolor" | "color"
+            | "border" | "cellpadding" | "cellspacing" | "colspan" | "rowspan" | "class" | "id"
+            | "dir" | "lang" | "face" | "size" | "target" => {
+                out.push(' ');
+                out.push_str(&attr_lc);
+                out.push_str("=\"");
+                out.push_str(&escape_html_text(val));
+                out.push('"');
+            }
+            "rel" if tag != "a" => {
+                out.push_str(" rel=\"");
+                out.push_str(&escape_html_text(val));
+                out.push('"');
+            }
+            _ => {}
+        }
+    }
+    if tag == "a" {
+        out.push_str(" rel=\"noopener noreferrer\"");
+    }
+    out.push('>');
+
+    let is_void = matches!(tag, "br" | "hr" | "img" | "wbr" | "col");
+    if !is_void {
+        for child in el_ref.children() {
+            match child.value() {
+                scraper::Node::Text(text) => out.push_str(&escape_html_text(text)),
+                scraper::Node::Element(_) => {
+                    if let Some(child_el) = scraper::ElementRef::wrap(child) {
+                        sanitize_element(
+                            child_el,
+                            inline_parts,
+                            allow_remote_images,
+                            has_remote_images,
+                            out,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.push_str("</");
+        out.push_str(tag);
+        out.push('>');
+    }
 }
 
 fn extract_envelope_address(raw: &str) -> String {
@@ -1007,108 +2161,98 @@ fn extract_envelope_address(raw: &str) -> String {
 }
 
 fn extract_raw_attachment(raw: &str, index: usize) -> Result<(String, String, Vec<u8>)> {
-    let (head, body) = match raw.find("\r\n\r\n") {
-        Some(pos) => (&raw[..pos], &raw[pos + 4..]),
-        None => match raw.find("\n\n") {
-            Some(pos) => (&raw[..pos], &raw[pos + 2..]),
-            None => (raw, ""),
-        },
-    };
-    let boundary = head.replace("\r\n", "\n").split('\n').find_map(|line| {
-        let (key, value) = line.split_once(':')?;
-        if key.trim().eq_ignore_ascii_case("content-type") {
-            value.split(';').find_map(|param| {
-                let (k, v) = param.split_once('=')?;
-                if k.trim().eq_ignore_ascii_case("boundary") {
-                    return Some(v.trim().trim_matches('"').to_owned());
-                }
-                None
-            })
-        } else {
-            None
-        }
-    });
-    let Some(boundary) = boundary else {
+    let (head, body) = split_head_body(raw);
+    let mut walk = MimeWalkState::default();
+    walk_mime(head, body, 0, &mut walk);
+    let Some((name, content_type, decoded)) = walk.raw_attachments.into_iter().nth(index) else {
         return Err(SeraError::NotFound("attachment".into()));
     };
-    let delimiter = format!("--{boundary}");
-    let mut att_idx = 0usize;
-    for part in body.split(&delimiter).skip(1) {
-        let part = part
-            .strip_prefix("\r\n")
-            .or_else(|| part.strip_prefix('\n'))
-            .unwrap_or(part);
-        if part.starts_with("--") {
-            break;
-        }
-        let part = part
-            .strip_suffix("\r\n")
-            .or_else(|| part.strip_suffix('\n'))
-            .unwrap_or(part);
-        let (part_head, part_body) = match part.find("\r\n\r\n") {
-            Some(pos) => (&part[..pos], &part[pos + 4..]),
-            None => match part.find("\n\n") {
-                Some(pos) => (&part[..pos], &part[pos + 2..]),
-                None => (part, ""),
-            },
-        };
-        let head_lc = part_head.to_ascii_lowercase();
-        let content_type = head_lc
-            .split('\n')
-            .find_map(|l| {
-                l.split_once(':')
-                    .filter(|(k, _)| k.trim() == "content-type")
-            })
-            .map(|(_, v)| v.split(';').next().unwrap_or("").trim().to_owned())
-            .unwrap_or_else(|| "application/octet-stream".to_owned());
-        let filename = part_head.split('\n').find_map(|l| {
-            let (k, v) = l.split_once(':')?;
-            if !k.trim().eq_ignore_ascii_case("content-disposition") {
-                return None;
-            }
-            v.split(';').find_map(|p| {
-                let (k, v) = p.split_once('=')?;
-                if k.trim().eq_ignore_ascii_case("filename") {
-                    Some(v.trim().trim_matches('"').to_owned())
-                } else {
-                    None
-                }
-            })
-        });
-        if let Some(name) = filename {
-            if att_idx == index {
-                let decoded = if head_lc.contains("content-transfer-encoding: base64") {
-                    let compact: String =
-                        part_body.chars().filter(|c| !c.is_whitespace()).collect();
-                    base64::engine::general_purpose::STANDARD
-                        .decode(compact)
-                        .map_err(|_| SeraError::External("invalid attachment base64".into()))?
-                } else {
-                    part_body.as_bytes().to_vec()
-                };
-                if decoded.len() > MAX_ATTACHMENT_BYTES {
-                    return Err(SeraError::Validation(
-                        "attachment exceeds 20 MiB limit".into(),
-                    ));
-                }
-                return Ok((name, content_type, decoded));
-            }
-            att_idx += 1;
-        }
+    if decoded.len() > MAX_ATTACHMENT_BYTES {
+        return Err(SeraError::Validation(
+            "attachment exceeds 20 MiB limit".into(),
+        ));
     }
-    Err(SeraError::NotFound("attachment".into()))
+    Ok((name, content_type, decoded))
 }
 
-fn decode_rfc2047(value: &str) -> String {
-    // =?UTF-8?B?...?= (one encoded word is enough for subjects)
-    if let Some(rest) = value
-        .strip_prefix("=?UTF-8?B?")
-        .and_then(|r| r.strip_suffix("?="))
-        && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(rest.trim())
-    {
-        return String::from_utf8_lossy(&bytes).into_owned();
+fn decode_rfc2047_word(word: &str) -> Option<String> {
+    let inner = word.strip_prefix("=?")?.strip_suffix("?=")?;
+    let mut parts = inner.splitn(3, '?');
+    let charset = parts.next()?;
+    let encoding = parts.next()?;
+    let text = parts.next()?;
+    if text.contains('?') || text.chars().any(char::is_whitespace) {
+        return None;
     }
-    clean_header(value)
+    let bytes = if encoding.eq_ignore_ascii_case("B") {
+        base64::engine::general_purpose::STANDARD
+            .decode(text)
+            .ok()?
+    } else if encoding.eq_ignore_ascii_case("Q") {
+        let mut out = Vec::with_capacity(text.len());
+        let raw = text.as_bytes();
+        let mut i = 0;
+        while i < raw.len() {
+            if raw[i] == b'_' {
+                out.push(b' ');
+                i += 1;
+            } else if raw[i] == b'='
+                && i + 2 < raw.len()
+                && let (Some(hi), Some(lo)) = (hex_val(raw[i + 1]), hex_val(raw[i + 2]))
+            {
+                out.push((hi << 4) | lo);
+                i += 3;
+            } else {
+                out.push(raw[i]);
+                i += 1;
+            }
+        }
+        out
+    } else {
+        return None;
+    };
+    Some(decode_charset(&bytes, charset))
+}
+
+/// Decode RFC 2047 encoded words (`=?charset?B|Q?...?=`), including multi-word
+/// headers, UTF-8 / ISO-8859-1 / Windows-1252, and RFC 2047 whitespace-collapse
+/// between adjacent encoded words.
+fn decode_rfc2047(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut pos = 0;
+    let mut prev_was_encoded = false;
+    while pos < value.len() {
+        let rest = &value[pos..];
+        if let Some(rel_start) = rest.find("=?") {
+            let gap = &rest[..rel_start];
+            let abs_start = pos + rel_start;
+            let after_prefix = &value[abs_start + 2..];
+            if let Some(q1) = after_prefix.find('?')
+                && let Some(q2_rel) = after_prefix[q1 + 1..].find('?')
+                && let payload_start = q1 + 1 + q2_rel + 1
+                && let Some(rel_end) = after_prefix[payload_start..].find("?=")
+            {
+                let word_end = abs_start + 2 + payload_start + rel_end + 2;
+                let candidate = &value[abs_start..word_end];
+                if let Some(decoded) = decode_rfc2047_word(candidate) {
+                    if !(prev_was_encoded && gap.chars().all(|c| c == ' ' || c == '\t')) {
+                        out.push_str(gap);
+                    }
+                    out.push_str(&decoded);
+                    pos = word_end;
+                    prev_was_encoded = true;
+                    continue;
+                }
+            }
+            out.push_str(&rest[..rel_start + 2]);
+            pos = abs_start + 2;
+            prev_was_encoded = false;
+        } else {
+            out.push_str(rest);
+            break;
+        }
+    }
+    clean_header(&out)
 }
 
 /// Extract flags and the BODY[...] literal from an untagged FETCH response block.
@@ -1301,15 +2445,68 @@ pub async fn imap_folders(creds: &MailCredentials) -> Result<Vec<String>> {
     Ok(folders)
 }
 
-/// Extract the folder name (last quoted string) from an untagged LIST reply.
+/// Extract the folder name after the hierarchy delimiter from an untagged
+/// `LIST` reply (supports Dovecot/Hostinger unquoted names like `INBOX.Sent`,
+/// quoted names like `"Sent Items"`, and `NIL` delimiters).
 fn parse_list_name(line: &str) -> Option<String> {
-    let end = line.rfind('"')?;
-    let start = line[..end].rfind('"')?;
-    let name = &line[start + 1..end];
+    let rest = line.trim();
+    let rest = if rest
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("* list "))
+    {
+        &rest[7..]
+    } else {
+        return None;
+    };
+    let flags_end = rest.find(')')?;
+    let mut rest = rest[flags_end + 1..].trim_start();
+    // Skip hierarchy delimiter: either `"..."` or `NIL` or unquoted token.
+    if let Some(after_q) = rest.strip_prefix('"') {
+        let mut chars = after_q.char_indices();
+        let mut end_idx = None;
+        while let Some((i, ch)) = chars.next() {
+            if ch == '\\' {
+                let _ = chars.next();
+            } else if ch == '"' {
+                end_idx = Some(i + 1);
+                break;
+            }
+        }
+        rest = after_q[end_idx?..].trim_start();
+    } else {
+        let delim_end = rest.find(char::is_whitespace)?;
+        rest = rest[delim_end..].trim_start();
+    }
+    if rest.is_empty() {
+        return None;
+    }
+    let name = if let Some(after_q) = rest.strip_prefix('"') {
+        let mut out = String::new();
+        let mut chars = after_q.char_indices();
+        let mut closed = false;
+        while let Some((_, ch)) = chars.next() {
+            if ch == '\\' {
+                if let Some((_, esc)) = chars.next() {
+                    out.push(esc);
+                }
+            } else if ch == '"' {
+                closed = true;
+                break;
+            } else {
+                out.push(ch);
+            }
+        }
+        if !closed {
+            return None;
+        }
+        out
+    } else {
+        rest.trim().to_owned()
+    };
     if name.is_empty() || name == "*" {
         return None;
     }
-    Some(name.replace("\\\"", "\"").replace("\\\\", "\\"))
+    Some(name)
 }
 
 /// Validate an IMAP flag (`\Seen`, `\Flagged`, ...): backslash + letters only.
@@ -1442,6 +2639,22 @@ pub async fn imap_read(creds: &MailCredentials, folder: &str, uid: u32) -> Resul
     let msg = imap_fetch(&mut wire, uid).await?;
     let _ = wire.send_line("a9 LOGOUT").await;
     Ok(msg)
+}
+
+/// Read one message by UID with sanitized HTML, `cid:` inline images, and
+/// optional remote image allowance.
+pub async fn imap_read_detail(
+    creds: &MailCredentials,
+    folder: &str,
+    uid: u32,
+    allow_remote_images: bool,
+) -> Result<MailMessageDetail> {
+    let mut wire = imap_connect(creds).await?;
+    let folder = normalize_folder(folder)?;
+    select_folder(&mut wire, &folder).await?;
+    let (flags, raw) = imap_fetch_raw(&mut wire, uid, "BODY.PEEK[]").await?;
+    let _ = wire.send_line("a9 LOGOUT").await;
+    Ok(parse_message_detail(uid, flags, &raw, allow_remote_images))
 }
 
 /// Read one attachment's raw bytes (up to `MAX_ATTACHMENT_BYTES`) by UID and
@@ -2617,5 +3830,167 @@ mod tests {
                 .is_err()
         );
         server.await.unwrap();
+    }
+
+    #[test]
+    fn parses_dovecot_and_hostinger_list_responses() {
+        assert_eq!(
+            parse_list_name("* LIST (\\HasNoChildren \\Sent) \".\" INBOX.Sent"),
+            Some("INBOX.Sent".to_owned())
+        );
+        assert_eq!(
+            parse_list_name("* LIST (\\HasNoChildren) \"/\" \"Sent Items\""),
+            Some("Sent Items".to_owned())
+        );
+        assert_eq!(
+            parse_list_name("* LIST (\\HasNoChildren) \".\" \"INBOX.My \\\"Folder\\\"\""),
+            Some("INBOX.My \"Folder\"".to_owned())
+        );
+        assert_eq!(
+            parse_list_name("* LIST () NIL INBOX"),
+            Some("INBOX".to_owned())
+        );
+        assert_eq!(parse_list_name("* LIST (\\HasNoChildren) \".\" *"), None);
+    }
+
+    #[test]
+    fn decodes_rfc2047_multiword_and_charsets() {
+        // Adjacent encoded words collapse separating whitespace.
+        assert_eq!(
+            decode_rfc2047("=?UTF-8?B?SMOpbGxv?= =?utf-8?q?_World?="),
+            "Héllo World"
+        );
+        // Non-encoded text keeps surrounding spaces.
+        assert_eq!(
+            decode_rfc2047("Re: =?iso-8859-1?Q?Caf=E9?= meeting"),
+            "Re: Café meeting"
+        );
+        // Windows-1252 0x80 = Euro sign, 0x93/0x94 = curly quotes.
+        assert_eq!(
+            decode_rfc2047("=?windows-1252?Q?=80100_=93ok=94?="),
+            "€100 “ok”"
+        );
+    }
+
+    #[test]
+    fn recursive_mime_parses_qp_sanitizes_html_and_rewrites_cid() {
+        let png_bytes = b"\x89PNG\r\n\x1a\nfake";
+        let png_b64 = base64::engine::general_purpose::STANDARD.encode(png_bytes);
+        let raw = format!(
+            "From: =?UTF-8?Q?Alice_M=C3=BCller?= <alice@example.com>\r\n\
+             Subject: =?UTF-8?B?UmVwb3J0?= =?UTF-8?Q?_2026?=\r\n\
+             Content-Type: multipart/mixed; boundary=\"mix\"\r\n\r\n\
+             --mix\r\n\
+             Content-Type: multipart/related; boundary=\"rel\"\r\n\r\n\
+             --rel\r\n\
+             Content-Type: multipart/alternative; boundary=\"alt\"\r\n\r\n\
+             --alt\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             Content-Transfer-Encoding: quoted-printable\r\n\r\n\
+             Hello =\r\nCaf=C3=A9\r\n\
+             --alt\r\n\
+             Content-Type: text/html; charset=utf-8\r\n\
+             Content-Transfer-Encoding: quoted-printable\r\n\r\n\
+             <html><head><style>body{{color:red}}</style></head><body>\
+             <script>alert(1)</script>\
+             <p onclick=\"evil()\">Hi</p>\
+             <a href=\"javascript:alert(2)\">bad</a>\
+             <a href=\"https://example.com\">good</a>\
+             <img src=\"cid:logo@serabot\">\
+             <img src=\"https://tracker.example.com/px.png\">\
+             <div style=\"background-image: url(https://tracker.example.com/bg.png); color: blue\">x</div>\
+             </body></html>\r\n\
+             --alt--\r\n\
+             --rel\r\n\
+             Content-Type: image/png\r\n\
+             Content-ID: <logo@serabot>\r\n\
+             Content-Disposition: inline\r\n\
+             Content-Transfer-Encoding: base64\r\n\r\n\
+             {png_b64}\r\n\
+             --rel--\r\n\
+             --mix\r\n\
+             Content-Type: application/pdf\r\n\
+             Content-Disposition: attachment; filename=\"report.pdf\"\r\n\
+             Content-Transfer-Encoding: base64\r\n\r\n\
+             JVBERi0xLjQK\r\n\
+             --mix--\r\n"
+        );
+
+        let blocked = parse_message_detail(1, vec![], &raw, false);
+        assert_eq!(blocked.subject, "Report 2026");
+        assert_eq!(blocked.from, "Alice Müller <alice@example.com>");
+        assert_eq!(blocked.body_text, "Hello Café");
+        assert!(blocked.has_remote_images);
+        assert_eq!(blocked.attachments.len(), 1);
+        assert_eq!(blocked.attachments[0].name, "report.pdf");
+        let html = blocked.body_html.as_deref().unwrap();
+        assert!(!html.contains("<script"));
+        assert!(!html.contains("<style"));
+        assert!(!html.contains("onclick"));
+        assert!(!html.contains("javascript:"));
+        assert!(!html.contains("https://tracker.example.com/px.png"));
+        assert!(!html.contains("https://tracker.example.com/bg.png"));
+        assert!(html.contains(&format!("data:image/png;base64,{png_b64}")));
+        assert!(html.contains("href=\"https://example.com\""));
+
+        let allowed = parse_message_detail(1, vec![], &raw, true);
+        let html_allowed = allowed.body_html.as_deref().unwrap();
+        assert!(html_allowed.contains("https://tracker.example.com/px.png"));
+    }
+
+    #[test]
+    fn builds_html_message_with_inline_logo_and_cc() {
+        let msg = build_message_full(
+            "me@example.com",
+            &["to@example.com".into()],
+            &["cc@example.com".into()],
+            "HTML test",
+            "Plain body",
+            Some("<p>HTML body</p><img src=\"cid:signature-logo@serabot\">"),
+            Some(("image/png", b"png-bytes")),
+            &[],
+        )
+        .unwrap();
+        let text = String::from_utf8(msg).unwrap();
+        assert!(text.contains("Cc: cc@example.com"));
+        assert!(!text.contains("Bcc:"));
+        assert!(text.contains("multipart/related"));
+        assert!(text.contains("multipart/alternative"));
+        assert!(text.contains("Content-ID: <signature-logo@serabot>"));
+        assert!(text.contains("<p>HTML body</p>"));
+    }
+
+    #[test]
+    fn signature_config_roundtrips_without_password_reentry() {
+        let store = crate::store::Store::open_in_memory(384).unwrap();
+        let user = store
+            .create_user("mail-sig", "sig@example.example", "Sig")
+            .unwrap();
+        let secrets =
+            UserSecrets::with_master_key(store, [9u8; crate::user_secrets::KEY_BYTES]).unwrap();
+        let c = creds(Security::None);
+        store_credentials(&secrets, &user.id, None, &c).unwrap();
+        store_signature_config(
+            &secrets,
+            &user.id,
+            None,
+            &MailSignatureConfig {
+                signature: "Best, Alice".into(),
+                signature_html: Some("<b>Best, Alice</b>".into()),
+                signature_logo_hash: Some("a".repeat(64)),
+            },
+        )
+        .unwrap();
+        let accounts = list_accounts(&secrets, &user.id).unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].signature.as_deref(), Some("Best, Alice"));
+        assert_eq!(
+            accounts[0].signature_html.as_deref(),
+            Some("<b>Best, Alice</b>")
+        );
+        assert_eq!(
+            accounts[0].signature_logo_hash.as_deref(),
+            Some("a".repeat(64).as_str())
+        );
     }
 }

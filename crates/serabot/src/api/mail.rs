@@ -13,6 +13,7 @@ pub(super) fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/v1/mail", get(status).delete(disconnect))
         .route("/v1/mail/connect", post(connect))
+        .route("/v1/mail/signature", put(update_signature))
         .route("/v1/mail/folders", get(folders))
         .route("/v1/mail/messages", get(messages))
         .route("/v1/mail/search", get(search))
@@ -31,6 +32,12 @@ pub(super) fn routes() -> Router<Arc<ApiState>> {
             post(save_attachment_to_library),
         )
         .route("/v1/mail/send", post(send_message))
+        .route("/v1/mail/schedule", post(schedule_message))
+        .route("/v1/mail/scheduled", get(list_scheduled))
+        .route(
+            "/v1/mail/scheduled/{id}",
+            patch(update_scheduled).delete(delete_scheduled),
+        )
 }
 
 #[derive(Deserialize)]
@@ -55,6 +62,10 @@ struct ConnectRequest {
     /// Signature appended to every sent message (0.74.5).
     #[serde(default)]
     signature: Option<String>,
+    #[serde(default)]
+    signature_html: Option<String>,
+    #[serde(default)]
+    signature_logo_hash: Option<String>,
 }
 
 async fn connect(
@@ -68,6 +79,27 @@ async fn connect(
         .map(str::trim)
         .filter(|s| !s.is_empty());
     mail::account_provider(account_label)?;
+    if let Some(hash) = body
+        .signature_logo_hash
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        verify_logo_artifact(&state, &user.id, hash)?;
+    }
+    let sig_cfg = mail::MailSignatureConfig {
+        signature: body.signature.clone().unwrap_or_default(),
+        signature_html: body.signature_html.clone(),
+        signature_logo_hash: body.signature_logo_hash.clone(),
+    };
+    mail::validate_signature_config(&sig_cfg)?;
+    if !sig_cfg.signature.is_empty() {
+        state
+            .runtime
+            .scan_owner_output(&user.id, &sig_cfg.signature)?;
+    }
+    if let Some(html) = sig_cfg.signature_html.as_deref() {
+        state.runtime.scan_owner_output(&user.id, html)?;
+    }
     let creds = MailCredentials {
         smtp_host: body.smtp_host,
         smtp_port: body.smtp_port,
@@ -82,6 +114,12 @@ async fn connect(
     };
     mail::validate_credentials(&creds)?;
     mail::store_credentials(&state.users, &user.id, account_label, &creds)?;
+    if sig_cfg.signature_html.is_some()
+        || sig_cfg.signature_logo_hash.is_some()
+        || !sig_cfg.signature.is_empty()
+    {
+        mail::store_signature_config(&state.users, &user.id, account_label, &sig_cfg)?;
+    }
     let smtp = mail::smtp_test(&creds).await.map(|_| "ok".to_owned());
     let imap = mail::imap_test(&creds).await.map(|_| "ok".to_owned());
     let _ = state.store.record_audit(
@@ -118,12 +156,20 @@ async fn status(
     Extension(user): Extension<ActingUser>,
 ) -> Result<Json<Value>> {
     let connected = mail::load_credentials(&state.users, &user.id, None)?;
+    let sig_cfg = if connected.is_some() {
+        Some(mail::load_signature_config(&state.users, &user.id, None)?)
+    } else {
+        None
+    };
     let accounts = mail::list_accounts(&state.users, &user.id)?;
     Ok(Json(json!({
         "connected": connected.is_some(),
         "smtp_host": connected.as_ref().map(|c| c.smtp_host.clone()),
         "imap_host": connected.as_ref().map(|c| c.imap_host.clone()),
         "username": connected.as_ref().map(|c| c.username.clone()),
+        "signature": sig_cfg.as_ref().map(|s| s.signature.clone()),
+        "signature_html": sig_cfg.as_ref().and_then(|s| s.signature_html.clone()),
+        "signature_logo_hash": sig_cfg.as_ref().and_then(|s| s.signature_logo_hash.clone()),
         "accounts": accounts,
     })))
 }
@@ -144,6 +190,8 @@ struct AccountQuery {
     folder: Option<String>,
     #[serde(default)]
     limit: Option<u32>,
+    #[serde(default)]
+    allow_remote_images: Option<bool>,
 }
 
 fn query_account(query: &AccountQuery) -> Result<Option<&str>> {
@@ -184,7 +232,7 @@ async fn messages(
     Ok(Json(json!({ "messages": messages })))
 }
 
-/// `GET /v1/mail/messages/{uid}?account=&folder=`: one full message (read-only).
+/// `GET /v1/mail/messages/{uid}?account=&folder=&allow_remote_images=`: one full message (read-only).
 async fn message(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
@@ -195,7 +243,8 @@ async fn message(
     let creds = mail::load_credentials(&state.users, &user.id, account)?
         .ok_or_else(|| SeraError::Validation("mail is not connected; connect it first".into()))?;
     let folder = query.folder.as_deref().unwrap_or("");
-    let message = mail::imap_read(&creds, folder, uid).await?;
+    let allow_remote = query.allow_remote_images.unwrap_or(false);
+    let message = mail::imap_read_detail(&creds, folder, uid, allow_remote).await?;
     Ok(Json(json!({ "message": message })))
 }
 
@@ -386,57 +435,47 @@ struct SendRequest {
     #[serde(default)]
     account: Option<String>,
     to: Vec<String>,
+    #[serde(default)]
+    cc: Vec<String>,
+    #[serde(default)]
+    bcc: Vec<String>,
     subject: String,
     body: String,
     #[serde(default)]
+    body_html: Option<String>,
+    #[serde(default)]
     artifact_hashes: Vec<String>,
+    #[serde(default)]
+    attachment_hashes: Vec<String>,
 }
 
-/// `POST /v1/mail/send`: send an email from the UI with optional owned artifact attachments.
+/// `POST /v1/mail/send`: send an email from the UI with optional HTML body and owned artifact attachments.
 async fn send_message(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
     Json(req): Json<SendRequest>,
 ) -> Result<Json<Value>> {
     let account = normalize_account(req.account.as_deref())?;
-    state.runtime.scan_owner_output(&user.id, &req.subject)?;
-    state.runtime.scan_owner_output(&user.id, &req.body)?;
-    for rcpt in &req.to {
-        state.runtime.scan_owner_output(&user.id, rcpt)?;
-    }
-    if req.artifact_hashes.len() > mail::MAX_ATTACHMENTS {
-        return Err(SeraError::Validation(format!(
-            "at most {} attachments are allowed",
-            mail::MAX_ATTACHMENTS
-        )));
-    }
-    let mut attachments = Vec::with_capacity(req.artifact_hashes.len());
-    for hash in &req.artifact_hashes {
-        if !state.store.user_owns_artifact(&user.id, hash)? {
-            return Err(SeraError::Forbidden("artifact".into()));
-        }
-        let stored = state.artifacts.load(hash)?;
-        if !state.runtime.policy().is_allowed(&stored.filename) {
-            return Err(SeraError::PolicyViolation);
-        }
-        if stored.bytes.is_empty() || stored.bytes.len() > mail::MAX_ATTACHMENT_BYTES {
-            return Err(SeraError::Validation(
-                "each attachment must be 1 byte to 20 MiB".into(),
-            ));
-        }
-        let content_type = crate::util::mime_for_filename(&stored.filename).to_owned();
-        attachments.push(mail::Attachment {
-            name: stored.filename,
-            content_type,
-            bytes: stored.bytes,
-        });
-    }
-    let creds = require_mail_creds(&state, &user.id, account)?;
-    let from = mail::from_address(&creds);
-    let body = mail::body_with_signature(&creds, req.body)?;
-    state.runtime.scan_owner_output(&user.id, &body)?;
-    let msg = mail::build_message(&from, &req.to, &req.subject, &body, &attachments)?;
-    mail::smtp_send(&creds, &from, &req.to, &msg).await?;
+    let mut hashes = req.artifact_hashes;
+    hashes.extend(req.attachment_hashes);
+    let sent = mail::send_account_mail(
+        &state.users,
+        &state.store,
+        &state.artifacts,
+        state.runtime.policy(),
+        mail::SendAccountMailParams {
+            user_id: &user.id,
+            account,
+            to: &req.to,
+            cc: &req.cc,
+            bcc: &req.bcc,
+            subject: &req.subject,
+            body: &req.body,
+            body_html: req.body_html.as_deref(),
+            attachment_hashes: &hashes,
+        },
+    )
+    .await?;
     let _ = state.store.record_audit(
         &user.id,
         "mail.send_ui",
@@ -447,16 +486,343 @@ async fn send_message(
         None,
         Some(&json!({
             "account": account,
-            "to_count": req.to.len(),
+            "to_count": sent.to_count,
             "subject_chars": req.subject.chars().count(),
-            "attachments": attachments.len(),
+            "attachments": sent.attachments,
         })),
     );
     Ok(Json(json!({
         "sent": true,
-        "to_count": req.to.len(),
-        "attachments": attachments.len(),
+        "to_count": sent.to_count,
+        "attachments": sent.attachments,
     })))
+}
+
+fn verify_logo_artifact(state: &ApiState, user_id: &str, hash: &str) -> Result<()> {
+    if !state.store.user_owns_artifact(user_id, hash)? {
+        return Err(SeraError::Forbidden("artifact".into()));
+    }
+    let stored = state.artifacts.load(hash)?;
+    let mime = mail::inline_image_mime_for_filename(&stored.filename);
+    if !mail::is_safe_inline_image_mime(mime) {
+        return Err(SeraError::Validation(
+            "signature logo must be png, jpeg, gif, or webp".into(),
+        ));
+    }
+    if stored.bytes.is_empty() || stored.bytes.len() > 512 * 1024 {
+        return Err(SeraError::Validation(
+            "signature logo must be 1 byte to 512 KiB".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct SignatureUpdateRequest {
+    #[serde(default)]
+    account: Option<String>,
+    #[serde(default)]
+    signature: String,
+    #[serde(default)]
+    signature_html: Option<String>,
+    #[serde(default)]
+    signature_logo_hash: Option<String>,
+}
+
+/// `PUT /v1/mail/signature`: update plain/HTML signature and optional logo artifact without password re-entry.
+async fn update_signature(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Json(req): Json<SignatureUpdateRequest>,
+) -> Result<Json<Value>> {
+    let account = normalize_account(req.account.as_deref())?;
+    state.runtime.scan_owner_output(&user.id, &req.signature)?;
+    if let Some(html) = &req.signature_html {
+        state.runtime.scan_owner_output(&user.id, html)?;
+    }
+    if let Some(hash) = req
+        .signature_logo_hash
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        verify_logo_artifact(&state, &user.id, hash)?;
+    }
+    let cfg = mail::MailSignatureConfig {
+        signature: req.signature,
+        signature_html: req.signature_html,
+        signature_logo_hash: req.signature_logo_hash,
+    };
+    mail::store_signature_config(&state.users, &user.id, account, &cfg)?;
+    let _ = state.store.record_audit(
+        &user.id,
+        "mail.signature_updated",
+        Some("mail"),
+        None,
+        None,
+        None,
+        None,
+        Some(&json!({ "account": account })),
+    );
+    Ok(Json(json!({
+        "ok": true,
+        "account": account,
+        "signature": cfg.signature,
+        "signature_html": cfg.signature_html,
+        "signature_logo_hash": cfg.signature_logo_hash,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ScheduleRequest {
+    #[serde(default)]
+    account: Option<String>,
+    to: Vec<String>,
+    #[serde(default)]
+    cc: Vec<String>,
+    #[serde(default)]
+    bcc: Vec<String>,
+    subject: String,
+    body: String,
+    #[serde(default)]
+    body_html: Option<String>,
+    send_at: i64,
+}
+
+fn validate_schedule_fields(
+    to: &[String],
+    cc: &[String],
+    bcc: &[String],
+    subject: &str,
+    body: &str,
+    body_html: Option<&str>,
+    send_at: i64,
+) -> Result<()> {
+    if to.is_empty() || to.len() + cc.len() + bcc.len() > mail::MAX_RECIPIENTS {
+        return Err(SeraError::Validation(format!(
+            "1 to {} recipients are allowed",
+            mail::MAX_RECIPIENTS
+        )));
+    }
+    for addr in to.iter().chain(cc.iter()).chain(bcc.iter()) {
+        if addr.is_empty()
+            || addr.len() > 254
+            || addr.chars().any(|c| c == '\r' || c == '\n' || c == ',')
+        {
+            return Err(SeraError::Validation(format!("invalid recipient {addr:?}")));
+        }
+    }
+    if subject.chars().count() > mail::MAX_SUBJECT_CHARS {
+        return Err(SeraError::Validation("subject is too long".into()));
+    }
+    if body.chars().count() > mail::MAX_BODY_CHARS {
+        return Err(SeraError::Validation("body is too long".into()));
+    }
+    if let Some(html) = body_html
+        && html.chars().count() > mail::MAX_BODY_CHARS
+    {
+        return Err(SeraError::Validation("HTML body is too long".into()));
+    }
+    if send_at <= 0 {
+        return Err(SeraError::Validation(
+            "send_at must be a positive unix timestamp".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// `POST /v1/mail/schedule`: queue an outgoing email for future delivery.
+async fn schedule_message(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Json(req): Json<ScheduleRequest>,
+) -> Result<Json<Value>> {
+    let account = normalize_account(req.account.as_deref())?;
+    let _creds = require_mail_creds(&state, &user.id, account)?;
+    validate_schedule_fields(
+        &req.to,
+        &req.cc,
+        &req.bcc,
+        &req.subject,
+        &req.body,
+        req.body_html.as_deref(),
+        req.send_at,
+    )?;
+    state.runtime.scan_owner_output(&user.id, &req.subject)?;
+    state.runtime.scan_owner_output(&user.id, &req.body)?;
+    if let Some(html) = &req.body_html {
+        state.runtime.scan_owner_output(&user.id, html)?;
+    }
+    for rcpt in req.to.iter().chain(req.cc.iter()).chain(req.bcc.iter()) {
+        state.runtime.scan_owner_output(&user.id, rcpt)?;
+    }
+    let row = state.store.create_scheduled_mail(
+        &user.id,
+        account.unwrap_or(""),
+        &req.to,
+        &req.cc,
+        &req.bcc,
+        &req.subject,
+        &req.body,
+        req.body_html.as_deref(),
+        req.send_at,
+    )?;
+    let _ = state.store.record_audit(
+        &user.id,
+        "mail.schedule",
+        Some("mail"),
+        None,
+        None,
+        None,
+        None,
+        Some(&json!({ "id": row.id, "account": account, "send_at": row.send_at })),
+    );
+    Ok(Json(json!({ "item": row })))
+}
+
+#[derive(Deserialize)]
+struct ScheduledListQuery {
+    #[serde(default)]
+    account: Option<String>,
+}
+
+/// `GET /v1/mail/scheduled?account=`: list the acting user's scheduled emails.
+async fn list_scheduled(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Query(query): Query<ScheduledListQuery>,
+) -> Result<Json<Value>> {
+    let filter = normalize_account(query.account.as_deref())?;
+    let items = state.store.list_scheduled_mail(&user.id, filter)?;
+    Ok(Json(json!({ "items": items })))
+}
+
+#[derive(Deserialize)]
+struct UpdateScheduledRequest {
+    #[serde(default)]
+    to: Option<Vec<String>>,
+    #[serde(default)]
+    cc: Option<Vec<String>>,
+    #[serde(default)]
+    bcc: Option<Vec<String>>,
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    body_html: Option<Option<String>>,
+    #[serde(default)]
+    send_at: Option<i64>,
+}
+
+/// `PATCH /v1/mail/scheduled/{id}`: update a pending scheduled email (UID-scoped).
+async fn update_scheduled(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateScheduledRequest>,
+) -> Result<Json<Value>> {
+    let validate_rcpts = |list: &[String], label: &str| -> Result<()> {
+        if list.len() > mail::MAX_RECIPIENTS {
+            return Err(SeraError::Validation(format!(
+                "too many {label} recipients"
+            )));
+        }
+        for r in list {
+            let trimmed = r.trim();
+            if trimmed.is_empty()
+                || trimmed.len() > 254
+                || trimmed.contains(['\r', '\n', ','])
+                || !trimmed.contains('@')
+            {
+                return Err(SeraError::Validation(format!("invalid {label} recipient")));
+            }
+            state.runtime.scan_owner_output(&user.id, r)?;
+        }
+        Ok(())
+    };
+    if let Some(to) = &req.to {
+        if to.is_empty() {
+            return Err(SeraError::Validation("invalid to recipients".into()));
+        }
+        validate_rcpts(to, "to")?;
+    }
+    if let Some(cc) = &req.cc {
+        validate_rcpts(cc, "cc")?;
+    }
+    if let Some(bcc) = &req.bcc {
+        validate_rcpts(bcc, "bcc")?;
+    }
+    let total_req_rcpts = req.to.as_ref().map_or(0, Vec::len)
+        + req.cc.as_ref().map_or(0, Vec::len)
+        + req.bcc.as_ref().map_or(0, Vec::len);
+    if total_req_rcpts > mail::MAX_RECIPIENTS {
+        return Err(SeraError::Validation(format!(
+            "too many recipients (max {})",
+            mail::MAX_RECIPIENTS
+        )));
+    }
+    if let Some(subject) = &req.subject {
+        if subject.chars().count() > mail::MAX_SUBJECT_CHARS {
+            return Err(SeraError::Validation("subject is too long".into()));
+        }
+        state.runtime.scan_owner_output(&user.id, subject)?;
+    }
+    if let Some(body) = &req.body {
+        if body.chars().count() > mail::MAX_BODY_CHARS {
+            return Err(SeraError::Validation("body is too long".into()));
+        }
+        state.runtime.scan_owner_output(&user.id, body)?;
+    }
+    if let Some(Some(html)) = &req.body_html {
+        if html.chars().count() > mail::MAX_BODY_CHARS {
+            return Err(SeraError::Validation("HTML body is too long".into()));
+        }
+        state.runtime.scan_owner_output(&user.id, html)?;
+    }
+    if let Some(send_at) = req.send_at
+        && send_at <= 0
+    {
+        return Err(SeraError::Validation(
+            "send_at must be a positive unix timestamp".into(),
+        ));
+    }
+    let item = state.store.update_scheduled_mail(
+        &user.id,
+        &id,
+        crate::store::ScheduledMailPatch {
+            to: req.to,
+            cc: req.cc,
+            bcc: req.bcc,
+            subject: req.subject,
+            body: req.body,
+            body_html: req.body_html,
+            send_at: req.send_at,
+        },
+    )?;
+    Ok(Json(json!({ "item": item })))
+}
+
+/// `DELETE /v1/mail/scheduled/{id}`: cancel/delete a scheduled email (UID-scoped).
+async fn delete_scheduled(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    let deleted = state.store.delete_scheduled_mail(&user.id, &id)?;
+    if !deleted {
+        return Err(SeraError::NotFound(format!("scheduled mail {id}")));
+    }
+    let _ = state.store.record_audit(
+        &user.id,
+        "mail.schedule_cancelled",
+        Some("mail"),
+        None,
+        None,
+        None,
+        None,
+        Some(&json!({ "id": id })),
+    );
+    Ok(Json(json!({ "deleted": true })))
 }
 
 /// `GET /v1/mail/messages/{uid}/attachments/{index}?account=&folder=`: download one attachment.
