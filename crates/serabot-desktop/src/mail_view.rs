@@ -184,6 +184,57 @@ pub fn full_date_label(ts: i64, offset_min: i64) -> String {
     )
 }
 
+/// A local wall-clock moment: `add_days` after today at `hour`:00, for a viewer
+/// whose UTC offset is `offset_min`.
+pub fn local_time_at(now: i64, offset_min: i64, add_days: i64, hour: u32) -> i64 {
+    let today = (now + offset_min * 60).div_euclid(86_400);
+    (today + add_days) * 86_400 + i64::from(hour) * 3600 - offset_min * 60
+}
+
+/// `(label, unix time)` choices for Snooze, nearest first. Later today is only
+/// offered before 15:00; the weekend and next-week choices are skipped when they
+/// would repeat Tomorrow morning.
+pub fn snooze_presets(now: i64, offset_min: i64) -> Vec<(&'static str, i64)> {
+    let local = now + offset_min * 60;
+    let days = local.div_euclid(86_400);
+    let secs = local.rem_euclid(86_400);
+    // 0 = Thursday, 2 = Saturday, 4 = Monday (see WEEKDAYS).
+    let idx = days.rem_euclid(7);
+    let until = |target: i64| {
+        let d = (target - idx).rem_euclid(7);
+        if d == 0 { 7 } else { d }
+    };
+    let mut out = Vec::new();
+    if secs < 15 * 3600 {
+        out.push(("Later today", now + 3 * 3600));
+    }
+    out.push(("Tomorrow morning", local_time_at(now, offset_min, 1, 9)));
+    let to_sat = until(2);
+    if to_sat > 1 {
+        out.push(("This weekend", local_time_at(now, offset_min, to_sat, 9)));
+    }
+    let to_mon = until(4);
+    if to_mon > 1 {
+        out.push(("Next week", local_time_at(now, offset_min, to_mon, 9)));
+    }
+    out
+}
+
+/// A folder whose last path segment is one of `names` (case-insensitive), such as
+/// Archive or Trash.
+pub fn special_folder<'a>(folders: &'a [String], names: &[&str]) -> Option<&'a str> {
+    let last = |f: &str| {
+        f.rsplit(['/', '.'])
+            .next()
+            .unwrap_or(f)
+            .to_ascii_lowercase()
+    };
+    folders
+        .iter()
+        .find(|f| names.iter().any(|n| last(f) == *n))
+        .map(String::as_str)
+}
+
 // ---------------------------------------------------- senders, avatars ----
 
 /// The display part of `Jane Doe <jane@x.example>`, else the address itself.
@@ -569,6 +620,53 @@ mod tests {
         assert_eq!(short_time_label(NOW - 86_400 * 400, NOW, 0), "21 Oct 2025");
         assert_eq!(full_date_label(NOW, 0), "Wed 25 Nov 2026, 10:00");
         assert_eq!(DayBucket::ThisWeek.label(), "This week");
+    }
+
+    #[test]
+    fn snooze_presets_follow_the_viewers_clock() {
+        // Wed 25 Nov 2026 10:00 UTC.
+        let p = snooze_presets(NOW, 0);
+        let labels: Vec<&str> = p.iter().map(|(l, _)| *l).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Later today",
+                "Tomorrow morning",
+                "This weekend",
+                "Next week"
+            ]
+        );
+        assert_eq!(p[0].1, NOW + 3 * 3600);
+        assert_eq!(full_date_label(p[1].1, 0), "Thu 26 Nov 2026, 09:00");
+        assert_eq!(full_date_label(p[2].1, 0), "Sat 28 Nov 2026, 09:00");
+        assert_eq!(full_date_label(p[3].1, 0), "Mon 30 Nov 2026, 09:00");
+        // 17:00 local (UTC+7): no "Later today", and 09:00 means 02:00 UTC.
+        let late = snooze_presets(NOW, 7 * 60);
+        assert_eq!(late[0].0, "Tomorrow morning");
+        assert_eq!(full_date_label(late[0].1, 7 * 60), "Thu 26 Nov 2026, 09:00");
+        // On a Friday, tomorrow is the weekend; on a Sunday, tomorrow is Monday.
+        let fri = snooze_presets(NOW + 86_400 * 2, 0);
+        assert!(!fri.iter().any(|(l, _)| *l == "This weekend"));
+        let sun = snooze_presets(NOW + 86_400 * 4, 0);
+        assert!(!sun.iter().any(|(l, _)| *l == "Next week"));
+        assert!(sun.iter().any(|(l, _)| *l == "This weekend"));
+    }
+
+    #[test]
+    fn archive_and_trash_folders_are_found() {
+        let folders: Vec<String> = ["INBOX", "INBOX.Archive", "INBOX.Trash", "Sent"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            special_folder(&folders, &["archive", "archives"]),
+            Some("INBOX.Archive")
+        );
+        assert_eq!(
+            special_folder(&folders, &["trash", "deleted items"]),
+            Some("INBOX.Trash")
+        );
+        assert_eq!(special_folder(&folders, &["spam", "junk"]), None);
     }
 
     #[test]
