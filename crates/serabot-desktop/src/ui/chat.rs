@@ -3864,8 +3864,8 @@ pub(super) fn HeaderModelChip(session: Signal<Session>) -> Element {
                                         };
                                         let bot_for_click = bot_for_click.clone();
                                         let fav_key = item_value.clone();
-                                        let is_fav = favorites.iter().any(|v| *v == item_value);
-                                        let is_recent = !is_fav && recent.iter().any(|v| *v == item_value);
+                                        let is_fav = favorites.contains(&item_value);
+                                        let is_recent = !is_fav && recent.contains(&item_value);
                                         rsx! {
                                             button {
                                                 key: "{item_value}",

@@ -40,7 +40,7 @@ pub fn SettingsNav(session: Signal<Session>) -> Element {
             .map(|score| (score, s))
         })
         .collect();
-    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.sort_by_key(|a| std::cmp::Reverse(a.0));
     let first_hit = found.first().map(|(_, section)| *section);
     rsx! {
         nav { class: "settings-nav", "aria-label": "Settings sections",

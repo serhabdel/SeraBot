@@ -3543,10 +3543,10 @@ mod tests {
             summary(&flat),
             vec![
                 "day:Today",
-                "5:1:false",
-                "4:1:false",
+                "5:0:false",
+                "4:0:false",
                 "day:This week",
-                "3:1:false"
+                "3:0:false"
             ]
         );
     }
