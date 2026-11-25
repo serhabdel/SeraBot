@@ -33,6 +33,7 @@ pub mod local_folders;
 pub mod local_fs;
 pub mod local_xfer;
 pub mod logs;
+pub mod mail_view;
 pub mod marketplace;
 pub mod marketplace_flow;
 pub mod media_view;

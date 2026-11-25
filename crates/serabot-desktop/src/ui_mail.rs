@@ -2782,6 +2782,7 @@ mod tests {
             body_html: None,
             has_remote_images: false,
             attachments: vec![],
+            ..Default::default()
         }
     }
 

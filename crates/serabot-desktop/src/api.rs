@@ -2104,6 +2104,119 @@ pub struct MailMessageInfo {
     pub has_remote_images: bool,
     #[serde(default)]
     pub attachments: Vec<MailAttachmentInfo>,
+    /// 0.74.14: Cc, conversation fields, list snippet and unsubscribe targets.
+    #[serde(default)]
+    pub cc: String,
+    #[serde(default)]
+    pub message_id: String,
+    #[serde(default)]
+    pub in_reply_to: String,
+    #[serde(default)]
+    pub references: Vec<String>,
+    #[serde(default)]
+    pub snippet: String,
+    #[serde(default)]
+    pub has_attachments: bool,
+    #[serde(default)]
+    pub thread_key: String,
+    #[serde(default)]
+    pub unsubscribe: Option<MailUnsubscribeInfo>,
+}
+
+/// `List-Unsubscribe` targets of a message (0.74.14). `mailto` is sent by the
+/// server on request; `url` is only ever opened in the user's browser.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct MailUnsubscribeInfo {
+    #[serde(default)]
+    pub mailto: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub one_click: bool,
+}
+
+/// A snoozed message (0.74.14).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct MailSnoozeItem {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub account_label: String,
+    #[serde(default)]
+    pub folder: String,
+    #[serde(default)]
+    pub uid: u32,
+    #[serde(default)]
+    pub subject: String,
+    #[serde(default)]
+    pub from_addr: String,
+    #[serde(default)]
+    pub wake_at: i64,
+    #[serde(default)]
+    pub created_at: i64,
+}
+
+/// One recipient suggestion from `GET /v1/mail/contacts` (0.74.14).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct MailContact {
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub uses: i64,
+    #[serde(default)]
+    pub last_used: i64,
+}
+
+/// A saved mail search (0.74.14).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct SavedMailSearch {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub query: String,
+    #[serde(default)]
+    pub created_at: i64,
+}
+
+/// Where `POST /v1/mail/drafts` stored the draft (0.74.14).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct MailDraftSaved {
+    #[serde(default)]
+    pub folder: String,
+    #[serde(default)]
+    pub uid: Option<u32>,
+}
+
+/// Request body for `POST /v1/mail/messages/{uid}/snooze` (0.74.14).
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct MailSnoozeRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    pub folder: String,
+    pub wake_at: i64,
+    pub subject: String,
+    pub from: String,
+}
+
+/// Request body for `POST /v1/mail/drafts` (0.74.14).
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct MailDraftRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replace_uid: Option<u32>,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub subject: String,
+    pub body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_html: Option<String>,
 }
 
 /// Alias matching the 0.74.12 mail workspace API.
@@ -2215,6 +2328,9 @@ pub struct MailScheduleRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_html: Option<String>,
     pub send_at: i64,
+    /// `undo` for the short hold behind Undo send; omitted for Send later.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 /// Request body for `PATCH /v1/mail/scheduled/{id}` (0.74.13).
@@ -5554,6 +5670,52 @@ impl ApiClient {
         body_html: Option<String>,
         send_at: i64,
     ) -> Result<ScheduledMailItem, ApiError> {
+        self.mail_schedule_kind(
+            account, to, cc, bcc, subject, body, body_html, send_at, None,
+        )
+    }
+
+    /// `POST /v1/mail/schedule` with `kind = "undo"`: hold a message for a few
+    /// seconds so it can still be cancelled with [`ApiClient::mail_cancel_scheduled`]
+    /// (0.74.14).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mail_send_with_undo(
+        &self,
+        account: Option<&str>,
+        to: &[String],
+        cc: &[String],
+        bcc: &[String],
+        subject: &str,
+        body: &str,
+        body_html: Option<String>,
+        send_at: i64,
+    ) -> Result<ScheduledMailItem, ApiError> {
+        self.mail_schedule_kind(
+            account,
+            to,
+            cc,
+            bcc,
+            subject,
+            body,
+            body_html,
+            send_at,
+            Some("undo"),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mail_schedule_kind(
+        &self,
+        account: Option<&str>,
+        to: &[String],
+        cc: &[String],
+        bcc: &[String],
+        subject: &str,
+        body: &str,
+        body_html: Option<String>,
+        send_at: i64,
+        kind: Option<&str>,
+    ) -> Result<ScheduledMailItem, ApiError> {
         let recipients: Vec<String> = to
             .iter()
             .map(|s| s.trim().to_owned())
@@ -5584,6 +5746,7 @@ impl ApiClient {
             body: body.to_owned(),
             body_html: body_html.filter(|h| !h.trim().is_empty()),
             send_at,
+            kind: kind.map(str::to_owned),
         };
         let reply: serde_json::Value =
             self.request(Method::POST, &["v1", "mail", "schedule"], &[], Some(&req))?;
@@ -5639,6 +5802,153 @@ impl ApiClient {
         }
         let _: serde_json::Value =
             self.request::<_, ()>(Method::DELETE, &["v1", "mail", "scheduled", id], &[], None)?;
+        Ok(())
+    }
+
+    /// `POST /v1/mail/messages/{uid}/snooze`: hide a message until `wake_at` (0.74.14).
+    pub fn mail_snooze(
+        &self,
+        account: Option<&str>,
+        folder: &str,
+        uid: u32,
+        wake_at: i64,
+        subject: &str,
+        from: &str,
+    ) -> Result<MailSnoozeItem, ApiError> {
+        if wake_at <= 0 {
+            return Err(ApiError::Validation("Pick a valid snooze time."));
+        }
+        let req = MailSnoozeRequest {
+            account: account
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+            folder: folder.to_owned(),
+            wake_at,
+            subject: subject.chars().take(300).collect(),
+            from: from.chars().take(300).collect(),
+        };
+        let uid_str = uid.to_string();
+        let reply: serde_json::Value = self.request(
+            Method::POST,
+            &["v1", "mail", "messages", &uid_str, "snooze"],
+            &[],
+            Some(&req),
+        )?;
+        let inner = reply.get("item").unwrap_or(&reply);
+        serde_json::from_value(inner.clone()).map_err(|_| ApiError::InvalidResponse)
+    }
+
+    /// `DELETE /v1/mail/messages/{uid}/snooze`: bring a snoozed message back now (0.74.14).
+    pub fn mail_unsnooze(
+        &self,
+        account: Option<&str>,
+        folder: &str,
+        uid: u32,
+    ) -> Result<(), ApiError> {
+        let mut query: Vec<(&str, &str)> = vec![("folder", folder)];
+        if let Some(label) = account.map(str::trim).filter(|s| !s.is_empty()) {
+            query.push(("account", label));
+        }
+        let uid_str = uid.to_string();
+        let _: serde_json::Value = self.request::<_, ()>(
+            Method::DELETE,
+            &["v1", "mail", "messages", &uid_str, "snooze"],
+            &query,
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// `GET /v1/mail/snoozed`: snoozed messages, soonest first (0.74.14).
+    pub fn mail_list_snoozed(
+        &self,
+        account: Option<&str>,
+    ) -> Result<Vec<MailSnoozeItem>, ApiError> {
+        let query: &[(&str, &str)] = match account.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(label) => &[("account", label)],
+            None => &[],
+        };
+        let reply: serde_json::Value = self.get(&["v1", "mail", "snoozed"], query)?;
+        Ok(serde_json::from_value(reply["items"].clone()).unwrap_or_default())
+    }
+
+    /// `GET /v1/mail/contacts?q=`: recipient suggestions, most used first (0.74.14).
+    pub fn mail_contacts(&self, q: &str, limit: u32) -> Result<Vec<MailContact>, ApiError> {
+        let limit = limit.clamp(1, 20).to_string();
+        let query: Vec<(&str, &str)> = vec![("q", q.trim()), ("limit", limit.as_str())];
+        let reply: serde_json::Value = self.get(&["v1", "mail", "contacts"], &query)?;
+        Ok(serde_json::from_value(reply["items"].clone()).unwrap_or_default())
+    }
+
+    /// `GET /v1/mail/saved-searches` (0.74.14).
+    pub fn mail_saved_searches(&self) -> Result<Vec<SavedMailSearch>, ApiError> {
+        let reply: serde_json::Value = self.get(&["v1", "mail", "saved-searches"], &[])?;
+        Ok(serde_json::from_value(reply["items"].clone()).unwrap_or_default())
+    }
+
+    /// `POST /v1/mail/saved-searches` (0.74.14).
+    pub fn mail_create_saved_search(
+        &self,
+        name: &str,
+        query: &str,
+    ) -> Result<SavedMailSearch, ApiError> {
+        let name = name.trim();
+        let query = query.trim();
+        if name.is_empty() || query.is_empty() {
+            return Err(ApiError::Validation("Give the search a name and a query."));
+        }
+        let body = serde_json::json!({ "name": name, "query": query });
+        let reply: serde_json::Value = self.request(
+            Method::POST,
+            &["v1", "mail", "saved-searches"],
+            &[],
+            Some(&body),
+        )?;
+        let inner = reply.get("item").unwrap_or(&reply);
+        serde_json::from_value(inner.clone()).map_err(|_| ApiError::InvalidResponse)
+    }
+
+    /// `DELETE /v1/mail/saved-searches/{id}` (0.74.14).
+    pub fn mail_delete_saved_search(&self, id: &str) -> Result<(), ApiError> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(ApiError::Validation("Missing saved search ID."));
+        }
+        let _: serde_json::Value = self.request::<_, ()>(
+            Method::DELETE,
+            &["v1", "mail", "saved-searches", id],
+            &[],
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// `POST /v1/mail/drafts`: save or replace a draft in the mailbox's Drafts
+    /// folder (0.74.14). Pass the previous `uid` as `replace_uid`.
+    pub fn mail_save_draft(&self, req: &MailDraftRequest) -> Result<MailDraftSaved, ApiError> {
+        self.request(Method::POST, &["v1", "mail", "drafts"], &[], Some(req))
+    }
+
+    /// `POST /v1/mail/unsubscribe`: send the `mailto:` request of a
+    /// `List-Unsubscribe` header (0.74.14).
+    pub fn mail_unsubscribe(&self, account: Option<&str>, mailto: &str) -> Result<(), ApiError> {
+        let mailto = mailto.trim();
+        if mailto.is_empty() {
+            return Err(ApiError::Validation(
+                "This message has no unsubscribe address.",
+            ));
+        }
+        let body = serde_json::json!({
+            "account": account.map(str::trim).filter(|s| !s.is_empty()),
+            "mailto": mailto,
+        });
+        let _: serde_json::Value = self.request(
+            Method::POST,
+            &["v1", "mail", "unsubscribe"],
+            &[],
+            Some(&body),
+        )?;
         Ok(())
     }
 
@@ -9490,5 +9800,169 @@ mod mail_and_search_tests {
             dummy.mail_cancel_scheduled("  "),
             Err(ApiError::Validation(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod mail_workspace_tests {
+    use super::*;
+    use secrecy::SecretString;
+    use std::io::{Read, Write};
+
+    fn serve_once(response: Vec<u8>) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request);
+                let _ = stream.write_all(&response);
+            }
+        });
+        port
+    }
+
+    fn client_for(port: u16) -> ApiClient {
+        let endpoint = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        ApiClient::new(endpoint, SecretString::new("t".repeat(40))).unwrap()
+    }
+
+    fn json_response(body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn list_rows_carry_thread_snippet_and_unsubscribe_fields() {
+        let body = r#"{"messages":[{"uid":2,"subject":"Re: Plan","from":"Bob <bob@x.test>","to":"me@x.test","cc":"c@x.test","date":"Mon, 23 Nov 2026 10:00:00 +0000","flags":["Seen"],"body":"Sounds good.","snippet":"Sounds good.","has_attachments":true,"message_id":"<b@x>","in_reply_to":"<a@x>","references":["<a@x>"],"thread_key":"t-1","unsubscribe":{"mailto":"u@news.test?subject=unsubscribe","url":"https://news.test/u","one_click":true}}]}"#;
+        let rows = client_for(serve_once(json_response(body)))
+            .mail_messages(None, "INBOX", 20)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.thread_key, "t-1");
+        assert_eq!(row.snippet, "Sounds good.");
+        assert_eq!(row.in_reply_to, "<a@x>");
+        assert_eq!(row.references, vec!["<a@x>".to_owned()]);
+        assert!(row.has_attachments);
+        let unsub = row.unsubscribe.as_ref().unwrap();
+        assert_eq!(
+            unsub.mailto.as_deref(),
+            Some("u@news.test?subject=unsubscribe")
+        );
+        assert_eq!(unsub.url.as_deref(), Some("https://news.test/u"));
+        assert!(unsub.one_click);
+
+        // Older servers omit every new field.
+        let old = r#"{"messages":[{"uid":1,"subject":"Old","from":"a@x.test"}]}"#;
+        let rows = client_for(serve_once(json_response(old)))
+            .mail_messages(None, "INBOX", 20)
+            .unwrap();
+        assert!(rows[0].thread_key.is_empty());
+        assert!(rows[0].unsubscribe.is_none());
+    }
+
+    #[test]
+    fn snooze_contacts_and_saved_searches_parse() {
+        let snoozed = client_for(serve_once(json_response(
+            r#"{"item":{"id":"s1","account_label":"","folder":"INBOX","uid":3,"subject":"Lunch","from_addr":"c@x.test","wake_at":1795700000,"created_at":1795600000}}"#,
+        )))
+        .mail_snooze(None, "INBOX", 3, 1_795_700_000, "Lunch", "c@x.test")
+        .unwrap();
+        assert_eq!(snoozed.uid, 3);
+        assert_eq!(snoozed.wake_at, 1_795_700_000);
+        assert!(
+            client_for(1)
+                .mail_snooze(None, "INBOX", 3, 0, "x", "y")
+                .is_err()
+        );
+
+        let ok = json_response(r#"{"removed":true}"#);
+        client_for(serve_once(ok))
+            .mail_unsnooze(Some("work"), "INBOX", 3)
+            .unwrap();
+
+        let listed = client_for(serve_once(json_response(
+            r#"{"items":[{"id":"s1","account_label":"","folder":"INBOX","uid":3,"subject":"Lunch","from_addr":"c@x.test","wake_at":1795700000,"created_at":1795600000}]}"#,
+        )))
+        .mail_list_snoozed(None)
+        .unwrap();
+        assert_eq!(listed.len(), 1);
+
+        let contacts = client_for(serve_once(json_response(
+            r#"{"items":[{"email":"anna@x.test","name":"Anna","uses":2,"last_used":5}]}"#,
+        )))
+        .mail_contacts("an", 8)
+        .unwrap();
+        assert_eq!(contacts[0].email, "anna@x.test");
+        assert_eq!(contacts[0].uses, 2);
+
+        let created = client_for(serve_once(json_response(
+            r#"{"item":{"id":"q1","name":"From Anna","query":"from:anna","created_at":9}}"#,
+        )))
+        .mail_create_saved_search("From Anna", "from:anna")
+        .unwrap();
+        assert_eq!(created.id, "q1");
+        assert!(client_for(1).mail_create_saved_search(" ", "x").is_err());
+        assert!(client_for(1).mail_delete_saved_search(" ").is_err());
+        let list = client_for(serve_once(json_response(
+            r#"{"items":[{"id":"q1","name":"From Anna","query":"from:anna","created_at":9}]}"#,
+        )))
+        .mail_saved_searches()
+        .unwrap();
+        assert_eq!(list[0].query, "from:anna");
+        client_for(serve_once(json_response(r#"{"deleted":true}"#)))
+            .mail_delete_saved_search("q1")
+            .unwrap();
+    }
+
+    #[test]
+    fn drafts_unsubscribe_and_undo_send_round_trip() {
+        let saved = client_for(serve_once(json_response(
+            r#"{"folder":"INBOX.Drafts","uid":99}"#,
+        )))
+        .mail_save_draft(&MailDraftRequest {
+            account: None,
+            folder: None,
+            replace_uid: Some(5),
+            to: vec!["b@x.test".into()],
+            cc: vec![],
+            subject: "Draft".into(),
+            body: "Hi".into(),
+            body_html: None,
+        })
+        .unwrap();
+        assert_eq!(saved.folder, "INBOX.Drafts");
+        assert_eq!(saved.uid, Some(99));
+
+        client_for(serve_once(json_response(r#"{"sent":true}"#)))
+            .mail_unsubscribe(None, "u@news.test?subject=unsubscribe")
+            .unwrap();
+        assert!(client_for(1).mail_unsubscribe(None, "  ").is_err());
+
+        let held = client_for(serve_once(json_response(
+            r#"{"item":{"id":"u1","to":["b@x.test"],"cc":[],"bcc":[],"subject":"Hi","body":"b","send_at":1795600010,"status":"pending","created_at":1795600000}}"#,
+        )))
+        .mail_send_with_undo(
+            None,
+            &["b@x.test".into()],
+            &[],
+            &[],
+            "Hi",
+            "b",
+            None,
+            1_795_600_010,
+        )
+        .unwrap();
+        assert_eq!(held.id, "u1");
+        assert!(
+            client_for(1)
+                .mail_send_with_undo(None, &[], &[], &[], "s", "b", None, 5)
+                .is_err()
+        );
     }
 }

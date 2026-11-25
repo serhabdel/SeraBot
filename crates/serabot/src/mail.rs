@@ -1501,7 +1501,7 @@ pub fn parse_message_detail(
         None
     } else {
         let parsed = mail_ux::parse_list_unsubscribe(&list_unsubscribe, &list_unsubscribe_post);
-        (parsed.mailto.is_some() || parsed.url.is_some()).then(|| MailUnsubscribe {
+        (parsed.mailto.is_some() || parsed.url.is_some()).then_some(MailUnsubscribe {
             mailto: parsed.mailto,
             url: parsed.url,
             one_click: parsed.one_click,
