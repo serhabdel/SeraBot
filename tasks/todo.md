@@ -638,7 +638,7 @@ never merge without the owner's OK.
 
 ## Release 0.74.15 (proposed) — harness, stability, composer, recall
 
-Plan: `docs/specs/0.74.15-proposal.md`. Stacked on `release/0.74.14` until that merges. Version stays `0.74.14` until the batch is cut.
+Plan: `docs/specs/0.74.15-proposal.md`. Version stays `0.74.14` until the batch is cut.
 
 - [x] Mail composer: sticky footer, recipient chips (Enter/comma/Tab/paste, Backspace removes, suggestions with arrows), attach from PC + drag and drop + Library, size/count limits, Ctrl+Enter, address validation.
 - [x] Chat: message action bar below the message instead of floating over its neighbour; a retried message with no reply between shows once.
