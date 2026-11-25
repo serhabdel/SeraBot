@@ -295,17 +295,22 @@ async fn handle(socket: tokio::net::TcpStream, state: Arc<Mutex<State>>) {
                         let mut it = args.splitn(2, ' ');
                         let uid: u32 = it.next().and_then(|w| w.parse().ok()).unwrap_or(0);
                         let dest = unquote(it.next().unwrap_or(""));
-                        let taken = st.boxes.get_mut(&selected).and_then(|v| {
-                            v.iter().position(|m| m.uid == uid).map(|at| v.remove(at))
-                        });
-                        match (taken, st.boxes.contains_key(&dest)) {
-                            (Some(mut m), true) => {
+                        // Refuse before touching the source, as a real server does.
+                        let taken = if st.boxes.contains_key(&dest) {
+                            st.boxes.get_mut(&selected).and_then(|v| {
+                                v.iter().position(|m| m.uid == uid).map(|at| v.remove(at))
+                            })
+                        } else {
+                            None
+                        };
+                        match taken {
+                            Some(mut m) => {
                                 st.next_uid += 1;
                                 m.uid = st.next_uid;
                                 st.boxes.get_mut(&dest).unwrap().push(m);
                                 format!("* 1 EXPUNGE\r\n{tag} OK moved\r\n")
                             }
-                            _ => format!("{tag} NO cannot move\r\n"),
+                            None => format!("{tag} NO cannot move\r\n"),
                         }
                     }
                     "EXPUNGE" => {
