@@ -1,6 +1,7 @@
 //! The worker loop, maintenance and task dispatch.
 
 use super::*;
+use tracing::Instrument;
 
 /// Aborts the task it holds when dropped. The lease heartbeat is held this
 /// way, so a panic in the turn cannot leave it renewing a lease nobody runs.
