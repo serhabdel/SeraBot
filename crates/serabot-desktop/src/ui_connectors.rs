@@ -1088,22 +1088,25 @@ where
         .map_err(|_| "Request thread exited unexpectedly.".to_owned())?
 }
 
-/// Native per-user SMTP/IMAP Mail connector card (Hostinger preset + live test results).
+/// Native per-user SMTP/IMAP Mail connector card (multi-account list, Hostinger preset,
+/// password-optional edits, and live test results).
 #[component]
 pub(crate) fn MailConnectorCard(
     session: Signal<Session>,
     on_status: EventHandler<serabot_desktop::MailStatus>,
 ) -> Element {
     use serabot_desktop::{
-        MailConnectRequest, MailConnectResponse, MailProbeOutcome, MailSecurity, MailStatus,
-        validate_mail_connect,
+        MailAccountStatus, MailConnectRequest, MailConnectResponse, MailProbeOutcome, MailSecurity,
+        MailStatus, validate_mail_connect_with_mode,
     };
     let mut status = use_signal(|| Option::<MailStatus>::None);
     let mut loading = use_signal(|| true);
     let mut busy = use_signal(|| false);
     let mut error = use_signal(|| Option::<String>::None);
     let mut test_result = use_signal(|| Option::<MailConnectResponse>::None);
-    let mut confirm_disconnect = use_signal(|| false);
+    let mut confirm_disconnect_account = use_signal(|| Option::<String>::None);
+    let mut form_open = use_signal(|| false);
+    let mut editing_existing = use_signal(|| false);
 
     let mut smtp_host = use_signal(String::new);
     let mut smtp_port = use_signal(|| "587".to_owned());
@@ -1117,6 +1120,7 @@ pub(crate) fn MailConnectorCard(
     let mut account_name = use_signal(String::new);
     let mut signature = use_signal(String::new);
     let mut mail_window = use_signal(|| false);
+    let mut mail_window_account = use_signal(|| Option::<String>::None);
 
     let load_status = move || {
         loading.set(true);
@@ -1126,21 +1130,6 @@ pub(crate) fn MailConnectorCard(
             loading.set(false);
             match res {
                 Ok(st) => {
-                    if let Some(h) = st.smtp_host.as_deref().filter(|s| !s.is_empty())
-                        && smtp_host.read().is_empty()
-                    {
-                        smtp_host.set(h.to_owned());
-                    }
-                    if let Some(h) = st.imap_host.as_deref().filter(|s| !s.is_empty())
-                        && imap_host.read().is_empty()
-                    {
-                        imap_host.set(h.to_owned());
-                    }
-                    if let Some(u) = st.username.as_deref().filter(|s| !s.is_empty())
-                        && username.read().is_empty()
-                    {
-                        username.set(u.to_owned());
-                    }
                     on_status.call(st.clone());
                     status.set(Some(st));
                 }
@@ -1150,7 +1139,13 @@ pub(crate) fn MailConnectorCard(
     };
     use_hook(load_status);
 
-    let connected = status().as_ref().is_some_and(|s| s.connected);
+    let accounts: Vec<MailAccountStatus> = status()
+        .as_ref()
+        .map(|s| s.accounts.clone())
+        .unwrap_or_default();
+    let connected = status()
+        .as_ref()
+        .is_some_and(|s| s.connected || !s.accounts.is_empty());
     let connected_user = status()
         .as_ref()
         .and_then(|s| s.username.clone())
@@ -1163,26 +1158,9 @@ pub(crate) fn MailConnectorCard(
         .as_ref()
         .and_then(|s| s.imap_host.clone())
         .unwrap_or_default();
-    let accounts_line = status()
-        .as_ref()
-        .map(|s| {
-            s.accounts
-                .iter()
-                .map(|a| {
-                    let label = if a.account.is_empty() {
-                        "default".to_owned()
-                    } else {
-                        a.account.clone()
-                    };
-                    match a.username.as_deref().filter(|u| !u.is_empty()) {
-                        Some(u) => format!("{label} ({u})"),
-                        None => label,
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_default();
+
+    let show_form = !connected || form_open();
+    let is_editing = connected && editing_existing();
 
     let submit_connect = move |_| {
         if busy() {
@@ -1201,9 +1179,31 @@ pub(crate) fn MailConnectorCard(
         let from_val = from_addr().trim().to_owned();
         let account_val = account_name().trim().to_owned();
         let sig_val = signature().trim().to_owned();
+        let is_update = editing_existing();
+        if !is_update
+            && let Some(st) = status().as_ref()
+            && st
+                .accounts
+                .iter()
+                .any(|a| a.account.eq_ignore_ascii_case(&account_val))
+        {
+            let label = if account_val.is_empty() {
+                "default"
+            } else {
+                account_val.as_str()
+            };
+            error.set(Some(format!(
+                "Mailbox \"{label}\" is already connected. Click Edit on it to update settings, or choose a different label."
+            )));
+            return;
+        }
         let req = MailConnectRequest {
             account: (!account_val.is_empty()).then_some(account_val),
-            signature: (!sig_val.is_empty()).then_some(sig_val),
+            signature: if is_update {
+                Some(sig_val)
+            } else {
+                (!sig_val.is_empty()).then_some(sig_val)
+            },
             smtp_host: smtp_host().trim().to_owned(),
             smtp_port: sp,
             smtp_security: smtp_security(),
@@ -1214,19 +1214,26 @@ pub(crate) fn MailConnectorCard(
             imap_security: imap_security(),
             from: (!from_val.is_empty()).then_some(from_val),
         };
-        if let Err(err) = validate_mail_connect(&req) {
+        if let Err(err) = validate_mail_connect_with_mode(&req, is_update) {
             error.set(Some(err.to_string()));
             return;
         }
         busy.set(true);
         spawn(async move {
-            let res = run_mail_job(session, move |c| c.mail_connect(&req)).await;
+            let res =
+                run_mail_job(session, move |c| c.mail_connect_with_mode(&req, is_update)).await;
             busy.set(false);
             match res {
                 Ok(reply) => {
                     password.set(String::new());
+                    let both_ok = reply.smtp_test == MailProbeOutcome::Ok
+                        && reply.imap_test == MailProbeOutcome::Ok;
                     test_result.set(Some(reply));
-                    // Re-fetch so the accounts list includes the new mailbox.
+                    if both_ok {
+                        form_open.set(false);
+                        editing_existing.set(false);
+                    }
+                    // Re-fetch so the accounts list includes the saved mailbox.
                     if let Ok(st) = run_mail_job(session, |c| c.mail_status()).await {
                         on_status.call(st.clone());
                         status.set(Some(st));
@@ -1247,11 +1254,40 @@ pub(crate) fn MailConnectorCard(
         error.set(None);
     };
 
+    let start_add_mailbox = move |_| {
+        account_name.set(String::new());
+        smtp_host.set(String::new());
+        smtp_port.set("587".to_owned());
+        smtp_security.set(MailSecurity::StartTls);
+        imap_host.set(String::new());
+        imap_port.set("993".to_owned());
+        imap_security.set(MailSecurity::Ssl);
+        username.set(String::new());
+        password.set(String::new());
+        from_addr.set(String::new());
+        signature.set(String::new());
+        editing_existing.set(false);
+        form_open.set(true);
+        error.set(None);
+        test_result.set(None);
+        confirm_disconnect_account.set(None);
+    };
+
     let can_submit = !busy()
         && !smtp_host().trim().is_empty()
         && !imap_host().trim().is_empty()
         && !username().trim().is_empty()
-        && !password().is_empty();
+        && (is_editing || !password().is_empty());
+
+    let edit_label = {
+        let acct = account_name();
+        let trimmed = acct.trim();
+        if trimmed.is_empty() {
+            "default".to_owned()
+        } else {
+            trimmed.to_owned()
+        }
+    };
 
     rsx! {
         div { class: "card connector-card mail-connector-card",
@@ -1260,7 +1296,7 @@ pub(crate) fn MailConnectorCard(
                     BrandLogo { brand: "agentmail".to_owned(), size: 28 }
                     div {
                         h3 { class: "card-title", "Mail (SMTP / IMAP)" }
-                        span { class: "card-sub", "Personal mailbox for reading and sending email (writes ask you first)." }
+                        span { class: "card-sub", "Personal mailboxes for reading and sending email (writes ask you first)." }
                     }
                 }
                 StatusChip {
@@ -1268,14 +1304,193 @@ pub(crate) fn MailConnectorCard(
                     text: if loading() && status().is_none() {
                         "Checking\u{2026}".to_owned()
                     } else if connected {
-                        "Connected".to_owned()
+                        if accounts.len() > 1 {
+                            format!("{} connected", accounts.len())
+                        } else {
+                            "Connected".to_owned()
+                        }
                     } else {
                         "Not connected".to_owned()
                     },
                 }
             }
 
-            if connected {
+            if !accounts.is_empty() {
+                div {
+                    class: "mail-connected-summary",
+                    role: "region",
+                    "aria-label": "Connected Mailboxes",
+                    p { class: "tiny", strong { "Connected Mailboxes" } }
+                    for acct in accounts.iter() {
+                        {
+                            let acct_key = acct.account.clone();
+                            let display_label = if acct_key.is_empty() {
+                                "default".to_owned()
+                            } else {
+                                acct_key.clone()
+                            };
+                            let acct_user = acct.username.clone().unwrap_or_default();
+                            let acct_smtp = acct.smtp_host.clone().unwrap_or_default();
+                            let acct_imap = acct.imap_host.clone().unwrap_or_default();
+                            let confirming = confirm_disconnect_account().as_deref()
+                                == Some(acct_key.as_str());
+                            let acct_for_edit = acct.clone();
+                            let open_key = acct_key.clone();
+                            let ask_disc_key = acct_key.clone();
+                            let do_disc_key = acct_key.clone();
+                            rsx! {
+                                div {
+                                    key: "{acct_key}",
+                                    style: "display: flex; flex-direction: column; gap: 6px; padding: 6px 0; border-top: 1px solid var(--hairline);",
+                                    div {
+                                        style: "display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;",
+                                        div {
+                                            style: "display: flex; flex-direction: column; gap: 2px; min-width: 0;",
+                                            p { class: "tiny",
+                                                strong { class: "mono", "{display_label}" }
+                                                if !acct_user.is_empty() {
+                                                    span { class: "muted", " · " }
+                                                    span { class: "mono", "{acct_user}" }
+                                                }
+                                            }
+                                            if !acct_smtp.is_empty() || !acct_imap.is_empty() {
+                                                p { class: "tiny muted",
+                                                    "SMTP: "
+                                                    span { class: "mono", "{acct_smtp}" }
+                                                    " · IMAP: "
+                                                    span { class: "mono", "{acct_imap}" }
+                                                }
+                                            }
+                                        }
+                                        div {
+                                            style: "display: flex; align-items: center; gap: 6px; flex-wrap: wrap;",
+                                            button {
+                                                class: "btn ghost sm",
+                                                r#type: "button",
+                                                disabled: busy(),
+                                                onclick: move |_| {
+                                                    account_name.set(acct_for_edit.account.clone());
+                                                    smtp_host.set(acct_for_edit.smtp_host.clone().unwrap_or_default());
+                                                    smtp_port.set(acct_for_edit.smtp_port.unwrap_or(587).to_string());
+                                                    smtp_security.set(acct_for_edit.smtp_security.unwrap_or(MailSecurity::StartTls));
+                                                    imap_host.set(acct_for_edit.imap_host.clone().unwrap_or_default());
+                                                    imap_port.set(acct_for_edit.imap_port.unwrap_or(993).to_string());
+                                                    imap_security.set(acct_for_edit.imap_security.unwrap_or(MailSecurity::Ssl));
+                                                    username.set(acct_for_edit.username.clone().unwrap_or_default());
+                                                    password.set(String::new());
+                                                    from_addr.set(acct_for_edit.from.clone().unwrap_or_default());
+                                                    signature.set(acct_for_edit.signature.clone().unwrap_or_default());
+                                                    editing_existing.set(true);
+                                                    form_open.set(true);
+                                                    error.set(None);
+                                                    test_result.set(None);
+                                                    confirm_disconnect_account.set(None);
+                                                },
+                                                "Edit"
+                                            }
+                                            button {
+                                                class: "btn ghost sm",
+                                                r#type: "button",
+                                                disabled: busy(),
+                                                onclick: move |_| {
+                                                    mail_window_account.set(
+                                                        (!open_key.is_empty()).then(|| open_key.clone()),
+                                                    );
+                                                    mail_window.set(true);
+                                                },
+                                                "Open"
+                                            }
+                                            button {
+                                                class: "btn ghost sm",
+                                                r#type: "button",
+                                                disabled: busy(),
+                                                onclick: move |_| {
+                                                    confirm_disconnect_account.set(Some(ask_disc_key.clone()));
+                                                },
+                                                "Disconnect"
+                                            }
+                                        }
+                                    }
+                                    if confirming {
+                                        div {
+                                            class: "mp-confirm",
+                                            role: "alertdialog",
+                                            "aria-label": "Confirm mail disconnect",
+                                            span { class: "tiny",
+                                                "Disconnect '{display_label}' and delete saved credentials?"
+                                            }
+                                            button {
+                                                class: "btn danger sm",
+                                                r#type: "button",
+                                                disabled: busy(),
+                                                onclick: move |_| {
+                                                    let acct_key_now = do_disc_key.clone();
+                                                    confirm_disconnect_account.set(None);
+                                                    busy.set(true);
+                                                    error.set(None);
+                                                    test_result.set(None);
+                                                    if editing_existing()
+                                                        && account_name().trim() == acct_key_now.as_str()
+                                                    {
+                                                        form_open.set(false);
+                                                        editing_existing.set(false);
+                                                    }
+                                                    let acct_opt = (!acct_key_now.is_empty())
+                                                        .then_some(acct_key_now);
+                                                    spawn(async move {
+                                                        let res = run_mail_job(session, move |c| {
+                                                            c.mail_disconnect(acct_opt.as_deref())
+                                                        })
+                                                        .await;
+                                                        busy.set(false);
+                                                        match res {
+                                                            Ok(_) => {
+                                                                if let Ok(st) = run_mail_job(session, |c| c.mail_status()).await {
+                                                                    on_status.call(st.clone());
+                                                                    status.set(Some(st));
+                                                                } else {
+                                                                    let next = MailStatus::default();
+                                                                    on_status.call(next.clone());
+                                                                    status.set(Some(next));
+                                                                }
+                                                            }
+                                                            Err(msg) => error.set(Some(msg)),
+                                                        }
+                                                    });
+                                                },
+                                                "Confirm disconnect"
+                                            }
+                                            button {
+                                                class: "btn ghost sm",
+                                                r#type: "button",
+                                                disabled: busy(),
+                                                onclick: move |_| confirm_disconnect_account.set(None),
+                                                "Cancel"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                div { class: "card-actions",
+                    button {
+                        class: "btn primary",
+                        r#type: "button",
+                        disabled: busy(),
+                        onclick: move |_| session.write().open_section(serabot_desktop::session::Section::Mail),
+                        "Open Mail"
+                    }
+                    button {
+                        class: "btn ghost",
+                        r#type: "button",
+                        disabled: busy(),
+                        onclick: start_add_mailbox,
+                        "+ Add another mailbox"
+                    }
+                }
+            } else if connected {
                 div { class: "mail-connected-summary", role: "status",
                     if !connected_user.is_empty() {
                         p { class: "tiny",
@@ -1291,78 +1506,21 @@ pub(crate) fn MailConnectorCard(
                             span { class: "mono", "{connected_imap}" }
                         }
                     }
-                    if !accounts_line.is_empty() {
-                        p { class: "tiny muted",
-                            "Mailboxes: "
-                            span { class: "mono", "{accounts_line}" }
-                        }
-                    }
                 }
-                if confirm_disconnect() {
-                    div { class: "mp-confirm", role: "alertdialog", "aria-label": "Confirm mail disconnect",
-                        span { class: "tiny", "Disconnect this mailbox and delete saved credentials?" }
-                        button {
-                            class: "btn danger sm",
-                            r#type: "button",
-                            disabled: busy(),
-                            onclick: move |_| {
-                                confirm_disconnect.set(false);
-                                busy.set(true);
-                                error.set(None);
-                                test_result.set(None);
-                                let acct = account_name().trim().to_owned();
-                                let acct = if acct.is_empty() { None } else { Some(acct) };
-                                spawn(async move {
-                                    let res = run_mail_job(session, move |c| c.mail_disconnect(acct.as_deref())).await;
-                                    busy.set(false);
-                                    match res {
-                                        Ok(_) => {
-                                            if let Ok(st) = run_mail_job(session, |c| c.mail_status()).await {
-                                                on_status.call(st.clone());
-                                                status.set(Some(st));
-                                            } else {
-                                                let next = MailStatus::default();
-                                                on_status.call(next.clone());
-                                                status.set(Some(next));
-                                            }
-                                        }
-                                        Err(msg) => error.set(Some(msg)),
-                                    }
-                                });
-                            },
-                            "Confirm disconnect"
-                        }
-                        button {
-                            class: "btn ghost sm",
-                            r#type: "button",
-                            disabled: busy(),
-                            onclick: move |_| confirm_disconnect.set(false),
-                            "Cancel"
-                        }
+                div { class: "card-actions",
+                    button {
+                        class: "btn primary",
+                        r#type: "button",
+                        disabled: busy(),
+                        onclick: move |_| session.write().open_section(serabot_desktop::session::Section::Mail),
+                        "Open Mail"
                     }
-                } else {
-                    div { class: "card-actions",
-                        button {
-                            class: "btn primary",
-                            r#type: "button",
-                            disabled: busy(),
-                            onclick: move |_| session.write().open_section(serabot_desktop::session::Section::Mail),
-                            "Open Mail"
-                        }
-                        button {
-                            class: "btn ghost",
-                            r#type: "button",
-                            disabled: busy(),
-                            onclick: move |_| mail_window.set(true),
-                            "Open inbox"
-                        }
-                        button {
-                            class: "btn ghost",
-                            r#type: "button",
-                            disabled: busy(),
-                            onclick: move |_| confirm_disconnect.set(true),
-                            "Disconnect"
-                        }
+                    button {
+                        class: "btn ghost",
+                        r#type: "button",
+                        disabled: busy(),
+                        onclick: start_add_mailbox,
+                        "+ Add another mailbox"
                     }
                 }
             }
@@ -1402,167 +1560,218 @@ pub(crate) fn MailConnectorCard(
                 div { class: "banner err", role: "alert", span { class: "grow", "{msg}" } }
             }
 
-            div { class: "mail-preset-row",
-                span { class: "tiny muted", "Quick preset:" }
-                button {
-                    class: "btn ghost sm",
-                    r#type: "button",
-                    disabled: busy(),
-                    onclick: apply_hostinger,
-                    "Hostinger"
+            if show_form {
+                div { class: "mail-preset-row",
+                    span { class: "tiny",
+                        strong {
+                            if is_editing {
+                                "Edit mailbox: {edit_label}"
+                            } else if connected {
+                                "Add another mailbox"
+                            } else {
+                                "Connect a mailbox"
+                            }
+                        }
+                    }
+                    span { class: "tiny muted", "· Quick preset:" }
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        disabled: busy(),
+                        onclick: apply_hostinger,
+                        "Hostinger"
+                    }
                 }
-            }
 
-            div { class: "form-grid mail-form-grid",
-                div { class: "field mail-from-field",
-                    label { class: "field-label", r#for: "mail-account", "Account name (optional)" }
-                    input {
-                        id: "mail-account",
-                        class: "input",
-                        r#type: "text",
-                        placeholder: "default (leave empty for the main mailbox)",
-                        disabled: busy(),
-                        value: "{account_name}",
-                        oninput: move |e| account_name.set(e.value()),
+                div { class: "form-grid mail-form-grid",
+                    div { class: "field mail-from-field",
+                        label { class: "field-label", r#for: "mail-account",
+                            if connected && !is_editing {
+                                "Account label (e.g. work, personal)"
+                            } else {
+                                "Account name (optional)"
+                            }
+                        }
+                        input {
+                            id: "mail-account",
+                            class: "input",
+                            r#type: "text",
+                            placeholder: if connected && !is_editing {
+                                "e.g. work, personal"
+                            } else {
+                                "default (leave empty for the main mailbox)"
+                            },
+                            disabled: busy() || is_editing,
+                            value: "{account_name}",
+                            oninput: move |e| account_name.set(e.value()),
+                        }
                     }
-                }
-                div { class: "field",
-                    label { class: "field-label", r#for: "mail-smtp-host", "SMTP host" }
-                    input {
-                        id: "mail-smtp-host",
-                        class: "input",
-                        r#type: "text",
-                        placeholder: "smtp.hostinger.com",
-                        disabled: busy(),
-                        value: "{smtp_host}",
-                        oninput: move |e| smtp_host.set(e.value()),
+                    div { class: "field",
+                        label { class: "field-label", r#for: "mail-smtp-host", "SMTP host" }
+                        input {
+                            id: "mail-smtp-host",
+                            class: "input",
+                            r#type: "text",
+                            placeholder: "smtp.hostinger.com",
+                            disabled: busy(),
+                            value: "{smtp_host}",
+                            oninput: move |e| smtp_host.set(e.value()),
+                        }
                     }
-                }
-                div { class: "field",
-                    label { class: "field-label", r#for: "mail-smtp-port", "SMTP port" }
-                    input {
-                        id: "mail-smtp-port",
-                        class: "input",
-                        r#type: "text",
-                        placeholder: "587",
-                        disabled: busy(),
-                        value: "{smtp_port}",
-                        oninput: move |e| smtp_port.set(e.value()),
+                    div { class: "field",
+                        label { class: "field-label", r#for: "mail-smtp-port", "SMTP port" }
+                        input {
+                            id: "mail-smtp-port",
+                            class: "input",
+                            r#type: "text",
+                            placeholder: "587",
+                            disabled: busy(),
+                            value: "{smtp_port}",
+                            oninput: move |e| smtp_port.set(e.value()),
+                        }
                     }
-                }
-                div { class: "field",
-                    label { class: "field-label", r#for: "mail-smtp-sec", "SMTP security" }
-                    select {
-                        id: "mail-smtp-sec",
-                        class: "input",
-                        disabled: busy(),
-                        value: "{smtp_security().as_str()}",
-                        onchange: move |e| smtp_security.set(MailSecurity::parse(&e.value())),
-                        for sec in MailSecurity::ALL {
-                            option { key: "{sec.as_str()}", value: "{sec.as_str()}", "{sec.label()}" }
+                    div { class: "field",
+                        label { class: "field-label", r#for: "mail-smtp-sec", "SMTP security" }
+                        select {
+                            id: "mail-smtp-sec",
+                            class: "input",
+                            disabled: busy(),
+                            value: "{smtp_security().as_str()}",
+                            onchange: move |e| smtp_security.set(MailSecurity::parse(&e.value())),
+                            for sec in MailSecurity::ALL {
+                                option { key: "{sec.as_str()}", value: "{sec.as_str()}", "{sec.label()}" }
+                            }
+                        }
+                    }
+                    div { class: "field",
+                        label { class: "field-label", r#for: "mail-imap-host", "IMAP host" }
+                        input {
+                            id: "mail-imap-host",
+                            class: "input",
+                            r#type: "text",
+                            placeholder: "imap.hostinger.com",
+                            disabled: busy(),
+                            value: "{imap_host}",
+                            oninput: move |e| imap_host.set(e.value()),
+                        }
+                    }
+                    div { class: "field",
+                        label { class: "field-label", r#for: "mail-imap-port", "IMAP port" }
+                        input {
+                            id: "mail-imap-port",
+                            class: "input",
+                            r#type: "text",
+                            placeholder: "993",
+                            disabled: busy(),
+                            value: "{imap_port}",
+                            oninput: move |e| imap_port.set(e.value()),
+                        }
+                    }
+                    div { class: "field",
+                        label { class: "field-label", r#for: "mail-imap-sec", "IMAP security" }
+                        select {
+                            id: "mail-imap-sec",
+                            class: "input",
+                            disabled: busy(),
+                            value: "{imap_security().as_str()}",
+                            onchange: move |e| imap_security.set(MailSecurity::parse(&e.value())),
+                            for sec in MailSecurity::ALL {
+                                option { key: "{sec.as_str()}", value: "{sec.as_str()}", "{sec.label()}" }
+                            }
+                        }
+                    }
+                    div { class: "field",
+                        label { class: "field-label", r#for: "mail-username", "Username / Email" }
+                        input {
+                            id: "mail-username",
+                            class: "input",
+                            r#type: "text",
+                            placeholder: "you@domain.com",
+                            disabled: busy(),
+                            value: "{username}",
+                            oninput: move |e| username.set(e.value()),
+                        }
+                    }
+                    div { class: "field",
+                        label { class: "field-label", r#for: "mail-password",
+                            if is_editing {
+                                "Password (optional — write-only)"
+                            } else {
+                                "Password (write-only)"
+                            }
+                        }
+                        SecretField {
+                            value: password,
+                            label: "Mailbox password".to_owned(),
+                            placeholder: if is_editing {
+                                "Leave blank to keep saved password".to_owned()
+                            } else {
+                                "Mailbox password (required)".to_owned()
+                            },
+                            disabled: busy(),
+                        }
+                    }
+                    div { class: "field mail-from-field",
+                        label { class: "field-label", r#for: "mail-from", "From address (optional)" }
+                        input {
+                            id: "mail-from",
+                            class: "input",
+                            r#type: "text",
+                            placeholder: "Defaults to username",
+                            disabled: busy(),
+                            value: "{from_addr}",
+                            oninput: move |e| from_addr.set(e.value()),
+                        }
+                    }
+                    div { class: "field mail-from-field",
+                        label { class: "field-label", r#for: "mail-signature", "Signature (optional, appended to every send)" }
+                        textarea {
+                            id: "mail-signature",
+                            class: "input",
+                            rows: 3,
+                            placeholder: "Jane Doe — Acme",
+                            disabled: busy(),
+                            value: "{signature}",
+                            oninput: move |e| signature.set(e.value()),
                         }
                     }
                 }
-                div { class: "field",
-                    label { class: "field-label", r#for: "mail-imap-host", "IMAP host" }
-                    input {
-                        id: "mail-imap-host",
-                        class: "input",
-                        r#type: "text",
-                        placeholder: "imap.hostinger.com",
-                        disabled: busy(),
-                        value: "{imap_host}",
-                        oninput: move |e| imap_host.set(e.value()),
-                    }
-                }
-                div { class: "field",
-                    label { class: "field-label", r#for: "mail-imap-port", "IMAP port" }
-                    input {
-                        id: "mail-imap-port",
-                        class: "input",
-                        r#type: "text",
-                        placeholder: "993",
-                        disabled: busy(),
-                        value: "{imap_port}",
-                        oninput: move |e| imap_port.set(e.value()),
-                    }
-                }
-                div { class: "field",
-                    label { class: "field-label", r#for: "mail-imap-sec", "IMAP security" }
-                    select {
-                        id: "mail-imap-sec",
-                        class: "input",
-                        disabled: busy(),
-                        value: "{imap_security().as_str()}",
-                        onchange: move |e| imap_security.set(MailSecurity::parse(&e.value())),
-                        for sec in MailSecurity::ALL {
-                            option { key: "{sec.as_str()}", value: "{sec.as_str()}", "{sec.label()}" }
-                        }
-                    }
-                }
-                div { class: "field",
-                    label { class: "field-label", r#for: "mail-username", "Username / Email" }
-                    input {
-                        id: "mail-username",
-                        class: "input",
-                        r#type: "text",
-                        placeholder: "you@domain.com",
-                        disabled: busy(),
-                        value: "{username}",
-                        oninput: move |e| username.set(e.value()),
-                    }
-                }
-                div { class: "field",
-                    label { class: "field-label", r#for: "mail-password", "Password (write-only)" }
-                    SecretField {
-                        value: password,
-                        label: "Mailbox password".to_owned(),
-                        placeholder: if connected { "Enter password to update".to_owned() } else { "Mailbox password".to_owned() },
-                        disabled: busy(),
-                    }
-                }
-                div { class: "field mail-from-field",
-                    label { class: "field-label", r#for: "mail-from", "From address (optional)" }
-                    input {
-                        id: "mail-from",
-                        class: "input",
-                        r#type: "text",
-                        placeholder: "Defaults to username",
-                        disabled: busy(),
-                        value: "{from_addr}",
-                        oninput: move |e| from_addr.set(e.value()),
-                    }
-                }
-                div { class: "field mail-from-field",
-                    label { class: "field-label", r#for: "mail-signature", "Signature (optional, appended to every send)" }
-                    textarea {
-                        id: "mail-signature",
-                        class: "input",
-                        rows: 3,
-                        placeholder: "Jane Doe — Acme",
-                        disabled: busy(),
-                        value: "{signature}",
-                        oninput: move |e| signature.set(e.value()),
-                    }
-                }
-            }
 
-            p { class: "tiny muted",
-                "Credentials are sealed per user on the server and never sent back to this app. Connecting tests both SMTP and IMAP login."
-            }
-
-            div { class: "card-actions",
-                button {
-                    class: "btn primary",
-                    r#type: "button",
-                    disabled: !can_submit,
-                    onclick: submit_connect,
-                    if busy() {
-                        "Testing & saving\u{2026}"
-                    } else if connected {
-                        "Update & test"
+                p { class: "tiny muted",
+                    if is_editing {
+                        "Leave the password blank to keep your saved password. Saving tests both SMTP and IMAP login."
                     } else {
-                        "Connect & test"
+                        "Credentials are sealed per user on the server and never sent back to this app. Connecting tests both SMTP and IMAP login."
+                    }
+                }
+
+                div { class: "card-actions",
+                    button {
+                        class: "btn primary",
+                        r#type: "button",
+                        disabled: !can_submit,
+                        onclick: submit_connect,
+                        if busy() {
+                            "Testing & saving\u{2026}"
+                        } else if is_editing {
+                            "Save changes"
+                        } else {
+                            "Connect & test"
+                        }
+                    }
+                    if connected {
+                        button {
+                            class: "btn ghost",
+                            r#type: "button",
+                            disabled: busy(),
+                            onclick: move |_| {
+                                form_open.set(false);
+                                editing_existing.set(false);
+                                password.set(String::new());
+                                error.set(None);
+                            },
+                            "Cancel"
+                        }
                     }
                 }
             }
@@ -1571,6 +1780,7 @@ pub(crate) fn MailConnectorCard(
                 MailWindow {
                     session,
                     accounts: status().map(|s| s.accounts.clone()).unwrap_or_default(),
+                    initial_account: mail_window_account(),
                     on_close: move |_| mail_window.set(false),
                 }
             }
@@ -1640,10 +1850,11 @@ fn open_mail_message(
 pub(crate) fn MailWindow(
     session: Signal<Session>,
     accounts: Vec<serabot_desktop::MailAccountStatus>,
+    initial_account: Option<String>,
     on_close: EventHandler<()>,
 ) -> Element {
     use serabot_desktop::MailMessageInfo;
-    let mut account = use_signal(|| Option::<String>::None);
+    let mut account = use_signal(move || initial_account);
     let folders = use_signal(Vec::<String>::new);
     let mut folder = use_signal(|| "INBOX".to_owned());
     let messages = use_signal(Vec::<MailMessageInfo>::new);
@@ -1663,6 +1874,8 @@ pub(crate) fn MailWindow(
             error,
         )
     });
+
+    let has_default_account = accounts.iter().any(|a| a.account.is_empty());
 
     rsx! {
         div { class: "mp-sheet-scrim", onclick: move |_| on_close.call(()),
@@ -1695,12 +1908,28 @@ pub(crate) fn MailWindow(
                             account.set(a.clone());
                             reload_mail_window(session, a, folder(), folders, messages, open_msg, loading, error);
                         },
-                        option { value: "", "default" }
+                        if !has_default_account {
+                            option { value: "", "default" }
+                        }
                         for a in accounts.iter() {
-                            option {
-                                key: "{a.account}",
-                                value: "{a.account}",
-                                "{a.account} ({a.username.clone().unwrap_or_default()})"
+                            {
+                                let label = if a.account.is_empty() {
+                                    "default"
+                                } else {
+                                    a.account.as_str()
+                                };
+                                let user = a.username.clone().unwrap_or_default();
+                                rsx! {
+                                    option {
+                                        key: "{a.account}",
+                                        value: "{a.account}",
+                                        if user.is_empty() {
+                                            "{label}"
+                                        } else {
+                                            "{label} ({user})"
+                                        }
+                                    }
+                                }
                             }
                         }
                     }

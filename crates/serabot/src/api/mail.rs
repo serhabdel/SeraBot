@@ -51,6 +51,7 @@ struct ConnectRequest {
     #[serde(default)]
     smtp_security: Security,
     username: String,
+    #[serde(default)]
     password: String,
     imap_host: String,
     #[serde(default = "mail::default_imap_port")]
@@ -79,6 +80,31 @@ async fn connect(
         .map(str::trim)
         .filter(|s| !s.is_empty());
     mail::account_provider(account_label)?;
+    let existing_creds = mail::load_credentials(&state.users, &user.id, account_label)?;
+    let password = if body.password.is_empty() {
+        match &existing_creds {
+            Some(existing) => existing.password.clone(),
+            None => {
+                return Err(SeraError::Validation(
+                    "password is required for a new mailbox".into(),
+                ));
+            }
+        }
+    } else {
+        body.password
+    };
+    let existing_sig = if existing_creds.is_some() {
+        Some(mail::load_signature_config(
+            &state.users,
+            &user.id,
+            account_label,
+        )?)
+    } else {
+        None
+    };
+    let sig_fields_omitted = body.signature_html.is_none()
+        && body.signature_logo_hash.is_none()
+        && body.signature.is_none();
     if let Some(hash) = body
         .signature_logo_hash
         .as_deref()
@@ -86,39 +112,59 @@ async fn connect(
     {
         verify_logo_artifact(&state, &user.id, hash)?;
     }
-    let sig_cfg = mail::MailSignatureConfig {
-        signature: body.signature.clone().unwrap_or_default(),
-        signature_html: body.signature_html.clone(),
-        signature_logo_hash: body.signature_logo_hash.clone(),
+    let sig_cfg = if sig_fields_omitted {
+        None
+    } else {
+        let cfg = mail::MailSignatureConfig {
+            signature: body
+                .signature
+                .clone()
+                .or_else(|| existing_sig.as_ref().map(|s| s.signature.clone()))
+                .unwrap_or_default(),
+            signature_html: body
+                .signature_html
+                .clone()
+                .or_else(|| existing_sig.as_ref().and_then(|s| s.signature_html.clone())),
+            signature_logo_hash: body.signature_logo_hash.clone().or_else(|| {
+                existing_sig
+                    .as_ref()
+                    .and_then(|s| s.signature_logo_hash.clone())
+            }),
+        };
+        mail::validate_signature_config(&cfg)?;
+        if !cfg.signature.is_empty() {
+            state.runtime.scan_owner_output(&user.id, &cfg.signature)?;
+        }
+        if let Some(html) = cfg.signature_html.as_deref() {
+            state.runtime.scan_owner_output(&user.id, html)?;
+        }
+        Some(cfg)
     };
-    mail::validate_signature_config(&sig_cfg)?;
-    if !sig_cfg.signature.is_empty() {
-        state
-            .runtime
-            .scan_owner_output(&user.id, &sig_cfg.signature)?;
-    }
-    if let Some(html) = sig_cfg.signature_html.as_deref() {
-        state.runtime.scan_owner_output(&user.id, html)?;
-    }
+    let creds_signature = if sig_fields_omitted {
+        existing_creds.as_ref().and_then(|c| c.signature.clone())
+    } else {
+        match body.signature.as_deref() {
+            Some(s) if s.trim().is_empty() => None,
+            Some(s) => Some(s.to_owned()),
+            None => existing_creds.as_ref().and_then(|c| c.signature.clone()),
+        }
+    };
     let creds = MailCredentials {
         smtp_host: body.smtp_host,
         smtp_port: body.smtp_port,
         smtp_security: body.smtp_security,
         username: body.username,
-        password: body.password,
+        password,
         imap_host: body.imap_host,
         imap_port: body.imap_port,
         imap_security: body.imap_security,
         from: body.from,
-        signature: body.signature,
+        signature: creds_signature,
     };
     mail::validate_credentials(&creds)?;
     mail::store_credentials(&state.users, &user.id, account_label, &creds)?;
-    if sig_cfg.signature_html.is_some()
-        || sig_cfg.signature_logo_hash.is_some()
-        || !sig_cfg.signature.is_empty()
-    {
-        mail::store_signature_config(&state.users, &user.id, account_label, &sig_cfg)?;
+    if let Some(cfg) = &sig_cfg {
+        mail::store_signature_config(&state.users, &user.id, account_label, cfg)?;
     }
     let smtp = mail::smtp_test(&creds).await.map(|_| "ok".to_owned());
     let imap = mail::imap_test(&creds).await.map(|_| "ok".to_owned());
@@ -163,7 +209,7 @@ async fn status(
     };
     let accounts = mail::list_accounts(&state.users, &user.id)?;
     Ok(Json(json!({
-        "connected": connected.is_some(),
+        "connected": connected.is_some() || !accounts.is_empty(),
         "smtp_host": connected.as_ref().map(|c| c.smtp_host.clone()),
         "imap_host": connected.as_ref().map(|c| c.imap_host.clone()),
         "username": connected.as_ref().map(|c| c.username.clone()),

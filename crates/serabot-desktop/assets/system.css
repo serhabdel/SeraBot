@@ -2612,4 +2612,143 @@ html[data-reduce-transparency="true"] .sheet.sheet-palette {
   overflow: visible;
 }
 
+/* WhatsApp Connected Profile Card & Allowed Chats chips (0.74.16). */
+.wa-profile-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+}
 
+.wa-avatar {
+  position: relative;
+  flex: 0 0 44px;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--ok-soft);
+  border: 1px solid var(--ok);
+  color: var(--label-1);
+  font-size: var(--fs-body);
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  user-select: none;
+}
+
+.wa-status-dot {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--surface-2);
+  background: var(--label-3);
+}
+
+.wa-status-dot.online {
+  background: var(--ok);
+}
+
+.wa-status-dot.reconnecting {
+  background: var(--warn);
+}
+
+.wa-profile-meta {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.wa-profile-name {
+  color: var(--label-1);
+  font-size: var(--fs-body);
+  font-weight: 600;
+  line-height: 1.25;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wa-profile-phone {
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+  line-height: 1.3;
+}
+
+.wa-profile-sub {
+  color: var(--label-3);
+}
+
+.wa-allowlist-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.wa-chat-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 2px 0 4px;
+}
+
+.wa-chat-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px 4px 10px;
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  color: var(--label-1);
+  font-size: var(--fs-caption);
+  line-height: 1.2;
+}
+
+.wa-chat-chip-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--label-3);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+
+.wa-chat-chip-remove:hover:not(:disabled) {
+  background: var(--hairline-strong);
+  color: var(--label-1);
+}
+
+.wa-chat-chip-remove:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.wa-chat-add .input {
+  flex: 1 1 200px;
+}
+
+.wa-risk-footnote {
+  margin-top: 4px;
+  color: var(--label-3);
+  opacity: 0.85;
+}

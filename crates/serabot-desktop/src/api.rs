@@ -1750,9 +1750,19 @@ pub struct MailAccountStatus {
     #[serde(default)]
     pub smtp_host: Option<String>,
     #[serde(default)]
+    pub smtp_port: Option<u16>,
+    #[serde(default)]
+    pub smtp_security: Option<MailSecurity>,
+    #[serde(default)]
     pub imap_host: Option<String>,
     #[serde(default)]
+    pub imap_port: Option<u16>,
+    #[serde(default)]
+    pub imap_security: Option<MailSecurity>,
+    #[serde(default)]
     pub username: Option<String>,
+    #[serde(default)]
+    pub from: Option<String>,
     #[serde(default)]
     pub signature: Option<String>,
     #[serde(default)]
@@ -2347,7 +2357,12 @@ fn is_loopback_mail_host(host: &str) -> bool {
 }
 
 /// Validate mail credentials locally before sending.
-pub fn validate_mail_connect(req: &MailConnectRequest) -> Result<(), ApiError> {
+/// When `is_update` is true, an empty password is allowed so the server reuses
+/// the saved sealed password for that mailbox.
+pub fn validate_mail_connect_with_mode(
+    req: &MailConnectRequest,
+    is_update: bool,
+) -> Result<(), ApiError> {
     if let Some(account) = req
         .account
         .as_deref()
@@ -2398,7 +2413,7 @@ pub fn validate_mail_connect(req: &MailConnectRequest) -> Result<(), ApiError> {
             "Enter your email address or mailbox username.",
         ));
     }
-    if req.password.is_empty() || req.password.len() > 1024 {
+    if (!is_update && req.password.is_empty()) || req.password.len() > 1024 {
         return Err(ApiError::Validation(
             "Password must be 1 to 1024 characters.",
         ));
@@ -2429,6 +2444,11 @@ pub fn validate_mail_connect(req: &MailConnectRequest) -> Result<(), ApiError> {
         ));
     }
     Ok(())
+}
+
+/// Validate mail credentials locally before sending (new mailbox: password required).
+pub fn validate_mail_connect(req: &MailConnectRequest) -> Result<(), ApiError> {
+    validate_mail_connect_with_mode(req, false)
 }
 
 /// One hit from `GET /v1/conversations/search`.
@@ -5410,9 +5430,19 @@ impl ApiClient {
     }
 
     /// `POST /v1/mail/connect`: save per-user SMTP/IMAP credentials and run live SMTP + IMAP login tests.
-    pub fn mail_connect(&self, req: &MailConnectRequest) -> Result<MailConnectResponse, ApiError> {
-        validate_mail_connect(req)?;
+    /// When `is_update` is true, an empty password is sent through so the server reuses the saved password.
+    pub fn mail_connect_with_mode(
+        &self,
+        req: &MailConnectRequest,
+        is_update: bool,
+    ) -> Result<MailConnectResponse, ApiError> {
+        validate_mail_connect_with_mode(req, is_update)?;
         self.request(Method::POST, &["v1", "mail", "connect"], &[], Some(req))
+    }
+
+    /// `POST /v1/mail/connect`: save per-user SMTP/IMAP credentials and run live SMTP + IMAP login tests.
+    pub fn mail_connect(&self, req: &MailConnectRequest) -> Result<MailConnectResponse, ApiError> {
+        self.mail_connect_with_mode(req, true)
     }
 
     /// `DELETE /v1/mail`: disconnect and remove saved per-user SMTP/IMAP
@@ -9580,6 +9610,50 @@ mod mail_and_search_tests {
         ));
         req.smtp_security = MailSecurity::StartTls;
         assert!(validate_mail_connect(&req).is_ok());
+
+        req.password.clear();
+        assert!(matches!(
+            validate_mail_connect(&req),
+            Err(ApiError::Validation(_))
+        ));
+        assert!(matches!(
+            validate_mail_connect_with_mode(&req, false),
+            Err(ApiError::Validation(_))
+        ));
+        assert!(validate_mail_connect_with_mode(&req, true).is_ok());
+    }
+
+    #[test]
+    fn mail_account_status_deserializes_full_metadata_with_defaults() {
+        let full: MailAccountStatus = serde_json::from_str(
+            r#"{
+                "account": "work",
+                "username": "work@example.test",
+                "smtp_host": "smtp.example.test",
+                "smtp_port": 465,
+                "smtp_security": "ssl",
+                "imap_host": "imap.example.test",
+                "imap_port": 993,
+                "imap_security": "ssl",
+                "from": "Work <work@example.test>",
+                "signature": "Best"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(full.account, "work");
+        assert_eq!(full.smtp_port, Some(465));
+        assert_eq!(full.smtp_security, Some(MailSecurity::Ssl));
+        assert_eq!(full.imap_port, Some(993));
+        assert_eq!(full.imap_security, Some(MailSecurity::Ssl));
+        assert_eq!(full.from.as_deref(), Some("Work <work@example.test>"));
+
+        let legacy: MailAccountStatus =
+            serde_json::from_str(r#"{"account":"","username":"me@example.test"}"#).unwrap();
+        assert_eq!(legacy.smtp_port, None);
+        assert_eq!(legacy.smtp_security, None);
+        assert_eq!(legacy.imap_port, None);
+        assert_eq!(legacy.imap_security, None);
+        assert_eq!(legacy.from, None);
     }
 
     #[test]

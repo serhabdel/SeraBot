@@ -647,3 +647,12 @@ Plan: `docs/specs/0.74.15-proposal.md`. Version stays `0.74.14` until the batch 
 - [ ] Still open: file splits, durable job runner, turn-loop invariant tests, back-pressure audit, restore drill, Settings Save/Discard bar, Activity feed, shared components, audit-coverage test, mobile mail parity.
 - [ ] Track 7b recall and retry-by-reference: **needs owner approval** before code.
 
+## Release 0.74.16 — Providers & Bot Routing (no Local ACP), WhatsApp Live Profile, Multi-Account Mail Updates
+
+- [x] Remove Claude Code (Local ACP) from Desktop UI (`main.rs`, `ui/shell.rs`, `ui/chat.rs`, `ui_bots.rs`) and add **Bot routing** overview directly in **Settings → Providers** (`ui/providers.rs`, `pages-connect.css`).
+- [x] WhatsApp Connector Live Profile (`whatsapp_link/client.rs`, `whatsapp_link/mod.rs`, `api/whatsapp_link.rs`, `ui_whatsapp_link.rs`, `system.css`): live `push_name`, `phone` backfill, connected profile card with avatar/dot/refresh, and chip-based Allowed Chats.
+- [x] Custom Email Connector Multi-Account & Password-Optional Updates (`api/mail.rs`, `mail.rs`, `api/tests/mail_api.rs`, desktop `api.rs`, `ui_connectors.rs`): preserve sealed password & HTML signature when updating an existing mailbox, full non-secret metadata per account, **Connected Mailboxes** list with per-account Edit/Open/Disconnect and **+ Add another mailbox**.
+- [x] Version bump `0.74.16` (`Cargo.toml`), mobile `0.74.16+90`, `docs/release-0.74.16.md`, `README.md`, `tasks/todo.md`.
+- [ ] Owner: live pass on Providers bot routing, WhatsApp connected profile display, and editing/adding custom email accounts without re-entering password.
+
+

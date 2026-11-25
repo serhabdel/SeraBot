@@ -36,6 +36,14 @@ pub struct PairingView {
     pub error: Option<String>,
 }
 
+/// Live profile snapshot read from a member's active WhatsApp client (0.74.16).
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct ProfileView {
+    pub push_name: Option<String>,
+    pub phone: Option<String>,
+    pub connected: bool,
+}
+
 struct Live {
     client: Arc<Client>,
     stop: CancellationToken,
@@ -183,6 +191,24 @@ impl WhatsappLink {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .contains_key(user_id)
+    }
+
+    /// Live profile metadata read from the member's running client, if any.
+    pub fn profile_view(&self, user_id: &str) -> Option<ProfileView> {
+        let live = self.live.lock().unwrap_or_else(|p| p.into_inner());
+        let client = &live.get(user_id)?.client;
+        let raw_name = client.push_name();
+        let trimmed_name = raw_name.trim();
+        let push_name = (!trimmed_name.is_empty()).then(|| trimmed_name.to_string());
+        let phone = client
+            .pn()
+            .map(|jid| jid.user.to_string())
+            .filter(|digits| !digits.trim().is_empty());
+        Some(ProfileView {
+            push_name,
+            phone,
+            connected: client.is_connected(),
+        })
     }
 
     pub fn pairing_view(&self, user_id: &str) -> PairingView {
@@ -1641,6 +1667,7 @@ mod tests {
         let off = WhatsappLink::new(Arc::new(config), link.store.clone());
         assert!(off.start(&admin, None).await.is_err());
         assert!(!off.is_live(&admin));
+        assert!(off.profile_view(&admin).is_none());
     }
 
     #[test]

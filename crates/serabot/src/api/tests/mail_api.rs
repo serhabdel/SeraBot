@@ -1090,3 +1090,229 @@ async fn scheduled_and_undo_mail_keep_owned_attachments_and_refuse_foreign_ones(
     assert_eq!(res.status(), StatusCode::OK);
     assert!(store.scheduled_mail_attachments(&id).unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn mail_connect_password_optional_updates_and_multi_account_metadata() {
+    let root = temp_base();
+    let (app, _, store) = app_with_root(true, Policy::empty(), root);
+    let alice = store
+        .create_user("multi-a", "ma@example.example", "Multi A")
+        .unwrap();
+    let alice_token = mint_for(&store, &alice.id, "multi-a-tok");
+
+    // 1. Connecting a brand-new mailbox without a password is rejected.
+    let missing_pw = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/connect",
+        json!({
+            "smtp_host": "127.0.0.1",
+            "smtp_port": 2525,
+            "smtp_security": "none",
+            "username": "ma@example.example",
+            "password": "",
+            "imap_host": "127.0.0.1",
+            "imap_port": 2143,
+            "imap_security": "none"
+        }),
+    )
+    .await;
+    assert_eq!(missing_pw.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let err_body = read_json(missing_pw).await;
+    assert_eq!(err_body["code"], "validation");
+
+    // Connect the default mailbox with an initial password.
+    let initial = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/connect",
+        json!({
+            "smtp_host": "127.0.0.1",
+            "smtp_port": 2525,
+            "smtp_security": "none",
+            "username": "ma@example.example",
+            "password": "initial-secret-password",
+            "imap_host": "127.0.0.1",
+            "imap_port": 2143,
+            "imap_security": "none",
+            "from": "Alice <ma@example.example>"
+        }),
+    )
+    .await;
+    assert_eq!(initial.status(), StatusCode::OK);
+
+    // Save an HTML signature + logo via PUT /v1/mail/signature.
+    let upload_req = Request::builder()
+        .method("POST")
+        .uri("/v1/library/upload")
+        .header("authorization", format!("Bearer {alice_token}"))
+        .header("x-filename", "sig-logo.png")
+        .body(Body::from(b"\x89PNG\r\n\x1a\nsig-logo".to_vec()))
+        .unwrap();
+    let upload_res = app.clone().oneshot(upload_req).await.unwrap();
+    assert_eq!(upload_res.status(), StatusCode::OK);
+    let logo_hash = read_json(upload_res).await["item"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let sig_res = app
+        .clone()
+        .oneshot(request_with_token(
+            "PUT",
+            "/v1/mail/signature",
+            &alice_token,
+            Some(json!({
+                "signature": "Alice Default",
+                "signature_html": "<b>Alice Default</b>",
+                "signature_logo_hash": logo_hash,
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(sig_res.status(), StatusCode::OK);
+
+    // 2. Updating the existing default mailbox with an empty password (and omitting signature
+    //    fields) succeeds, preserves the sealed password, and preserves the HTML signature + logo.
+    let update_no_sig = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/connect",
+        json!({
+            "smtp_host": "127.0.0.1",
+            "smtp_port": 2526,
+            "smtp_security": "none",
+            "username": "ma@example.example",
+            "password": "",
+            "imap_host": "127.0.0.1",
+            "imap_port": 2144,
+            "imap_security": "none",
+            "from": "Alice Updated <ma@example.example>"
+        }),
+    )
+    .await;
+    assert_eq!(update_no_sig.status(), StatusCode::OK);
+
+    let secrets =
+        crate::user_secrets::UserSecrets::with_master_key(store.clone(), [9u8; 32]).unwrap();
+    let saved_default = crate::mail::load_credentials(&secrets, &alice.id, None)
+        .unwrap()
+        .expect("default creds exist");
+    assert_eq!(saved_default.password, "initial-secret-password");
+    assert_eq!(saved_default.smtp_port, 2526);
+    assert_eq!(
+        saved_default.from.as_deref(),
+        Some("Alice Updated <ma@example.example>")
+    );
+
+    let status_after_update = read_json(get(&app, &alice_token, "/v1/mail").await).await;
+    assert_eq!(status_after_update["signature"], "Alice Default");
+    assert_eq!(
+        status_after_update["signature_html"],
+        "<b>Alice Default</b>"
+    );
+    assert_eq!(status_after_update["signature_logo_hash"], logo_hash);
+
+    // Updating plain signature with empty password also succeeds and keeps the sealed password.
+    let update_with_sig = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/connect",
+        json!({
+            "smtp_host": "127.0.0.1",
+            "smtp_port": 2526,
+            "smtp_security": "none",
+            "username": "ma@example.example",
+            "imap_host": "127.0.0.1",
+            "imap_port": 2144,
+            "imap_security": "none",
+            "from": "Alice Updated <ma@example.example>",
+            "signature": "Alice Plain Updated"
+        }),
+    )
+    .await;
+    assert_eq!(update_with_sig.status(), StatusCode::OK);
+    let saved_default = crate::mail::load_credentials(&secrets, &alice.id, None)
+        .unwrap()
+        .expect("default creds exist");
+    assert_eq!(saved_default.password, "initial-secret-password");
+
+    // 3. Adding a second named mailbox ("work") alongside default works, and both appear in
+    //    GET /v1/mail with full non-secret metadata (and never a password field).
+    let work_missing_pw = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/connect",
+        json!({
+            "account": "work",
+            "smtp_host": "127.0.0.1",
+            "smtp_port": 2587,
+            "smtp_security": "none",
+            "username": "work@example.example",
+            "imap_host": "127.0.0.1",
+            "imap_port": 2993,
+            "imap_security": "none"
+        }),
+    )
+    .await;
+    assert_eq!(work_missing_pw.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let work_ok = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/connect",
+        json!({
+            "account": "work",
+            "smtp_host": "127.0.0.1",
+            "smtp_port": 2587,
+            "smtp_security": "none",
+            "username": "work@example.example",
+            "password": "work-secret-password",
+            "imap_host": "127.0.0.1",
+            "imap_port": 2993,
+            "imap_security": "none",
+            "from": "Work <work@example.example>",
+            "signature": "Work Sig"
+        }),
+    )
+    .await;
+    assert_eq!(work_ok.status(), StatusCode::OK);
+
+    let status_res = get(&app, &alice_token, "/v1/mail").await;
+    assert_eq!(status_res.status(), StatusCode::OK);
+    let status = read_json(status_res).await;
+    assert_eq!(status["connected"], true);
+    let accounts = status["accounts"].as_array().expect("accounts array");
+    assert_eq!(accounts.len(), 2);
+
+    let def_acct = accounts
+        .iter()
+        .find(|a| a["account"] == "")
+        .expect("default account");
+    assert_eq!(def_acct["username"], "ma@example.example");
+    assert_eq!(def_acct["smtp_host"], "127.0.0.1");
+    assert_eq!(def_acct["smtp_port"], 2526);
+    assert_eq!(def_acct["smtp_security"], "none");
+    assert_eq!(def_acct["imap_host"], "127.0.0.1");
+    assert_eq!(def_acct["imap_port"], 2144);
+    assert_eq!(def_acct["imap_security"], "none");
+    assert_eq!(def_acct["from"], "Alice Updated <ma@example.example>");
+    assert_eq!(def_acct["signature"], "Alice Plain Updated");
+    assert_eq!(def_acct["signature_html"], "<b>Alice Default</b>");
+    assert_eq!(def_acct["signature_logo_hash"], logo_hash);
+    assert!(def_acct.get("password").is_none());
+
+    let work_acct = accounts
+        .iter()
+        .find(|a| a["account"] == "work")
+        .expect("work account");
+    assert_eq!(work_acct["username"], "work@example.example");
+    assert_eq!(work_acct["smtp_host"], "127.0.0.1");
+    assert_eq!(work_acct["smtp_port"], 2587);
+    assert_eq!(work_acct["smtp_security"], "none");
+    assert_eq!(work_acct["imap_host"], "127.0.0.1");
+    assert_eq!(work_acct["imap_port"], 2993);
+    assert_eq!(work_acct["imap_security"], "none");
+    assert_eq!(work_acct["from"], "Work <work@example.example>");
+    assert_eq!(work_acct["signature"], "Work Sig");
+    assert!(work_acct.get("password").is_none());
+}

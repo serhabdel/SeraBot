@@ -404,17 +404,9 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     // the reply's TurnTrace when the turn completes.
     let model_label = {
         let state = session.read();
-        let bot = state.conversation_bot(&state.conversation);
-        if bot
-            .as_deref()
-            .is_some_and(|bot| state.bot_uses_claude_agent(bot))
-        {
-            "Claude Code (local)".to_owned()
-        } else {
-            match state.state.catalog.as_ref().map(|c| &c.selection) {
-                Some(selection) if !selection.is_auto() => short_model(&selection.model),
-                _ => "Auto".to_owned(),
-            }
+        match state.state.catalog.as_ref().map(|c| &c.selection) {
+            Some(selection) if !selection.is_auto() => short_model(&selection.model),
+            _ => "Auto".to_owned(),
         }
     };
     // The latest route switch, for the failover flash (~6s) and the
@@ -1197,14 +1189,6 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         *last_feed_start_render.borrow_mut() = Some(window.start);
         window
     };
-    if is_one_to_one
-        && let Some(bot_id) = active_bot.clone()
-        && session.read().bot_uses_claude_agent(&bot_id)
-    {
-        return rsx! {
-            crate::ui_claude_code::ClaudeAgentBotView { session, bot_id }
-        };
-    }
     rsx! {
         div { class: "pane-body chat-body",
             onkeydown: move |event: KeyboardEvent| {
@@ -2748,31 +2732,19 @@ fn MessageRow(
 
 /// Shown under the picker when the server lists no concrete model.
 pub(super) const NO_MODELS_HINT: &str = "Ask the admin to allow more models.";
-const LOCAL_ACP_VALUE: &str = "local-acp|claude-code";
 
 #[component]
 pub(super) fn ModelBar(
     session: Signal<Session>,
     #[props(default = false)] compact: bool,
 ) -> Element {
-    // Picker items: (value, label). "auto" first, optional local Claude Code
-    // (ACP) entry in a 1:1 bot chat, then the catalog entries (or the static
-    // provider model lists when the catalog is empty).
-    let (active_bot, acp_active, items, current, allowed, saved, rows, kinds, provider_accounts) = {
+    // Picker items: (value, label). "auto" first, then the catalog entries
+    // (or the static provider model lists when the catalog is empty).
+    let (items, current, allowed, saved, rows, kinds, provider_accounts) = {
         let session = session.read();
-        let active_bot = session.conversation_bot(&session.conversation);
-        let acp_active = active_bot
-            .as_deref()
-            .is_some_and(|bot| session.bot_uses_claude_agent(bot));
         let catalog = session.state.catalog.as_ref();
         let mut items: Vec<(String, String)> =
             vec![("auto".to_owned(), "Auto · approved route".to_owned())];
-        if active_bot.is_some() {
-            items.push((
-                LOCAL_ACP_VALUE.to_owned(),
-                "Claude Code · Local desktop (ACP)".to_owned(),
-            ));
-        }
         let mut current = "auto".to_owned();
         let mut allowed = false;
         let mut saved = "auto".to_owned();
@@ -2843,8 +2815,6 @@ pub(super) fn ModelBar(
             }
         }
         (
-            active_bot,
-            acp_active,
             items,
             current,
             allowed,
@@ -2873,9 +2843,8 @@ pub(super) fn ModelBar(
         )
     };
     let changed = value != current || draft_account != saved_account;
-    // Only "auto" (plus local ACP in bot chat) left: the server offered no concrete model.
-    let no_models = session.read().state.catalog.is_some()
-        && items.len() <= if active_bot.is_some() { 2 } else { 1 };
+    // Only "auto" left: the server offered no concrete model.
+    let no_models = session.read().state.catalog.is_some() && items.len() <= 1;
     // Thinking levels the active model accepts, and the one in force. Updates
     // immediately when switching models instead of waiting on a catalog reload.
     let (thinking_levels, thinking_now) = {
@@ -2914,9 +2883,7 @@ pub(super) fn ModelBar(
         (levels, active_level)
     };
     // The chip: `provider/account · model · thinking`.
-    let current_label = if acp_active {
-        "Claude Code · Local ACP".to_owned()
-    } else {
+    let current_label = {
         let s = session.read();
         let level = (!changed && !thinking_now.is_empty()).then_some(thinking_now.as_str());
         route_chip::chip_label(&s.route_options(), &s.state.draft, level)
@@ -2982,8 +2949,6 @@ pub(super) fn ModelBar(
             })
             .collect()
     };
-    let bot_for_enter = active_bot.clone();
-    let bot_for_click = active_bot.clone();
     // 0.73: context fill of the latest turn (turn.context), shown as a thin
     // meter in the model bar.
     let (ctx_percent, ctx_title) = {
@@ -3034,19 +2999,8 @@ pub(super) fn ModelBar(
                             if let Some((_, item_value, _)) =
                                 keyed.get(active_idx().min(count.saturating_sub(1)))
                             {
-                                if item_value == LOCAL_ACP_VALUE {
-                                    if let Some(bot) = bot_for_enter.as_deref() {
-                                        session.write().set_bot_claude_agent(bot, true);
-                                    }
-                                    open.set(false);
-                                    query.set(String::new());
-                                    return;
-                                }
                                 let account = picked_account_for(&session.read(), &picked_account.read(), item_value);
                                 let mut session = session.write();
-                                if let Some(bot) = bot_for_enter.as_deref() {
-                                    session.set_bot_claude_agent(bot, false);
-                                }
                                 set_model_draft_with(&mut session, item_value, account);
                                 if compact {
                                     let parsed = session.state.draft.clone();
@@ -3078,8 +3032,7 @@ pub(super) fn ModelBar(
                     onclick: move |_| {
                         if !open() {
                             query.set(String::new());
-                            let target = if acp_active { LOCAL_ACP_VALUE } else { value.as_str() };
-                            let position = items.iter().position(|(v, _)| v == target).unwrap_or(0);
+                            let position = items.iter().position(|(v, _)| v == value.as_str()).unwrap_or(0);
                             active_idx.set(position);
                         }
                         open.set(!open());
@@ -3112,12 +3065,7 @@ pub(super) fn ModelBar(
                         }
                         for (pos, (_index, item_value, label, header, row)) in render_rows.into_iter().enumerate() {
                             div { key: "{item_value}",
-                            if item_value == LOCAL_ACP_VALUE {
-                                div { class: "pop-group model-group",
-                                    BrandLogo { brand: "claude".to_owned(), size: 16 }
-                                    span { "Local \u{00b7} Desktop (ACP)" }
-                                }
-                            } else if let Some((brand, name)) = header {
+                            if let Some((brand, name)) = header {
                                 div { class: "pop-group model-group",
                                     BrandLogo { brand, size: 16 }
                                     span { "{name}" }
@@ -3140,21 +3088,9 @@ pub(super) fn ModelBar(
                                 class: if pos == active { "pop-item active" } else { "pop-item" },
                                 onclick: {
                                     let item_value = item_value.clone();
-                                    let bot_for_click = bot_for_click.clone();
                                     move |_| {
-                                        if item_value == LOCAL_ACP_VALUE {
-                                            if let Some(bot) = bot_for_click.as_deref() {
-                                                session.write().set_bot_claude_agent(bot, true);
-                                            }
-                                            open.set(false);
-                                            query.set(String::new());
-                                            return;
-                                        }
                                         let account = picked_account_for(&session.read(), &picked_account.read(), &item_value);
                                         let mut session = session.write();
-                                        if let Some(bot) = bot_for_click.as_deref() {
-                                            session.set_bot_claude_agent(bot, false);
-                                        }
                                         set_model_draft_with(&mut session, &item_value, account);
                                         if compact {
                                             let parsed = session.state.draft.clone();
@@ -3171,15 +3107,7 @@ pub(super) fn ModelBar(
                                         query.set(String::new());
                                     }
                                 },
-                                if item_value == LOCAL_ACP_VALUE {
-                                    div { class: "model-row",
-                                        span { class: "model-title", "Claude Code" }
-                                        div { class: "model-meta",
-                                            span { class: "chip", "Local ACP" }
-                                            span { class: "model-id", "Runs locally in allowed folder" }
-                                        }
-                                    }
-                                } else if let Some(row) = row {
+                                if let Some(row) = row {
                                     div { class: "model-row",
                                         span { class: "model-title", "{row.title}" }
                                         div { class: "model-meta",
@@ -3197,7 +3125,7 @@ pub(super) fn ModelBar(
                                 } else {
                                     span { "{label}" }
                                 }
-                                if (item_value == LOCAL_ACP_VALUE && acp_active) || (!acp_active && item_value == current) {
+                                if item_value == current {
                                     Icon { name: "check", size: 14 }
                                 }
                             }
@@ -3465,8 +3393,6 @@ pub(super) fn HeaderModelChip(session: Signal<Session>) -> Element {
 
     let (
         label,
-        active_bot,
-        acp_active,
         current,
         current_provider,
         rows,
@@ -3476,17 +3402,9 @@ pub(super) fn HeaderModelChip(session: Signal<Session>) -> Element {
         thinking_now,
     ) = {
         let state = session.read();
-        let active_bot = state.conversation_bot(&state.conversation);
-        let acp_active = active_bot
-            .as_deref()
-            .is_some_and(|bot| state.bot_uses_claude_agent(bot));
-        let label = if acp_active {
-            "Claude Code (local)".to_owned()
-        } else {
-            match state.state.catalog.as_ref().map(|c| &c.selection) {
-                Some(selection) if !selection.is_auto() => short_model(&selection.model),
-                _ => "Auto".to_owned(),
-            }
+        let label = match state.state.catalog.as_ref().map(|c| &c.selection) {
+            Some(selection) if !selection.is_auto() => short_model(&selection.model),
+            _ => "Auto".to_owned(),
         };
         let mut current = "auto".to_owned();
         let mut current_provider = String::new();
@@ -3566,8 +3484,6 @@ pub(super) fn HeaderModelChip(session: Signal<Session>) -> Element {
         };
         (
             label,
-            active_bot,
-            acp_active,
             current,
             current_provider,
             rows,
@@ -3601,13 +3517,10 @@ pub(super) fn HeaderModelChip(session: Signal<Session>) -> Element {
         }
     }
 
-    let total_count = rows.len() + 1 + usize::from(active_bot.is_some());
+    let total_count = rows.len() + 1;
     let active_prov = {
         let cur = selected_provider();
-        if cur == "__all__"
-            || (cur == "__acp__" && active_bot.is_some())
-            || rail_providers.iter().any(|p| p.0 == cur)
-        {
+        if cur == "__all__" || rail_providers.iter().any(|p| p.0 == cur) {
             cur
         } else {
             String::from("__all__")
@@ -3618,14 +3531,12 @@ pub(super) fn HeaderModelChip(session: Signal<Session>) -> Element {
     #[derive(Clone)]
     enum HeaderModelEntry {
         Auto,
-        LocalAcp,
         Model(provider_view::PickerRow),
     }
     impl HeaderModelEntry {
         fn value(&self) -> String {
             match self {
                 Self::Auto => "auto".to_owned(),
-                Self::LocalAcp => LOCAL_ACP_VALUE.to_owned(),
                 Self::Model(row) => row.value.clone(),
             }
         }
@@ -3634,12 +3545,6 @@ pub(super) fn HeaderModelChip(session: Signal<Session>) -> Element {
     let mut filtered: Vec<HeaderModelEntry> = Vec::new();
     if active_prov == "__all__" && (needle.is_empty() || "auto approved route".contains(&needle)) {
         filtered.push(HeaderModelEntry::Auto);
-    }
-    if active_bot.is_some()
-        && (active_prov == "__all__" || active_prov == "__acp__")
-        && (needle.is_empty() || "claude code local desktop acp".contains(&needle))
-    {
-        filtered.push(HeaderModelEntry::LocalAcp);
     }
     // Typing ranks by how well the words match (letters may be skipped: "son5" finds
     // "claude-sonnet-5"). With an empty box, starred models lead, then recent ones.
@@ -3689,12 +3594,10 @@ pub(super) fn HeaderModelChip(session: Signal<Session>) -> Element {
         active_idx().min(filtered.len() - 1)
     };
     let keyed_values: Vec<String> = filtered.iter().map(HeaderModelEntry::value).collect();
-    let bot_for_enter = active_bot.clone();
-    let bot_for_click = active_bot.clone();
 
-    let account_provider = if active_prov != "__all__" && active_prov != "__acp__" {
+    let account_provider = if active_prov != "__all__" {
         Some(active_prov.clone())
-    } else if !acp_active && !current_provider.is_empty() {
+    } else if !current_provider.is_empty() {
         Some(current_provider.clone())
     } else {
         None
@@ -3762,19 +3665,8 @@ pub(super) fn HeaderModelChip(session: Signal<Session>) -> Element {
                                 event.prevent_default();
                                 event.stop_propagation();
                                 if let Some(item_value) = keyed_values.get(active_idx().min(count.saturating_sub(1))) {
-                                    if item_value == LOCAL_ACP_VALUE {
-                                        if let Some(bot) = bot_for_enter.as_deref() {
-                                            session.write().set_bot_claude_agent(bot, true);
-                                        }
-                                        open.set(false);
-                                        query.set(String::new());
-                                        return;
-                                    }
                                     let account = picked_account_for(&session.read(), &picked_account.read(), item_value);
                                     let mut s = session.write();
-                                    if let Some(bot) = bot_for_enter.as_deref() {
-                                        s.set_bot_claude_agent(bot, false);
-                                    }
                                     set_model_draft_with(&mut s, item_value, account);
                                     let parsed = s.state.draft.clone();
                                     if s.state.catalog.as_ref().is_some_and(|catalog| catalog.allows(&parsed)) {
@@ -3825,21 +3717,6 @@ pub(super) fn HeaderModelChip(session: Signal<Session>) -> Element {
                                     span { class: "model-rail-count", "{count}" }
                                 }
                             }
-                            if active_bot.is_some() {
-                                button {
-                                    r#type: "button",
-                                    role: "tab",
-                                    "aria-selected": if active_prov == "__acp__" { "true" } else { "false" },
-                                    class: if active_prov == "__acp__" { "model-rail-item active" } else { "model-rail-item" },
-                                    onclick: move |_| {
-                                        selected_provider.set(String::from("__acp__"));
-                                        active_idx.set(0);
-                                    },
-                                    BrandLogo { brand: "claude".to_owned(), size: 16 }
-                                    span { class: "model-rail-name", "Local ACP" }
-                                    span { class: "model-rail-count", "1" }
-                                }
-                            }
                         }
                         // Right body: Search + Accounts + Scrollable Models + Pinned Thinking Footer
                         div { class: "model-pop-body",
@@ -3872,15 +3749,13 @@ pub(super) fn HeaderModelChip(session: Signal<Session>) -> Element {
                                 for (pos, entry) in filtered.into_iter().enumerate() {
                                     {
                                         let item_value = entry.value();
-                                        let is_selected = (item_value == LOCAL_ACP_VALUE && acp_active)
-                                            || (!acp_active && item_value == current);
+                                        let is_selected = item_value == current;
                                         let item_class = match (pos == active, is_selected) {
                                             (true, true) => "model-pop-item active selected",
                                             (true, false) => "model-pop-item active",
                                             (false, true) => "model-pop-item selected",
                                             (false, false) => "model-pop-item",
                                         };
-                                        let bot_for_click = bot_for_click.clone();
                                         let fav_key = item_value.clone();
                                         let is_fav = favorites.contains(&item_value);
                                         let is_recent = !is_fav && recent.contains(&item_value);
@@ -3892,19 +3767,8 @@ pub(super) fn HeaderModelChip(session: Signal<Session>) -> Element {
                                                 onclick: {
                                                     let item_value = item_value.clone();
                                                     move |_| {
-                                                        if item_value == LOCAL_ACP_VALUE {
-                                                            if let Some(bot) = bot_for_click.as_deref() {
-                                                                session.write().set_bot_claude_agent(bot, true);
-                                                            }
-                                                            open.set(false);
-                                                            query.set(String::new());
-                                                            return;
-                                                        }
                                                         let account = picked_account_for(&session.read(), &picked_account.read(), &item_value);
                                                         let mut s = session.write();
-                                                        if let Some(bot) = bot_for_click.as_deref() {
-                                                            s.set_bot_claude_agent(bot, false);
-                                                        }
                                                         set_model_draft_with(&mut s, &item_value, account);
                                                         let parsed = s.state.draft.clone();
                                                         if s.state.catalog.as_ref().is_some_and(|catalog| catalog.allows(&parsed)) {
@@ -3920,15 +3784,6 @@ pub(super) fn HeaderModelChip(session: Signal<Session>) -> Element {
                                                             span { class: "model-title", "Auto" }
                                                             div { class: "model-meta",
                                                                 span { class: "model-id", "Approved route" }
-                                                            }
-                                                        }
-                                                    },
-                                                    HeaderModelEntry::LocalAcp => rsx! {
-                                                        div { class: "model-row",
-                                                            span { class: "model-title", "Claude Code" }
-                                                            div { class: "model-meta",
-                                                                span { class: "chip", "Local ACP" }
-                                                                span { class: "model-id", "Runs locally in allowed folder" }
                                                             }
                                                         }
                                                     },

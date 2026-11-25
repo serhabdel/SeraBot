@@ -591,3 +591,104 @@
   min-width: 40px;
 }
 
+/* Bot routing card on the Providers page (0.74.16). */
+.bot-routing-card {
+  padding: 0;
+  gap: 0;
+  overflow: hidden;
+  border-color: var(--glass-edge);
+  border-radius: var(--card-radius);
+  background: var(--card-bg);
+  box-shadow: var(--card-shadow);
+}
+
+.bot-route-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--hairline);
+  transition: background var(--dur-1) var(--ease);
+}
+
+.bot-route-row:last-child {
+  border-bottom: none;
+}
+
+.bot-route-row:hover {
+  background: var(--hover);
+}
+
+.bot-route-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.bot-route-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.bot-route-name {
+  font-size: var(--fs-body);
+  font-weight: 600;
+  color: var(--label-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bot-route-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: var(--fs-caption);
+  color: var(--label-3);
+}
+
+.bot-route-assigned {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bot-route-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.bot-route-select {
+  width: auto;
+  min-width: 190px;
+  max-width: 260px;
+  height: 30px;
+  padding: 2px 26px 2px 10px;
+  font-size: var(--fs-caption);
+}
+
+@media (max-width: 720px) {
+  .bot-route-row {
+    flex-wrap: wrap;
+    align-items: flex-start;
+  }
+
+  .bot-route-controls {
+    width: 100%;
+    justify-content: flex-end;
+  }
+
+  .bot-route-select {
+    flex: 1 1 auto;
+    min-width: 0;
+    max-width: none;
+  }
+}
