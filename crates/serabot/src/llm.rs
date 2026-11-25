@@ -1122,6 +1122,22 @@ impl LlmClient {
         }
     }
 
+    fn should_retry_cloud_version(project: &str, error: &SeraError) -> bool {
+        if matches!(error, SeraError::Upstream { status: 403, .. }) {
+            return true;
+        }
+        if !matches!(error, SeraError::Upstream { status: 400, .. }) {
+            return false;
+        }
+        if project.is_empty() {
+            return true;
+        }
+        let lower = error.to_string().to_ascii_lowercase();
+        ["version", "project", "client", "deprecated", "outdated"]
+            .iter()
+            .any(|needle| lower.contains(needle))
+    }
+
     /// Read a finished Cloud Code answer. `None` means Google returned a
     /// malformed tool call and nothing else: send the request again.
     fn cloud_answer(&self, bytes: &[u8], tools: &[ToolSpec]) -> Result<Option<LlmResponse>> {
@@ -1280,7 +1296,9 @@ impl LlmClient {
                                 wire_model = alias;
                                 continue;
                             }
-                            if !version_retried {
+                            if !version_retried
+                                && Self::should_retry_cloud_version(&project, &error)
+                            {
                                 version_retried = true;
                                 cloud_code::invalidate_live_version().await;
                                 if project.is_empty() {
@@ -1298,13 +1316,7 @@ impl LlmClient {
                         }
                         CloudPost::Failed(error) => {
                             if !version_retried
-                                && matches!(
-                                    &error,
-                                    SeraError::Upstream {
-                                        status: 400 | 403,
-                                        ..
-                                    }
-                                )
+                                && Self::should_retry_cloud_version(&project, &error)
                             {
                                 version_retried = true;
                                 cloud_code::invalidate_live_version().await;
@@ -1380,7 +1392,7 @@ impl LlmClient {
                     }
                     CloudPost::SessionLimited => last_error = Some(catalog_status_error(400)),
                     CloudPost::BadRequest(error) => {
-                        if !version_retried {
+                        if !version_retried && Self::should_retry_cloud_version(&project, &error) {
                             version_retried = true;
                             cloud_code::invalidate_live_version().await;
                             if project.is_empty() {
@@ -1393,15 +1405,7 @@ impl LlmClient {
                         last_error = Some(catalog_retag(error));
                     }
                     CloudPost::Failed(error) => {
-                        if !version_retried
-                            && matches!(
-                                &error,
-                                SeraError::Upstream {
-                                    status: 400 | 403,
-                                    ..
-                                }
-                            )
-                        {
+                        if !version_retried && Self::should_retry_cloud_version(&project, &error) {
                             version_retried = true;
                             cloud_code::invalidate_live_version().await;
                             if project.is_empty() {
