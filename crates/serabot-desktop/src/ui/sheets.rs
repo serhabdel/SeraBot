@@ -1,4 +1,5 @@
 use super::*;
+use serabot_desktop::session::SettingsSection;
 
 /// Contextual right pane: bot profile, conversation details, provider and
 /// connector summaries.
@@ -671,6 +672,10 @@ enum PaletteAction {
     Conversation(String),
     Overlay(Overlay),
     ToggleTheme,
+    /// A section of the Settings page.
+    Settings(SettingsSection),
+    /// Open Mail with a new message.
+    ComposeMail,
 }
 
 #[derive(Clone)]
@@ -694,6 +699,12 @@ fn run_palette_action(
         PaletteAction::Bot(id) => session.write().open_bot_chat(id),
         PaletteAction::Conversation(id) => session.write().open_conversation(id),
         PaletteAction::Overlay(next) => overlay.set(next),
+        PaletteAction::Settings(section) => session.write().open_settings_section(section),
+        PaletteAction::ComposeMail => {
+            let mut s = session.write();
+            s.mail_compose_request = true;
+            s.open_section(Section::Mail);
+        }
         PaletteAction::ToggleTheme => {
             let next = match session.read().theme {
                 Theme::Dark => Theme::Light,
@@ -710,6 +721,12 @@ fn run_palette_action(
 pub(super) fn CommandPaletteSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
     let mut query = use_signal(String::new);
     let mut active_idx = use_signal(|| 0usize);
+    use_effect(move || {
+        let idx = active_idx();
+        let _ = dioxus::document::eval(&format!(
+            "document.getElementById('palette-opt-{idx}')?.scrollIntoView({{block: 'nearest'}});"
+        ));
+    });
 
     let entries: Vec<PaletteEntry> = {
         let s = session.read();
@@ -812,6 +829,34 @@ pub(super) fn CommandPaletteSheet(session: Signal<Session>, overlay: Signal<Over
             shortcut: "",
             action: PaletteAction::Overlay(Overlay::NewGroup),
         });
+        out.push(PaletteEntry {
+            group: "Actions",
+            title: "Compose email".to_owned(),
+            subtitle: "Open Mail with a new message".to_owned(),
+            icon: "edit",
+            shortcut: "",
+            action: PaletteAction::ComposeMail,
+        });
+        for section in [
+            SettingsSection::Account,
+            SettingsSection::Appearance,
+            SettingsSection::Notifications,
+            SettingsSection::Chat,
+            SettingsSection::Voice,
+            SettingsSection::LocalFolders,
+            SettingsSection::Telegram,
+            SettingsSection::WebSearch,
+            SettingsSection::About,
+        ] {
+            out.push(PaletteEntry {
+                group: "Settings",
+                title: format!("Settings: {}", section.label()),
+                subtitle: section.description().to_owned(),
+                icon: "settings",
+                shortcut: "",
+                action: PaletteAction::Settings(section),
+            });
+        }
         out.push(PaletteEntry {
             group: "Actions",
             title: "Toggle Light / Dark theme".to_owned(),
@@ -926,6 +971,11 @@ pub(super) fn CommandPaletteSheet(session: Signal<Session>, overlay: Signal<Over
                     id: "cmd-palette-input",
                     class: "palette-input",
                     r#type: "search",
+                    role: "combobox",
+                    "aria-expanded": "true",
+                    "aria-controls": "cmd-palette-list",
+                    "aria-autocomplete": "list",
+                    "aria-activedescendant": "palette-opt-{active}",
                     autofocus: true,
                     placeholder: "Jump to a screen, bot, conversation, or action\u{2026}",
                     value: "{query}",
@@ -943,7 +993,7 @@ pub(super) fn CommandPaletteSheet(session: Signal<Session>, overlay: Signal<Over
                     Icon { name: "x", size: 15 }
                 }
             }
-            div { class: "palette-list", role: "listbox", "aria-label": "Command results",
+            div { id: "cmd-palette-list", class: "palette-list", role: "listbox", "aria-label": "Command results",
                 if filtered.is_empty() {
                     div { class: "palette-empty muted", "No matching screens, bots, or actions." }
                 } else {
@@ -961,6 +1011,7 @@ pub(super) fn CommandPaletteSheet(session: Signal<Session>, overlay: Signal<Over
                                                 div { class: "palette-group", "{item.group}" }
                                             }
                                             button {
+                                                id: "palette-opt-{idx}",
                                                 class: if idx == active { "palette-item active" } else { "palette-item" },
                                                 r#type: "button",
                                                 role: "option",

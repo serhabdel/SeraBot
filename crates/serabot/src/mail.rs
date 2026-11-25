@@ -27,6 +27,7 @@ use tokio_rustls::TlsConnector;
 
 use crate::error::{Result, SeraError};
 use crate::gateway::{Tool, ToolContext, ToolOutput, ToolRegistry, ToolSpec};
+use crate::mail_ux;
 use crate::maker::ArtifactStore;
 use crate::policy::Policy;
 use crate::store::Store;
@@ -1005,6 +1006,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
         Ok(())
     }
 
+    /// Write an IMAP literal (raw bytes) followed by the closing CRLF.
+    async fn send_literal(&mut self, bytes: &[u8]) -> Result<()> {
+        tokio::time::timeout(IO_TIMEOUT, async {
+            self.stream.write_all(bytes).await?;
+            self.stream.write_all(b"\r\n").await?;
+            self.stream.flush().await
+        })
+        .await
+        .map_err(|_| SeraError::External("mail server write timed out".into()))?
+        .map_err(|e| SeraError::External(format!("mail server write: {e}")))?;
+        Ok(())
+    }
+
     /// Read a reply and require it to start with `want` (e.g. "250" for
     /// SMTP, "* OK" for an IMAP greeting, "a1 OK" for a tagged IMAP reply).
     /// The whole prefix is compared: an earlier version compared only the
@@ -1285,7 +1299,17 @@ pub struct MailAttachment {
     pub data_base64: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// Safe `List-Unsubscribe` targets of a message (0.74.14).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct MailUnsubscribe {
+    /// `mailto:` target without the scheme; the server sends the request.
+    pub mailto: Option<String>,
+    /// `https:` link; clients open it in the user's browser.
+    pub url: Option<String>,
+    pub one_click: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct MailMessage {
     pub uid: u32,
     pub subject: String,
@@ -1296,11 +1320,23 @@ pub struct MailMessage {
     /// message, else the raw body (HTML parts are not decoded).
     pub body: String,
     pub attachments: Vec<MailAttachment>,
+    pub to: String,
+    pub cc: String,
+    pub message_id: String,
+    pub in_reply_to: String,
+    pub references: Vec<String>,
+    /// First words of the plain body, for list rows.
+    pub snippet: String,
+    /// Attachments seen, or `multipart/mixed` announced by a headers-only fetch.
+    pub has_attachments: bool,
+    /// Messages of one conversation share a key (set on list and search results).
+    pub thread_key: String,
+    pub unsubscribe: Option<MailUnsubscribe>,
 }
 
 /// Full parsed message for `GET /v1/mail/messages/{uid}`, including sanitized
 /// HTML body, `cid:` inline images, and remote-image indicator.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct MailMessageDetail {
     pub uid: u32,
     pub subject: String,
@@ -1312,6 +1348,15 @@ pub struct MailMessageDetail {
     pub body_html: Option<String>,
     pub has_remote_images: bool,
     pub attachments: Vec<MailAttachment>,
+    pub to: String,
+    pub cc: String,
+    pub message_id: String,
+    pub in_reply_to: String,
+    pub references: Vec<String>,
+    pub snippet: String,
+    pub has_attachments: bool,
+    pub thread_key: String,
+    pub unsubscribe: Option<MailUnsubscribe>,
 }
 
 /// Quote an IMAP string literal.
@@ -1382,6 +1427,15 @@ pub fn parse_message(uid: u32, flags: Vec<String>, raw: &str) -> MailMessage {
         flags: detail.flags,
         body: detail.body,
         attachments: detail.attachments,
+        to: detail.to,
+        cc: detail.cc,
+        message_id: detail.message_id,
+        in_reply_to: detail.in_reply_to,
+        references: detail.references,
+        snippet: detail.snippet,
+        has_attachments: detail.has_attachments,
+        thread_key: detail.thread_key,
+        unsubscribe: detail.unsubscribe,
     }
 }
 
@@ -1399,14 +1453,60 @@ pub fn parse_message_detail(
     let mut subject = String::new();
     let mut from = String::new();
     let mut date = String::new();
+    let mut to = String::new();
+    let mut cc = String::new();
+    let mut message_id = String::new();
+    let mut in_reply_to = String::new();
+    let mut references: Vec<String> = Vec::new();
+    let mut list_unsubscribe = String::new();
+    let mut list_unsubscribe_post = String::new();
+    let mut announces_mixed = false;
     for (k, v) in &headers {
         match k.as_str() {
             "subject" if subject.is_empty() => subject = decode_rfc2047(v),
             "from" if from.is_empty() => from = decode_rfc2047(v),
             "date" if date.is_empty() => date = clean_header(v),
+            "to" if to.is_empty() => to = clip(&decode_rfc2047(v), 1000),
+            "cc" if cc.is_empty() => cc = clip(&decode_rfc2047(v), 1000),
+            "message-id" if message_id.is_empty() => {
+                message_id = mail_ux::message_ids(v)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
+            }
+            "in-reply-to" if in_reply_to.is_empty() => {
+                in_reply_to = mail_ux::message_ids(v)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
+            }
+            "references" if references.is_empty() => {
+                let mut ids = mail_ux::message_ids(v);
+                let keep_from = ids.len().saturating_sub(50);
+                references = ids.split_off(keep_from);
+            }
+            "list-unsubscribe" if list_unsubscribe.is_empty() => {
+                list_unsubscribe = clean_header(v);
+            }
+            "list-unsubscribe-post" if list_unsubscribe_post.is_empty() => {
+                list_unsubscribe_post = clean_header(v);
+            }
+            "content-type" => {
+                announces_mixed = v.to_ascii_lowercase().contains("multipart/mixed");
+            }
             _ => {}
         }
     }
+    let unsubscribe = if list_unsubscribe.is_empty() {
+        None
+    } else {
+        let parsed = mail_ux::parse_list_unsubscribe(&list_unsubscribe, &list_unsubscribe_post);
+        (parsed.mailto.is_some() || parsed.url.is_some()).then_some(MailUnsubscribe {
+            mailto: parsed.mailto,
+            url: parsed.url,
+            one_click: parsed.one_click,
+        })
+    };
     let mut walk = MimeWalkState::default();
     walk_mime(head, body, 0, &mut walk);
 
@@ -1434,10 +1534,38 @@ pub fn parse_message_detail(
         date,
         flags,
         body: body_text.clone(),
+        snippet: mail_ux::snippet_from(&body_text),
         body_text,
         body_html: sanitized_html,
         has_remote_images,
+        has_attachments: announces_mixed || !walk.attachments.is_empty(),
         attachments: walk.attachments,
+        to,
+        cc,
+        message_id,
+        in_reply_to,
+        references,
+        thread_key: String::new(),
+        unsubscribe,
+    }
+}
+
+/// Give every message of a list or search result its conversation key.
+pub fn assign_thread_keys(messages: &mut [MailMessage]) {
+    let keys = {
+        let inputs: Vec<mail_ux::ThreadInput<'_>> = messages
+            .iter()
+            .map(|m| mail_ux::ThreadInput {
+                message_id: &m.message_id,
+                in_reply_to: &m.in_reply_to,
+                references: &m.references,
+                subject: &m.subject,
+            })
+            .collect();
+        mail_ux::thread_keys(&inputs)
+    };
+    for (message, key) in messages.iter_mut().zip(keys) {
+        message.thread_key = key;
     }
 }
 
@@ -2367,7 +2495,8 @@ pub async fn imap_list(
     select_folder(&mut wire, &folder).await?;
     wire.send_line("a3 UID SEARCH ALL").await?;
     let (_, untagged) = wire.expect_tagged("a3").await?;
-    let out = fetch_search_results(&mut wire, untagged, limit).await?;
+    let mut out = fetch_search_results(&mut wire, untagged, limit).await?;
+    assign_thread_keys(&mut out);
     let _ = wire.send_line("a9 LOGOUT").await;
     Ok(out)
 }
@@ -2398,11 +2527,15 @@ pub async fn imap_list_headers(
             out.push(msg);
         }
     }
+    assign_thread_keys(&mut out);
     let _ = wire.send_line("a9 LOGOUT").await;
     Ok(out)
 }
 
-/// Search a folder by subject/from/body text; returns the newest `limit` matches.
+/// Search a folder; returns the newest `limit` matches. A bare word searches
+/// subject, sender and body. Operators narrow it (`from:`, `to:`, `subject:`,
+/// `has:attachment`, `is:unread`, `is:starred`, `before:`, `after:`, see
+/// [`mail_ux::parse_query`]).
 pub async fn imap_search(
     creds: &MailCredentials,
     folder: &str,
@@ -2410,22 +2543,25 @@ pub async fn imap_search(
     limit: u32,
 ) -> Result<Vec<MailMessage>> {
     let limit = limit.clamp(1, MAX_LIST);
-    let query = query.trim();
-    if query.is_empty() || query.len() > 256 {
-        return Err(SeraError::Validation(
-            "query must be 1-256 characters".into(),
-        ));
-    }
+    let parsed = mail_ux::parse_query(query).map_err(SeraError::Validation)?;
     let mut wire = imap_connect(creds).await?;
     let folder = normalize_folder(folder)?;
     select_folder(&mut wire, &folder).await?;
-    let q = imap_quote(query);
-    wire.send_line(&format!(
-        "a3 UID SEARCH OR OR SUBJECT {q} FROM {q} TEXT {q}"
-    ))
-    .await?;
+    let criteria = parsed.imap_criteria(&imap_quote);
+    wire.send_line(&format!("a3 UID SEARCH {criteria}")).await?;
     let (_, untagged) = wire.expect_tagged("a3").await?;
-    let out = fetch_search_results(&mut wire, untagged, limit).await?;
+    // `has:attachment` is checked after the fetch, so look at more candidates.
+    let fetch_limit = if parsed.needs_attachment_filter() {
+        MAX_LIST
+    } else {
+        limit
+    };
+    let mut out = fetch_search_results(&mut wire, untagged, fetch_limit).await?;
+    if parsed.needs_attachment_filter() {
+        out.retain(|m| m.has_attachments);
+        out.truncate(limit as usize);
+    }
+    assign_thread_keys(&mut out);
     let _ = wire.send_line("a9 LOGOUT").await;
     Ok(out)
 }
@@ -2629,6 +2765,104 @@ pub async fn imap_delete(creds: &MailCredentials, folder: &str, uid: u32) -> Res
     wire.expect_tagged("a5").await?;
     let _ = wire.send_line("a9 LOGOUT").await;
     Ok(())
+}
+
+/// Build the RFC 822 bytes of a draft. Unlike a sent message, a draft may have no
+/// recipients yet.
+pub fn build_draft_message(
+    from: &str,
+    to: &[String],
+    cc: &[String],
+    subject: &str,
+    body: &str,
+    body_html: Option<&str>,
+) -> Result<Vec<u8>> {
+    const PLACEHOLDER: &str = "draft-placeholder@serabot.invalid";
+    let recipients: Vec<String> = if to.is_empty() {
+        vec![PLACEHOLDER.to_owned()]
+    } else {
+        to.to_vec()
+    };
+    let raw = build_message_full(from, &recipients, cc, subject, body, body_html, None, &[])?;
+    if !to.is_empty() {
+        return Ok(raw);
+    }
+    let text = String::from_utf8_lossy(&raw).replacen(&format!("To: {PLACEHOLDER}\r\n"), "", 1);
+    Ok(text.into_bytes())
+}
+
+/// Save a draft into `folder` with `IMAP APPEND`, flagged `\Draft \Seen`. When
+/// `replace_uid` is given, the older copy is deleted afterwards. Returns the new
+/// UID when the server reports `APPENDUID`.
+pub async fn imap_save_draft(
+    creds: &MailCredentials,
+    folder: &str,
+    raw: &[u8],
+    replace_uid: Option<u32>,
+) -> Result<Option<u32>> {
+    if raw.is_empty() || raw.len() > MAX_MESSAGE_BYTES {
+        return Err(SeraError::Validation("draft size is out of range".into()));
+    }
+    let folder = normalize_folder(folder)?;
+    let mut wire = imap_connect(creds).await?;
+    wire.send_line(&format!(
+        "a4 APPEND {} (\\Draft \\Seen) {{{}}}",
+        imap_quote(&folder),
+        raw.len()
+    ))
+    .await?;
+    let go_ahead = wire.read_line().await?;
+    if !go_ahead.starts_with('+') {
+        return Err(SeraError::External(format!(
+            "mail server refused the draft: {}",
+            clip(&go_ahead, 200)
+        )));
+    }
+    wire.send_literal(raw).await?;
+    let (done, _) = wire.expect_tagged("a4").await?;
+    let _ = wire.send_line("a9 LOGOUT").await;
+    let new_uid = mail_ux::parse_appenduid(&done);
+    if let Some(old) = replace_uid
+        && Some(old) != new_uid
+    {
+        // The new copy is already stored; a failed cleanup only leaves a stale draft.
+        let _ = imap_delete(creds, &folder, old).await;
+    }
+    Ok(new_uid)
+}
+
+/// Send the plain request a `List-Unsubscribe: <mailto:...>` header asks for.
+/// Goes through the same blocklist scan as every other outgoing mail.
+pub async fn send_unsubscribe_mailto(
+    secrets: &UserSecrets,
+    store: &Store,
+    policy: &Policy,
+    user_id: &str,
+    account: Option<&str>,
+    target: &str,
+) -> Result<()> {
+    let account = account.map(str::trim).filter(|s| !s.is_empty());
+    account_provider(account)?;
+    let (addr, subject, body) = mail_ux::split_mailto(target)
+        .ok_or_else(|| SeraError::Validation("unsubscribe address is not valid".into()))?;
+    let subject = if subject.trim().is_empty() {
+        "unsubscribe".to_owned()
+    } else {
+        subject
+    };
+    let body = if body.trim().is_empty() {
+        "unsubscribe".to_owned()
+    } else {
+        body
+    };
+    for text in [&addr, &subject, &body] {
+        scan_mail_text(store, policy, user_id, text)?;
+    }
+    let creds = require_creds(secrets, user_id, account)?;
+    let from = from_address(&creds);
+    let rcpts = vec![addr];
+    let msg = build_message_full(&from, &rcpts, &[], &subject, &body, None, None, &[])?;
+    smtp_send(&creds, &from, &rcpts, &msg).await
 }
 
 /// Read one message by UID.

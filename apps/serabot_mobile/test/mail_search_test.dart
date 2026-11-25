@@ -465,4 +465,39 @@ void main() {
       expect(sendCalls.single['subject'], 'Re: Contract review');
     });
   });
+  group('mail list fields (0.74.14)', () {
+    test('parses snippet, thread key, attachment hint and unsubscribe', () {
+      final msg = MailMessageInfo.fromJson({
+        'uid': 7,
+        'subject': 'Re: Plan',
+        'from': 'Bob <bob@example.test>',
+        'flags': ['Seen'],
+        'snippet': 'Sounds good.',
+        'thread_key': 't-1',
+        'has_attachments': true,
+        'unsubscribe': {
+          'mailto': 'unsub@news.test?subject=unsubscribe',
+          'url': 'https://news.test/u',
+        },
+      });
+      expect(msg.snippet, 'Sounds good.');
+      expect(msg.threadKey, 't-1');
+      expect(msg.hasFiles, isTrue);
+      expect(msg.unsubscribeMailto, 'unsub@news.test?subject=unsubscribe');
+      expect(msg.unsubscribeUrl, 'https://news.test/u');
+      // Changing flags keeps everything else.
+      final copy = msg.copyWith(flags: const []);
+      expect(copy.snippet, 'Sounds good.');
+      expect(copy.threadKey, 't-1');
+      expect(copy.unsubscribeUrl, 'https://news.test/u');
+    });
+
+    test('an older server omits the new fields', () {
+      final msg = MailMessageInfo.fromJson({'uid': 1, 'subject': 'Old'});
+      expect(msg.snippet, '');
+      expect(msg.threadKey, '');
+      expect(msg.hasFiles, isFalse);
+      expect(msg.unsubscribeMailto, isNull);
+    });
+  });
 }

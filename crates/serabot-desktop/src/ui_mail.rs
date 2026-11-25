@@ -11,15 +11,30 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use dioxus::prelude::*;
 use serabot_desktop::bot_library::LibraryItem;
+use serabot_desktop::mail_view::{
+    DayBucket, MailKey, Selection, apply_suggestion, day_bucket, full_date_label, group_threads,
+    map_key, parse_mail_date, sender_name, suggestion_query,
+};
 use serabot_desktop::session::{Section, Session};
 use serabot_desktop::{
-    MailAccountStatus, MailAttachmentInfo, MailMessageInfo, MailStatus, ScheduledMailItem,
+    MailAccountStatus, MailContact, MailDraftRequest, MailMessageInfo, MailSnoozeItem, MailStatus,
+    SavedMailSearch, ScheduledMailItem,
 };
+use serde::Deserialize;
 
 use crate::ui::Icon;
+use crate::ui_mail_actions::{
+    FAILED, SEND_HOLD_SECS, UndoEntry, UndoKind, announce, archive_messages, delete_messages,
+    queue_draft_delete, restore_failed, run_undo, set_flags, settle, sleep_ms,
+};
+use crate::ui_mail_list::{
+    BulkBar, DayHeader, MailRow, RowSkeletons, ShortcutsDialog, SnoozeDialog, ThreadInfo, UndoBar,
+};
+use crate::ui_mail_reader::MailReader;
 
 const DEFAULT_MAIL_LIMIT: u32 = 50;
 const SCHEDULED_VIRTUAL_FOLDER: &str = "__scheduled__";
+const SNOOZED_VIRTUAL_FOLDER: &str = "__snoozed__";
 
 /// Filter tabs for the middle message list.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -32,14 +47,14 @@ pub enum MailFilter {
 
 /// Mode for the Compose / Reply / Forward modal.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum ComposeMode {
+pub(crate) enum ComposeMode {
     New,
     Reply,
     Forward,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ComposeState {
+pub(crate) struct ComposeState {
     mode: ComposeMode,
     to: String,
     cc: String,
@@ -50,7 +65,7 @@ struct ComposeState {
 }
 
 impl ComposeState {
-    fn new_empty() -> Self {
+    pub(crate) fn new_empty() -> Self {
         Self {
             mode: ComposeMode::New,
             to: String::new(),
@@ -62,7 +77,7 @@ impl ComposeState {
         }
     }
 
-    fn reply_to(msg: &MailMessageInfo) -> Self {
+    pub(crate) fn reply_to(msg: &MailMessageInfo) -> Self {
         Self {
             mode: ComposeMode::Reply,
             to: extract_email_addr(&msg.from),
@@ -74,7 +89,30 @@ impl ComposeState {
         }
     }
 
-    fn forward_of(msg: &MailMessageInfo) -> Self {
+    /// Reply to the sender and keep everyone else on Cc, leaving out the sender, the
+    /// mailbox's own address and duplicates.
+    pub(crate) fn reply_all(msg: &MailMessageInfo, own: &str) -> Self {
+        let mut base = Self::reply_to(msg);
+        let own = own.trim().to_ascii_lowercase();
+        let sender = extract_email_addr(&msg.from).to_ascii_lowercase();
+        let mut cc: Vec<String> = Vec::new();
+        for raw in [&msg.to, &msg.cc] {
+            for entry in parse_recipients(raw) {
+                let addr = extract_email_addr(&entry);
+                let lower = addr.to_ascii_lowercase();
+                if lower.is_empty() || lower == own || lower == sender {
+                    continue;
+                }
+                if !cc.iter().any(|c| c.eq_ignore_ascii_case(&addr)) {
+                    cc.push(addr);
+                }
+            }
+        }
+        base.cc = cc.join(", ");
+        base
+    }
+
+    pub(crate) fn forward_of(msg: &MailMessageInfo) -> Self {
         Self {
             mode: ComposeMode::Forward,
             to: String::new(),
@@ -408,7 +446,7 @@ fn build_signature_html_and_plain(
 }
 
 /// Run one blocking mail API call on a dedicated background thread.
-async fn run_mail_job<T, F>(session: Signal<Session>, job: F) -> Result<T, String>
+pub(crate) async fn run_mail_job<T, F>(session: Signal<Session>, job: F) -> Result<T, String>
 where
     T: Send + 'static,
     F: FnOnce(&serabot_desktop::ApiClient) -> Result<T, serabot_desktop::ApiError> + Send + 'static,
@@ -564,21 +602,34 @@ pub fn format_bytes(size: usize) -> String {
     }
 }
 
-fn toggle_flag_local(msg: &mut MailMessageInfo, flag: &str, on: bool) {
-    msg.flags.retain(|f| !f.eq_ignore_ascii_case(flag));
+/// Set or clear one flag on a message. The server reports flags without the
+/// leading backslash (`Seen`), the UI used to write them with it (`\Seen`); both
+/// spellings count as the same flag.
+pub(crate) fn toggle_flag_local(msg: &mut MailMessageInfo, flag: &str, on: bool) {
+    let bare = flag.trim_start_matches('\\');
+    msg.flags
+        .retain(|f| !f.trim_start_matches('\\').eq_ignore_ascii_case(bare));
     if on {
-        msg.flags.push(flag.to_owned());
+        msg.flags.push(bare.to_owned());
     }
 }
 
-fn update_message_flags_in_list(messages: &mut [MailMessageInfo], uid: u32, flag: &str, on: bool) {
+pub(crate) fn update_message_flags_in_list(
+    messages: &mut [MailMessageInfo],
+    uid: u32,
+    flag: &str,
+    on: bool,
+) {
     if let Some(item) = messages.iter_mut().find(|m| m.uid == uid) {
         toggle_flag_local(item, flag, on);
     }
 }
 
 #[cfg(windows)]
-fn save_bytes_with_picker(default_name: &str, bytes: &[u8]) -> Result<Option<String>, String> {
+pub(crate) fn save_bytes_with_picker(
+    default_name: &str,
+    bytes: &[u8],
+) -> Result<Option<String>, String> {
     let Some(path) = rfd::FileDialog::new()
         .set_title("Save attachment")
         .set_file_name(default_name)
@@ -591,7 +642,10 @@ fn save_bytes_with_picker(default_name: &str, bytes: &[u8]) -> Result<Option<Str
 }
 
 #[cfg(not(windows))]
-fn save_bytes_with_picker(_default_name: &str, _bytes: &[u8]) -> Result<Option<String>, String> {
+pub(crate) fn save_bytes_with_picker(
+    _default_name: &str,
+    _bytes: &[u8],
+) -> Result<Option<String>, String> {
     Err("Save to disk needs the Windows app.".to_owned())
 }
 
@@ -708,7 +762,396 @@ fn load_full_message(
     });
 }
 
-/// Dedicated 3-pane Mail workspace (`Section::Mail`).
+/// Everything the list, the reader and the mail actions share. Signals are `Copy`,
+/// so the whole bundle is `Copy` and can be handed to any component or closure.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct MailCtx {
+    pub session: Signal<Session>,
+    pub account: Signal<Option<String>>,
+    pub folder: Signal<String>,
+    pub folders: Signal<Vec<String>>,
+    pub messages: Signal<Vec<MailMessageInfo>>,
+    pub selected: Signal<Option<MailMessageInfo>>,
+    pub selection: Signal<Selection>,
+    pub undo: Signal<Option<UndoEntry>>,
+    pub seq: Signal<u64>,
+    pub remote_loaded: Signal<bool>,
+    pub loading_reader: Signal<bool>,
+    pub loading_list: Signal<bool>,
+    pub error: Signal<Option<String>>,
+    pub reader_html: Signal<bool>,
+    pub snooze_for: Signal<Option<Vec<u32>>>,
+    pub ask_open: Signal<bool>,
+    pub compose: Signal<Option<ComposeState>>,
+    pub filter: Signal<MailFilter>,
+    pub active_search: Signal<String>,
+    pub shortcuts_open: Signal<bool>,
+}
+
+/// Open a message in the reader (marks it read).
+pub(crate) fn open_message(ctx: MailCtx, uid: u32) {
+    let mut reader_html = ctx.reader_html;
+    let mut ask_open = ctx.ask_open;
+    reader_html.set(true);
+    ask_open.set(false);
+    load_full_message(
+        ctx.session,
+        (*ctx.account.peek()).clone(),
+        (*ctx.folder.peek()).clone(),
+        uid,
+        false,
+        ctx.messages,
+        ctx.selected,
+        ctx.remote_loaded,
+        ctx.loading_reader,
+        ctx.error,
+    );
+}
+
+/// Reload the open message with remote images allowed.
+pub(crate) fn open_message_with_remote_images(ctx: MailCtx, uid: u32) {
+    load_full_message(
+        ctx.session,
+        (*ctx.account.peek()).clone(),
+        (*ctx.folder.peek()).clone(),
+        uid,
+        true,
+        ctx.messages,
+        ctx.selected,
+        ctx.remote_loaded,
+        ctx.loading_reader,
+        ctx.error,
+    );
+}
+
+/// Reload the current folder or search. Settles any pending Undo first so a
+/// deferred move cannot reappear in the new list.
+pub(crate) fn reload(ctx: MailCtx) {
+    settle(ctx);
+    let mut selection = ctx.selection;
+    selection.write().clear();
+    load_folder_and_messages(
+        ctx.session,
+        (*ctx.account.peek()).clone(),
+        (*ctx.folder.peek()).clone(),
+        (*ctx.active_search.peek()).clone(),
+        ctx.folders,
+        ctx.messages,
+        ctx.selected,
+        ctx.loading_list,
+        ctx.error,
+    );
+}
+
+/// One entry of the rendered list: a day heading or a message row.
+enum ListItem {
+    Day(&'static str),
+    Row(Box<MailMessageInfo>, ThreadInfo),
+}
+
+/// Group, order and label the visible messages. With `threaded` set, each
+/// conversation shows its newest message with a count; expanded conversations list
+/// the older ones under it.
+fn build_list_items(
+    rows: &[MailMessageInfo],
+    threaded: bool,
+    expanded: &BTreeSet<String>,
+    now: i64,
+    offset: i64,
+) -> Vec<ListItem> {
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut last_bucket: Option<DayBucket> = None;
+    let mut push_day = |items: &mut Vec<ListItem>, msg: &MailMessageInfo| {
+        if let Some(ts) = parse_mail_date(&msg.date) {
+            let bucket = day_bucket(ts, now, offset);
+            if last_bucket != Some(bucket) {
+                last_bucket = Some(bucket);
+                items.push(ListItem::Day(bucket.label()));
+            }
+        }
+    };
+    if !threaded {
+        for msg in rows {
+            push_day(&mut items, msg);
+            items.push(ListItem::Row(Box::new(msg.clone()), ThreadInfo::default()));
+        }
+        return items;
+    }
+    let keyed: Vec<(u32, String)> = rows.iter().map(|m| (m.uid, m.thread_key.clone())).collect();
+    for (key, uids) in group_threads(&keyed) {
+        let Some(head) = rows.iter().find(|m| m.uid == uids[0]) else {
+            continue;
+        };
+        let open = expanded.contains(&key);
+        push_day(&mut items, head);
+        items.push(ListItem::Row(
+            Box::new(head.clone()),
+            ThreadInfo {
+                count: uids.len(),
+                expanded: open,
+                is_child: false,
+            },
+        ));
+        if open {
+            for uid in &uids[1..] {
+                if let Some(child) = rows.iter().find(|m| m.uid == *uid) {
+                    items.push(ListItem::Row(
+                        Box::new(child.clone()),
+                        ThreadInfo {
+                            count: 1,
+                            expanded: false,
+                            is_child: true,
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    items
+}
+
+/// Messages from the page: key presses (with whether focus is in a text field) and
+/// the viewer's UTC offset.
+#[derive(Clone, Debug, Deserialize)]
+struct BridgeEvent {
+    kind: String,
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    shift: bool,
+    #[serde(default)]
+    ctrl: bool,
+    #[serde(default)]
+    alt: bool,
+    #[serde(default)]
+    typing: bool,
+    #[serde(default)]
+    minutes: i64,
+}
+
+/// Page-side helper for the mail window. It owns the parts that need no Rust state:
+/// resizable panes and the density choice (both remembered in `localStorage`),
+/// reports key presses so the shortcuts work, and reports the UTC offset once.
+/// Re-running it replaces the previous listeners.
+const MAIL_BRIDGE_JS: &str = r#"
+(function () {
+  if (window.__serabotMailCleanup) { window.__serabotMailCleanup(); }
+  const KEY = 'serabot.mail.layout.v1';
+  const shell = () => document.querySelector('.mail-shell');
+  const read = () => { try { return JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) { return {}; } };
+  const write = (v) => { try { localStorage.setItem(KEY, JSON.stringify(v)); } catch (e) {} };
+  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+  const apply = () => {
+    const s = shell(); if (!s) return;
+    const l = read();
+    const total = s.clientWidth || 1200;
+    const sidebar = clamp(l.sidebar || 220, 180, 320);
+    const room = Math.max(total - sidebar - 360, 260);
+    const list = clamp(l.list || 340, 260, Math.min(560, room));
+    s.style.setProperty('--mail-sidebar-w', sidebar + 'px');
+    s.style.setProperty('--mail-list-w', list + 'px');
+    s.dataset.density = l.density === 'compact' ? 'compact' : 'comfortable';
+  };
+  let drag = null;
+  const onDown = (e) => {
+    const bar = e.target.closest && e.target.closest('.mail-resizer');
+    const s = shell();
+    if (!bar || !s) return;
+    drag = { which: bar.dataset.resize, left: s.getBoundingClientRect().left, id: e.pointerId, bar };
+    try { bar.setPointerCapture(e.pointerId); } catch (err) {}
+    bar.classList.add('dragging');
+    e.preventDefault();
+  };
+  const onMove = (e) => {
+    if (!drag) return;
+    const s = shell(); if (!s) return;
+    const l = read();
+    const x = e.clientX - drag.left;
+    if (drag.which === 'sidebar') { l.sidebar = clamp(Math.round(x), 180, 320); }
+    else { l.list = clamp(Math.round(x - (l.sidebar || 220) - 6), 260, 560); }
+    write(l); apply();
+  };
+  const onUp = () => { if (drag) { drag.bar.classList.remove('dragging'); drag = null; } };
+  const onKey = (e) => {
+    if (!shell()) { cleanup(); return; }
+    if (['Shift', 'Control', 'Alt', 'Meta', 'CapsLock'].indexOf(e.key) >= 0) return;
+    const el = document.activeElement;
+    const tag = el && el.tagName;
+    const typing = !!(el && (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable))
+      || !!document.querySelector('.mp-sheet, .mail-dialog');
+    const ctrl = e.ctrlKey || e.metaKey;
+    if (!typing && ctrl && (e.key === 'a' || e.key === 'z')) e.preventDefault();
+    dioxus.send({ kind: 'key', key: e.key, shift: e.shiftKey, ctrl: ctrl, alt: e.altKey, typing: typing });
+  };
+  const onResize = () => apply();
+  const cleanup = () => {
+    document.removeEventListener('pointerdown', onDown);
+    document.removeEventListener('pointermove', onMove);
+    document.removeEventListener('pointerup', onUp);
+    document.removeEventListener('keydown', onKey);
+    window.removeEventListener('resize', onResize);
+    window.__serabotMailCleanup = null;
+  };
+  window.__serabotMailCleanup = cleanup;
+  document.addEventListener('pointerdown', onDown);
+  document.addEventListener('pointermove', onMove);
+  document.addEventListener('pointerup', onUp);
+  document.addEventListener('keydown', onKey);
+  window.addEventListener('resize', onResize);
+  window.__serabotMail = {
+    toggleDensity: () => { const l = read(); l.density = l.density === 'compact' ? 'comfortable' : 'compact'; write(l); apply(); },
+    focusSearch: () => { const i = document.getElementById('mail-search'); if (i) { i.focus(); i.select(); } },
+    apply: apply,
+  };
+  apply();
+  dioxus.send({ kind: 'offset', minutes: -new Date().getTimezoneOffset() });
+})();
+"#;
+
+/// The address mail is sent from for the active mailbox (used to leave yourself out
+/// of Reply all).
+fn own_address_of(status: &Option<MailStatus>, account: &Option<String>) -> String {
+    let Some(status) = status else {
+        return String::new();
+    };
+    let wanted = account.clone().unwrap_or_default();
+    status
+        .accounts
+        .iter()
+        .find(|a| a.account == wanted)
+        .and_then(|a| a.username.clone())
+        .or_else(|| status.username.clone())
+        .unwrap_or_default()
+}
+
+/// Run a shortcut. `typing` was already ruled out by the page.
+fn handle_key(ctx: MailCtx, key: MailKey, status: Signal<Option<MailStatus>>) {
+    let visible: Vec<u32> = filter_messages(&ctx.messages.peek(), *ctx.filter.peek())
+        .iter()
+        .map(|m| m.uid)
+        .collect();
+    let open = (*ctx.selected.peek()).clone();
+    let open_uid = open.as_ref().map(|m| m.uid);
+    let checked = ctx.selection.peek().uids();
+    let targets: Vec<u32> = if checked.is_empty() {
+        open_uid.into_iter().collect()
+    } else {
+        checked
+    };
+    let mut compose = ctx.compose;
+    let mut snooze_for = ctx.snooze_for;
+    let mut shortcuts_open = ctx.shortcuts_open;
+    let mut selection = ctx.selection;
+    let mut ask_open = ctx.ask_open;
+    match key {
+        MailKey::NextMessage | MailKey::PrevMessage => {
+            let idx = open_uid.and_then(|u| visible.iter().position(|v| *v == u));
+            let next = match (key, idx) {
+                (MailKey::NextMessage, Some(i)) => visible.get(i + 1),
+                (MailKey::PrevMessage, Some(i)) => i.checked_sub(1).and_then(|p| visible.get(p)),
+                _ => visible.first(),
+            };
+            if let Some(uid) = next.copied() {
+                open_message(ctx, uid);
+            }
+        }
+        MailKey::OpenMessage => {
+            if open_uid.is_none()
+                && let Some(uid) = visible.first().copied()
+            {
+                open_message(ctx, uid);
+            }
+        }
+        MailKey::Compose => compose.set(Some(ComposeState::new_empty())),
+        MailKey::Reply => {
+            if let Some(msg) = &open {
+                compose.set(Some(ComposeState::reply_to(msg)));
+            }
+        }
+        MailKey::ReplyAll => {
+            if let Some(msg) = &open {
+                let own = own_address_of(&status.peek(), &ctx.account.peek());
+                compose.set(Some(ComposeState::reply_all(msg, &own)));
+            }
+        }
+        MailKey::Forward => {
+            if let Some(msg) = &open {
+                compose.set(Some(ComposeState::forward_of(msg)));
+            }
+        }
+        MailKey::Archive => archive_messages(ctx, targets),
+        MailKey::Delete => delete_messages(ctx, targets),
+        MailKey::ToggleStar => {
+            if let Some(msg) = &open {
+                set_flags(ctx, targets, None, Some(!is_starred(msg)), None);
+            }
+        }
+        MailKey::ToggleRead => {
+            if let Some(msg) = &open {
+                set_flags(ctx, targets, Some(is_unread(msg)), None, None);
+            }
+        }
+        MailKey::Snooze => {
+            if !targets.is_empty() {
+                snooze_for.set(Some(targets));
+            }
+        }
+        MailKey::SelectToggle => {
+            if let Some(uid) = open_uid {
+                selection.write().toggle(uid);
+            }
+        }
+        MailKey::SelectAll => selection.write().select_all(&visible),
+        MailKey::FocusSearch => {
+            let _ = dioxus::document::eval(
+                "window.__serabotMail && window.__serabotMail.focusSearch();",
+            );
+        }
+        MailKey::Undo => {
+            if ctx.undo.peek().is_some() {
+                run_undo(ctx);
+            }
+        }
+        MailKey::Escape => {
+            if snooze_for.peek().is_some() {
+                snooze_for.set(None);
+            } else if *shortcuts_open.peek() {
+                shortcuts_open.set(false);
+            } else if !selection.peek().is_empty() {
+                selection.write().clear();
+            } else if *ask_open.peek() {
+                ask_open.set(false);
+            }
+        }
+        MailKey::Help => shortcuts_open.set(true),
+        MailKey::GoInbox => {
+            let mut folder = ctx.folder;
+            folder.set("INBOX".to_owned());
+            reload(ctx);
+        }
+    }
+}
+
+fn load_snoozed_messages(ctx: MailCtx, mut items: Signal<Vec<MailSnoozeItem>>) {
+    let session = ctx.session;
+    let account = (*ctx.account.peek()).clone();
+    let mut loading = ctx.loading_list;
+    let mut error = ctx.error;
+    loading.set(true);
+    error.set(None);
+    spawn(async move {
+        let res = run_mail_job(session, move |c| c.mail_list_snoozed(account.as_deref())).await;
+        loading.set(false);
+        match res {
+            Ok(list) => items.set(list),
+            Err(msg) => error.set(Some(msg)),
+        }
+    });
+}
+
+/// The Mail workspace (`Section::Mail`): folders and saved searches, a message
+/// list with conversations, day headings, bulk actions and quick actions, and a
+/// reading pane. Panes can be resized and the list density changed.
 #[component]
 pub fn MailView(session: Signal<Session>) -> Element {
     let mut mail_status = use_signal(|| Option::<MailStatus>::None);
@@ -716,25 +1159,74 @@ pub fn MailView(session: Signal<Session>) -> Element {
     let mut account = use_signal(|| Option::<String>::None);
     let folders = use_signal(|| vec!["INBOX".to_owned()]);
     let mut folder = use_signal(|| "INBOX".to_owned());
-    let mut messages = use_signal(Vec::<MailMessageInfo>::new);
-    let mut selected_msg = use_signal(|| Option::<MailMessageInfo>::None);
-    let mut reader_html_mode = use_signal(|| true);
-    let remote_images_loaded = use_signal(|| false);
-    let mut scheduled_items = use_signal(Vec::<ScheduledMailItem>::new);
-    let mut selected_scheduled = use_signal(|| Option::<ScheduledMailItem>::None);
-    let mut reschedule_open = use_signal(|| false);
-    let mut reschedule_input = use_signal(String::new);
-    let mut filter = use_signal(|| MailFilter::All);
-    let mut search_input = use_signal(String::new);
-    let mut active_search = use_signal(String::new);
+    let messages = use_signal(Vec::<MailMessageInfo>::new);
+    let selected = use_signal(|| Option::<MailMessageInfo>::None);
+    let reader_html = use_signal(|| true);
+    let remote_loaded = use_signal(|| false);
+    let selection = use_signal(Selection::default);
+    let undo = use_signal(|| Option::<UndoEntry>::None);
+    let seq = use_signal(|| 0u64);
+    let snooze_for = use_signal(|| Option::<Vec<u32>>::None);
+    let ask_open = use_signal(|| false);
+    let compose = use_signal(|| Option::<ComposeState>::None);
+    let filter = use_signal(|| MailFilter::All);
+    let active_search = use_signal(String::new);
+    let shortcuts_open = use_signal(|| false);
     let loading_list = use_signal(|| false);
     let loading_reader = use_signal(|| false);
-    let mut error = use_signal(|| Option::<String>::None);
-    let mut confirm_delete = use_signal(|| false);
-    let mut move_menu_open = use_signal(|| false);
-    let mut move_target = use_signal(String::new);
-    let mut compose = use_signal(|| Option::<ComposeState>::None);
+    let error = use_signal(|| Option::<String>::None);
+
+    let mut scheduled_items = use_signal(Vec::<ScheduledMailItem>::new);
+    let mut selected_scheduled = use_signal(|| Option::<ScheduledMailItem>::None);
+    let mut snoozed_items = use_signal(Vec::<MailSnoozeItem>::new);
+    let mut reschedule_open = use_signal(|| false);
+    let mut reschedule_input = use_signal(String::new);
+    let mut search_input = use_signal(String::new);
+    let mut search_help_open = use_signal(|| false);
+    let mut saved_searches = use_signal(Vec::<SavedMailSearch>::new);
+    let mut threads_on = use_signal(|| true);
+    let mut expanded = use_signal(BTreeSet::<String>::new);
+    let mut tz_offset = use_signal(|| 0i64);
     let mut signature_modal_open = use_signal(|| false);
+
+    let ctx = MailCtx {
+        session,
+        account,
+        folder,
+        folders,
+        messages,
+        selected,
+        selection,
+        undo,
+        seq,
+        remote_loaded,
+        loading_reader,
+        loading_list,
+        error,
+        reader_html,
+        snooze_for,
+        ask_open,
+        compose,
+        filter,
+        active_search,
+        shortcuts_open,
+    };
+
+    // "Compose email" from the command palette.
+    use_effect(move || {
+        if session.read().mail_compose_request {
+            session.write().mail_compose_request = false;
+            let mut compose = compose;
+            compose.set(Some(ComposeState::new_empty()));
+        }
+    });
+
+    // Rows whose move or delete failed after the window was closed come back here.
+    use_effect(move || {
+        if !FAILED.read().is_empty() {
+            restore_failed(ctx);
+        }
+    });
 
     use_hook(move || {
         spawn(async move {
@@ -750,23 +1242,37 @@ pub fn MailView(session: Signal<Session>) -> Element {
                     };
                     mail_status.set(Some(st));
                     if has_any {
-                        account.set(initial_account.clone());
-                        load_folder_and_messages(
-                            session,
-                            initial_account,
-                            "INBOX".to_owned(),
-                            String::new(),
-                            folders,
-                            messages,
-                            selected_msg,
-                            loading_list,
-                            error,
-                        );
+                        account.set(initial_account);
+                        reload(ctx);
+                        if let Ok(list) = run_mail_job(session, |c| c.mail_saved_searches()).await {
+                            saved_searches.set(list);
+                        }
                     }
                 }
-                Err(err) => error.set(Some(err)),
+                Err(err) => {
+                    let mut error = error;
+                    error.set(Some(err));
+                }
             }
         });
+    });
+
+    // Keyboard shortcuts, pane resizing and the viewer's UTC offset come from the page.
+    use_future(move || async move {
+        let mut bridge = dioxus::document::eval(MAIL_BRIDGE_JS);
+        while let Ok(event) = bridge.recv::<BridgeEvent>().await {
+            match event.kind.as_str() {
+                "offset" => tz_offset.set(event.minutes),
+                "key" => {
+                    if let Some(key) =
+                        map_key(&event.key, event.shift, event.ctrl, event.alt, event.typing)
+                    {
+                        handle_key(ctx, key, mail_status);
+                    }
+                }
+                _ => {}
+            }
+        }
     });
 
     let status_val = mail_status();
@@ -795,6 +1301,11 @@ pub fn MailView(session: Signal<Session>) -> Element {
                     p { class: "muted",
                         "Read, search, organize, and send emails directly from SeraBot using your own SMTP and IMAP credentials. Your password stays sealed per user on the server."
                     }
+                    ul { class: "mail-empty-steps",
+                        li { "Open Settings, then Integrations, then Mail." }
+                        li { "Enter your SMTP and IMAP details and press Connect." }
+                        li { "Come back here. Your inbox loads on its own." }
+                    }
                     if let Some(err) = error() {
                         div { class: "banner err", role: "alert", span { class: "grow", "{err}" } }
                     }
@@ -817,24 +1328,49 @@ pub fn MailView(session: Signal<Session>) -> Element {
         .unwrap_or_default();
     let active_account_status = accounts
         .iter()
-        .find(|a| {
-            let cur = account().unwrap_or_default();
-            a.account == cur
-        })
+        .find(|a| a.account == account().unwrap_or_default())
         .cloned();
+    let own_address = own_address_of(&status_val, &account());
+    let now = now_unix_secs() as i64;
+    let offset = tz_offset();
     let visible_messages = filter_messages(&messages(), filter());
-    let current_uid = selected_msg().map(|m| m.uid);
     let is_scheduled_view = folder() == SCHEDULED_VIRTUAL_FOLDER;
+    let is_snoozed_view = folder() == SNOOZED_VIRTUAL_FOLDER;
+    let is_virtual_view = is_scheduled_view || is_snoozed_view;
     let current_sched_id = selected_scheduled().map(|s| s.id);
+    let items = build_list_items(
+        &visible_messages,
+        threads_on() && active_search().is_empty(),
+        &expanded(),
+        now,
+        offset,
+    );
+    let order: Vec<u32> = items
+        .iter()
+        .filter_map(|item| match item {
+            ListItem::Row(msg, _) => Some(msg.uid),
+            ListItem::Day(_) => None,
+        })
+        .collect();
+    let unread_count = messages().iter().filter(|m| is_unread(m)).count();
+    let search_active = !active_search().is_empty();
+    let already_saved = saved_searches()
+        .iter()
+        .any(|s| s.query.eq_ignore_ascii_case(active_search().trim()));
+    let folder_list = folders();
 
     rsx! {
-        div { class: "mail-shell",
-            // Left pane: account switcher, Compose, folders, Scheduled, Signature, Manage accounts
+        div { class: "mail-shell", tabindex: "-1",
+            // Left pane: Compose, mailbox switcher, folders, saved searches
             aside { class: "mail-sidebar", "aria-label": "Mail folders",
                 button {
                     class: "btn primary mail-compose-btn",
                     r#type: "button",
-                    onclick: move |_| compose.set(Some(ComposeState::new_empty())),
+                    title: "Compose (c)",
+                    onclick: move |_| {
+                        let mut compose = compose;
+                        compose.set(Some(ComposeState::new_empty()));
+                    },
                     Icon { name: "edit", size: 15 }
                     "Compose"
                 }
@@ -848,27 +1384,14 @@ pub fn MailView(session: Signal<Session>) -> Element {
                             value: "{account().clone().unwrap_or_default()}",
                             onchange: move |e| {
                                 let v = e.value();
-                                let next = if v.is_empty() { None } else { Some(v) };
-                                account.set(next.clone());
+                                account.set(if v.is_empty() { None } else { Some(v) });
                                 folder.set("INBOX".to_owned());
                                 search_input.set(String::new());
+                                let mut active_search = active_search;
                                 active_search.set(String::new());
-                                confirm_delete.set(false);
-                                move_menu_open.set(false);
-                                move_target.set(String::new());
                                 selected_scheduled.set(None);
                                 reschedule_open.set(false);
-                                load_folder_and_messages(
-                                    session,
-                                    next,
-                                    "INBOX".to_owned(),
-                                    String::new(),
-                                    folders,
-                                    messages,
-                                    selected_msg,
-                                    loading_list,
-                                    error,
-                                );
+                                reload(ctx);
                             },
                             if status_val.as_ref().is_some_and(|s| s.connected) {
                                 option { value: "", "Default" }
@@ -884,52 +1407,59 @@ pub fn MailView(session: Signal<Session>) -> Element {
                     }
                 }
 
-                nav { class: "mail-folder-list",
-                    for f in folders().iter() {
+                nav { class: "mail-folder-list", "aria-label": "Folders",
+                    for f in folder_list.iter() {
                         {
                             let f_name = f.clone();
                             let f_click = f.clone();
                             let (icon_name, label) = folder_icon_and_label(&f_name);
-                            let active = !is_scheduled_view && folder().eq_ignore_ascii_case(&f_name);
+                            let active = !is_virtual_view && folder().eq_ignore_ascii_case(&f_name);
+                            let badge = if active && unread_count > 0 && label == "Inbox" {
+                                Some(unread_count)
+                            } else {
+                                None
+                            };
                             rsx! {
                                 button {
                                     key: "{f_name}",
                                     class: if active { "mail-folder-item active" } else { "mail-folder-item" },
                                     r#type: "button",
+                                    "aria-current": if active { "page" } else { "false" },
                                     onclick: move |_| {
                                         folder.set(f_click.clone());
-                                        confirm_delete.set(false);
-                                        move_menu_open.set(false);
-                                        move_target.set(String::new());
                                         selected_scheduled.set(None);
                                         reschedule_open.set(false);
-                                        load_folder_and_messages(
-                                            session,
-                                            account(),
-                                            f_click.clone(),
-                                            active_search(),
-                                            folders,
-                                            messages,
-                                            selected_msg,
-                                            loading_list,
-                                            error,
-                                        );
+                                        reload(ctx);
                                     },
                                     Icon { name: icon_name.to_owned(), size: 15 }
                                     span { class: "mail-folder-label", "{label}" }
+                                    if let Some(n) = badge {
+                                        span { class: "mail-folder-badge", "{n}" }
+                                    }
                                 }
                             }
                         }
                     }
                     div { class: "mail-folder-divider" }
                     button {
+                        class: if is_snoozed_view { "mail-folder-item active" } else { "mail-folder-item" },
+                        r#type: "button",
+                        onclick: move |_| {
+                            folder.set(SNOOZED_VIRTUAL_FOLDER.to_owned());
+                            let mut selected = selected;
+                            selected.set(None);
+                            load_snoozed_messages(ctx, snoozed_items);
+                        },
+                        Icon { name: "history", size: 15 }
+                        span { class: "mail-folder-label", "Snoozed" }
+                    }
+                    button {
                         class: if is_scheduled_view { "mail-folder-item active" } else { "mail-folder-item" },
                         r#type: "button",
                         onclick: move |_| {
                             folder.set(SCHEDULED_VIRTUAL_FOLDER.to_owned());
-                            confirm_delete.set(false);
-                            move_menu_open.set(false);
-                            selected_msg.set(None);
+                            let mut selected = selected;
+                            selected.set(None);
                             reschedule_open.set(false);
                             load_scheduled_messages(
                                 session,
@@ -945,13 +1475,90 @@ pub fn MailView(session: Signal<Session>) -> Element {
                     }
                 }
 
+                if !saved_searches().is_empty() {
+                    div { class: "mail-saved", role: "group", "aria-label": "Saved searches",
+                        div { class: "mail-saved-title", "Saved searches" }
+                        for s in saved_searches().iter() {
+                            {
+                                let s_apply = s.clone();
+                                let s_delete = s.clone();
+                                rsx! {
+                                    div { key: "{s.id}", class: "mail-saved-row",
+                                        button {
+                                            class: "mail-saved-item",
+                                            r#type: "button",
+                                            title: "{s.query}",
+                                            onclick: move |_| {
+                                                if is_virtual_view {
+                                                    folder.set("INBOX".to_owned());
+                                                }
+                                                search_input.set(s_apply.query.clone());
+                                                let mut active_search = active_search;
+                                                active_search.set(s_apply.query.clone());
+                                                reload(ctx);
+                                            },
+                                            Icon { name: "search", size: 13 }
+                                            span { class: "mail-folder-label", "{s.name}" }
+                                        }
+                                        button {
+                                            class: "icon-btn sm mail-saved-x",
+                                            r#type: "button",
+                                            title: "Remove this saved search",
+                                            "aria-label": "Remove saved search {s.name}",
+                                            onclick: move |_| {
+                                                let id = s_delete.id.clone();
+                                                let id_rm = s_delete.id.clone();
+                                                spawn(async move {
+                                                    let res = run_mail_job(session, move |c| {
+                                                        c.mail_delete_saved_search(&id)
+                                                    })
+                                                    .await;
+                                                    match res {
+                                                        Ok(()) => saved_searches.write().retain(|x| x.id != id_rm),
+                                                        Err(err) => {
+                                                            session.write().toast = Some(format!("Could not remove the saved search: {err}"));
+                                                        }
+                                                    }
+                                                });
+                                            },
+                                            Icon { name: "x", size: 12 }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 div { class: "mail-sidebar-foot",
+                    button {
+                        class: "btn ghost sm mail-manage-link",
+                        r#type: "button",
+                        title: "Toggle compact rows",
+                        onclick: move |_| {
+                            let _ = dioxus::document::eval(
+                                "window.__serabotMail && window.__serabotMail.toggleDensity();",
+                            );
+                        },
+                        Icon { name: "list", size: 14 }
+                        "Density"
+                    }
                     button {
                         class: "btn ghost sm mail-manage-link",
                         r#type: "button",
                         onclick: move |_| signature_modal_open.set(true),
                         Icon { name: "edit", size: 14 }
                         "Signature"
+                    }
+                    button {
+                        class: "btn ghost sm mail-manage-link",
+                        r#type: "button",
+                        onclick: move |_| {
+                            let mut shortcuts_open = shortcuts_open;
+                            shortcuts_open.set(true);
+                        },
+                        Icon { name: "code", size: 14 }
+                        "Shortcuts"
                     }
                     button {
                         class: "btn ghost sm mail-manage-link",
@@ -963,7 +1570,9 @@ pub fn MailView(session: Signal<Session>) -> Element {
                 }
             }
 
-            // Middle pane: scheduled list OR search + filter + message list
+            div { class: "mail-resizer", "data-resize": "sidebar", role: "separator", "aria-orientation": "vertical", "aria-label": "Resize folders" }
+
+            // Middle pane
             section { class: "mail-list-pane", "aria-label": "Messages",
                 if is_scheduled_view {
                     div { class: "mail-list-toolbar",
@@ -987,23 +1596,25 @@ pub fn MailView(session: Signal<Session>) -> Element {
                             Icon { name: "refresh", size: 15 }
                         }
                     }
-
                     if let Some(err) = error() {
                         div { class: "banner err mail-banner", role: "alert",
                             span { class: "grow", "{err}" }
                         }
                     }
-
                     div { class: "mail-list-scroll",
                         if loading_list() {
-                            div { class: "mail-list-empty muted", "Loading scheduled emails\u{2026}" }
+                            RowSkeletons {}
                         } else if scheduled_items().is_empty() {
-                            div { class: "mail-list-empty muted", "No scheduled emails for this mailbox." }
+                            div { class: "mail-list-empty",
+                                Icon { name: "workflows", size: 22 }
+                                p { class: "muted", "Nothing is scheduled." }
+                                p { class: "tiny muted", "Use Send later in a new message to queue one." }
+                            }
                         } else {
                             for item in scheduled_items().iter() {
                                 {
                                     let item_click = item.clone();
-                                    let selected = current_sched_id.as_deref() == Some(item.id.as_str());
+                                    let selected_row = current_sched_id.as_deref() == Some(item.id.as_str());
                                     let rcpts = if item.to.is_empty() {
                                         "(No recipients)".to_owned()
                                     } else {
@@ -1019,22 +1630,105 @@ pub fn MailView(session: Signal<Session>) -> Element {
                                         "failed" => "mail-sched-badge failed",
                                         _ => "mail-sched-badge pending",
                                     };
+                                    let when = full_date_label(item.send_at, offset);
                                     rsx! {
                                         div {
                                             key: "{item.id}",
-                                            class: if selected { "mail-row selected" } else { "mail-row" },
+                                            class: if selected_row { "mail-row selected" } else { "mail-row" },
+                                            role: "option",
                                             onclick: move |_| {
                                                 reschedule_open.set(false);
                                                 reschedule_input.set(String::new());
                                                 selected_scheduled.set(Some(item_click.clone()));
                                             },
-                                            div { class: "mail-row-top",
-                                                span { class: "{status_cls}", "{item.status}" }
-                                                span { class: "mail-row-sender", "{rcpts}" }
+                                            div { class: "mail-row-main",
+                                                div { class: "mail-row-top",
+                                                    span { class: "{status_cls}", "{item.status}" }
+                                                    span { class: "mail-row-sender", "{rcpts}" }
+                                                    span { class: "mail-row-date", "{when}" }
+                                                }
+                                                div { class: "mail-row-subject", "{subject}" }
                                             }
-                                            div { class: "mail-row-bottom",
-                                                span { class: "mail-row-subject", "{subject}" }
-                                                span { class: "mail-row-date", "{item.send_at}" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if is_snoozed_view {
+                    div { class: "mail-list-toolbar",
+                        span { class: "mail-scheduled-heading", "Snoozed" }
+                        button {
+                            class: "icon-btn",
+                            r#type: "button",
+                            title: "Refresh snoozed",
+                            "aria-label": "Refresh snoozed messages",
+                            disabled: loading_list(),
+                            onclick: move |_| load_snoozed_messages(ctx, snoozed_items),
+                            Icon { name: "refresh", size: 15 }
+                        }
+                    }
+                    if let Some(err) = error() {
+                        div { class: "banner err mail-banner", role: "alert",
+                            span { class: "grow", "{err}" }
+                        }
+                    }
+                    div { class: "mail-list-scroll",
+                        if loading_list() {
+                            RowSkeletons {}
+                        } else if snoozed_items().is_empty() {
+                            div { class: "mail-list-empty",
+                                Icon { name: "history", size: 22 }
+                                p { class: "muted", "No snoozed messages." }
+                                p { class: "tiny muted", "Press z on a message to bring it back later." }
+                            }
+                        } else {
+                            for item in snoozed_items().iter() {
+                                {
+                                    let wake = full_date_label(item.wake_at, offset);
+                                    let subject = if item.subject.trim().is_empty() {
+                                        "(No subject)".to_owned()
+                                    } else {
+                                        item.subject.clone()
+                                    };
+                                    let name = sender_name(&item.from_addr);
+                                    let item_back = item.clone();
+                                    rsx! {
+                                        div { key: "{item.id}", class: "mail-row snoozed-row", role: "option",
+                                            div { class: "mail-row-main",
+                                                div { class: "mail-row-top",
+                                                    span { class: "mail-row-sender", "{name}" }
+                                                    span { class: "mail-row-date", "{wake}" }
+                                                }
+                                                div { class: "mail-row-subject", "{subject}" }
+                                                div { class: "mail-row-snippet", "Returns to {item_back.folder} at that time" }
+                                            }
+                                            div { class: "mail-row-actions always",
+                                                button {
+                                                    class: "btn ghost sm",
+                                                    r#type: "button",
+                                                    onclick: move |_| {
+                                                        let it = item_back.clone();
+                                                        let acct = account();
+                                                        spawn(async move {
+                                                            let (fold, uid, id) = (it.folder.clone(), it.uid, it.id.clone());
+                                                            let res = run_mail_job(session, move |c| {
+                                                                c.mail_unsnooze(acct.as_deref(), &fold, uid)
+                                                            })
+                                                            .await;
+                                                            match res {
+                                                                Ok(()) => {
+                                                                    snoozed_items.write().retain(|x| x.id != id);
+                                                                    session.write().toast = Some("Back in your folder.".to_owned());
+                                                                }
+                                                                Err(err) => {
+                                                                    session.write().toast = Some(format!("Could not unsnooze: {err}"));
+                                                                }
+                                                            }
+                                                        });
+                                                    },
+                                                    "Unsnooze"
+                                                }
                                             }
                                         }
                                     }
@@ -1047,31 +1741,25 @@ pub fn MailView(session: Signal<Session>) -> Element {
                         div { class: "mail-search-box",
                             Icon { name: "search", size: 14 }
                             input {
+                                id: "mail-search",
                                 class: "input mail-search-input",
                                 r#type: "text",
-                                placeholder: "Search folder (Enter)",
+                                placeholder: "Search (from: to: subject: is:unread has:attachment)",
                                 "aria-label": "Search messages",
                                 value: "{search_input}",
                                 oninput: move |e| search_input.set(e.value()),
                                 onkeydown: move |e: KeyboardEvent| {
                                     if e.key() == Key::Enter && !e.is_composing() {
                                         let q = search_input().trim().to_owned();
-                                        active_search.set(q.clone());
-                                        load_folder_and_messages(
-                                            session,
-                                            account(),
-                                            folder(),
-                                            q,
-                                            folders,
-                                            messages,
-                                            selected_msg,
-                                            loading_list,
-                                            error,
-                                        );
+                                        let mut active_search = active_search;
+                                        active_search.set(q);
+                                        reload(ctx);
+                                    } else if e.key() == Key::Escape {
+                                        search_help_open.set(false);
                                     }
                                 },
                             }
-                            if !search_input().is_empty() || !active_search().is_empty() {
+                            if !search_input().is_empty() || search_active {
                                 button {
                                     class: "icon-btn sm",
                                     r#type: "button",
@@ -1079,22 +1767,59 @@ pub fn MailView(session: Signal<Session>) -> Element {
                                     "aria-label": "Clear search",
                                     onclick: move |_| {
                                         search_input.set(String::new());
+                                        let mut active_search = active_search;
                                         active_search.set(String::new());
-                                        load_folder_and_messages(
-                                            session,
-                                            account(),
-                                            folder(),
-                                            String::new(),
-                                            folders,
-                                            messages,
-                                            selected_msg,
-                                            loading_list,
-                                            error,
-                                        );
+                                        reload(ctx);
                                     },
                                     Icon { name: "x", size: 13 }
                                 }
                             }
+                            if search_active && !already_saved {
+                                button {
+                                    class: "icon-btn sm",
+                                    r#type: "button",
+                                    title: "Save this search",
+                                    "aria-label": "Save this search",
+                                    onclick: move |_| {
+                                        let q = active_search().trim().to_owned();
+                                        let name: String = q.chars().take(40).collect();
+                                        spawn(async move {
+                                            let res = run_mail_job(session, move |c| {
+                                                c.mail_create_saved_search(&name, &q)
+                                            })
+                                            .await;
+                                            match res {
+                                                Ok(saved) => {
+                                                    saved_searches.write().push(saved);
+                                                    session.write().toast = Some("Search saved.".to_owned());
+                                                }
+                                                Err(err) => {
+                                                    session.write().toast = Some(format!("Could not save the search: {err}"));
+                                                }
+                                            }
+                                        });
+                                    },
+                                    Icon { name: "plus", size: 13 }
+                                }
+                            }
+                            button {
+                                class: if search_help_open() { "icon-btn sm active" } else { "icon-btn sm" },
+                                r#type: "button",
+                                title: "Search tips",
+                                "aria-label": "Search tips",
+                                "aria-expanded": if search_help_open() { "true" } else { "false" },
+                                onclick: move |_| search_help_open.set(!search_help_open()),
+                                Icon { name: "alert-circle", size: 13 }
+                            }
+                        }
+                        button {
+                            class: "icon-btn",
+                            r#type: "button",
+                            title: if threads_on() { "Showing conversations" } else { "Showing single messages" },
+                            "aria-label": "Group messages into conversations",
+                            "aria-pressed": if threads_on() { "true" } else { "false" },
+                            onclick: move |_| threads_on.set(!threads_on()),
+                            Icon { name: "threads", size: 15 }
                         }
                         button {
                             class: "icon-btn",
@@ -1102,22 +1827,26 @@ pub fn MailView(session: Signal<Session>) -> Element {
                             title: "Refresh",
                             "aria-label": "Refresh messages",
                             disabled: loading_list(),
-                            onclick: move |_| {
-                                load_folder_and_messages(
-                                    session,
-                                    account(),
-                                    folder(),
-                                    active_search(),
-                                    folders,
-                                    messages,
-                                    selected_msg,
-                                    loading_list,
-                                    error,
-                                );
-                            },
+                            onclick: move |_| reload(ctx),
                             Icon { name: "refresh", size: 15 }
                         }
                     }
+
+                    if search_help_open() {
+                        div { class: "mail-search-help", role: "note",
+                            p { class: "tiny muted", "Combine words with these filters:" }
+                            ul {
+                                li { code { "from:anna" } " sender" }
+                                li { code { "to:bob" } " recipient" }
+                                li { code { "subject:invoice" } " subject" }
+                                li { code { "is:unread" } " or " code { "is:starred" } }
+                                li { code { "has:attachment" } " with a file" }
+                                li { code { "after:2026-01-01" } " and " code { "before:2026-06-30" } }
+                            }
+                        }
+                    }
+
+                    BulkBar { ctx }
 
                     div { class: "mail-filter-bar", role: "tablist", "aria-label": "Filter messages",
                         for (tab, label) in [
@@ -1131,7 +1860,10 @@ pub fn MailView(session: Signal<Session>) -> Element {
                                 r#type: "button",
                                 role: "tab",
                                 "aria-selected": if filter() == tab { "true" } else { "false" },
-                                onclick: move |_| filter.set(tab),
+                                onclick: move |_| {
+                                    let mut filter = filter;
+                                    filter.set(tab);
+                                },
                                 "{label}"
                             }
                         }
@@ -1140,105 +1872,58 @@ pub fn MailView(session: Signal<Session>) -> Element {
                     if let Some(err) = error() {
                         div { class: "banner err mail-banner", role: "alert",
                             span { class: "grow", "{err}" }
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                onclick: move |_| reload(ctx),
+                                "Try again"
+                            }
                         }
                     }
 
-                    div { class: "mail-list-scroll",
-                        if loading_list() {
-                            div { class: "mail-list-empty muted", "Loading messages\u{2026}" }
-                        } else if visible_messages.is_empty() {
-                            div { class: "mail-list-empty muted",
-                                if !active_search().is_empty() {
-                                    "No messages match your search."
+                    div { class: "mail-list-scroll", role: "listbox", "aria-label": "Messages", "aria-multiselectable": "true",
+                        if loading_list() && messages().is_empty() {
+                            RowSkeletons {}
+                        } else if items.is_empty() {
+                            div { class: "mail-list-empty",
+                                if search_active {
+                                    Icon { name: "search", size: 22 }
+                                    p { class: "muted", "No messages match your search." }
+                                    p { class: "tiny muted", "Try fewer words, or search the whole mailbox from another folder." }
+                                } else if filter() != MailFilter::All {
+                                    Icon { name: "check", size: 22 }
+                                    p { class: "muted", "Nothing here with this filter." }
                                 } else {
-                                    "No messages in this view."
+                                    Icon { name: "check", size: 22 }
+                                    p { class: "muted", "You are all caught up." }
+                                    p { class: "tiny muted", "No messages in this folder." }
                                 }
                             }
                         } else {
-                            for msg in visible_messages.iter() {
+                            for item in items.iter() {
                                 {
-                                    let uid = msg.uid;
-                                    let unread = is_unread(msg);
-                                    let starred = is_starred(msg);
-                                    let has_attach = !msg.attachments.is_empty();
-                                    let selected = current_uid == Some(uid);
-                                    let sender = if msg.from.trim().is_empty() {
-                                        "(Unknown sender)".to_owned()
-                                    } else {
-                                        msg.from.clone()
-                                    };
-                                    let subject = if msg.subject.trim().is_empty() {
-                                        "(No subject)".to_owned()
-                                    } else {
-                                        msg.subject.clone()
-                                    };
-                                    let date = msg.date.clone();
-                                    rsx! {
-                                        div {
-                                            key: "{uid}",
-                                            class: if selected {
-                                                "mail-row selected"
-                                            } else if unread {
-                                                "mail-row unread"
-                                            } else {
-                                                "mail-row"
-                                            },
-                                            onclick: move |_| {
-                                                confirm_delete.set(false);
-                                                move_menu_open.set(false);
-                                                reader_html_mode.set(true);
-                                                load_full_message(
-                                                    session,
-                                                    account(),
-                                                    folder(),
-                                                    uid,
-                                                    false,
-                                                    messages,
-                                                    selected_msg,
-                                                    remote_images_loaded,
-                                                    loading_reader,
-                                                    error,
-                                                );
-                                            },
-                                            div { class: "mail-row-top",
-                                                span { class: if unread { "mail-unread-dot active" } else { "mail-unread-dot" } }
-                                                span { class: "mail-row-sender", "{sender}" }
-                                                span { class: "mail-row-date", "{date}" }
-                                            }
-                                            div { class: "mail-row-bottom",
-                                                span { class: "mail-row-subject", "{subject}" }
-                                                div { class: "mail-row-badges",
-                                                    if has_attach {
-                                                        span { class: "mail-row-attach", title: "Has attachments",
-                                                            Icon { name: "paperclip", size: 13 }
+                                    match item {
+                                        ListItem::Day(label) => rsx! {
+                                            DayHeader { key: "day-{label}", label: label.to_string() }
+                                        },
+                                        ListItem::Row(msg, info) => {
+                                            let info = *info;
+                                            let thread_key = msg.thread_key.clone();
+                                            rsx! {
+                                                MailRow {
+                                                    key: "{msg.uid}",
+                                                    ctx,
+                                                    msg: (**msg).clone(),
+                                                    thread: info,
+                                                    order: order.clone(),
+                                                    now,
+                                                    offset,
+                                                    on_toggle_thread: move |_| {
+                                                        let mut set = expanded.write();
+                                                        if !set.remove(&thread_key) {
+                                                            set.insert(thread_key.clone());
                                                         }
-                                                    }
-                                                    button {
-                                                        class: if starred { "mail-star-btn starred" } else { "mail-star-btn" },
-                                                        r#type: "button",
-                                                        title: if starred { "Unstar" } else { "Star" },
-                                                        "aria-label": if starred { "Unstar message" } else { "Star message" },
-                                                        onclick: move |e: MouseEvent| {
-                                                            e.stop_propagation();
-                                                            let next_star = !starred;
-                                                            update_message_flags_in_list(&mut messages.write(), uid, "\\Flagged", next_star);
-                                                            if let Some(ref mut cur) = *selected_msg.write()
-                                                                && cur.uid == uid
-                                                            {
-                                                                toggle_flag_local(cur, "\\Flagged", next_star);
-                                                            }
-                                                            let acct = account();
-                                                            let fold = folder();
-                                                            spawn(async move {
-                                                                if let Err(err) = run_mail_job(session, move |c| {
-                                                                    c.mail_flag(acct.as_deref(), &fold, uid, None, Some(next_star))
-                                                                }).await {
-                                                                    session.write().toast = Some(format!("Could not update star: {err}"));
-                                                                }
-                                                            });
-                                                        },
-                                                        Icon { name: "star", size: 14 }
-                                                    }
+                                                    },
                                                 }
                                             }
                                         }
@@ -1250,7 +1935,9 @@ pub fn MailView(session: Signal<Session>) -> Element {
                 }
             }
 
-            // Right pane: scheduled item detail OR message reader
+            div { class: "mail-resizer", "data-resize": "list", role: "separator", "aria-orientation": "vertical", "aria-label": "Resize message list" }
+
+            // Right pane
             section { class: "mail-reader-pane", "aria-label": "Message reader",
                 if is_scheduled_view {
                     if let Some(item) = selected_scheduled() {
@@ -1286,7 +1973,7 @@ pub fn MailView(session: Signal<Session>) -> Element {
                                         }
                                         div { class: "mail-meta-row",
                                             span { class: "mail-meta-key", "Send" }
-                                            span { class: "mail-meta-val", "{format_unix_rfc3339(item.send_at.max(0) as u64)} ({item.status})" }
+                                            span { class: "mail-meta-val", "{full_date_label(item.send_at, offset)} ({item.status})" }
                                         }
                                     }
 
@@ -1318,9 +2005,10 @@ pub fn MailView(session: Signal<Session>) -> Element {
                                                             r#type: "button",
                                                             disabled: normalize_custom_datetime(&reschedule_input()).is_none(),
                                                             onclick: move |_| {
-                                                                let Some(send_at) = normalize_custom_datetime(&reschedule_input()) else {
+                                                                let Some(local_at) = normalize_custom_datetime(&reschedule_input()) else {
                                                                     return;
                                                                 };
+                                                                let send_at = local_at - offset * 60;
                                                                 let id = item_id.clone();
                                                                 let row_id = item_id.clone();
                                                                 reschedule_open.set(false);
@@ -1350,6 +2038,8 @@ pub fn MailView(session: Signal<Session>) -> Element {
                                                     }
                                                 }
                                             }
+                                        }
+                                        if is_pending {
                                             button {
                                                 class: "btn danger sm",
                                                 r#type: "button",
@@ -1399,390 +2089,51 @@ pub fn MailView(session: Signal<Session>) -> Element {
                             p { "Select a scheduled email to inspect or reschedule." }
                         }
                     }
+                } else if is_snoozed_view {
+                    div { class: "mail-reader-empty muted",
+                        Icon { name: "history", size: 24 }
+                        p { "Snoozed messages leave your list and come back, unread, at the time you chose." }
+                    }
                 } else if loading_reader() {
-                    div { class: "mail-reader-empty muted", "Loading message\u{2026}" }
-                } else if let Some(msg) = selected_msg() {
-                    {
-                        let uid = msg.uid;
-                        let unread = is_unread(&msg);
-                        let starred = is_starred(&msg);
-                        let has_html = msg
-                            .body_html
-                            .as_deref()
-                            .is_some_and(|h| !h.trim().is_empty());
-                        let msg_reply = msg.clone();
-                        let msg_fwd = msg.clone();
-                        let msg_bot = msg.clone();
-                        let other_folders: Vec<String> = folders()
-                            .into_iter()
-                            .filter(|f| !f.eq_ignore_ascii_case(&folder()))
-                            .collect();
-                        rsx! {
-                            div { class: "mail-reader-head",
-                                h2 { class: "mail-reader-subject",
-                                    if msg.subject.trim().is_empty() {
-                                        "(No subject)"
-                                    } else {
-                                        "{msg.subject}"
-                                    }
-                                }
-                                div { class: "mail-reader-meta",
-                                    div { class: "mail-meta-row",
-                                        span { class: "mail-meta-key", "From" }
-                                        span { class: "mail-meta-val", "{msg.from}" }
-                                    }
-                                    if !msg.to.trim().is_empty() {
-                                        div { class: "mail-meta-row",
-                                            span { class: "mail-meta-key", "To" }
-                                            span { class: "mail-meta-val", "{msg.to}" }
-                                        }
-                                    }
-                                    div { class: "mail-meta-row",
-                                        span { class: "mail-meta-key", "Date" }
-                                        span { class: "mail-meta-val", "{msg.date}" }
-                                    }
-                                }
-
-                                div { class: "mail-reader-actions",
-                                    button {
-                                        class: "btn ghost sm",
-                                        r#type: "button",
-                                        onclick: move |_| compose.set(Some(ComposeState::reply_to(&msg_reply))),
-                                        Icon { name: "undo", size: 14 }
-                                        "Reply"
-                                    }
-                                    button {
-                                        class: "btn ghost sm",
-                                        r#type: "button",
-                                        onclick: move |_| compose.set(Some(ComposeState::forward_of(&msg_fwd))),
-                                        Icon { name: "external", size: 14 }
-                                        "Forward"
-                                    }
-                                    button {
-                                        class: if starred { "btn ghost sm mail-starred-active" } else { "btn ghost sm" },
-                                        r#type: "button",
-                                        onclick: move |_| {
-                                            let next_star = !starred;
-                                            update_message_flags_in_list(&mut messages.write(), uid, "\\Flagged", next_star);
-                                            if let Some(ref mut cur) = *selected_msg.write() {
-                                                toggle_flag_local(cur, "\\Flagged", next_star);
-                                            }
-                                            let acct = account();
-                                            let fold = folder();
-                                            spawn(async move {
-                                                if let Err(err) = run_mail_job(session, move |c| {
-                                                    c.mail_flag(acct.as_deref(), &fold, uid, None, Some(next_star))
-                                                }).await {
-                                                    session.write().toast = Some(format!("Could not update star: {err}"));
-                                                }
-                                            });
-                                        },
-                                        Icon { name: "star", size: 14 }
-                                        if starred { "Starred" } else { "Star" }
-                                    }
-                                    button {
-                                        class: "btn ghost sm",
-                                        r#type: "button",
-                                        onclick: move |_| {
-                                            let next_seen = unread;
-                                            update_message_flags_in_list(&mut messages.write(), uid, "\\Seen", next_seen);
-                                            if let Some(ref mut cur) = *selected_msg.write() {
-                                                toggle_flag_local(cur, "\\Seen", next_seen);
-                                            }
-                                            let acct = account();
-                                            let fold = folder();
-                                            spawn(async move {
-                                                if let Err(err) = run_mail_job(session, move |c| {
-                                                    c.mail_flag(acct.as_deref(), &fold, uid, Some(next_seen), None)
-                                                }).await {
-                                                    session.write().toast = Some(format!("Could not update read state: {err}"));
-                                                }
-                                            });
-                                        },
-                                        if unread { "Mark read" } else { "Mark unread" }
-                                    }
-
-                                    div { class: "mail-move-wrap",
-                                        button {
-                                            class: "btn ghost sm",
-                                            r#type: "button",
-                                            onclick: move |_| {
-                                                let open = !move_menu_open();
-                                                if open && move_target().is_empty()
-                                                    && let Some(first) = other_folders.first()
-                                                {
-                                                    move_target.set(first.clone());
-                                                }
-                                                move_menu_open.set(open);
-                                            },
-                                            Icon { name: "folder", size: 14 }
-                                            "Move to"
-                                        }
-                                        if move_menu_open() {
-                                            div { class: "mail-move-popover",
-                                                select {
-                                                    class: "input",
-                                                    "aria-label": "Destination folder",
-                                                    value: "{move_target}",
-                                                    onchange: move |e| move_target.set(e.value()),
-                                                    for f in other_folders.iter() {
-                                                        option { key: "{f}", value: "{f}", "{f}" }
-                                                    }
-                                                }
-                                                button {
-                                                    class: "btn primary sm",
-                                                    r#type: "button",
-                                                    disabled: move_target().trim().is_empty(),
-                                                    onclick: move |_| {
-                                                        let dest = move_target().trim().to_owned();
-                                                        move_menu_open.set(false);
-                                                        let acct = account();
-                                                        let fold = folder();
-                                                        spawn(async move {
-                                                            match run_mail_job(session, move |c| {
-                                                                c.mail_move(acct.as_deref(), &fold, uid, &dest)
-                                                            }).await {
-                                                                Ok(()) => {
-                                                                    messages.write().retain(|m| m.uid != uid);
-                                                                    selected_msg.set(None);
-                                                                    session.write().toast = Some("Message moved.".to_owned());
-                                                                }
-                                                                Err(err) => {
-                                                                    session.write().toast = Some(format!("Move failed: {err}"));
-                                                                }
-                                                            }
-                                                        });
-                                                    },
-                                                    "Move"
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    if confirm_delete() {
-                                        div { class: "mail-delete-confirm",
-                                            button {
-                                                class: "btn danger sm",
-                                                r#type: "button",
-                                                onclick: move |_| {
-                                                    confirm_delete.set(false);
-                                                    let acct = account();
-                                                    let fold = folder();
-                                                    spawn(async move {
-                                                        match run_mail_job(session, move |c| {
-                                                            c.mail_delete(acct.as_deref(), &fold, uid)
-                                                        }).await {
-                                                            Ok(()) => {
-                                                                messages.write().retain(|m| m.uid != uid);
-                                                                selected_msg.set(None);
-                                                                session.write().toast = Some("Message deleted.".to_owned());
-                                                            }
-                                                            Err(err) => {
-                                                                session.write().toast = Some(format!("Delete failed: {err}"));
-                                                            }
-                                                        }
-                                                    });
-                                                },
-                                                "Confirm delete"
-                                            }
-                                            button {
-                                                class: "btn ghost sm",
-                                                r#type: "button",
-                                                onclick: move |_| confirm_delete.set(false),
-                                                "Cancel"
-                                            }
-                                        }
-                                    } else {
-                                        button {
-                                            class: "btn ghost sm",
-                                            r#type: "button",
-                                            onclick: move |_| confirm_delete.set(true),
-                                            Icon { name: "trash", size: 14 }
-                                            "Delete"
-                                        }
-                                    }
-
-                                    if has_html {
-                                        div { class: "mail-format-pill", role: "group", "aria-label": "Message format",
-                                            button {
-                                                class: if reader_html_mode() { "seg-btn active" } else { "seg-btn" },
-                                                r#type: "button",
-                                                onclick: move |_| reader_html_mode.set(true),
-                                                "HTML"
-                                            }
-                                            button {
-                                                class: if !reader_html_mode() { "seg-btn active" } else { "seg-btn" },
-                                                r#type: "button",
-                                                onclick: move |_| reader_html_mode.set(false),
-                                                "Plain"
-                                            }
-                                        }
-                                    }
-
-                                    button {
-                                        class: "btn ghost sm mail-ask-bot-btn",
-                                        r#type: "button",
-                                        onclick: move |_| {
-                                            let prompt = format_ask_bot_prompt(
-                                                account().as_deref(),
-                                                &folder(),
-                                                &msg_bot,
-                                            );
-                                            let mut sess = session.write();
-                                            sess.composer = prompt;
-                                            sess.open_section(Section::Chat);
-                                        },
-                                        Icon { name: "robot", size: 14 }
-                                        "Ask bot"
-                                    }
-                                }
-                            }
-
-                            if msg.has_remote_images && !remote_images_loaded() {
-                                div { class: "mail-remote-img-banner",
-                                    span { class: "mail-remote-img-text", "Remote images blocked" }
-                                    span { class: "muted", "·" }
-                                    button {
-                                        class: "btn ghost sm",
-                                        r#type: "button",
-                                        onclick: move |_| {
-                                            load_full_message(
-                                                session,
-                                                account(),
-                                                folder(),
-                                                uid,
-                                                true,
-                                                messages,
-                                                selected_msg,
-                                                remote_images_loaded,
-                                                loading_reader,
-                                                error,
-                                            );
-                                        },
-                                        "Load remote images"
-                                    }
-                                }
-                            }
-
-                            div { class: "mail-reader-body",
-                                if has_html && reader_html_mode() {
-                                    if let Some(ref html) = msg.body_html {
-                                        iframe {
-                                            class: "mail-html-frame",
-                                            "sandbox": "",
-                                            srcdoc: "{wrap_email_html_srcdoc(html)}",
-                                            title: "Email HTML content",
-                                        }
-                                    }
-                                } else {
-                                    pre { class: "mail-plain-body", "{msg.body}" }
-                                }
-                            }
-
-                            if !msg.attachments.is_empty() {
-                                div { class: "mail-attachments",
-                                    h3 { class: "mail-attachments-title",
-                                        Icon { name: "paperclip", size: 14 }
-                                        "Attachments ({msg.attachments.len()})"
-                                    }
-                                    div { class: "mail-attachments-list",
-                                        for (idx, att) in msg.attachments.iter().enumerate() {
-                                            {
-                                                let att: MailAttachmentInfo = att.clone();
-                                                let name = if att.name.trim().is_empty() {
-                                                    format!("attachment-{idx}")
-                                                } else {
-                                                    att.name.clone()
-                                                };
-                                                let name_save = name.clone();
-                                                let size_label = format_bytes(att.size);
-                                                rsx! {
-                                                    div { key: "{idx}-{name}", class: "mail-attachment-row",
-                                                        div { class: "mail-attachment-info",
-                                                            span { class: "mail-attachment-name", "{name}" }
-                                                            span { class: "tiny muted", "{att.content_type} · {size_label}" }
-                                                        }
-                                                        div { class: "mail-attachment-actions",
-                                                            button {
-                                                                class: "btn ghost sm",
-                                                                r#type: "button",
-                                                                onclick: move |_| {
-                                                                    let acct = account();
-                                                                    let fold = folder();
-                                                                    let label = name_save.clone();
-                                                                    spawn(async move {
-                                                                        match run_mail_job(session, move |c| {
-                                                                            c.mail_save_attachment_to_library(acct.as_deref(), &fold, uid, idx)
-                                                                        }).await {
-                                                                            Ok(_) => {
-                                                                                session.write().toast = Some(format!("Saved {label} to Library."));
-                                                                            }
-                                                                            Err(err) => {
-                                                                                session.write().toast = Some(format!("Could not save to Library: {err}"));
-                                                                            }
-                                                                        }
-                                                                    });
-                                                                },
-                                                                Icon { name: "library", size: 13 }
-                                                                "Save to Library"
-                                                            }
-                                                            button {
-                                                                class: "btn ghost sm",
-                                                                r#type: "button",
-                                                                onclick: move |_| {
-                                                                    let acct = account();
-                                                                    let fold = folder();
-                                                                    let label = name.clone();
-                                                                    spawn(async move {
-                                                                        match run_mail_job(session, move |c| {
-                                                                            c.mail_attachment_bytes(acct.as_deref(), &fold, uid, idx)
-                                                                        }).await {
-                                                                            Ok(bytes) => {
-                                                                                match save_bytes_with_picker(&label, &bytes) {
-                                                                                    Ok(Some(path)) => {
-                                                                                        session.write().toast = Some(format!("Saved to {path}"));
-                                                                                    }
-                                                                                    Ok(None) => {}
-                                                                                    Err(err) => {
-                                                                                        session.write().toast = Some(err);
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                            Err(err) => {
-                                                                                session.write().toast = Some(format!("Download failed: {err}"));
-                                                                            }
-                                                                        }
-                                                                    });
-                                                                },
-                                                                Icon { name: "download", size: 13 }
-                                                                "Save to disk"
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                    div { class: "mail-reader-empty muted",
+                        span { class: "skeleton mail-skel-line wide" }
+                        span { class: "skeleton mail-skel-line" }
+                        span { class: "skeleton mail-skel-line wide" }
+                    }
+                } else if let Some(msg) = selected() {
+                    MailReader {
+                        key: "{msg.uid}",
+                        ctx,
+                        msg: msg.clone(),
+                        own_address: own_address.clone(),
+                        offset,
                     }
                 } else {
                     div { class: "mail-reader-empty muted",
                         Icon { name: "send", size: 24 }
-                        p { "Select a message to read." }
+                        p { "Select a message to read it." }
+                        p { class: "tiny", "Press ? for keyboard shortcuts." }
                     }
                 }
             }
+
+            UndoBar { ctx }
+            SnoozeDialog { ctx, now, offset }
+            ShortcutsDialog { open: shortcuts_open }
         }
 
         if let Some(draft) = compose() {
             MailComposeModal {
                 session,
+                ctx,
                 account: account(),
                 initial: draft,
-                on_close: move |_| compose.set(None),
+                on_close: move |_| {
+                    let mut compose = compose;
+                    compose.set(None);
+                },
                 on_sent: move |_| {
+                    let mut compose = compose;
                     compose.set(None);
                     if folder() == SCHEDULED_VIRTUAL_FOLDER {
                         load_scheduled_messages(
@@ -1790,18 +2141,6 @@ pub fn MailView(session: Signal<Session>) -> Element {
                             account(),
                             scheduled_items,
                             selected_scheduled,
-                            loading_list,
-                            error,
-                        );
-                    } else {
-                        load_folder_and_messages(
-                            session,
-                            account(),
-                            folder(),
-                            active_search(),
-                            folders,
-                            messages,
-                            selected_msg,
                             loading_list,
                             error,
                         );
@@ -1814,16 +2153,18 @@ pub fn MailView(session: Signal<Session>) -> Element {
             MailSignatureModal {
                 session,
                 account: account(),
-                account_status: active_account_status,
+                account_status: active_account_status.clone(),
                 on_close: move |_| signature_modal_open.set(false),
-                on_saved: move |(sig, sig_html, logo_hash): (Option<String>, Option<String>, Option<String>)| {
+                on_saved: move |(sig, sig_html, sig_logo): (Option<String>, Option<String>, Option<String>)| {
                     signature_modal_open.set(false);
+                    let acct_key = account().unwrap_or_default();
                     if let Some(ref mut st) = *mail_status.write() {
-                        let cur = account().unwrap_or_default();
-                        if let Some(acct_row) = st.accounts.iter_mut().find(|a| a.account == cur) {
-                            acct_row.signature = sig;
-                            acct_row.signature_html = sig_html;
-                            acct_row.signature_logo_hash = logo_hash;
+                        for a in st.accounts.iter_mut() {
+                            if a.account == acct_key {
+                                a.signature = sig.clone();
+                                a.signature_html = sig_html.clone();
+                                a.signature_logo_hash = sig_logo.clone();
+                            }
                         }
                     }
                 },
@@ -1832,9 +2173,53 @@ pub fn MailView(session: Signal<Session>) -> Element {
     }
 }
 
+fn compose_fingerprint(to: &str, cc: &str, subject: &str, body: &str) -> String {
+    format!("{to}\u{1}{cc}\u{1}{subject}\u{1}{body}")
+}
+
+/// Recipient suggestions under an address field.
+#[component]
+fn SuggestList(
+    items: Vec<MailContact>,
+    field: Signal<String>,
+    on_pick: EventHandler<()>,
+) -> Element {
+    let mut field = field;
+    rsx! {
+        div { class: "mail-suggest", role: "listbox", "aria-label": "Suggested recipients",
+            for c in items.iter() {
+                {
+                    let email = c.email.clone();
+                    let label = if c.name.trim().is_empty() {
+                        c.email.clone()
+                    } else {
+                        format!("{} <{}>", c.name, c.email)
+                    };
+                    rsx! {
+                        button {
+                            key: "{email}",
+                            class: "mail-suggest-item",
+                            r#type: "button",
+                            role: "option",
+                            onmousedown: move |e: MouseEvent| {
+                                e.prevent_default();
+                                let next = apply_suggestion(&field(), &email);
+                                field.set(next);
+                                on_pick.call(());
+                            },
+                            "{label}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[component]
 fn MailComposeModal(
     session: Signal<Session>,
+    ctx: MailCtx,
     account: Option<String>,
     initial: ComposeState,
     on_close: EventHandler<()>,
@@ -1859,6 +2244,13 @@ fn MailComposeModal(
     let mut custom_send_at = use_signal(String::new);
     let mut sending = use_signal(|| false);
     let mut send_error = use_signal(|| Option::<String>::None);
+    let mut suggestions = use_signal(Vec::<MailContact>::new);
+    let mut suggest_field = use_signal(|| 0u8);
+    let mut suggest_seen = use_signal(String::new);
+    let mut draft_uid = use_signal(|| Option::<u32>::None);
+    let mut draft_folder = use_signal(String::new);
+    let mut draft_state = use_signal(|| "");
+    let mut finished = use_signal(|| false);
 
     let modal_title = match initial.mode {
         ComposeMode::New => "New message",
@@ -1906,8 +2298,30 @@ fn MailComposeModal(
         let subj = subject();
         let (plain_body, body_html) = compose_to_body_and_html(&body(), html_mode());
         let hashes: Vec<String> = selected_hashes().into_iter().collect();
+        // Attachments cannot ride through the server-side hold, so those send at once.
+        let can_hold = hashes.is_empty();
+        let hold_at = now_unix_secs() as i64 + SEND_HOLD_SECS;
+        let acct_del = acct.clone();
+        let old_draft = draft_uid().map(|uid| (draft_folder(), uid));
         spawn(async move {
             let res = run_mail_job(session, move |c| {
+                if can_hold {
+                    match c.mail_send_with_undo(
+                        acct.as_deref(),
+                        &recipients,
+                        &cc_list,
+                        &bcc_list,
+                        &subj,
+                        &plain_body,
+                        body_html.clone(),
+                        hold_at,
+                    ) {
+                        Ok(item) => return Ok(Some(item.id)),
+                        // A clock that disagrees with the server: send straight away.
+                        Err(e) if e.to_string().contains("hold") => {}
+                        Err(e) => return Err(e),
+                    }
+                }
                 c.mail_send(
                     acct.as_deref(),
                     &recipients,
@@ -1917,13 +2331,26 @@ fn MailComposeModal(
                     &plain_body,
                     body_html,
                     &hashes,
-                )
+                )?;
+                Ok(None)
             })
             .await;
             sending.set(false);
             match res {
-                Ok(()) => {
-                    session.write().toast = Some("Email sent.".to_owned());
+                Ok(held) => {
+                    finished.set(true);
+                    match held {
+                        Some(id) => announce(
+                            ctx,
+                            "Message sent".to_owned(),
+                            UndoKind::Send { scheduled_id: id },
+                            ((SEND_HOLD_SECS - 1) * 1000) as u32,
+                        ),
+                        None => session.write().toast = Some("Email sent.".to_owned()),
+                    }
+                    if let Some((folder, uid)) = old_draft {
+                        queue_draft_delete(acct_del, folder, uid);
+                    }
                     on_sent.call(());
                 }
                 Err(err) => send_error.set(Some(err)),
@@ -1963,6 +2390,7 @@ fn MailComposeModal(
             sending.set(false);
             match res {
                 Ok(item) => {
+                    finished.set(true);
                     session.write().toast = Some(format!(
                         "Email scheduled for {}.",
                         format_unix_rfc3339(item.send_at.max(0) as u64)
@@ -1972,6 +2400,79 @@ fn MailComposeModal(
                 Err(err) => send_error.set(Some(err)),
             }
         });
+    });
+
+    let refresh_suggestions = Callback::new(move |(field, value): (u8, String)| {
+        let Some(q) = suggestion_query(&value) else {
+            suggestions.set(Vec::new());
+            return;
+        };
+        suggest_field.set(field);
+        suggest_seen.set(q.clone());
+        spawn(async move {
+            let q_job = q.clone();
+            let res = run_mail_job(session, move |c| c.mail_contacts(&q_job, 6)).await;
+            if suggest_seen() == q {
+                suggestions.set(res.unwrap_or_default());
+            }
+        });
+    });
+
+    // Save a draft to the mailbox's Drafts folder once typing has paused for a few
+    // seconds, replacing the previous autosave.
+    let account_for_draft = account.clone();
+    let fp_start = compose_fingerprint(&initial.to, &initial.cc, &initial.subject, &initial.body);
+    use_future(move || {
+        let acct = account_for_draft.clone();
+        let start = fp_start.clone();
+        async move {
+            let mut saved_fp = start.clone();
+            let mut last_seen = start;
+            loop {
+                sleep_ms(3000).await;
+                if *finished.peek() {
+                    break;
+                }
+                let fp = compose_fingerprint(&to.peek(), &cc.peek(), &subject.peek(), &body.peek());
+                if fp != last_seen {
+                    last_seen = fp;
+                    continue;
+                }
+                if fp == saved_fp || *sending.peek() {
+                    continue;
+                }
+                let (plain, html) = compose_to_body_and_html(&body.peek(), *html_mode.peek());
+                let req = MailDraftRequest {
+                    account: acct.clone(),
+                    folder: None,
+                    replace_uid: *draft_uid.peek(),
+                    to: parse_recipients(&to.peek()),
+                    cc: parse_recipients(&cc.peek()),
+                    subject: (*subject.peek()).clone(),
+                    body: plain,
+                    body_html: html,
+                };
+                draft_state.set("Saving draft\u{2026}");
+                let res = run_mail_job(session, move |c| c.mail_save_draft(&req)).await;
+                // One attempt per edit: a failing server is not retried until the next change.
+                saved_fp = fp;
+                match res {
+                    Ok(saved) => {
+                        if *finished.peek() {
+                            // The message went out while this save was in flight.
+                            if let Some(uid) = saved.uid {
+                                queue_draft_delete(acct.clone(), saved.folder.clone(), uid);
+                            }
+                            break;
+                        }
+                        draft_uid.set(saved.uid);
+                        draft_folder.set(saved.folder);
+                        draft_state.set("Draft saved");
+                    }
+                    Err(_) => draft_state.set("Draft not saved"),
+                }
+            }
+        }
     });
 
     let (_, preview_html_opt) = compose_to_body_and_html(&body(), true);
@@ -1984,6 +2485,11 @@ fn MailComposeModal(
             role: "dialog",
             "aria-modal": "true",
             "aria-label": "{modal_title}",
+            onkeydown: move |e: KeyboardEvent| {
+                if e.key() == Key::Escape {
+                    on_close.call(());
+                }
+            },
             div { class: "mp-sheet-head",
                 h2 { class: "mp-sheet-title", "{modal_title}" }
                 button {
@@ -2013,7 +2519,19 @@ fn MailComposeModal(
                         placeholder: "alice@example.com, bob@example.com",
                         disabled: sending(),
                         value: "{to}",
-                        oninput: move |e| to.set(e.value()),
+                        oninput: move |e| {
+                            let v = e.value();
+                            to.set(v.clone());
+                            refresh_suggestions.call((1, v));
+                        },
+                        onblur: move |_| suggestions.set(Vec::new()),
+                    }
+                    if suggest_field() == 1 && !suggestions().is_empty() {
+                        SuggestList {
+                            items: suggestions(),
+                            field: to,
+                            on_pick: move |_| suggestions.set(Vec::new()),
+                        }
                     }
                 }
                 if show_cc_bcc() {
@@ -2027,7 +2545,19 @@ fn MailComposeModal(
                                 placeholder: "cc@example.com",
                                 disabled: sending(),
                                 value: "{cc}",
-                                oninput: move |e| cc.set(e.value()),
+                                oninput: move |e| {
+                                    let v = e.value();
+                                    cc.set(v.clone());
+                                    refresh_suggestions.call((2, v));
+                                },
+                                onblur: move |_| suggestions.set(Vec::new()),
+                            }
+                            if suggest_field() == 2 && !suggestions().is_empty() {
+                                SuggestList {
+                                    items: suggestions(),
+                                    field: cc,
+                                    on_pick: move |_| suggestions.set(Vec::new()),
+                                }
                             }
                         }
                         div { class: "field",
@@ -2039,7 +2569,19 @@ fn MailComposeModal(
                                 placeholder: "bcc@example.com",
                                 disabled: sending(),
                                 value: "{bcc}",
-                                oninput: move |e| bcc.set(e.value()),
+                                oninput: move |e| {
+                                    let v = e.value();
+                                    bcc.set(v.clone());
+                                    refresh_suggestions.call((3, v));
+                                },
+                                onblur: move |_| suggestions.set(Vec::new()),
+                            }
+                            if suggest_field() == 3 && !suggestions().is_empty() {
+                                SuggestList {
+                                    items: suggestions(),
+                                    field: bcc,
+                                    on_pick: move |_| suggestions.set(Vec::new()),
+                                }
                             }
                         }
                     }
@@ -2249,6 +2791,7 @@ fn MailComposeModal(
                 }
 
                 div { class: "card-actions mail-compose-actions",
+                    span { class: "tiny muted mail-draft-state", role: "status", "{draft_state}" }
                     button {
                         class: "btn ghost",
                         r#type: "button",
@@ -2782,6 +3325,7 @@ mod tests {
             body_html: None,
             has_remote_images: false,
             attachments: vec![],
+            ..Default::default()
         }
     }
 
@@ -2932,5 +3476,78 @@ mod tests {
         assert!(plain.contains("CEO · Acme"));
         assert!(html.contains("https://acme.example"));
         assert!(html.contains("data:image/png;base64,AA"));
+    }
+
+    #[test]
+    fn flags_match_with_or_without_the_backslash() {
+        // The server reports `Seen`; older UI code wrote `\\Seen`.
+        let mut msg = sample_msg(1, &["Seen", "Flagged"]);
+        toggle_flag_local(&mut msg, "\\Seen", false);
+        assert!(is_unread(&msg));
+        toggle_flag_local(&mut msg, "\\Seen", true);
+        assert!(!is_unread(&msg));
+        toggle_flag_local(&mut msg, "\\Flagged", false);
+        assert!(!is_starred(&msg));
+        assert_eq!(msg.flags, vec!["Seen".to_owned()]);
+    }
+
+    #[test]
+    fn reply_all_keeps_others_and_drops_self_sender_and_duplicates() {
+        let mut msg = sample_msg(1, &[]);
+        msg.from = "Alice <alice@example.test>".into();
+        msg.to = "me@example.test, Bob <bob@example.test>".into();
+        msg.cc = "carol@example.test, ME@example.test, alice@example.test".into();
+        let draft = ComposeState::reply_all(&msg, "me@example.test");
+        assert_eq!(draft.to, "alice@example.test");
+        assert_eq!(draft.cc, "bob@example.test, carol@example.test");
+        assert!(draft.subject.starts_with("Re: "));
+    }
+
+    #[test]
+    fn list_items_group_conversations_and_add_day_headings() {
+        let mk = |uid: u32, key: &str, date: &str| MailMessageInfo {
+            thread_key: key.into(),
+            date: date.into(),
+            ..sample_msg(uid, &[])
+        };
+        let rows = vec![
+            mk(5, "t1", "Wed, 25 Nov 2026 09:00:00 +0000"),
+            mk(4, "t2", "Wed, 25 Nov 2026 08:00:00 +0000"),
+            mk(3, "t1", "Mon, 23 Nov 2026 08:00:00 +0000"),
+        ];
+        let now = 1_795_600_800; // Wed 25 Nov 2026 10:00 UTC
+        let summary = |items: &[ListItem]| -> Vec<String> {
+            items
+                .iter()
+                .map(|item| match item {
+                    ListItem::Day(label) => format!("day:{label}"),
+                    ListItem::Row(msg, info) => {
+                        format!("{}:{}:{}", msg.uid, info.count, info.is_child)
+                    }
+                })
+                .collect()
+        };
+        let folded = build_list_items(&rows, true, &BTreeSet::new(), now, 0);
+        assert_eq!(
+            summary(&folded),
+            vec!["day:Today", "5:2:false", "4:1:false"]
+        );
+        let open: BTreeSet<String> = ["t1".to_owned()].into();
+        let expanded = build_list_items(&rows, true, &open, now, 0);
+        assert_eq!(
+            summary(&expanded),
+            vec!["day:Today", "5:2:false", "3:1:true", "4:1:false"]
+        );
+        let flat = build_list_items(&rows, false, &BTreeSet::new(), now, 0);
+        assert_eq!(
+            summary(&flat),
+            vec![
+                "day:Today",
+                "5:0:false",
+                "4:0:false",
+                "day:This week",
+                "3:0:false"
+            ]
+        );
     }
 }

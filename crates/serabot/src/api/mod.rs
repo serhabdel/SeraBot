@@ -70,6 +70,7 @@ mod library;
 mod local;
 mod logs;
 mod mail;
+mod mail_extras;
 mod marketplace;
 mod media;
 mod memories;
@@ -892,6 +893,7 @@ pub fn router(state: ApiState) -> Router {
         .merge(files::routes())
         .merge(projects::routes())
         .merge(mail::routes())
+        .merge(mail_extras::routes())
         .merge(library::routes())
         .merge(local::routes())
         .layer(middleware::from_fn_with_state(shared.clone(), rate_limit))

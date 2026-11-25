@@ -26,25 +26,84 @@ pub fn SettingsNav(session: Signal<Session>) -> Element {
             .is_some_and(|view| view.mem0.available);
         (s.settings_section, s.can_admin(), mem0_available)
     };
+    let mut query = use_signal(String::new);
+    let needle = query().trim().to_owned();
+    // While searching, one ranked list replaces the groups.
+    let mut found: Vec<(i32, SettingsSection)> = SettingsSection::ALL
+        .into_iter()
+        .filter(|s| s.visible_with_memory(is_admin, mem0_available))
+        .filter_map(|s| {
+            serabot_desktop::picker_search::best_score(
+                &needle,
+                &[(s.label(), 4), (s.description(), 2), (s.keywords(), 1)],
+            )
+            .map(|score| (score, s))
+        })
+        .collect();
+    found.sort_by_key(|a| std::cmp::Reverse(a.0));
+    let first_hit = found.first().map(|(_, section)| *section);
     rsx! {
         nav { class: "settings-nav", "aria-label": "Settings sections",
-            for group in SettingsGroup::ALL {
-                {
-                    let items: Vec<SettingsSection> = SettingsSection::ALL
-                        .into_iter()
-                        .filter(|s| s.group() == group && s.visible_with_memory(is_admin, mem0_available))
-                        .collect();
-                    rsx! {
-                        if !items.is_empty() {
-                            div { key: "{group.label()}", class: "settings-nav-group",
-                                div { class: "settings-nav-group-label", "{group.label()}" }
-                                for section in items {
-                                    button {
-                                        key: "{section.label()}",
-                                        class: if current == section { "settings-nav-item on" } else { "settings-nav-item" },
-                                        "aria-current": if current == section { "page" } else { "false" },
-                                        onclick: move |_| session.write().open_settings_section(section),
-                                        "{section.label()}"
+            div { class: "settings-search",
+                input {
+                    id: "settings-search",
+                    class: "input",
+                    r#type: "search",
+                    placeholder: "Search settings\u{2026}",
+                    "aria-label": "Search settings",
+                    value: "{query}",
+                    oninput: move |e| query.set(e.value()),
+                    onkeydown: move |e: KeyboardEvent| {
+                        if e.key() == Key::Escape {
+                            query.set(String::new());
+                        } else if e.key() == Key::Enter
+                            && let Some(first) = first_hit
+                        {
+                            query.set(String::new());
+                            session.write().open_settings_section(first);
+                        }
+                    },
+                }
+            }
+            if !needle.is_empty() {
+                div { class: "settings-nav-group", role: "list",
+                    if found.is_empty() {
+                        div { class: "settings-nav-empty muted", "No setting matches \"{needle}\"." }
+                    }
+                    for (_, section) in found.iter().copied() {
+                        button {
+                            key: "{section.label()}",
+                            class: if current == section { "settings-nav-item on" } else { "settings-nav-item" },
+                            "aria-current": if current == section { "page" } else { "false" },
+                            onclick: move |_| {
+                                query.set(String::new());
+                                session.write().open_settings_section(section);
+                            },
+                            span { class: "settings-nav-label", "{section.label()}" }
+                            span { class: "settings-nav-desc", "{section.description()}" }
+                        }
+                    }
+                }
+            } else {
+                for group in SettingsGroup::ALL {
+                    {
+                        let items: Vec<SettingsSection> = SettingsSection::ALL
+                            .into_iter()
+                            .filter(|s| s.group() == group && s.visible_with_memory(is_admin, mem0_available))
+                            .collect();
+                        rsx! {
+                            if !items.is_empty() {
+                                div { key: "{group.label()}", class: "settings-nav-group",
+                                    div { class: "settings-nav-group-label", "{group.label()}" }
+                                    for section in items {
+                                        button {
+                                            key: "{section.label()}",
+                                            class: if current == section { "settings-nav-item on" } else { "settings-nav-item" },
+                                            "aria-current": if current == section { "page" } else { "false" },
+                                            onclick: move |_| session.write().open_settings_section(section),
+                                            span { class: "settings-nav-label", "{section.label()}" }
+                                            span { class: "settings-nav-desc", "{section.description()}" }
+                                        }
                                     }
                                 }
                             }

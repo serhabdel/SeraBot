@@ -1,0 +1,163 @@
+/* ===== Shared UX layer 0.74.14 =====
+   Loaded last. It adds the design tokens that were missing (spacing, a named
+   focus ring), one keyboard focus style for every control, and the pieces of the
+   model picker and Settings search added in this release. Nothing here changes a
+   colour or radius that already exists. */
+
+:root {
+  /* Spacing scale (4px base). New code uses these instead of ad-hoc pixels. */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  /* Keyboard focus ring: one look everywhere. */
+  --focus-ring: 2px solid var(--accent);
+  --focus-offset: 2px;
+}
+
+/* One focus-visible style for anything a keyboard user can reach. Controls that
+   draw their own ring keep it (they set outline themselves). */
+:where(button, [role="button"], a[href], summary, select, input, textarea, [tabindex]:not([tabindex="-1"])):focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-offset);
+}
+
+/* Reduced motion: honour the OS setting as well as the in-app switch. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ---- model picker: favorites ---- */
+
+.model-title-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.model-title-line .model-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.model-fav {
+  margin-left: auto;
+  display: inline-grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--r-xs);
+  color: var(--label-3);
+  opacity: 0.35;
+  cursor: pointer;
+  transition:
+    opacity var(--dur-1) var(--ease),
+    color var(--dur-1) var(--ease);
+}
+
+.model-pop-item:hover .model-fav,
+.model-pop-item.active .model-fav,
+.model-fav.on {
+  opacity: 1;
+}
+
+.model-fav:hover {
+  background: var(--hover);
+  color: var(--label-1);
+}
+
+.model-fav.on {
+  color: var(--warn);
+}
+
+.model-fav.on svg {
+  fill: currentColor;
+}
+
+/* A small window gets one column: the provider rail becomes a row of tabs. */
+@media (max-width: 720px) {
+  .model-pop-grid {
+    grid-template-columns: 1fr;
+  }
+  .model-pop-rail {
+    flex-direction: row;
+    overflow-x: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .model-pop-rail .model-rail-item {
+    flex: none;
+  }
+}
+
+/* ---- Settings: search and descriptions ---- */
+
+.settings-search {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: var(--sp-2) var(--sp-2) var(--sp-3);
+  background: var(--surface);
+}
+
+.settings-nav-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+}
+
+.settings-nav-label {
+  color: inherit;
+}
+
+.settings-nav-desc {
+  color: var(--label-3);
+  font-size: var(--fs-micro);
+  font-weight: 400;
+  line-height: 1.3;
+  text-align: left;
+}
+
+.settings-nav-item.on .settings-nav-desc {
+  color: var(--label-2);
+}
+
+.settings-nav-empty {
+  padding: var(--sp-3);
+  font-size: var(--fs-body-2);
+}
+
+/* ---- command palette: keep the active row readable ---- */
+
+.palette-item.active {
+  outline: 0;
+}
+
+.palette-item:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: -2px;
+}
+
+/* ---- chat: code blocks ---- */
+
+.md-code-block.wrapped pre,
+.md-code-block.wrapped code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.md-code-wrap.on {
+  color: var(--accent-ink);
+}

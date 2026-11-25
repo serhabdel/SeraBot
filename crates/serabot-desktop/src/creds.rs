@@ -75,6 +75,10 @@ pub struct UiPrefs {
     /// Show `:::hand` notes in a handwriting font (0.74.3). Off renders
     /// them as plain paragraphs. Local only, like the rest of `UiPrefs`.
     pub handwritten_notes: bool,
+    /// Models starred in the picker, as `provider|model` (0.74.14).
+    pub favorite_models: Vec<String>,
+    /// Models chosen lately, newest first (0.74.14).
+    pub recent_models: Vec<String>,
 }
 
 impl Default for UiPrefs {
@@ -85,6 +89,8 @@ impl Default for UiPrefs {
             notify_approvals: true,
             enter_sends: true,
             handwritten_notes: true,
+            favorite_models: Vec::new(),
+            recent_models: Vec::new(),
         }
     }
 }
@@ -95,6 +101,14 @@ impl UiPrefs {
         if !matches!(self.text_size.as_str(), "small" | "normal" | "large") {
             self.text_size = "normal".into();
         }
+        crate::picker_search::sanitize_values(
+            &mut self.favorite_models,
+            crate::picker_search::MAX_FAVORITES,
+        );
+        crate::picker_search::sanitize_values(
+            &mut self.recent_models,
+            crate::picker_search::MAX_RECENT,
+        );
         self
     }
 }
@@ -569,6 +583,8 @@ mod tests {
             notify_approvals: false,
             enter_sends: false,
             handwritten_notes: true,
+            favorite_models: vec!["anthropic|claude-sonnet".into()],
+            recent_models: vec!["openai|gpt".into()],
         };
         save_settings_to(
             &dir,

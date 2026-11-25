@@ -590,10 +590,24 @@ class _MailScreenState extends State<MailScreen> {
                                   : FontWeight.normal,
                             ),
                           ),
-                          subtitle: Text(
-                            '${msg.from}${msg.date.isNotEmpty ? ' • ${msg.date}' : ''}',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
+                          isThreeLine: msg.snippet.isNotEmpty,
+                          subtitle: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                '${msg.from}${msg.date.isNotEmpty ? ' • ${msg.date}' : ''}',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                              if (msg.snippet.isNotEmpty)
+                                Text(
+                                  msg.snippet,
+                                  key: Key('mail-snippet-${msg.uid}'),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: Theme.of(context).textTheme.bodySmall,
+                                ),
+                            ],
                           ),
                           trailing: Row(
                             mainAxisSize: MainAxisSize.min,

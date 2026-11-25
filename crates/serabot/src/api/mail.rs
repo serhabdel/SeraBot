@@ -229,6 +229,8 @@ async fn messages(
     let folder = query.folder.as_deref().unwrap_or("");
     let limit = query.limit.unwrap_or(20);
     let messages = mail::imap_list(&creds, folder, limit).await?;
+    let messages = super::mail_extras::hide_snoozed(&state, &user.id, account, folder, messages);
+    super::mail_extras::observe_senders(&state, &user.id, &messages);
     Ok(Json(json!({ "messages": messages })))
 }
 
@@ -275,13 +277,13 @@ async fn disconnect(
     ))
 }
 
-fn normalize_account(account: Option<&str>) -> Result<Option<&str>> {
+pub(super) fn normalize_account(account: Option<&str>) -> Result<Option<&str>> {
     let label = account.map(str::trim).filter(|s| !s.is_empty());
     mail::account_provider(label)?;
     Ok(label)
 }
 
-fn require_mail_creds(
+pub(super) fn require_mail_creds(
     state: &ApiState,
     user_id: &str,
     account: Option<&str>,
@@ -314,6 +316,7 @@ async fn search(
     let q = query.q.as_deref().unwrap_or("");
     let limit = query.limit.unwrap_or(20);
     let messages = mail::imap_search(&creds, folder, q, limit).await?;
+    super::mail_extras::observe_senders(&state, &user.id, &messages);
     Ok(Json(json!({ "messages": messages })))
 }
 
@@ -476,6 +479,11 @@ async fn send_message(
         },
     )
     .await?;
+    super::mail_extras::remember_recipients(
+        &state,
+        &user.id,
+        &[req.to.as_slice(), req.cc.as_slice(), req.bcc.as_slice()],
+    );
     let _ = state.store.record_audit(
         &user.id,
         "mail.send_ui",
@@ -586,7 +594,14 @@ struct ScheduleRequest {
     #[serde(default)]
     body_html: Option<String>,
     send_at: i64,
+    /// `later` (default) or `undo`, the short hold behind Undo send.
+    #[serde(default)]
+    kind: Option<String>,
 }
+
+/// Undo send holds a message for a few seconds; anything outside this window is refused.
+const UNDO_MIN_SECS: i64 = 3;
+const UNDO_MAX_SECS: i64 = 120;
 
 fn validate_schedule_fields(
     to: &[String],
@@ -655,7 +670,22 @@ async fn schedule_message(
     for rcpt in req.to.iter().chain(req.cc.iter()).chain(req.bcc.iter()) {
         state.runtime.scan_owner_output(&user.id, rcpt)?;
     }
-    let row = state.store.create_scheduled_mail(
+    let kind = match req.kind.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        None | Some("later") => "later",
+        Some("undo") => {
+            let now = chrono::Utc::now().timestamp();
+            if req.send_at < now + UNDO_MIN_SECS - 1 || req.send_at > now + UNDO_MAX_SECS {
+                return Err(SeraError::Validation(format!(
+                    "an undo hold lasts {UNDO_MIN_SECS} to {UNDO_MAX_SECS} seconds"
+                )));
+            }
+            "undo"
+        }
+        Some(_) => {
+            return Err(SeraError::Validation("kind must be later or undo".into()));
+        }
+    };
+    let row = state.store.create_scheduled_mail_kind(
         &user.id,
         account.unwrap_or(""),
         &req.to,
@@ -665,7 +695,13 @@ async fn schedule_message(
         &req.body,
         req.body_html.as_deref(),
         req.send_at,
+        kind,
     )?;
+    super::mail_extras::remember_recipients(
+        &state,
+        &user.id,
+        &[req.to.as_slice(), req.cc.as_slice(), req.bcc.as_slice()],
+    );
     let _ = state.store.record_audit(
         &user.id,
         "mail.schedule",

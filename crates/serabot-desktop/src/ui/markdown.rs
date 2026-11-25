@@ -911,15 +911,32 @@ pub(super) fn CodeBlock(
     };
     let tokens = tokenize_cached(&lang, &code);
     let mut expanded = use_signal(|| false);
+    let mut wrap = use_signal(|| false);
     let long = code_is_long(&code);
     let capped = long && !expanded();
     let lines = code.lines().count();
+    let mut class = String::from("md-code-block");
+    if capped {
+        class.push_str(" capped");
+    }
+    if wrap() {
+        class.push_str(" wrapped");
+    }
     rsx! {
-        div { class: if capped { "md-code-block capped" } else { "md-code-block" },
+        div { class: "{class}",
             div { class: "md-code-head",
                 span { class: "md-code-lang", "{label}" }
                 span { class: "md-code-meta",
                     if lines == 1 { "1 line" } else { "{lines} lines" }
+                }
+                button {
+                    class: if wrap() { "md-code-copy md-code-wrap on" } else { "md-code-copy md-code-wrap" },
+                    r#type: "button",
+                    title: "Wrap long lines",
+                    "aria-label": "Wrap long lines",
+                    "aria-pressed": if wrap() { "true" } else { "false" },
+                    onclick: move |_| wrap.set(!wrap()),
+                    "Wrap"
                 }
                 if !streaming {
                     button {

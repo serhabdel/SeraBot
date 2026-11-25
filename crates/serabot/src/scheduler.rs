@@ -343,7 +343,10 @@ pub async fn process_due_scheduled_mail(
         .await;
         match res {
             Ok(sent) => {
-                let _ = store.complete_scheduled_mail(&row.id, Utc::now().timestamp());
+                if let Err(error) = store.complete_scheduled_mail(&row.id, Utc::now().timestamp()) {
+                    // The mail went out; say so loudly so it is not sent a second time by hand.
+                    tracing::error!(%error, id = %row.id, "scheduled mail was sent but not marked sent");
+                }
                 let _ = store.record_audit(
                     &row.user_id,
                     "mail.scheduled_sent",
@@ -361,10 +364,20 @@ pub async fn process_due_scheduled_mail(
             }
             Err(error) => {
                 let msg = error.to_string();
-                let _ = store.fail_scheduled_mail(&row.id, &msg);
+                // Network and SMTP trouble is worth retrying; a blocklist or validation
+                // refusal will fail the same way again.
+                let transient = matches!(error, crate::error::SeraError::External(_));
+                let status = store
+                    .retry_or_fail_scheduled_mail(&row.id, &msg, transient, Utc::now().timestamp())
+                    .unwrap_or("failed");
+                let action = if status == "pending" {
+                    "mail.scheduled_retry"
+                } else {
+                    "mail.scheduled_failed"
+                };
                 let _ = store.record_audit(
                     &row.user_id,
-                    "mail.scheduled_failed",
+                    action,
                     Some("mail"),
                     None,
                     None,
@@ -383,7 +396,40 @@ pub async fn process_due_scheduled_mail(
     Ok(processed)
 }
 
-/// 30-second background loop that delivers due scheduled emails.
+/// Wake snoozed messages whose time has come: the snooze row is removed (so the
+/// message reappears in its folder) and the message is marked unread on a best-effort
+/// basis.
+pub async fn process_due_snoozes(
+    store: &Store,
+    secrets: &crate::user_secrets::UserSecrets,
+    now_unix: i64,
+) -> Result<usize> {
+    let due = store.claim_due_snoozes(now_unix, 50)?;
+    for row in &due {
+        let account = (!row.account_label.is_empty()).then_some(row.account_label.as_str());
+        if let Ok(Some(creds)) = crate::mail::load_credentials(secrets, &row.user_id, account)
+            && let Err(error) =
+                crate::mail::imap_flag(&creds, &row.folder, row.uid, Some(false), None).await
+        {
+            tracing::warn!(%error, "could not mark a woken message unread");
+        }
+        let _ = store.record_audit(
+            &row.user_id,
+            "mail.snooze_woke",
+            Some("mail"),
+            None,
+            None,
+            None,
+            None,
+            Some(&json!({ "account": account, "folder": row.folder, "uid": row.uid })),
+        );
+    }
+    Ok(due.len())
+}
+
+/// Background loop (every 5 seconds, so the Undo send hold ends on time) that
+/// delivers due scheduled emails, wakes snoozed messages, and fails sends that a
+/// restart left half-done.
 pub async fn run_scheduled_mail_loop(
     store: Store,
     secrets: std::sync::Arc<crate::user_secrets::UserSecrets>,
@@ -391,12 +437,18 @@ pub async fn run_scheduled_mail_loop(
     policy: crate::policy::Policy,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
             _ = interval.tick() => {
                 let now_unix = Utc::now().timestamp();
+                if let Err(error) = store.recover_stale_scheduled_mail(now_unix) {
+                    tracing::warn!(%error, "stale scheduled mail recovery failed");
+                }
+                if let Err(error) = process_due_snoozes(&store, &secrets, now_unix).await {
+                    tracing::warn!(%error, "snooze wake check failed");
+                }
                 if let Err(error) = process_due_scheduled_mail(
                     &store,
                     &secrets,

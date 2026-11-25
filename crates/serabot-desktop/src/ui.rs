@@ -93,10 +93,12 @@ const CSS_PAGES: &str = concat!(
     include_str!("../assets/marketplace.css"),
     include_str!("../assets/providers.css"),
     include_str!("../assets/pages-work.css"),
+    include_str!("../assets/mail.css"),
     include_str!("../assets/pages-data.css"),
     include_str!("../assets/pages-connect.css"),
     include_str!("../assets/claude-code.css"),
-    include_str!("../assets/system.css")
+    include_str!("../assets/system.css"),
+    include_str!("../assets/ux.css")
 );
 
 /// The `data-activity` value the stylesheet keys the avatar ring and the

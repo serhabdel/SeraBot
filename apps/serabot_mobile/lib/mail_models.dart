@@ -327,11 +327,20 @@ class MailMessageInfo {
     this.flags = const [],
     this.body = '',
     this.attachments = const [],
+    this.snippet = '',
+    this.threadKey = '',
+    this.hasAttachments = false,
+    this.unsubscribeMailto,
+    this.unsubscribeUrl,
   });
 
   factory MailMessageInfo.fromJson(Map<String, dynamic> json) {
     final rawFlags = json['flags'] as List? ?? const [];
     final rawAttachments = json['attachments'] as List? ?? const [];
+    final rawUnsubscribe = json['unsubscribe'];
+    final unsubscribe = rawUnsubscribe is Map<String, dynamic>
+        ? rawUnsubscribe
+        : const <String, dynamic>{};
     return MailMessageInfo(
       uid: (json['uid'] as num?)?.toInt() ?? 0,
       subject: json['subject'] as String? ?? '',
@@ -343,6 +352,11 @@ class MailMessageInfo {
           .whereType<Map<String, dynamic>>()
           .map(MailAttachmentInfo.fromJson)
           .toList(),
+      snippet: json['snippet'] as String? ?? '',
+      threadKey: json['thread_key'] as String? ?? '',
+      hasAttachments: json['has_attachments'] as bool? ?? false,
+      unsubscribeMailto: unsubscribe['mailto'] as String?,
+      unsubscribeUrl: unsubscribe['url'] as String?,
     );
   }
 
@@ -353,6 +367,21 @@ class MailMessageInfo {
   final List<String> flags;
   final String body;
   final List<MailAttachmentInfo> attachments;
+
+  /// First words of the body, for list rows (0.74.14).
+  final String snippet;
+
+  /// Messages of one conversation share a key (0.74.14).
+  final String threadKey;
+
+  /// A list fetch may not carry the attachments themselves, only this hint.
+  final bool hasAttachments;
+
+  /// `List-Unsubscribe` targets, when the sender is a mailing list (0.74.14).
+  final String? unsubscribeMailto;
+  final String? unsubscribeUrl;
+
+  bool get hasFiles => hasAttachments || attachments.isNotEmpty;
 
   bool get isSeen => flags.any((f) {
     final lower = f.toLowerCase();
@@ -377,6 +406,11 @@ class MailMessageInfo {
       flags: flags ?? this.flags,
       body: body ?? this.body,
       attachments: attachments ?? this.attachments,
+      snippet: snippet,
+      threadKey: threadKey,
+      hasAttachments: hasAttachments,
+      unsubscribeMailto: unsubscribeMailto,
+      unsubscribeUrl: unsubscribeUrl,
     );
   }
 
