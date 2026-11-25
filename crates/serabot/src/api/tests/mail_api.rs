@@ -640,7 +640,7 @@ async fn ux_fake_imap(listener: TcpListener, log: std::sync::Arc<std::sync::Mute
                 writer
                     .write_all(
                         format!(
-                            "* {uid} FETCH (FLAGS (\\Seen) UID {uid} BODY[] {{{}}}\r\n{raw}\r\n)\r\n{tag} OK done\r\n",
+                            "* {uid} FETCH (FLAGS (\\Seen) UID {uid} BODY[] {{{}}}\r\n{raw})\r\n{tag} OK done\r\n",
                             raw.len()
                         )
                         .as_bytes(),

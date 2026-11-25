@@ -3,12 +3,13 @@
 
 BEGIN;
 
--- Retry bookkeeping for scheduled sends. `claimed_at` lets a restart find rows
--- that were left in `sending`. `kind` is 'later' (Send later) or 'undo' (the
--- short hold behind Undo send; hidden from the Scheduled folder unless it failed).
-ALTER TABLE scheduled_mail ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE scheduled_mail ADD COLUMN claimed_at INTEGER;
-ALTER TABLE scheduled_mail ADD COLUMN kind TEXT NOT NULL DEFAULT 'later';
+-- The `scheduled_mail` columns `attempts`, `claimed_at` and `kind` are added by the
+-- migration runner in store.rs (SQLite has no ADD COLUMN IF NOT EXISTS, and this
+-- file may run again on a database that already has them).
+--   attempts    send tries so far
+--   claimed_at  when a row entered `sending`, so a restart can find stuck rows
+--   kind        'later' (Send later) or 'undo' (the short hold behind Undo send,
+--               hidden from the Scheduled folder unless it failed)
 
 -- A snoozed message stays on the server. It is hidden from its folder list until
 -- `wake_at`, then the wake loop deletes the row and marks the message unread.

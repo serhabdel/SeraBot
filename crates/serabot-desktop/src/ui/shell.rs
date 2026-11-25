@@ -6,6 +6,9 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
     let section = session.read().section;
     let mut session = session;
     let overlay = use_signal(|| Overlay::None);
+    // Archive, move and delete from Mail wait here for their Undo window, even after
+    // the Mail page is left.
+    crate::ui_mail_actions::use_mail_committer(session);
     let chat = section == Section::Chat;
     let mut drawer_open = use_signal(|| false);
     let mut toast = use_signal(|| Option::<(String, bool)>::None);

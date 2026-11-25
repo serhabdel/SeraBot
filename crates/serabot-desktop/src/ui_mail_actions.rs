@@ -6,7 +6,8 @@
 //! fails, the rows come back and a toast says why.
 //!
 //! A deferred move or delete lives in a global signal, not in the window's state, so
-//! it still reaches the server if the user leaves Mail during the Undo window.
+//! it still reaches the server if the user leaves Mail during the Undo window. The
+//! always-mounted shell runs the timer and the remote calls ([`use_mail_committer`]).
 //! Rows whose move failed are parked in [`FAILED`] until a mail window puts them
 //! back.
 
@@ -36,6 +37,10 @@ pub(crate) struct DeferredMove {
 }
 
 static PENDING: GlobalSignal<Option<DeferredMove>> = Signal::global(|| None);
+/// Moves whose Undo window is over (or was dismissed), waiting for the shell to send them.
+static OUTBOX: GlobalSignal<Vec<DeferredMove>> = Signal::global(Vec::new);
+/// Autosaved drafts to delete once their message went out: `(account, folder, uid)`.
+static DRAFT_TRASH: GlobalSignal<Vec<(Option<String>, String, u32)>> = Signal::global(Vec::new);
 /// Moves the server refused, waiting to be put back into a visible list.
 pub(crate) static FAILED: GlobalSignal<Vec<DeferredMove>> = Signal::global(Vec::new);
 static DEFER_SEQ: GlobalSignal<u64> = Signal::global(|| 0);
@@ -148,10 +153,10 @@ fn take_pending(id: Option<u64>) -> Option<DeferredMove> {
     }
 }
 
-/// Send a deferred move or delete to the server. Runs on a root task so it
+/// Send a deferred move or delete to the server. Called from the shell's scope, so it
 /// finishes even when the mail window is gone. A failure is reported and parked.
 fn commit_remote(session: Signal<Session>, pending: DeferredMove) {
-    spawn_forever(async move {
+    spawn(async move {
         let uids: Vec<u32> = pending.rows.iter().map(|m| m.uid).collect();
         let (acct, fold, dest) = (
             pending.account.clone(),
@@ -197,8 +202,55 @@ pub(crate) fn settle(ctx: MailCtx) {
         undo.set(None);
     }
     if let Some(pending) = take_pending(None) {
-        commit_remote(ctx.session, pending);
+        OUTBOX.write().push(pending);
     }
+}
+
+/// Queue the deletion of an autosaved draft that is no longer needed.
+pub(crate) fn queue_draft_delete(account: Option<String>, folder: String, uid: u32) {
+    DRAFT_TRASH.write().push((account, folder, uid));
+}
+
+/// Runs the Undo timer and the remote calls for mail actions. Call it once from a
+/// component that stays mounted for the whole session (the shell).
+pub(crate) fn use_mail_committer(session: Signal<Session>) {
+    // A move that just left the list gets its Undo window, then goes out.
+    use_effect(move || {
+        let pending: Option<DeferredMove> = (*PENDING.read()).clone();
+        if let Some(pending) = pending {
+            spawn(async move {
+                sleep_ms(DEFER_MS).await;
+                if let Some(done) = take_pending(Some(pending.id)) {
+                    OUTBOX.write().push(done);
+                }
+            });
+        }
+    });
+    // Settled moves go to the server.
+    use_effect(move || {
+        if OUTBOX.read().is_empty() {
+            return;
+        }
+        let ready: Vec<DeferredMove> = std::mem::take(&mut *OUTBOX.write());
+        for pending in ready {
+            commit_remote(session, pending);
+        }
+    });
+    // Leftover autosaves are removed in the background.
+    use_effect(move || {
+        if DRAFT_TRASH.read().is_empty() {
+            return;
+        }
+        let ready: Vec<(Option<String>, String, u32)> = std::mem::take(&mut *DRAFT_TRASH.write());
+        for (account, folder, uid) in ready {
+            spawn(async move {
+                let _ = run_mail_job(session, move |c| {
+                    c.mail_delete(account.as_deref(), &folder, uid)
+                })
+                .await;
+            });
+        }
+    });
 }
 
 /// Show an Undo toast that disappears after `ttl_ms`. An earlier entry is settled
@@ -432,13 +484,6 @@ pub(crate) fn defer_remove(ctx: MailCtx, uids: Vec<u32>, dest: Option<String>, l
         folder,
     });
     push_undo(ctx, label, UndoKind::Deferred { id }, DEFER_MS);
-    let session = ctx.session;
-    spawn_forever(async move {
-        sleep_ms(DEFER_MS).await;
-        if let Some(pending) = take_pending(Some(id)) {
-            commit_remote(session, pending);
-        }
-    });
 }
 
 /// Move messages to the mailbox's Archive folder.

@@ -25,7 +25,7 @@ use serde::Deserialize;
 use crate::ui::Icon;
 use crate::ui_mail_actions::{
     FAILED, SEND_HOLD_SECS, UndoEntry, UndoKind, announce, archive_messages, delete_messages,
-    restore_failed, run_undo, set_flags, settle, sleep_ms,
+    queue_draft_delete, restore_failed, run_undo, set_flags, settle, sleep_ms,
 };
 use crate::ui_mail_list::{
     BulkBar, DayHeader, MailRow, RowSkeletons, ShortcutsDialog, SnoozeDialog, ThreadInfo, UndoBar,
@@ -2340,12 +2340,7 @@ fn MailComposeModal(
                         None => session.write().toast = Some("Email sent.".to_owned()),
                     }
                     if let Some((folder, uid)) = old_draft {
-                        spawn_forever(async move {
-                            let _ = run_mail_job(session, move |c| {
-                                c.mail_delete(acct_del.as_deref(), &folder, uid)
-                            })
-                            .await;
-                        });
+                        queue_draft_delete(acct_del, folder, uid);
                     }
                     on_sent.call(());
                 }
@@ -2457,13 +2452,7 @@ fn MailComposeModal(
                         if *finished.peek() {
                             // The message went out while this save was in flight.
                             if let Some(uid) = saved.uid {
-                                let (acct_del, folder) = (acct.clone(), saved.folder.clone());
-                                spawn_forever(async move {
-                                    let _ = run_mail_job(session, move |c| {
-                                        c.mail_delete(acct_del.as_deref(), &folder, uid)
-                                    })
-                                    .await;
-                                });
+                                queue_draft_delete(acct.clone(), saved.folder.clone(), uid);
                             }
                             break;
                         }

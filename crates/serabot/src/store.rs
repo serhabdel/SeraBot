@@ -921,6 +921,20 @@ impl Store {
         }
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version < 52 {
+            for (column, definition) in [
+                ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+                ("claimed_at", "INTEGER"),
+                ("kind", "TEXT NOT NULL DEFAULT 'later'"),
+            ] {
+                let present: bool = connection
+                    .prepare("SELECT 1 FROM pragma_table_info('scheduled_mail') WHERE name = ?1")?
+                    .exists([column])?;
+                if !present {
+                    connection.execute_batch(&format!(
+                        "ALTER TABLE scheduled_mail ADD COLUMN {column} {definition};"
+                    ))?;
+                }
+            }
             connection.execute_batch(MIGRATION_52)?;
             connection.pragma_update(None, "user_version", 52)?;
         }
