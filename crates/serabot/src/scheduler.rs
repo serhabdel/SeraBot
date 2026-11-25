@@ -323,6 +323,21 @@ pub async fn process_due_scheduled_mail(
     let mut processed = 0usize;
     for row in due {
         let account = (!row.account_label.is_empty()).then_some(row.account_label.as_str());
+        // Never send a message that should carry files without them: if the list cannot
+        // be read, the send goes back to be retried.
+        let attachment_hashes = match store.scheduled_mail_attachments(&row.id) {
+            Ok(hashes) => hashes,
+            Err(error) => {
+                let _ = store.retry_or_fail_scheduled_mail(
+                    &row.id,
+                    &error.to_string(),
+                    true,
+                    Utc::now().timestamp(),
+                );
+                processed += 1;
+                continue;
+            }
+        };
         let res = crate::mail::send_account_mail(
             secrets,
             store,
@@ -337,7 +352,7 @@ pub async fn process_due_scheduled_mail(
                 subject: &row.subject,
                 body: &row.body,
                 body_html: row.body_html.as_deref(),
-                attachment_hashes: &[],
+                attachment_hashes: &attachment_hashes,
             },
         )
         .await;

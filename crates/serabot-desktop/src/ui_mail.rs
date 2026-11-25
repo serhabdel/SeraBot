@@ -2272,29 +2272,26 @@ fn MailComposeModal(
         let subj = subject();
         let (plain_body, body_html) = compose_to_body_and_html(&body(), html_mode());
         let hashes: Vec<String> = selected_hashes().into_iter().collect();
-        // Attachments cannot ride through the server-side hold, so those send at once.
-        let can_hold = hashes.is_empty();
         let hold_at = now_unix_secs() as i64 + SEND_HOLD_SECS;
         let acct_del = acct.clone();
         let old_draft = draft_uid().map(|uid| (draft_folder(), uid));
         spawn(async move {
             let res = run_mail_job(session, move |c| {
-                if can_hold {
-                    match c.mail_send_with_undo(
-                        acct.as_deref(),
-                        &recipients,
-                        &cc_list,
-                        &bcc_list,
-                        &subj,
-                        &plain_body,
-                        body_html.clone(),
-                        hold_at,
-                    ) {
-                        Ok(item) => return Ok(Some(item.id)),
-                        // A clock that disagrees with the server: send straight away.
-                        Err(e) if e.to_string().contains("hold") => {}
-                        Err(e) => return Err(e),
-                    }
+                match c.mail_send_with_undo(
+                    acct.as_deref(),
+                    &recipients,
+                    &cc_list,
+                    &bcc_list,
+                    &subj,
+                    &plain_body,
+                    body_html.clone(),
+                    hold_at,
+                    &hashes,
+                ) {
+                    Ok(item) => return Ok(Some(item.id)),
+                    // A clock that disagrees with the server: send straight away.
+                    Err(e) if e.to_string().contains("hold") => {}
+                    Err(e) => return Err(e),
                 }
                 c.mail_send(
                     acct.as_deref(),
@@ -2355,6 +2352,7 @@ fn MailComposeModal(
         let bcc_list = recipient_addresses(&bcc());
         let subj = subject();
         let (plain_body, body_html) = compose_to_body_and_html(&body(), html_mode());
+        let hashes: Vec<String> = selected_hashes().into_iter().collect();
         spawn(async move {
             let res = run_mail_job(session, move |c| {
                 c.mail_schedule(
@@ -2366,6 +2364,7 @@ fn MailComposeModal(
                     &plain_body,
                     body_html,
                     send_at,
+                    &hashes,
                 )
             })
             .await;
