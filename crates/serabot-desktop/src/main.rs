@@ -35,6 +35,8 @@ mod ui_mail;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_mail_actions;
 #[cfg(any(windows, feature = "ui-check"))]
+mod ui_mail_compose;
+#[cfg(any(windows, feature = "ui-check"))]
 mod ui_mail_list;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_mail_reader;
