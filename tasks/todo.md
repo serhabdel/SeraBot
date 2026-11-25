@@ -663,5 +663,15 @@ Plan: `docs/specs/0.74.15-proposal.md`. Version stays `0.74.14` until the batch 
 - [x] Version bump `0.74.17` (`Cargo.toml`), mobile `0.74.17+91`, `docs/release-0.74.17.md`, `README.md`, `tasks/todo.md`.
 - [ ] Owner: live pass on signing into LinkedIn/Instagram in the `social` browser profile, assigning `marketer`, and testing a saved Hostinger mailbox.
 
+## Release 0.74.18 — Antigravity Reliability, Claude & Mistral Sign-In, Inception Labs
+
+- [x] Antigravity Connector Reliability (`cloud_code.rs`, `llm.rs`): 6-hour TTL `LIVE_VERSION` cache (never caching `None`), `IDE_VERSION` bumped to `2.31.4`, and automatic `invalidate_live_version` + negative project-discovery retry on initial `400`/`403`.
+- [x] Claude Sign-In Upgrade (`auth_flows/claude.rs`, `api/connectors.rs`, `provider_presets.rs`, `provider_accounts.rs`, `ui/providers.rs`, `ui/account_views.rs`): `"OAuth / API Key"` preset badge, inline `"Paste callback URL or code#state"` fallback for port `54545`, and `sk-ant-oat01-...` `setup-token` support.
+- [x] Inception Labs Native Provider + Logo (`providers.rs`, `relay_net.rs`, `costs.rs`, `provider_presets.rs`, `branding.rs`): `https://api.inceptionlabs.ai/v1`, Mercury models & pricing, relay allowlist, and custom SVG logo.
+- [x] Mistral Vibe Browser Sign-In (`auth_flows/mistral.rs`, `auth_flows/mod.rs`, `provider_presets.rs`, `provider_flow.rs`, `ui/account_views.rs`, `provider_accounts.rs`, `ui/providers.rs`): PKCE-bound `console.mistral.ai/api/vibe/sign-in` polling & API-key exchange under `FlowKind::Device` (no `user_code`).
+- [x] Version bump `0.74.18` (`Cargo.toml`), mobile `0.74.18+92`, `docs/release-0.74.18.md`, `README.md`, `tasks/todo.md`.
+- [ ] Owner: live pass on Claude sign-in, Mistral browser sign-in, Google Antigravity chat, and Inception Labs `mercury-3`.
+
+
 
 

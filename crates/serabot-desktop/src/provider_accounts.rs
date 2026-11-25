@@ -327,7 +327,7 @@ pub fn add_methods(provider: &ProviderStatus, preset: Option<&ProviderPreset>) -
     let flows: Vec<&str> = if provider.signin.is_empty() && !is_plan {
         match preset.map(|p| p.sign_in) {
             Some("pkce" | "pkce_google") => vec!["pkce"],
-            Some("device") => vec!["device"],
+            Some("device" | "browser") => vec!["device"],
             _ => Vec::new(),
         }
     } else {
@@ -547,6 +547,58 @@ pub fn summary_line(accounts: &[ProviderAccount]) -> String {
         "accounts"
     };
     format!("{} {noun}, {ready} ready", accounts.len())
+}
+
+/// Parse a pasted Claude OAuth callback URL (`http://localhost:54545/callback?code=...&state=...`)
+/// or `code#state` string into `(code, state)`.
+pub fn parse_claude_callback(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains("://") || trimmed.starts_with('/') || trimmed.contains("code=") {
+        let query = trimmed
+            .split_once('?')
+            .map(|(_, q)| q)
+            .unwrap_or(trimmed)
+            .split('#')
+            .next()
+            .unwrap_or("");
+        let mut code = None;
+        let mut state = None;
+        for pair in query.split('&') {
+            let Some((k, v)) = pair.split_once('=') else {
+                continue;
+            };
+            match k {
+                "code" if !v.is_empty() => code = Some(v.to_owned()),
+                "state" if !v.is_empty() => state = Some(v.to_owned()),
+                _ => {}
+            }
+        }
+        return match (code, state) {
+            (Some(c), Some(s))
+                if !c.chars().any(char::is_whitespace) && !s.chars().any(char::is_whitespace) =>
+            {
+                Some((c, s))
+            }
+            _ => None,
+        };
+    }
+    let (code, state) = trimmed.split_once('#')?;
+    if code.is_empty()
+        || state.is_empty()
+        || code.chars().any(char::is_whitespace)
+        || state.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    Some((code.to_owned(), state.to_owned()))
+}
+
+/// Build the loopback callback request path for a pasted Claude `(code, state)`.
+pub fn claude_callback_path(code: &str, state: &str) -> String {
+    format!("/callback?code={code}&state={state}")
 }
 
 #[cfg(test)]
@@ -908,6 +960,15 @@ mod tests {
             assert_eq!((empty, filled, first), ("Add account", "Add account", None));
             assert_eq!(text, "No account yet. Add an API key to use this provider.");
         }
+        // Mistral: a key or a browser-polled device sign-in.
+        let (methods, empty, _, first, text) =
+            card(&kinded("mistral", "oauth_or_key", &["device"]), "mistral");
+        assert_eq!(methods, vec![AddMethod::Key, AddMethod::Device]);
+        assert_eq!((empty, first), ("Sign in", Some(AddMethod::Device)));
+        assert_eq!(text, "No account yet. Sign in, or add an API key.");
+        // Older server with no signin list falls back to preset ("browser" -> Device).
+        let (methods, ..) = card(&kinded("mistral", "oauth_or_key", &[]), "mistral");
+        assert_eq!(methods, vec![AddMethod::Key, AddMethod::Device]);
         // A local server needs neither.
         let (methods, ..) = card(&kinded("openai-compatible", "none", &[]), "ollama");
         assert!(methods.is_empty());
@@ -1044,5 +1105,32 @@ mod tests {
             Some(&kinded("google-antigravity", "oauth", &["pkce"])),
             agy
         ));
+    }
+
+    #[test]
+    fn claude_callback_parser_accepts_urls_and_code_hash_state() {
+        assert_eq!(
+            parse_claude_callback("http://localhost:54545/callback?code=abc123&state=xyz789"),
+            Some(("abc123".to_owned(), "xyz789".to_owned()))
+        );
+        assert_eq!(
+            parse_claude_callback("  abc123#xyz789  "),
+            Some(("abc123".to_owned(), "xyz789".to_owned()))
+        );
+        assert_eq!(
+            parse_claude_callback("code=abc123&state=xyz789"),
+            Some(("abc123".to_owned(), "xyz789".to_owned()))
+        );
+        assert_eq!(
+            claude_callback_path("abc123", "xyz789"),
+            "/callback?code=abc123&state=xyz789"
+        );
+        assert_eq!(parse_claude_callback(""), None);
+        assert_eq!(parse_claude_callback("abc123#"), None);
+        assert_eq!(parse_claude_callback("#xyz789"), None);
+        assert_eq!(
+            parse_claude_callback("http://localhost:54545/callback?error=access_denied"),
+            None
+        );
     }
 }

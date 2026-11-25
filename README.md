@@ -11,7 +11,7 @@ Deterministic Rust around bounded LLM calls.</p>
 
 ## What it is
 
-SeraBot (`0.74.17`) is an invitation-only, multi-user self-hosted agent built as **one Rust binary** and **one SQLite/WAL database**. Each invited member signs in with Microsoft OIDC and gets an isolated, UID-scoped workspace—chats, bot fleet, skills, memory, documents, project folders, AI provider accounts, connectors, and an encrypted vault. Nobody can read another member's data or credentials.
+SeraBot (`0.74.18`) is an invitation-only, multi-user self-hosted agent built as **one Rust binary** and **one SQLite/WAL database**. Each invited member signs in with Microsoft OIDC and gets an isolated, UID-scoped workspace—chats, bot fleet, skills, memory, documents, project folders, AI provider accounts, connectors, and an encrypted vault. Nobody can read another member's data or credentials.
 
 | Part | Stack | What it does |
 | --- | --- | --- |

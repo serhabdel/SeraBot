@@ -161,6 +161,9 @@ impl ProviderFlow {
         match (&self.phase, self.kind) {
             (FlowPhase::Starting, _) => "Getting the sign-in page\u{2026}",
             (FlowPhase::Waiting, FlowKind::Browser) => "Finish signing in in your browser",
+            (FlowPhase::Waiting, FlowKind::Device) if self.user_code.is_none() => {
+                "Finish signing in in your browser"
+            }
             (FlowPhase::Waiting, FlowKind::Device) => "Enter this code on the provider's page",
             (FlowPhase::Done { created: true }, _) => "Account added",
             (FlowPhase::Done { created: false }, _) => "Signed in again",
@@ -175,7 +178,10 @@ impl ProviderFlow {
     pub fn detail(&self) -> Option<String> {
         match &self.phase {
             FlowPhase::Starting => None,
-            FlowPhase::Waiting if self.kind == FlowKind::Browser && !self.browser_opened => {
+            FlowPhase::Waiting
+                if (self.kind == FlowKind::Browser || self.user_code.is_none())
+                    && !self.browser_opened =>
+            {
                 Some("Your browser did not open. Use Open page, or copy the link below.".to_owned())
             }
             FlowPhase::Waiting if self.kind == FlowKind::Browser => {
@@ -219,6 +225,7 @@ pub fn denied_text(reason: Option<&str>) -> String {
                 .to_owned()
         }
         Some("expired_token" | "expired") => "The code expired before it was entered.".to_owned(),
+        Some(message) if message.contains(' ') && message.len() <= 240 => message.to_owned(),
         _ => "The provider did not approve this sign-in.".to_owned(),
     }
 }
@@ -503,6 +510,21 @@ mod tests {
         flow.apply(FlowMsg::Ended(FlowEnd::Expired));
         flow.cancel();
         assert_eq!(flow.phase, FlowPhase::Done { created: true });
+    }
+
+    #[test]
+    fn a_device_flow_without_a_user_code_shows_browser_headline() {
+        let mut flow = ProviderFlow::new("mistral", FlowKind::Device);
+        let mut s = started("device");
+        s.user_code = None;
+        flow.apply(FlowMsg::Started {
+            started: s,
+            opened: true,
+        });
+        assert_eq!(flow.phase, FlowPhase::Waiting);
+        assert!(flow.user_code.is_none());
+        assert!(flow.browser_opened);
+        assert_eq!(flow.headline(), "Finish signing in in your browser");
     }
 
     #[test]

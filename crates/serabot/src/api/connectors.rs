@@ -41,6 +41,10 @@ pub(super) async fn list_providers(
                 })
                 .map(|(name, _)| name.clone())
                 .collect::<Vec<_>>();
+            let kind = crate::providers::canonical_kind(&provider.kind)?;
+            let signin = signin_flows(&state, is_admin, &provider.id, &kind);
+            let risk = signin_risk(&kind, &signin);
+            let has_oauth_signin = !signin.is_empty();
             let is_oauth =
                 config.is_some_and(|c| {
                     c.auth.eq_ignore_ascii_case("oauth")
@@ -55,21 +59,30 @@ pub(super) async fn list_providers(
             let mut secrets = json!({
                 "api_key": visible_secret_status(&state.secrets, config.map(|c| c.api_key_secret.as_str()), is_admin),
             });
-            if is_oauth || config.is_some_and(|c| !c.refresh_token_secret.is_empty()) {
+            if is_oauth
+                || has_oauth_signin
+                || config.is_some_and(|c| !c.refresh_token_secret.is_empty())
+            {
                 secrets["refresh_token"] = visible_secret_status(
                     &state.secrets,
                     config.map(|c| c.refresh_token_secret.as_str()),
                     is_admin,
                 );
             }
-            if is_oauth || config.is_some_and(|c| !c.oauth_client_id_secret.is_empty()) {
+            if is_oauth
+                || has_oauth_signin
+                || config.is_some_and(|c| !c.oauth_client_id_secret.is_empty())
+            {
                 secrets["oauth_client_id"] = visible_secret_status(
                     &state.secrets,
                     config.map(|c| c.oauth_client_id_secret.as_str()),
                     is_admin,
                 );
             }
-            if is_oauth || config.is_some_and(|c| !c.oauth_client_secret_secret.is_empty()) {
+            if is_oauth
+                || has_oauth_signin
+                || config.is_some_and(|c| !c.oauth_client_secret_secret.is_empty())
+            {
                 secrets["oauth_client_secret"] = visible_secret_status(
                     &state.secrets,
                     config.map(|c| c.oauth_client_secret_secret.as_str()),
@@ -96,29 +109,10 @@ pub(super) async fn list_providers(
                 "secrets": secrets,
                 "credential": credential_view(&state, &user.id, &provider.id)?,
                 "accounts": provider_account_views(&state, &user.id, &provider.id)?,
-                "signin": signin_flows(
-                    &state,
-                    is_admin,
-                    &provider.id,
-                    &crate::providers::canonical_kind(&provider.kind)?,
-                ),
-                "signin_risk": signin_risk(
-                    &crate::providers::canonical_kind(&provider.kind)?,
-                    &signin_flows(
-                        &state,
-                        is_admin,
-                        &provider.id,
-                        &crate::providers::canonical_kind(&provider.kind)?,
-                    ),
-                ),
+                "signin": signin,
+                "signin_risk": risk,
             });
-            add_signin_status(
-                &mut view,
-                &state,
-                is_admin,
-                &provider.id,
-                &crate::providers::canonical_kind(&provider.kind)?,
-            );
+            add_signin_status(&mut view, &state, is_admin, &provider.id, &kind);
             Ok(view)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -129,6 +123,10 @@ pub(super) async fn list_providers(
                 .iter()
                 .any(|p| p.get("id").and_then(Value::as_str) == Some(&id))
             {
+                let kind = crate::providers::canonical_kind(&profile.kind)?;
+                let signin = signin_flows(&state, is_admin, &id, &kind);
+                let risk = signin_risk(&kind, &signin);
+                let has_oauth_signin = !signin.is_empty();
                 let is_oauth = profile.auth.eq_ignore_ascii_case("oauth")
                     || matches!(
                         profile.kind.as_str(),
@@ -137,21 +135,21 @@ pub(super) async fn list_providers(
                 let mut secrets = json!({
                     "api_key": visible_secret_status(&state.secrets, Some(profile.api_key_secret.as_str()), is_admin),
                 });
-                if is_oauth || !profile.refresh_token_secret.is_empty() {
+                if is_oauth || has_oauth_signin || !profile.refresh_token_secret.is_empty() {
                     secrets["refresh_token"] = visible_secret_status(
                         &state.secrets,
                         Some(profile.refresh_token_secret.as_str()),
                         is_admin,
                     );
                 }
-                if is_oauth || !profile.oauth_client_id_secret.is_empty() {
+                if is_oauth || has_oauth_signin || !profile.oauth_client_id_secret.is_empty() {
                     secrets["oauth_client_id"] = visible_secret_status(
                         &state.secrets,
                         Some(profile.oauth_client_id_secret.as_str()),
                         is_admin,
                     );
                 }
-                if is_oauth || !profile.oauth_client_secret_secret.is_empty() {
+                if is_oauth || has_oauth_signin || !profile.oauth_client_secret_secret.is_empty() {
                     secrets["oauth_client_secret"] = visible_secret_status(
                         &state.secrets,
                         Some(profile.oauth_client_secret_secret.as_str()),
@@ -188,29 +186,10 @@ pub(super) async fn list_providers(
                     "secrets": secrets,
                     "credential": credential_view(&state, &user.id, &id)?,
                     "accounts": provider_account_views(&state, &user.id, &id)?,
-                    "signin": signin_flows(
-                        &state,
-                        is_admin,
-                        &id,
-                        &crate::providers::canonical_kind(&profile.kind)?,
-                    ),
-                    "signin_risk": signin_risk(
-                        &crate::providers::canonical_kind(&profile.kind)?,
-                        &signin_flows(
-                            &state,
-                            is_admin,
-                            &id,
-                            &crate::providers::canonical_kind(&profile.kind)?,
-                        ),
-                    ),
+                    "signin": signin,
+                    "signin_risk": risk,
                 });
-                add_signin_status(
-                    &mut view,
-                    &state,
-                    is_admin,
-                    &id,
-                    &crate::providers::canonical_kind(&profile.kind)?,
-                );
+                add_signin_status(&mut view, &state, is_admin, &id, &kind);
                 providers.push(view);
             }
         }

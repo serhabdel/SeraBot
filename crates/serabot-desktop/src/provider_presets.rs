@@ -26,9 +26,9 @@ pub struct ProviderPreset {
     pub secret_name: &'static str,
     /// Whether to fetch the live model list (/models).
     pub catalog_fetch: bool,
-    /// Auth type: "api_key", "oauth" (sign-in only) or "none" (local server).
+    /// Auth type: "api_key", "oauth" (sign-in only), "oauth_or_key" or "none" (local server).
     pub auth: &'static str,
-    /// Badge label: "OAuth", "API Key", "Local", "Custom".
+    /// Badge label: "OAuth", "OAuth / API Key", "API Key", "Local", "Custom".
     pub badge: &'static str,
     /// One short line for the owner.
     pub note: &'static str,
@@ -36,8 +36,9 @@ pub struct ProviderPreset {
     /// provider has no key page (sign-in only, or a local server).
     pub key_url: &'static str,
     /// A real sign-in flow the provider documents for apps: pkce (browser
-    /// authorization code), device (device code) or pkce_google (Google
-    /// Cloud Code). Empty for providers that only take an API key.
+    /// authorization code), device (device code), browser (browser sign-in
+    /// polled via device flow) or pkce_google (Google Cloud Code). Empty for
+    /// providers that only take an API key.
     pub sign_in: &'static str,
     /// A plain-words risk shown beside a sign-in that rides on a vendor's
     /// consumer plan rather than an API contract. Empty when there is none.
@@ -95,7 +96,7 @@ pub fn filter_presets(
         .iter()
         .filter(|preset| match filter {
             DirectoryFilter::All => true,
-            DirectoryFilter::ApiKey => preset.auth == "api_key",
+            DirectoryFilter::ApiKey => matches!(preset.auth, "api_key" | "oauth_or_key"),
             DirectoryFilter::OAuth => preset.auth == "oauth" || !preset.sign_in.is_empty(),
             DirectoryFilter::Local => preset.auth == "none",
             DirectoryFilter::Connected => is_connected(preset),
@@ -227,11 +228,11 @@ const PRESETS: &[ProviderPreset] = &[
         ],
         secret_name: "mistral_api_key",
         catalog_fetch: true,
-        auth: "api_key",
-        badge: "API Key",
-        note: "Mistral Large 4 and Mistral Small",
+        auth: "oauth_or_key",
+        badge: "OAuth / API Key",
+        note: "Mistral Large 4 and Mistral Small — sign in with Mistral or paste an API key",
         key_url: "https://console.mistral.ai/api-keys",
-        sign_in: "",
+        sign_in: "browser",
         risk: "",
     },
     ProviderPreset {
@@ -574,6 +575,29 @@ const PRESETS: &[ProviderPreset] = &[
         risk: "",
     },
     ProviderPreset {
+        id: "inception",
+        label: "Inception Labs",
+        subtitle: "Mercury 3 diffusion LLMs — ultra-fast OpenAI-compatible API (API winds down Dec 28, 2026)",
+        base_url: "https://api.inceptionlabs.ai/v1",
+        kind: "inception",
+        default_id: "inception",
+        models: &[
+            "mercury-3",
+            "mercury-2.5",
+            "mercury-2",
+            "mercury-edit-2",
+            "mercury-voice",
+        ],
+        secret_name: "inception_api_key",
+        catalog_fetch: true,
+        auth: "api_key",
+        badge: "API Key",
+        note: "Mercury 3 (1M context) · API available through Dec 28, 2026",
+        key_url: "https://platform.inceptionlabs.ai/",
+        sign_in: "",
+        risk: "",
+    },
+    ProviderPreset {
         id: "anthropic",
         label: "Anthropic (Claude)",
         subtitle: "Claude models on the native Messages API. Sign in with Claude or add several API keys; each account is yours alone.",
@@ -600,7 +624,7 @@ const PRESETS: &[ProviderPreset] = &[
         secret_name: "anthropic_api_key",
         catalog_fetch: true,
         auth: "api_key",
-        badge: "API Key",
+        badge: "OAuth / API Key",
         note: "Sign in with Claude (browser, several accounts) or add API keys",
         key_url: "https://console.anthropic.com/settings/keys",
         sign_in: "pkce",
@@ -814,7 +838,7 @@ mod tests {
             assert!(!preset.note.is_empty(), "{:?}", preset.id);
             assert!(!preset.badge.is_empty(), "{:?}", preset.id);
             assert!(
-                matches!(preset.auth, "api_key" | "oauth" | "none"),
+                matches!(preset.auth, "api_key" | "oauth" | "oauth_or_key" | "none"),
                 "{:?}",
                 preset.id
             );
@@ -887,11 +911,27 @@ mod tests {
                         | "huggingface"
                         | "nebius"
                         | "sambanova"
+                        | "inception"
                 ),
                 "{:?}",
                 preset.id
             );
         }
+        assert_eq!(
+            preset_for("inception").unwrap().base_url,
+            "https://api.inceptionlabs.ai/v1"
+        );
+        assert_eq!(preset_for("inception").unwrap().kind, "inception");
+        assert_eq!(
+            preset_for("inception").unwrap().models,
+            [
+                "mercury-3",
+                "mercury-2.5",
+                "mercury-2",
+                "mercury-edit-2",
+                "mercury-voice",
+            ]
+        );
         assert_eq!(
             preset_for("openai").unwrap().base_url,
             "https://api.openai.com/v1"
@@ -932,6 +972,7 @@ mod tests {
         let anthropic = preset_for("anthropic").unwrap();
         assert_eq!(anthropic.kind, "anthropic");
         assert_eq!(anthropic.base_url, "https://api.anthropic.com/v1");
+        assert_eq!(anthropic.badge, "OAuth / API Key");
         // A key or a Claude browser sign-in (PKCE); the card says both.
         assert_eq!((anthropic.auth, anthropic.sign_in), ("api_key", "pkce"));
         let go = preset_for("opencode-go").unwrap();
@@ -1107,12 +1148,14 @@ mod tests {
                 "chatgpt-codex" => "pkce",
                 // Copilot: GitHub's device code (it has no browser flow).
                 "github-copilot" => "device",
+                // Mistral: browser sign-in or an API key.
+                "mistral" => "browser",
                 _ => "",
             };
             assert_eq!(preset.sign_in, expected_sign_in, "{:?}", preset.id);
             match preset.auth {
                 // A key provider names the page where the key is created.
-                "api_key" if preset.id != "custom" => {
+                "api_key" | "oauth_or_key" if preset.id != "custom" => {
                     assert!(preset.key_url.starts_with("https://"), "{:?}", preset.id)
                 }
                 // A sign-in-only provider has no key to get.
@@ -1125,10 +1168,12 @@ mod tests {
             }
         }
         // Key-only providers never claim a sign-in.
-        for id in ["openai", "mistral", "gemini", "perplexity", "huggingface"] {
+        for id in ["openai", "gemini", "perplexity", "huggingface"] {
             let preset = preset_for(id).unwrap();
             assert_eq!((preset.auth, preset.sign_in), ("api_key", ""), "{id}");
         }
+        let mistral = preset_for("mistral").unwrap();
+        assert_eq!((mistral.auth, mistral.sign_in), ("oauth_or_key", "browser"));
         assert_eq!(preset_for("ollama").unwrap().auth, "none");
     }
 

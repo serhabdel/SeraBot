@@ -193,10 +193,14 @@ pub(super) fn AddProviderSheet(session: Signal<Session>, overlay: Signal<Overlay
                                     }
                                 }
                             }
-                        } else if preset.sign_in == "pkce" {
+                        } else if matches!(preset.sign_in, "pkce" | "browser") {
                             div { class: "banner info",
                                 span {
-                                    "Paste an API key below, or leave it empty and press Save and sign in to sign in with your browser."
+                                    if preset.kind == "anthropic" {
+                                        "Paste an API key below, or leave it empty and press Save and sign in to sign in with Claude in your browser (port 54545; you can also paste the callback URL or code#state)."
+                                    } else {
+                                        "Paste an API key below, or leave it empty and press Save and sign in to sign in with your browser."
+                                    }
                                 }
                             }
                         } else if preset.auth == "none" {
@@ -861,12 +865,13 @@ fn SigninNotice(session: Signal<Session>, provider_id: String, blocker: SigninBl
 fn PlanTile(session: Signal<Session>, overlay: Signal<Overlay>, preset: ProviderPreset) -> Element {
     let mut overlay = overlay;
     let can_write = session.read().can_admin();
-    let takes_key = preset.auth == "api_key";
+    let takes_key = matches!(preset.auth, "api_key" | "oauth_or_key");
     let button_label = match preset.kind {
         "anthropic" => "Sign in with Claude",
         "openai-codex" => "Sign in with ChatGPT",
         "google-antigravity" => "Sign in with Google",
         "github-copilot" => "Sign in with GitHub",
+        "mistral" => "Sign in with Mistral",
         _ => "Sign in",
     };
     let how = match preset.sign_in {

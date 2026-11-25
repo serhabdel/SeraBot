@@ -70,6 +70,8 @@ const SVG_CLAUDE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 
 
 const SVG_WHATSAPP: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="5" fill="#25D366"/><path d="M12 6.2a5.8 5.8 0 0 0-5 8.7l-.7 2.8 2.9-.7A5.8 5.8 0 1 0 12 6.2Z" fill="none" stroke="#fff" stroke-width="1.65" stroke-linejoin="round"/><path d="M9.9 9.7c-.2-.4-.3-.4-.5-.4h-.5c-.2 0-.4.1-.6.4-.2.2-.8.8-.8 1.9s.8 2.2.9 2.3c.1.2 1.6 2.5 3.9 3.4 1.9.7 2.3.6 2.7.5.4-.1 1.3-.5 1.5-1 .2-.5.2-.9.1-1-.1-.1-.2-.2-.6-.4l-1.3-.6c-.2-.1-.3-.1-.5.1l-.5.6c-.2.2-.3.2-.5.1-.3-.1-1-.4-1.9-1.2-.7-.6-1.2-1.4-1.3-1.6-.1-.2 0-.4.1-.5l.4-.5.2-.4c.1-.2 0-.3 0-.4l-.6-1.3Z" fill="#fff"/></svg>"##;
 
+const SVG_INCEPTION: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="5" fill="#0F172A"/><circle cx="12" cy="12" r="5.2" fill="none" stroke="#6366F1" stroke-width="1.6"/><ellipse cx="12" cy="12" rx="8.2" ry="3.1" transform="rotate(-28 12 12)" fill="none" stroke="#fff" stroke-width="1.5"/><circle cx="12" cy="12" r="2.1" fill="#fff"/></svg>"##;
+
 /// Every known brand. To add one: drop `<key>.png` in `assets/brands/`, list
 /// it in `SOURCES.md`, and add a line here.
 static BRANDS: &[Brand] = &[
@@ -302,6 +304,11 @@ static BRANDS: &[Brand] = &[
         mark: png!("sambanova"),
     },
     Brand {
+        keys: &["inception", "inceptionlabs"],
+        label: "Inception Labs",
+        mark: Mark::Svg(SVG_INCEPTION),
+    },
+    Brand {
         keys: &["anthropic"],
         label: "Anthropic",
         mark: Mark::Svg(SVG_ANTHROPIC),
@@ -441,6 +448,8 @@ mod tests {
         "huggingface",
         "nebius",
         "sambanova",
+        "inception",
+        "inceptionlabs",
         "openai-compatible",
         "custom",
     ];

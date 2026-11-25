@@ -79,9 +79,9 @@ pub fn client_id_for(secrets: &SharedSecrets, override_name: &str) -> String {
         .unwrap_or_else(|| DEFAULT_CLIENT_ID.to_owned())
 }
 
-/// The code a member pasted or the redirect carried: `code`, `code#state`, or
-/// the whole callback URL. Returns the code and the state, when it came with
-/// one.
+/// The code a member pasted or the redirect carried: `code`, `code#state`,
+/// the whole callback URL, or a `setup-token` (`sk-ant-oat01-...`). Returns
+/// the code/token and the state, when it came with one.
 pub fn split_pasted_code(input: &str) -> (String, Option<String>) {
     let input = input.trim();
     if (input.starts_with("http://") || input.starts_with("https://"))
@@ -91,10 +91,20 @@ pub fn split_pasted_code(input: &str) -> (String, Option<String>) {
         let mut state = None;
         for (key, value) in url.query_pairs() {
             match key.as_ref() {
-                "code" => code = Some(value.into_owned()),
-                "state" => state = Some(value.into_owned()),
+                "code" => {
+                    let trimmed = value.trim();
+                    if !trimmed.is_empty() {
+                        code = Some(trimmed.to_owned());
+                    }
+                }
+                "state" => state = Some(value.trim().to_owned()),
                 _ => {}
             }
+        }
+        if state.is_none()
+            && let Some(fragment) = url.fragment().map(str::trim).filter(|f| !f.is_empty())
+        {
+            state = Some(fragment.to_owned());
         }
         if let Some(code) = code {
             return (code, state);
@@ -269,6 +279,31 @@ impl SignInProvider for ClaudeSignIn {
             return Err(SeraError::Rejected {
                 code: "bad_code",
                 message: "The sign-in code or verifier is not valid".into(),
+            });
+        }
+        if code.starts_with("sk-ant-oat01-") {
+            if code.len() <= "sk-ant-oat01-".len() || code.chars().any(char::is_whitespace) {
+                return Err(SeraError::Rejected {
+                    code: "bad_code",
+                    message: "The sign-in token is not valid".into(),
+                });
+            }
+            use sha2::Digest as _;
+            let digest = hex::encode(sha2::Sha256::digest(code.as_bytes()));
+            return Ok(SignedIn {
+                label: "Claude setup-token".into(),
+                auth_kind: AuthKind::Oauth,
+                fingerprint: Some(identity_fingerprint(
+                    "claude",
+                    &format!("setup-token:{digest}"),
+                )),
+                identity: json!({"plan": "Claude setup-token"}),
+                credential: ProviderCredential {
+                    expires_at: None,
+                    api_key: code,
+                    refresh_token: String::new(),
+                    generation: None,
+                },
             });
         }
         let client_id = self.client_id()?;
@@ -1033,5 +1068,64 @@ mod tests {
             validate_loopback_redirect(&spec, "http://localhost:54545/oauth-callback").is_err()
         );
         assert!(validate_loopback_redirect(&spec, "https://claude.ai/callback").is_err());
+    }
+
+    #[tokio::test]
+    async fn pasted_setup_token_is_stored_directly_without_token_exchange() {
+        let token = "sk-ant-oat01-synthetic-setup-token-1234";
+        assert_eq!(
+            split_pasted_code(&format!("  {token}  ")),
+            (token.to_owned(), None)
+        );
+        let harness = harness();
+        let alice = member(&harness, "microsoft:claude-setup-token");
+        let server = MockServer::start().await;
+        let service = service(&harness, &server, true);
+        let started = service
+            .start(&alice, "claude", "anthropic", start_request())
+            .await
+            .unwrap();
+        let outcome = service
+            .complete(
+                &alice,
+                "claude",
+                "anthropic",
+                complete_request(&started.flow_id, token),
+            )
+            .await
+            .unwrap();
+        assert!(outcome.created);
+        assert!(server.received_requests().await.unwrap().is_empty());
+        let account = harness
+            .accounts
+            .get(&alice, "claude", &outcome.account_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(account.auth_kind, AuthKind::Oauth);
+        assert_eq!(account.label, "Claude setup-token");
+        let stored = harness
+            .accounts
+            .credential(&alice, "claude", &outcome.account_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.api_key, token);
+        assert!(stored.refresh_token.is_empty());
+
+        // Pasting the same setup-token again updates the existing account.
+        let started2 = service
+            .start(&alice, "claude", "anthropic", start_request())
+            .await
+            .unwrap();
+        let outcome2 = service
+            .complete(
+                &alice,
+                "claude",
+                "anthropic",
+                complete_request(&started2.flow_id, token),
+            )
+            .await
+            .unwrap();
+        assert!(!outcome2.created);
+        assert_eq!(outcome.account_id, outcome2.account_id);
     }
 }

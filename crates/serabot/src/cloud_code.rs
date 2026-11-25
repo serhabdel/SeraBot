@@ -93,8 +93,25 @@ pub const ANTIGRAVITY_UPDATER_URL: &str =
     "https://antigravity-hub-auto-updater-971186067036.us-central1.run.app/releases/latest";
 /// Environment override for the Antigravity Hub version (HielCowork's name).
 pub const ANTIGRAVITY_VERSION_ENV: &str = "AGY_VERSION";
-/// The live version, once asked (`None` when the updater did not answer).
-static LIVE_VERSION: tokio::sync::OnceCell<Option<String>> = tokio::sync::OnceCell::const_new();
+/// TTL for the cached live Antigravity Hub version (6 hours).
+const LIVE_VERSION_TTL: Duration = Duration::from_secs(6 * 3600);
+/// The live version and when it was fetched (`None` when not cached; failures
+/// are never cached so subsequent requests can retry).
+static LIVE_VERSION: std::sync::OnceLock<
+    tokio::sync::RwLock<Option<(String, std::time::Instant)>>,
+> = std::sync::OnceLock::new();
+
+fn live_version_cache() -> &'static tokio::sync::RwLock<Option<(String, std::time::Instant)>> {
+    LIVE_VERSION.get_or_init(|| tokio::sync::RwLock::new(None))
+}
+
+/// Clear the cached live Antigravity Hub version so the next request fetches a
+/// fresh version from the updater (for example after a 400/403 version refusal).
+pub async fn invalidate_live_version() {
+    if let Some(cache) = LIVE_VERSION.get() {
+        *cache.write().await = None;
+    }
+}
 
 /// The version in an updater answer (`{"version": "2.31.4", ...}`), when it
 /// is a plain dotted version.
@@ -137,9 +154,10 @@ async fn fetch_live_version() -> Option<String> {
 
 /// The Antigravity Hub version this server presents (user agent and
 /// `ideVersion`), in HielCowork's order: the provider's own `client_version`,
-/// then `AGY_VERSION`, then the live updater's (asked once per process), then
-/// the pinned [`IDE_VERSION`]. Google retires old client versions, so a server
-/// that never updates its pin still presents the current one.
+/// then `AGY_VERSION`, then the live updater's (cached for 6 hours, never
+/// caching failures), then the pinned [`IDE_VERSION`]. Google retires old
+/// client versions, so a server that never updates its pin still presents the
+/// current one.
 pub async fn antigravity_version(configured: Option<&str>) -> String {
     let env = std::env::var(ANTIGRAVITY_VERSION_ENV).ok();
     if let Some(version) = [configured, env.as_deref()]
@@ -150,11 +168,24 @@ pub async fn antigravity_version(configured: Option<&str>) -> String {
     {
         return version.to_owned();
     }
-    LIVE_VERSION
-        .get_or_init(fetch_live_version)
-        .await
-        .clone()
-        .unwrap_or_else(|| IDE_VERSION.to_owned())
+    let cache = live_version_cache();
+    if let Some((version, fetched_at)) = cache.read().await.as_ref()
+        && fetched_at.elapsed() < LIVE_VERSION_TTL
+    {
+        return version.clone();
+    }
+    let mut guard = cache.write().await;
+    if let Some((version, fetched_at)) = guard.as_ref()
+        && fetched_at.elapsed() < LIVE_VERSION_TTL
+    {
+        return version.clone();
+    }
+    if let Some(version) = fetch_live_version().await {
+        *guard = Some((version.clone(), std::time::Instant::now()));
+        return version;
+    }
+    *guard = None;
+    IDE_VERSION.to_owned()
 }
 
 /// The model Cloud Code serves when a Claude 5.5 name is not aliased on the
@@ -185,13 +216,13 @@ pub fn with_configured_models<'a>(
 
 pub const ANTIGRAVITY_SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs";
 pub const CLOUD_CODE_USER_AGENT: &str =
-    "antigravity/hub/2.25.0 (aidev_client; os_type=windows; arch=amd64; cl=1003475615)";
+    "antigravity/hub/2.31.4 (aidev_client; os_type=windows; arch=amd64; cl=1003475615)";
 pub const CLOUD_CODE_API_CLIENT: &str = "google-cloud-sdk vscode/1.96.0";
 pub const THOUGHT_SIGNATURE_SENTINEL: &str = "skip_thought_signature_validator";
 
 /// The Antigravity Hub version the user agent and `ideVersion` carry when the
 /// provider sets no `client_version`.
-pub const IDE_VERSION: &str = "2.25.0";
+pub const IDE_VERSION: &str = "2.31.4";
 const CALLBACK_PATH: &str = "/oauth-callback";
 const PREFERRED_PORT: u16 = 51121;
 const SESSION_SPACE: u64 = 9_000_000_000_000_000_000;
@@ -2778,13 +2809,41 @@ mod tests {
         assert_eq!(parse_updater_version(&large), None);
     }
 
+    static TEST_LIVE_VERSION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn the_presented_version_prefers_the_providers_own_then_the_pin() {
+        let _guard = TEST_LIVE_VERSION_LOCK.lock().await;
+        invalidate_live_version().await;
         assert_eq!(antigravity_version(Some("2.40.1")).await, "2.40.1");
         if std::env::var(ANTIGRAVITY_VERSION_ENV).is_err() {
             // Tests never ask the updater, so the pin stands in for it.
             assert_eq!(antigravity_version(None).await, IDE_VERSION);
             assert_eq!(antigravity_version(Some("latest")).await, IDE_VERSION);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalidate_live_version_clears_cached_version_and_never_caches_none() {
+        let _guard = TEST_LIVE_VERSION_LOCK.lock().await;
+        assert_eq!(
+            parse_updater_version(br#"{"version":"2.35.0"}"#).as_deref(),
+            Some("2.35.0")
+        );
+        assert_eq!(IDE_VERSION, "2.31.4");
+        assert!(CLOUD_CODE_USER_AGENT.contains("antigravity/hub/2.31.4"));
+        *live_version_cache().write().await =
+            Some(("2.99.0".to_owned(), std::time::Instant::now()));
+        if std::env::var(ANTIGRAVITY_VERSION_ENV).is_err() {
+            assert_eq!(antigravity_version(None).await, "2.99.0");
+            invalidate_live_version().await;
+            assert!(live_version_cache().read().await.is_none());
+            // fetch_live_version returns None in tests; None is never cached.
+            assert_eq!(antigravity_version(None).await, IDE_VERSION);
+            assert!(live_version_cache().read().await.is_none());
+        } else {
+            invalidate_live_version().await;
+            assert!(live_version_cache().read().await.is_none());
         }
     }
 

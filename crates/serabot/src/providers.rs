@@ -231,6 +231,12 @@ const BUILTINS: &[BuiltinProvider] = &[
         summary: "SambaNova Cloud; catalog GET {base}/models",
     },
     BuiltinProvider {
+        kind: "inception",
+        base_url: Some("https://api.inceptionlabs.ai/v1"),
+        auth: "api_key",
+        summary: "Inception Labs Mercury diffusion LLMs (OpenAI-compatible); catalog GET {base}/models",
+    },
+    BuiltinProvider {
         kind: "anthropic",
         base_url: Some("https://api.anthropic.com/v1"),
         auth: "api_key",
@@ -1906,6 +1912,7 @@ mod tests {
             "huggingface",
             "nebius",
             "sambanova",
+            "inception",
         ] {
             assert!(kinds.contains(&kind), "{kind}");
         }
@@ -1967,6 +1974,12 @@ mod tests {
                 false,
             ),
             (
+                "inception",
+                "https://api.inceptionlabs.ai/v1",
+                "https://api.inceptionlabs.ai/v1/models",
+                false,
+            ),
+            (
                 "perplexity",
                 "https://api.perplexity.ai",
                 "https://api.perplexity.ai/v1/models",
@@ -1979,6 +1992,7 @@ mod tests {
             assert_eq!(resolved.strict, strict, "{kind}");
             assert!(matches!(auth_plan(kind, "").unwrap(), AuthPlan::ApiKey));
         }
+        assert!(check_profile("inception", "", "", "", "", true, 1800).is_ok());
         // Perplexity only contacts its own host for the list.
         assert!(resolve_catalog("perplexity", "https://evil.example").is_err());
         // An Ollama-style server is a custom OpenAI-compatible endpoint on

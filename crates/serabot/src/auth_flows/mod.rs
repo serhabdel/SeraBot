@@ -29,6 +29,7 @@ pub mod codex;
 pub mod copilot;
 pub mod device;
 pub mod google;
+pub mod mistral;
 pub mod muse;
 pub mod pkce;
 #[cfg(test)]
@@ -374,6 +375,7 @@ impl SignInRegistry {
         // Each provider's `plan_oauth` flag (checked per request) turns it off.
         registry.register("openai-codex", Arc::new(codex::CodexSignIn::new()));
         registry.register("github-copilot", Arc::new(copilot::CopilotSignIn::new()));
+        registry.register("mistral", Arc::new(mistral::MistralSignIn::new()));
         registry
     }
 
@@ -838,7 +840,7 @@ impl SignInService {
             flow: FlowKind::Device,
             url: started.verification_uri,
             expires_in: lifetime.as_secs(),
-            user_code: Some(started.user_code),
+            user_code: (!started.user_code.is_empty()).then_some(started.user_code),
             interval: Some(started.interval),
             state: None,
         })
