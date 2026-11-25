@@ -875,17 +875,12 @@ pub(super) fn CommandPaletteSheet(session: Signal<Session>, overlay: Signal<Over
         });
         for bot in s.state.listed_bots.iter().filter(|b| b.enabled) {
             let name = s.bot_display_name(&bot.id);
-            let acp = s.bot_uses_claude_agent(&bot.id);
-            let sub = if acp {
-                format!("{} · Local Claude Code (ACP)", bot.role)
-            } else {
-                format!("{} · Server route", bot.role)
-            };
+            let sub = format!("{} · Server route", bot.role);
             out.push(PaletteEntry {
                 group: "Bots",
                 title: name,
                 subtitle: sub,
-                icon: if acp { "code" } else { "bot" },
+                icon: "bot",
                 shortcut: "",
                 action: PaletteAction::Bot(bot.id.clone()),
             });

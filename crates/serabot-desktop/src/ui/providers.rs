@@ -487,6 +487,7 @@ pub(super) fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) 
                     }
                     div { class: "prov-default-picker", ModelBar { session } }
                 }
+                BotRoutingSection { session }
                 if !loaded {
                     div { class: "prov-grid", role: "status", "aria-busy": "true",
                         div { class: "prov-card skeleton-card",
@@ -1014,6 +1015,280 @@ fn UsageCard(session: Signal<Session>) -> Element {
                     }
                 } else {
                     p { class: "caption", "No usage report loaded yet. Load the last 7 days to see calls and tokens." }
+                }
+            }
+        }
+    }
+}
+
+struct BotRouteRowView {
+    id: String,
+    name: String,
+    avatar: String,
+    current_value: String,
+    assigned_label: String,
+    thinking_badge: Option<String>,
+    fallback_count: usize,
+    unlisted_current: bool,
+}
+
+fn thinking_badge_label(level: &str) -> &str {
+    match level {
+        "off" => "Off",
+        "low" => "Low",
+        "medium" => "Medium",
+        "high" => "High",
+        "xhigh" => "Extra high",
+        other => other,
+    }
+}
+
+fn quick_set_bot_model(
+    mut session: Signal<Session>,
+    bot_id: String,
+    prev_value: String,
+    next_value: String,
+) {
+    if prev_value == next_value {
+        return;
+    }
+    let mut s = session.write();
+    if s.bot_settings.saving || !s.can_admin() {
+        return;
+    }
+    let mut display_name = s.bot_display_name(&bot_id);
+    if display_name.trim().is_empty() {
+        display_name = bot_id.clone();
+    }
+    let mut original = serabot_desktop::session::BotDraft {
+        display_name: display_name.clone(),
+        model: prev_value,
+        ..Default::default()
+    };
+    let mut draft = original.clone();
+    draft.model = next_value;
+    if original.model == draft.model {
+        original.model = if draft.model.is_empty() {
+            "__reset__|__reset__".to_owned()
+        } else {
+            String::new()
+        };
+    }
+    s.bot_settings.bot = Some(bot_id);
+    s.bot_settings.original = original;
+    s.bot_settings.draft = draft;
+    s.bot_settings.hydrated = true;
+    s.save_bot_settings();
+    // Mark unhydrated so opening the full bot settings sheet later reloads
+    // every field cleanly from the server record.
+    s.bot_settings.hydrated = false;
+}
+
+/// Compact per-bot model routing table on the Providers page.
+#[component]
+fn BotRoutingSection(session: Signal<Session>) -> Element {
+    let (rows, model_groups, can_write, saving_bot, route_error) = {
+        let s = session.read();
+        let enabled_bots: Vec<_> = s
+            .state
+            .listed_bots
+            .iter()
+            .filter(|bot| bot.enabled)
+            .collect();
+        if enabled_bots.is_empty() {
+            return rsx! {};
+        }
+        let options = s.route_options();
+        type ModelGroup = (String, String, Vec<(String, String)>);
+        let mut model_groups: Vec<ModelGroup> = Vec::new();
+        let mut model_to_value: Vec<(String, String)> = Vec::new();
+        let mut ready_values: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for prov in options.provider_choices() {
+            if !prov.egress_approved {
+                continue;
+            }
+            let prov_ready = s
+                .state
+                .providers
+                .iter()
+                .find(|p| p.id == prov.id)
+                .is_none_or(usable);
+            if !prov_ready {
+                continue;
+            }
+            let models: Vec<(String, String)> = options
+                .model_choices(&prov.id)
+                .into_iter()
+                .map(|choice| {
+                    let value = serabot_desktop::session::model_value(&prov.id, &choice.model);
+                    model_to_value.push((choice.model.clone(), value.clone()));
+                    ready_values.insert(value.clone());
+                    (value, human_model(&choice.model))
+                })
+                .collect();
+            if !models.is_empty() {
+                model_groups.push((prov.id, prov.label, models));
+            }
+        }
+        let rows: Vec<BotRouteRowView> = enabled_bots
+            .into_iter()
+            .map(|bot| {
+                let detail = s.state.bot_details.get(&bot.id);
+                let route_primary = detail
+                    .and_then(|d| d.route.as_ref())
+                    .and_then(|r| r.route.as_ref());
+                let current_value = if let Some(primary) = route_primary {
+                    serabot_desktop::session::model_value(&primary.provider, &primary.model)
+                } else if let Some(model_id) = bot.model.as_deref().filter(|m| !m.is_empty()) {
+                    if let Some(d) =
+                        detail.filter(|d| !d.provider.is_empty() && !d.model.is_empty())
+                    {
+                        serabot_desktop::session::model_value(&d.provider, &d.model)
+                    } else {
+                        model_to_value
+                            .iter()
+                            .find(|(raw, _)| raw == model_id)
+                            .map(|(_, val)| val.clone())
+                            .unwrap_or_else(|| model_id.to_owned())
+                    }
+                } else {
+                    String::new()
+                };
+                let assigned_label = if let Some(primary) = route_primary {
+                    human_model(&primary.model)
+                } else if let Some(model_id) = bot.model.as_deref().filter(|m| !m.is_empty()) {
+                    human_model(model_id)
+                } else {
+                    "Default".to_owned()
+                };
+                let thinking_badge = route_primary
+                    .and_then(|p| p.thinking.as_deref())
+                    .or_else(|| detail.and_then(|d| d.thinking.as_deref()))
+                    .filter(|level| !level.is_empty())
+                    .map(|level| thinking_badge_label(level).to_owned());
+                let fallback_count = detail
+                    .and_then(|d| d.route.as_ref())
+                    .map(|r| r.fallbacks.len())
+                    .unwrap_or(0);
+                let unlisted_current =
+                    !current_value.is_empty() && !ready_values.contains(&current_value);
+                BotRouteRowView {
+                    id: bot.id.clone(),
+                    name: s.bot_display_name(&bot.id),
+                    avatar: s.bot_avatar(&bot.id),
+                    current_value,
+                    assigned_label,
+                    thinking_badge,
+                    fallback_count,
+                    unlisted_current,
+                }
+            })
+            .collect();
+        let can_write = s.can_admin() && !s.bot_settings.saving;
+        let saving_bot = if s.bot_settings.saving {
+            s.bot_settings.bot.clone()
+        } else {
+            None
+        };
+        let route_error = s.bot_settings.error.clone();
+        (rows, model_groups, can_write, saving_bot, route_error)
+    };
+    let count = rows.len();
+    rsx! {
+        section { class: "prov-section bot-routing-section", "aria-labelledby": "prov-bot-routing",
+            div { class: "prov-section-head",
+                div {
+                    h2 { id: "prov-bot-routing", class: "prov-section-title", "Bot routing" }
+                    p { class: "tiny", "Assign each bot its own model, or leave it on Default to inherit the global route above." }
+                }
+                span { class: "prov-count", "{count} enabled" }
+            }
+            if let Some(err) = route_error {
+                div { class: "banner err", role: "alert",
+                    span { class: "grow", "{err}" }
+                }
+            }
+            div { class: "card bot-routing-card", role: "list", "aria-label": "Bot routing",
+                for row in rows {
+                    {
+                        let bot_id_for_select = row.id.clone();
+                        let bot_id_for_btn = row.id.clone();
+                        let current_for_select = row.current_value.clone();
+                        let is_saving = saving_bot.as_deref() == Some(row.id.as_str());
+                        let select_id = format!("bot-route-select-{}", row.id);
+                        rsx! {
+                            div { key: "{row.id}", class: "bot-route-row", role: "listitem",
+                                div { class: "bot-route-info",
+                                    span { class: "avatar sm bot", style: avatar_style(&row.id), "{row.avatar}" }
+                                    div { class: "bot-route-copy",
+                                        span { class: "bot-route-name", "{row.name}" }
+                                        div { class: "bot-route-meta",
+                                            span { class: "bot-route-assigned", "{row.assigned_label}" }
+                                            if let Some(thinking) = row.thinking_badge {
+                                                span { class: "chip muted", "Thinking: {thinking}" }
+                                            }
+                                            if is_saving {
+                                                span { class: "chip muted", "Saving\u{2026}" }
+                                            }
+                                        }
+                                    }
+                                }
+                                div { class: "bot-route-controls",
+                                    select {
+                                        id: "{select_id}",
+                                        class: "select bot-route-select",
+                                        "aria-label": "Model for {row.name}",
+                                        value: "{row.current_value}",
+                                        disabled: !can_write,
+                                        onchange: move |event| {
+                                            quick_set_bot_model(
+                                                session,
+                                                bot_id_for_select.clone(),
+                                                current_for_select.clone(),
+                                                event.value(),
+                                            );
+                                        },
+                                        option {
+                                            value: "",
+                                            selected: row.current_value.is_empty(),
+                                            "Default (inherit)"
+                                        }
+                                        if row.unlisted_current {
+                                            option {
+                                                value: "{row.current_value}",
+                                                selected: true,
+                                                "{row.assigned_label}"
+                                            }
+                                        }
+                                        for (prov_id, prov_label, models) in &model_groups {
+                                            optgroup { key: "{prov_id}", label: "{prov_label}",
+                                                for (val, label) in models {
+                                                    option {
+                                                        key: "{val}",
+                                                        value: "{val}",
+                                                        selected: *val == row.current_value,
+                                                        "{label}"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    button {
+                                        class: "btn ghost sm",
+                                        r#type: "button",
+                                        title: "Configure primary model, fallbacks and failover rules",
+                                        onclick: move |_| session.write().open_bot_settings(bot_id_for_btn.clone()),
+                                        Icon { name: "settings", size: 13 }
+                                        if row.fallback_count > 0 {
+                                            "Fallbacks ({row.fallback_count})"
+                                        } else {
+                                            "Fallbacks"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

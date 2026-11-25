@@ -18,6 +18,8 @@ use crate::store::Store;
 
 #[cfg(feature = "whatsapp-link")]
 pub mod client;
+#[cfg(feature = "whatsapp-link")]
+pub use client::ProfileView;
 
 /// Conversation origin for chats that arrive over the linked device.
 pub const ORIGIN_WHATSAPP_LINK: &str = "whatsapp_link";
@@ -420,5 +422,33 @@ mod tests {
             decide_inbound_any("u", &allow, &stranger, false, false),
             InboundDecision::Drop
         );
+    }
+
+    #[test]
+    fn linked_phone_is_backfilled_and_preserved() {
+        let store = Store::open_in_memory(8).unwrap();
+        let alice = store.admin_user_id().unwrap();
+
+        // Linked initially before the client learned its phone number.
+        store
+            .set_whatsapp_link_status(&alice, "linked", None)
+            .unwrap();
+        let account = store.whatsapp_link_account(&alice).unwrap().unwrap();
+        assert_eq!(account.status, "linked");
+        assert_eq!(account.phone, None);
+
+        // Once live profile supplies the phone, persisting it backfills the row.
+        store
+            .set_whatsapp_link_status(&alice, "linked", Some("212612345678"))
+            .unwrap();
+        let account = store.whatsapp_link_account(&alice).unwrap().unwrap();
+        assert_eq!(account.phone.as_deref(), Some("212612345678"));
+
+        // Passing None later preserves the stored phone number.
+        store
+            .set_whatsapp_link_status(&alice, "linked", None)
+            .unwrap();
+        let account = store.whatsapp_link_account(&alice).unwrap().unwrap();
+        assert_eq!(account.phone.as_deref(), Some("212612345678"));
     }
 }

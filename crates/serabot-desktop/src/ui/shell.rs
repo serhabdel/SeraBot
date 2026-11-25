@@ -25,8 +25,6 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
         prev_conv_for_history.set(active_conv_for_history);
         history_open.0.set(false);
     }
-    // Claude Code on this computer keeps running while other pages are open.
-    crate::ui_claude_code::use_claude_code_provider();
     // A sign-in the session starts by itself (right after a save, or when an
     // error asks for one) opens its sheet here.
     let mut overlay_for_signin = overlay;
@@ -99,7 +97,7 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
                 }
             }
             div {
-                class: if (chat && settings_open) || preview_open {
+                class: if settings_open || preview_open {
                     "scrim inspector-scrim open"
                 } else {
                     "scrim inspector-scrim"
@@ -114,7 +112,7 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
                     }
                 },
             }
-            if chat {
+            if chat || settings_open {
                 SettingsPanel { session, overlay }
             }
             crate::ui_files::PreviewDock { session }
@@ -2119,22 +2117,6 @@ pub(super) fn Topbar(
                 // 0.63: the model picker lives here, out of the composer.
                 if active_bot.is_some() && session.read().conversation.starts_with("dir:") {
                     super::chat::HeaderModelChip { session }
-                }
-                if let Some(bot) = active_bot.clone() {
-                    {
-                        let acp_on = session.read().bot_uses_claude_agent(&bot);
-                        rsx! {
-                            button {
-                                class: if acp_on { "btn primary sm cc-mode-btn" } else { "btn ghost sm cc-mode-btn" },
-                                r#type: "button",
-                                title: if acp_on { "Switch back to server bot model" } else { "Run local Claude Code agent (ACP) in this bot chat" },
-                                "aria-pressed": if acp_on { "true" } else { "false" },
-                                onclick: move |_| session.write().toggle_bot_claude_agent(&bot),
-                                BrandLogo { brand: "claude".to_owned(), size: 14 }
-                                span { if acp_on { "Claude Agent: On" } else { "Claude Agent" } }
-                            }
-                        }
-                    }
                 }
                 // The member stack belongs to groups and rooms; in a one-to-one
                 // chat it only repeated every enabled bot.

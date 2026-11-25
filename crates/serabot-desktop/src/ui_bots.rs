@@ -1079,9 +1079,6 @@ fn route_row_views(session: &Session) -> (Vec<RouteRowView>, RouteCheck) {
 /// of the settings form keeps its own Save.
 #[component]
 pub fn RouteEditor(session: Signal<Session>, bot: String) -> Element {
-    let acp_on = session.read().bot_uses_claude_agent(&bot);
-    let bot_for_server = bot.clone();
-    let bot_for_acp = bot.clone();
     let (rows, check, hydrated, saving, dirty, error, notice, failover, effective, last_switch) = {
         let s = session.read();
         let (rows, check) = route_row_views(&s);
@@ -1090,6 +1087,7 @@ pub fn RouteEditor(session: Signal<Session>, bot: String) -> Element {
             .bot_settings
             .bot
             .as_deref()
+            .or(Some(bot.as_str()))
             .and_then(|id| s.state.bot_details.get(id))
             .and_then(|detail| detail.route.as_ref());
         (
@@ -1110,34 +1108,8 @@ pub fn RouteEditor(session: Signal<Session>, bot: String) -> Element {
     let can_save = hydrated && dirty && !saving && check.is_ok();
     rsx! {
         div { class: "field route-field",
-            span { class: "field-label", "Model & agent route" }
-            div { class: "route-block", role: "group", "aria-label": "Model and agent route",
-                div { class: "route-slot",
-                    div { class: "route-slot-title", span { "Execution engine" } }
-                    div { class: "seg", role: "group", "aria-label": "Execution engine",
-                        button {
-                            class: if !acp_on { "seg-btn active" } else { "seg-btn" },
-                            r#type: "button",
-                            "aria-pressed": if !acp_on { "true" } else { "false" },
-                            onclick: move |_| session.write().set_bot_claude_agent(&bot_for_server, false),
-                            "Server model route"
-                        }
-                        button {
-                            class: if acp_on { "seg-btn active" } else { "seg-btn" },
-                            r#type: "button",
-                            "aria-pressed": if acp_on { "true" } else { "false" },
-                            onclick: move |_| session.write().set_bot_claude_agent(&bot_for_acp, true),
-                            "Claude Code (Local ACP)"
-                        }
-                    }
-                    span { class: "hint",
-                        if acp_on {
-                            "This bot runs locally through Claude Code (ACP) in an allowed desktop folder with per-action approval."
-                        } else {
-                            "Uses the server provider chain below (and can reach allowed local folders via the relay)."
-                        }
-                    }
-                }
+            span { class: "field-label", "Model route & failover" }
+            div { class: "route-block", role: "group", "aria-label": "Model route and failover",
                 if !hydrated {
                     div { class: "banner info", role: "status",
                         span { class: "spinner" }

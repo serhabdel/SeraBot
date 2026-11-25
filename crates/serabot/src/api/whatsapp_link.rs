@@ -24,25 +24,66 @@ fn link(_state: &ApiState) -> Result<&'static ()> {
     ))
 }
 
-/// The caller's link: status, allowed chats and, while pairing, the QR
-/// payload or pairing code to show.
+/// The caller's link: status, live profile, allowed chats and, while pairing,
+/// the QR payload or pairing code to show.
 pub(super) async fn whatsapp_link_status(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
 ) -> Result<Json<Value>> {
     let account = state.store.whatsapp_link_account(&user.id)?;
+    let stored_phone = account.as_ref().and_then(|a| a.phone.clone());
+    let updated_at = account.as_ref().map(|a| a.updated_at.clone());
     #[cfg_attr(not(feature = "whatsapp-link"), allow(unused_mut))]
+    let mut phone = stored_phone.clone();
+    #[cfg_attr(not(feature = "whatsapp-link"), allow(unused_mut))]
+    let mut push_name: Option<String> = None;
+    #[cfg_attr(not(feature = "whatsapp-link"), allow(unused_mut))]
+    let mut connected = false;
+    #[cfg_attr(not(feature = "whatsapp-link"), allow(unused_mut))]
+    let mut pairing: Option<Value> = None;
+
+    #[cfg(feature = "whatsapp-link")]
+    if let Ok(link) = link(&state) {
+        if let Some(profile) = link.profile_view(&user.id) {
+            connected = profile.connected;
+            push_name = profile.push_name;
+            if let Some(live_phone) = profile.phone {
+                let should_persist = stored_phone.as_deref() != Some(live_phone.as_str())
+                    && account.as_ref().is_some_and(|a| a.status == "linked");
+                if should_persist
+                    && let Err(error) =
+                        state
+                            .store
+                            .set_whatsapp_link_status(&user.id, "linked", Some(&live_phone))
+                {
+                    tracing::warn!(%error, "whatsapp link: live phone not saved");
+                }
+                phone = Some(live_phone);
+            }
+        } else {
+            connected = link.is_live(&user.id);
+        }
+        pairing = Some(serde_json::to_value(link.pairing_view(&user.id))?);
+    }
+
     let mut body = json!({
         "enabled": link(&state).is_ok(),
         "status": account.as_ref().map(|a| a.status.clone()).unwrap_or_else(|| "signed_out".into()),
-        "phone": account.as_ref().and_then(|a| a.phone.clone()),
+        "phone": phone,
+        "push_name": push_name,
+        "updated_at": updated_at,
+        "connected": connected,
+        "profile": {
+            "push_name": push_name,
+            "phone": phone,
+            "connected": connected,
+            "linked_at": updated_at,
+        },
         "allowlist": account.as_ref().map(|a| a.allowlist.clone()).unwrap_or_default(),
         "risk": "Unofficial WhatsApp client: the number can be banned. Use a spare number.",
     });
-    #[cfg(feature = "whatsapp-link")]
-    if let Ok(link) = link(&state) {
-        body["connected"] = json!(link.is_live(&user.id));
-        body["pairing"] = serde_json::to_value(link.pairing_view(&user.id))?;
+    if let Some(pairing) = pairing {
+        body["pairing"] = pairing;
     }
     Ok(Json(body))
 }
