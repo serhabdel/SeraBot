@@ -48,6 +48,8 @@ struct State {
     boxes: BTreeMap<String, Vec<FakeMessage>>,
     next_uid: u32,
     log: Vec<String>,
+    /// Answer partial fetches (`BODY[]<0.N>`) with `NO`, like a server without them.
+    reject_partial: bool,
 }
 
 pub(crate) struct FakeImap {
@@ -111,6 +113,10 @@ impl FakeImap {
     /// Every command line the client has sent so far.
     pub(crate) fn commands(&self) -> Vec<String> {
         self.state.lock().unwrap().log.clone()
+    }
+
+    pub(crate) fn reject_partial_fetches(&self) {
+        self.state.lock().unwrap().reject_partial = true;
     }
 
     pub(crate) fn messages(&self, folder: &str) -> Vec<FakeMessage> {
@@ -244,23 +250,40 @@ async fn handle(socket: tokio::net::TcpStream, state: Arc<Mutex<State>>) {
                         format!("* SEARCH {}\r\n{tag} OK done\r\n", uids.join(" "))
                     }
                     "FETCH" => {
-                        let uid: u32 = args
-                            .split_whitespace()
-                            .next()
-                            .and_then(|w| w.parse().ok())
-                            .unwrap_or(0);
-                        match st
-                            .boxes
-                            .get(&selected)
-                            .and_then(|v| v.iter().find(|m| m.uid == uid))
-                        {
-                            Some(m) => format!(
-                                "* {uid} FETCH (UID {uid} FLAGS ({}) BODY[] {{{}}}\r\n{})\r\n{tag} OK done\r\n",
-                                flag_list(&m.flags),
-                                m.raw.len(),
-                                m.raw
-                            ),
-                            None => format!("{tag} OK done\r\n"),
+                        let set = args.split_whitespace().next().unwrap_or("");
+                        let partial = args
+                            .split("<0.")
+                            .nth(1)
+                            .and_then(|r| r.split('>').next())
+                            .and_then(|n| n.parse::<usize>().ok());
+                        if partial.is_some() && st.reject_partial {
+                            format!("{tag} NO partial fetch not supported\r\n")
+                        } else {
+                            let mut text = String::new();
+                            for uid in set.split(',').filter_map(|w| w.parse::<u32>().ok()) {
+                                let Some(m) = st
+                                    .boxes
+                                    .get(&selected)
+                                    .and_then(|v| v.iter().find(|m| m.uid == uid))
+                                else {
+                                    continue;
+                                };
+                                let (section, bytes) = match partial {
+                                    Some(n) => {
+                                        let cut = n.min(m.raw.len());
+                                        ("BODY[]<0>", m.raw.as_bytes()[..cut].to_vec())
+                                    }
+                                    None => ("BODY[]", m.raw.as_bytes().to_vec()),
+                                };
+                                text.push_str(&format!(
+                                    "* {uid} FETCH (UID {uid} FLAGS ({}) {section} {{{}}}\r\n{})\r\n",
+                                    flag_list(&m.flags),
+                                    bytes.len(),
+                                    String::from_utf8_lossy(&bytes)
+                                ));
+                            }
+                            text.push_str(&format!("{tag} OK done\r\n"));
+                            text
                         }
                     }
                     "STORE" => {
