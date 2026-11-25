@@ -34,6 +34,15 @@ mailbox or on a real Windows desktop; see **Owner verification**.
   - Keyboard: `j/k`, `Enter`, `c`, `r`/`a`, `f`, `e`, `#`, `s`, `u`, `z`, `x`, `Ctrl+A`, `Ctrl+Z`, `/`, `g`, `Esc`, `?` (cheat sheet). Shortcuts are ignored while typing in a field or while a dialog is open.
   - Fixed: "Mark unread" and un-star did not update rows loaded from the server, because the server reports flags without the backslash.
 
+- **Mail composer** (`ui_mail_compose.rs`, `assets/ux.css`)
+  - The Send buttons are always visible (sticky footer, wider drawer); they used to fall out of view in a short window.
+  - To, Cc and Bcc are chip fields: Enter, comma, semicolon, Tab, a space after a finished address, or a paste of several addresses makes chips; Backspace removes the last one; arrow keys pick suggestions. Invalid addresses are marked and block Send with a message.
+  - Attach files from this PC, by drag and drop onto the composer, or from the Library. Limits (10 files, 18 MB in total) are checked before upload. Ctrl+Enter sends.
+
+- **Chat message bar and retries** (`ui/chat.rs`, `chat_feed.rs`)
+  - Copy, Quote, Create task and Edit sit in a row under their message instead of floating over the neighbouring one.
+  - A message sent again with no reply in between shows once. This hides the copy in the transcript only; the server still stores both. A real recall needs a server change, proposed in `docs/specs/0.74.15-proposal.md`.
+
 - **Model picker** (`picker_search.rs`, `ui/chat.rs`)
   - Fuzzy search ("son5" finds "claude-sonnet-5"), ranked by match quality.
   - Favorites (star) and Recent, kept on this device; with an empty search box favorites lead, then recents.
@@ -52,7 +61,7 @@ mailbox or on a real Windows desktop; see **Owner verification**.
 
 These were proposed and left out on purpose, so the notes do not overstate:
 
-- Branch-from-here and pin on chat messages (need server support for forking a conversation).
+- Branch-from-here and pin on chat messages (need server support for forking a conversation), and recalling a sent message (see the 0.74.15 proposal).
 - A single Send/Stop morph button, mode chips in the composer, per-model cost and speed hints (the catalog has no price or latency data) and a per-chat versus default model toggle.
 - A shared Save/Discard bar for Settings (each card still saves itself) and an Activity feed (no event source for it yet).
 - Mail on mobile beyond the snippet: threads, snooze, drafts and undo send are desktop-only for now.
