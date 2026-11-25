@@ -12,7 +12,7 @@
 
 use crate::ui::{BrandLogo, Icon};
 use crate::ui_composio::ComposioCard;
-use crate::ui_connectors::{ConnectorCard, GoogleSetupCard};
+use crate::ui_connectors::{ConnectorCard, GoogleSetupCard, SocialAccountsCard};
 use crate::ui_marketplace::{MarketplaceTab, PluginSheet};
 use crate::ui_mcp_accounts::GithubCard;
 use crate::ui_whatsapp_link::WhatsappLinkCard;
@@ -61,22 +61,47 @@ fn fetch_mail_status(creds: &Credentials) -> Result<MailStatus, String> {
 }
 
 fn mail_entry(status: Option<&MailStatus>) -> Entry {
-    let connected = status.is_some_and(|s| s.connected);
-    let (pill, tone, meta) = if let Some(st) = status.filter(|s| s.connected) {
-        let user = st
-            .username
-            .as_deref()
-            .map(str::trim)
-            .filter(|u| !u.is_empty())
-            .unwrap_or("Your mailbox");
-        ("Connected".to_owned(), Tone::Ok, user.to_owned())
-    } else {
-        (
-            "Not connected".to_owned(),
-            Tone::Muted,
-            "Your mailbox".to_owned(),
-        )
-    };
+    let connected = status.is_some_and(|s| s.connected || !s.accounts.is_empty());
+    let (pill, tone, meta) =
+        if let Some(st) = status.filter(|s| s.connected || !s.accounts.is_empty()) {
+            let default_user = st
+                .username
+                .as_deref()
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .map(str::to_owned);
+            let meta = if let Some(user) = default_user {
+                if st.accounts.len() > 1 {
+                    format!("{user} (+{} more)", st.accounts.len() - 1)
+                } else {
+                    user
+                }
+            } else if st.accounts.len() > 1 {
+                format!("{} mailboxes connected", st.accounts.len())
+            } else if let Some(first) = st.accounts.first() {
+                let label = first.account.trim();
+                let user = first
+                    .username
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|u| !u.is_empty());
+                match (label.is_empty(), user) {
+                    (false, Some(u)) => format!("{label} ({u})"),
+                    (false, None) => label.to_owned(),
+                    (true, Some(u)) => u.to_owned(),
+                    (true, None) => "1 mailbox connected".to_owned(),
+                }
+            } else {
+                "Connected".to_owned()
+            };
+            ("Connected".to_owned(), Tone::Ok, meta)
+        } else {
+            (
+                "Not connected".to_owned(),
+                Tone::Muted,
+                "Your mailbox".to_owned(),
+            )
+        };
     Entry {
         source: Source::Connector(MAIL_CONNECTOR_ID.to_owned()),
         brand_key: "agentmail".to_owned(),
@@ -378,6 +403,22 @@ fn InstalledTab(
     let marketplace_pending =
         !marketplace_loaded && !marketplace_unavailable && marketplace_error.is_none();
     let loading = nothing && (!connectors_loaded || marketplace_pending);
+    let needle_lc = needle.trim().to_lowercase();
+    let show_social = needle_lc.is_empty()
+        || needle_lc == "x"
+        || [
+            "social",
+            "browser",
+            "linkedin",
+            "instagram",
+            "twitter",
+            "x.com",
+            "facebook",
+            "youtube",
+            "marketer",
+        ]
+        .iter()
+        .any(|kw| kw.contains(&needle_lc) || needle_lc.contains(kw));
     let inline_error = state_error.or(marketplace_error);
     rsx! {
         if let Some(message) = inline_error {
@@ -393,7 +434,7 @@ fn InstalledTab(
         }
         if loading {
             SkeletonGrid { label: "Loading integrations", count: 8 }
-        } else if nothing && needle.trim().is_empty() {
+        } else if nothing && !show_social && needle.trim().is_empty() {
             div { class: "empty",
                 div { class: "empty-icon", Icon { name: "connectors", size: 20 } }
                 h2 { class: "empty-title", "Nothing set up yet" }
@@ -405,7 +446,7 @@ fn InstalledTab(
                     "Browse Marketplace"
                 }
             }
-        } else if nothing {
+        } else if nothing && !show_social {
             div { class: "empty compact",
                 h3 { class: "empty-title", "No integrations match that search" }
                 p { class: "empty-text", "Try another name, category, or suite (like Microsoft or Google)." }
@@ -426,6 +467,10 @@ fn InstalledTab(
                         }
                     }
                 }
+            }
+            if show_social {
+                h2 { class: "connector-suite-title", "Social" }
+                SocialAccountsCard { session }
             }
             for (suite, cards) in available {
                 h2 { key: "{suite}", class: "connector-suite-title", "{suite}" }

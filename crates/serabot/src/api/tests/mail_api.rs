@@ -1316,3 +1316,148 @@ async fn mail_connect_password_optional_updates_and_multi_account_metadata() {
     assert_eq!(work_acct["signature"], "Work Sig");
     assert!(work_acct.get("password").is_none());
 }
+
+#[tokio::test]
+async fn mail_test_endpoint_checks_saved_default_and_named_accounts() {
+    let smtp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let smtp_port = smtp_listener.local_addr().unwrap().port();
+    let imap_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let imap_port = imap_listener.local_addr().unwrap().port();
+
+    // 2 connect calls + 2 /v1/mail/test calls = 4 SMTP & 4 IMAP connections.
+    let smtp_server = tokio::spawn(async move {
+        for _ in 0..4 {
+            let (socket, _) = smtp_listener.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            writer.write_all(b"220 fake ESMTP\r\n").await.unwrap();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.starts_with("EHLO") {
+                    writer
+                        .write_all(b"250-fake\r\n250 AUTH LOGIN\r\n")
+                        .await
+                        .unwrap();
+                } else if line == "AUTH LOGIN" {
+                    writer.write_all(b"334 VXNlcm5hbWU6\r\n").await.unwrap();
+                    let _ = lines.next_line().await;
+                    writer.write_all(b"334 UGFzc3dvcmQ6\r\n").await.unwrap();
+                    let _ = lines.next_line().await;
+                    writer.write_all(b"235 ok\r\n").await.unwrap();
+                } else if line == "QUIT" {
+                    writer.write_all(b"221 bye\r\n").await.unwrap();
+                    break;
+                } else {
+                    writer.write_all(b"250 ok\r\n").await.unwrap();
+                }
+            }
+        }
+    });
+
+    let imap_server = tokio::spawn(async move {
+        for _ in 0..4 {
+            let (socket, _) = imap_listener.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            writer
+                .write_all(b"* OK [CAPABILITY IMAP4rev1 AUTH=LOGIN] ready.\r\n")
+                .await
+                .unwrap();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let tag = line.split_whitespace().next().unwrap_or("a1");
+                if line.contains(" LOGOUT") {
+                    writer
+                        .write_all(format!("* BYE\r\n{tag} OK bye\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                    break;
+                }
+                writer
+                    .write_all(format!("{tag} OK\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+
+    let root = temp_base();
+    let (app, _, store) = app_with_root(true, Policy::empty(), root);
+    let alice = store
+        .create_user("mail-test-a", "mta@example.example", "Mail Test A")
+        .unwrap();
+    let alice_token = mint_for(&store, &alice.id, "mail-test-tok");
+
+    // 1. Not connected yet -> 404 for both default and named account.
+    let res = post_json(&app, &alice_token, "/v1/mail/test", json!({})).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+    let res = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/test",
+        json!({ "account": "work" }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+    // 2. Connect default mailbox and named "work" mailbox.
+    let res = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/connect",
+        json!({
+            "smtp_host": "127.0.0.1",
+            "smtp_port": smtp_port,
+            "smtp_security": "none",
+            "username": "mta@example.example",
+            "password": "default-password",
+            "imap_host": "127.0.0.1",
+            "imap_port": imap_port,
+            "imap_security": "none"
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let res = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/connect",
+        json!({
+            "account": "work",
+            "smtp_host": "127.0.0.1",
+            "smtp_port": smtp_port,
+            "smtp_security": "none",
+            "username": "work@example.example",
+            "password": "work-password",
+            "imap_host": "127.0.0.1",
+            "imap_port": imap_port,
+            "imap_security": "none"
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // 3. POST /v1/mail/test without password tests saved default and named accounts.
+    let res = post_json(&app, &alice_token, "/v1/mail/test", json!({})).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = read_json(res).await;
+    assert_eq!(body["account"], "");
+    assert_eq!(body["smtp_test"], "ok");
+    assert_eq!(body["imap_test"], "ok");
+
+    let res = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/test",
+        json!({ "account": "work" }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = read_json(res).await;
+    assert_eq!(body["account"], "work");
+    assert_eq!(body["smtp_test"], "ok");
+    assert_eq!(body["imap_test"], "ok");
+
+    smtp_server.await.unwrap();
+    imap_server.await.unwrap();
+}

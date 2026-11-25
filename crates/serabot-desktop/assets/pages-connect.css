@@ -692,3 +692,125 @@
     max-width: none;
   }
 }
+
+/* Social accounts browser-session card (0.74.17). */
+.social-accounts-card {
+  gap: 14px;
+  padding: var(--card-pad);
+  border-color: var(--glass-edge);
+  border-radius: var(--card-radius);
+  background: var(--card-bg);
+  box-shadow: var(--card-shadow);
+}
+
+.social-accounts-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  border: 1px solid var(--hairline);
+  background: var(--surface-2, var(--hover));
+  color: var(--label-1);
+}
+
+.social-platform-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 260px), 1fr));
+  gap: 10px;
+}
+
+.social-platform-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md, 10px);
+  background: var(--surface-1, transparent);
+  transition: border-color var(--dur-1) var(--ease), background var(--dur-1) var(--ease);
+}
+
+.social-platform-row:hover {
+  border-color: var(--hairline-strong);
+  background: var(--hover);
+}
+
+.social-platform-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.social-platform-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  border: 1px solid var(--hairline);
+  background: var(--surface-2, var(--hover));
+  color: var(--label-1);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.social-platform-badge[data-platform="linkedin"] {
+  color: #0a66c2;
+}
+
+.social-platform-badge[data-platform="instagram"] {
+  color: #d62976;
+}
+
+.social-platform-badge[data-platform="facebook"] {
+  color: #1877f2;
+}
+
+.social-platform-badge[data-platform="youtube"],
+.social-platform-badge[data-platform="youtube_studio"] {
+  color: #ff0000;
+}
+
+.social-platform-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.social-platform-name {
+  font-size: var(--fs-body);
+  font-weight: 600;
+  color: var(--label-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.social-platform-domain {
+  font-size: var(--fs-caption);
+  color: var(--label-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.social-accounts-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-top: 6px;
+  border-top: 1px solid var(--hairline);
+}
+

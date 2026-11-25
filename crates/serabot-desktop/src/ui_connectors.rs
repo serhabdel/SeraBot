@@ -1335,6 +1335,7 @@ pub(crate) fn MailConnectorCard(
                             let confirming = confirm_disconnect_account().as_deref()
                                 == Some(acct_key.as_str());
                             let acct_for_edit = acct.clone();
+                            let test_key = acct_key.clone();
                             let open_key = acct_key.clone();
                             let ask_disc_key = acct_key.clone();
                             let do_disc_key = acct_key.clone();
@@ -1387,6 +1388,34 @@ pub(crate) fn MailConnectorCard(
                                                     confirm_disconnect_account.set(None);
                                                 },
                                                 "Edit"
+                                            }
+                                            button {
+                                                class: "btn ghost sm",
+                                                r#type: "button",
+                                                disabled: busy(),
+                                                onclick: move |_| {
+                                                    if busy() {
+                                                        return;
+                                                    }
+                                                    let acct_opt = (!test_key.is_empty())
+                                                        .then(|| test_key.clone());
+                                                    busy.set(true);
+                                                    error.set(None);
+                                                    test_result.set(None);
+                                                    confirm_disconnect_account.set(None);
+                                                    spawn(async move {
+                                                        let res = run_mail_job(session, move |c| {
+                                                            c.mail_test(acct_opt.as_deref())
+                                                        })
+                                                        .await;
+                                                        busy.set(false);
+                                                        match res {
+                                                            Ok(reply) => test_result.set(Some(reply)),
+                                                            Err(msg) => error.set(Some(msg)),
+                                                        }
+                                                    });
+                                                },
+                                                "Test"
                                             }
                                             button {
                                                 class: "btn ghost sm",
@@ -1999,6 +2028,269 @@ pub(crate) fn MailWindow(
                             p { class: "tiny muted", "Select a message to read it." }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+fn social_platform_badge(id: &str) -> (&'static str, &'static str) {
+    match id {
+        "linkedin" => ("in", "LinkedIn"),
+        "instagram" => ("IG", "Instagram"),
+        "x" => ("𝕏", "X"),
+        "facebook" => ("f", "Facebook"),
+        "youtube" | "youtube_studio" => ("▶", "YouTube Studio"),
+        _ => ("@", "Social"),
+    }
+}
+
+fn default_social_platforms() -> Vec<serabot_desktop::SocialPlatformInfo> {
+    vec![
+        serabot_desktop::SocialPlatformInfo {
+            id: "linkedin".to_owned(),
+            name: "LinkedIn".to_owned(),
+            url: "https://www.linkedin.com/login".to_owned(),
+            domain: "linkedin.com".to_owned(),
+        },
+        serabot_desktop::SocialPlatformInfo {
+            id: "instagram".to_owned(),
+            name: "Instagram".to_owned(),
+            url: "https://www.instagram.com/accounts/login/".to_owned(),
+            domain: "instagram.com".to_owned(),
+        },
+        serabot_desktop::SocialPlatformInfo {
+            id: "x".to_owned(),
+            name: "X".to_owned(),
+            url: "https://x.com/i/flow/login".to_owned(),
+            domain: "x.com".to_owned(),
+        },
+        serabot_desktop::SocialPlatformInfo {
+            id: "facebook".to_owned(),
+            name: "Facebook".to_owned(),
+            url: "https://www.facebook.com/login".to_owned(),
+            domain: "facebook.com".to_owned(),
+        },
+        serabot_desktop::SocialPlatformInfo {
+            id: "youtube".to_owned(),
+            name: "YouTube Studio".to_owned(),
+            url: "https://studio.youtube.com/".to_owned(),
+            domain: "studio.youtube.com".to_owned(),
+        },
+    ]
+}
+
+/// Persistent `social` browser profile card for LinkedIn, Instagram, X, Facebook, and YouTube Studio.
+#[component]
+pub(crate) fn SocialAccountsCard(session: Signal<Session>) -> Element {
+    use serabot_desktop::{BotSettingsUpdate, SocialBrowserStatus};
+    let mut status = use_signal(|| Option::<SocialBrowserStatus>::None);
+    let mut loading = use_signal(|| true);
+    let mut opening_platform = use_signal(|| Option::<String>::None);
+    let mut assigning = use_signal(|| false);
+    let mut error = use_signal(|| Option::<String>::None);
+    let mut notice = use_signal(|| Option::<String>::None);
+
+    let load_status = Callback::new(move |()| {
+        loading.set(true);
+        error.set(None);
+        spawn(async move {
+            let res = run_mail_job(session, |c| c.browser_social_status()).await;
+            loading.set(false);
+            match res {
+                Ok(st) => status.set(Some(st)),
+                Err(msg) => error.set(Some(msg)),
+            }
+        });
+    });
+    use_hook(move || load_status.call(()));
+
+    let current = status();
+    let (chip_tone, chip_text) = if loading() && current.is_none() {
+        (Tone::Muted, "Checking\u{2026}".to_owned())
+    } else if current.as_ref().is_some_and(|s| s.session_active) {
+        (Tone::Ok, "Active".to_owned())
+    } else if current.as_ref().is_some_and(|s| s.profile_exists) {
+        (Tone::Ok, "Ready".to_owned())
+    } else {
+        (Tone::Muted, "Not set up".to_owned())
+    };
+
+    let marketer_assigned = current
+        .as_ref()
+        .is_some_and(|s| s.assigned_bots.iter().any(|b| b == "marketer"));
+
+    let platforms = current
+        .as_ref()
+        .filter(|s| !s.platforms.is_empty())
+        .map(|s| s.platforms.clone())
+        .unwrap_or_else(default_social_platforms);
+
+    let busy = opening_platform().is_some() || assigning();
+
+    rsx! {
+        div { class: "card connector-card social-accounts-card",
+            div { class: "card-head",
+                div { class: "connector-id",
+                    div { class: "social-accounts-icon", "aria-hidden": "true",
+                        Icon { name: "browser", size: 18 }
+                    }
+                    div {
+                        h3 { class: "card-title", "Social Accounts (Browser Sessions)" }
+                        span { class: "card-sub",
+                            "Sign in once yourself in SeraBot's persistent "
+                            code { "social" }
+                            " browser profile. Your "
+                            code { "marketer" }
+                            " bot reuses that real session and always asks before publishing."
+                        }
+                    }
+                }
+                StatusChip { tone: chip_tone, text: chip_text }
+            }
+
+            if let Some(msg) = error() {
+                div { class: "banner err", role: "alert", span { class: "grow", "{msg}" } }
+            }
+            if let Some(msg) = notice() {
+                div { class: "banner ok", role: "status", span { class: "grow", "{msg}" } }
+            }
+
+            div { class: "social-platform-grid", role: "list", "aria-label": "Social platforms",
+                for plat in platforms {
+                    {
+                        let plat_id = plat.id.clone();
+                        let plat_id_click = plat_id.clone();
+                        let (glyph, fallback_name) = social_platform_badge(&plat_id);
+                        let display_name = if plat.name.trim().is_empty() {
+                            fallback_name.to_owned()
+                        } else {
+                            plat.name.clone()
+                        };
+                        let domain = if !plat.domain.trim().is_empty() {
+                            plat.domain.clone()
+                        } else {
+                            plat.url.clone()
+                        };
+                        let is_opening = opening_platform().as_deref() == Some(plat_id.as_str());
+                        rsx! {
+                            div {
+                                key: "{plat_id}",
+                                class: "social-platform-row",
+                                role: "listitem",
+                                div { class: "social-platform-info",
+                                    span {
+                                        class: "social-platform-badge",
+                                        "data-platform": "{plat_id}",
+                                        "aria-hidden": "true",
+                                        "{glyph}"
+                                    }
+                                    div { class: "social-platform-copy",
+                                        span { class: "social-platform-name", "{display_name}" }
+                                        if !domain.is_empty() {
+                                            span { class: "social-platform-domain mono", "{domain}" }
+                                        }
+                                    }
+                                }
+                                button {
+                                    class: "btn ghost sm",
+                                    r#type: "button",
+                                    disabled: busy,
+                                    onclick: move |_| {
+                                        if opening_platform().is_some() || assigning() {
+                                            return;
+                                        }
+                                        let target = plat_id_click.clone();
+                                        opening_platform.set(Some(target.clone()));
+                                        error.set(None);
+                                        notice.set(None);
+                                        spawn(async move {
+                                            let res = run_mail_job(session, move |c| {
+                                                c.browser_social_open(&target)
+                                            })
+                                            .await;
+                                            opening_platform.set(None);
+                                            match res {
+                                                Ok(reply) => {
+                                                    let sid = reply
+                                                        .get("session_id")
+                                                        .and_then(|v| v.as_str())
+                                                        .map(str::trim)
+                                                        .filter(|s| !s.is_empty())
+                                                        .unwrap_or("social")
+                                                        .to_owned();
+                                                    let mut s = session.write();
+                                                    s.open_section(serabot_desktop::session::Section::Browser);
+                                                    s.panel.focus_session(&sid);
+                                                }
+                                                Err(msg) => error.set(Some(msg)),
+                                            }
+                                        });
+                                    },
+                                    if is_opening { "Opening\u{2026}" } else { "Sign in / Open" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            div { class: "social-accounts-foot",
+                if marketer_assigned {
+                    StatusChip { tone: Tone::Ok, text: "Assigned to social".to_owned() }
+                } else {
+                    button {
+                        class: "btn primary sm",
+                        r#type: "button",
+                        disabled: busy,
+                        onclick: move |_| {
+                            if assigning() || opening_platform().is_some() {
+                                return;
+                            }
+                            assigning.set(true);
+                            error.set(None);
+                            notice.set(None);
+                            spawn(async move {
+                                let update = BotSettingsUpdate {
+                                    browser_profile: Some(Some("social".to_owned())),
+                                    ..Default::default()
+                                };
+                                let res = run_mail_job(session, move |c| {
+                                    c.update_bot("marketer", &update)
+                                })
+                                .await;
+                                assigning.set(false);
+                                match res {
+                                    Ok(()) => {
+                                        notice.set(Some(
+                                            "Assigned marketer to the social browser profile."
+                                                .to_owned(),
+                                        ));
+                                        if let Ok(st) =
+                                            run_mail_job(session, |c| c.browser_social_status())
+                                                .await
+                                        {
+                                            status.set(Some(st));
+                                        }
+                                    }
+                                    Err(msg) => error.set(Some(msg)),
+                                }
+                            });
+                        },
+                        if assigning() {
+                            "Assigning\u{2026}"
+                        } else {
+                            "Assign marketer to social profile"
+                        }
+                    }
+                }
+                button {
+                    class: "btn ghost sm",
+                    r#type: "button",
+                    disabled: busy,
+                    onclick: move |_| load_status.call(()),
+                    Icon { name: "refresh", size: 14 }
+                    "Refresh"
                 }
             }
         }

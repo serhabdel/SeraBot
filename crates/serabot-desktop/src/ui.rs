@@ -96,7 +96,6 @@ const CSS_PAGES: &str = concat!(
     include_str!("../assets/mail.css"),
     include_str!("../assets/pages-data.css"),
     include_str!("../assets/pages-connect.css"),
-    include_str!("../assets/claude-code.css"),
     include_str!("../assets/system.css"),
     include_str!("../assets/ux.css")
 );

@@ -723,3 +723,143 @@ pub(super) async fn profile_delete(
         "reassigned_bots": reassigned,
     })))
 }
+
+// ---- social accounts profile ----
+
+pub const SOCIAL_PROFILE_ID: &str = "social";
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct SocialPlatform {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub login_url: &'static str,
+    pub domain: &'static str,
+}
+
+pub const SOCIAL_PLATFORMS: &[SocialPlatform] = &[
+    SocialPlatform {
+        id: "linkedin",
+        name: "LinkedIn",
+        login_url: "https://www.linkedin.com/login",
+        domain: "linkedin.com",
+    },
+    SocialPlatform {
+        id: "instagram",
+        name: "Instagram",
+        login_url: "https://www.instagram.com/accounts/login/",
+        domain: "instagram.com",
+    },
+    SocialPlatform {
+        id: "x",
+        name: "X",
+        login_url: "https://x.com/i/flow/login",
+        domain: "x.com",
+    },
+    SocialPlatform {
+        id: "facebook",
+        name: "Facebook",
+        login_url: "https://www.facebook.com/login/",
+        domain: "facebook.com",
+    },
+    SocialPlatform {
+        id: "youtube",
+        name: "YouTube Studio",
+        login_url: "https://studio.youtube.com/",
+        domain: "studio.youtube.com",
+    },
+];
+
+/// `GET /v1/browser/social/status`: UID-scoped status of the dedicated `"social"`
+/// browser profile, its assigned bots, and the supported social platforms.
+pub(super) async fn browser_social_status(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    let profile_exists = state
+        .store
+        .get_browser_profile(&user.id, SOCIAL_PROFILE_ID)?
+        .is_some();
+    let mut bots = profile_bots(&state, &user)?;
+    let assigned_bots = bots.remove(SOCIAL_PROFILE_ID).unwrap_or_default();
+    let (active, controller, url) = match state.browser.as_ref() {
+        Some(browser) => {
+            let info = browser.info(&user.id, SOCIAL_PROFILE_ID).await;
+            let controller = match info.controller {
+                Controller::Bot => "bot",
+                Controller::User => "user",
+            };
+            (info.active, controller, info.url)
+        }
+        None => (false, "bot", None),
+    };
+    Ok(Json(json!({
+        "profile_id": SOCIAL_PROFILE_ID,
+        "profile_exists": profile_exists,
+        "active": active,
+        "session_id": active.then_some(SOCIAL_PROFILE_ID),
+        "controller": controller,
+        "url": url,
+        "assigned_bots": assigned_bots,
+        "platforms": SOCIAL_PLATFORMS,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SocialOpenRequest {
+    platform: String,
+}
+
+/// `POST /v1/browser/social/open`: ensure the `"social"` browser profile
+/// exists, launch it under owner control, navigate to the platform's login URL,
+/// audit `browser.social_open`, and return the session JSON.
+pub(super) async fn browser_social_open(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Json(req): Json<SocialOpenRequest>,
+) -> Result<Json<Value>> {
+    let platform_id = req.platform.trim().to_ascii_lowercase();
+    let platform = SOCIAL_PLATFORMS
+        .iter()
+        .find(|p| p.id == platform_id)
+        .ok_or_else(|| {
+            SeraError::Validation(format!("unknown social platform: {}", req.platform))
+        })?;
+
+    let browser = manager(&state)?;
+
+    if state
+        .store
+        .get_browser_profile(&user.id, SOCIAL_PROFILE_ID)?
+        .is_none()
+    {
+        state.store.create_browser_profile(&user.id, "Social")?;
+    }
+
+    browser.open_session(&user.id, SOCIAL_PROFILE_ID).await?;
+    browser
+        .set_controller(&user.id, SOCIAL_PROFILE_ID, Controller::User)
+        .await?;
+    let lease = browser.user_lease(&user.id, SOCIAL_PROFILE_ID).await?;
+    let page = lease.backend().navigate(platform.login_url).await?;
+    lease.note_navigation(&page.url);
+    drop(lease);
+
+    state.store.record_audit(
+        &user.id,
+        "browser.social_open",
+        None,
+        None,
+        None,
+        None,
+        Some(state.runtime.policy_version()),
+        Some(&json!({ "platform": platform.id })),
+    )?;
+
+    session_reply(
+        &state,
+        &user,
+        SOCIAL_PROFILE_ID,
+        browser.info(&user.id, SOCIAL_PROFILE_ID).await.to_json(),
+    )
+}

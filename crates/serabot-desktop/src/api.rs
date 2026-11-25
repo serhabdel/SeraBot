@@ -1869,6 +1869,36 @@ pub struct MailDisconnectResponse {
     pub connected: bool,
 }
 
+/// One social platform entry returned by `GET /v1/browser/social/status`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct SocialPlatformInfo {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, alias = "login_url")]
+    pub url: String,
+    #[serde(default)]
+    pub domain: String,
+}
+
+/// Status of the persistent `social` browser profile (`GET /v1/browser/social/status`).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct SocialBrowserStatus {
+    #[serde(default, alias = "profile_id")]
+    pub profile: String,
+    #[serde(default)]
+    pub profile_exists: bool,
+    #[serde(default, alias = "active")]
+    pub session_active: bool,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub assigned_bots: Vec<String>,
+    #[serde(default)]
+    pub platforms: Vec<SocialPlatformInfo>,
+}
+
 /// One attachment of a read mail message (`GET /v1/mail/messages/{uid}`, 0.74.5).
 /// `data_base64` is only present for small attachments.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -5457,6 +5487,44 @@ impl ApiClient {
             None => &[],
         };
         self.request::<_, ()>(Method::DELETE, &["v1", "mail"], query, None)
+    }
+
+    /// `POST /v1/mail/test`: re-run live SMTP + IMAP login tests for a saved mailbox.
+    pub fn mail_test(&self, account: Option<&str>) -> Result<MailConnectResponse, ApiError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            account: Option<&'a str>,
+        }
+        let account = account.map(str::trim).filter(|s| !s.is_empty());
+        self.request(
+            Method::POST,
+            &["v1", "mail", "test"],
+            &[],
+            Some(&Body { account }),
+        )
+    }
+
+    /// `GET /v1/browser/social/status`: status of the persistent `social` browser profile.
+    pub fn browser_social_status(&self) -> Result<SocialBrowserStatus, ApiError> {
+        self.get(&["v1", "browser", "social", "status"], &[])
+    }
+
+    /// `POST /v1/browser/social/open`: open the persistent `social` browser profile on a platform sign-in page.
+    pub fn browser_social_open(&self, platform: &str) -> Result<serde_json::Value, ApiError> {
+        let platform = platform.trim();
+        if platform.is_empty() {
+            return Err(ApiError::Validation("Platform is required."));
+        }
+        #[derive(Serialize)]
+        struct Body<'a> {
+            platform: &'a str,
+        }
+        self.request(
+            Method::POST,
+            &["v1", "browser", "social", "open"],
+            &[],
+            Some(&Body { platform }),
+        )
     }
 
     /// `GET /v1/mail/folders?account=`: folder names of one mailbox (0.74.5).
@@ -10081,5 +10149,72 @@ mod mail_workspace_tests {
                 .mail_send_with_undo(None, &[], &[], &[], "s", "b", None, 5, &[])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn browser_social_status_and_open_round_trip() {
+        let status_body = r#"{
+            "profile_id": "social",
+            "profile_exists": true,
+            "active": true,
+            "session_id": "social",
+            "controller": "user",
+            "url": "https://www.linkedin.com/login",
+            "assigned_bots": ["marketer"],
+            "platforms": [
+                {"id": "linkedin", "name": "LinkedIn", "login_url": "https://www.linkedin.com/login", "domain": "linkedin.com"}
+            ]
+        }"#;
+        let status = client_for(serve_once(json_response(status_body)))
+            .browser_social_status()
+            .unwrap();
+        assert_eq!(status.profile, "social");
+        assert!(status.profile_exists);
+        assert!(status.session_active);
+        assert_eq!(status.session_id.as_deref(), Some("social"));
+        assert_eq!(status.assigned_bots, vec!["marketer".to_owned()]);
+        assert_eq!(status.platforms.len(), 1);
+        assert_eq!(status.platforms[0].id, "linkedin");
+        assert_eq!(status.platforms[0].url, "https://www.linkedin.com/login");
+        assert_eq!(status.platforms[0].domain, "linkedin.com");
+
+        let opened = client_for(serve_once(json_response(
+            r#"{"id":"social","profile_name":"Social","active":true,"url":"https://www.linkedin.com/login"}"#,
+        )))
+        .browser_social_open("linkedin")
+        .unwrap();
+        assert_eq!(opened.get("id").and_then(|v| v.as_str()), Some("social"));
+        assert!(client_for(1).browser_social_open("  ").is_err());
+    }
+
+    #[test]
+    fn mail_test_round_trip() {
+        let body = r#"{
+            "connected": true,
+            "account": "work",
+            "smtp_host": "smtp.hostinger.com",
+            "imap_host": "imap.hostinger.com",
+            "username": "work@example.test",
+            "smtp_test": "ok",
+            "imap_test": {"error": "invalid credentials"}
+        }"#;
+        let res = client_for(serve_once(json_response(body)))
+            .mail_test(Some("work"))
+            .unwrap();
+        assert!(res.connected);
+        assert_eq!(res.account.as_deref(), Some("work"));
+        assert_eq!(res.smtp_test, MailProbeOutcome::Ok);
+        assert_eq!(
+            res.imap_test,
+            MailProbeOutcome::Error("invalid credentials".into())
+        );
+
+        let default_res = client_for(serve_once(json_response(
+            r#"{"connected":true,"smtp_test":"ok","imap_test":"ok"}"#,
+        )))
+        .mail_test(None)
+        .unwrap();
+        assert_eq!(default_res.smtp_test, MailProbeOutcome::Ok);
+        assert_eq!(default_res.imap_test, MailProbeOutcome::Ok);
     }
 }
