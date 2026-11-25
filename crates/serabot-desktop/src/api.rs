@@ -5873,6 +5873,18 @@ impl ApiClient {
         Ok(serde_json::from_value(reply["items"].clone()).unwrap_or_default())
     }
 
+    /// `GET /v1/mail/unread`: unread messages in a folder, without loading any (0.74.15).
+    pub fn mail_unread(&self, account: Option<&str>, folder: &str) -> Result<u32, ApiError> {
+        let mut query: Vec<(&str, &str)> = vec![("folder", folder)];
+        if let Some(label) = account.map(str::trim).filter(|s| !s.is_empty()) {
+            query.push(("account", label));
+        }
+        let reply: serde_json::Value = self.get(&["v1", "mail", "unread"], &query)?;
+        Ok(reply["unread"]
+            .as_u64()
+            .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX)))
+    }
+
     /// `GET /v1/mail/contacts?q=`: recipient suggestions, most used first (0.74.14).
     pub fn mail_contacts(&self, q: &str, limit: u32) -> Result<Vec<MailContact>, ApiError> {
         let limit = limit.clamp(1, 20).to_string();
@@ -9918,6 +9930,18 @@ mod mail_workspace_tests {
         client_for(serve_once(json_response(r#"{"deleted":true}"#)))
             .mail_delete_saved_search("q1")
             .unwrap();
+    }
+
+    #[test]
+    fn unread_count_is_read_from_the_reply() {
+        let n = client_for(serve_once(json_response(r#"{"unread":7}"#)))
+            .mail_unread(Some("work"), "INBOX")
+            .unwrap();
+        assert_eq!(n, 7);
+        let none = client_for(serve_once(json_response(r#"{}"#)))
+            .mail_unread(None, "INBOX")
+            .unwrap();
+        assert_eq!(none, 0);
     }
 
     #[test]

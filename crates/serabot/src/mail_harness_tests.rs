@@ -3,7 +3,7 @@
 
 use crate::mail::{
     build_draft_message, imap_delete, imap_flag, imap_folders, imap_list, imap_move,
-    imap_save_draft, imap_search, parse_message_detail,
+    imap_save_draft, imap_search, imap_unread_uids, parse_message_detail,
 };
 use crate::mail_test_support::{FakeImap, FakeMessage};
 use crate::mail_ux;
@@ -69,6 +69,29 @@ async fn list_search_flag_move_and_delete_against_a_dovecot_like_server() {
             .map(|m| m.uid)
             .collect::<Vec<_>>(),
         vec![2]
+    );
+}
+
+#[tokio::test]
+async fn unread_uids_come_from_one_search_without_fetching() {
+    let server = FakeImap::start(&["Archive"], inbox()).await;
+    let creds = server.credentials();
+    assert_eq!(imap_unread_uids(&creds, "INBOX").await.unwrap(), vec![2, 3]);
+    assert!(
+        imap_unread_uids(&creds, "Archive")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    imap_flag(&creds, "INBOX", 2, Some(true), None)
+        .await
+        .unwrap();
+    assert_eq!(imap_unread_uids(&creds, "INBOX").await.unwrap(), vec![3]);
+    let commands = server.commands();
+    assert!(commands.iter().any(|c| c.contains("EXAMINE")), "read-only");
+    assert!(
+        !commands.iter().any(|c| c.contains("UID FETCH")),
+        "counting must not fetch messages: {commands:?}"
     );
 }
 

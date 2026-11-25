@@ -2532,6 +2532,20 @@ pub async fn imap_list_headers(
     Ok(out)
 }
 
+/// UIDs of the unread messages of a folder. One `SEARCH UNSEEN` on a read-only
+/// `EXAMINE`; nothing is fetched or flagged, so it is cheap enough to poll.
+pub async fn imap_unread_uids(creds: &MailCredentials, folder: &str) -> Result<Vec<u32>> {
+    let mut wire = imap_connect(creds).await?;
+    let folder = normalize_folder(folder)?;
+    wire.send_line(&format!("a2 EXAMINE {}", imap_quote(&folder)))
+        .await?;
+    wire.expect_tagged("a2").await?;
+    wire.send_line("a3 UID SEARCH UNSEEN").await?;
+    let (_, untagged) = wire.expect_tagged("a3").await?;
+    let _ = wire.send_line("a9 LOGOUT").await;
+    Ok(parse_search_uids(&untagged))
+}
+
 /// Search a folder; returns the newest `limit` matches. A bare word searches
 /// subject, sender and body. Operators narrow it (`from:`, `to:`, `subject:`,
 /// `has:attachment`, `is:unread`, `is:starred`, `before:`, `after:`, see
