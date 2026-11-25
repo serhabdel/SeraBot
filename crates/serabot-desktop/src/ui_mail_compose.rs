@@ -226,10 +226,15 @@ pub(crate) fn RecipientField(
                             }
                             Key::Character(c) => {
                                 let text = draft();
-                                if (c == "," || c == ";") && !text.trim().is_empty() {
-                                    e.prevent_default();
-                                    commit.call(text);
-                                } else if c == " " && !text.contains('<') && is_complete_address(&text) {
+                                // A comma or semicolon ends an address; so does a space after one
+                                // that already looks finished.
+                                let ends_entry = !text.trim().is_empty()
+                                    && (c == ","
+                                        || c == ";"
+                                        || (c == " "
+                                            && !text.contains('<')
+                                            && is_complete_address(&text)));
+                                if ends_entry {
                                     e.prevent_default();
                                     commit.call(text);
                                 }
