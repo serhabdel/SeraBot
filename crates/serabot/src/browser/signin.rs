@@ -29,14 +29,44 @@ struct Rule {
     bot_note: &'static str,
 }
 
-const RULES: &[Rule] = &[Rule {
-    provider: "google",
-    host: "accounts.google.com",
-    // Matches both `/signin/rejected` and `/v3/signin/rejected`.
-    path_markers: &["/signin/rejected"],
-    message: "Google refused sign-in from this automated server browser. Use the Google connector (Connectors → Google) for Gmail/Drive/Calendar, or sign in from a regular browser on your PC.",
-    bot_note: "Google refused the sign-in from this automated browser (\"This browser or app may not be secure\"). Do not retry the login or look for another way past it. Tell the owner to use the Google connector (Connectors → Google) for Gmail, Drive and Calendar instead.",
-}];
+const RULES: &[Rule] = &[
+    Rule {
+        provider: "google",
+        host: "accounts.google.com",
+        // Matches both `/signin/rejected` and `/v3/signin/rejected`.
+        path_markers: &["/signin/rejected"],
+        message: "Google refused sign-in from this automated server browser. Use the Google connector (Connectors → Google) for Gmail/Drive/Calendar, or sign in from a regular browser on your PC.",
+        bot_note: "Google refused the sign-in from this automated browser (\"This browser or app may not be secure\"). Do not retry the login or look for another way past it. Tell the owner to use the Google connector (Connectors → Google) for Gmail, Drive and Calendar instead.",
+    },
+    Rule {
+        provider: "linkedin",
+        host: "www.linkedin.com",
+        path_markers: &["/checkpoint/challenge", "/checkpoint/lg/"],
+        message: "LinkedIn asked for a verification checkpoint. Complete the verification in the Browser tab, then hand control back to the bot.",
+        bot_note: "LinkedIn presented a verification checkpoint. Stop immediately — never retry or try to bypass it. Instruct the owner to complete verification in the Browser tab.",
+    },
+    Rule {
+        provider: "instagram",
+        host: "www.instagram.com",
+        path_markers: &["/challenge/", "/accounts/suspended/"],
+        message: "Instagram asked for a security challenge or account verification. Complete the verification in the Browser tab, then hand control back to the bot.",
+        bot_note: "Instagram presented a security challenge or account check. Stop immediately — never retry or try to bypass it. Instruct the owner to complete verification in the Browser tab.",
+    },
+    Rule {
+        provider: "x",
+        host: "x.com",
+        path_markers: &["/account/access"],
+        message: "X asked for an account access verification. Complete the verification in the Browser tab, then hand control back to the bot.",
+        bot_note: "X presented an account access verification. Stop immediately — never retry or try to bypass it. Instruct the owner to complete verification in the Browser tab.",
+    },
+    Rule {
+        provider: "facebook",
+        host: "www.facebook.com",
+        path_markers: &["/checkpoint/"],
+        message: "Facebook asked for a security checkpoint. Complete the verification in the Browser tab, then hand control back to the bot.",
+        bot_note: "Facebook presented a security checkpoint. Stop immediately — never retry or try to bypass it. Instruct the owner to complete verification in the Browser tab.",
+    },
+];
 
 /// Status the owner console shows for each sign-in refusal helper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -98,6 +128,58 @@ mod tests {
     }
 
     #[test]
+    fn recognises_social_checkpoint_pages() {
+        let cases = [
+            (
+                "linkedin",
+                "https://www.linkedin.com/checkpoint/challenge/AgE123",
+            ),
+            (
+                "linkedin",
+                "https://www.linkedin.com/checkpoint/lg/login-submit",
+            ),
+            (
+                "instagram",
+                "https://www.instagram.com/challenge/123456/abcdef/",
+            ),
+            (
+                "instagram",
+                "https://www.instagram.com/accounts/suspended/?next=/",
+            ),
+            ("x", "https://x.com/account/access"),
+            (
+                "facebook",
+                "https://www.facebook.com/checkpoint/828281030927956/",
+            ),
+        ];
+        for (expected_provider, url) in cases {
+            let block =
+                signin_block_hint(url).unwrap_or_else(|| panic!("expected block for {url}"));
+            assert_eq!(block.provider, expected_provider);
+            assert!(
+                block.message.contains("Browser"),
+                "message for {expected_provider} should mention Browser"
+            );
+            assert!(
+                block.bot_note.contains("Browser"),
+                "bot_note for {expected_provider} should mention Browser"
+            );
+            assert!(
+                block.bot_note.contains("never retry") || block.bot_note.contains("Do not retry"),
+                "bot_note for {expected_provider} should forbid retrying"
+            );
+        }
+
+        // Ordinary social pages must not trigger checkpoint blocks.
+        assert!(signin_block_hint("https://www.linkedin.com/login").is_none());
+        assert!(signin_block_hint("https://www.linkedin.com/feed/").is_none());
+        assert!(signin_block_hint("https://www.instagram.com/accounts/login/").is_none());
+        assert!(signin_block_hint("https://x.com/i/flow/login").is_none());
+        assert!(signin_block_hint("https://x.com/home").is_none());
+        assert!(signin_block_hint("https://www.facebook.com/login/").is_none());
+    }
+
+    #[test]
     fn ignores_ordinary_sign_in_pages_and_look_alikes() {
         assert!(signin_block_hint("https://accounts.google.com/v3/signin/identifier").is_none());
         assert!(signin_block_hint("https://accounts.google.com/").is_none());
@@ -123,7 +205,12 @@ mod tests {
     fn helper_status_lists_monitored_providers() {
         let helpers = signin_helper_statuses();
         assert_eq!(helpers.len(), RULES.len());
-        assert!(helpers.iter().any(|row| row.provider == "google"));
+        for provider in ["google", "linkedin", "instagram", "x", "facebook"] {
+            assert!(
+                helpers.iter().any(|row| row.provider == provider),
+                "missing helper status for {provider}"
+            );
+        }
         assert_eq!(helpers[0].status, HELPER_STATUS);
     }
 }

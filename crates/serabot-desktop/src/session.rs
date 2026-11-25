@@ -5988,7 +5988,15 @@ impl Session {
                     Some(self.memory_list_operation())
                 }
             }
-            Section::Providers => (!self.state.providers_loaded).then_some(Operation::Providers),
+            Section::Providers => {
+                if !self.state.providers_loaded {
+                    Some(Operation::Providers)
+                } else if !self.state.bots_loaded && self.state.listed_bots.is_empty() {
+                    Some(Operation::ListBots)
+                } else {
+                    None
+                }
+            }
             Section::Tasks => {
                 if self.state.tasks_loaded {
                     None
@@ -6006,6 +6014,8 @@ impl Session {
                     Some(Operation::Connectors)
                 } else if !self.state.marketplace_loaded && !self.state.marketplace_unavailable {
                     Some(Operation::MarketplaceList)
+                } else if !self.state.bots_loaded && self.state.listed_bots.is_empty() {
+                    Some(Operation::ListBots)
                 } else {
                     None
                 }
@@ -6021,7 +6031,13 @@ impl Session {
                     (!self.state.memories_loaded).then(|| self.memory_list_operation())
                 }
                 SettingsSection::Providers => {
-                    (!self.state.providers_loaded).then_some(Operation::Providers)
+                    if !self.state.providers_loaded {
+                        Some(Operation::Providers)
+                    } else if !self.state.bots_loaded && self.state.listed_bots.is_empty() {
+                        Some(Operation::ListBots)
+                    } else {
+                        None
+                    }
                 }
                 SettingsSection::Logs => (!self.state.logs_loaded).then(|| Operation::Logs {
                     level: self.logs_level.clone(),
@@ -6033,6 +6049,8 @@ impl Session {
                     } else if !self.state.marketplace_loaded && !self.state.marketplace_unavailable
                     {
                         Some(Operation::MarketplaceList)
+                    } else if !self.state.bots_loaded && self.state.listed_bots.is_empty() {
+                        Some(Operation::ListBots)
                     } else {
                         None
                     }

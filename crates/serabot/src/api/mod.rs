@@ -486,6 +486,8 @@ pub fn router(state: ApiState) -> Router {
             "/v1/browser/profiles/{id}",
             put(profile_rename).delete(profile_delete),
         )
+        .route("/v1/browser/social/status", get(browser_social_status))
+        .route("/v1/browser/social/open", post(browser_social_open))
         .route("/v1/messages", post(send_message))
         .route("/v1/bots/health", get(bot_health_report))
         .route("/v1/bots", get(list_bots).post(create_bot))

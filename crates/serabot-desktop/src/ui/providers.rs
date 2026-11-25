@@ -1251,7 +1251,11 @@ fn BotRoutingSection(session: Signal<Session>) -> Element {
                                         option {
                                             value: "",
                                             selected: row.current_value.is_empty(),
-                                            "Default (inherit)"
+                                            if row.fallback_count > 0 {
+                                                "Default (reset route & fallbacks)"
+                                            } else {
+                                                "Default (inherit)"
+                                            }
                                         }
                                         if row.unlisted_current {
                                             option {

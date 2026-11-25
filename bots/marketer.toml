@@ -31,6 +31,17 @@ tools = [
   "conversation_library",
   "telegram_send_document",
   "ask_teammate",
+  "browser_navigate",
+  "browser_snapshot",
+  "browser_click",
+  "browser_type",
+  "browser_press",
+  "browser_screenshot",
+  "browser_tabs",
+  "browser_new_tab",
+  "browser_upload",
+  "browser_wait",
+  "browser_scroll",
 ]
-require_approval = []
+require_approval = ["browser_click", "browser_type", "browser_press"]
 enabled = true

@@ -450,6 +450,7 @@ impl Session {
         if let Some(id) = self.bot_settings.bot.clone() {
             self.state.bot_details.remove(&id);
             self.schedule(Operation::ListBots, Duration::ZERO);
+            self.schedule(Operation::BotDetail { id }, Duration::ZERO);
         }
     }
 

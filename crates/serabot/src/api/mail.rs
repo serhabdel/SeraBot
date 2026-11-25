@@ -13,6 +13,7 @@ pub(super) fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/v1/mail", get(status).delete(disconnect))
         .route("/v1/mail/connect", post(connect))
+        .route("/v1/mail/test", post(test_mailbox))
         .route("/v1/mail/signature", put(update_signature))
         .route("/v1/mail/folders", get(folders))
         .route("/v1/mail/messages", get(messages))
@@ -192,6 +193,32 @@ async fn connect(
         "smtp_host": creds.smtp_host,
         "imap_host": creds.imap_host,
         "username": creds.username,
+        "smtp_test": match smtp { Ok(v) => json!(v), Err(e) => json!({"error": e.to_string()}) },
+        "imap_test": match imap { Ok(v) => json!(v), Err(e) => json!({"error": e.to_string()}) },
+    })))
+}
+
+#[derive(Default, Deserialize)]
+struct TestMailboxRequest {
+    #[serde(default)]
+    account: Option<String>,
+}
+
+/// `POST /v1/mail/test`: run live SMTP + IMAP login tests on a saved mailbox
+/// without re-entering its password.
+async fn test_mailbox(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    body: Option<Json<TestMailboxRequest>>,
+) -> Result<Json<Value>> {
+    let req = body.map(|Json(v)| v).unwrap_or_default();
+    let account_label = normalize_account(req.account.as_deref())?;
+    let creds = mail::load_credentials(&state.users, &user.id, account_label)?
+        .ok_or_else(|| SeraError::NotFound("mail account is not connected".into()))?;
+    let smtp = mail::smtp_test(&creds).await.map(|_| "ok".to_owned());
+    let imap = mail::imap_test(&creds).await.map(|_| "ok".to_owned());
+    Ok(Json(json!({
+        "account": account_label.unwrap_or(""),
         "smtp_test": match smtp { Ok(v) => json!(v), Err(e) => json!({"error": e.to_string()}) },
         "imap_test": match imap { Ok(v) => json!(v), Err(e) => json!({"error": e.to_string()}) },
     })))

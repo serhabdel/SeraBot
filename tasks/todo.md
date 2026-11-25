@@ -655,4 +655,13 @@ Plan: `docs/specs/0.74.15-proposal.md`. Version stays `0.74.14` until the batch 
 - [x] Version bump `0.74.16` (`Cargo.toml`), mobile `0.74.16+90`, `docs/release-0.74.16.md`, `README.md`, `tasks/todo.md`.
 - [ ] Owner: live pass on Providers bot routing, WhatsApp connected profile display, and editing/adding custom email accounts without re-entering password.
 
+## Release 0.74.17 — Browser-Backed Social Accounts Hub, Providers Routing Polish & Saved-Mailbox Test
+
+- [x] Social Accounts Hub (`browser/signin.rs`, `api/browser.rs`, `api/mod.rs`, `bots/marketer.toml`, `prompts/marketer.txt`, desktop `api.rs`, `ui_connectors.rs`, `ui_integrations.rs`, `pages-connect.css`): persistent `"social"` browser profile endpoints (`/v1/browser/social/status`, `/v1/browser/social/open`), LinkedIn/Instagram/X/Facebook checkpoint refusal rules, `marketer` browser tools + confirmation-gated prompt, and 1-click **Social Accounts** card with **Assign `marketer` to `social` profile**.
+- [x] Providers Bot Routing Polish & Dead ACP Cleanup (`session.rs`, `session/bot_settings.rs`, `ui/providers.rs`, `ui.rs`, removed `ui_claude_code.rs`): startup `ListBots` hydration, `BotDetail` refresh on save, explicit reset label when fallbacks exist.
+- [x] Integrations & Mail Test (`api/mail.rs`, `api/tests/mail_api.rs`, desktop `api.rs`, `ui_connectors.rs`, `ui_integrations.rs`): `POST /v1/mail/test` + per-row **Test** button without password re-entry, and named-mailbox summary in Integrations.
+- [x] Version bump `0.74.17` (`Cargo.toml`), mobile `0.74.17+91`, `docs/release-0.74.17.md`, `README.md`, `tasks/todo.md`.
+- [ ] Owner: live pass on signing into LinkedIn/Instagram in the `social` browser profile, assigning `marketer`, and testing a saved Hostinger mailbox.
+
+
 
