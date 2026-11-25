@@ -2,8 +2,9 @@
 //! corpus for the HTML sanitizer and the header parsers.
 
 use crate::mail::{
-    build_draft_message, imap_delete, imap_flag, imap_folders, imap_list, imap_move,
-    imap_save_draft, imap_search, imap_unread_uids, parse_message_detail,
+    build_draft_message, imap_delete, imap_flag, imap_folders, imap_list, imap_list_preview,
+    imap_move, imap_save_draft, imap_search, imap_search_preview, imap_unread_uids,
+    parse_message_detail,
 };
 use crate::mail_test_support::{FakeImap, FakeMessage};
 use crate::mail_ux;
@@ -69,6 +70,79 @@ async fn list_search_flag_move_and_delete_against_a_dovecot_like_server() {
             .map(|m| m.uid)
             .collect::<Vec<_>>(),
         vec![2]
+    );
+}
+
+fn fetch_commands(server: &FakeImap) -> Vec<String> {
+    server
+        .commands()
+        .into_iter()
+        .filter(|c| c.contains("UID FETCH"))
+        .collect()
+}
+
+#[tokio::test]
+async fn list_rows_come_from_one_batched_partial_fetch() {
+    let mut messages = inbox();
+    // A message with a very large body must not be downloaded whole for the list.
+    messages.push(FakeMessage::new(
+        4,
+        "Big",
+        "Dan <dan@example.example>",
+        &"x ".repeat(100_000),
+    ));
+    let server = FakeImap::start(&[], messages).await;
+    let creds = server.credentials();
+
+    let rows = imap_list_preview(&creds, "INBOX", 10).await.unwrap();
+    assert_eq!(
+        rows.iter().map(|m| m.uid).collect::<Vec<_>>(),
+        vec![4, 3, 2, 1]
+    );
+    assert_eq!(rows[2].snippet, "Please pay.");
+    assert!(rows[3].flags.iter().any(|f| f == "Seen"));
+    assert!(
+        !rows[0].snippet.is_empty(),
+        "the big message still gets a snippet"
+    );
+    assert!(!rows[0].thread_key.is_empty());
+
+    let fetches = fetch_commands(&server);
+    assert_eq!(
+        fetches.len(),
+        1,
+        "one fetch for the whole list: {fetches:?}"
+    );
+    assert!(
+        fetches[0].contains("4,3,2,1") && fetches[0].contains("<0.8192>"),
+        "{fetches:?}"
+    );
+
+    let found = imap_search_preview(&creds, "INBOX", "from:bob", 10)
+        .await
+        .unwrap();
+    assert_eq!(found.iter().map(|m| m.uid).collect::<Vec<_>>(), vec![2]);
+    assert!(imap_list_preview(&creds, "INBOX", 10).await.unwrap().len() == 4);
+}
+
+#[tokio::test]
+async fn list_rows_fall_back_to_whole_messages_when_partial_fetch_is_refused() {
+    let server = FakeImap::start(&[], inbox()).await;
+    server.reject_partial_fetches();
+    let creds = server.credentials();
+    let rows = imap_list_preview(&creds, "INBOX", 10).await.unwrap();
+    assert_eq!(
+        rows.iter().map(|m| m.uid).collect::<Vec<_>>(),
+        vec![3, 2, 1]
+    );
+    let fetches = fetch_commands(&server);
+    assert!(
+        fetches.iter().any(|c| c.contains("<0.")),
+        "tried the batch first"
+    );
+    assert!(
+        fetches.iter().filter(|c| !c.contains("<0.")).count() >= 3,
+        "then one whole fetch per message: {fetches:?}"
     );
 }
 

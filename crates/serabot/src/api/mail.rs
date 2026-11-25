@@ -228,7 +228,7 @@ async fn messages(
         .ok_or_else(|| SeraError::Validation("mail is not connected; connect it first".into()))?;
     let folder = query.folder.as_deref().unwrap_or("");
     let limit = query.limit.unwrap_or(20);
-    let messages = mail::imap_list(&creds, folder, limit).await?;
+    let messages = mail::imap_list_preview(&creds, folder, limit).await?;
     let messages = super::mail_extras::hide_snoozed(&state, &user.id, account, folder, messages);
     super::mail_extras::observe_senders(&state, &user.id, &messages);
     Ok(Json(json!({ "messages": messages })))
@@ -315,7 +315,7 @@ async fn search(
     let folder = query.folder.as_deref().unwrap_or("");
     let q = query.q.as_deref().unwrap_or("");
     let limit = query.limit.unwrap_or(20);
-    let messages = mail::imap_search(&creds, folder, q, limit).await?;
+    let messages = mail::imap_search_preview(&creds, folder, q, limit).await?;
     super::mail_extras::observe_senders(&state, &user.id, &messages);
     Ok(Json(json!({ "messages": messages })))
 }
