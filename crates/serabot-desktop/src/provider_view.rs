@@ -702,8 +702,8 @@ mod tests {
         let keys = ids(&keys);
         assert!(!sign_in.contains(&"chatgpt-codex"), "{sign_in:?}");
         assert!(sign_in.contains(&"anthropic") && sign_in.contains(&"antigravity"));
-        assert!(sign_in.contains(&"github-copilot"));
-        assert!(!keys.contains(&"openai") && keys.contains(&"mistral"));
+        assert!(sign_in.contains(&"github-copilot") && sign_in.contains(&"mistral"));
+        assert!(!keys.contains(&"openai") && keys.contains(&"deepseek"));
         assert!(
             keys.contains(&"custom"),
             "a custom endpoint can always be added"

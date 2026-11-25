@@ -1109,6 +1109,19 @@ impl LlmClient {
         }
     }
 
+    fn clear_negative_project_discovery(&self) {
+        if let Some(state) = &self.project {
+            let has_known = state
+                .known
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some();
+            if !has_known {
+                state.tried.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+
     /// Read a finished Cloud Code answer. `None` means Google returned a
     /// malformed tool call and nothing else: send the request again.
     fn cloud_answer(&self, bytes: &[u8], tools: &[ToolSpec]) -> Result<Option<LlmResponse>> {
@@ -1141,10 +1154,11 @@ impl LlmClient {
         temperature: Option<f32>,
         thinking_level: Option<&str>,
     ) -> Result<LlmResponse> {
-        let project = self.cloud_project().await;
+        let mut project = self.cloud_project().await;
         let conversation = current_conversation();
         let targets = cloud_code::chat_targets(&self.base_url)?;
         let mut refreshed = false;
+        let mut version_retried = false;
         let mut malformed = 0usize;
         // The id sent on the wire: the asked model, or once its HielCowork wire
         // alias when a cluster does not know the plain name.
@@ -1153,7 +1167,7 @@ impl LlmClient {
         let mut effective_thinking = thinking_level;
         let mut stripped_thinking = false;
         let mut last_error: Option<SeraError> = None;
-        for _ in 0..2 {
+        for _ in 0..3 {
             let mut restart = false;
             for target in &targets {
                 let mut session_bumped = false;
@@ -1234,6 +1248,18 @@ impl LlmClient {
                             continue;
                         }
                         CloudPost::Retryable(error) => {
+                            if !version_retried
+                                && matches!(&error, SeraError::Upstream { status: 403, .. })
+                            {
+                                version_retried = true;
+                                cloud_code::invalidate_live_version().await;
+                                if project.is_empty() {
+                                    self.clear_negative_project_discovery();
+                                    project = self.cloud_project().await;
+                                }
+                                restart = true;
+                                break;
+                            }
                             if !target.stream.contains(".sandbox.googleapis.com")
                                 || last_error.is_none()
                             {
@@ -1254,13 +1280,43 @@ impl LlmClient {
                                 wire_model = alias;
                                 continue;
                             }
+                            if !version_retried {
+                                version_retried = true;
+                                cloud_code::invalidate_live_version().await;
+                                if project.is_empty() {
+                                    self.clear_negative_project_discovery();
+                                    project = self.cloud_project().await;
+                                }
+                                restart = true;
+                                break;
+                            }
                             if !target.stream.contains(".sandbox.googleapis.com") {
                                 last_error = Some(error);
                                 break;
                             }
                             return Err(last_error.unwrap_or(error));
                         }
-                        CloudPost::Failed(error) => return Err(error),
+                        CloudPost::Failed(error) => {
+                            if !version_retried
+                                && matches!(
+                                    &error,
+                                    SeraError::Upstream {
+                                        status: 400 | 403,
+                                        ..
+                                    }
+                                )
+                            {
+                                version_retried = true;
+                                cloud_code::invalidate_live_version().await;
+                                if project.is_empty() {
+                                    self.clear_negative_project_discovery();
+                                    project = self.cloud_project().await;
+                                }
+                                restart = true;
+                                break;
+                            }
+                            return Err(error);
+                        }
                         CloudPost::Unauthorized => return Err(cloud_status_error(401)),
                         CloudPost::NotFound | CloudPost::SessionLimited | CloudPost::Transport => {
                             break;
@@ -1281,15 +1337,16 @@ impl LlmClient {
 
     async fn fetch_cloud_code_catalog(&self, catalog_url: &str) -> Result<ModelCatalog> {
         let urls = cloud_code::catalog_urls(catalog_url)?;
-        let project = self.cloud_project().await;
-        let body = if project.is_empty() {
-            json!({})
-        } else {
-            json!({"project": project})
-        };
+        let mut project = self.cloud_project().await;
         let mut refreshed = false;
+        let mut version_retried = false;
         let mut last_error: Option<SeraError> = None;
-        for _ in 0..2 {
+        for _ in 0..3 {
+            let body = if project.is_empty() {
+                json!({})
+            } else {
+                json!({"project": project})
+            };
             let mut restart = false;
             for url in &urls {
                 let used = zeroize::Zeroizing::new(self.bearer());
@@ -1306,10 +1363,54 @@ impl LlmClient {
                     }
                     CloudPost::Unauthorized => return Err(catalog_status_error(401)),
                     CloudPost::NotFound => last_error = Some(catalog_status_error(404)),
-                    CloudPost::Retryable(error) => last_error = Some(catalog_retag(error)),
+                    CloudPost::Retryable(error) => {
+                        if !version_retried
+                            && matches!(&error, SeraError::Upstream { status: 403, .. })
+                        {
+                            version_retried = true;
+                            cloud_code::invalidate_live_version().await;
+                            if project.is_empty() {
+                                self.clear_negative_project_discovery();
+                                project = self.cloud_project().await;
+                            }
+                            restart = true;
+                            break;
+                        }
+                        last_error = Some(catalog_retag(error));
+                    }
                     CloudPost::SessionLimited => last_error = Some(catalog_status_error(400)),
-                    CloudPost::BadRequest(error) => last_error = Some(catalog_retag(error)),
+                    CloudPost::BadRequest(error) => {
+                        if !version_retried {
+                            version_retried = true;
+                            cloud_code::invalidate_live_version().await;
+                            if project.is_empty() {
+                                self.clear_negative_project_discovery();
+                                project = self.cloud_project().await;
+                            }
+                            restart = true;
+                            break;
+                        }
+                        last_error = Some(catalog_retag(error));
+                    }
                     CloudPost::Failed(error) => {
+                        if !version_retried
+                            && matches!(
+                                &error,
+                                SeraError::Upstream {
+                                    status: 400 | 403,
+                                    ..
+                                }
+                            )
+                        {
+                            version_retried = true;
+                            cloud_code::invalidate_live_version().await;
+                            if project.is_empty() {
+                                self.clear_negative_project_discovery();
+                                project = self.cloud_project().await;
+                            }
+                            restart = true;
+                            break;
+                        }
                         return Err(catalog_retag(error));
                     }
                     CloudPost::Transport => {}

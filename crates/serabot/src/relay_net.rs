@@ -61,6 +61,7 @@ pub const RELAY_PROVIDERS: &[(&str, &str, &[&str])] = &[
     ),
     ("anthropic", "Anthropic", &["api.anthropic.com"]),
     ("openai", "OpenAI", &["api.openai.com"]),
+    ("inception", "Inception Labs", &["api.inceptionlabs.ai"]),
 ];
 
 /// Open tunnels per member, at most.

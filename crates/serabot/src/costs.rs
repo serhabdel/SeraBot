@@ -497,12 +497,33 @@ pub fn suggested_prices() -> (String, Vec<SuggestedPrice>) {
     )) else {
         return (String::new(), Vec::new());
     };
-    let rows = file
+    let mut rows: Vec<SuggestedPrice> = file
         .prices
         .into_iter()
         .filter_map(|row| serde_json::from_value::<SuggestedPrice>(row).ok())
         .filter(|row| row.input_per_m.is_finite() && row.output_per_m.is_finite())
         .collect();
+    for (model, input_per_m, cached_input_per_m, output_per_m) in [
+        ("mercury-3", 0.10, Some(0.01), 0.35),
+        ("mercury-2.5", 0.10, Some(0.01), 0.35),
+        ("mercury-2", 0.10, Some(0.01), 0.35),
+        ("mercury-edit-2", 0.10, Some(0.01), 0.35),
+        ("mercury-voice", 0.20, None, 0.75),
+    ] {
+        if !rows.iter().any(|r| {
+            r.provider.eq_ignore_ascii_case("inception") && r.model.eq_ignore_ascii_case(model)
+        }) {
+            rows.push(SuggestedPrice {
+                provider: "inception".into(),
+                model: model.into(),
+                input_per_m,
+                cached_input_per_m,
+                output_per_m,
+                source_url: "https://www.inceptionlabs.ai/pricing".into(),
+                notes: "Inception Labs Mercury diffusion LLMs.".into(),
+            });
+        }
+    }
     (file.researched_at, rows)
 }
 
@@ -666,6 +687,17 @@ mod tests {
         assert!(
             rows.iter()
                 .all(|row| row.input_per_m >= 0.0 && row.output_per_m >= 0.0)
+        );
+        let mercury3 = rows
+            .iter()
+            .find(|row| row.provider == "inception" && row.model == "mercury-3")
+            .expect("inception mercury-3 price");
+        assert!((mercury3.input_per_m - 0.10).abs() < 1e-9);
+        assert!((mercury3.output_per_m - 0.35).abs() < 1e-9);
+        assert_eq!(mercury3.cached_input_per_m, Some(0.01));
+        assert!(
+            rows.iter()
+                .any(|row| row.provider == "inception" && row.model == "mercury-voice")
         );
         assert_eq!(millions(1_250_000.0 / 1_000_000.0), "1.25M");
     }

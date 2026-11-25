@@ -603,16 +603,22 @@ fn FlowPanel(
     title: String,
     can_write: bool,
 ) -> Element {
+    let mut pasted_callback = use_signal(String::new);
+    let mut paste_error = use_signal(|| Option::<String>::None);
     let device = method == AddMethod::Device;
+    let is_claude_pkce = !device && kind == "anthropic";
+    let is_browser_device = device && kind == "mistral";
     let Some(flow) = flow else {
         return rsx! {
             div { class: "flow-panel",
                 p { class: "flow-title",
-                    if device { "Sign in with a one-time code" } else { "Sign in with your browser" }
+                    if device && !is_browser_device { "Sign in with a one-time code" } else { "Sign in with your browser" }
                 }
                 p { class: "muted",
-                    if device {
+                    if device && !is_browser_device {
                         "You get a short code to type on {title}'s own page. This window updates when it is approved."
+                    } else if is_claude_pkce {
+                        "Your browser opens {title}'s sign-in page (port 54545). Sign in there, or paste the callback URL or code#state if the redirect does not complete."
                     } else {
                         "Your browser opens {title}'s sign-in page. Sign in there, then come back."
                     }
@@ -626,7 +632,7 @@ fn FlowPanel(
                         onclick: move |_| {
                             session.write().start_provider_signin(provider.clone(), kind.clone(), method)
                         },
-                        if device { "Get a code" } else { "Open browser" }
+                        if device && !is_browser_device { "Get a code" } else { "Open browser" }
                     }
                 }
             }
@@ -655,6 +661,33 @@ fn FlowPanel(
     let device_flow = flow.kind == FlowKind::Device;
     let retry_provider = provider.clone();
     let retry_kind = kind.clone();
+    let submit_pasted = Callback::new(move |()| {
+        let raw = pasted_callback();
+        let Some((cb_code, cb_state)) = accounts::parse_claude_callback(&raw) else {
+            paste_error.set(Some(
+                "Paste the full callback URL (with code and state) or code#state.".to_owned(),
+            ));
+            return;
+        };
+        paste_error.set(None);
+        let path = accounts::claude_callback_path(&cb_code, &cb_state);
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 54545));
+            let stream =
+                std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2))
+                    .or_else(|_| {
+                        let v6 = std::net::SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 54545));
+                        std::net::TcpStream::connect_timeout(&v6, std::time::Duration::from_secs(2))
+                    });
+            if let Ok(mut conn) = stream {
+                let req = format!(
+                    "GET {path} HTTP/1.1\r\nHost: localhost:54545\r\nConnection: close\r\n\r\n"
+                );
+                let _ = conn.write_all(req.as_bytes());
+            }
+        });
+    });
     rsx! {
         div { class: "{panel_class}", "aria-live": "polite",
             p { class: "flow-title", "{headline}" }
@@ -716,13 +749,60 @@ fn FlowPanel(
                         "Cancel sign-in"
                     }
                 }
-                if !device_flow {
+                if !device_flow || flow.user_code.is_none() {
                     if let Some(page) = url {
                         p { class: "flow-link", "{page}" }
                     }
                 }
+                if !device_flow {
+                    if is_claude_pkce {
+                        div { class: "field",
+                            label { class: "field-label", r#for: "claude-callback-input",
+                                "Paste callback URL or code#state"
+                            }
+                            p { class: "hint",
+                                "In case port 54545 is blocked or your browser is on another machine, paste the callback URL or code#state from Claude here:"
+                            }
+                            div { class: "row",
+                                input {
+                                    id: "claude-callback-input",
+                                    class: "input grow",
+                                    autocomplete: "off",
+                                    spellcheck: false,
+                                    value: "{pasted_callback}",
+                                    placeholder: "http://localhost:54545/callback?code=...&state=... or code#state",
+                                    oninput: move |event| {
+                                        pasted_callback.set(event.value());
+                                        paste_error.set(None);
+                                    },
+                                    onkeydown: move |event: KeyboardEvent| {
+                                        if event.key() == Key::Enter {
+                                            event.prevent_default();
+                                            submit_pasted.call(());
+                                        }
+                                    },
+                                }
+                                button {
+                                    class: "btn primary sm",
+                                    r#type: "button",
+                                    disabled: pasted_callback().trim().is_empty(),
+                                    onclick: move |_| submit_pasted.call(()),
+                                    "Complete sign-in"
+                                }
+                            }
+                            if let Some(err) = paste_error() {
+                                p { class: "field-error", role: "alert", "{err}" }
+                            }
+                        }
+                    }
+                }
             }
             if bad || flow.phase == FlowPhase::Cancelled {
+                if is_claude_pkce && bad {
+                    p { class: "hint",
+                        "Claude redirects to localhost:54545/callback. If port 54545 is blocked, free that port or use an Anthropic API key instead."
+                    }
+                }
                 div { class: "route-actions",
                     button {
                         class: "btn primary sm",
