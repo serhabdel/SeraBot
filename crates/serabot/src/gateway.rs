@@ -540,6 +540,15 @@ impl Gateway {
         self.registry.is_registered(name)
     }
 
+    pub fn is_effectful_tool(&self, name: &str) -> bool {
+        is_destructive_tool(name)
+            || OWN_CHAT_DELIVERY_TOOLS.contains(&name)
+            || self
+                .registry
+                .get(name)
+                .is_some_and(|tool| tool.spec().external_effect)
+    }
+
     pub async fn execute(
         &self,
         name: &str,
@@ -611,7 +620,7 @@ impl Gateway {
         // uncertain before it goes out, exactly like the approved path: a
         // crash or a lost lease before the outcome is stored must route the
         // task to needs_review instead of silently requeueing it.
-        let effectful = own_chat || tool.spec().destructive();
+        let effectful = own_chat || tool.spec().destructive() || tool.spec().external_effect;
         if effectful
             && let Some(task_id) = context.task_id.as_deref()
             && let Err(error) = self.store.mark_task_uncertain(&context.user_id, task_id)
@@ -851,7 +860,7 @@ impl Gateway {
         // A standing grant runs without a fresh approval, so the uncertain
         // flag is the only thing keeping a destructive dispatch from being
         // replayed after a crash: same rule as the approved path.
-        let effectful = tool.spec().destructive();
+        let effectful = tool.spec().destructive() || tool.spec().external_effect;
         if effectful
             && let Some(task_id) = context.task_id.as_deref()
             && let Err(error) = self.store.mark_task_uncertain(&context.user_id, task_id)

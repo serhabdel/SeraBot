@@ -309,6 +309,111 @@ fn next_occurrence(now: DateTime<Utc>, time: NaiveTime, tz: Tz) -> Option<DateTi
     resolve_local(tomorrow.and_time(time), tz).map(|value| value.with_timezone(&Utc))
 }
 
+/// Claim due `scheduled_mail` rows (`status = 'pending'` and `send_at <= now_unix`),
+/// re-scan against the blocklist, send via `mail::send_account_mail`, and mark
+/// each row `sent` or `failed`.
+pub async fn process_due_scheduled_mail(
+    store: &Store,
+    secrets: &crate::user_secrets::UserSecrets,
+    artifacts: &crate::maker::ArtifactStore,
+    policy: &crate::policy::Policy,
+    now_unix: i64,
+) -> Result<usize> {
+    let due = store.claim_due_scheduled_mail(now_unix, 20)?;
+    let mut processed = 0usize;
+    for row in due {
+        let account = (!row.account_label.is_empty()).then_some(row.account_label.as_str());
+        let res = crate::mail::send_account_mail(
+            secrets,
+            store,
+            artifacts,
+            policy,
+            crate::mail::SendAccountMailParams {
+                user_id: &row.user_id,
+                account,
+                to: &row.to,
+                cc: &row.cc,
+                bcc: &row.bcc,
+                subject: &row.subject,
+                body: &row.body,
+                body_html: row.body_html.as_deref(),
+                attachment_hashes: &[],
+            },
+        )
+        .await;
+        match res {
+            Ok(sent) => {
+                let _ = store.complete_scheduled_mail(&row.id, Utc::now().timestamp());
+                let _ = store.record_audit(
+                    &row.user_id,
+                    "mail.scheduled_sent",
+                    Some("mail"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&json!({
+                        "id": row.id,
+                        "account": account,
+                        "to_count": sent.to_count,
+                    })),
+                );
+            }
+            Err(error) => {
+                let msg = error.to_string();
+                let _ = store.fail_scheduled_mail(&row.id, &msg);
+                let _ = store.record_audit(
+                    &row.user_id,
+                    "mail.scheduled_failed",
+                    Some("mail"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&json!({
+                        "id": row.id,
+                        "account": account,
+                        "error": msg,
+                    })),
+                );
+            }
+        }
+        processed += 1;
+    }
+    Ok(processed)
+}
+
+/// 30-second background loop that delivers due scheduled emails.
+pub async fn run_scheduled_mail_loop(
+    store: Store,
+    secrets: std::sync::Arc<crate::user_secrets::UserSecrets>,
+    artifacts: std::sync::Arc<crate::maker::ArtifactStore>,
+    policy: crate::policy::Policy,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = interval.tick() => {
+                let now_unix = Utc::now().timestamp();
+                if let Err(error) = process_due_scheduled_mail(
+                    &store,
+                    &secrets,
+                    &artifacts,
+                    &policy,
+                    now_unix,
+                )
+                .await
+                {
+                    tracing::warn!(%error, "scheduled mail check failed");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

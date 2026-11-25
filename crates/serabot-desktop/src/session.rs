@@ -1002,6 +1002,8 @@ pub struct Session {
     pub regenerating: bool,
     /// A stop was asked for while a request was in flight.
     stop_queued: bool,
+    /// Out-of-band stop request in flight, independent of the worker slot.
+    stop_rx: Option<std::sync::mpsc::Receiver<Result<usize, String>>>,
     /// Picked files waiting for upload, one request at a time.
     upload_queue: std::collections::VecDeque<(String, Vec<u8>)>,
     /// An upload request is in flight.
@@ -1223,6 +1225,7 @@ impl Session {
             upload_thumb: None,
             regenerating: false,
             stop_queued: false,
+            stop_rx: None,
             upload_queue: std::collections::VecDeque::new(),
             uploading: false,
             pick_rx: None,
@@ -1512,6 +1515,7 @@ impl Session {
         self.composer_files.clear();
         self.attach_notice = None;
         self.stop_queued = false;
+        self.stop_rx = None;
         self.upload_queue.clear();
         self.uploading = false;
         self.pending = None;
@@ -3823,9 +3827,9 @@ impl Session {
             .is_some_and(|message| message.role == Role::User && message.id.starts_with("opt-"))
     }
 
-    /// The Stop button: ask the server to end this conversation's running
-    /// reply or queued send. When another request holds the slot, the stop
-    /// waits for it.
+    /// The Stop button: immediately mark stopping, clear local queued sends,
+    /// and send `POST /v1/conversations/{id}/stop` out-of-band without waiting
+    /// for the main worker slot.
     pub fn stop_turn(&mut self) {
         if !self.main_run_active()
             && crate::runs::active_count(&self.state.runs.rows) == 0
@@ -3834,8 +3838,80 @@ impl Session {
             return;
         }
         self.state.stopping = true;
-        self.stop_queued = true;
-        self.flush_stop();
+        self.stop_queued = false;
+        self.backlog.retain(|op| {
+            !matches!(
+                op,
+                Operation::Submit(_) | Operation::SubmitTo { .. } | Operation::SubmitWith { .. }
+            )
+        });
+        if !self.queue.wants_interrupt() && !self.queue.is_empty() {
+            self.queue = crate::chat_compose::SendQueue::default();
+            self.persist_composer_state();
+        }
+        let Some(credentials) = self.credentials.clone() else {
+            return;
+        };
+        let endpoint = credentials.endpoint.clone();
+        let token = secrecy::SecretString::new(credentials.token.expose_secret().to_owned());
+        let conversation = self.conversation.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.stop_rx = Some(receiver);
+        let spawned = std::thread::Builder::new()
+            .name("serabot-stop".into())
+            .spawn(move || {
+                let result = ApiClient::new(endpoint, token)
+                    .and_then(|client| client.stop_conversation(&conversation))
+                    .map_err(|error| error.to_string());
+                let _ = sender.send(result);
+            });
+        if spawned.is_err() {
+            self.stop_rx = None;
+            if self.ready() {
+                self.start_request(Operation::StopTurn);
+            } else {
+                self.stop_queued = true;
+            }
+        }
+    }
+
+    /// Drain the out-of-band stop request, if one is in flight.
+    fn poll_stop(&mut self) {
+        let Some(receiver) = &self.stop_rx else {
+            return;
+        };
+        let Ok(result) = receiver.try_recv() else {
+            return;
+        };
+        self.stop_rx = None;
+        match result {
+            Ok(count) => {
+                self.run_action_done();
+                if count == 0 {
+                    self.state.stopping = false;
+                    self.schedule(Operation::History, Duration::ZERO);
+                    if !self.main_run_active()
+                        && crate::runs::active_count(&self.state.runs.rows) == 0
+                    {
+                        self.toast = Some("Nothing is running to stop.".into());
+                    }
+                } else if let Some(task) = self
+                    .state
+                    .task
+                    .as_ref()
+                    .filter(|task| !task.status.terminal())
+                {
+                    self.schedule(Operation::Task(task.id.clone()), Duration::ZERO);
+                } else {
+                    self.state.stopping = false;
+                    self.schedule(Operation::History, Duration::ZERO);
+                }
+            }
+            Err(message) => {
+                self.state.stopping = false;
+                self.toast = Some(format!("Could not stop the reply: {message}"));
+            }
+        }
     }
 
     /// Send a queued stop once the request slot is free, or drop it when the
@@ -4266,6 +4342,7 @@ impl Session {
             || self.folder_stats_wanted
             || self.pick_rx.is_some()
             || self.stop_queued
+            || self.stop_rx.is_some()
             || !self.upload_queue.is_empty()
             || self.panel.open()
             || self.panel.session_active()
@@ -4292,6 +4369,7 @@ impl Session {
         self.poll_telegram();
         self.poll_download();
         self.poll_attachments();
+        self.poll_stop();
         self.flush_stop();
         self.poll_folder_pick();
         self.poll_folder_stats();
@@ -4533,6 +4611,14 @@ impl Session {
             }
         }
         let kind = scope_event_kind(kind, &payload, &self.conversation);
+        if matches!(
+            kind.as_str(),
+            "turn.completed" | "turn.failed" | "task.completed" | "task.failed" | "task.cancelled"
+        ) && !self.main_run_active()
+            && crate::runs::active_count(&self.state.runs.rows) == 0
+        {
+            self.state.stopping = false;
+        }
         choose_event_kind(
             &mut self.last_event_kind,
             &mut self.events_dirty,
@@ -8613,15 +8699,41 @@ mod backlog_tests {
         session.pending = Some(OperationKind::Submit);
         session.stop_turn_or_runs();
         assert!(session.state.stopping);
-        assert!(session.stop_queued);
+        assert!(!session.stop_queued);
 
-        // Once Submit completes with a non-terminal task, flush_stop would fire
-        // StopTurn; if StopTurn returns 0, stopping clears and History queues.
+        // Once Submit completes with a non-terminal task, StopTurn has already
+        // been dispatched out-of-band; if StopTurn returns 0, stopping clears.
         session.pending = None;
         let scope = session.state.scope.clone();
         assert!(session.state.receive(&scope, Reply::Stopping(0)));
         session.state.stopping = false;
         assert!(!session.state.stopping);
+    }
+
+    #[test]
+    fn stop_clears_queued_sends_and_stop_queued_immediately() {
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        session.state.connected = true;
+        session.state.history_loaded = true;
+        session.state.task = Some(crate::Task {
+            id: "t-stop".into(),
+            kind: "turn".into(),
+            bot: "main".into(),
+            status: TaskStatus::Running,
+        });
+        session.queue.push("queued follow-up", None).unwrap();
+        session
+            .backlog
+            .push_back(Operation::Submit(zeroize::Zeroizing::new("pending".into())));
+        session.pending = Some(OperationKind::History);
+        session.stop_queued = true;
+
+        session.stop_turn();
+        assert!(session.state.stopping);
+        assert!(!session.stop_queued);
+        assert!(session.queue.is_empty());
+        assert!(session.backlog.is_empty());
     }
 
     #[test]

@@ -89,6 +89,38 @@ const MIGRATION_47: &str = include_str!("../migrations/0047_plan_prices.sql");
 const MIGRATION_48: &str = include_str!("../migrations/0048_jobs.sql");
 const MIGRATION_49: &str = include_str!("../migrations/0049_helpers.sql");
 const MIGRATION_50: &str = include_str!("../migrations/0050_project_checks.sql");
+const MIGRATION_51: &str = include_str!("../migrations/0051_scheduled_mail.sql");
+
+/// One scheduled outgoing email row (`scheduled_mail`, 0.74.13).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct ScheduledMailRow {
+    pub id: String,
+    pub user_id: String,
+    pub account_label: String,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub subject: String,
+    pub body: String,
+    pub body_html: Option<String>,
+    pub send_at: i64,
+    pub status: String,
+    pub last_error: Option<String>,
+    pub created_at: i64,
+    pub sent_at: Option<i64>,
+}
+
+/// Fields that may be updated on a pending scheduled email.
+#[derive(Debug, Clone, Default)]
+pub struct ScheduledMailPatch {
+    pub to: Option<Vec<String>>,
+    pub cc: Option<Vec<String>>,
+    pub bcc: Option<Vec<String>>,
+    pub subject: Option<String>,
+    pub body: Option<String>,
+    pub body_html: Option<Option<String>>,
+    pub send_at: Option<i64>,
+}
 
 /// One member's account for a marketplace plugin (no secret).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -880,6 +912,11 @@ impl Store {
         if version < 50 {
             connection.execute_batch(MIGRATION_50)?;
             connection.pragma_update(None, "user_version", 50)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 51 {
+            connection.execute_batch(MIGRATION_51)?;
+            connection.pragma_update(None, "user_version", 51)?;
         }
         // VACUUM INTO (backups) may renumber rowids; rebuild the external-content
         // FTS index only when its row count no longer matches `memories`.
@@ -6482,6 +6519,252 @@ pub fn insert_outbox(
     Ok(id)
 }
 
+fn scheduled_mail_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledMailRow> {
+    let to_json: String = row.get(3)?;
+    let cc_json: String = row.get(4)?;
+    let bcc_json: String = row.get(5)?;
+    let to: Vec<String> = serde_json::from_str(&to_json).unwrap_or_default();
+    let cc: Vec<String> = serde_json::from_str(&cc_json).unwrap_or_default();
+    let bcc: Vec<String> = serde_json::from_str(&bcc_json).unwrap_or_default();
+    Ok(ScheduledMailRow {
+        id: row.get(0)?,
+        user_id: row.get(1)?,
+        account_label: row.get(2)?,
+        to,
+        cc,
+        bcc,
+        subject: row.get(6)?,
+        body: row.get(7)?,
+        body_html: row.get(8)?,
+        send_at: row.get(9)?,
+        status: row.get(10)?,
+        last_error: row.get(11)?,
+        created_at: row.get(12)?,
+        sent_at: row.get(13)?,
+    })
+}
+
+impl Store {
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_scheduled_mail(
+        &self,
+        user_id: &str,
+        account_label: &str,
+        to: &[String],
+        cc: &[String],
+        bcc: &[String],
+        subject: &str,
+        body: &str,
+        body_html: Option<&str>,
+        send_at: i64,
+    ) -> Result<ScheduledMailRow> {
+        let id = new_id();
+        let created_at = chrono::Utc::now().timestamp();
+        let to_json = serde_json::to_string(to)?;
+        let cc_json = serde_json::to_string(cc)?;
+        let bcc_json = serde_json::to_string(bcc)?;
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO scheduled_mail (
+                id, user_id, account_label, to_json, cc_json, bcc_json,
+                subject, body, body_html, send_at, status, last_error, created_at, sent_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', NULL, ?11, NULL)",
+            params![
+                id,
+                user_id,
+                account_label,
+                to_json,
+                cc_json,
+                bcc_json,
+                subject,
+                body,
+                body_html,
+                send_at,
+                created_at
+            ],
+        )?;
+        Ok(ScheduledMailRow {
+            id,
+            user_id: user_id.to_owned(),
+            account_label: account_label.to_owned(),
+            to: to.to_vec(),
+            cc: cc.to_vec(),
+            bcc: bcc.to_vec(),
+            subject: subject.to_owned(),
+            body: body.to_owned(),
+            body_html: body_html.map(str::to_owned),
+            send_at,
+            status: "pending".to_owned(),
+            last_error: None,
+            created_at,
+            sent_at: None,
+        })
+    }
+
+    pub fn list_scheduled_mail(
+        &self,
+        user_id: &str,
+        account_label: Option<&str>,
+    ) -> Result<Vec<ScheduledMailRow>> {
+        let connection = self.connection()?;
+        let mut out = Vec::new();
+        if let Some(label) = account_label {
+            let mut stmt = connection.prepare(
+                "SELECT id, user_id, account_label, to_json, cc_json, bcc_json,
+                        subject, body, body_html, send_at, status, last_error, created_at, sent_at
+                 FROM scheduled_mail
+                 WHERE user_id = ?1 AND account_label = ?2
+                 ORDER BY send_at ASC, created_at ASC",
+            )?;
+            let rows = stmt.query_map(params![user_id, label], scheduled_mail_from_row)?;
+            for row in rows {
+                out.push(row?);
+            }
+        } else {
+            let mut stmt = connection.prepare(
+                "SELECT id, user_id, account_label, to_json, cc_json, bcc_json,
+                        subject, body, body_html, send_at, status, last_error, created_at, sent_at
+                 FROM scheduled_mail
+                 WHERE user_id = ?1
+                 ORDER BY send_at ASC, created_at ASC",
+            )?;
+            let rows = stmt.query_map(params![user_id], scheduled_mail_from_row)?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn update_scheduled_mail(
+        &self,
+        user_id: &str,
+        id: &str,
+        patch: ScheduledMailPatch,
+    ) -> Result<ScheduledMailRow> {
+        let connection = self.connection()?;
+        let current: Option<ScheduledMailRow> = connection
+            .query_row(
+                "SELECT id, user_id, account_label, to_json, cc_json, bcc_json,
+                        subject, body, body_html, send_at, status, last_error, created_at, sent_at
+                 FROM scheduled_mail
+                 WHERE id = ?1 AND user_id = ?2",
+                params![id, user_id],
+                scheduled_mail_from_row,
+            )
+            .optional()?;
+        let Some(mut row) = current else {
+            return Err(SeraError::NotFound(format!("scheduled mail {id}")));
+        };
+        if row.status != "pending" {
+            return Err(SeraError::Validation(
+                "only pending scheduled emails can be updated".into(),
+            ));
+        }
+        if let Some(to) = patch.to {
+            row.to = to;
+        }
+        if let Some(cc) = patch.cc {
+            row.cc = cc;
+        }
+        if let Some(bcc) = patch.bcc {
+            row.bcc = bcc;
+        }
+        if let Some(subject) = patch.subject {
+            row.subject = subject;
+        }
+        if let Some(body) = patch.body {
+            row.body = body;
+        }
+        if let Some(body_html) = patch.body_html {
+            row.body_html = body_html;
+        }
+        if let Some(send_at) = patch.send_at {
+            row.send_at = send_at;
+        }
+        let to_json = serde_json::to_string(&row.to)?;
+        let cc_json = serde_json::to_string(&row.cc)?;
+        let bcc_json = serde_json::to_string(&row.bcc)?;
+        let changed = connection.execute(
+            "UPDATE scheduled_mail
+             SET to_json = ?1, cc_json = ?2, bcc_json = ?3,
+                 subject = ?4, body = ?5, body_html = ?6, send_at = ?7
+             WHERE id = ?8 AND user_id = ?9 AND status = 'pending'",
+            params![
+                to_json,
+                cc_json,
+                bcc_json,
+                row.subject,
+                row.body,
+                row.body_html,
+                row.send_at,
+                id,
+                user_id
+            ],
+        )?;
+        if changed == 0 {
+            return Err(SeraError::Validation(
+                "only pending scheduled emails can be updated".into(),
+            ));
+        }
+        Ok(row)
+    }
+
+    pub fn delete_scheduled_mail(&self, user_id: &str, id: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "DELETE FROM scheduled_mail WHERE id = ?1 AND user_id = ?2 AND status != 'sending'",
+            params![id, user_id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn claim_due_scheduled_mail(
+        &self,
+        now_unix: i64,
+        limit: usize,
+    ) -> Result<Vec<ScheduledMailRow>> {
+        let connection = self.connection()?;
+        let mut stmt = connection.prepare(
+            "UPDATE scheduled_mail
+             SET status = 'sending'
+             WHERE id IN (
+                 SELECT id FROM scheduled_mail
+                 WHERE status = 'pending' AND send_at <= ?1
+                 ORDER BY send_at ASC, created_at ASC
+                 LIMIT ?2
+             )
+             RETURNING id, user_id, account_label, to_json, cc_json, bcc_json,
+                       subject, body, body_html, send_at, status, last_error, created_at, sent_at",
+        )?;
+        let rows = stmt.query_map(params![now_unix, limit as i64], scheduled_mail_from_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn complete_scheduled_mail(&self, id: &str, sent_at: i64) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "UPDATE scheduled_mail SET status = 'sent', sent_at = ?2, last_error = NULL WHERE id = ?1 AND status = 'sending'",
+            params![id, sent_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn fail_scheduled_mail(&self, id: &str, error: &str) -> Result<()> {
+        let connection = self.connection()?;
+        let clipped: String = error.chars().take(1000).collect();
+        connection.execute(
+            "UPDATE scheduled_mail SET status = 'failed', last_error = ?2 WHERE id = ?1 AND status = 'sending'",
+            params![id, clipped],
+        )?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7151,7 +7434,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 50);
+        assert_eq!(version, 51);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
@@ -7216,7 +7499,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 50);
+        assert_eq!(version, 51);
         assert!(store.list_device_tokens().unwrap().is_empty());
         // The team table arrives with the same migration batch.
         assert!(
@@ -7290,7 +7573,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 50);
+        assert_eq!(version, 51);
         let admin = admin(&store);
         let memory = crate::memory::get(&store, &admin, "mem-legacy").unwrap();
         assert_eq!(memory.origin, "explicit");
@@ -7379,7 +7662,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 50);
+        assert_eq!(version, 51);
 
         let admin = store.admin_user().unwrap().unwrap();
         assert_eq!(admin.id, ADMIN_USER_ID);
@@ -7510,7 +7793,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 50);
+        assert_eq!(version, 51);
 
         // Every scoped table carries user_id = the admin, and the column is
         // NOT NULL with a real foreign key.
@@ -7665,7 +7948,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 50);
+        assert_eq!(version, 51);
 
         // The old row is now the admin's, with the empty prompt the migration
         // header documents; startup seeding fills it from the template.

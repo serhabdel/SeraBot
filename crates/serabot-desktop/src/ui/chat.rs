@@ -3433,27 +3433,232 @@ fn TurnMemoryItem(item: serabot_desktop::turn_trace::MemoryItem) -> Element {
     }
 }
 
-/// The model chip in a one-to-one chat's header (0.63): the current model at
-/// a glance; a click opens the full picker (model, account, thinking) in a
-/// popover, so the composer only holds what is being written.
+/// The model chip in a one-to-one chat's header (0.63; 2-column card in 0.74.13):
+/// the current model at a glance; a click opens the 2-column picker (provider
+/// rail on the left, search + account switcher + model list + pinned thinking
+/// bar on the right).
 #[component]
 pub(super) fn HeaderModelChip(session: Signal<Session>) -> Element {
     let mut open = use_signal(|| false);
-    let label = {
+    let mut selected_provider = use_signal(|| String::from("__all__"));
+    let mut query = use_signal(String::new);
+    let mut active_idx = use_signal(|| 0usize);
+    let picked_account = use_signal(BTreeMap::<String, String>::new);
+
+    let (
+        label,
+        active_bot,
+        acp_active,
+        current,
+        current_provider,
+        rows,
+        kinds,
+        provider_accounts,
+        thinking_levels,
+        thinking_now,
+    ) = {
         let state = session.read();
-        let bot = state.conversation_bot(&state.conversation);
-        if bot
+        let active_bot = state.conversation_bot(&state.conversation);
+        let acp_active = active_bot
             .as_deref()
-            .is_some_and(|bot| state.bot_uses_claude_agent(bot))
-        {
+            .is_some_and(|bot| state.bot_uses_claude_agent(bot));
+        let label = if acp_active {
             "Claude Code (local)".to_owned()
         } else {
             match state.state.catalog.as_ref().map(|c| &c.selection) {
                 Some(selection) if !selection.is_auto() => short_model(&selection.model),
                 _ => "Auto".to_owned(),
             }
+        };
+        let mut current = "auto".to_owned();
+        let mut current_provider = String::new();
+        let mut rows: Vec<provider_view::PickerRow> = Vec::new();
+        if let Some(catalog) = state.state.catalog.as_ref() {
+            if !catalog.selection.is_auto() {
+                current = format!("{}|{}", catalog.selection.provider, catalog.selection.model);
+                current_provider = catalog.selection.provider.clone();
+            }
+            if catalog.entries.is_empty() {
+                let plain: Vec<serabot_desktop::CatalogEntry> = catalog
+                    .providers
+                    .iter()
+                    .flat_map(|provider| {
+                        provider
+                            .models
+                            .iter()
+                            .map(|model| serabot_desktop::CatalogEntry {
+                                provider: provider.id.clone(),
+                                model: model.clone(),
+                                data_egress_approved: provider.data_egress_approved,
+                                name: None,
+                                context_length: None,
+                                tags: Vec::new(),
+                                thinking: Vec::new(),
+                                account_ids: Vec::new(),
+                            })
+                    })
+                    .collect();
+                rows = provider_view::picker_rows(&plain, human_model);
+            } else {
+                rows = provider_view::picker_rows(&catalog.entries, human_model);
+            }
+        }
+        let kinds: BTreeMap<String, String> = state
+            .state
+            .providers
+            .iter()
+            .map(|provider| (provider.id.clone(), provider.kind.clone()))
+            .collect();
+        let options = state.route_options();
+        let mut provider_accounts: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        for row in &rows {
+            if !provider_accounts.contains_key(&row.provider) {
+                provider_accounts.insert(
+                    row.provider.clone(),
+                    route_chip::picker_accounts(&options, &row.provider),
+                );
+            }
+        }
+        let draft = &state.state.draft;
+        let draft_levels = if !draft.provider.is_empty() && !draft.model.is_empty() {
+            options.thinking_levels(&draft.provider, &draft.model)
+        } else {
+            Vec::new()
+        };
+        let (saved_levels, saved_level) = state
+            .state
+            .catalog
+            .as_ref()
+            .map(|catalog| {
+                (
+                    catalog.thinking.levels.clone(),
+                    catalog.thinking.level.clone().unwrap_or_default(),
+                )
+            })
+            .unwrap_or_default();
+        let thinking_levels = if !draft_levels.is_empty() {
+            draft_levels
+        } else {
+            saved_levels
+        };
+        let thinking_now = if thinking_levels.iter().any(|l| l == &saved_level) {
+            saved_level
+        } else {
+            String::new()
+        };
+        (
+            label,
+            active_bot,
+            acp_active,
+            current,
+            current_provider,
+            rows,
+            kinds,
+            provider_accounts,
+            thinking_levels,
+            thinking_now,
+        )
+    };
+
+    let segments = route_chip::thinking_segments(&thinking_levels, &thinking_now);
+
+    // Build provider rail entries in display order.
+    let mut rail_providers: Vec<(String, String, String, usize)> = Vec::new();
+    for row in &rows {
+        if let Some(existing) = rail_providers.iter_mut().find(|p| p.0 == row.provider) {
+            existing.3 += 1;
+        } else {
+            let kind = kinds
+                .get(&row.provider)
+                .cloned()
+                .unwrap_or_else(|| row.provider.clone());
+            let brand = if branding::brand_label(&row.provider).is_some() {
+                row.provider.clone()
+            } else {
+                kind.clone()
+            };
+            let name =
+                provider_view::display_name(&row.provider, &kind, branding::brand_label(&kind));
+            rail_providers.push((row.provider.clone(), brand, name, 1));
+        }
+    }
+
+    let total_count = rows.len() + 1 + usize::from(active_bot.is_some());
+    let active_prov = {
+        let cur = selected_provider();
+        if cur == "__all__"
+            || (cur == "__acp__" && active_bot.is_some())
+            || rail_providers.iter().any(|p| p.0 == cur)
+        {
+            cur
+        } else {
+            String::from("__all__")
         }
     };
+
+    let needle = query().trim().to_lowercase();
+    #[derive(Clone)]
+    enum HeaderModelEntry {
+        Auto,
+        LocalAcp,
+        Model(provider_view::PickerRow),
+    }
+    impl HeaderModelEntry {
+        fn value(&self) -> String {
+            match self {
+                Self::Auto => "auto".to_owned(),
+                Self::LocalAcp => LOCAL_ACP_VALUE.to_owned(),
+                Self::Model(row) => row.value.clone(),
+            }
+        }
+    }
+
+    let mut filtered: Vec<HeaderModelEntry> = Vec::new();
+    if active_prov == "__all__" && (needle.is_empty() || "auto approved route".contains(&needle)) {
+        filtered.push(HeaderModelEntry::Auto);
+    }
+    if active_bot.is_some()
+        && (active_prov == "__all__" || active_prov == "__acp__")
+        && (needle.is_empty() || "claude code local desktop acp".contains(&needle))
+    {
+        filtered.push(HeaderModelEntry::LocalAcp);
+    }
+    for row in &rows {
+        if active_prov != "__all__" && row.provider != active_prov {
+            continue;
+        }
+        if !needle.is_empty()
+            && !row.title.to_lowercase().contains(&needle)
+            && !row.model.to_lowercase().contains(&needle)
+            && !row.provider.to_lowercase().contains(&needle)
+        {
+            continue;
+        }
+        filtered.push(HeaderModelEntry::Model(row.clone()));
+    }
+
+    let active = if filtered.is_empty() {
+        0
+    } else {
+        active_idx().min(filtered.len() - 1)
+    };
+    let keyed_values: Vec<String> = filtered.iter().map(HeaderModelEntry::value).collect();
+    let bot_for_enter = active_bot.clone();
+    let bot_for_click = active_bot.clone();
+
+    let account_provider = if active_prov != "__all__" && active_prov != "__acp__" {
+        Some(active_prov.clone())
+    } else if !acp_active && !current_provider.is_empty() {
+        Some(current_provider.clone())
+    } else {
+        None
+    };
+    let account_choices = account_provider
+        .as_deref()
+        .and_then(|prov| provider_accounts.get(prov))
+        .filter(|choices| !choices.is_empty())
+        .cloned();
+
     rsx! {
         div { class: "header-model",
             button {
@@ -3462,29 +3667,282 @@ pub(super) fn HeaderModelChip(session: Signal<Session>) -> Element {
                 title: "Model and thinking for this chat",
                 "aria-haspopup": "dialog",
                 "aria-expanded": if open() { "true" } else { "false" },
-                onclick: move |_| open.set(!open()),
+                onclick: move |_| {
+                    if !open() {
+                        query.set(String::new());
+                        active_idx.set(0);
+                    }
+                    open.set(!open());
+                },
+                onkeydown: move |event: KeyboardEvent| {
+                    if event.key() == Key::Escape && open() {
+                        event.prevent_default();
+                        event.stop_propagation();
+                        open.set(false);
+                    }
+                },
                 Icon { name: "sparkles", size: 14 }
                 span { class: "header-model-label", "{label}" }
                 Icon { name: "chevron-down", size: 12 }
             }
             if open() {
                 div {
-                    class: "header-model-scrim",
+                    class: "header-model-scrim escape-close",
                     onclick: move |_| open.set(false),
                 }
                 div {
-                    class: "header-model-pop",
+                    class: "header-model-pop model-pop pop open",
                     role: "dialog",
                     "aria-label": "Model and thinking",
                     onkeydown: move |event: KeyboardEvent| {
-                        if event.key() == Key::Escape {
-                            event.prevent_default();
-                            open.set(false);
+                        let count = keyed_values.len();
+                        match event.key() {
+                            Key::Escape => {
+                                event.prevent_default();
+                                event.stop_propagation();
+                                open.set(false);
+                            }
+                            Key::ArrowDown => {
+                                event.prevent_default();
+                                if count > 0 {
+                                    active_idx.set((active_idx() + 1).min(count - 1));
+                                }
+                            }
+                            Key::ArrowUp => {
+                                event.prevent_default();
+                                active_idx.set(active_idx().saturating_sub(1));
+                            }
+                            Key::Enter => {
+                                event.prevent_default();
+                                event.stop_propagation();
+                                if let Some(item_value) = keyed_values.get(active_idx().min(count.saturating_sub(1))) {
+                                    if item_value == LOCAL_ACP_VALUE {
+                                        if let Some(bot) = bot_for_enter.as_deref() {
+                                            session.write().set_bot_claude_agent(bot, true);
+                                        }
+                                        open.set(false);
+                                        query.set(String::new());
+                                        return;
+                                    }
+                                    let account = picked_account_for(&session.read(), &picked_account.read(), item_value);
+                                    let mut s = session.write();
+                                    if let Some(bot) = bot_for_enter.as_deref() {
+                                        s.set_bot_claude_agent(bot, false);
+                                    }
+                                    set_model_draft_with(&mut s, item_value, account);
+                                    let parsed = s.state.draft.clone();
+                                    if s.state.catalog.as_ref().is_some_and(|catalog| catalog.allows(&parsed)) {
+                                        s.apply_model(parsed);
+                                    }
+                                    open.set(false);
+                                    query.set(String::new());
+                                }
+                            }
+                            _ => {}
                         }
                     },
-                    p { class: "header-model-title", "Model for this chat" }
-                    ModelBar { session, compact: true }
-                    p { class: "tiny muted", "Applies from your next message." }
+                    div { class: "model-pop-grid",
+                        // Left column: Providers rail
+                        div { class: "model-pop-rail", role: "tablist", "aria-label": "Providers",
+                            button {
+                                key: "__all__",
+                                r#type: "button",
+                                role: "tab",
+                                "aria-selected": if active_prov == "__all__" { "true" } else { "false" },
+                                class: if active_prov == "__all__" { "model-rail-item active" } else { "model-rail-item" },
+                                onclick: move |_| {
+                                    selected_provider.set(String::from("__all__"));
+                                    active_idx.set(0);
+                                },
+                                span { class: "model-rail-badge",
+                                    Icon { name: "sparkles", size: 12 }
+                                }
+                                span { class: "model-rail-name", "All" }
+                                span { class: "model-rail-count", "{total_count}" }
+                            }
+                            for (prov_id, brand, name, count) in rail_providers {
+                                button {
+                                    key: "{prov_id}",
+                                    r#type: "button",
+                                    role: "tab",
+                                    "aria-selected": if active_prov == prov_id { "true" } else { "false" },
+                                    class: if active_prov == prov_id { "model-rail-item active" } else { "model-rail-item" },
+                                    onclick: {
+                                        let prov_id = prov_id.clone();
+                                        move |_| {
+                                            selected_provider.set(prov_id.clone());
+                                            active_idx.set(0);
+                                        }
+                                    },
+                                    BrandLogo { brand, size: 16 }
+                                    span { class: "model-rail-name", "{name}" }
+                                    span { class: "model-rail-count", "{count}" }
+                                }
+                            }
+                            if active_bot.is_some() {
+                                button {
+                                    r#type: "button",
+                                    role: "tab",
+                                    "aria-selected": if active_prov == "__acp__" { "true" } else { "false" },
+                                    class: if active_prov == "__acp__" { "model-rail-item active" } else { "model-rail-item" },
+                                    onclick: move |_| {
+                                        selected_provider.set(String::from("__acp__"));
+                                        active_idx.set(0);
+                                    },
+                                    BrandLogo { brand: "claude".to_owned(), size: 16 }
+                                    span { class: "model-rail-name", "Local ACP" }
+                                    span { class: "model-rail-count", "1" }
+                                }
+                            }
+                        }
+                        // Right body: Search + Accounts + Scrollable Models + Pinned Thinking Footer
+                        div { class: "model-pop-body",
+                            div { class: "model-pop-search",
+                                input {
+                                    class: "input",
+                                    placeholder: "Search models\u{2026}",
+                                    value: "{query}",
+                                    oninput: move |event| {
+                                        query.set(event.value());
+                                        active_idx.set(0);
+                                    },
+                                }
+                                if let (Some(prov), Some(choices)) = (account_provider.clone(), account_choices) {
+                                    div { class: "model-pop-accounts",
+                                        PickAccounts {
+                                            session,
+                                            provider: prov,
+                                            choices,
+                                            compact: true,
+                                            picked: picked_account,
+                                        }
+                                    }
+                                }
+                            }
+                            div { class: "model-pop-list",
+                                if filtered.is_empty() {
+                                    div { class: "pop-empty", "No models match." }
+                                }
+                                for (pos, entry) in filtered.into_iter().enumerate() {
+                                    {
+                                        let item_value = entry.value();
+                                        let is_selected = (item_value == LOCAL_ACP_VALUE && acp_active)
+                                            || (!acp_active && item_value == current);
+                                        let item_class = match (pos == active, is_selected) {
+                                            (true, true) => "model-pop-item active selected",
+                                            (true, false) => "model-pop-item active",
+                                            (false, true) => "model-pop-item selected",
+                                            (false, false) => "model-pop-item",
+                                        };
+                                        let bot_for_click = bot_for_click.clone();
+                                        rsx! {
+                                            button {
+                                                key: "{item_value}",
+                                                r#type: "button",
+                                                class: "{item_class}",
+                                                onclick: {
+                                                    let item_value = item_value.clone();
+                                                    move |_| {
+                                                        if item_value == LOCAL_ACP_VALUE {
+                                                            if let Some(bot) = bot_for_click.as_deref() {
+                                                                session.write().set_bot_claude_agent(bot, true);
+                                                            }
+                                                            open.set(false);
+                                                            query.set(String::new());
+                                                            return;
+                                                        }
+                                                        let account = picked_account_for(&session.read(), &picked_account.read(), &item_value);
+                                                        let mut s = session.write();
+                                                        if let Some(bot) = bot_for_click.as_deref() {
+                                                            s.set_bot_claude_agent(bot, false);
+                                                        }
+                                                        set_model_draft_with(&mut s, &item_value, account);
+                                                        let parsed = s.state.draft.clone();
+                                                        if s.state.catalog.as_ref().is_some_and(|catalog| catalog.allows(&parsed)) {
+                                                            s.apply_model(parsed);
+                                                        }
+                                                        open.set(false);
+                                                        query.set(String::new());
+                                                    }
+                                                },
+                                                match entry {
+                                                    HeaderModelEntry::Auto => rsx! {
+                                                        div { class: "model-row",
+                                                            span { class: "model-title", "Auto" }
+                                                            div { class: "model-meta",
+                                                                span { class: "model-id", "Approved route" }
+                                                            }
+                                                        }
+                                                    },
+                                                    HeaderModelEntry::LocalAcp => rsx! {
+                                                        div { class: "model-row",
+                                                            span { class: "model-title", "Claude Code" }
+                                                            div { class: "model-meta",
+                                                                span { class: "chip", "Local ACP" }
+                                                                span { class: "model-id", "Runs locally in allowed folder" }
+                                                            }
+                                                        }
+                                                    },
+                                                    HeaderModelEntry::Model(row) => rsx! {
+                                                        div { class: "model-row",
+                                                            span { class: "model-title", "{row.title}" }
+                                                            div { class: "model-meta",
+                                                                if active_prov == "__all__" {
+                                                                    span { class: "chip muted", "{human_provider(&row.provider)}" }
+                                                                }
+                                                                if row.title != row.model {
+                                                                    span { class: "model-id", "{row.model}" }
+                                                                }
+                                                                if let Some(context) = row.context.clone() {
+                                                                    span { class: "chip muted", "{context}" }
+                                                                }
+                                                                for tag in row.tags.clone() {
+                                                                    span { class: "chip", "{tag}" }
+                                                                }
+                                                            }
+                                                        }
+                                                    },
+                                                }
+                                                if is_selected {
+                                                    Icon { name: "check", size: 14 }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            div { class: "model-pop-footer",
+                                if !segments.is_empty() {
+                                    span { class: "model-pop-thinking-label", "Thinking" }
+                                    div {
+                                        class: "seg thinking-seg",
+                                        role: "group",
+                                        title: "How hard the model thinks before it answers",
+                                        "aria-label": "Thinking level",
+                                        for segment in segments {
+                                            button {
+                                                key: "{segment.label}",
+                                                r#type: "button",
+                                                class: if segment.active { "seg-btn active" } else { "seg-btn" },
+                                                "aria-pressed": if segment.active { "true" } else { "false" },
+                                                onclick: {
+                                                    let value = segment.value.clone();
+                                                    move |_| {
+                                                        session
+                                                            .write()
+                                                            .set_thinking((!value.is_empty()).then(|| value.clone()));
+                                                    }
+                                                },
+                                                "{segment.label}"
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    span { class: "tiny muted", "Applies from your next message." }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

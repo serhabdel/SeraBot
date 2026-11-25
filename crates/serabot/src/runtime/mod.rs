@@ -358,6 +358,7 @@ impl Runtime {
             .store
             .cancel_pending_conversation_tasks(user_id, conversation_id)?;
         let turn_ids = self.store.running_turn_ids(user_id, conversation_id)?;
+        let mut seen_turns: HashSet<String> = turn_ids.iter().cloned().collect();
         if !turn_ids.is_empty() {
             {
                 let mut marks = self
@@ -384,13 +385,62 @@ impl Runtime {
         let early_tasks = self
             .store
             .running_task_ids_without_turn(user_id, conversation_id)?;
+        let mut seen_tasks: HashSet<String> = HashSet::new();
         if !early_tasks.is_empty() {
             let mut pending_tasks = self
                 .stop_tasks
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             for task_id in &early_tasks {
+                seen_tasks.insert(task_id.clone());
                 if pending_tasks.insert(task_id.clone()) {
+                    count += 1;
+                }
+            }
+        }
+        if let Ok(handoffs) = self
+            .store
+            .list_handoffs(user_id, Some(conversation_id), 200)
+        {
+            for handoff in handoffs {
+                if !matches!(handoff.status, "queued" | "running" | "resumed") {
+                    continue;
+                }
+                let child_turns = self
+                    .store
+                    .running_turn_ids_for_task(user_id, &handoff.child_task_id)?;
+                let mut cancelled_child_turn = false;
+                for tid in child_turns {
+                    if !seen_turns.insert(tid.clone()) {
+                        cancelled_child_turn = true;
+                        continue;
+                    }
+                    cancelled_child_turn = true;
+                    self.stop_requests
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(tid.clone());
+                    let token = self
+                        .stop_tokens
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .get(&tid)
+                        .cloned();
+                    if let Some(token) = token {
+                        token.cancel();
+                    }
+                    count += 1;
+                }
+                if !cancelled_child_turn
+                    && seen_tasks.insert(handoff.child_task_id.clone())
+                    && let Ok(task) = self.store.get_task(user_id, &handoff.child_task_id)
+                    && matches!(task.status.as_str(), "running" | "queued" | "waiting_model")
+                    && self
+                        .stop_tasks
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(handoff.child_task_id)
+                {
                     count += 1;
                 }
             }

@@ -270,3 +270,302 @@ async fn mail_attachments_download_and_save_to_library_with_fake_imap() {
 
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn mail_signature_update_and_scheduled_mail_crud_and_delivery() {
+    let smtp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let smtp_port = smtp_listener.local_addr().unwrap().port();
+    let imap_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let imap_port = imap_listener.local_addr().unwrap().port();
+
+    let smtp_server = tokio::spawn(async move {
+        let mut received = Vec::new();
+        // 1 for connect smtp_test, 1 for scheduled delivery
+        for _ in 0..2 {
+            let (socket, _) = smtp_listener.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            let mut data = String::new();
+            writer.write_all(b"220 fake ESMTP\r\n").await.unwrap();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.starts_with("EHLO") {
+                    writer
+                        .write_all(b"250-fake\r\n250 AUTH LOGIN\r\n")
+                        .await
+                        .unwrap();
+                } else if line == "AUTH LOGIN" {
+                    writer.write_all(b"334 VXNlcm5hbWU6\r\n").await.unwrap();
+                    let _ = lines.next_line().await;
+                    writer.write_all(b"334 UGFzc3dvcmQ6\r\n").await.unwrap();
+                    let _ = lines.next_line().await;
+                    writer.write_all(b"235 ok\r\n").await.unwrap();
+                } else if line.starts_with("MAIL FROM") || line.starts_with("RCPT TO") {
+                    writer.write_all(b"250 ok\r\n").await.unwrap();
+                } else if line == "DATA" {
+                    writer.write_all(b"354 go\r\n").await.unwrap();
+                    loop {
+                        let l = lines.next_line().await.unwrap().unwrap();
+                        if l == "." {
+                            break;
+                        }
+                        data.push_str(&l);
+                        data.push('\n');
+                    }
+                    writer.write_all(b"250 queued\r\n").await.unwrap();
+                } else if line == "QUIT" {
+                    writer.write_all(b"221 bye\r\n").await.unwrap();
+                    break;
+                } else {
+                    writer.write_all(b"250 ok\r\n").await.unwrap();
+                }
+            }
+            if !data.is_empty() {
+                received.push(data);
+            }
+        }
+        received
+    });
+
+    let imap_server = tokio::spawn(async move {
+        let (socket, _) = imap_listener.accept().await.unwrap();
+        let (reader, mut writer) = socket.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        writer
+            .write_all(b"* OK [CAPABILITY IMAP4rev1 AUTH=LOGIN] ready.\r\n")
+            .await
+            .unwrap();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let tag = line.split_whitespace().next().unwrap_or("a1");
+            if line.contains(" LOGOUT") {
+                writer
+                    .write_all(format!("* BYE\r\n{tag} OK bye\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                break;
+            }
+            writer
+                .write_all(format!("{tag} OK\r\n").as_bytes())
+                .await
+                .unwrap();
+        }
+    });
+
+    let root = temp_base();
+    let (app, _state, store) = app_with_root(
+        true,
+        Policy::from_text("synthetic-forbidden-phrase"),
+        root.clone(),
+    );
+    let alice = store
+        .create_user("sched-a", "sa@example.example", "Sched A")
+        .unwrap();
+    let bob = store
+        .create_user("sched-b", "sb@example.example", "Sched B")
+        .unwrap();
+    let alice_token = mint_for(&store, &alice.id, "sched-a-tok");
+    let bob_token = mint_for(&store, &bob.id, "sched-b-tok");
+
+    // Connect Alice's mailbox.
+    let res = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/connect",
+        json!({
+            "smtp_host": "127.0.0.1",
+            "smtp_port": smtp_port,
+            "smtp_security": "none",
+            "username": "sa@example.example",
+            "password": "app-password",
+            "imap_host": "127.0.0.1",
+            "imap_port": imap_port,
+            "imap_security": "none"
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Upload a PNG logo for Alice.
+    let upload_req = Request::builder()
+        .method("POST")
+        .uri("/v1/library/upload")
+        .header("authorization", format!("Bearer {alice_token}"))
+        .header("x-filename", "logo.png")
+        .body(Body::from(b"\x89PNG\r\n\x1a\nfake-logo".to_vec()))
+        .unwrap();
+    let upload_res = app.clone().oneshot(upload_req).await.unwrap();
+    assert_eq!(upload_res.status(), StatusCode::OK);
+    let logo_hash = read_json(upload_res).await["item"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Update signature without password re-entry via PUT /v1/mail/signature.
+    let sig_res = app
+        .clone()
+        .oneshot(request_with_token(
+            "PUT",
+            "/v1/mail/signature",
+            &alice_token,
+            Some(json!({
+                "signature": "Alice",
+                "signature_html": "<b>Alice</b>",
+                "signature_logo_hash": logo_hash,
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(sig_res.status(), StatusCode::OK);
+
+    let status_res = get(&app, &alice_token, "/v1/mail").await;
+    assert_eq!(status_res.status(), StatusCode::OK);
+    let status = read_json(status_res).await;
+    assert_eq!(status["signature"], "Alice");
+    assert_eq!(status["signature_html"], "<b>Alice</b>");
+    assert_eq!(status["signature_logo_hash"], logo_hash);
+
+    // Blocklisted scheduled email is rejected at schedule time.
+    let bad_sched = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/schedule",
+        json!({
+            "to": ["rcpt@example.com"],
+            "subject": "Bad synthetic-forbidden-phrase",
+            "body": "Clean",
+            "send_at": 1_800_000_000i64,
+        }),
+    )
+    .await;
+    assert_eq!(bad_sched.status(), StatusCode::FORBIDDEN);
+
+    // Schedule two valid emails (one due in the past, one to cancel).
+    let s1 = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/schedule",
+        json!({
+            "to": ["rcpt@example.com"],
+            "cc": ["cc@example.com"],
+            "subject": "Scheduled hello",
+            "body": "Plain scheduled",
+            "body_html": "<p>HTML scheduled</p>",
+            "send_at": 1_700_000_000i64,
+        }),
+    )
+    .await;
+    assert_eq!(s1.status(), StatusCode::OK);
+    let id1 = read_json(s1).await["item"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let s2 = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/schedule",
+        json!({
+            "to": ["rcpt@example.com"],
+            "subject": "To cancel",
+            "body": "Cancel me",
+            "send_at": 1_900_000_000i64,
+        }),
+    )
+    .await;
+    assert_eq!(s2.status(), StatusCode::OK);
+    let id2 = read_json(s2).await["item"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Bob cannot see, patch, or delete Alice's scheduled emails.
+    let bob_list = get(&app, &bob_token, "/v1/mail/scheduled").await;
+    assert_eq!(bob_list.status(), StatusCode::OK);
+    assert!(
+        read_json(bob_list).await["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let bob_del = app
+        .clone()
+        .oneshot(request_with_token(
+            "DELETE",
+            &format!("/v1/mail/scheduled/{id1}"),
+            &bob_token,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(bob_del.status(), StatusCode::NOT_FOUND);
+
+    // Alice patches id1 and deletes id2.
+    let patch_res = app
+        .clone()
+        .oneshot(request_with_token(
+            "PATCH",
+            &format!("/v1/mail/scheduled/{id1}"),
+            &alice_token,
+            Some(json!({ "subject": "Scheduled updated" })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(patch_res.status(), StatusCode::OK);
+    assert_eq!(
+        read_json(patch_res).await["item"]["subject"],
+        "Scheduled updated"
+    );
+
+    let del_res = app
+        .clone()
+        .oneshot(request_with_token(
+            "DELETE",
+            &format!("/v1/mail/scheduled/{id2}"),
+            &alice_token,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(del_res.status(), StatusCode::OK);
+
+    // Run scheduler delivery for due emails at now_unix = 1_750_000_000.
+    let users_secrets =
+        crate::user_secrets::UserSecrets::with_master_key(store.clone(), [9u8; 32]).unwrap();
+    let artifacts = crate::maker::ArtifactStore::new(root.join("sched-artifacts")).unwrap();
+    let logo_meta = crate::maker::ArtifactMeta {
+        title: "logo.png".into(),
+        filename: "logo.png".into(),
+        language: crate::domain::Language::En,
+        source_artifact: None,
+        created_at: chrono::Utc::now(),
+    };
+    let saved_logo = artifacts
+        .save(b"\x89PNG\r\n\x1a\nfake-logo", "logo.png", logo_meta)
+        .unwrap();
+    assert_eq!(saved_logo.hash, logo_hash);
+    let policy = Policy::from_text("synthetic-forbidden-phrase");
+    let processed = crate::scheduler::process_due_scheduled_mail(
+        &store,
+        &users_secrets,
+        &artifacts,
+        &policy,
+        1_750_000_000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(processed, 1);
+
+    let alice_list = get(&app, &alice_token, "/v1/mail/scheduled").await;
+    let items = read_json(alice_list).await["items"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["status"], "sent");
+
+    let sent_payloads = smtp_server.await.unwrap();
+    assert_eq!(sent_payloads.len(), 1);
+    assert!(sent_payloads[0].contains("Subject: Scheduled updated"));
+    assert!(sent_payloads[0].contains("Content-ID: <signature-logo@serabot>"));
+    imap_server.await.unwrap();
+}
