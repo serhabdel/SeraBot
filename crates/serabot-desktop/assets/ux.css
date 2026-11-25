@@ -149,3 +149,15 @@
   outline: var(--focus-ring);
   outline-offset: -2px;
 }
+
+/* ---- chat: code blocks ---- */
+
+.md-code-block.wrapped pre,
+.md-code-block.wrapped code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.md-code-wrap.on {
+  color: var(--accent-ink);
+}

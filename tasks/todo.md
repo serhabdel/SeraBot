@@ -624,5 +624,14 @@ never merge without the owner's OK.
 - [x] Version bump `0.74.13` (`Cargo.toml`), mobile `0.74.13+87`, `docs/release-0.74.13.md`, `README.md`, `tasks/todo.md`.
 - [ ] Owner: live pass on Hostinger IMAP/SMTP (folders, HTML emails, Signature logo, Send later), instant Stop, browser DNS errors, and 2-column Model Selector card.
 
+## Release 0.74.14 — Mail workspace, model picker, Settings search & shared UX layer
 
-
+- [x] Scheduled-send reliability: retry with backoff, stale `sending` rows failed (never resent), checked completion writes, 5 s loop (`store_mail.rs`, `scheduler.rs`, migration `0052`).
+- [x] Mail server: list/search metadata + threading, search operators, snooze, drafts (IMAP APPEND), Undo send hold, contacts, saved searches, unsubscribe (`mail_ux.rs`, `mail.rs`, `api/mail*.rs`).
+- [x] Desktop mail window: resizable panes + density, avatar/snippet rows, day headings, conversations, bulk bar, deferred archive/delete/move with Undo, snooze dialog + Snoozed folder, reader toolbar + Ask-bot strip + unsubscribe, compose suggestions/autosave/Undo send, shortcuts (`ui_mail*.rs`, `mail_view.rs`, `mail.css`).
+- [x] Model picker fuzzy search + favorites/recents (`picker_search.rs`, `ui/chat.rs`); code-block Wrap toggle.
+- [x] Settings search + descriptions, palette Settings/Compose entries + combobox a11y, approvals badge on Chats, shared focus ring/spacing tokens (`ux.css`).
+- [x] Mobile: snippet in the mail list, new fields in `MailMessageInfo`.
+- [x] Version bump `0.74.14` (`Cargo.toml`, `Cargo.lock`), mobile `0.74.14+88`, `docs/release-0.74.14.md`, `README.md`, `AGENTS.md`.
+- [ ] Owner: live pass on Hostinger (Drafts APPEND, search operators, threading, snooze wake, Undo send, unsubscribe) and on Windows WebView2 (pane resize, density, shortcuts, Undo bar, snooze dialog, picker star).
+- [ ] Deferred: branch/pin chat messages, Send/Stop morph, composer mode chips, picker cost/speed hints and per-chat default toggle, Settings Save/Discard bar, Activity feed, mobile threads/snooze/drafts.

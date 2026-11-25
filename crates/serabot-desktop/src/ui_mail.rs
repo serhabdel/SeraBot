@@ -3477,4 +3477,77 @@ mod tests {
         assert!(html.contains("https://acme.example"));
         assert!(html.contains("data:image/png;base64,AA"));
     }
+
+    #[test]
+    fn flags_match_with_or_without_the_backslash() {
+        // The server reports `Seen`; older UI code wrote `\\Seen`.
+        let mut msg = sample_msg(1, &["Seen", "Flagged"]);
+        toggle_flag_local(&mut msg, "\\Seen", false);
+        assert!(is_unread(&msg));
+        toggle_flag_local(&mut msg, "\\Seen", true);
+        assert!(!is_unread(&msg));
+        toggle_flag_local(&mut msg, "\\Flagged", false);
+        assert!(!is_starred(&msg));
+        assert_eq!(msg.flags, vec!["Seen".to_owned()]);
+    }
+
+    #[test]
+    fn reply_all_keeps_others_and_drops_self_sender_and_duplicates() {
+        let mut msg = sample_msg(1, &[]);
+        msg.from = "Alice <alice@example.test>".into();
+        msg.to = "me@example.test, Bob <bob@example.test>".into();
+        msg.cc = "carol@example.test, ME@example.test, alice@example.test".into();
+        let draft = ComposeState::reply_all(&msg, "me@example.test");
+        assert_eq!(draft.to, "alice@example.test");
+        assert_eq!(draft.cc, "bob@example.test, carol@example.test");
+        assert!(draft.subject.starts_with("Re: "));
+    }
+
+    #[test]
+    fn list_items_group_conversations_and_add_day_headings() {
+        let mk = |uid: u32, key: &str, date: &str| MailMessageInfo {
+            thread_key: key.into(),
+            date: date.into(),
+            ..sample_msg(uid, &[])
+        };
+        let rows = vec![
+            mk(5, "t1", "Wed, 25 Nov 2026 09:00:00 +0000"),
+            mk(4, "t2", "Wed, 25 Nov 2026 08:00:00 +0000"),
+            mk(3, "t1", "Mon, 23 Nov 2026 08:00:00 +0000"),
+        ];
+        let now = 1_795_600_800; // Wed 25 Nov 2026 10:00 UTC
+        let summary = |items: &[ListItem]| -> Vec<String> {
+            items
+                .iter()
+                .map(|item| match item {
+                    ListItem::Day(label) => format!("day:{label}"),
+                    ListItem::Row(msg, info) => {
+                        format!("{}:{}:{}", msg.uid, info.count, info.is_child)
+                    }
+                })
+                .collect()
+        };
+        let folded = build_list_items(&rows, true, &BTreeSet::new(), now, 0);
+        assert_eq!(
+            summary(&folded),
+            vec!["day:Today", "5:2:false", "4:1:false"]
+        );
+        let open: BTreeSet<String> = ["t1".to_owned()].into();
+        let expanded = build_list_items(&rows, true, &open, now, 0);
+        assert_eq!(
+            summary(&expanded),
+            vec!["day:Today", "5:2:false", "3:1:true", "4:1:false"]
+        );
+        let flat = build_list_items(&rows, false, &BTreeSet::new(), now, 0);
+        assert_eq!(
+            summary(&flat),
+            vec![
+                "day:Today",
+                "5:1:false",
+                "4:1:false",
+                "day:This week",
+                "3:1:false"
+            ]
+        );
+    }
 }
