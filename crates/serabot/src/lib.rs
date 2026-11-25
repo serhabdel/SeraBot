@@ -56,6 +56,10 @@ pub mod local_relay;
 pub mod local_transfer;
 pub mod logging;
 pub mod mail;
+#[cfg(test)]
+mod mail_harness_tests;
+#[cfg(test)]
+mod mail_test_support;
 pub mod mail_ux;
 pub mod maker;
 pub mod marketplace;
