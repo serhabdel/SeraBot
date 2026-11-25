@@ -643,6 +643,7 @@ Plan: `docs/specs/0.74.15-proposal.md`. Version stays `0.74.14` until the batch 
 - [x] Mail composer: sticky footer, recipient chips (Enter/comma/Tab/paste, Backspace removes, suggestions with arrows), attach from PC + drag and drop + Library, size/count limits, Ctrl+Enter, address validation.
 - [x] Chat: message action bar below the message instead of floating over its neighbour; a retried message with no reply between shows once.
 - [ ] Owner: try the composer on Windows (drop files, Enter in To, footer in a short window) and the chat bar.
-- [ ] Track 1 harness, Track 2 stability, Track 3 mail polish, Track 5 shared components, Track 6 security (see proposal).
+- [x] Track 1: fake IMAP server + client tests, owner checklist script. Track 2: batched list fetch, task tracing span. Track 3: unread badge, attachments on scheduled/undo sends. Track 6: hostile HTML and header corpora.
+- [ ] Still open: file splits, durable job runner, turn-loop invariant tests, back-pressure audit, restore drill, Settings Save/Discard bar, Activity feed, shared components, audit-coverage test, mobile mail parity.
 - [ ] Track 7b recall and retry-by-reference: **needs owner approval** before code.
 
