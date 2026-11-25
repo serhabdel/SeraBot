@@ -1212,6 +1212,15 @@ pub fn MailView(session: Signal<Session>) -> Element {
         shortcuts_open,
     };
 
+    // "Compose email" from the command palette.
+    use_effect(move || {
+        if session.read().mail_compose_request {
+            session.write().mail_compose_request = false;
+            let mut compose = compose;
+            compose.set(Some(ComposeState::new_empty()));
+        }
+    });
+
     // Rows whose move or delete failed after the window was closed come back here.
     use_effect(move || {
         if !FAILED.read().is_empty() {

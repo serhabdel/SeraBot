@@ -473,6 +473,50 @@ impl SettingsSection {
         }
     }
 
+    /// One line under the name in the Settings list.
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Account => "Your sign-in, role and session.",
+            Self::Appearance => "Theme, text size and motion.",
+            Self::Notifications => "When SeraBot should tell you something.",
+            Self::Chat => "How the composer and replies behave.",
+            Self::Voice => "Speech input and spoken replies.",
+            Self::LocalFolders => "Folders on this PC the bots may read.",
+            Self::Memory => "What SeraBot remembers about you.",
+            Self::Integrations => "Mail, calendar and other connected apps.",
+            Self::Providers => "AI providers, accounts and models.",
+            Self::Vault => "Saved logins for the browser bot.",
+            Self::Telegram => "Link a Telegram chat.",
+            Self::WebSearch => "Web search and crawling switches.",
+            Self::Usage => "Spending, tokens and limits.",
+            Self::Logs => "Recent activity and errors.",
+            Self::Admin => "Members, invites and server settings.",
+            Self::About => "Version, updates and licences.",
+        }
+    }
+
+    /// Extra words the Settings search matches besides the name and description.
+    pub fn keywords(self) -> &'static str {
+        match self {
+            Self::Account => "sign out profile role invite session login",
+            Self::Appearance => "dark light theme font size animation reduce motion",
+            Self::Notifications => "alerts approvals toast",
+            Self::Chat => "enter send turn limits handwriting composer",
+            Self::Voice => "microphone dictation audio speech tts",
+            Self::LocalFolders => "files network relay disk allowed folders",
+            Self::Memory => "facts recall mem0 retrieval remember",
+            Self::Integrations => "email imap smtp mail google microsoft github slack connectors",
+            Self::Providers => "api key openai anthropic model account quota route",
+            Self::Vault => "passwords credentials secrets browser logins",
+            Self::Telegram => "bot link chat",
+            Self::WebSearch => "tavily firecrawl search crawl",
+            Self::Usage => "cost budget tokens price spend",
+            Self::Logs => "audit debug events errors",
+            Self::Admin => "users members invite backup server",
+            Self::About => "update version release licence",
+        }
+    }
+
     pub fn group(self) -> SettingsGroup {
         match self {
             Self::Account
@@ -868,6 +912,8 @@ pub struct Session {
     /// Device-local look and chat preferences (Settings page).
     pub prefs: creds::UiPrefs,
     pub settings_section: SettingsSection,
+    /// Set by the command palette: the Mail page opens a new message when it sees this.
+    pub mail_compose_request: bool,
     seen_approvals: Option<usize>,
     /// Usage page range in days (7, 30 or 90) and whether a load is running.
     pub usage_days: u32,
@@ -1148,6 +1194,7 @@ impl Session {
             theme,
             prefs: creds::UiPrefs::default(),
             settings_section: SettingsSection::Account,
+            mail_compose_request: false,
             seen_approvals: None,
             pins,
             usage_days: 30,
@@ -1647,6 +1694,27 @@ impl Session {
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
         self.save_ui_settings();
+    }
+
+    /// Star or unstar a model in the picker (`provider|model`) and remember it.
+    pub fn toggle_favorite_model(&mut self, value: &str) {
+        let mut prefs = self.prefs.clone();
+        crate::picker_search::toggle_favorite(&mut prefs.favorite_models, value);
+        self.set_prefs(prefs);
+    }
+
+    /// Note a model choice so the picker can list it under Recent.
+    fn record_recent_model(&mut self, selection: &Selection) {
+        if selection.provider.is_empty() || selection.model.is_empty() {
+            return;
+        }
+        let value = format!("{}|{}", selection.provider, selection.model);
+        if self.prefs.recent_models.first() == Some(&value) {
+            return;
+        }
+        let mut prefs = self.prefs.clone();
+        crate::picker_search::touch_recent(&mut prefs.recent_models, &value);
+        self.set_prefs(prefs);
     }
 
     /// Change the device preferences and persist them.
@@ -4105,6 +4173,7 @@ impl Session {
             return;
         }
         self.state.error = None;
+        self.record_recent_model(&selection);
         self.start_request(Operation::Apply(selection));
     }
 

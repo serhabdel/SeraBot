@@ -176,6 +176,7 @@ pub(super) fn IconRail(
     let mut session = session;
     let mut overlay = overlay;
     let section = session.read().section;
+    let waiting = session.read().state.approvals.len();
     let work: [(Section, &str, &str); 3] = [
         (Section::Chat, "chat", "Chats"),
         (Section::Mail, "send", "Mail"),
@@ -209,15 +210,28 @@ pub(super) fn IconRail(
             div { class: "rail-divider", "aria-hidden": "true" }
             for group in [work.as_slice(), workspace.as_slice()] {
                 for (target, icon, label) in group.iter().copied() {
-                    button {
-                        key: "{label}",
-                        class: if section == target { "rail-btn labeled on" } else { "rail-btn labeled" },
-                        title: "{label}",
-                        "aria-label": "{label}",
-                        "aria-current": if section == target { "page" } else { "false" },
-                        onclick: move |_| session.write().open_section(target),
-                        Icon { name: icon, size: 18 }
-                        span { class: "rail-label", "{label}" }
+                    {
+                        let badge = if target == Section::Chat { waiting } else { 0 };
+                        let tip = if badge > 0 {
+                            format!("{label}: {badge} waiting for your OK")
+                        } else {
+                            label.to_owned()
+                        };
+                        rsx! {
+                            button {
+                                key: "{label}",
+                                class: if section == target { "rail-btn labeled on" } else { "rail-btn labeled" },
+                                title: "{tip}",
+                                "aria-label": "{tip}",
+                                "aria-current": if section == target { "page" } else { "false" },
+                                onclick: move |_| session.write().open_section(target),
+                                Icon { name: icon, size: 18 }
+                                span { class: "rail-label", "{label}" }
+                                if badge > 0 {
+                                    span { class: "rail-badge", "aria-hidden": "true", "{badge}" }
+                                }
+                            }
+                        }
                     }
                 }
                 div { class: "rail-divider", "aria-hidden": "true" }

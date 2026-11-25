@@ -3623,18 +3623,46 @@ pub(super) fn HeaderModelChip(session: Signal<Session>) -> Element {
     {
         filtered.push(HeaderModelEntry::LocalAcp);
     }
-    for row in &rows {
+    // Typing ranks by how well the words match (letters may be skipped: "son5" finds
+    // "claude-sonnet-5"). With an empty box, starred models lead, then recent ones.
+    let (favorites, recent) = {
+        let s = session.read();
+        (
+            s.prefs.favorite_models.clone(),
+            s.prefs.recent_models.clone(),
+        )
+    };
+    let mut scored: Vec<(
+        i32,
+        serabot_desktop::picker_search::Standing,
+        usize,
+        provider_view::PickerRow,
+    )> = Vec::new();
+    for (idx, row) in rows.iter().enumerate() {
         if active_prov != "__all__" && row.provider != active_prov {
             continue;
         }
-        if !needle.is_empty()
-            && !row.title.to_lowercase().contains(&needle)
-            && !row.model.to_lowercase().contains(&needle)
-            && !row.provider.to_lowercase().contains(&needle)
-        {
+        let score = if needle.is_empty() {
+            Some(0)
+        } else {
+            serabot_desktop::picker_search::best_score(
+                &needle,
+                &[(&row.title, 3), (&row.model, 2), (&row.provider, 1)],
+            )
+        };
+        let Some(score) = score else {
             continue;
-        }
-        filtered.push(HeaderModelEntry::Model(row.clone()));
+        };
+        let standing = if needle.is_empty() {
+            serabot_desktop::picker_search::standing(&row.value, &favorites, &recent)
+        } else {
+            serabot_desktop::picker_search::Standing::Other
+        };
+        scored.push((score, standing, idx, row.clone()));
+    }
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    for (_, _, _, row) in scored {
+        filtered.push(HeaderModelEntry::Model(row));
     }
 
     let active = if filtered.is_empty() {
@@ -3835,6 +3863,9 @@ pub(super) fn HeaderModelChip(session: Signal<Session>) -> Element {
                                             (false, false) => "model-pop-item",
                                         };
                                         let bot_for_click = bot_for_click.clone();
+                                        let fav_key = item_value.clone();
+                                        let is_fav = favorites.iter().any(|v| *v == item_value);
+                                        let is_recent = !is_fav && recent.iter().any(|v| *v == item_value);
                                         rsx! {
                                             button {
                                                 key: "{item_value}",
@@ -3885,7 +3916,24 @@ pub(super) fn HeaderModelChip(session: Signal<Session>) -> Element {
                                                     },
                                                     HeaderModelEntry::Model(row) => rsx! {
                                                         div { class: "model-row",
-                                                            span { class: "model-title", "{row.title}" }
+                                                            div { class: "model-title-line",
+                                                                span { class: "model-title", "{row.title}" }
+                                                                if is_recent {
+                                                                    span { class: "chip muted", "Recent" }
+                                                                }
+                                                                span {
+                                                                    class: if is_fav { "model-fav on" } else { "model-fav" },
+                                                                    role: "button",
+                                                                    title: if is_fav { "Remove from favorites" } else { "Add to favorites" },
+                                                                    "aria-label": if is_fav { "Remove from favorites" } else { "Add to favorites" },
+                                                                    "aria-pressed": if is_fav { "true" } else { "false" },
+                                                                    onclick: move |event: MouseEvent| {
+                                                                        event.stop_propagation();
+                                                                        session.write().toggle_favorite_model(&fav_key);
+                                                                    },
+                                                                    Icon { name: "star", size: 13 }
+                                                                }
+                                                            }
                                                             div { class: "model-meta",
                                                                 if active_prov == "__all__" {
                                                                     span { class: "chip muted", "{human_provider(&row.provider)}" }

@@ -44,6 +44,7 @@ pub mod oauth;
 pub mod ops_view;
 pub mod panel;
 pub mod pc_stats;
+pub mod picker_search;
 pub mod preview;
 pub mod projects;
 pub mod provider_accounts;
