@@ -90,6 +90,7 @@ const MIGRATION_48: &str = include_str!("../migrations/0048_jobs.sql");
 const MIGRATION_49: &str = include_str!("../migrations/0049_helpers.sql");
 const MIGRATION_50: &str = include_str!("../migrations/0050_project_checks.sql");
 const MIGRATION_51: &str = include_str!("../migrations/0051_scheduled_mail.sql");
+const MIGRATION_52: &str = include_str!("../migrations/0052_mail_ux.sql");
 
 /// One scheduled outgoing email row (`scheduled_mail`, 0.74.13).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -917,6 +918,11 @@ impl Store {
         if version < 51 {
             connection.execute_batch(MIGRATION_51)?;
             connection.pragma_update(None, "user_version", 51)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 52 {
+            connection.execute_batch(MIGRATION_52)?;
+            connection.pragma_update(None, "user_version", 52)?;
         }
         // VACUUM INTO (backups) may renumber rowids; rebuild the external-content
         // FTS index only when its row count no longer matches `memories`.
@@ -6614,6 +6620,7 @@ impl Store {
                         subject, body, body_html, send_at, status, last_error, created_at, sent_at
                  FROM scheduled_mail
                  WHERE user_id = ?1 AND account_label = ?2
+                   AND (kind <> 'undo' OR status = 'failed')
                  ORDER BY send_at ASC, created_at ASC",
             )?;
             let rows = stmt.query_map(params![user_id, label], scheduled_mail_from_row)?;
@@ -6626,6 +6633,7 @@ impl Store {
                         subject, body, body_html, send_at, status, last_error, created_at, sent_at
                  FROM scheduled_mail
                  WHERE user_id = ?1
+                   AND (kind <> 'undo' OR status = 'failed')
                  ORDER BY send_at ASC, created_at ASC",
             )?;
             let rows = stmt.query_map(params![user_id], scheduled_mail_from_row)?;
@@ -6727,7 +6735,7 @@ impl Store {
         let connection = self.connection()?;
         let mut stmt = connection.prepare(
             "UPDATE scheduled_mail
-             SET status = 'sending'
+             SET status = 'sending', claimed_at = ?1
              WHERE id IN (
                  SELECT id FROM scheduled_mail
                  WHERE status = 'pending' AND send_at <= ?1
@@ -7434,7 +7442,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 51);
+        assert_eq!(version, 52);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
@@ -7499,7 +7507,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 51);
+        assert_eq!(version, 52);
         assert!(store.list_device_tokens().unwrap().is_empty());
         // The team table arrives with the same migration batch.
         assert!(
@@ -7573,7 +7581,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 51);
+        assert_eq!(version, 52);
         let admin = admin(&store);
         let memory = crate::memory::get(&store, &admin, "mem-legacy").unwrap();
         assert_eq!(memory.origin, "explicit");
@@ -7662,7 +7670,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 51);
+        assert_eq!(version, 52);
 
         let admin = store.admin_user().unwrap().unwrap();
         assert_eq!(admin.id, ADMIN_USER_ID);
@@ -7793,7 +7801,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 51);
+        assert_eq!(version, 52);
 
         // Every scoped table carries user_id = the admin, and the column is
         // NOT NULL with a real foreign key.
@@ -7948,7 +7956,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 51);
+        assert_eq!(version, 52);
 
         // The old row is now the admin's, with the empty prompt the migration
         // header documents; startup seeding fills it from the template.

@@ -743,6 +743,7 @@ mod tests {
             flags: Vec::new(),
             body: String::new(),
             attachments: Vec::new(),
+            ..Default::default()
         }
     }
 

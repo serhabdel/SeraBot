@@ -569,3 +569,410 @@ async fn mail_signature_update_and_scheduled_mail_crud_and_delivery() {
     assert!(sent_payloads[0].contains("Content-ID: <signature-logo@serabot>"));
     imap_server.await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// 0.74.14 mail workspace: threading, snooze, contacts, saved searches, search
+// operators, drafts, undo hold.
+// ---------------------------------------------------------------------------
+
+fn ux_raw_message(uid: u32) -> String {
+    match uid {
+        1 => "From: Anna <anna@example.example>\r\nTo: me@example.example\r\nSubject: Plan\r\nMessage-ID: <a@x>\r\nDate: Mon, 23 Nov 2026 09:00:00 +0000\r\n\r\nLet us plan the launch.\r\n".to_owned(),
+        2 => "From: Bob <bob@example.example>\r\nTo: me@example.example\r\nSubject: Re: Plan\r\nMessage-ID: <b@x>\r\nIn-Reply-To: <a@x>\r\nReferences: <a@x>\r\nList-Unsubscribe: <mailto:unsub@news.example?subject=unsubscribe>, <https://news.example/u?id=1>\r\nList-Unsubscribe-Post: List-Unsubscribe=One-Click\r\nDate: Mon, 23 Nov 2026 10:00:00 +0000\r\n\r\nSounds good.\r\n".to_owned(),
+        _ => "From: Carol <carol@example.example>\r\nSubject: Lunch\r\nMessage-ID: <c@x>\r\nDate: Mon, 23 Nov 2026 11:00:00 +0000\r\n\r\nNoon?\r\n".to_owned(),
+    }
+}
+
+/// A fake IMAP server that answers every connection until the test aborts it.
+/// Every command line (and the lines of an APPEND literal) is appended to `log`.
+async fn ux_fake_imap(listener: TcpListener, log: std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    loop {
+        let (socket, _) = listener.accept().await.unwrap();
+        let (reader, mut writer) = socket.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        writer
+            .write_all(b"* OK [CAPABILITY IMAP4rev1 AUTH=LOGIN] ready.\r\n")
+            .await
+            .unwrap();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let tag = line.split_whitespace().next().unwrap_or("a1").to_owned();
+            log.lock().unwrap().push(line.clone());
+            if line.contains(" LOGIN ") {
+                writer
+                    .write_all(format!("{tag} OK logged in\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            } else if line.contains(" LOGOUT") {
+                writer
+                    .write_all(format!("* BYE\r\n{tag} OK bye\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                break;
+            } else if line.contains(" LIST ") {
+                writer
+                    .write_all(
+                        format!(
+                            "* LIST (\\HasNoChildren) \".\" INBOX\r\n* LIST (\\HasNoChildren \\Drafts) \".\" INBOX.Drafts\r\n{tag} OK done\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            } else if line.contains(" SELECT ") {
+                writer
+                    .write_all(
+                        format!("* 3 EXISTS\r\n{tag} OK [READ-WRITE] selected\r\n").as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            } else if line.contains(" UID SEARCH ") {
+                writer
+                    .write_all(format!("* SEARCH 1 2 3\r\n{tag} OK done\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            } else if line.contains(" UID FETCH ") {
+                let uid: u32 = line
+                    .split_whitespace()
+                    .nth(3)
+                    .and_then(|w| w.parse().ok())
+                    .unwrap_or(1);
+                let raw = ux_raw_message(uid);
+                writer
+                    .write_all(
+                        format!(
+                            "* {uid} FETCH (FLAGS (\\Seen) UID {uid} BODY[] {{{}}}\r\n{raw}\r\n)\r\n{tag} OK done\r\n",
+                            raw.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            } else if line.contains(" APPEND ") {
+                writer.write_all(b"+ go ahead\r\n").await.unwrap();
+                // Collect the literal until the client goes quiet, then confirm.
+                while let Ok(Ok(Some(l))) =
+                    tokio::time::timeout(std::time::Duration::from_millis(400), lines.next_line())
+                        .await
+                {
+                    log.lock().unwrap().push(format!("APPEND_BODY {l}"));
+                }
+                writer
+                    .write_all(format!("{tag} OK [APPENDUID 1 99] done\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            } else {
+                writer
+                    .write_all(format!("{tag} OK\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+}
+
+async fn delete_req(app: &Router, token: &str, uri: &str) -> Response {
+    app.clone()
+        .oneshot(request_with_token("DELETE", uri, token, None))
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn mail_workspace_threads_snooze_contacts_searches_drafts_and_undo() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let imap_port = listener.local_addr().unwrap().port();
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let server = tokio::spawn(ux_fake_imap(listener, log.clone()));
+
+    let root = temp_base();
+    let (app, _, store) =
+        app_with_root(true, Policy::from_text("synthetic-forbidden-phrase"), root);
+    let alice = store
+        .create_user("ux-a", "ua@example.example", "UX A")
+        .unwrap();
+    let bob = store
+        .create_user("ux-b", "ub@example.example", "UX B")
+        .unwrap();
+    let alice_token = mint_for(&store, &alice.id, "ux-a-tok");
+    let bob_token = mint_for(&store, &bob.id, "ux-b-tok");
+
+    // Store Alice's mailbox directly (the connect flow is covered elsewhere).
+    let secrets =
+        crate::user_secrets::UserSecrets::with_master_key(store.clone(), [9u8; 32]).unwrap();
+    crate::mail::store_credentials(
+        &secrets,
+        &alice.id,
+        None,
+        &crate::mail::MailCredentials {
+            smtp_host: "127.0.0.1".into(),
+            smtp_port: 2525,
+            smtp_security: crate::mail::Security::None,
+            username: "ua@example.example".into(),
+            password: "app-password".into(),
+            imap_host: "127.0.0.1".into(),
+            imap_port,
+            imap_security: crate::mail::Security::None,
+            from: None,
+            signature: None,
+        },
+    )
+    .unwrap();
+
+    // Threading, snippet, address and unsubscribe fields on the list.
+    let res = get(
+        &app,
+        &alice_token,
+        "/v1/mail/messages?folder=INBOX&limit=10",
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let listed = read_json(res).await;
+    let messages = listed["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 3);
+    let by_uid = |uid: u64| {
+        messages
+            .iter()
+            .find(|m| m["uid"].as_u64() == Some(uid))
+            .unwrap()
+            .clone()
+    };
+    let (m1, m2, m3) = (by_uid(1), by_uid(2), by_uid(3));
+    assert_eq!(m1["thread_key"], m2["thread_key"]);
+    assert_ne!(m1["thread_key"], m3["thread_key"]);
+    assert_eq!(m1["snippet"], "Let us plan the launch.");
+    assert_eq!(m2["in_reply_to"], "<a@x>");
+    assert_eq!(
+        m2["unsubscribe"]["mailto"],
+        "unsub@news.example?subject=unsubscribe"
+    );
+    assert_eq!(m2["unsubscribe"]["url"], "https://news.example/u?id=1");
+    assert_eq!(m2["unsubscribe"]["one_click"], true);
+    assert!(m1["unsubscribe"].is_null());
+    assert_eq!(m1["to"], "me@example.example");
+
+    // Senders of a listing become contacts.
+    let res = get(&app, &alice_token, "/v1/mail/contacts?q=ANNA").await;
+    let contacts = read_json(res).await;
+    assert_eq!(contacts["items"][0]["email"], "anna@example.example");
+    assert_eq!(contacts["items"][0]["name"], "Anna");
+    let res = get(&app, &bob_token, "/v1/mail/contacts?q=anna").await;
+    assert!(read_json(res).await["items"].as_array().unwrap().is_empty());
+
+    // Snooze hides one message, unsnooze brings it back, and Bob sees nothing.
+    let past = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/messages/3/snooze",
+        json!({ "folder": "INBOX", "wake_at": 5 }),
+    )
+    .await;
+    assert_eq!(past.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let wake = chrono::Utc::now().timestamp() + 3600;
+    let res = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/messages/3/snooze",
+        json!({ "folder": "INBOX", "wake_at": wake, "subject": "Lunch", "from": "carol@example.example" }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = get(
+        &app,
+        &alice_token,
+        "/v1/mail/messages?folder=INBOX&limit=10",
+    )
+    .await;
+    let after = read_json(res).await;
+    let uids: Vec<u64> = after["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["uid"].as_u64().unwrap())
+        .collect();
+    assert!(!uids.contains(&3), "{uids:?}");
+    assert_eq!(uids.len(), 2);
+    let res = get(&app, &alice_token, "/v1/mail/snoozed").await;
+    assert_eq!(read_json(res).await["items"].as_array().unwrap().len(), 1);
+    let res = get(&app, &bob_token, "/v1/mail/snoozed").await;
+    assert!(read_json(res).await["items"].as_array().unwrap().is_empty());
+    let res = delete_req(
+        &app,
+        &alice_token,
+        "/v1/mail/messages/3/snooze?folder=INBOX",
+    )
+    .await;
+    assert_eq!(read_json(res).await["removed"], true);
+    let res = get(
+        &app,
+        &alice_token,
+        "/v1/mail/messages?folder=INBOX&limit=10",
+    )
+    .await;
+    assert_eq!(
+        read_json(res).await["messages"].as_array().unwrap().len(),
+        3
+    );
+
+    // Search operators become IMAP criteria.
+    let res = get(
+        &app,
+        &alice_token,
+        "/v1/mail/search?folder=INBOX&q=from%3Aanna%20is%3Aunread",
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(
+        log.lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("UID SEARCH FROM \"anna\" UNSEEN")),
+        "{:?}",
+        log.lock().unwrap()
+    );
+    let res = get(
+        &app,
+        &alice_token,
+        "/v1/mail/search?folder=INBOX&q=is%3Aweird",
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Saved searches: validate, list, cap scope, delete.
+    let res = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/saved-searches",
+        json!({ "name": "From Anna", "query": "from:anna is:unread" }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let saved_id = read_json(res).await["item"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let res = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/saved-searches",
+        json!({ "name": "Bad", "query": "is:weird" }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let res = get(&app, &alice_token, "/v1/mail/saved-searches").await;
+    assert_eq!(read_json(res).await["items"].as_array().unwrap().len(), 1);
+    let res = get(&app, &bob_token, "/v1/mail/saved-searches").await;
+    assert!(read_json(res).await["items"].as_array().unwrap().is_empty());
+    let res = delete_req(
+        &app,
+        &bob_token,
+        &format!("/v1/mail/saved-searches/{saved_id}"),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let res = delete_req(
+        &app,
+        &alice_token,
+        &format!("/v1/mail/saved-searches/{saved_id}"),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Drafts: half-typed recipients are dropped, the Drafts folder is found, and the
+    // previous autosave is deleted once the new copy is stored.
+    let res = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/drafts",
+        json!({
+            "to": ["bob@example.example", "half"],
+            "subject": "Draft one",
+            "body": "Hello draft",
+            "replace_uid": 5
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let saved = read_json(res).await;
+    assert_eq!(saved["folder"], "INBOX.Drafts");
+    assert_eq!(saved["uid"], 99);
+    {
+        let log = log.lock().unwrap();
+        assert!(
+            log.iter()
+                .any(|l| l.contains("APPEND \"INBOX.Drafts\" (\\Draft \\Seen) {")),
+            "{log:?}"
+        );
+        assert!(
+            log.iter()
+                .any(|l| l == "APPEND_BODY To: bob@example.example"),
+            "{log:?}"
+        );
+        assert!(
+            log.iter().any(|l| l == "APPEND_BODY Subject: Draft one"),
+            "{log:?}"
+        );
+        assert!(!log.iter().any(|l| l.contains("half")), "{log:?}");
+        assert!(
+            log.iter()
+                .any(|l| l.contains("UID STORE 5 +FLAGS.SILENT (\\Deleted)")),
+            "{log:?}"
+        );
+        assert!(log.iter().any(|l| l.contains("UID EXPUNGE 5")), "{log:?}");
+    }
+    let res = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/drafts",
+        json!({ "subject": "Blocked synthetic-forbidden-phrase", "body": "x" }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+    // Undo send: a short hold is accepted, hidden from the Scheduled list, and
+    // anything outside the window or of an unknown kind is refused.
+    let soon = chrono::Utc::now().timestamp() + 10;
+    let res = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/schedule",
+        json!({
+            "to": ["bob@example.example"], "subject": "Undo me", "body": "b",
+            "send_at": soon, "kind": "undo"
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = get(&app, &alice_token, "/v1/mail/scheduled").await;
+    assert!(read_json(res).await["items"].as_array().unwrap().is_empty());
+    let far = chrono::Utc::now().timestamp() + 3000;
+    let res = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/schedule",
+        json!({
+            "to": ["bob@example.example"], "subject": "Too long", "body": "b",
+            "send_at": far, "kind": "undo"
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let res = post_json(
+        &app,
+        &alice_token,
+        "/v1/mail/schedule",
+        json!({
+            "to": ["bob@example.example"], "subject": "Odd", "body": "b",
+            "send_at": far, "kind": "weird"
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // Recipients of scheduled mail rank as contacts.
+    let res = get(&app, &alice_token, "/v1/mail/contacts?q=bob").await;
+    assert_eq!(
+        read_json(res).await["items"][0]["email"],
+        "bob@example.example"
+    );
+
+    server.abort();
+}
