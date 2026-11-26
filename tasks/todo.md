@@ -714,6 +714,11 @@ Plan: `docs/specs/0.74.15-proposal.md`. Version stays `0.74.14` until the batch 
 - [x] Version bump `0.74.23` (`Cargo.toml`), mobile `0.74.23+97`, `docs/release-0.74.23.md`, `README.md`, `tasks/todo.md`.
 - [ ] Owner: live verification of AI Provider modal sheet and Proton Pass AI Agent token probe/sync/autofill.
 
+## Release 0.74.24 — Windows CI Test Reliability Fix
+
+- [x] Windows CI Test Fix (`session.rs`): hardened `failed_providers_load_sets_section_load_error` mock TCP server (`flush` + `shutdown(Shutdown::Write)` to avoid Windows loopback `RST`, `AtomicBool` stop flag, and 15 s deadline).
+- [x] Version bump `0.74.24` (`Cargo.toml`), mobile `0.74.24+98`, `docs/release-0.74.24.md`, `README.md`, `tasks/todo.md`.
+
 
 
 

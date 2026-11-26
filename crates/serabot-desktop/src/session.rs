@@ -9123,19 +9123,27 @@ mod backlog_tests {
     #[test]
     fn failed_providers_load_sets_section_load_error() {
         use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
         let _guard = crate::creds::test_lock();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_server = stop.clone();
         let server = std::thread::spawn(move || {
-            for _ in 0..2 {
+            while !stop_server.load(Ordering::Relaxed) {
                 let Ok((mut stream, _)) = listener.accept() else {
                     break;
                 };
-                let mut buf = [0u8; 1024];
+                if stop_server.load(Ordering::Relaxed) {
+                    break;
+                }
+                let mut buf = [0u8; 2048];
                 let _ = stream.read(&mut buf);
                 let _ = stream.write_all(
                     b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 );
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
             }
         });
         let worker = crate::worker::Worker::start().unwrap();
@@ -9162,7 +9170,7 @@ mod backlog_tests {
             Some(crate::worker::OperationKind::Providers)
         );
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while session.pending.is_some() && Instant::now() < deadline {
             session.tick();
             std::thread::sleep(Duration::from_millis(10));
@@ -9174,6 +9182,7 @@ mod backlog_tests {
             session.section_load_error.is_some(),
             "failed Providers load must set section_load_error"
         );
+        stop.store(true, Ordering::Relaxed);
         let _ = std::net::TcpStream::connect(("127.0.0.1", port));
         let _ = server.join();
     }
