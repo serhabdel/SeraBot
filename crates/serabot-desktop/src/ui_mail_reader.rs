@@ -14,7 +14,8 @@ use serabot_desktop::{MailAttachmentInfo, MailMessageInfo};
 use crate::ui::Icon;
 use crate::ui_mail::{
     ComposeState, MailCtx, format_ask_bot_prompt, format_bytes, is_starred, is_unread,
-    open_message_with_remote_images, run_mail_job, save_bytes_with_picker, wrap_email_html_srcdoc,
+    open_message_with_remote_images, run_mail_job, save_bytes_with_picker,
+    wrap_email_html_srcdoc_with_remote,
 };
 use crate::ui_mail_actions::{archive_messages, defer_remove, delete_messages, set_flags};
 use serabot_desktop::session::Section;
@@ -28,6 +29,10 @@ const ASK_TASKS: &[(&str, &str)] = &[
     (
         "Draft a reply",
         "Read this email and draft a short, polite reply for me to review. Do not send it.",
+    ),
+    (
+        "Draft HTML reply",
+        "Read this email and draft a polished HTML reply with my signature using mail_draft for me to review.",
     ),
     (
         "Extract tasks",
@@ -364,11 +369,13 @@ pub(crate) fn MailReader(
         div { class: "mail-reader-body",
             if has_html && reader_html() {
                 if let Some(ref html) = msg.body_html {
-                    iframe {
-                        class: "mail-html-frame",
-                        "sandbox": "",
-                        srcdoc: "{wrap_email_html_srcdoc(html)}",
-                        title: "Email HTML content",
+                    div { class: "mail-paper-card",
+                        iframe {
+                            class: "mail-html-frame",
+                            "sandbox": "",
+                            srcdoc: "{wrap_email_html_srcdoc_with_remote(html, *ctx.remote_loaded.read())}",
+                            title: "Email HTML content",
+                        }
                     }
                 }
             } else {

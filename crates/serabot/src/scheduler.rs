@@ -352,6 +352,8 @@ pub async fn process_due_scheduled_mail(
                 subject: &row.subject,
                 body: &row.body,
                 body_html: row.body_html.as_deref(),
+                in_reply_to: None,
+                references: None,
                 attachment_hashes: &attachment_hashes,
             },
         )

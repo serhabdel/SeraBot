@@ -39,6 +39,9 @@ pub const MAIL_ACCOUNT_PREFIX: &str = "mail.";
 const MAIL_SIG_PROVIDER: &str = "mail_sig";
 const MAX_ACCOUNT_LABEL_CHARS: usize = 24;
 pub const MAIL_SEND_TOOL: &str = "mail_send";
+pub const MAIL_REPLY_TOOL: &str = "mail_reply";
+pub const MAIL_DRAFT_TOOL: &str = "mail_draft";
+pub const MAIL_TRIAGE_TOOL: &str = "mail_triage";
 pub const MAIL_LIST_TOOL: &str = "mail_list";
 pub const MAIL_READ_TOOL: &str = "mail_read";
 pub const MAIL_FOLDERS_TOOL: &str = "mail_folders";
@@ -54,7 +57,7 @@ pub const MAX_LIST: u32 = 50;
 pub const MAX_BODY_CHARS: usize = 256 * 1024;
 pub const MAX_SUBJECT_CHARS: usize = 500;
 pub const MAX_SIGNATURE_CHARS: usize = 4096;
-pub const MAX_SIGNATURE_HTML_CHARS: usize = 16384;
+pub const MAX_SIGNATURE_HTML_CHARS: usize = 65536;
 const MAX_INLINE_ATTACHMENT_BYTES: usize = 512 * 1024;
 const MAX_INLINE_ATTACHMENTS_TOTAL: usize = 2 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -470,6 +473,198 @@ pub struct Attachment {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InlineAttachment {
+    pub content_id: String,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Find `<img ... src="data:image/(png|jpeg|gif|webp);base64,...">` tags,
+/// decode each image (up to `MAX_INLINE_ATTACHMENT_BYTES` per image and
+/// `MAX_INLINE_ATTACHMENTS_TOTAL` total), and rewrite `src` to
+/// `cid:inline-{i}@serabot`.
+pub fn extract_inline_data_images(html: &str) -> (String, Vec<InlineAttachment>) {
+    let mut out = String::with_capacity(html.len());
+    let mut attachments = Vec::new();
+    let mut total_bytes: usize = 0;
+    let mut pos = 0;
+    let bytes = html.as_bytes();
+
+    while pos < bytes.len() {
+        let Some(rel_lt) = html[pos..].find('<') else {
+            out.push_str(&html[pos..]);
+            break;
+        };
+        let tag_start = pos + rel_lt;
+        out.push_str(&html[pos..tag_start]);
+
+        // Check if this is an `<img` tag (followed by whitespace, `/`, or `>`).
+        let is_img = html.get(tag_start + 1..tag_start + 4).is_some_and(|s| {
+            s.eq_ignore_ascii_case("img")
+                && html[tag_start + 4..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_whitespace() || c == '/' || c == '>')
+        });
+
+        // Find end of tag, respecting quoted attribute values.
+        let mut i = tag_start + 1;
+        let mut quote: Option<u8> = None;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if let Some(q) = quote {
+                if b == q {
+                    quote = None;
+                }
+            } else if b == b'"' || b == b'\'' {
+                quote = Some(b);
+            } else if b == b'>' {
+                i += 1;
+                break;
+            }
+            i += 1;
+        }
+        let tag_end = i;
+        let tag_str = &html[tag_start..tag_end];
+
+        if !is_img {
+            out.push_str(tag_str);
+            pos = tag_end;
+            continue;
+        }
+
+        if let Some((val_start, val_end, rewritten_cid, inline_att)) =
+            try_extract_img_data_src(tag_str, attachments.len(), total_bytes)
+        {
+            total_bytes += inline_att.bytes.len();
+            attachments.push(inline_att);
+            out.push_str(&tag_str[..val_start]);
+            out.push_str("cid:");
+            out.push_str(&rewritten_cid);
+            out.push_str(&tag_str[val_end..]);
+        } else {
+            out.push_str(tag_str);
+        }
+        pos = tag_end;
+    }
+
+    (out, attachments)
+}
+
+fn try_extract_img_data_src(
+    tag_str: &str,
+    next_index: usize,
+    total_bytes: usize,
+) -> Option<(usize, usize, String, InlineAttachment)> {
+    let bytes = tag_str.as_bytes();
+    let mut i = 4; // skip "<img"
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'>' || bytes[i] == b'/' {
+            if i < bytes.len() && bytes[i] == b'/' {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        let name_start = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'='
+            && bytes[i] != b'>'
+        {
+            i += 1;
+        }
+        let attr_name = &tag_str[name_start..i];
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'=' {
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let (val_start, val_end) = if bytes[i] == b'"' || bytes[i] == b'\'' {
+            let q = bytes[i];
+            i += 1;
+            let vs = i;
+            while i < bytes.len() && bytes[i] != q {
+                i += 1;
+            }
+            let ve = i;
+            if i < bytes.len() {
+                i += 1;
+            }
+            (vs, ve)
+        } else {
+            let vs = i;
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' {
+                i += 1;
+            }
+            (vs, i)
+        };
+
+        if attr_name.eq_ignore_ascii_case("src") {
+            let raw_val = tag_str[val_start..val_end].trim();
+            let prefix_len = "data:image/".len();
+            if raw_val.len() <= prefix_len
+                || !raw_val[..prefix_len].eq_ignore_ascii_case("data:image/")
+            {
+                return None;
+            }
+            let rest = &raw_val[prefix_len..];
+            let (mime_sub, payload) = rest.split_once(',')?;
+            let (subtype_raw, encoding_raw) = mime_sub.split_once(';')?;
+            if !encoding_raw.trim().eq_ignore_ascii_case("base64") {
+                return None;
+            }
+            let content_type = match subtype_raw.trim().to_ascii_lowercase().as_str() {
+                "png" => "image/png",
+                "jpeg" => "image/jpeg",
+                "gif" => "image/gif",
+                "webp" => "image/webp",
+                _ => return None,
+            };
+            let compact_b64: String = payload
+                .chars()
+                .filter(|c| !c.is_ascii_whitespace())
+                .collect();
+            if compact_b64.is_empty() {
+                return None;
+            }
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(compact_b64.as_bytes())
+                .ok()?;
+            if decoded.is_empty()
+                || decoded.len() > MAX_INLINE_ATTACHMENT_BYTES
+                || total_bytes.saturating_add(decoded.len()) > MAX_INLINE_ATTACHMENTS_TOTAL
+            {
+                return None;
+            }
+            let content_id = format!("inline-{next_index}@serabot");
+            return Some((
+                val_start,
+                val_end,
+                content_id.clone(),
+                InlineAttachment {
+                    content_id,
+                    content_type: content_type.to_owned(),
+                    bytes: decoded,
+                },
+            ));
+        }
+    }
+    None
+}
+
 /// Sanitize a header value: strip CR/LF and control chars.
 fn clean_header(value: &str) -> String {
     value
@@ -543,33 +738,42 @@ fn write_related_or_alternative(
     out: &mut String,
     body_text: &str,
     body_html: &str,
-    inline_logo: Option<(&str, &[u8])>,
+    inline_parts: &[InlineAttachment],
 ) {
-    if let Some((logo_mime, logo_bytes)) = inline_logo {
+    if !inline_parts.is_empty() {
         let rel_bnd = format!("serabot-rel-{}", uuid::Uuid::now_v7().simple());
         out.push_str(&format!(
             "Content-Type: multipart/related; boundary=\"{rel_bnd}\"\r\n\r\n"
         ));
         out.push_str(&format!("--{rel_bnd}\r\n"));
         write_alternative_body(out, body_text, body_html);
-        out.push_str(&format!("--{rel_bnd}\r\n"));
-        let ext = match logo_mime {
-            "image/png" => "png",
-            "image/jpeg" => "jpg",
-            "image/gif" => "gif",
-            "image/webp" => "webp",
-            _ => "bin",
-        };
-        out.push_str(&format!("Content-Type: {logo_mime}\r\n"));
-        out.push_str("Content-Transfer-Encoding: base64\r\n");
-        out.push_str("Content-ID: <signature-logo@serabot>\r\n");
-        out.push_str(&format!(
-            "Content-Disposition: inline; filename=\"signature-logo.{ext}\"\r\n\r\n"
-        ));
-        let encoded = base64::engine::general_purpose::STANDARD.encode(logo_bytes);
-        for chunk in encoded.as_bytes().chunks(76) {
-            out.push_str(std::str::from_utf8(chunk).unwrap_or(""));
-            out.push_str("\r\n");
+        for part in inline_parts {
+            out.push_str(&format!("--{rel_bnd}\r\n"));
+            let ext = match part.content_type.as_str() {
+                "image/png" => "png",
+                "image/jpeg" => "jpg",
+                "image/gif" => "gif",
+                "image/webp" => "webp",
+                _ => "bin",
+            };
+            let cid = part
+                .content_id
+                .trim()
+                .trim_start_matches('<')
+                .trim_end_matches('>');
+            let fname_stem = cid.split('@').next().unwrap_or("inline");
+            out.push_str(&format!("Content-Type: {}\r\n", part.content_type));
+            out.push_str("Content-Transfer-Encoding: base64\r\n");
+            out.push_str(&format!("Content-ID: <{cid}>\r\n"));
+            out.push_str(&format!(
+                "Content-Disposition: inline; filename=\"{}.{ext}\"\r\n\r\n",
+                clean_header(fname_stem)
+            ));
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&part.bytes);
+            for chunk in encoded.as_bytes().chunks(76) {
+                out.push_str(std::str::from_utf8(chunk).unwrap_or(""));
+                out.push_str("\r\n");
+            }
         }
         out.push_str(&format!("--{rel_bnd}--\r\n"));
     } else {
@@ -577,18 +781,21 @@ fn write_related_or_alternative(
     }
 }
 
-/// Build a MIME message supporting `cc`, `body_html`, inline `cid:signature-logo@serabot`,
-/// and regular attachments (`multipart/mixed` -> `multipart/related` -> `multipart/alternative`).
+/// Build a MIME message supporting `cc`, `body_html`, `In-Reply-To`, `References`,
+/// inline `cid:` parts, and regular attachments (`multipart/mixed` ->
+/// `multipart/related` -> `multipart/alternative`).
 /// `Bcc` recipients are passed to `smtp_send` envelope `RCPT TO` and never written to headers.
 #[allow(clippy::too_many_arguments)]
-pub fn build_message_full(
+pub fn build_message_with_inline(
     from: &str,
     to: &[String],
     cc: &[String],
     subject: &str,
     body: &str,
     body_html: Option<&str>,
-    inline_logo: Option<(&str, &[u8])>,
+    in_reply_to: Option<&str>,
+    references: Option<&str>,
+    inline_parts: &[InlineAttachment],
     attachments: &[Attachment],
 ) -> Result<Vec<u8>> {
     if to.is_empty() || to.len() + cc.len() > MAX_RECIPIENTS {
@@ -633,10 +840,13 @@ pub fn build_message_full(
             ));
         }
     }
-    let logo_overhead = inline_logo.map(|(_, b)| b.len() * 4 / 3 + 200).unwrap_or(0);
+    let inline_overhead: usize = inline_parts
+        .iter()
+        .map(|p| p.bytes.len() * 4 / 3 + 200)
+        .sum();
     let total: usize = body.len()
         + body_html.map_or(0, str::len)
-        + logo_overhead
+        + inline_overhead
         + attachments
             .iter()
             .map(|a| a.bytes.len() * 4 / 3 + 200)
@@ -670,11 +880,17 @@ pub fn build_message_full(
         "Message-ID: <{}@serabot>\r\n",
         uuid::Uuid::now_v7().simple()
     ));
+    if let Some(irt) = in_reply_to.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str(&format!("In-Reply-To: {}\r\n", clean_header(irt)));
+    }
+    if let Some(refs) = references.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str(&format!("References: {}\r\n", clean_header(refs)));
+    }
     out.push_str("MIME-Version: 1.0\r\n");
 
     if attachments.is_empty() {
         if let Some(html) = body_html {
-            write_related_or_alternative(&mut out, body, html, inline_logo);
+            write_related_or_alternative(&mut out, body, html, inline_parts);
         } else {
             out.push_str(
                 "Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n",
@@ -691,7 +907,7 @@ pub fn build_message_full(
         ));
         out.push_str(&format!("--{boundary}\r\n"));
         if let Some(html) = body_html {
-            write_related_or_alternative(&mut out, body, html, inline_logo);
+            write_related_or_alternative(&mut out, body, html, inline_parts);
             out.push_str(&format!("\r\n--{boundary}\r\n"));
         } else {
             out.push_str(
@@ -724,6 +940,42 @@ pub fn build_message_full(
     Ok(out.into_bytes())
 }
 
+/// Build a MIME message supporting `cc`, `body_html`, inline `cid:signature-logo@serabot`,
+/// and regular attachments (`multipart/mixed` -> `multipart/related` -> `multipart/alternative`).
+/// `Bcc` recipients are passed to `smtp_send` envelope `RCPT TO` and never written to headers.
+#[allow(clippy::too_many_arguments)]
+pub fn build_message_full(
+    from: &str,
+    to: &[String],
+    cc: &[String],
+    subject: &str,
+    body: &str,
+    body_html: Option<&str>,
+    inline_logo: Option<(&str, &[u8])>,
+    attachments: &[Attachment],
+) -> Result<Vec<u8>> {
+    let inline_parts: Vec<InlineAttachment> = inline_logo
+        .map(|(mime, bytes)| InlineAttachment {
+            content_id: "signature-logo@serabot".to_owned(),
+            content_type: mime.to_owned(),
+            bytes: bytes.to_vec(),
+        })
+        .into_iter()
+        .collect();
+    build_message_with_inline(
+        from,
+        to,
+        cc,
+        subject,
+        body,
+        body_html,
+        None,
+        None,
+        &inline_parts,
+        attachments,
+    )
+}
+
 pub struct SendAccountMailParams<'a> {
     pub user_id: &'a str,
     pub account: Option<&'a str>,
@@ -733,6 +985,8 @@ pub struct SendAccountMailParams<'a> {
     pub subject: &'a str,
     pub body: &'a str,
     pub body_html: Option<&'a str>,
+    pub in_reply_to: Option<&'a str>,
+    pub references: Option<&'a str>,
     pub attachment_hashes: &'a [String],
 }
 
@@ -779,6 +1033,41 @@ pub(crate) fn inline_image_mime_for_filename(filename: &str) -> &'static str {
         Some("webp") => "image/webp",
         _ => crate::util::mime_for_filename(filename),
     }
+}
+
+fn load_inline_logo_attachment(
+    store: &Store,
+    artifacts: &ArtifactStore,
+    user_id: &str,
+    sig_cfg: &MailSignatureConfig,
+) -> Result<Option<InlineAttachment>> {
+    let Some(logo_hash) = sig_cfg
+        .signature_logo_hash
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    if !store.user_owns_artifact(user_id, logo_hash)? {
+        return Err(SeraError::Forbidden("artifact".into()));
+    }
+    let stored = artifacts.load(logo_hash)?;
+    let mime = inline_image_mime_for_filename(&stored.filename).to_owned();
+    if !is_safe_inline_image_mime(&mime) {
+        return Err(SeraError::Validation(
+            "signature logo must be png, jpeg, gif, or webp".into(),
+        ));
+    }
+    if stored.bytes.is_empty() || stored.bytes.len() > MAX_INLINE_ATTACHMENT_BYTES {
+        return Err(SeraError::Validation(
+            "signature logo must be 1 byte to 512 KiB".into(),
+        ));
+    }
+    Ok(Some(InlineAttachment {
+        content_id: "signature-logo@serabot".to_owned(),
+        content_type: mime,
+        bytes: stored.bytes,
+    }))
 }
 
 /// Validate policy, load attachments & signature logo from the user's artifact
@@ -845,34 +1134,12 @@ pub async fn send_account_mail(
 
     let creds = require_creds(secrets, params.user_id, account)?;
     let sig_cfg = load_signature_config(secrets, params.user_id, account).unwrap_or_default();
-    let mut inline_logo: Option<(String, Vec<u8>)> = None;
-    if let Some(logo_hash) = sig_cfg
-        .signature_logo_hash
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-    {
-        if !store.user_owns_artifact(params.user_id, logo_hash)? {
-            return Err(SeraError::Forbidden("artifact".into()));
-        }
-        let stored = artifacts.load(logo_hash)?;
-        let mime = inline_image_mime_for_filename(&stored.filename).to_owned();
-        if !is_safe_inline_image_mime(&mime) {
-            return Err(SeraError::Validation(
-                "signature logo must be png, jpeg, gif, or webp".into(),
-            ));
-        }
-        if stored.bytes.is_empty() || stored.bytes.len() > MAX_INLINE_ATTACHMENT_BYTES {
-            return Err(SeraError::Validation(
-                "signature logo must be 1 byte to 512 KiB".into(),
-            ));
-        }
-        inline_logo = Some((mime, stored.bytes));
-    }
+    let inline_logo = load_inline_logo_attachment(store, artifacts, params.user_id, &sig_cfg)?;
 
     let from = from_address(&creds);
     let final_plain = body_with_signature(&creds, params.body.to_owned())?;
     scan_mail_text(store, policy, params.user_id, &final_plain)?;
-    let final_html = html_with_signature(
+    let mut final_html = html_with_signature(
         &creds,
         &sig_cfg,
         params.body,
@@ -883,17 +1150,26 @@ pub async fn send_account_mail(
         scan_mail_text(store, policy, params.user_id, html)?;
     }
 
-    let logo_ref = inline_logo
-        .as_ref()
-        .map(|(m, b)| (m.as_str(), b.as_slice()));
-    let msg = build_message_full(
+    let mut inline_parts = Vec::new();
+    if let Some(html) = final_html.take() {
+        let (rewritten, extracted) = extract_inline_data_images(&html);
+        inline_parts.extend(extracted);
+        final_html = Some(rewritten);
+    }
+    if let Some(logo) = inline_logo {
+        inline_parts.push(logo);
+    }
+
+    let msg = build_message_with_inline(
         &from,
         params.to,
         params.cc,
         params.subject,
         &final_plain,
         final_html.as_deref(),
-        logo_ref,
+        params.in_reply_to,
+        params.references,
+        &inline_parts,
         &attachments,
     )?;
     let mut all_rcpts = Vec::with_capacity(params.to.len() + params.cc.len() + params.bcc.len());
@@ -1879,8 +2155,7 @@ fn is_safe_data_image_url(val: &str) -> bool {
     meta_ok && !payload.is_empty()
 }
 
-fn normalize_css_for_scan(input: &str) -> String {
-    // 1. Strip CSS comments /* ... */
+fn strip_css_comments(input: &str) -> String {
     let mut no_comments = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     while let Some(c) = chars.next() {
@@ -1896,6 +2171,12 @@ fn normalize_css_for_scan(input: &str) -> String {
         }
         no_comments.push(c);
     }
+    no_comments
+}
+
+fn normalize_css_for_scan(input: &str) -> String {
+    // 1. Strip CSS comments /* ... */
+    let no_comments = strip_css_comments(input);
     // 2. Decode CSS backslash escapes and strip whitespace/control chars for matching.
     let mut out = String::with_capacity(no_comments.len());
     let bytes = no_comments.as_bytes();
@@ -1996,6 +2277,267 @@ fn sanitize_inline_style(
     }
 }
 
+fn css_has_dangerous_token(norm: &str) -> bool {
+    norm.contains("expression(")
+        || norm.contains("behavior:")
+        || norm.contains("-moz-binding")
+        || norm.contains("@import")
+        || norm.contains("@charset")
+        || norm.contains("javascript:")
+        || norm.contains("vbscript:")
+        || norm.contains("</style")
+        || norm.contains("position:fixed")
+}
+
+fn sanitize_css_declarations(
+    decls: &str,
+    allow_remote_images: bool,
+    has_remote_images: &mut bool,
+) -> Option<String> {
+    let mut cleaned = Vec::new();
+    for decl in decls.split(';') {
+        let trimmed = decl.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let norm = normalize_css_for_scan(trimmed);
+        if css_has_dangerous_token(&norm) {
+            continue;
+        }
+        if norm.contains("url(") {
+            let is_remote = norm.contains("http://")
+                || norm.contains("https://")
+                || norm.contains("url(//")
+                || norm.contains("url(\"//")
+                || norm.contains("url('//");
+            if is_remote {
+                *has_remote_images = true;
+                if !allow_remote_images {
+                    continue;
+                }
+                cleaned.push(trimmed);
+            } else if let Some(data_pos) = norm.find("data:") {
+                let data_slice = &norm[data_pos..];
+                let data_end = data_slice
+                    .find([')', '"', '\''])
+                    .unwrap_or(data_slice.len());
+                if is_safe_data_image_url(&data_slice[..data_end]) {
+                    cleaned.push(trimmed);
+                }
+            }
+            continue;
+        }
+        cleaned.push(trimmed);
+    }
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.join(";"))
+    }
+}
+
+fn find_matching_brace(s: &str, open_idx: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0usize;
+    let mut i = open_idx;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+        } else if b == b'"' || b == b'\'' {
+            quote = Some(b);
+        } else if b == b'{' {
+            depth += 1;
+        } else if b == b'}' {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn contains_unquoted_brace(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+        } else if b == b'"' || b == b'\'' {
+            quote = Some(b);
+        } else if b == b'{' {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn sanitize_css_block(
+    input: &str,
+    allow_remote_images: bool,
+    has_remote_images: &mut bool,
+) -> String {
+    let mut out = String::new();
+    let bytes = input.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+
+        // Skip @import and @charset at-rules up to ';' or newline.
+        let rest = &input[i..];
+        let is_banned_at = rest
+            .get(..7)
+            .is_some_and(|p| p.eq_ignore_ascii_case("@import"))
+            || rest
+                .get(..8)
+                .is_some_and(|p| p.eq_ignore_ascii_case("@charset"));
+        if is_banned_at {
+            let mut quote: Option<u8> = None;
+            while i < bytes.len() {
+                let b = bytes[i];
+                if let Some(q) = quote {
+                    if b == b'\\' && i + 1 < bytes.len() {
+                        i += 2;
+                        continue;
+                    }
+                    if b == q {
+                        quote = None;
+                    }
+                } else if b == b'"' || b == b'\'' {
+                    quote = Some(b);
+                } else if b == b';' || b == b'\n' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Scan until '{', ';', or '}' outside quotes.
+        let stmt_start = i;
+        let mut brace_idx = None;
+        let mut quote: Option<u8> = None;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if let Some(q) = quote {
+                if b == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if b == q {
+                    quote = None;
+                }
+            } else if b == b'"' || b == b'\'' {
+                quote = Some(b);
+            } else if b == b'{' {
+                brace_idx = Some(i);
+                break;
+            } else if b == b';' || b == b'}' {
+                i += 1;
+                break;
+            }
+            i += 1;
+        }
+
+        let Some(open_idx) = brace_idx else {
+            continue;
+        };
+        let Some(close_idx) = find_matching_brace(input, open_idx) else {
+            break;
+        };
+
+        let header = input[stmt_start..open_idx].trim();
+        let inner = &input[open_idx + 1..close_idx];
+        i = close_idx + 1;
+
+        if header.is_empty() || css_has_dangerous_token(&normalize_css_for_scan(header)) {
+            continue;
+        }
+
+        if contains_unquoted_brace(inner) {
+            let sanitized_inner = sanitize_css_block(inner, allow_remote_images, has_remote_images);
+            if !sanitized_inner.trim().is_empty() {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(header);
+                out.push('{');
+                out.push_str(&sanitized_inner);
+                out.push('}');
+            }
+        } else if let Some(clean_decls) =
+            sanitize_css_declarations(inner, allow_remote_images, has_remote_images)
+        {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(header);
+            out.push('{');
+            out.push_str(&clean_decls);
+            out.push('}');
+        }
+    }
+
+    out
+}
+
+pub fn sanitize_style_sheet(
+    css: &str,
+    allow_remote_images: bool,
+    has_remote_images: &mut bool,
+) -> Option<String> {
+    let no_comments = strip_css_comments(css);
+    // Strip any literal `</style` sequence (case-insensitive) so it cannot break out.
+    let mut clean_raw = String::with_capacity(no_comments.len());
+    let mut idx = 0;
+    let bytes = no_comments.as_bytes();
+    while idx < bytes.len() {
+        if no_comments[idx..]
+            .get(..7)
+            .is_some_and(|p| p.eq_ignore_ascii_case("</style"))
+        {
+            idx += 7;
+            continue;
+        }
+        let ch = no_comments[idx..].chars().next().unwrap();
+        clean_raw.push(ch);
+        idx += ch.len_utf8();
+    }
+
+    let result = sanitize_css_block(&clean_raw, allow_remote_images, has_remote_images);
+    let trimmed = result.trim();
+    if trimmed.is_empty() || css_has_dangerous_token(&normalize_css_for_scan(trimmed)) {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
 fn sanitize_email_html(
     html: &str,
     inline_parts: &HashMap<String, InlinePart>,
@@ -2027,7 +2569,6 @@ fn sanitize_element(
     if matches!(
         tag,
         "script"
-            | "style"
             | "iframe"
             | "object"
             | "embed"
@@ -2043,9 +2584,33 @@ fn sanitize_element(
             | "template"
             | "svg"
             | "math"
-            | "head"
             | "title"
     ) {
+        return;
+    }
+    if tag == "style" {
+        let raw_css: String = el_ref.text().collect();
+        if let Some(clean_css) =
+            sanitize_style_sheet(&raw_css, allow_remote_images, has_remote_images)
+        {
+            out.push_str("<style>");
+            out.push_str(&clean_css);
+            out.push_str("</style>");
+        }
+        return;
+    }
+    if tag == "head" {
+        for child in el_ref.children() {
+            if let Some(child_el) = scraper::ElementRef::wrap(child) {
+                sanitize_element(
+                    child_el,
+                    inline_parts,
+                    allow_remote_images,
+                    has_remote_images,
+                    out,
+                );
+            }
+        }
         return;
     }
     // Unwrap document-level wrappers so email HTML embeds cleanly.
@@ -3107,7 +3672,40 @@ async fn imap_fetch_section<S: AsyncRead + AsyncWrite + Unpin>(
 // --------------------------------------------------------------- tools ----
 
 pub fn register(registry: &mut ToolRegistry, secrets: Arc<UserSecrets>) -> Result<()> {
+    register_inner(registry, secrets, None, None)
+}
+
+pub fn register_with_artifacts(
+    registry: &mut ToolRegistry,
+    secrets: Arc<UserSecrets>,
+    store: Store,
+    artifacts: Arc<ArtifactStore>,
+) -> Result<()> {
+    register_inner(registry, secrets, Some(store), Some(artifacts))
+}
+
+fn register_inner(
+    registry: &mut ToolRegistry,
+    secrets: Arc<UserSecrets>,
+    store: Option<Store>,
+    artifacts: Option<Arc<ArtifactStore>>,
+) -> Result<()> {
     registry.register(MailSendTool {
+        secrets: secrets.clone(),
+        store: store.clone(),
+        artifacts: artifacts.clone(),
+    })?;
+    registry.register(MailReplyTool {
+        secrets: secrets.clone(),
+        store: store.clone(),
+        artifacts: artifacts.clone(),
+    })?;
+    registry.register(MailDraftTool {
+        secrets: secrets.clone(),
+        store,
+        artifacts,
+    })?;
+    registry.register(MailTriageTool {
         secrets: secrets.clone(),
     })?;
     registry.register(MailListTool {
@@ -3154,8 +3752,98 @@ fn arg_account(args: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn arg_string_list(args: &Value, key: &str) -> Vec<String> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| {
+                    v.as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_html_and_inline(
+    secrets: &UserSecrets,
+    store: Option<&Store>,
+    artifacts: Option<&Arc<ArtifactStore>>,
+    user_id: &str,
+    account: Option<&str>,
+    creds: &MailCredentials,
+    body_plain: &str,
+    body_html: Option<&str>,
+) -> Result<(Option<String>, Vec<InlineAttachment>)> {
+    let sig_cfg = load_signature_config(secrets, user_id, account).unwrap_or_default();
+    let inline_logo = match (store, artifacts) {
+        (Some(s), Some(a)) => load_inline_logo_attachment(s, a, user_id, &sig_cfg)?,
+        _ => None,
+    };
+    let mut final_html = html_with_signature(
+        creds,
+        &sig_cfg,
+        body_plain,
+        body_html,
+        inline_logo.is_some(),
+    )?;
+    let mut inline_parts = Vec::new();
+    if let Some(html) = final_html.take() {
+        let (rewritten, extracted) = extract_inline_data_images(&html);
+        inline_parts.extend(extracted);
+        final_html = Some(rewritten);
+    }
+    if let Some(logo) = inline_logo {
+        inline_parts.push(logo);
+    }
+    Ok((final_html, inline_parts))
+}
+
+fn split_header_addresses(header: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut angle_depth = 0usize;
+    for ch in header.chars() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                current.push(ch);
+            }
+            '<' if !in_quotes => {
+                angle_depth += 1;
+                current.push(ch);
+            }
+            '>' if !in_quotes => {
+                angle_depth = angle_depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ',' if !in_quotes && angle_depth == 0 => {
+                let addr = extract_envelope_address(current.trim());
+                if !addr.is_empty() && addr.contains('@') {
+                    out.push(addr.to_owned());
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    let addr = extract_envelope_address(current.trim());
+    if !addr.is_empty() && addr.contains('@') {
+        out.push(addr.to_owned());
+    }
+    out
+}
+
 pub struct MailSendTool {
     secrets: Arc<UserSecrets>,
+    store: Option<Store>,
+    artifacts: Option<Arc<ArtifactStore>>,
 }
 
 #[async_trait]
@@ -3164,15 +3852,19 @@ impl Tool for MailSendTool {
         ToolSpec {
             name: MAIL_SEND_TOOL.into(),
             description: "Send an email through the member's own SMTP mailbox (with optional \
-                          attachments). Always asks for approval; the approval names the \
-                          recipients and subject."
+                          HTML body, CC, threading headers, and attachments). Always asks for \
+                          approval; the approval names the recipients and subject."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "to": {"type": "array", "items": {"type": "string"}, "description": "Recipient addresses"},
+                    "cc": {"type": "array", "items": {"type": "string"}, "description": "Optional CC recipient addresses"},
                     "subject": {"type": "string"},
                     "body": {"type": "string", "description": "Plain-text body"},
+                    "body_html": {"type": "string", "description": "Optional HTML body (inline data:image/*;base64 images are extracted to cid: attachments)"},
+                    "in_reply_to": {"type": "string", "description": "Optional Message-ID for In-Reply-To header"},
+                    "references": {"type": "string", "description": "Optional space-separated Message-IDs for References header"},
                     "account": {"type": "string", "description": "Named mailbox connected in Integrations → Mail; omit for the default account"},
                     "attachments": {"type": "array", "items": {"type": "object", "properties": {
                         "name": {"type": "string"},
@@ -3190,27 +3882,34 @@ impl Tool for MailSendTool {
     async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
         let account = arg_account(&args);
         let creds = require_creds(&self.secrets, &context.user_id, account.as_deref())?;
-        let to: Vec<String> = args
-            .get("to")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|v| v.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let to = arg_string_list(&args, "to");
+        let cc = arg_string_list(&args, "cc");
         let subject = args
             .get("subject")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        let body = args
+        let raw_body = args
             .get("body")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        let body = body_with_signature(&creds, body)?;
+        let body_html = args.get("body_html").and_then(Value::as_str);
+        let in_reply_to = args.get("in_reply_to").and_then(Value::as_str);
+        let references = args.get("references").and_then(Value::as_str);
+
+        let body = body_with_signature(&creds, raw_body.clone())?;
+        let (final_html, inline_parts) = prepare_html_and_inline(
+            &self.secrets,
+            self.store.as_ref(),
+            self.artifacts.as_ref(),
+            &context.user_id,
+            account.as_deref(),
+            &creds,
+            &raw_body,
+            body_html,
+        )?;
+
         let mut attachments = Vec::new();
         if let Some(items) = args.get("attachments").and_then(Value::as_array) {
             for item in items {
@@ -3238,8 +3937,23 @@ impl Tool for MailSendTool {
                 });
             }
         }
-        let message = build_message(&from_address(&creds), &to, &subject, &body, &attachments)?;
-        smtp_send(&creds, &from_address(&creds), &to, &message).await?;
+        let from = from_address(&creds);
+        let message = build_message_with_inline(
+            &from,
+            &to,
+            &cc,
+            &subject,
+            &body,
+            final_html.as_deref(),
+            in_reply_to,
+            references,
+            &inline_parts,
+            &attachments,
+        )?;
+        let mut all_rcpts = Vec::with_capacity(to.len() + cc.len());
+        all_rcpts.extend(to.iter().cloned());
+        all_rcpts.extend(cc.iter().cloned());
+        smtp_send(&creds, &from, &all_rcpts, &message).await?;
         Ok(ToolOutput {
             content: format!(
                 "Sent to {}: \"{}\" ({} attachment(s), {} bytes).",
@@ -3250,8 +3964,400 @@ impl Tool for MailSendTool {
             ),
             data: Some(json!({
                 "to": to,
+                "cc": cc,
                 "subject": subject,
                 "attachments": attachments.iter().map(|a| json!({"name": a.name, "bytes": a.bytes.len()})).collect::<Vec<_>>(),
+            })),
+            ..ToolOutput::default()
+        })
+    }
+}
+
+pub struct MailReplyTool {
+    secrets: Arc<UserSecrets>,
+    store: Option<Store>,
+    artifacts: Option<Arc<ArtifactStore>>,
+}
+
+#[async_trait]
+impl Tool for MailReplyTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: MAIL_REPLY_TOOL.into(),
+            description: "Reply to an existing email (by UID) through the member's own SMTP \
+                          mailbox, automatically setting Re: subject, In-Reply-To, and \
+                          References headers plus HTML signature. Always asks for approval."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "uid": {"type": "integer", "description": "UID of the message to reply to"},
+                    "body": {"type": "string", "description": "Plain-text reply body"},
+                    "body_html": {"type": "string", "description": "Optional HTML reply body"},
+                    "folder": {"type": "string", "description": "Folder containing the original message, default INBOX"},
+                    "reply_all": {"type": "boolean", "description": "Include original To/CC recipients (excluding self)"},
+                    "account": {"type": "string", "description": "Named mailbox connected in Integrations → Mail; omit for the default account"}
+                },
+                "required": ["uid", "body"],
+                "additionalProperties": false
+            }),
+            external_effect: true,
+        }
+    }
+
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        let account = arg_account(&args);
+        let creds = require_creds(&self.secrets, &context.user_id, account.as_deref())?;
+        let uid =
+            args.get("uid")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| SeraError::Validation("uid is required".into()))? as u32;
+        let raw_body = args
+            .get("body")
+            .and_then(Value::as_str)
+            .ok_or_else(|| SeraError::Validation("body is required".into()))?
+            .to_owned();
+        let body_html = args.get("body_html").and_then(Value::as_str);
+        let folder = args
+            .get("folder")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("INBOX")
+            .to_owned();
+        let reply_all = args
+            .get("reply_all")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        let target = imap_read_detail(&creds, &folder, uid, false).await?;
+        let to = split_header_addresses(&target.from);
+        if to.is_empty() {
+            return Err(SeraError::Validation(
+                "original message has no valid From address to reply to".into(),
+            ));
+        }
+
+        let from = from_address(&creds);
+        let self_addr = extract_envelope_address(&from).to_ascii_lowercase();
+        let mut cc = Vec::new();
+        if reply_all {
+            for addr in split_header_addresses(&target.to)
+                .into_iter()
+                .chain(split_header_addresses(&target.cc))
+            {
+                let lc = addr.to_ascii_lowercase();
+                if lc != self_addr
+                    && !to.iter().any(|t| t.eq_ignore_ascii_case(&lc))
+                    && !cc.iter().any(|c: &String| c.eq_ignore_ascii_case(&lc))
+                {
+                    cc.push(addr);
+                }
+            }
+        }
+
+        let orig_subj = target.subject.trim();
+        let subject = if orig_subj
+            .get(..3)
+            .is_some_and(|p| p.eq_ignore_ascii_case("re:"))
+        {
+            orig_subj.to_owned()
+        } else if orig_subj.is_empty() {
+            "Re:".to_owned()
+        } else {
+            format!("Re: {orig_subj}")
+        };
+
+        let msg_id = target.message_id.trim();
+        let in_reply_to = (!msg_id.is_empty()).then_some(msg_id);
+        let mut refs: Vec<String> = target
+            .references
+            .iter()
+            .map(|r| r.trim().to_owned())
+            .filter(|r| !r.is_empty())
+            .collect();
+        if !msg_id.is_empty() && !refs.iter().any(|r| r == msg_id) {
+            refs.push(msg_id.to_owned());
+        }
+        let references_str = if refs.is_empty() {
+            None
+        } else {
+            Some(refs.join(" "))
+        };
+
+        let body = body_with_signature(&creds, raw_body.clone())?;
+        let (final_html, inline_parts) = prepare_html_and_inline(
+            &self.secrets,
+            self.store.as_ref(),
+            self.artifacts.as_ref(),
+            &context.user_id,
+            account.as_deref(),
+            &creds,
+            &raw_body,
+            body_html,
+        )?;
+
+        let message = build_message_with_inline(
+            &from,
+            &to,
+            &cc,
+            &subject,
+            &body,
+            final_html.as_deref(),
+            in_reply_to,
+            references_str.as_deref(),
+            &inline_parts,
+            &[],
+        )?;
+        let mut all_rcpts = Vec::with_capacity(to.len() + cc.len());
+        all_rcpts.extend(to.iter().cloned());
+        all_rcpts.extend(cc.iter().cloned());
+        smtp_send(&creds, &from, &all_rcpts, &message).await?;
+        Ok(ToolOutput {
+            content: format!(
+                "Replied to {}: \"{}\" ({} bytes).",
+                to.join(", "),
+                clip(&subject, 120),
+                message.len()
+            ),
+            data: Some(json!({
+                "uid": uid,
+                "to": to,
+                "cc": cc,
+                "subject": subject,
+                "in_reply_to": in_reply_to,
+            })),
+            ..ToolOutput::default()
+        })
+    }
+}
+
+pub struct MailDraftTool {
+    secrets: Arc<UserSecrets>,
+    store: Option<Store>,
+    artifacts: Option<Arc<ArtifactStore>>,
+}
+
+#[async_trait]
+impl Tool for MailDraftTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: MAIL_DRAFT_TOOL.into(),
+            description: "Save an email draft into the Drafts folder of the member's own IMAP \
+                          mailbox, appending their HTML and plain-text signature. Does not send."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "to": {"type": "array", "items": {"type": "string"}, "description": "Recipient addresses"},
+                    "cc": {"type": "array", "items": {"type": "string"}, "description": "Optional CC recipient addresses"},
+                    "subject": {"type": "string"},
+                    "body": {"type": "string", "description": "Plain-text body"},
+                    "body_html": {"type": "string", "description": "Optional HTML body"},
+                    "account": {"type": "string", "description": "Named mailbox connected in Integrations → Mail; omit for the default account"}
+                },
+                "required": ["to", "subject", "body"],
+                "additionalProperties": false
+            }),
+            external_effect: false,
+        }
+    }
+
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        let account = arg_account(&args);
+        let creds = require_creds(&self.secrets, &context.user_id, account.as_deref())?;
+        let to = arg_string_list(&args, "to");
+        let cc = arg_string_list(&args, "cc");
+        let subject = args
+            .get("subject")
+            .and_then(Value::as_str)
+            .ok_or_else(|| SeraError::Validation("subject is required".into()))?
+            .to_owned();
+        let raw_body = args
+            .get("body")
+            .and_then(Value::as_str)
+            .ok_or_else(|| SeraError::Validation("body is required".into()))?
+            .to_owned();
+        let body_html = args.get("body_html").and_then(Value::as_str);
+
+        let body = body_with_signature(&creds, raw_body.clone())?;
+        let (final_html, inline_parts) = prepare_html_and_inline(
+            &self.secrets,
+            self.store.as_ref(),
+            self.artifacts.as_ref(),
+            &context.user_id,
+            account.as_deref(),
+            &creds,
+            &raw_body,
+            body_html,
+        )?;
+
+        let from = from_address(&creds);
+        const PLACEHOLDER: &str = "draft-placeholder@serabot.invalid";
+        let recipients: Vec<String> = if to.is_empty() {
+            vec![PLACEHOLDER.to_owned()]
+        } else {
+            to.clone()
+        };
+        let raw = build_message_with_inline(
+            &from,
+            &recipients,
+            &cc,
+            &subject,
+            &body,
+            final_html.as_deref(),
+            None,
+            None,
+            &inline_parts,
+            &[],
+        )?;
+        let raw = if to.is_empty() {
+            String::from_utf8_lossy(&raw)
+                .replacen(&format!("To: {PLACEHOLDER}\r\n"), "", 1)
+                .into_bytes()
+        } else {
+            raw
+        };
+        let draft_uid = imap_save_draft(&creds, "Drafts", &raw, None).await?;
+        Ok(ToolOutput {
+            content: format!(
+                "Saved draft \"{}\" in Drafts{}.",
+                clip(&subject, 120),
+                draft_uid
+                    .map(|u| format!(" (UID #{u})"))
+                    .unwrap_or_default()
+            ),
+            data: Some(json!({
+                "uid": draft_uid,
+                "folder": "Drafts",
+                "to": to,
+                "cc": cc,
+                "subject": subject,
+            })),
+            ..ToolOutput::default()
+        })
+    }
+}
+
+pub struct MailTriageTool {
+    secrets: Arc<UserSecrets>,
+}
+
+#[async_trait]
+impl Tool for MailTriageTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: MAIL_TRIAGE_TOOL.into(),
+            description: "Triage the member's own IMAP mailbox in one call: returns connected \
+                          account info, signature configuration status, folder list, INBOX unread \
+                          count, and top unread message summaries. Read-only."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "account": {"type": "string", "description": "Named mailbox connected in Integrations → Mail; omit for the default account"},
+                    "limit": {"type": "integer", "description": "Max unread messages to summarize, 1-30, default 15"}
+                },
+                "additionalProperties": false
+            }),
+            external_effect: false,
+        }
+    }
+
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        let account = arg_account(&args);
+        let creds = require_creds(&self.secrets, &context.user_id, account.as_deref())?;
+        let sig_cfg = load_signature_config(&self.secrets, &context.user_id, account.as_deref())
+            .unwrap_or_default();
+        let has_signature_html = sig_cfg
+            .signature_html
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty());
+        let has_signature_logo = sig_cfg
+            .signature_logo_hash
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty());
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|n| (n as u32).clamp(1, 30))
+            .unwrap_or(15);
+
+        let folders = imap_folders(&creds).await?;
+        let unread_uids = imap_unread_uids(&creds, "INBOX").await?;
+        let unread_count = unread_uids.len();
+        let unread_messages = if unread_count > 0 {
+            imap_search_preview(&creds, "INBOX", "is:unread", limit).await?
+        } else {
+            Vec::new()
+        };
+
+        let summaries: Vec<Value> = unread_messages
+            .iter()
+            .map(|m| {
+                json!({
+                    "uid": m.uid,
+                    "from": m.from,
+                    "subject": m.subject,
+                    "date": m.date,
+                    "snippet": m.snippet,
+                })
+            })
+            .collect();
+
+        let lines: Vec<String> = unread_messages
+            .iter()
+            .map(|m| {
+                format!(
+                    "#{} {} — {} ({}): {}",
+                    m.uid,
+                    clip(&m.from, 50),
+                    clip(&m.subject, 80),
+                    m.date,
+                    clip(&m.snippet, 100)
+                )
+            })
+            .collect();
+
+        let account_label = account
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("default");
+        let summary_text = format!(
+            "Account: {} ({})\nSignature HTML: {}, Logo: {}\nFolders ({}): {}\nINBOX unread: {}\n{}",
+            account_label,
+            from_address(&creds),
+            if has_signature_html {
+                "configured"
+            } else {
+                "none"
+            },
+            if has_signature_logo {
+                "configured"
+            } else {
+                "none"
+            },
+            folders.len(),
+            folders.join(", "),
+            unread_count,
+            if lines.is_empty() {
+                "No unread messages.".to_owned()
+            } else {
+                lines.join("\n")
+            }
+        );
+
+        Ok(ToolOutput {
+            content: summary_text,
+            data: Some(json!({
+                "account": account_label,
+                "from": from_address(&creds),
+                "username": creds.username,
+                "signature_html_configured": has_signature_html,
+                "signature_logo_configured": has_signature_logo,
+                "folders": folders,
+                "inbox_unread_count": unread_count,
+                "unread": summaries,
             })),
             ..ToolOutput::default()
         })
@@ -4267,7 +5373,7 @@ mod tests {
              --alt\r\n\
              Content-Type: text/html; charset=utf-8\r\n\
              Content-Transfer-Encoding: quoted-printable\r\n\r\n\
-             <html><head><style>body{{color:red}}</style></head><body>\
+             <html><head><style>body{{color:red}} @import url(https://evil.com); p{{width:expression(alert(1)); background:javascript:1}}</style></head><body>\
              <script>alert(1)</script>\
              <p onclick=\"evil()\">Hi</p>\
              <a href=\"javascript:alert(2)\">bad</a>\
@@ -4301,7 +5407,9 @@ mod tests {
         assert_eq!(blocked.attachments[0].name, "report.pdf");
         let html = blocked.body_html.as_deref().unwrap();
         assert!(!html.contains("<script"));
-        assert!(!html.contains("<style"));
+        assert!(html.contains("<style>body{color:red}</style>"));
+        assert!(!html.contains("@import"));
+        assert!(!html.contains("expression("));
         assert!(!html.contains("onclick"));
         assert!(!html.contains("javascript:"));
         assert!(!html.contains("https://tracker.example.com/px.png"));
@@ -4368,5 +5476,183 @@ mod tests {
             accounts[0].signature_logo_hash.as_deref(),
             Some("a".repeat(64).as_str())
         );
+    }
+
+    #[test]
+    fn sanitize_style_sheet_preserves_safe_css_and_strips_dangerous_rules() {
+        let css = "/* comment */ @charset \"utf-8\"; @import url(https://evil.com/a.css); \
+                   .card { color: #222; position: fixed; behavior: url(x.htc); -moz-binding: url(y); \
+                   background: url(https://tracker.example.com/bg.png); width: expression(1); } \
+                   .overlay { background: url(//cdn.example.com/px.gif); } \
+                   .bad { background: javascript:alert(1); color: vbscript:msgbox(1); } \
+                   </style><script>alert(1)</script>";
+        let mut has_remote = false;
+        let cleaned = sanitize_style_sheet(css, false, &mut has_remote).unwrap();
+        assert!(has_remote);
+        assert!(cleaned.contains(".card{color: #222}"));
+        assert!(!cleaned.contains("comment"));
+        assert!(!cleaned.contains("@charset"));
+        assert!(!cleaned.contains("@import"));
+        assert!(!cleaned.contains("position: fixed"));
+        assert!(!cleaned.contains("behavior:"));
+        assert!(!cleaned.contains("-moz-binding"));
+        assert!(!cleaned.contains("expression("));
+        assert!(!cleaned.contains("javascript:"));
+        assert!(!cleaned.contains("vbscript:"));
+        assert!(!cleaned.contains("</style"));
+        assert!(!cleaned.contains("https://tracker.example.com/bg.png"));
+        assert!(!cleaned.contains("//cdn.example.com/px.gif"));
+
+        // When only dangerous rules exist, returns None so no empty <style> is emitted.
+        let mut has_remote2 = false;
+        assert!(
+            sanitize_style_sheet("@import 'x'; p{position:fixed}", false, &mut has_remote2)
+                .is_none()
+        );
+
+        // Remote images preserved when allow_remote_images = true.
+        let mut has_remote3 = false;
+        let allowed = sanitize_style_sheet(
+            ".bg{background:url(https://cdn.example.com/bg.png)}",
+            true,
+            &mut has_remote3,
+        )
+        .unwrap();
+        assert!(has_remote3);
+        assert!(allowed.contains("https://cdn.example.com/bg.png"));
+    }
+
+    #[test]
+    fn extract_inline_data_images_rewrites_multiple_images_to_cid() {
+        let png_b64 = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\n1");
+        let jpg_b64 = base64::engine::general_purpose::STANDARD.encode(b"\xff\xd8\xff\xe0jpeg");
+        let html = format!(
+            "<p>One: <img alt=\"a\" src=\"DATA:IMAGE/PNG;BASE64,{png_b64}\"></p>\
+             <p>Two: <img src='data:image/jpeg;base64,{jpg_b64}' width=\"10\"></p>\
+             <p>Keep: <img src=\"https://example.com/x.png\"></p>"
+        );
+        let (rewritten, parts) = extract_inline_data_images(&html);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].content_id, "inline-0@serabot");
+        assert_eq!(parts[0].content_type, "image/png");
+        assert_eq!(parts[0].bytes, b"\x89PNG\r\n\x1a\n1");
+        assert_eq!(parts[1].content_id, "inline-1@serabot");
+        assert_eq!(parts[1].content_type, "image/jpeg");
+        assert_eq!(parts[1].bytes, b"\xff\xd8\xff\xe0jpeg");
+        assert!(rewritten.contains("src=\"cid:inline-0@serabot\""));
+        assert!(rewritten.contains("src='cid:inline-1@serabot'"));
+        assert!(rewritten.contains("https://example.com/x.png"));
+
+        let raw = build_message_with_inline(
+            "me@example.com",
+            &["to@example.com".into()],
+            &[],
+            "Inline multi",
+            "Plain",
+            Some(&rewritten),
+            None,
+            None,
+            &parts,
+            &[],
+        )
+        .unwrap();
+        let text = String::from_utf8(raw).unwrap();
+        assert!(text.contains("Content-ID: <inline-0@serabot>"));
+        assert!(text.contains("Content-ID: <inline-1@serabot>"));
+        assert!(text.contains("multipart/related"));
+    }
+
+    #[test]
+    fn build_message_with_inline_writes_in_reply_to_and_references() {
+        let raw = build_message_with_inline(
+            "me@example.com",
+            &["to@example.com".into()],
+            &[],
+            "Re: Thread",
+            "Reply text",
+            None,
+            Some("<msg-1@example.com>"),
+            Some("<msg-0@example.com> <msg-1@example.com>"),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let text = String::from_utf8(raw).unwrap();
+        assert!(text.contains("In-Reply-To: <msg-1@example.com>\r\n"));
+        assert!(text.contains("References: <msg-0@example.com> <msg-1@example.com>\r\n"));
+    }
+
+    #[test]
+    fn signature_html_accepts_64kib_and_rejects_oversize() {
+        let store = crate::store::Store::open_in_memory(384).unwrap();
+        let user = store
+            .create_user("mail-sig-64k", "sig64k@example.example", "Sig64k")
+            .unwrap();
+        let secrets =
+            UserSecrets::with_master_key(store, [11u8; crate::user_secrets::KEY_BYTES]).unwrap();
+        let c = creds(Security::None);
+        store_credentials(&secrets, &user.id, None, &c).unwrap();
+
+        let ok_html = "a".repeat(MAX_SIGNATURE_HTML_CHARS);
+        store_signature_config(
+            &secrets,
+            &user.id,
+            None,
+            &MailSignatureConfig {
+                signature: String::new(),
+                signature_html: Some(ok_html),
+                signature_logo_hash: None,
+            },
+        )
+        .unwrap();
+
+        let too_big = "a".repeat(MAX_SIGNATURE_HTML_CHARS + 1);
+        assert!(
+            store_signature_config(
+                &secrets,
+                &user.id,
+                None,
+                &MailSignatureConfig {
+                    signature: String::new(),
+                    signature_html: Some(too_big),
+                    signature_logo_hash: None,
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn mail_reply_draft_triage_and_send_tool_specs() {
+        let store = crate::store::Store::open_in_memory(384).unwrap();
+        let secrets = Arc::new(
+            UserSecrets::with_master_key(store, [12u8; crate::user_secrets::KEY_BYTES]).unwrap(),
+        );
+        let mut reg = ToolRegistry::default();
+        register(&mut reg, secrets).unwrap();
+
+        let send = reg.get(MAIL_SEND_TOOL).unwrap().spec();
+        assert!(send.external_effect);
+        assert!(send.parameters["properties"]["body_html"].is_object());
+        assert!(send.parameters["properties"]["cc"].is_object());
+        assert!(send.parameters["properties"]["in_reply_to"].is_object());
+        assert!(send.parameters["properties"]["references"].is_object());
+
+        let reply = reg.get(MAIL_REPLY_TOOL).unwrap().spec();
+        assert!(reply.external_effect);
+        assert!(crate::gateway::is_destructive_tool(MAIL_REPLY_TOOL));
+        assert_eq!(reply.parameters["required"], json!(["uid", "body"]));
+
+        let draft = reg.get(MAIL_DRAFT_TOOL).unwrap().spec();
+        assert!(!draft.external_effect);
+        assert!(!crate::gateway::is_destructive_tool(MAIL_DRAFT_TOOL));
+        assert_eq!(
+            draft.parameters["required"],
+            json!(["to", "subject", "body"])
+        );
+
+        let triage = reg.get(MAIL_TRIAGE_TOOL).unwrap().spec();
+        assert!(!triage.external_effect);
+        assert!(!crate::gateway::is_destructive_tool(MAIL_TRIAGE_TOOL));
     }
 }
