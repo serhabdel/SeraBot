@@ -2172,3 +2172,129 @@ async fn a_github_token_that_github_refuses_parks_the_copilot_account_and_keeps_
             .is_some()
     );
 }
+
+#[test]
+fn claude_gateway_pins_to_loopback_and_resolves_v1_models_catalog() {
+    assert_eq!(
+        resolve_base_url("claude-agent-sdk", "").unwrap(),
+        "http://127.0.0.1:8791"
+    );
+    assert!(resolve_base_url("claude-agent-sdk", "https://gateway.example.com").is_err());
+    assert!(resolve_base_url("claude-agent-sdk", "http://192.168.1.5:8791").is_err());
+    assert!(
+        LlmClient::new("https://gateway.example.com", "gw-tok", 10, 4096)
+            .unwrap()
+            .with_claude_gateway()
+            .is_err()
+    );
+    let catalog = resolve_catalog("claude-agent-sdk", "http://127.0.0.1:8791").unwrap();
+    assert_eq!(catalog.url, "http://127.0.0.1:8791/v1/models");
+    assert!(!catalog.strict);
+}
+
+#[tokio::test]
+async fn claude_gateway_turn_and_models_list() {
+    let env = env();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/turn"))
+        .and(header("authorization", "Bearer gw-secret-123"))
+        .respond_with(|req: &Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap();
+            assert_eq!(body["model"], "claude-sonnet-4-5");
+            assert_eq!(body["system"], "Be concise.");
+            assert_eq!(body["max_tokens"], 32_768);
+            assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+            assert_eq!(body["messages"][0]["role"], "user");
+            assert_eq!(body["messages"][0]["content"], "Check status");
+            assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+            assert_eq!(body["tools"][0]["name"], "ping");
+            ResponseTemplate::new(200).set_body_json(json!({
+                "content": "Checking now.",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "name": "ping",
+                        "arguments": {"host": "127.0.0.1"}
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 120,
+                    "completion_tokens": 35,
+                    "total_tokens": 155
+                },
+                "finish_reason": "tool_calls"
+            }))
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .and(header("authorization", "Bearer gw-secret-123"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [
+                {"id": "claude-sonnet-4-5"},
+                {"id": "claude-opus-4-5"}
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    env.accounts
+        .add_api_key(
+            &env.alice,
+            "claude-agent-sdk",
+            "Local gateway",
+            "gw-secret-123",
+        )
+        .unwrap();
+    let profile = ProviderConfig {
+        kind: "claude-agent-sdk".into(),
+        base_url: server.uri(),
+        models: vec!["claude-sonnet-4-5".into()],
+        data_egress_approved: true,
+        catalog_fetch: true,
+        ..Default::default()
+    };
+    let client = env
+        .credentials
+        .client(&env.alice, "claude-agent-sdk", &profile)
+        .unwrap()
+        .with_model("claude-sonnet-4-5");
+
+    let tools = vec![ToolSpec {
+        name: "ping".into(),
+        description: "Ping host".into(),
+        parameters: json!({"type": "object", "properties": {"host": {"type": "string"}}}),
+        external_effect: false,
+    }];
+    let response = client
+        .complete(
+            &[
+                LlmMessage::system("Be concise."),
+                LlmMessage::user("Check status"),
+            ],
+            &tools,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.message.content.as_deref(), Some("Checking now."));
+    assert_eq!(response.message.tool_calls.len(), 1);
+    assert_eq!(response.message.tool_calls[0].id, "call_1");
+    assert_eq!(response.message.tool_calls[0].name, "ping");
+    assert_eq!(
+        response.message.tool_calls[0].arguments,
+        json!({"host": "127.0.0.1"})
+    );
+    assert_eq!(response.usage.prompt_tokens, 120);
+    assert_eq!(response.usage.completion_tokens, 35);
+    assert_eq!(response.usage.total_tokens, 155);
+    assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
+
+    let models = client.list_models().await.unwrap();
+    assert!(models.contains("claude-sonnet-4-5"));
+    assert!(models.contains("claude-opus-4-5"));
+}

@@ -297,6 +297,14 @@ impl LlmClient {
         self
     }
 
+    /// Speak the local loopback Claude Agent SDK gateway wire format, pinning
+    /// the endpoint to loopback only.
+    pub fn with_claude_gateway(mut self) -> Result<Self> {
+        self.base_url = crate::config::validate_loopback_gateway_url(&self.base_url)?;
+        self.wire = Wire::ClaudeGateway;
+        Ok(self)
+    }
+
     /// Send `x-opencode-session` on every request (OpenCode Go). The id comes
     /// from the running conversation, so a retry reuses it; outside one, from
     /// a seed made for this client.
@@ -529,6 +537,9 @@ impl LlmClient {
                     .complete_anthropic(messages, tools, &model, temperature, extra)
                     .await;
             }
+            Wire::ClaudeGateway => {
+                return self.complete_claude_gateway(messages, tools, &model).await;
+            }
             Wire::ChatCompletions => {}
         }
         let mut body = json!({
@@ -657,7 +668,13 @@ impl LlmClient {
     }
 
     pub async fn list_models(&self) -> Result<std::collections::BTreeSet<String>> {
-        self.fetch_model_catalog(&format!("{}/models", self.base_url), false)
+        let url = if self.wire == Wire::ClaudeGateway {
+            let root = self.base_url.strip_suffix("/v1").unwrap_or(&self.base_url);
+            format!("{root}/v1/models")
+        } else {
+            format!("{}/models", self.base_url)
+        };
+        self.fetch_model_catalog(&url, false)
             .await
             .map(|catalog| catalog.into_keys().collect())
     }
@@ -679,7 +696,9 @@ impl LlmClient {
         }
         // A Copilot plan lists its models on its own host, which is this
         // client's base (the configured one is the individual plan's).
-        let url = if self.copilot {
+        let url = if self.wire == Wire::ClaudeGateway {
+            crate::config::validate_loopback_gateway_url(catalog_url)?
+        } else if self.copilot {
             validate_base_url(&format!("{}/models", self.base_url))?
         } else {
             validate_base_url(catalog_url)?
@@ -1818,7 +1837,7 @@ pub(crate) fn copilot_uses_responses(model: &str) -> bool {
         || lower.starts_with("gpt-6")
 }
 
-fn messages_to_json(messages: &[LlmMessage]) -> Vec<Value> {
+pub(super) fn messages_to_json(messages: &[LlmMessage]) -> Vec<Value> {
     messages
         .iter()
         .filter(|message| {

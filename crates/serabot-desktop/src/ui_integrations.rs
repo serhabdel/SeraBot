@@ -345,6 +345,7 @@ fn InstalledTab(
         marketplace_unavailable,
         marketplace_error,
         state_error,
+        section_load_error,
         errors,
         github,
     ) = {
@@ -357,6 +358,7 @@ fn InstalledTab(
             state.state.marketplace_unavailable,
             state.state.marketplace_error.clone(),
             state.state.error.clone(),
+            state.section_load_error.clone(),
             state.panel.connectors.errors.clone(),
             state.mcp_ui.github.clone(),
         )
@@ -402,7 +404,8 @@ fn InstalledTab(
     let nothing = set_up.is_empty() && available.is_empty();
     let marketplace_pending =
         !marketplace_loaded && !marketplace_unavailable && marketplace_error.is_none();
-    let loading = nothing && (!connectors_loaded || marketplace_pending);
+    let loading =
+        nothing && (!connectors_loaded || marketplace_pending) && section_load_error.is_none();
     let needle_lc = needle.trim().to_lowercase();
     let show_social = needle_lc.is_empty()
         || needle_lc == "x"
@@ -419,7 +422,14 @@ fn InstalledTab(
         ]
         .iter()
         .any(|kw| kw.contains(&needle_lc) || needle_lc.contains(kw));
-    let inline_error = state_error.or(marketplace_error);
+    let load_error_card = section_load_error
+        .clone()
+        .filter(|_| nothing && (!connectors_loaded || !marketplace_loaded));
+    let inline_error = if load_error_card.is_some() {
+        None
+    } else {
+        state_error.or(marketplace_error).or(section_load_error)
+    };
     rsx! {
         if let Some(message) = inline_error {
             div { class: "banner err", role: "alert",
@@ -427,12 +437,24 @@ fn InstalledTab(
                 button {
                     class: "btn ghost sm",
                     r#type: "button",
-                    onclick: move |_| session.write().refresh_connectors(),
+                    onclick: move |_| session.write().retry_section_load(),
                     "Retry"
                 }
             }
         }
-        if loading {
+        if let Some(err) = load_error_card {
+            div { class: "empty", role: "alert",
+                div { class: "empty-icon", Icon { name: "alert", size: 20 } }
+                h2 { class: "empty-title", "Could not load integrations" }
+                p { class: "empty-text", "{err}" }
+                button {
+                    class: "btn ghost sm",
+                    r#type: "button",
+                    onclick: move |_| session.write().retry_section_load(),
+                    "Retry"
+                }
+            }
+        } else if loading {
             SkeletonGrid { label: "Loading integrations", count: 8 }
         } else if nothing && !show_social && needle.trim().is_empty() {
             div { class: "empty",
@@ -523,10 +545,11 @@ fn BotsTab(session: Signal<Session>, query: Signal<String>) -> Element {
 /// The Composio tab: its key form when there is none, then its apps.
 #[component]
 fn ComposioTab(session: Signal<Session>) -> Element {
-    let (loaded, connector) = {
+    let (loaded, section_load_error, connector) = {
         let state = session.read();
         (
             state.state.connectors_loaded,
+            state.section_load_error.clone(),
             state
                 .state
                 .connectors
@@ -537,9 +560,27 @@ fn ComposioTab(session: Signal<Session>) -> Element {
     };
     match connector {
         Some(connector) => rsx! { ComposioCard { session, connector } },
-        None if !loaded => rsx! {
-            SkeletonGrid { label: "Loading Composio", count: 1 }
-        },
+        None if !loaded => {
+            if let Some(err) = section_load_error {
+                rsx! {
+                    div { class: "empty compact", role: "alert",
+                        div { class: "empty-icon", Icon { name: "alert", size: 20 } }
+                        h3 { class: "empty-title", "Could not load Composio" }
+                        p { class: "empty-text", "{err}" }
+                        button {
+                            class: "btn ghost sm",
+                            r#type: "button",
+                            onclick: move |_| session.write().retry_section_load(),
+                            "Retry"
+                        }
+                    }
+                }
+            } else {
+                rsx! {
+                    SkeletonGrid { label: "Loading Composio", count: 1 }
+                }
+            }
+        }
         None => rsx! {
             div { class: "empty compact", role: "status",
                 h3 { class: "empty-title", "Composio is not listed on this server" }

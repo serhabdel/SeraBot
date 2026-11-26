@@ -438,13 +438,14 @@ fn open_custom(mut session: Signal<Session>, mut overlay: Signal<Overlay>) {
 #[component]
 pub(super) fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
     let mut query = use_signal(String::new);
-    let (providers, loaded, can_write, is_admin) = {
+    let (providers, loaded, can_write, is_admin, section_load_error) = {
         let s = session.read();
         (
             s.state.providers.clone(),
             s.state.providers_loaded,
             s.can_admin(),
             s.is_admin(),
+            s.section_load_error.clone(),
         )
     };
     let order = provider_view::card_order(&providers, usable);
@@ -493,14 +494,28 @@ pub(super) fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) 
                 }
                 BotRoutingSection { session }
                 if !loaded {
-                    div { class: "prov-grid", role: "status", "aria-busy": "true",
-                        div { class: "prov-card skeleton-card",
-                            div { class: "skeleton title" }
-                            div { class: "skeleton block" }
+                    if let Some(err) = section_load_error {
+                        div { class: "empty prov-empty", role: "alert",
+                            div { class: "empty-icon", Icon { name: "alert", size: 20 } }
+                            h2 { class: "empty-title", "Could not load AI providers" }
+                            p { class: "empty-text", "{err}" }
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                onclick: move |_| session.write().retry_section_load(),
+                                "Retry"
+                            }
                         }
-                        div { class: "prov-card skeleton-card",
-                            div { class: "skeleton title" }
-                            div { class: "skeleton block" }
+                    } else {
+                        div { class: "prov-grid", role: "status", "aria-busy": "true",
+                            div { class: "prov-card skeleton-card",
+                                div { class: "skeleton title" }
+                                div { class: "skeleton block" }
+                            }
+                            div { class: "prov-card skeleton-card",
+                                div { class: "skeleton title" }
+                                div { class: "skeleton block" }
+                            }
                         }
                     }
                 } else if providers.is_empty() {

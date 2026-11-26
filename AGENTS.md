@@ -38,6 +38,14 @@ on the server, never offers "always" permissions, and never reads Claude
 Code's credentials. Do not widen it (other agents, terminal capability,
 server-side use) without a new design.
 
+The opt-in Python `claude-agent-sdk` loopback gateway (`services/claude_gateway/`)
+is the companion approved exception for bridging Claude Agent SDK turns: it
+binds strictly to loopback (`127.0.0.1` / `::1`), requires constant-time
+Bearer token auth (`SERABOT_CLAUDE_GATEWAY_TOKEN`), passes `tools=[]` and
+`setting_sources=[]` to `ClaudeAgentOptions`, and captures `mcp__serabot__*`
+tool calls so all tool execution routes back through SeraBot's Rust `gateway`
+with SeraBot's own permissions, approvals, and audit log.
+
 WhatsApp as a linked device (0.58, `docs/specs/whatsapp-linked-device.md`)
 uses the unofficial `whatsapp-rust` client with the owner's approval and a
 spare number. It is on by default in 0.59 (`[whatsapp_link] enabled = false`

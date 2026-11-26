@@ -681,6 +681,15 @@ Plan: `docs/specs/0.74.15-proposal.md`. Version stays `0.74.14` until the batch 
 - [x] Version bump `0.74.19` (`Cargo.toml`), mobile `0.74.19+93`, `docs/release-0.74.19.md`, `README.md`, `tasks/todo.md`.
 - [ ] Owner: live pass on Antigravity, Claude, and the updated Settings / AI Providers UI.
 
+## Release 0.74.20 — Claude Agent SDK Gateway, Settings Scroll & Loading Fix, Vendor PNG Icons
+
+- [x] Python `claude-agent-sdk` Loopback Gateway (`services/claude_gateway/`, `AGENTS.md`): loopback-only HTTP server with constant-time Bearer auth, `tools=[]` / `setting_sources=[]`, and `mcp__serabot__*` tool capture back to SeraBot's Rust `gateway`.
+- [x] Rust `[claude_gateway]` & `claude-agent-sdk` Wire (`config.rs`, `providers.rs`, `llm.rs`, `llm/wire_calls.rs`, `wire/mod.rs`, `provider_presets.rs`): loopback-pinned `Wire::ClaudeGateway` + `"Claude Agent SDK (Gateway)"` preset.
+- [x] Settings Independent Scroll & Lazy-Loading Fix (`settings.css`, `pages-data.css`, `ui/settings_view.rs`, `session.rs`, `ui/providers.rs`, `ui_integrations.rs`, `ui_logs.rs`, `ui/memory.rs`): independent sidebar/content scrolling, scroll-to-top on switch, `poll_paused` clear on navigation, and `section_load_error` + inline Retry button.
+- [x] Real Vendor PNG Icons (`assets/brands/{opencode,muse,nous,inception}.png`, `branding.rs`, `SOURCES.md`): 64×64 RGBA PNGs replacing generic SVG placeholders.
+- [x] Version bump `0.74.20` (`Cargo.toml`), mobile `0.74.20+94`, `docs/release-0.74.20.md`, `README.md`, `tasks/todo.md`.
+- [ ] Owner: live pass on `services/claude_gateway`, Settings independent scroll, lazy-loaded tabs, and new vendor icons.
+
 
 
 

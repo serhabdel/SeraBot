@@ -673,21 +673,6 @@
 
 /* ---- Settings ---- */
 
-.settings-layout {
-  gap: 32px;
-  max-width: 1040px;
-}
-
-.settings-nav {
-  flex: 0 0 188px;
-  gap: 2px;
-  padding: 6px;
-  border: 1px solid var(--glass-edge);
-  border-radius: var(--card-radius);
-  background: var(--card-bg);
-  box-shadow: var(--card-shadow);
-}
-
 .settings-nav-item {
   position: relative;
   padding: 8px 12px 8px 14px;
@@ -714,11 +699,6 @@
 .settings-nav-item:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
-}
-
-.settings-content {
-  gap: 16px;
-  max-width: 760px;
 }
 
 .settings-content > * {

@@ -356,7 +356,15 @@ pub(super) fn MemoryView(session: Signal<Session>) -> Element {
     let review_summary = use_signal(|| Option::<(usize, usize)>::None);
 
     let today = today_utc_date();
-    let (raw_memories, memories_loaded, stats_opt, header, app_error, bot_names) = {
+    let (
+        raw_memories,
+        memories_loaded,
+        stats_opt,
+        header,
+        app_error,
+        section_load_error,
+        bot_names,
+    ) = {
         let s = session.read();
         let bot_names: std::collections::HashMap<String, String> = s
             .state
@@ -370,6 +378,7 @@ pub(super) fn MemoryView(session: Signal<Session>) -> Element {
             s.state.memory_stats.clone(),
             memory_header(s.state.memory_stats.as_ref()),
             s.state.error.clone(),
+            s.section_load_error.clone(),
             bot_names,
         )
     };
@@ -797,16 +806,32 @@ pub(super) fn MemoryView(session: Signal<Session>) -> Element {
                     }
                 }
 
-                div { class: "card-grid mem-grid",
-                    if !memories_loaded {
-                        for n in 0..6 {
-                            div { key: "{n}", class: "card mem-card", "aria-busy": "true",
-                                div { class: "skeleton row" }
-                                div { class: "skeleton title" }
-                                div { class: "skeleton block" }
+                if !memories_loaded {
+                    if let Some(err) = section_load_error {
+                        div { class: "empty", role: "alert",
+                            div { class: "empty-icon", Icon { name: "alert", size: 20 } }
+                            h2 { class: "empty-title", "Could not load memories" }
+                            p { class: "empty-text", "{err}" }
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                onclick: move |_| session.write().retry_section_load(),
+                                "Retry"
+                            }
+                        }
+                    } else {
+                        div { class: "card-grid mem-grid",
+                            for n in 0..6 {
+                                div { key: "{n}", class: "card mem-card", "aria-busy": "true",
+                                    div { class: "skeleton row" }
+                                    div { class: "skeleton title" }
+                                    div { class: "skeleton block" }
+                                }
                             }
                         }
                     }
+                } else {
+                div { class: "card-grid mem-grid",
                     for memory in memories {
                         div {
                             class: if memory.superseded { "card mem-card superseded" } else if memory.pending { "card mem-card pending" } else { "card mem-card" },
@@ -943,6 +968,7 @@ pub(super) fn MemoryView(session: Signal<Session>) -> Element {
                             }
                         }
                     }
+                }
                 }
                 if memories_loaded && memories_empty {
                     div { class: "empty",

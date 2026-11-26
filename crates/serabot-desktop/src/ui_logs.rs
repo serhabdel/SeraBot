@@ -50,13 +50,14 @@ pub fn LogsView(session: Signal<Session>) -> Element {
     let mut query = use_signal(|| session.read().logs_query.clone());
     let mut wrap = use_signal(|| false);
     let mut copied_all = use_signal(|| false);
-    let (entries, supported, loaded, logs_error) = {
+    let (entries, supported, loaded, logs_error, section_load_error) = {
         let state = session.read();
         (
             state.state.logs.clone(),
             state.state.logs_supported,
             state.state.logs_loaded,
             state.state.logs_error.clone(),
+            state.section_load_error.clone(),
         )
     };
     let level = session.read().logs_level.clone();
@@ -216,9 +217,23 @@ pub fn LogsView(session: Signal<Session>) -> Element {
                             }
                         }
                     } else if !loaded {
-                        div { class: "logs-skeleton", role: "status", "aria-label": "Loading logs",
-                            for n in 0..8 {
-                                div { key: "{n}", class: "skeleton logs-skeleton-row" }
+                        if let Some(err) = section_load_error.as_deref().or(logs_error.as_deref()) {
+                            div { class: "empty logs-empty", role: "alert",
+                                span { class: "empty-icon", Icon { name: "alert", size: 20 } }
+                                h2 { class: "empty-title", "Could not load logs" }
+                                p { class: "empty-text", "{err}" }
+                                button {
+                                    class: "btn ghost sm",
+                                    r#type: "button",
+                                    onclick: move |_| session.write().retry_section_load(),
+                                    "Retry"
+                                }
+                            }
+                        } else {
+                            div { class: "logs-skeleton", role: "status", "aria-label": "Loading logs",
+                                for n in 0..8 {
+                                    div { key: "{n}", class: "skeleton logs-skeleton-row" }
+                                }
                             }
                         }
                     } else if let Some(err) = logs_error.as_deref().filter(|_| entries.is_empty()) {
@@ -228,7 +243,8 @@ pub fn LogsView(session: Signal<Session>) -> Element {
                             p { class: "empty-text", "{err}" }
                             button {
                                 class: "btn ghost sm",
-                                onclick: move |_| session.write().refresh_logs(),
+                                r#type: "button",
+                                onclick: move |_| session.write().retry_section_load(),
                                 "Retry"
                             }
                         }

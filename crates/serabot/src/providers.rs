@@ -278,6 +278,12 @@ const BUILTINS: &[BuiltinProvider] = &[
         auth: "oauth",
         summary: "Antigravity PKCE; Cloud Code chat and POST /v1internal:fetchAvailableModels",
     },
+    BuiltinProvider {
+        kind: "claude-agent-sdk",
+        base_url: Some("http://127.0.0.1:8791"),
+        auth: "api_key",
+        summary: "Local Claude Agent SDK loopback gateway; POST /v1/turn and GET /v1/models",
+    },
 ];
 
 pub fn builtins() -> &'static [BuiltinProvider] {
@@ -341,6 +347,14 @@ pub fn canonical_kind(kind: &str) -> Result<String> {
 
 pub fn resolve_base_url(kind: &str, base_url: &str) -> Result<String> {
     let kind = canonical_kind(kind)?;
+    if kind == "claude-agent-sdk" {
+        let chosen = if base_url.trim().is_empty() {
+            "http://127.0.0.1:8791"
+        } else {
+            base_url
+        };
+        return crate::config::validate_loopback_gateway_url(chosen);
+    }
     if kind == "google-antigravity" {
         let chosen = if base_url.trim().is_empty() {
             "https://daily-cloudcode-pa.googleapis.com"
@@ -459,6 +473,14 @@ pub fn check_profile(
 
 pub fn resolve_catalog(kind: &str, base_url: &str) -> Result<ResolvedCatalog> {
     let kind = canonical_kind(kind)?;
+    if kind == "claude-agent-sdk" {
+        let base = crate::config::validate_loopback_gateway_url(base_url)?;
+        let root = base.strip_suffix("/v1").unwrap_or(&base);
+        return Ok(ResolvedCatalog {
+            url: crate::config::validate_loopback_gateway_url(&format!("{root}/v1/models"))?,
+            strict: false,
+        });
+    }
     if kind == "google-antigravity" {
         return Ok(ResolvedCatalog {
             url: crate::cloud_code::primary_catalog_url(base_url)?,
@@ -1611,6 +1633,7 @@ pub fn open_provider_client(
         "openai-codex" => client = client.with_wire(Wire::Responses),
         "github-copilot" => client = client.with_copilot(),
         "opencode-go" => client = client.with_opencode_session(),
+        "claude-agent-sdk" => client = client.with_claude_gateway()?,
         _ => {}
     }
     // The operator's own credential uses the provider's project; a member's

@@ -99,6 +99,9 @@ pub struct Config {
     /// (see docs/memory.md).
     #[serde(default)]
     pub memory: MemoryConfig,
+    /// Local loopback gateway wrapping the Claude Agent SDK.
+    #[serde(default)]
+    pub claude_gateway: ClaudeGatewayConfig,
     #[serde(skip)]
     pub base_dir: PathBuf,
     /// Admin-console bot config overrides (tools/skills/require_approval),
@@ -146,6 +149,7 @@ impl Default for Config {
             connectors: ConnectorsConfig::default(),
             fleet: FleetConfig::default(),
             memory: MemoryConfig::default(),
+            claude_gateway: ClaudeGatewayConfig::default(),
             base_dir: PathBuf::from("."),
             bot_config_overrides: BTreeMap::new(),
         }
@@ -215,6 +219,9 @@ impl Config {
         self.users.validate()?;
         self.logging.validate()?;
         self.memory.validate()?;
+        if self.claude_gateway.enabled {
+            validate_loopback_gateway_url(&self.claude_gateway.url)?;
+        }
         if !self.server.bind.starts_with("127.")
             && !self.server.bind.starts_with("localhost")
             && !self.server.bind.starts_with("[::1]")
@@ -3296,6 +3303,51 @@ fn default_link_selector() -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn claude_gateway_defaults_and_loopback_validation() {
+        let mut config = valid_config();
+        assert!(!config.claude_gateway.enabled);
+        assert_eq!(config.claude_gateway.url, "http://127.0.0.1:8791");
+        assert_eq!(config.claude_gateway.token_secret, "claude_gateway_token");
+        assert_eq!(config.claude_gateway.timeout_secs, 180);
+
+        for ok in [
+            "http://127.0.0.1:8791",
+            "http://127.0.0.1",
+            "http://[::1]:8791",
+            "http://localhost:8791",
+            "http://localhost",
+        ] {
+            config.claude_gateway.enabled = true;
+            config.claude_gateway.url = ok.into();
+            config.validate().unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+
+        for bad in [
+            "https://127.0.0.1:8791",
+            "https://gateway.example.com",
+            "http://192.168.1.25:8791",
+            "http://10.0.0.1:8791",
+            "http://127.0.0.1.evil.example:8791",
+            "http://localhost.evil.example:8791",
+            "http://user@127.0.0.1:8791",
+            "http://127.0.0.1:8791?x=1",
+            "",
+        ] {
+            config.claude_gateway.enabled = true;
+            config.claude_gateway.url = bad.into();
+            assert!(
+                config.validate().is_err(),
+                "expected non-loopback/invalid URL {bad:?} to be rejected"
+            );
+        }
+
+        // Disabled gateway does not reject even if url is modified.
+        config.claude_gateway.enabled = false;
+        config.claude_gateway.url = "http://192.168.1.25:8791".into();
+        config.validate().unwrap();
+    }
+
     fn route(provider: &str, model: &str) -> BotRoute {
         BotRoute {
             provider: provider.into(),
@@ -4580,4 +4632,98 @@ fn default_whatsapp_link_idle() -> u64 {
 
 fn default_whatsapp_link_os() -> String {
     "Windows".into()
+}
+
+/// `[claude_gateway]`: local loopback gateway wrapping the Claude Agent SDK.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeGatewayConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_claude_gateway_url")]
+    pub url: String,
+    #[serde(default = "default_claude_gateway_token_secret")]
+    pub token_secret: String,
+    #[serde(default = "default_claude_gateway_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl Default for ClaudeGatewayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: default_claude_gateway_url(),
+            token_secret: default_claude_gateway_token_secret(),
+            timeout_secs: default_claude_gateway_timeout_secs(),
+        }
+    }
+}
+
+fn default_claude_gateway_url() -> String {
+    "http://127.0.0.1:8791".into()
+}
+
+fn default_claude_gateway_token_secret() -> String {
+    "claude_gateway_token".into()
+}
+
+fn default_claude_gateway_timeout_secs() -> u64 {
+    180
+}
+
+pub(crate) fn validate_loopback_gateway_url(value: &str) -> Result<String> {
+    let invalid = || {
+        SeraError::Config(
+            "claude_gateway.url must be a loopback HTTP URL (http://127.0.0.1..., http://[::1]..., or http://localhost...) without credentials, query, or fragment"
+                .into(),
+        )
+    };
+    let trimmed = value.trim();
+    if trimmed != value
+        || trimmed.is_empty()
+        || value.chars().any(char::is_control)
+        || value.contains('\\')
+    {
+        return Err(invalid());
+    }
+    let url = url::Url::parse(trimmed).map_err(|_| invalid())?;
+    if url.scheme() != "http"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid());
+    }
+    let authority = trimmed
+        .split_once("://")
+        .ok_or_else(invalid)?
+        .1
+        .split(['/', '?', '#'])
+        .next()
+        .ok_or_else(invalid)?;
+    if authority.contains('@') {
+        return Err(invalid());
+    }
+    let is_loopback_authority = authority == "127.0.0.1"
+        || authority.starts_with("127.0.0.1:")
+        || authority == "[::1]"
+        || authority.starts_with("[::1]:")
+        || authority.eq_ignore_ascii_case("localhost")
+        || authority
+            .split_once(':')
+            .is_some_and(|(host, _)| host.eq_ignore_ascii_case("localhost"));
+    let is_loopback_host = matches!(
+        url.host(),
+        Some(url::Host::Ipv4(ip)) if ip == std::net::Ipv4Addr::LOCALHOST
+    ) || matches!(
+        url.host(),
+        Some(url::Host::Ipv6(ip)) if ip == std::net::Ipv6Addr::LOCALHOST
+    ) || matches!(
+        url.host(),
+        Some(url::Host::Domain(host)) if host.eq_ignore_ascii_case("localhost")
+    );
+    if !is_loopback_authority || !is_loopback_host {
+        return Err(invalid());
+    }
+    Ok(url.as_str().trim_end_matches('/').to_owned())
 }
