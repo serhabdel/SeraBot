@@ -2679,7 +2679,7 @@ const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
 const DEFAULT_SPECIALIST_TOOLS: &[&str] = &["skill_list", "skill_search", "skill_load"];
 
 const MAX_BOT_DESCRIPTION_CHARS: usize = 2000;
-const MAX_SCAFFOLD_TOOLS: usize = 32;
+const MAX_SCAFFOLD_TOOLS: usize = 64;
 const MAX_SCAFFOLD_SKILLS: usize = 16;
 
 /// A specialist built from the fixed template, ready to become a per-user
@@ -3994,6 +3994,44 @@ enabled = false
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn specialist_tool_limit_allows_up_to_64_tools() {
+        let policy = crate::policy::Policy::empty();
+        let allow_64: Vec<String> = SPECIALIST_TOOL_ALLOWLIST
+            .iter()
+            .take(64)
+            .map(|s| (*s).to_owned())
+            .collect();
+        assert_eq!(allow_64.len(), 64);
+        let scaffolded = build_specialist_bot(
+            "fullbot",
+            "Specialist with 64 tools.",
+            Some(&allow_64),
+            None,
+            &[],
+            &policy,
+        )
+        .expect("64 tools should be allowed");
+        assert_eq!(scaffolded.config.tools.len(), 64);
+
+        let too_many: Vec<String> = SPECIALIST_TOOL_ALLOWLIST
+            .iter()
+            .take(65)
+            .map(|s| (*s).to_owned())
+            .collect();
+        assert_eq!(too_many.len(), 65);
+        let err = build_specialist_bot(
+            "fullbot",
+            "Specialist with 65 tools.",
+            Some(&too_many),
+            None,
+            &[],
+            &policy,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("too many tools"), "{err}");
     }
 
     #[test]

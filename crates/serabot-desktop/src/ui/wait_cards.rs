@@ -419,14 +419,15 @@ pub(crate) fn FailedTurnCard(
             div { class: "failed-actions",
                 if let Some(offer) = card.fallback.clone() {
                     button {
-                        class: "btn primary sm",
+                        class: "btn primary sm failed-fallback-btn",
                         r#type: "button",
+                        title: "{offer.label}",
                         disabled: !can_act,
                         onclick: {
                             let pick = offer.clone();
                             move |_| session.write().retry_on_fallback(pick.clone())
                         },
-                        "{offer.label}"
+                        span { class: "failed-fallback-label", "{offer.label}" }
                     }
                 }
                 if has_alternatives {

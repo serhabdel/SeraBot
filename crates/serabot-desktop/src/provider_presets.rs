@@ -604,8 +604,16 @@ const PRESETS: &[ProviderPreset] = &[
         base_url: "https://api.anthropic.com/v1",
         kind: "anthropic",
         default_id: "anthropic",
-        // Anthropic's models overview (2026-11); the default comes first.
+        // Valid Anthropic model IDs first so the fallback list works before
+        // a live /models fetch; newer aliases follow.
         models: &[
+            "claude-sonnet-4-5",
+            "claude-opus-4-5",
+            "claude-haiku-4-5",
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
             "claude-opus-5-5",
             "claude-fable-5-2",
             "claude-sonnet-5-5",
@@ -614,12 +622,6 @@ const PRESETS: &[ProviderPreset] = &[
             "claude-fable-5",
             "claude-opus-5",
             "claude-sonnet-5",
-            "claude-opus-4-8",
-            "claude-opus-4-7",
-            "claude-opus-4-6",
-            "claude-sonnet-4-6",
-            "claude-sonnet-4-5",
-            "claude-haiku-4-5",
         ],
         secret_name: "anthropic_api_key",
         catalog_fetch: true,

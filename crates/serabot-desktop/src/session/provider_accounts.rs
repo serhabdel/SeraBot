@@ -755,10 +755,12 @@ impl Session {
     /// Fill the editor from the bot's record once it has arrived. The pump
     /// calls this on every tick; it does nothing after the first fill.
     pub(super) fn hydrate_route_editor(&mut self) {
-        if !self.bot_settings.open {
-            return;
-        }
-        let Some(id) = self.bot_settings.bot.clone() else {
+        let id = if self.bot_settings.open {
+            self.bot_settings.bot.clone()
+        } else {
+            self.route_editor.bot.clone()
+        };
+        let Some(id) = id else {
             return;
         };
         if self.route_editor.bot.as_deref() == Some(id.as_str()) && self.route_editor.hydrated {
@@ -779,6 +781,52 @@ impl Session {
             hydrated: true,
             ..RouteEditorUi::default()
         };
+    }
+
+    /// Select a bot for the inline route editor on the AI Providers page.
+    pub fn select_route_bot(&mut self, bot_id: &str) {
+        if self.route_editor.bot.as_deref() == Some(bot_id) && self.route_editor.hydrated {
+            return;
+        }
+        self.route_editor = RouteEditorUi {
+            bot: Some(bot_id.to_owned()),
+            ..RouteEditorUi::default()
+        };
+        if self.state.bot_details.contains_key(bot_id) {
+            self.hydrate_route_editor();
+        } else {
+            self.load_bot_detail(bot_id.to_owned());
+        }
+    }
+
+    /// Swap two fallback slots (0-based fallback indices) in the route editor.
+    pub fn swap_route_fallbacks(&mut self, a: usize, b: usize) {
+        if a == b
+            || a >= self.route_editor.draft.fallbacks.len()
+            || b >= self.route_editor.draft.fallbacks.len()
+        {
+            return;
+        }
+        self.route_editor.draft.fallbacks.swap(a, b);
+        self.route_editor.draft.consent.swap(a, b);
+        self.route_editor.error = None;
+        self.route_editor.notice = None;
+    }
+
+    /// Remove a fallback slot (0-based fallback index) and compact remaining fallbacks.
+    pub fn remove_route_fallback(&mut self, index: usize) {
+        let len = self.route_editor.draft.fallbacks.len();
+        if index >= len {
+            return;
+        }
+        for i in index..(len - 1) {
+            self.route_editor.draft.fallbacks[i] = self.route_editor.draft.fallbacks[i + 1].clone();
+            self.route_editor.draft.consent[i] = self.route_editor.draft.consent[i + 1];
+        }
+        self.route_editor.draft.fallbacks[len - 1] = Default::default();
+        self.route_editor.draft.consent[len - 1] = false;
+        self.route_editor.error = None;
+        self.route_editor.notice = None;
     }
 
     /// Edit one row of the route editor. Row 0 is the primary, 1 and 2 are the

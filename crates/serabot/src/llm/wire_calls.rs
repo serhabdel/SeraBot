@@ -87,6 +87,11 @@ async fn read_error_body(mut response: reqwest::Response) -> String {
     llm_failure::bounded_body(&out)
 }
 
+fn is_anthropic_oauth_gate(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("claude code") || lower.contains("only authorized") || lower.contains("oauth")
+}
+
 /// The reasoning text a reply carried, bounded and stripped of control
 /// characters. Untrusted display data.
 fn bounded_reasoning(text: &str) -> Option<String> {
@@ -123,9 +128,14 @@ impl LlmClient {
             if let Some(body) = &call.body {
                 request = request.header("accept", "text/event-stream").json(body);
             } else {
-                request = request
-                    .header("user-agent", USER_AGENT)
-                    .header("accept", "application/json");
+                if !call
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+                {
+                    request = request.header("user-agent", USER_AGENT);
+                }
+                request = request.header("accept", "application/json");
             }
             let response = self.decorate(request).send().await;
             match response {
@@ -155,7 +165,16 @@ impl LlmClient {
                         repaired = true;
                         continue;
                     }
-                    let message = if call.echo_error {
+                    let message = if self.wire == Wire::AnthropicPlan
+                        && matches!(status.as_u16(), 401 | 403)
+                        && is_anthropic_oauth_gate(&text)
+                    {
+                        format!(
+                            "Anthropic rejected the Claude plan OAuth token (HTTP {}): {}. Use a Console API key (sk-ant-api03-...) if OAuth is blocked.",
+                            status.as_u16(),
+                            sanitize_provider_error(&text)
+                        )
+                    } else if call.echo_error {
                         format!(
                             "LLM request failed with status {}: {}",
                             status.as_u16(),

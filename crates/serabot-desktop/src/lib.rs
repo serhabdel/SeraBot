@@ -208,7 +208,7 @@ mod tests {
         assert!(validate_tool_list(&[]).is_ok());
         assert!(validate_tool_list(&["delegate".into()]).is_err());
         assert!(validate_tool_list(&["../secret".into()]).is_err());
-        assert!(validate_tool_list(&vec!["skill_list".into(); 33]).is_err());
+        assert!(validate_tool_list(&vec!["skill_list".into(); 65]).is_err());
         assert_eq!(
             parse_skill_list("ask, notes").unwrap(),
             vec!["ask".to_string(), "notes".to_string()]

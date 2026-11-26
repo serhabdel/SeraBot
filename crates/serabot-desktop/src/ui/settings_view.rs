@@ -199,32 +199,45 @@ pub(super) fn SettingsView(session: Signal<Session>, overlay: Signal<Overlay>) -
                     {settings_new_cards}
                     if sel == SettingsSection::Account {
                     div { class: "card",
-                        div { class: "card-head",
-                            h3 { class: "card-title", "Your account" }
+                        div { class: "settings-card-head",
+                            div { class: "settings-card-head-copy",
+                                h3 { class: "card-title", "Your account" }
+                                p { class: "settings-card-desc", "Current session and identity on {server}." }
+                            }
+                            if let Some(user) = &signed_in_user {
+                                if !user.role.is_empty() {
+                                    span { class: "chip accent", "{user.role}" }
+                                }
+                            }
                         }
-                        p { class: "card-sub", "{server}" }
-                        if !version.is_empty() {
-                            p { class: "tiny", "Server {version}" }
-                        }
-                        if let Some(user) = &signed_in_user {
+                        div { class: "settings-kv-list",
+                            if let Some(user) = &signed_in_user {
+                                div { class: "kv-row",
+                                    span { class: "kv-key", "Signed in as" }
+                                    span { class: "kv-val", "{user.label()}" }
+                                }
+                                if !user.email.is_empty() && user.email != user.label() {
+                                    div { class: "kv-row",
+                                        span { class: "kv-key", "Email" }
+                                        span { class: "kv-val", "{user.email}" }
+                                    }
+                                }
+                            } else {
+                                div { class: "kv-row",
+                                    span { class: "kv-key", "Session" }
+                                    span { class: "kv-val", "Signed in with a saved session" }
+                                }
+                            }
                             div { class: "kv-row",
-                                span { class: "kv-key", "Signed in as" }
-                                span { class: "kv-val", "{user.label()}" }
+                                span { class: "kv-key", "Server" }
+                                span { class: "kv-val mono", "{server}" }
                             }
-                            if !user.email.is_empty() && user.email != user.label() {
+                            if !version.is_empty() {
                                 div { class: "kv-row",
-                                    span { class: "kv-key", "Email" }
-                                    span { class: "kv-val", "{user.email}" }
+                                    span { class: "kv-key", "Server version" }
+                                    span { class: "kv-val mono", "{version}" }
                                 }
                             }
-                            if !user.role.is_empty() {
-                                div { class: "kv-row",
-                                    span { class: "kv-key", "Role" }
-                                    span { class: "kv-val", "{user.role}" }
-                                }
-                            }
-                        } else {
-                            p { class: "tiny", "Signed in with a saved session." }
                         }
                         if confirm_sign_out() {
                             div { class: "vault-confirm", role: "alertdialog", "aria-label": "Confirm sign out",
@@ -248,17 +261,20 @@ pub(super) fn SettingsView(session: Signal<Session>, overlay: Signal<Overlay>) -
                                 }
                             }
                         } else {
-                            div { class: "card-actions",
-                                button {
-                                    class: "btn danger",
-                                    r#type: "button",
-                                    disabled: signing_out,
-                                    title: "End this session on the server and remove it from this device",
-                                    onclick: move |_| confirm_sign_out.set(true),
-                                    if signing_out { "Signing out\u{2026}" } else { "Sign out" }
-                                }
-                                if signing_out {
-                                    span { class: "spinner", title: "Signing out" }
+                            div { class: "settings-card-foot",
+                                span { class: "tiny muted", "Ends this session on the server and clears local tokens." }
+                                div { class: "settings-card-foot-actions",
+                                    if signing_out {
+                                        span { class: "spinner", title: "Signing out" }
+                                    }
+                                    button {
+                                        class: "btn danger sm",
+                                        r#type: "button",
+                                        disabled: signing_out,
+                                        title: "End this session on the server and remove it from this device",
+                                        onclick: move |_| confirm_sign_out.set(true),
+                                        if signing_out { "Signing out\u{2026}" } else { "Sign out" }
+                                    }
                                 }
                             }
                         }
@@ -266,9 +282,14 @@ pub(super) fn SettingsView(session: Signal<Session>, overlay: Signal<Overlay>) -
                     }
                     if sel == SettingsSection::Telegram {
                     div { class: "card",
-                        div { class: "card-head",
-                            h3 { class: "card-title", "Telegram" }
-                            div { class: "row",
+                        div { class: "settings-card-head",
+                            div { class: "settings-card-head-copy",
+                                h3 { class: "card-title", "Telegram" }
+                                p { class: "settings-card-desc",
+                                    "Link Telegram to chat with your bots from your phone using the same memory and approvals."
+                                }
+                            }
+                            div { class: "settings-card-head-actions",
                                 if telegram_loading {
                                     span { class: "spinner", title: "Reading Telegram status" }
                                 }
@@ -281,9 +302,6 @@ pub(super) fn SettingsView(session: Signal<Session>, overlay: Signal<Overlay>) -
                                 }
                             }
                         }
-                        p { class: "card-sub",
-                            "Link Telegram to chat with your bots from your phone. They use the same memory and ask you first, just like here."
-                        }
                         if let Some(status) = telegram_status {
                             div { class: "chips",
                                 span {
@@ -292,7 +310,7 @@ pub(super) fn SettingsView(session: Signal<Session>, overlay: Signal<Overlay>) -
                                 }
                                 span {
                                     class: if status.linked { "chip ok" } else { "chip muted" },
-                                    if status.linked { "linked" } else { "not linked" }
+                                    if status.linked { "Linked" } else { "Not linked" }
                                 }
                                 if let Some(chat) = status.chat_label() {
                                     span { class: "chip mono", "{chat}" }
@@ -302,14 +320,14 @@ pub(super) fn SettingsView(session: Signal<Session>, overlay: Signal<Overlay>) -
                                 }
                             }
                             if !status.enabled {
-                                p { class: "tiny",
+                                p { class: "tiny muted",
                                     "Telegram is turned off on the server. Ask your admin to turn it on."
                                 }
                             }
                             if status.linked {
                                 if telegram_confirm {
-                                    div { class: "row",
-                                        span { class: "tiny",
+                                    div { class: "vault-confirm",
+                                        span { class: "caption",
                                             "Unlink this chat? Messages from it will be ignored until you link again."
                                         }
                                         button {
@@ -326,7 +344,8 @@ pub(super) fn SettingsView(session: Signal<Session>, overlay: Signal<Overlay>) -
                                         }
                                     }
                                 } else {
-                                    div { class: "card-actions",
+                                    div { class: "settings-card-foot",
+                                        span { class: "tiny muted", "Your Telegram chat is active." }
                                         button {
                                             class: "btn danger sm",
                                             onclick: move |_| session.write().request_unlink_telegram(),
@@ -335,9 +354,10 @@ pub(super) fn SettingsView(session: Signal<Session>, overlay: Signal<Overlay>) -
                                     }
                                 }
                             } else if status.enabled {
-                                div { class: "card-actions",
+                                div { class: "settings-card-foot",
+                                    span { class: "tiny muted", "Generate a one-time link code to connect your Telegram." }
                                     button {
-                                        class: "btn primary",
+                                        class: "btn primary sm",
                                         disabled: telegram_linking || telegram_loading,
                                         onclick: move |_| session.write().link_telegram(),
                                         if telegram_linking { "Requesting code…" } else { "Link Telegram" }
@@ -347,11 +367,11 @@ pub(super) fn SettingsView(session: Signal<Session>, overlay: Signal<Overlay>) -
                         } else if telegram_loading {
                             div { class: "skeleton block" }
                         } else if telegram_loaded && telegram_error.is_none() {
-                            p { class: "tiny",
+                            p { class: "tiny muted",
                                 "Telegram status is unavailable. Press Refresh status to retry."
                             }
                         } else if !telegram_loaded && telegram_error.is_none() {
-                            p { class: "tiny", "Reading Telegram status…" }
+                            p { class: "tiny muted", "Reading Telegram status…" }
                         }
                         if let Some(link) = telegram_link {
                             div { class: "field",
@@ -372,11 +392,11 @@ pub(super) fn SettingsView(session: Signal<Session>, overlay: Signal<Overlay>) -
                                         if copied_telegram() { "Copied" } else { "Copy" }
                                     }
                                 }
-                                p { class: "tiny",
+                                p { class: "tiny muted",
                                     "The code works once and expires 10 minutes after it was requested. After sending it, press Refresh status."
                                 }
                                 if let Some(expires) = link.expires_at.as_deref() {
-                                    p { class: "tiny", "Expires {expires}." }
+                                    p { class: "tiny muted", "Expires {expires}." }
                                 }
                             }
                         }
@@ -387,9 +407,12 @@ pub(super) fn SettingsView(session: Signal<Session>, overlay: Signal<Overlay>) -
                     }
                     if sel == SettingsSection::Admin && can_admin {
                     div { class: "card",
-                        div { class: "card-head",
-                            h3 { class: "card-title", "Safety checks" }
-                            div { class: "row",
+                        div { class: "settings-card-head",
+                            div { class: "settings-card-head-copy",
+                                h3 { class: "card-title", "Safety checks" }
+                                p { class: "settings-card-desc", "What the server checks before your bots act." }
+                            }
+                            div { class: "settings-card-head-actions",
                                 if status_loading {
                                     span { class: "spinner", title: "Reading the server posture" }
                                 }
@@ -401,14 +424,25 @@ pub(super) fn SettingsView(session: Signal<Session>, overlay: Signal<Overlay>) -
                                 }
                             }
                         }
-                        p { class: "card-sub", "What the server checks before your bots act." }
-                        div { class: "chips",
-                            span { class: "chip", "Safety rules: {policy_version}" }
-                            span { class: "chip", "Tasks waiting: {pending_tasks}" }
-                            span { class: "chip", "Waiting for your OK: {pending_approvals}" }
-                            span {
-                                class: if restart_pending { "chip warn" } else { "chip ok" },
-                                if restart_pending { "Restart needed" } else { "Up to date" }
+                        div { class: "settings-stat-grid",
+                            div { class: "settings-stat-tile",
+                                span { class: "settings-stat-label", "Safety rules" }
+                                span { class: "settings-stat-val mono", "{policy_version}" }
+                            }
+                            div { class: "settings-stat-tile",
+                                span { class: "settings-stat-label", "Tasks waiting" }
+                                span { class: "settings-stat-val", "{pending_tasks}" }
+                            }
+                            div { class: "settings-stat-tile",
+                                span { class: "settings-stat-label", "Waiting for OK" }
+                                span { class: "settings-stat-val", "{pending_approvals}" }
+                            }
+                            div { class: "settings-stat-tile",
+                                span { class: "settings-stat-label", "Server state" }
+                                span {
+                                    class: if restart_pending { "chip warn" } else { "chip ok" },
+                                    if restart_pending { "Restart needed" } else { "Up to date" }
+                                }
                             }
                         }
                         if let Some(error) = status_error {
@@ -460,8 +494,11 @@ pub(super) fn SettingsView(session: Signal<Session>, overlay: Signal<Overlay>) -
                     }
                     if sel == SettingsSection::Admin && can_admin {
                     div { class: "card",
-                        div { class: "card-head",
-                            h3 { class: "card-title", "What's turned on" }
+                        div { class: "settings-card-head",
+                            div { class: "settings-card-head-copy",
+                                h3 { class: "card-title", "Server capabilities & audio" }
+                                p { class: "settings-card-desc", "Live server feature flags and audio transcription models." }
+                            }
                         }
                         div { class: "chips",
                             span {
@@ -482,25 +519,22 @@ pub(super) fn SettingsView(session: Signal<Session>, overlay: Signal<Overlay>) -
                             }
                         }
                         if audio_enabled == Some(true) {
-                            p { class: "tiny",
-                                "Speech-to-text: {transcription}. Audio understanding: {understanding}."
-                            }
-                            p { class: "tiny",
-                                "Voice notes you send on Telegram are turned into text before the bot answers."
+                            p { class: "tiny muted",
+                                "Speech-to-text: {transcription}. Audio understanding: {understanding}. Voice notes you send on Telegram are turned into text before the bot answers."
                             }
                         } else if audio_enabled == Some(false) {
-                            p { class: "tiny", "Audio is turned off on the server." }
+                            p { class: "tiny muted", "Audio is turned off on the server." }
                         } else {
-                            p { class: "tiny",
+                            p { class: "tiny muted",
                                 "This server is too old to report what is turned on. Update it to see live status."
                             }
                         }
                         if catalog_fetch == Some(false) {
-                            p { class: "tiny",
-                                "Ask your admin to turn on live model lists, then use Fetch models on the AI providers page."
+                            p { class: "tiny muted",
+                                "Ask your admin to turn on live model lists, then use Refresh models on the AI providers page."
                             }
                         }
-                        div { class: "form-grid",
+                        div { class: "settings-grid-2",
                             div { class: "field",
                                 label { class: "field-label", "Speech-to-text model" }
                                 input {
@@ -520,36 +554,45 @@ pub(super) fn SettingsView(session: Signal<Session>, overlay: Signal<Overlay>) -
                                 }
                             }
                         }
-                        p { class: "tiny",
-                            "Audio uses the Mistral key you already saved under AI providers."
-                        }
-                        label { class: "check",
+                        label { class: "settings-toggle-row",
+                            div { class: "settings-toggle-copy",
+                                span { class: "settings-toggle-title", "Turn on audio transcription and understanding" }
+                                span { class: "settings-toggle-desc", "Uses the Mistral key you already saved under AI providers." }
+                            }
                             input {
+                                class: "switch",
                                 "type": "checkbox",
                                 checked: audio_on,
                                 onchange: move |event| session.write().audio.enabled = event.checked(),
                             }
-                            span { "Turn on audio transcription and understanding" }
                         }
                         if let Some(message) = admin_error.clone() {
                             div { class: "banner err", role: "alert", span { "{message}" } }
                         } else if let Some(message) = admin_notice.clone() {
                             div { class: "settings-notice-ok", role: "status", "{message}" }
                         }
-                        button {
-                            class: "btn primary",
-                            r#type: "button",
-                            disabled: !can_admin,
-                            onclick: move |_| session.write().save_audio(),
-                            "Save audio settings"
+                        div { class: "settings-card-foot",
+                            span { class: "tiny muted", "Applies to server-side audio processing." }
+                            button {
+                                class: "btn primary sm",
+                                r#type: "button",
+                                disabled: !can_admin,
+                                onclick: move |_| session.write().save_audio(),
+                                "Save audio settings"
+                            }
                         }
                     }
                     }
                     if sel == SettingsSection::Voice {
                     div { class: "card",
-                        div { class: "card-head",
-                            h3 { class: "card-title", "Voice and scanned pages" }
-                            div { class: "row",
+                        div { class: "settings-card-head",
+                            div { class: "settings-card-head-copy",
+                                h3 { class: "card-title", "Voice and scanned pages" }
+                                p { class: "settings-card-desc",
+                                    "OCR for scanned PDFs/images and voice-note replies on Telegram."
+                                }
+                            }
+                            div { class: "settings-card-head-actions",
                                 if voice_loading {
                                     span { class: "spinner", title: "Loading voice settings" }
                                 }
@@ -563,7 +606,7 @@ pub(super) fn SettingsView(session: Signal<Session>, overlay: Signal<Overlay>) -
                                 }
                             }
                         }
-                        div { class: "card-actions",
+                        div { class: "chips",
                             span {
                                 class: if voice_stt_ready { "chip ok" } else { "chip warn" },
                                 if voice_stt_ready { "Speech-to-text ready" } else { "Speech-to-text off" }
@@ -579,33 +622,46 @@ pub(super) fn SettingsView(session: Signal<Session>, overlay: Signal<Overlay>) -
                         }
                         if !voice_loaded {
                             if voice_loading {
-                                p { class: "tiny", role: "status", "Loading voice and scanned-page settings\u{2026}" }
+                                p { class: "tiny muted", role: "status", "Loading voice and scanned-page settings\u{2026}" }
                             } else {
-                                p { class: "tiny",
+                                p { class: "tiny muted",
                                     "Could not load voice settings automatically. Press Refresh to retry."
                                 }
-                                button {
-                                    class: "btn ghost",
-                                    r#type: "button",
-                                    disabled: voice_loading,
-                                    onclick: move |_| session.write().load_voice(),
-                                    "Load voice settings"
+                                div { class: "settings-card-foot",
+                                    span {}
+                                    button {
+                                        class: "btn ghost sm",
+                                        r#type: "button",
+                                        disabled: voice_loading,
+                                        onclick: move |_| session.write().load_voice(),
+                                        "Load voice settings"
+                                    }
                                 }
                             }
                         } else {
-                            p { class: "tiny",
-                                "Scanned PDFs and images are read with OCR when they have no text. Voice replies send a Telegram voice note instead of text."
+                            if voice_stt_detail.is_some() || voice_tts_detail.is_some() || voice_ocr_detail.is_some() {
+                                div { class: "settings-kv-list",
+                                    if let Some(detail) = voice_stt_detail.clone() {
+                                        div { class: "kv-row",
+                                            span { class: "kv-key", "Speech to text" }
+                                            span { class: "kv-val", "{detail}" }
+                                        }
+                                    }
+                                    if let Some(detail) = voice_tts_detail.clone() {
+                                        div { class: "kv-row",
+                                            span { class: "kv-key", "Voice replies" }
+                                            span { class: "kv-val", "{detail}" }
+                                        }
+                                    }
+                                    if let Some(detail) = voice_ocr_detail.clone() {
+                                        div { class: "kv-row",
+                                            span { class: "kv-key", "Scanned pages" }
+                                            span { class: "kv-val", "{detail}" }
+                                        }
+                                    }
+                                }
                             }
-                            if let Some(detail) = voice_stt_detail.clone() {
-                                p { class: "tiny", "Speech to text: {detail}" }
-                            }
-                            if let Some(detail) = voice_tts_detail.clone() {
-                                p { class: "tiny", "Voice replies: {detail}" }
-                            }
-                            if let Some(detail) = voice_ocr_detail.clone() {
-                                p { class: "tiny", "Scanned pages: {detail}" }
-                            }
-                            div { class: "form-grid",
+                            div { class: "settings-grid-2",
                                 div { class: "field",
                                     label { class: "field-label", "Speech-to-text model" }
                                     input {
@@ -643,86 +699,125 @@ pub(super) fn SettingsView(session: Signal<Session>, overlay: Signal<Overlay>) -
                                     }
                                 }
                             }
-                            label { class: "check",
+                            label { class: "settings-toggle-row",
+                                div { class: "settings-toggle-copy",
+                                    span { class: "settings-toggle-title", "Read scanned PDFs and images with OCR" }
+                                    span { class: "settings-toggle-desc", "Runs automatically when an uploaded PDF or image has no embedded text." }
+                                }
                                 input {
+                                    class: "switch",
                                     "type": "checkbox",
                                     checked: voice_ocr_enabled,
                                     onchange: move |event| session.write().voice.ocr_enabled = event.checked(),
                                 }
-                                span { "Read scanned PDFs and images when they have no text" }
                             }
-                            div { class: "card-actions",
-                                for mode in ["text", "voice"] {
-                                    button {
-                                        class: if voice_reply_mode == mode { "btn primary" } else { "btn ghost" },
-                                        onclick: {
-                                            let mode = mode.to_string();
-                                            move |_| session.write().voice.reply_mode = mode.clone()
-                                        },
-                                        if mode == "voice" { "Reply with voice" } else { "Reply with text" }
+                            div { class: "field",
+                                label { class: "field-label", "Default Telegram reply style" }
+                                div { class: "seg", role: "group", "aria-label": "Reply style",
+                                    for mode in ["text", "voice"] {
+                                        button {
+                                            key: "{mode}",
+                                            r#type: "button",
+                                            class: if voice_reply_mode == mode { "seg-btn active" } else { "seg-btn" },
+                                            "aria-pressed": if voice_reply_mode == mode { "true" } else { "false" },
+                                            onclick: {
+                                                let mode = mode.to_string();
+                                                move |_| session.write().voice.reply_mode = mode.clone()
+                                            },
+                                            if mode == "voice" { "Reply with voice" } else { "Reply with text" }
+                                        }
                                     }
                                 }
-                            }
-                            p { class: "tiny",
-                                "Voice replies stop at {voice_max_chars} characters. In Telegram, /voice and /text switch the style for that chat."
+                                span { class: "hint",
+                                    "Voice replies stop at {voice_max_chars} characters. In Telegram, /voice and /text switch the style for that chat."
+                                }
                             }
                             if let Some(message) = admin_error.clone() {
                                 div { class: "banner err", role: "alert", span { "{message}" } }
                             } else if let Some(message) = admin_notice.clone() {
                                 div { class: "settings-notice-ok", role: "status", "{message}" }
                             }
-                            button {
-                                class: "btn primary",
-                                r#type: "button",
-                                disabled: !can_admin || voice_loading,
-                                onclick: move |_| session.write().save_voice(),
-                                "Save voice settings"
+                            div { class: "settings-card-foot",
+                                span { class: "tiny muted", "Applies to voice replies and scanned documents." }
+                                button {
+                                    class: "btn primary sm",
+                                    r#type: "button",
+                                    disabled: !can_admin || voice_loading,
+                                    onclick: move |_| session.write().save_voice(),
+                                    "Save voice settings"
+                                }
                             }
                         }
                     }
                     }
                     if sel == SettingsSection::About {
                     div { class: "card",
-                        div { class: "card-head",
-                            h3 { class: "card-title", "Updates" }
-                        }
-                        button {
-                            class: "btn ghost",
-                            disabled: checking,
-                            onclick: move |_| session.write().check_updates_manual(),
-                            if checking { "Checking…" } else { "Check for updates" }
+                        div { class: "settings-card-head",
+                            div { class: "settings-card-head-copy",
+                                h3 { class: "card-title", "Updates" }
+                                p { class: "settings-card-desc", "Check for newer desktop releases." }
+                            }
                         }
                         if let Some(message) = update_notice {
-                            p { class: "tiny", "{message}" }
+                            p { class: "tiny muted", "{message}" }
                         }
-                        if let Some(info) = update {
+                        if let Some(info) = update.clone() {
                             p { class: "accent", "v{info.version} available" }
-                            button {
-                                class: "btn primary",
-                                onclick: {
-                                    let info = info.clone();
-                                    move |_| {
-                                        let result = session.write().apply_update(&info);
-                                        match result {
-                                            Ok(()) => std::process::exit(0),
-                                            Err(error) => session.write().update.error = Some(error),
-                                        }
-                                    }
-                                },
-                                "Install and restart"
-                            }
                         }
                         if let Some(error) = update_error {
                             p { class: "error-text", "{error}" }
+                        }
+                        div { class: "settings-card-foot",
+                            span { class: "tiny muted", "Current desktop version: v{env!(\"CARGO_PKG_VERSION\")}" }
+                            div { class: "settings-card-foot-actions",
+                                button {
+                                    class: "btn ghost sm",
+                                    disabled: checking,
+                                    onclick: move |_| session.write().check_updates_manual(),
+                                    if checking { "Checking…" } else { "Check for updates" }
+                                }
+                                if let Some(info) = update {
+                                    button {
+                                        class: "btn primary sm",
+                                        onclick: {
+                                            let info = info.clone();
+                                            move |_| {
+                                                let result = session.write().apply_update(&info);
+                                                match result {
+                                                    Ok(()) => std::process::exit(0),
+                                                    Err(error) => session.write().update.error = Some(error),
+                                                }
+                                            }
+                                        },
+                                        "Install and restart"
+                                    }
+                                }
+                            }
                         }
                     }
                     }
                     if sel == SettingsSection::Chat {
                     div { class: "card",
-                        div { class: "card-head",
-                            h3 { class: "card-title", "Keyboard" }
+                        div { class: "settings-card-head",
+                            div { class: "settings-card-head-copy",
+                                h3 { class: "card-title", "Keyboard shortcuts" }
+                                p { class: "settings-card-desc", "Quick keys available across the desktop app." }
+                            }
                         }
-                        p { class: "tiny", "Enter sends, Shift+Enter adds a line, Ctrl/Cmd+K focuses search, Esc closes the topmost sheet or menu." }
+                        div { class: "settings-kv-list",
+                            div { class: "kv-row",
+                                span { class: "kv-key", "Send / new line" }
+                                span { class: "kv-val mono", "Enter / Shift+Enter" }
+                            }
+                            div { class: "kv-row",
+                                span { class: "kv-key", "Focus search" }
+                                span { class: "kv-val mono", "Ctrl/Cmd + K" }
+                            }
+                            div { class: "kv-row",
+                                span { class: "kv-key", "Close topmost sheet or menu" }
+                                span { class: "kv-val mono", "Esc" }
+                            }
+                        }
                     }
                     }
                 }

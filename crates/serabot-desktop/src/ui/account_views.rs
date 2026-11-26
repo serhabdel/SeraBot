@@ -222,9 +222,9 @@ pub(super) fn AccountsBlock(
                                             StatusChip { tone: state.tone(), text: state.label().to_owned() }
                                         }
                                         div { class: "acct-meta",
-                                            span { "{kind_label}" }
+                                            span { class: "acct-auth-kind", "{kind_label}" }
                                             if let Some(identity) = identity {
-                                                span { class: "chip muted", "{identity}" }
+                                                span { class: "acct-identity-pill", title: "{identity}", "{identity}" }
                                             }
                                             if let Some((tone, text)) = test {
                                                 StatusChip { tone, text }

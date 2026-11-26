@@ -672,6 +672,15 @@ Plan: `docs/specs/0.74.15-proposal.md`. Version stays `0.74.14` until the batch 
 - [x] Version bump `0.74.18` (`Cargo.toml`), mobile `0.74.18+92`, `docs/release-0.74.18.md`, `README.md`, `tasks/todo.md`.
 - [ ] Owner: live pass on Claude sign-in, Mistral browser sign-in, Google Antigravity chat, and Inception Labs `mercury-3`.
 
+## Release 0.74.19 — Antigravity & Claude Fixes, History Sanitization, Settings & Providers UI/UX
+
+- [x] Antigravity Connector & Catalog Reliability (`cloud_code.rs`, `llm.rs`, `model_router.rs`): fallback across all Cloud Code origins on `CloudPost::Failed`, 5-minute `CachedVersion::Failed` cache, and `FetchFailure::RequestFailed` for non-auth 4xx responses.
+- [x] Claude Plan & `setup-token` Transport (`providers.rs`, `llm/wire_calls.rs`, `auth_flows/claude.rs`, `provider_presets.rs`): route `sk-ant-oat*` through `Wire::AnthropicPlan` (`Bearer` + `oauth-2025-04-20`), avoid duplicate `User-Agent` on wire GETs, surface clear OAuth gate errors, and reorder `anthropic` fallback models.
+- [x] Tool Limit & Conversation Poisoning (`config.rs`, `store.rs`, `llm.rs`, desktop `api.rs`): `MAX_SCAFFOLD_TOOLS` 32 → 64; `sanitize_llm_history` + `messages_to_json` drop empty-id / orphaned `Role::Tool` results.
+- [x] Chat `"Retry on..."` & Settings / AI Providers Overhaul (`wait_cards.rs`, `chat_failure.rs`, `runs.css`, `ui_settings_page.rs`, `ui/settings_view.rs`, `ui/providers.rs`, `pages-connect.css`, `settings.css`): bounded scrollable `.failed-alt`, diversified alternatives, structured Settings cards, and two-column per-bot routing & fallback chain editor (`bot-chain-shell`).
+- [x] Version bump `0.74.19` (`Cargo.toml`), mobile `0.74.19+93`, `docs/release-0.74.19.md`, `README.md`, `tasks/todo.md`.
+- [ ] Owner: live pass on Antigravity, Claude, and the updated Settings / AI Providers UI.
+
 
 
 

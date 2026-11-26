@@ -646,6 +646,79 @@ async fn a_plan_account_sends_a_bearer_and_the_oauth_beta() {
 }
 
 #[tokio::test]
+async fn a_plan_account_catalog_sends_bearer_and_single_plan_user_agent() {
+    let env = env();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .and(header("authorization", "Bearer plan-access-cat"))
+        .and(header("anthropic-beta", "oauth-2025-04-20"))
+        .and(header("anthropic-version", "2023-06-01"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "claude-sonnet-4-20250514", "display_name": "Claude Sonnet 4"}],
+            "has_more": false
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let profile = claude_profile(&server, true);
+    let account = add_claude_plan(&env, &env.alice, "plan-access-cat", "plan-refresh-cat");
+    let client = env
+        .credentials
+        .client_for_account(&env.alice, CLAUDE, &profile, &account)
+        .unwrap();
+    let catalog = client
+        .fetch_model_catalog(&format!("{}/v1/models", server.uri()), true)
+        .await
+        .unwrap();
+    assert!(catalog.contains_key("claude-sonnet-4-20250514"));
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests[0].headers.get("x-api-key").is_none());
+    let agents: Vec<&str> = requests[0]
+        .headers
+        .get_all("user-agent")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    assert_eq!(
+        agents,
+        vec!["anthropic-sdk-typescript/0.112.1 userOAuthProvider"]
+    );
+}
+
+#[tokio::test]
+async fn a_setup_token_uses_plan_bearer_without_refresh_token() {
+    let env = env();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(header(
+            "authorization",
+            "Bearer sk-ant-oat01-synthetic-token",
+        ))
+        .and(header("anthropic-beta", "oauth-2025-04-20"))
+        .and(header("anthropic-version", "2023-06-01"))
+        .respond_with(claude_text("from setup-token"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let profile = claude_profile(&server, true);
+    let account = add_claude_plan(&env, &env.alice, "sk-ant-oat01-synthetic-token", "");
+    let client = env
+        .credentials
+        .client_for_account(&env.alice, CLAUDE, &profile, &account)
+        .unwrap()
+        .with_model("claude-sonnet-4-20250514");
+    let reply = client
+        .complete(&[LlmMessage::user("hi")], &[], None, None)
+        .await
+        .unwrap();
+    assert_eq!(reply.message.content.as_deref(), Some("from setup-token"));
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests[0].headers.get("x-api-key").is_none());
+}
+
+#[tokio::test]
 async fn a_plan_account_is_refused_while_the_flag_is_off() {
     let env = env();
     let server = MockServer::start().await;

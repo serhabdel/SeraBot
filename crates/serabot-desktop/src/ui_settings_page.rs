@@ -130,82 +130,96 @@ pub fn AppearanceCard(session: Signal<Session>) -> Element {
     let sizes = [("small", "Small"), ("normal", "Normal"), ("large", "Large")];
     rsx! {
         div { class: "card",
-            div { class: "card-head",
-                h3 { class: "card-title", "Appearance" }
+            div { class: "settings-card-head",
+                div { class: "settings-card-head-copy",
+                    h3 { class: "card-title", "Appearance" }
+                    p { class: "settings-card-desc", "Customize theme, text scale, and motion on this computer." }
+                }
+                span { class: "chip muted", "This device" }
             }
-            div { class: "field",
-                label { class: "field-label", "Theme" }
-                div { class: "seg", role: "group", "aria-label": "Theme",
-                    for (mode, label) in themes {
-                        button {
-                            key: "{label}",
-                            class: if theme == mode { "seg-btn active" } else { "seg-btn" },
-                            "aria-pressed": if theme == mode { "true" } else { "false" },
-                            onclick: move |_| session.write().set_theme(mode),
-                            "{label}"
+            div { class: "settings-grid-2",
+                div { class: "field",
+                    label { class: "field-label", "Theme" }
+                    div { class: "seg", role: "group", "aria-label": "Theme",
+                        for (mode, label) in themes {
+                            button {
+                                key: "{label}",
+                                class: if theme == mode { "seg-btn active" } else { "seg-btn" },
+                                "aria-pressed": if theme == mode { "true" } else { "false" },
+                                onclick: move |_| session.write().set_theme(mode),
+                                "{label}"
+                            }
+                        }
+                    }
+                }
+                div { class: "field",
+                    label { class: "field-label", "Text size" }
+                    div { class: "seg", role: "group", "aria-label": "Text size",
+                        for (value, label) in sizes {
+                            button {
+                                key: "{value}",
+                                class: if prefs.text_size == value { "seg-btn active" } else { "seg-btn" },
+                                "aria-pressed": if prefs.text_size == value { "true" } else { "false" },
+                                onclick: {
+                                    let prefs = prefs.clone();
+                                    move |_| {
+                                        let mut next = prefs.clone();
+                                        next.text_size = value.to_owned();
+                                        session.write().set_prefs(next);
+                                    }
+                                },
+                                "{label}"
+                            }
                         }
                     }
                 }
             }
-            div { class: "field",
-                label { class: "field-label", "Text size" }
-                div { class: "seg", role: "group", "aria-label": "Text size",
-                    for (value, label) in sizes {
-                        button {
-                            key: "{value}",
-                            class: if prefs.text_size == value { "seg-btn active" } else { "seg-btn" },
-                            "aria-pressed": if prefs.text_size == value { "true" } else { "false" },
-                            onclick: {
-                                let prefs = prefs.clone();
-                                move |_| {
-                                    let mut next = prefs.clone();
-                                    next.text_size = value.to_owned();
-                                    session.write().set_prefs(next);
-                                }
-                            },
-                            "{label}"
+            div { class: "settings-toggle-list",
+                label { class: "settings-toggle-row",
+                    div { class: "settings-toggle-copy",
+                        span { class: "settings-toggle-title", "Reduce motion" }
+                        span { class: "settings-toggle-desc", "Turn off panel transitions and subtle animations." }
+                    }
+                    input {
+                        class: "switch",
+                        r#type: "checkbox",
+                        checked: prefs.reduce_motion,
+                        onchange: {
+                            let prefs = prefs.clone();
+                            move |event| {
+                                let mut next = prefs.clone();
+                                next.reduce_motion = event.checked();
+                                session.write().set_prefs(next);
+                            }
+                        },
+                    }
+                }
+                label { class: "settings-toggle-row",
+                    div { class: "settings-toggle-copy",
+                        span { class: "settings-toggle-title", "Handwritten notes" }
+                        span { class: "settings-toggle-desc",
+                            if prefs.handwritten_notes {
+                                "Short notes and sign-offs from your bots render in a handwriting font."
+                            } else {
+                                "Short notes and sign-offs from your bots render as plain text."
+                            }
                         }
+                    }
+                    input {
+                        class: "switch",
+                        r#type: "checkbox",
+                        checked: prefs.handwritten_notes,
+                        onchange: {
+                            let prefs = prefs.clone();
+                            move |event| {
+                                let mut next = prefs.clone();
+                                next.handwritten_notes = event.checked();
+                                session.write().set_prefs(next);
+                            }
+                        },
                     }
                 }
             }
-            label { class: "check",
-                input {
-                    r#type: "checkbox",
-                    checked: prefs.reduce_motion,
-                    onchange: {
-                        let prefs = prefs.clone();
-                        move |event| {
-                            let mut next = prefs.clone();
-                            next.reduce_motion = event.checked();
-                            session.write().set_prefs(next);
-                        }
-                    },
-                }
-                span { "Reduce motion" }
-            }
-            label { class: "check",
-                input {
-                    r#type: "checkbox",
-                    checked: prefs.handwritten_notes,
-                    onchange: {
-                        let prefs = prefs.clone();
-                        move |event| {
-                            let mut next = prefs.clone();
-                            next.handwritten_notes = event.checked();
-                            session.write().set_prefs(next);
-                        }
-                    },
-                }
-                span { "Handwritten notes" }
-            }
-            p { class: "tiny",
-                if prefs.handwritten_notes {
-                    "Short notes and sign-offs from your bots render in a handwriting font."
-                } else {
-                    "Short notes and sign-offs from your bots render as plain text."
-                }
-            }
-            p { class: "tiny", "These choices apply on this computer only." }
         }
     }
 }
@@ -216,25 +230,33 @@ pub fn NotificationsCard(session: Signal<Session>) -> Element {
     let prefs = session.read().prefs.clone();
     rsx! {
         div { class: "card",
-            div { class: "card-head",
-                h3 { class: "card-title", "Notifications" }
-            }
-            label { class: "check",
-                input {
-                    r#type: "checkbox",
-                    checked: prefs.notify_approvals,
-                    onchange: {
-                        let prefs = prefs.clone();
-                        move |event| {
-                            let mut next = prefs.clone();
-                            next.notify_approvals = event.checked();
-                            session.write().set_prefs(next);
-                        }
-                    },
+            div { class: "settings-card-head",
+                div { class: "settings-card-head-copy",
+                    h3 { class: "card-title", "Notifications" }
+                    p { class: "settings-card-desc", "Control when SeraBot surfaces alerts in this window." }
                 }
-                span { "Tell me when a bot is waiting for my OK" }
             }
-            p { class: "tiny", "You see a short message in this window. Requests also wait on the Approvals page." }
+            div { class: "settings-toggle-list",
+                label { class: "settings-toggle-row",
+                    div { class: "settings-toggle-copy",
+                        span { class: "settings-toggle-title", "Tell me when a bot is waiting for my OK" }
+                        span { class: "settings-toggle-desc", "Shows a short notice in this window. Requests also wait on the Approvals page." }
+                    }
+                    input {
+                        class: "switch",
+                        r#type: "checkbox",
+                        checked: prefs.notify_approvals,
+                        onchange: {
+                            let prefs = prefs.clone();
+                            move |event| {
+                                let mut next = prefs.clone();
+                                next.notify_approvals = event.checked();
+                                session.write().set_prefs(next);
+                            }
+                        },
+                    }
+                }
+            }
         }
     }
 }
@@ -245,29 +267,37 @@ pub fn ChatPrefsCard(session: Signal<Session>) -> Element {
     let prefs = session.read().prefs.clone();
     rsx! {
         div { class: "card",
-            div { class: "card-head",
-                h3 { class: "card-title", "Chat" }
-            }
-            label { class: "check",
-                input {
-                    r#type: "checkbox",
-                    checked: prefs.enter_sends,
-                    onchange: {
-                        let prefs = prefs.clone();
-                        move |event| {
-                            let mut next = prefs.clone();
-                            next.enter_sends = event.checked();
-                            session.write().set_prefs(next);
-                        }
-                    },
+            div { class: "settings-card-head",
+                div { class: "settings-card-head-copy",
+                    h3 { class: "card-title", "Chat input" }
+                    p { class: "settings-card-desc", "Configure how messages are sent from the composer." }
                 }
-                span { "Press Enter to send" }
             }
-            p { class: "tiny",
-                if prefs.enter_sends {
-                    "Enter sends your message. Shift+Enter starts a new line."
-                } else {
-                    "Ctrl+Enter sends your message. Enter starts a new line."
+            div { class: "settings-toggle-list",
+                label { class: "settings-toggle-row",
+                    div { class: "settings-toggle-copy",
+                        span { class: "settings-toggle-title", "Press Enter to send" }
+                        span { class: "settings-toggle-desc",
+                            if prefs.enter_sends {
+                                "Enter sends your message. Shift+Enter starts a new line."
+                            } else {
+                                "Ctrl+Enter sends your message. Enter starts a new line."
+                            }
+                        }
+                    }
+                    input {
+                        class: "switch",
+                        r#type: "checkbox",
+                        checked: prefs.enter_sends,
+                        onchange: {
+                            let prefs = prefs.clone();
+                            move |event| {
+                                let mut next = prefs.clone();
+                                next.enter_sends = event.checked();
+                                session.write().set_prefs(next);
+                            }
+                        },
+                    }
                 }
             }
         }
@@ -342,89 +372,100 @@ pub fn TurnLimitsCard(session: Signal<Session>) -> Element {
         has_draft && validate_turn_limits_draft(&calls.read(), &rounds.read(), view).is_err();
     rsx! {
         div { class: "card",
-            div { class: "card-head",
-                h3 { class: "card-title", "Bot work limits" }
+            div { class: "settings-card-head",
+                div { class: "settings-card-head-copy",
+                    h3 { class: "card-title", "Bot work limits" }
+                    p { class: "settings-card-desc", "{summary}" }
+                }
                 if view.is_none() {
-                    button {
-                        class: "btn ghost sm",
-                        r#type: "button",
-                        onclick: move |_| session.write().load_turn_limits(),
-                        "Retry"
+                    div { class: "settings-card-head-actions",
+                        button {
+                            class: "btn ghost sm",
+                            r#type: "button",
+                            onclick: move |_| session.write().load_turn_limits(),
+                            "Retry"
+                        }
                     }
                 }
             }
-            p { class: "tiny", "{summary}" }
-            p { class: "tiny",
+            p { class: "tiny muted",
                 "When a turn reaches a limit, the bot answers with what it has so far and offers Continue."
             }
-            label { class: "field",
-                span { class: "field-label", "Tool calls per turn" }
-                input {
-                    class: if invalid_draft && !calls.read().trim().is_empty() { "input invalid" } else { "input" },
-                    r#type: "number",
-                    min: "1",
-                    max: "{ceiling.map(|c| c.max_tool_calls_per_turn).unwrap_or(0)}",
-                    placeholder: "{view.map(|v| v.max_tool_calls_per_turn).unwrap_or(0)}",
-                    disabled: view.is_none(),
-                    value: "{calls}",
-                    oninput: move |event| {
-                        local_error.set(None);
-                        calls.set(event.value());
-                    },
+            div { class: "settings-grid-2",
+                label { class: "field",
+                    span { class: "field-label", "Tool calls per turn" }
+                    input {
+                        class: if invalid_draft && !calls.read().trim().is_empty() { "input invalid" } else { "input" },
+                        r#type: "number",
+                        min: "1",
+                        max: "{ceiling.map(|c| c.max_tool_calls_per_turn).unwrap_or(0)}",
+                        placeholder: "{view.map(|v| v.max_tool_calls_per_turn).unwrap_or(0)}",
+                        disabled: view.is_none(),
+                        value: "{calls}",
+                        oninput: move |event| {
+                            local_error.set(None);
+                            calls.set(event.value());
+                        },
+                    }
                 }
-            }
-            label { class: "field",
-                span { class: "field-label", "Tool rounds per turn" }
-                input {
-                    class: if invalid_draft && !rounds.read().trim().is_empty() { "input invalid" } else { "input" },
-                    r#type: "number",
-                    min: "1",
-                    max: "{ceiling.map(|c| c.max_tool_rounds).unwrap_or(0)}",
-                    placeholder: "{view.map(|v| v.max_tool_rounds).unwrap_or(0)}",
-                    disabled: view.is_none(),
-                    value: "{rounds}",
-                    oninput: move |event| {
-                        local_error.set(None);
-                        rounds.set(event.value());
-                    },
+                label { class: "field",
+                    span { class: "field-label", "Tool rounds per turn" }
+                    input {
+                        class: if invalid_draft && !rounds.read().trim().is_empty() { "input invalid" } else { "input" },
+                        r#type: "number",
+                        min: "1",
+                        max: "{ceiling.map(|c| c.max_tool_rounds).unwrap_or(0)}",
+                        placeholder: "{view.map(|v| v.max_tool_rounds).unwrap_or(0)}",
+                        disabled: view.is_none(),
+                        value: "{rounds}",
+                        oninput: move |event| {
+                            local_error.set(None);
+                            rounds.set(event.value());
+                        },
+                    }
                 }
             }
             if let Some(error) = error {
                 p { class: "field-error tiny", role: "alert", "{error}" }
             }
-            div { class: "row-actions",
-                button {
-                    class: "btn primary sm",
-                    r#type: "button",
-                    disabled: view.is_none() || !has_draft,
-                    onclick: move |_| {
-                        let current = session.read().state.turn_limits;
-                        let validated = validate_turn_limits_draft(&calls.read(), &rounds.read(), current);
-                        match validated {
-                            Ok((calls_text, rounds_text)) => {
-                                local_error.set(None);
-                                session.write().save_turn_limits(&calls_text, &rounds_text);
-                                calls.set(String::new());
-                                rounds.set(String::new());
-                            }
-                            Err(msg) => {
-                                local_error.set(Some(msg));
-                            }
-                        }
-                    },
-                    "Save"
+            div { class: "settings-card-foot",
+                span { class: "tiny muted",
+                    if has_draft { "Unsaved limit changes." } else { "Empty fields keep the current limit." }
                 }
-                button {
-                    class: "btn sm",
-                    r#type: "button",
-                    disabled: view.is_none(),
-                    onclick: move |_| {
-                        local_error.set(None);
-                        session.write().reset_turn_limits();
-                        calls.set(String::new());
-                        rounds.set(String::new());
-                    },
-                    "Reset to default"
+                div { class: "settings-card-foot-actions",
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        disabled: view.is_none(),
+                        onclick: move |_| {
+                            local_error.set(None);
+                            session.write().reset_turn_limits();
+                            calls.set(String::new());
+                            rounds.set(String::new());
+                        },
+                        "Reset to default"
+                    }
+                    button {
+                        class: "btn primary sm",
+                        r#type: "button",
+                        disabled: view.is_none() || !has_draft,
+                        onclick: move |_| {
+                            let current = session.read().state.turn_limits;
+                            let validated = validate_turn_limits_draft(&calls.read(), &rounds.read(), current);
+                            match validated {
+                                Ok((calls_text, rounds_text)) => {
+                                    local_error.set(None);
+                                    session.write().save_turn_limits(&calls_text, &rounds_text);
+                                    calls.set(String::new());
+                                    rounds.set(String::new());
+                                }
+                                Err(msg) => {
+                                    local_error.set(Some(msg));
+                                }
+                            }
+                        },
+                        "Save"
+                    }
                 }
             }
         }
@@ -479,22 +520,24 @@ pub fn WebSearchCard(session: Signal<Session>) -> Element {
     };
     rsx! {
         div { class: "card",
-            div { class: "card-head",
-                h3 { class: "card-title", "Web search & crawl" }
-            }
-            p { class: "tiny",
-                "Let bots search the web and read pages. Each switch needs its API key saved on the Connectors page; the key value is never shown here."
+            div { class: "settings-card-head",
+                div { class: "settings-card-head-copy",
+                    h3 { class: "card-title", "Web search & crawl" }
+                    p { class: "settings-card-desc",
+                        "Let bots search the web and read pages using API keys saved on the Connectors page."
+                    }
+                }
             }
             if !can_save {
-                p { class: "tiny", role: "note",
+                p { class: "tiny muted", role: "note",
                     "Only an admin can turn web search connectors on or off."
                 }
             }
             if rows.is_empty() {
                 if connectors_loaded {
-                    p { class: "tiny", "No web search connectors are configured on this server." }
+                    p { class: "tiny muted", "No web search connectors are configured on this server." }
                 } else {
-                    p { class: "tiny", role: "status", "Loading connectors\u{2026}" }
+                    p { class: "tiny muted", role: "status", "Loading connectors\u{2026}" }
                 }
             }
             for row in rows {
@@ -534,8 +577,8 @@ pub fn WebSearchCard(session: Signal<Session>) -> Element {
                     }
                 }
             }
-            p { class: "tiny",
-                "Turning one on makes its tools available to bots (give them in Bots). Connectors also carry a Test button for a read-only key check."
+            p { class: "tiny muted",
+                "Turning one on makes its tools available to bots. Connectors also carry a Test button for a read-only key check."
             }
         }
     }
@@ -559,10 +602,13 @@ pub fn Mem0RecallCard(session: Signal<Session>) -> Element {
         Mem0CardState::Loading => {
             return rsx! {
                 div { class: "card",
-                    div { class: "card-head",
-                        h3 { class: "card-title", "Mem0 recall" }
+                    div { class: "settings-card-head",
+                        div { class: "settings-card-head-copy",
+                            h3 { class: "card-title", "Mem0 recall" }
+                            p { class: "settings-card-desc", "Optional external memory recall." }
+                        }
                     }
-                    p { class: "tiny", role: "status", "Loading memory settings\u{2026}" }
+                    p { class: "tiny muted", role: "status", "Loading memory settings\u{2026}" }
                 }
             };
         }
@@ -570,13 +616,18 @@ pub fn Mem0RecallCard(session: Signal<Session>) -> Element {
             let err_msg = error.unwrap_or_else(|| "Could not load memory settings.".into());
             return rsx! {
                 div { class: "card",
-                    div { class: "card-head",
-                        h3 { class: "card-title", "Mem0 recall" }
-                        button {
-                            class: "btn ghost sm",
-                            r#type: "button",
-                            onclick: move |_| session.write().load_memory_settings(),
-                            "Retry"
+                    div { class: "settings-card-head",
+                        div { class: "settings-card-head-copy",
+                            h3 { class: "card-title", "Mem0 recall" }
+                            p { class: "settings-card-desc", "Optional external memory recall." }
+                        }
+                        div { class: "settings-card-head-actions",
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                onclick: move |_| session.write().load_memory_settings(),
+                                "Retry"
+                            }
                         }
                     }
                     p { class: "field-error tiny", role: "alert", "{err_msg}" }
@@ -586,10 +637,12 @@ pub fn Mem0RecallCard(session: Signal<Session>) -> Element {
         Mem0CardState::Unavailable => {
             return rsx! {
                 div { class: "card",
-                    div { class: "card-head",
-                        h3 { class: "card-title", "Mem0 recall" }
+                    div { class: "settings-card-head",
+                        div { class: "settings-card-head-copy",
+                            h3 { class: "card-title", "Mem0 recall" }
+                            p { class: "settings-card-desc", "Mem0 extra recall is not enabled on this server." }
+                        }
                     }
-                    p { class: "tiny", "Mem0 extra recall is not enabled on this server." }
                 }
             };
         }
@@ -601,27 +654,23 @@ pub fn Mem0RecallCard(session: Signal<Session>) -> Element {
     let configured = settings.mem0.configured;
     rsx! {
         div { class: "card",
-            div { class: "card-head",
-                h3 { class: "card-title", "Mem0 recall" }
-            }
-            p { class: "tiny",
-                "When on, your turns also recall matching facts from Mem0 Platform and merge them with local memory. Your API key stays encrypted on the server and is never shown again after you save it. See docs/memory.md."
-            }
-            label { class: "check",
-                input {
-                    r#type: "checkbox",
-                    checked: configured,
-                    disabled: true,
-                    "aria-readonly": "true",
+            div { class: "settings-card-head",
+                div { class: "settings-card-head-copy",
+                    h3 { class: "card-title", "Mem0 recall" }
+                    p { class: "settings-card-desc",
+                        "Recall matching facts from Mem0 Platform and merge them with local memory."
+                    }
                 }
-                span { "Use Mem0 for extra recall (save or remove your key below)" }
-            }
-            div { class: "health-status",
-                if configured {
-                    StatusChip { tone: Tone::Ok, text: "Key saved".to_owned() }
-                } else {
-                    StatusChip { tone: Tone::Muted, text: "Off, no key".to_owned() }
+                div { class: "settings-card-head-actions",
+                    if configured {
+                        StatusChip { tone: Tone::Ok, text: "Key saved".to_owned() }
+                    } else {
+                        StatusChip { tone: Tone::Muted, text: "Off, no key".to_owned() }
+                    }
                 }
+            }
+            p { class: "tiny muted",
+                "Your API key stays encrypted on the server and is never shown again after you save it. See docs/memory.md."
             }
             div { class: "field",
                 span { class: "field-label", "Mem0 API key" }
@@ -633,27 +682,6 @@ pub fn Mem0RecallCard(session: Signal<Session>) -> Element {
                     } else {
                         "Paste your Mem0 API key".to_owned()
                     },
-                }
-            }
-            div { class: "row-actions",
-                button {
-                    class: "btn primary sm",
-                    r#type: "button",
-                    disabled: key_draft.read().trim().is_empty(),
-                    onclick: move |_| {
-                        let mut key_draft = key_draft;
-                        session.write().save_mem0_key(&key_draft.read());
-                        key_draft.set(String::new());
-                    },
-                    if configured { "Replace key" } else { "Save key" }
-                }
-                if configured && !confirming_remove() {
-                    button {
-                        class: "btn sm",
-                        r#type: "button",
-                        onclick: move |_| confirming_remove.set(true),
-                        "Remove key"
-                    }
                 }
             }
             if configured && confirming_remove() {
@@ -679,6 +707,32 @@ pub fn Mem0RecallCard(session: Signal<Session>) -> Element {
             if let Some(error) = error {
                 p { class: "field-error tiny", role: "alert", "{error}" }
             }
+            div { class: "settings-card-foot",
+                span { class: "tiny muted",
+                    if configured { "Extra recall is active for your turns." } else { "Save a key to turn on Mem0 recall." }
+                }
+                div { class: "settings-card-foot-actions",
+                    if configured && !confirming_remove() {
+                        button {
+                            class: "btn ghost sm",
+                            r#type: "button",
+                            onclick: move |_| confirming_remove.set(true),
+                            "Remove key"
+                        }
+                    }
+                    button {
+                        class: "btn primary sm",
+                        r#type: "button",
+                        disabled: key_draft.read().trim().is_empty(),
+                        onclick: move |_| {
+                            let mut key_draft = key_draft;
+                            session.write().save_mem0_key(&key_draft.read());
+                            key_draft.set(String::new());
+                        },
+                        if configured { "Replace key" } else { "Save key" }
+                    }
+                }
+            }
         }
     }
 }
@@ -691,21 +745,26 @@ pub fn AboutCard(session: Signal<Session>) -> Element {
     };
     rsx! {
         div { class: "card",
-            div { class: "card-head",
-                h3 { class: "card-title", "About SeraBot" }
+            div { class: "settings-card-head",
+                div { class: "settings-card-head-copy",
+                    h3 { class: "card-title", "About SeraBot" }
+                    p { class: "settings-card-desc", "Desktop app and connected server details." }
+                }
             }
-            div { class: "kv-row",
-                span { class: "kv-key", "This app" }
-                span { class: "kv-val", "{env!(\"CARGO_PKG_VERSION\")}" }
-            }
-            div { class: "kv-row",
-                span { class: "kv-key", "Server" }
-                span { class: "kv-val", "{server}" }
-            }
-            if !version.is_empty() {
+            div { class: "settings-kv-list",
                 div { class: "kv-row",
-                    span { class: "kv-key", "Server version" }
-                    span { class: "kv-val", "{version}" }
+                    span { class: "kv-key", "This app" }
+                    span { class: "kv-val mono", "{env!(\"CARGO_PKG_VERSION\")}" }
+                }
+                div { class: "kv-row",
+                    span { class: "kv-key", "Server" }
+                    span { class: "kv-val mono", "{server}" }
+                }
+                if !version.is_empty() {
+                    div { class: "kv-row",
+                        span { class: "kv-key", "Server version" }
+                        span { class: "kv-val mono", "{version}" }
+                    }
                 }
             }
         }
@@ -757,15 +816,21 @@ pub fn LocalFoldersCard(session: Signal<Session>) -> Element {
     };
     rsx! {
         div { class: "card",
-            div { class: "card-head",
-                h3 { class: "card-title", "Local folders" }
-                if !folders.is_empty() {
-                    span { class: "chip muted", "{folders.len()}" }
+            div { class: "settings-card-head",
+                div { class: "settings-card-head-copy",
+                    h3 { class: "card-title", "Local folders" }
+                    p { class: "settings-card-desc",
+                        "Allow bots to browse, search, and read folders on this PC (writes always require approval)."
+                    }
                 }
-            }
-            p { class: "tiny",
-                "Let your bots browse, search and read big folders on this PC, bring Word, Excel, PowerPoint, PDF and image files in to work on, and with your approval save results back. "
-                "It is off until you add a folder. Only this app can see the folder paths; the bots get a short name."
+                div { class: "settings-card-head-actions",
+                    if !folders.is_empty() {
+                        span { class: "chip muted", "{folders.len()}" }
+                    }
+                    if running {
+                        span { class: "chip ok", "Connected to your bots" }
+                    }
+                }
             }
             p { class: "tiny muted",
                 strong { "Local PC folders" }

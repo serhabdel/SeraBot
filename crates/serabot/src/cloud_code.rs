@@ -95,13 +95,37 @@ pub const ANTIGRAVITY_UPDATER_URL: &str =
 pub const ANTIGRAVITY_VERSION_ENV: &str = "AGY_VERSION";
 /// TTL for the cached live Antigravity Hub version (6 hours).
 const LIVE_VERSION_TTL: Duration = Duration::from_secs(6 * 3600);
-/// The live version and when it was fetched (`None` when not cached; failures
-/// are never cached so subsequent requests can retry).
-static LIVE_VERSION: std::sync::OnceLock<
-    tokio::sync::RwLock<Option<(String, std::time::Instant)>>,
-> = std::sync::OnceLock::new();
+/// TTL for a failed live version probe (5 minutes), so an unreachable updater
+/// does not stall every Cloud Code request for 3 seconds.
+#[cfg_attr(test, allow(dead_code))]
+const LIVE_VERSION_FAILURE_TTL: Duration = Duration::from_secs(5 * 60);
 
-fn live_version_cache() -> &'static tokio::sync::RwLock<Option<(String, std::time::Instant)>> {
+#[derive(Clone)]
+enum CachedVersion {
+    Live(String, std::time::Instant),
+    #[cfg_attr(test, allow(dead_code))]
+    Failed(std::time::Instant),
+}
+
+impl CachedVersion {
+    fn fresh_value(&self) -> Option<String> {
+        match self {
+            Self::Live(version, fetched_at) if fetched_at.elapsed() < LIVE_VERSION_TTL => {
+                Some(version.clone())
+            }
+            Self::Failed(failed_at) if failed_at.elapsed() < LIVE_VERSION_FAILURE_TTL => {
+                Some(IDE_VERSION.to_owned())
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The live version and when it was fetched (`None` when not cached).
+static LIVE_VERSION: std::sync::OnceLock<tokio::sync::RwLock<Option<CachedVersion>>> =
+    std::sync::OnceLock::new();
+
+fn live_version_cache() -> &'static tokio::sync::RwLock<Option<CachedVersion>> {
     LIVE_VERSION.get_or_init(|| tokio::sync::RwLock::new(None))
 }
 
@@ -154,10 +178,10 @@ async fn fetch_live_version() -> Option<String> {
 
 /// The Antigravity Hub version this server presents (user agent and
 /// `ideVersion`), in HielCowork's order: the provider's own `client_version`,
-/// then `AGY_VERSION`, then the live updater's (cached for 6 hours, never
-/// caching failures), then the pinned [`IDE_VERSION`]. Google retires old
-/// client versions, so a server that never updates its pin still presents the
-/// current one.
+/// then `AGY_VERSION`, then the live updater's (cached for 6 hours, with
+/// failures cached for 5 minutes), then the pinned [`IDE_VERSION`]. Google
+/// retires old client versions, so a server that never updates its pin still
+/// presents the current one.
 pub async fn antigravity_version(configured: Option<&str>) -> String {
     let env = std::env::var(ANTIGRAVITY_VERSION_ENV).ok();
     if let Some(version) = [configured, env.as_deref()]
@@ -169,22 +193,33 @@ pub async fn antigravity_version(configured: Option<&str>) -> String {
         return version.to_owned();
     }
     let cache = live_version_cache();
-    if let Some((version, fetched_at)) = cache.read().await.as_ref()
-        && fetched_at.elapsed() < LIVE_VERSION_TTL
+    if let Some(version) = cache
+        .read()
+        .await
+        .as_ref()
+        .and_then(CachedVersion::fresh_value)
     {
-        return version.clone();
-    }
-    let mut guard = cache.write().await;
-    if let Some((version, fetched_at)) = guard.as_ref()
-        && fetched_at.elapsed() < LIVE_VERSION_TTL
-    {
-        return version.clone();
-    }
-    if let Some(version) = fetch_live_version().await {
-        *guard = Some((version.clone(), std::time::Instant::now()));
         return version;
     }
-    *guard = None;
+    let mut guard = cache.write().await;
+    if let Some(version) = guard.as_ref().and_then(CachedVersion::fresh_value) {
+        return version;
+    }
+    if let Some(version) = fetch_live_version().await {
+        *guard = Some(CachedVersion::Live(
+            version.clone(),
+            std::time::Instant::now(),
+        ));
+        return version;
+    }
+    #[cfg(not(test))]
+    {
+        *guard = Some(CachedVersion::Failed(std::time::Instant::now()));
+    }
+    #[cfg(test)]
+    {
+        *guard = None;
+    }
     IDE_VERSION.to_owned()
 }
 
@@ -2832,8 +2867,10 @@ mod tests {
         );
         assert_eq!(IDE_VERSION, "2.31.4");
         assert!(CLOUD_CODE_USER_AGENT.contains("antigravity/hub/2.31.4"));
-        *live_version_cache().write().await =
-            Some(("2.99.0".to_owned(), std::time::Instant::now()));
+        *live_version_cache().write().await = Some(CachedVersion::Live(
+            "2.99.0".to_owned(),
+            std::time::Instant::now(),
+        ));
         if std::env::var(ANTIGRAVITY_VERSION_ENV).is_err() {
             assert_eq!(antigravity_version(None).await, "2.99.0");
             invalidate_live_version().await;
