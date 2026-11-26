@@ -284,6 +284,18 @@ const BUILTINS: &[BuiltinProvider] = &[
         auth: "api_key",
         summary: "Local Claude Agent SDK loopback gateway; POST /v1/turn and GET /v1/models",
     },
+    BuiltinProvider {
+        kind: "kiro",
+        base_url: Some("https://q.us-east-1.amazonaws.com"),
+        auth: "oauth_or_key",
+        summary: "AWS Kiro (Amazon Q) device sign-in or token; EventStream chat and GET /ListAvailableModels",
+    },
+    BuiltinProvider {
+        kind: "devin",
+        base_url: Some("https://server.codeium.com"),
+        auth: "oauth_or_key",
+        summary: "Devin CLI PKCE sign-in or session token; Connect-RPC GetChatMessage and GetCliModelConfigs",
+    },
 ];
 
 pub fn builtins() -> &'static [BuiltinProvider] {
@@ -301,6 +313,9 @@ pub enum OAuthStyle {
     /// A GitHub Copilot sign-in: the long-lived GitHub token is exchanged for a
     /// short-lived Copilot token. The refresh token never rotates.
     CopilotExchange,
+    /// An AWS Kiro sign-in: packed JSON refresh material refreshed against the
+    /// pinned regional OIDC endpoint.
+    KiroRefresh,
 }
 
 pub enum AuthPlan {
@@ -379,6 +394,10 @@ pub fn resolve_base_url(kind: &str, base_url: &str) -> Result<String> {
         base_url
     };
     let endpoint = validate_base_url(chosen)?;
+    if kind == "devin" {
+        let _ = crate::wire::devin::rpc_url(&endpoint, crate::wire::devin::CHAT_RPC_PATH)?;
+        return Ok(endpoint);
+    }
     let host = url::Url::parse(&endpoint)
         .ok()
         .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
@@ -403,6 +422,8 @@ pub fn auth_plan(kind: &str, auth: &str) -> Result<AuthPlan> {
         } else {
             "api_key"
         }
+    } else if requested == "oauth_or_key" {
+        "api_key"
     } else {
         requested
     };
@@ -429,12 +450,19 @@ pub fn auth_plan(kind: &str, auth: &str) -> Result<AuthPlan> {
                 token_url: crate::auth_flows::copilot::TOKEN_URL,
                 client_id_fallback: None,
             }),
+            "kiro" => Ok(AuthPlan::OAuth {
+                style: OAuthStyle::KiroRefresh,
+                token_url: "https://oidc.us-east-1.amazonaws.com/token",
+                client_id_fallback: None,
+            }),
             _ => Err(SeraError::Config(
-                "oauth auth is only supported for muse-code, google-antigravity, openai-codex and github-copilot"
+                "oauth auth is only supported for muse-code, google-antigravity, openai-codex, github-copilot and kiro"
                     .into(),
             )),
         },
-        _ => Err(SeraError::Config("auth must be api_key or oauth".into())),
+        _ => Err(SeraError::Config(
+            "auth must be api_key, oauth or oauth_or_key".into(),
+        )),
     }
 }
 
@@ -487,9 +515,34 @@ pub fn resolve_catalog(kind: &str, base_url: &str) -> Result<ResolvedCatalog> {
             strict: true,
         });
     }
+    if kind == "devin" {
+        let base = validate_base_url(base_url)?;
+        return Ok(ResolvedCatalog {
+            url: crate::wire::devin::rpc_url(&base, crate::wire::devin::MODELS_RPC_PATH)?,
+            strict: false,
+        });
+    }
     let base = validate_base_url(base_url)?;
     let parsed =
         url::Url::parse(&base).map_err(|_| SeraError::Config("invalid catalog base url".into()))?;
+    if kind == "kiro" {
+        if is_exact_loopback(&parsed) {
+            return Ok(ResolvedCatalog {
+                url: validate_base_url(&format!("{base}/ListAvailableModels"))?,
+                strict: false,
+            });
+        }
+        let host = parsed.host_str().unwrap_or("");
+        if !is_kiro_q_host(host) {
+            return Err(SeraError::Config(
+                "catalog fetch for this provider only contacts its documented host".into(),
+            ));
+        }
+        return Ok(ResolvedCatalog {
+            url: validate_base_url(&format!("https://{host}/ListAvailableModels"))?,
+            strict: false,
+        });
+    }
     if let Some(spec) = OFFICIAL_CATALOGS.iter().find(|item| item.kind == kind) {
         if is_exact_loopback(&parsed) {
             return Ok(ResolvedCatalog {
@@ -512,6 +565,30 @@ pub fn resolve_catalog(kind: &str, base_url: &str) -> Result<ResolvedCatalog> {
         url: validate_base_url(&format!("{base}/models"))?,
         strict: false,
     })
+}
+
+fn is_kiro_q_host(host: &str) -> bool {
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "q.us-east-1.amazonaws.com"
+            | "q.us-west-2.amazonaws.com"
+            | "q.eu-central-1.amazonaws.com"
+            | "q.eu-west-1.amazonaws.com"
+            | "q.ap-southeast-1.amazonaws.com"
+            | "q.ap-northeast-1.amazonaws.com"
+    )
+}
+
+fn is_kiro_oidc_host(host: &str) -> bool {
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "oidc.us-east-1.amazonaws.com"
+            | "oidc.us-west-2.amazonaws.com"
+            | "oidc.eu-central-1.amazonaws.com"
+            | "oidc.eu-west-1.amazonaws.com"
+            | "oidc.ap-southeast-1.amazonaws.com"
+            | "oidc.ap-northeast-1.amazonaws.com"
+    )
 }
 
 fn is_exact_loopback(url: &url::Url) -> bool {
@@ -546,6 +623,7 @@ pub fn enforce_oauth_target(style: OAuthStyle, token_url: &str) -> Result<String
             host.eq_ignore_ascii_case(crate::auth_flows::copilot::API_HOST)
                 && parsed.path() == crate::auth_flows::copilot::TOKEN_PATH
         }
+        OAuthStyle::KiroRefresh => is_kiro_oidc_host(host) && parsed.path() == "/token",
     };
     if !ok {
         return Err(SeraError::Config(
@@ -1496,8 +1574,42 @@ pub fn open_provider_client(
             "GitHub Copilot sign-in is turned off on this server".into(),
         ));
     }
+    // AWS Kiro OAuth accounts carry packed refresh material; API keys / pasted
+    // tokens have an empty refresh_token.
+    let kiro_oauth = kind == "kiro" && !credential.refresh_token.trim().is_empty();
+    if kiro_oauth && !(profile.plan_oauth_enabled() && owner.account_id != DEFAULT_ACCOUNT) {
+        return Err(SeraError::Forbidden(
+            "AWS Kiro sign-in is turned off on this server".into(),
+        ));
+    }
+    // Devin OAuth accounts (PKCE or pasted `devin-session-token$...`) are
+    // gated on `plan_oauth_enabled()`; plain API keys remain allowed.
+    let devin_oauth_from_row = if kind == "devin"
+        && owner.account_id != DEFAULT_ACCOUNT
+        && let Some(refresher) = owner.refresher
+    {
+        refresher
+            .accounts()
+            .store()
+            .provider_account(owner.user_id, owner.provider, owner.account_id)?
+            .is_some_and(|row| row.auth_kind == crate::accounts::AuthKind::Oauth)
+    } else {
+        false
+    };
+    let devin_oauth = kind == "devin"
+        && (devin_oauth_from_row
+            || !credential.refresh_token.trim().is_empty()
+            || credential
+                .api_key
+                .trim()
+                .starts_with(crate::auth_flows::devin::SESSION_TOKEN_PREFIX));
+    if devin_oauth && !(profile.plan_oauth_enabled() && owner.account_id != DEFAULT_ACCOUNT) {
+        return Err(SeraError::Forbidden(
+            "Devin sign-in is turned off on this server".into(),
+        ));
+    }
     // The plan decides the Copilot host (individual, business, enterprise); the
-    // sign-in remembered the one GitHub named.
+    // sign-in remembered the one GitHub named. Kiro likewise remembers its region.
     let endpoint = if kind == "github-copilot"
         && profile.base_url.trim().is_empty()
         && let Some(refresher) = owner.refresher
@@ -1512,6 +1624,21 @@ pub fn open_provider_client(
                     .and_then(crate::auth_flows::copilot::api_base_ok)
             }) {
         base
+    } else if kind == "kiro"
+        && profile.base_url.trim().is_empty()
+        && let Some(refresher) = owner.refresher
+        && let Some(region) = refresher
+            .accounts()
+            .store()
+            .provider_account(owner.user_id, owner.provider, owner.account_id)?
+            .and_then(|row| {
+                row.identity
+                    .get("region")
+                    .and_then(Value::as_str)
+                    .and_then(|r| crate::auth_flows::kiro::KiroRegion::parse(r).ok())
+            })
+    {
+        format!("https://{}", region.q_host())
     } else {
         endpoint
     };
@@ -1542,6 +1669,11 @@ pub fn open_provider_client(
         AuthPlan::ApiKey if claude_plan => Some((
             OAuthStyle::ClaudeRefresh,
             crate::auth_flows::claude::TOKEN_URL,
+            None,
+        )),
+        AuthPlan::ApiKey if kiro_oauth => Some((
+            OAuthStyle::KiroRefresh,
+            "https://oidc.us-east-1.amazonaws.com/token",
             None,
         )),
         AuthPlan::ApiKey => None,
@@ -1634,6 +1766,8 @@ pub fn open_provider_client(
         "github-copilot" => client = client.with_copilot(),
         "opencode-go" => client = client.with_opencode_session(),
         "claude-agent-sdk" => client = client.with_claude_gateway()?,
+        "kiro" => client = client.with_kiro(),
+        "devin" => client = client.with_devin(),
         _ => {}
     }
     // The operator's own credential uses the provider's project; a member's
@@ -1668,7 +1802,7 @@ pub fn open_provider_client(
             generation,
             matches!(
                 kind.as_str(),
-                "muse-code" | "anthropic" | "openai-codex" | "github-copilot"
+                "muse-code" | "anthropic" | "openai-codex" | "github-copilot" | "kiro" | "devin"
             ),
         );
         if kind == "openai-codex" {

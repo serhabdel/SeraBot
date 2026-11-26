@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use super::*;
-use crate::wire::{anthropic, responses};
+use crate::wire::{anthropic, devin, kiro, responses};
 
 /// Largest completion body read. Streams are buffered whole.
 const MAX_WIRE_BODY: usize = 16 * 1024 * 1024;
@@ -496,6 +496,183 @@ impl LlmClient {
             })
             .await?;
         parse_claude_gateway_response(&bytes)
+    }
+
+    /// One completion on the AWS Kiro EventStream transport.
+    pub(super) async fn complete_kiro(
+        &self,
+        messages: &[LlmMessage],
+        tools: &[ToolSpec],
+        model: &str,
+        extra: Option<&Map<String, Value>>,
+    ) -> Result<LlmResponse> {
+        let thinking_level = extra
+            .and_then(|fields| {
+                fields
+                    .get("thinking_level")
+                    .or_else(|| fields.get("thinkingLevel"))
+            })
+            .and_then(Value::as_str);
+        let body = kiro::build_generate_request(model, None, messages, tools, thinking_level);
+        let url = format!("{}/generateAssistantResponse", self.base_url);
+        let bytes = self
+            .send_wire(WireCall {
+                method: reqwest::Method::POST,
+                url,
+                query: Vec::new(),
+                auth: WireAuth::Bearer,
+                headers: vec![("accept", "application/vnd.amazon.eventstream".to_owned())],
+                body: Some(body),
+                fix_bad_request: None,
+                echo_error: true,
+                idempotent: false,
+            })
+            .await?;
+        let parsed = kiro::parse_event_stream(&bytes)?;
+        let finish_reason = Some(if parsed.tool_calls.is_empty() {
+            "stop".to_owned()
+        } else {
+            "tool_calls".to_owned()
+        });
+        Ok(LlmResponse {
+            message: LlmMessage {
+                role: Role::Assistant,
+                content: (!parsed.content.trim().is_empty()).then_some(parsed.content),
+                tool_calls: parsed.tool_calls,
+                tool_call_id: None,
+                name: None,
+                is_error: false,
+                images: Vec::new(),
+            },
+            usage: parsed.usage,
+            finish_reason,
+            reasoning: parsed.reasoning.as_deref().and_then(bounded_reasoning),
+        })
+    }
+
+    /// AWS Kiro `ListAvailableModels` catalog.
+    pub(super) async fn fetch_kiro_catalog(&self, catalog_url: &str) -> Result<ModelCatalog> {
+        let raw = catalog_url
+            .strip_suffix("?origin=AI_EDITOR")
+            .unwrap_or(catalog_url);
+        let url = validate_base_url(raw)?;
+        let bytes = self
+            .send_wire(WireCall {
+                method: reqwest::Method::GET,
+                url,
+                query: vec![("origin", "AI_EDITOR".to_owned())],
+                auth: WireAuth::Bearer,
+                headers: Vec::new(),
+                body: None,
+                fix_bad_request: None,
+                echo_error: false,
+                idempotent: true,
+            })
+            .await?;
+        let catalog = kiro::parse_models_catalog(&bytes)?;
+        if catalog.is_empty() {
+            return Err(SeraError::External(
+                "model catalog contained no usable model ids".into(),
+            ));
+        }
+        Ok(catalog)
+    }
+
+    /// One completion on the Devin CLI / Codeium Connect-RPC transport.
+    pub(super) async fn complete_devin(
+        &self,
+        messages: &[LlmMessage],
+        tools: &[ToolSpec],
+        model: &str,
+        extra: Option<&Map<String, Value>>,
+    ) -> Result<LlmResponse> {
+        let thinking_level = extra
+            .and_then(|fields| {
+                fields
+                    .get("thinking_level")
+                    .or_else(|| fields.get("thinkingConfig").and_then(|c| c.get("effort")))
+            })
+            .and_then(Value::as_str);
+        let body = devin::build_chat_request(model, "", messages, tools, thinking_level);
+        let url = devin::rpc_url(&self.base_url, devin::CHAT_RPC_PATH)?;
+        let bytes = self
+            .send_wire(WireCall {
+                method: reqwest::Method::POST,
+                url,
+                query: Vec::new(),
+                auth: WireAuth::Bearer,
+                headers: vec![
+                    ("connect-protocol-version", "1".to_owned()),
+                    ("accept", "application/json".to_owned()),
+                ],
+                body: Some(body),
+                fix_bad_request: None,
+                echo_error: true,
+                idempotent: false,
+            })
+            .await?;
+        let parsed = devin::parse_chat_response(&bytes)?;
+        Ok(LlmResponse {
+            message: LlmMessage {
+                role: Role::Assistant,
+                content: (!parsed.text.trim().is_empty()).then_some(parsed.text),
+                tool_calls: parsed.tool_calls,
+                tool_call_id: None,
+                name: None,
+                is_error: false,
+                images: Vec::new(),
+            },
+            usage: parsed.usage,
+            finish_reason: parsed.finish_reason,
+            reasoning: bounded_reasoning(&parsed.reasoning),
+        })
+    }
+
+    /// Devin CLI / Codeium `GetCliModelConfigs` catalog.
+    pub(super) async fn fetch_devin_catalog(&self, catalog_url: &str) -> Result<ModelCatalog> {
+        let url = if catalog_url.ends_with(devin::MODELS_RPC_PATH) {
+            let base = catalog_url
+                .strip_suffix(devin::MODELS_RPC_PATH)
+                .unwrap_or(catalog_url);
+            devin::rpc_url(base, devin::MODELS_RPC_PATH)?
+        } else {
+            devin::rpc_url(&self.base_url, devin::MODELS_RPC_PATH)?
+        };
+        let bytes = self
+            .send_wire(WireCall {
+                method: reqwest::Method::POST,
+                url,
+                query: Vec::new(),
+                auth: WireAuth::Bearer,
+                headers: vec![
+                    ("connect-protocol-version", "1".to_owned()),
+                    ("accept", "application/json".to_owned()),
+                ],
+                body: Some(serde_json::json!({})),
+                fix_bad_request: None,
+                echo_error: false,
+                idempotent: true,
+            })
+            .await?;
+        let models = devin::parse_models_catalog(&bytes)?;
+        let mut catalog = ModelCatalog::new();
+        for model in models {
+            catalog.insert(
+                model.id,
+                crate::providers::ModelMeta {
+                    name: model.name,
+                    context_length: model.context_length,
+                    max_output_tokens: model.max_output_tokens,
+                    tags: model.tags,
+                },
+            );
+        }
+        if catalog.is_empty() {
+            return Err(SeraError::External(
+                "model catalog contained no usable model ids".into(),
+            ));
+        }
+        Ok(catalog)
     }
 }
 

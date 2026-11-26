@@ -698,6 +698,15 @@ Plan: `docs/specs/0.74.15-proposal.md`. Version stays `0.74.14` until the batch 
 - [x] Version bump `0.74.21` (`Cargo.toml`), mobile `0.74.21+95`, `docs/release-0.74.21.md`, `README.md`, `tasks/todo.md`.
 - [ ] Owner: live visual pass on animated bot avatars, `LiveTimeline`, and memory pills in desktop WebView2.
 
+## Release 0.74.22 — AWS Kiro & Devin CLI OAuth, Thinking Level Accuracy, Usage Page Redesign
+
+- [x] AWS Kiro OAuth & EventStream Wire (`auth_flows/kiro.rs`, `wire/kiro.rs`, `providers.rs`, `llm.rs`, `llm/wire_calls.rs`, `relay_net.rs`, `provider_presets.rs`, `branding.rs`): AWS SSO OIDC device flow, strict `KiroRegion` allowlist, EventStream binary decoder (4 MiB frame cap), real `kiro.png` icon, and `PLAN_RISK_KIRO`.
+- [x] Devin CLI OAuth & Connect-RPC Wire (`auth_flows/devin.rs`, `wire/devin.rs`, `providers.rs`, `llm.rs`, `llm/wire_calls.rs`, `relay_net.rs`, `oauth.rs`, `provider_presets.rs`, `provider_flow.rs`, `branding.rs`): PKCE (`127.0.0.1:59653/callback`), `devin-session-token$...` paste fallback, Connect-RPC JSON wire (`GetCliModelConfigs` / `GetChatMessage`), real `devin.png` icon, and `PLAN_RISK_DEVIN`.
+- [x] Per-Model Thinking Level Accuracy (`thinking.rs`, `cloud_code.rs`): tightened Antigravity Gemini/Claude rules and added accurate `levels_for()` + `wire_fields()` for `claude-agent-sdk`, `kiro`, `devin`, `moonshot`, `inception`, `ollama`, `cerebras`, `together`, `fireworks`, `minimax`, `nebius`, and `sambanova`.
+- [x] Usage Page & Card Redesign (`ui_usage.rs`, `ui_usage_insights.rs`, `pages-data.css`): 4-card KPI Hero Strip, 5 segmented sub-view tabs, `.usage-card` containers, and `.usage-share-bar` proportion bars.
+- [x] Version bump `0.74.22` (`Cargo.toml`), mobile `0.74.22+96`, `docs/release-0.74.22.md`, `README.md`, `tasks/todo.md`.
+- [ ] Owner: live pass on Kiro OAuth, Devin CLI OAuth, thinking-level selectors, and redesigned Usage page.
+
 
 
 

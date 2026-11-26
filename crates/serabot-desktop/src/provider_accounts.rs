@@ -1080,6 +1080,45 @@ mod tests {
     }
 
     #[test]
+    fn kiro_and_devin_cards_offer_sign_in_or_key_with_risk_lines() {
+        use crate::provider_presets::{PLAN_RISK_DEVIN, PLAN_RISK_KIRO};
+
+        // Kiro: device code or pasted token, with PLAN_RISK_KIRO.
+        let kiro = kinded("kiro", "oauth_or_key", &["device"]);
+        let (methods, empty, filled, first, text) = card(&kiro, "kiro");
+        assert_eq!(methods, vec![AddMethod::Key, AddMethod::Device]);
+        assert_eq!((empty, filled), ("Sign in", "Add account"));
+        assert_eq!(first, Some(AddMethod::Device));
+        assert_eq!(text, "No account yet. Sign in, or add an API key.");
+        assert_eq!(
+            risk_text(&kiro, preset_for("kiro")).as_deref(),
+            Some(PLAN_RISK_KIRO)
+        );
+        // Fallback when server sends empty signin list.
+        assert_eq!(
+            add_methods(&kinded("kiro", "oauth_or_key", &[]), preset_for("kiro")),
+            vec![AddMethod::Key, AddMethod::Device]
+        );
+
+        // Devin CLI: browser PKCE or pasted session token, with PLAN_RISK_DEVIN.
+        let devin = kinded("devin", "oauth_or_key", &["pkce"]);
+        let (methods, empty, filled, first, text) = card(&devin, "devin");
+        assert_eq!(methods, vec![AddMethod::Key, AddMethod::Browser]);
+        assert_eq!((empty, filled), ("Sign in", "Add account"));
+        assert_eq!(first, Some(AddMethod::Browser));
+        assert_eq!(text, "No account yet. Sign in, or add an API key.");
+        assert_eq!(
+            risk_text(&devin, preset_for("devin")).as_deref(),
+            Some(PLAN_RISK_DEVIN)
+        );
+        // Fallback when server sends empty signin list.
+        assert_eq!(
+            add_methods(&kinded("devin", "oauth_or_key", &[]), preset_for("devin")),
+            vec![AddMethod::Key, AddMethod::Browser]
+        );
+    }
+
+    #[test]
     fn the_directory_offers_sign_in_without_any_setup() {
         let agy = preset_for("antigravity").unwrap();
         let claude = preset_for("anthropic").unwrap();
