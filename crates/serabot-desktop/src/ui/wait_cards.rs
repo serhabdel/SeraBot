@@ -43,10 +43,14 @@ pub enum LiveCardData {
     /// your reply…" with "Drafting from N steps".
     Writing { bot: String, steps: usize },
     /// Another bot is working in this conversation: "Handed off to {bot}"
-    /// with "Running in Runs — tap to open". No objective. `count` is how
-    /// many parallel handoffs are running; the card names the first and
-    /// counts the rest.
-    Delegating { bot: String, count: usize },
+    /// with a `from_bot → bot` handoff indicator and "Running in Runs — tap to open".
+    /// No objective. `count` is how many parallel handoffs are running; the card
+    /// names the first and counts the rest.
+    Delegating {
+        from_bot: String,
+        bot: String,
+        count: usize,
+    },
     /// The turn parked with an uncertain effect (0.74.10): the owner reviews
     /// it before anything is retried or dismisses / explicitly confirms a resend.
     NeedsReview,
@@ -129,6 +133,7 @@ pub fn derive_live_card(inputs: LiveCardInputs<'_>) -> LiveCardData {
     }
     if let Some(bot) = inputs.delegate_bot {
         return LiveCardData::Delegating {
+            from_bot: inputs.bot_name.to_owned(),
             bot: bot.to_owned(),
             count: inputs.delegate_count.max(1),
         };
@@ -262,9 +267,21 @@ pub(crate) fn LiveCard(
                 }
             }
         },
-        LiveCardData::Delegating { bot, count } => rsx! {
-            div { class: "live-card", role: "status", "aria-live": "polite",
+        LiveCardData::Delegating {
+            from_bot,
+            bot,
+            count,
+        } => rsx! {
+            div { class: "live-card live-card-delegating", role: "status", "aria-live": "polite",
                 span { class: "live-dot", "aria-hidden": "true" }
+                span { class: "handoff-pill", "aria-label": "Handing off from {from_bot} to {bot}",
+                    span { class: "handoff-bot", "{from_bot}" }
+                    span { class: "handoff-arrow", "aria-hidden": "true",
+                        span { class: "handoff-track" }
+                        span { class: "handoff-glyph", "\u{2192}" }
+                    }
+                    span { class: "handoff-bot", "{bot}" }
+                }
                 span { class: "live-text",
                     if count > 1 {
                         "Handed off to {bot} and {count - 1} more"
@@ -655,7 +672,8 @@ mod tests {
         with_delegate.delegate_bot = Some("Analyst");
         assert!(matches!(
             derive_live_card(with_delegate),
-            LiveCardData::Delegating { bot, count } if bot == "Analyst" && count == 1
+            LiveCardData::Delegating { from_bot, bot, count }
+                if from_bot == "Main" && bot == "Analyst" && count == 1
         ));
         // Parallel handoffs count: the card names the first and counts the rest.
         let mut with_parallel = inputs(&activity, Instant::now());
@@ -663,7 +681,8 @@ mod tests {
         with_parallel.delegate_count = 3;
         assert!(matches!(
             derive_live_card(with_parallel),
-            LiveCardData::Delegating { bot, count } if bot == "Analyst" && count == 3
+            LiveCardData::Delegating { from_bot, bot, count }
+                if from_bot == "Main" && bot == "Analyst" && count == 3
         ));
     }
 

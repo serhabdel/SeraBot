@@ -927,13 +927,17 @@ pub(super) fn Sidebar(
                         RailItem::Bot { id, label, role, subtitle, avatar, active, enabled, live, unread, pinned, extra_chats } => {
                             let pin_id = id.strip_prefix("dir:").unwrap_or(&id).to_owned();
                             let removable = serabot_desktop::can_remove_bot(&pin_id, &role);
-                            let act = session.read().state.working.activity_of(&pin_id, Instant::now());
+                            let now = Instant::now();
+                            let act = session.read().state.working.activity_of(&pin_id, now);
+                            let act_attr = activity_attr(
+                                session.read().state.working.activity_kind_of(&pin_id, now),
+                            );
                             let act_label = act.as_ref().map(BotActivity::label).unwrap_or_default();
                             rsx! {
                                 div {
                                     key: "{id}",
                                     class: if active { "thread active" } else { "thread" },
-                                    "data-activity": activity_attr(act.as_ref()),
+                                    "data-activity": act_attr,
                                     oncontextmenu: {
                                         let id = id.clone();
                                         let mut menu = menu;
@@ -952,8 +956,8 @@ pub(super) fn Sidebar(
                                                 session.write().open_bot_chat(bot);
                                             }
                                         },
-                                        span { class: "avatar-wrap", "data-activity": activity_attr(act.as_ref()),
-                                            span { class: "avatar bot", style: conversation_avatar_style(&id), "{avatar}" }
+                                        span { class: "avatar-wrap", "data-activity": act_attr,
+                                            span { class: "avatar bot", "data-activity": act_attr, style: conversation_avatar_style(&id), "{avatar}" }
                                         }
                                         div { class: "thread-copy",
                                             span { class: "thread-title", "{label}" }
@@ -1136,18 +1140,26 @@ pub(super) fn Sidebar(
                         },
                         RailItem::Thread { id, label, subtitle, depth, active, unread, archived, pinned } => {
                             let editing = renaming().as_ref().map(|(edit, _)| edit == &id).unwrap_or(false);
+                            let now = Instant::now();
                             let act = session
                                 .read()
                                 .state
                                 .working
-                                .conversation_working(&id, Instant::now())
+                                .conversation_working(&id, now)
                                 .then_some(BotActivity::Working(None));
+                            let act_attr = activity_attr(
+                                session
+                                    .read()
+                                    .state
+                                    .working
+                                    .conversation_activity_kind(&id, now),
+                            );
                             let act_label = act.as_ref().map(BotActivity::label).unwrap_or_default();
                             rsx! {
                                 div {
                                     key: "{id}",
                                     class: if active { "thread active" } else { "thread" },
-                                    "data-activity": activity_attr(act.as_ref()),
+                                    "data-activity": act_attr,
                                     style: format!("--depth: {depth};"),
                                     oncontextmenu: {
                                         let id = id.clone();
@@ -1225,9 +1237,10 @@ pub(super) fn Sidebar(
                                                     session.write().open_conversation(id.clone());
                                                 }
                                             },
-                                            span { class: "avatar-wrap", "data-activity": activity_attr(act.as_ref()),
+                                            span { class: "avatar-wrap", "data-activity": act_attr,
                                                 span {
                                                     class: if id.starts_with("room:") { "avatar bot group" } else { "avatar bot" },
+                                                    "data-activity": act_attr,
                                                     style: conversation_avatar_style(&id),
                                                     "{initial_of(&label)}"
                                                 }
@@ -2043,7 +2056,7 @@ pub(super) fn Topbar(
     };
     // Who is working: the chat bot, or each room member. A queued or running
     // task covers the moment before the first step event arrives.
-    let (header_act, team_acts) = {
+    let (header_act, header_act_kind, team_acts, team_kinds) = {
         let state = session.read();
         let now = Instant::now();
         let busy = matches!(task_status, Some(TaskStatus::Running | TaskStatus::Queued));
@@ -2060,13 +2073,31 @@ pub(super) fn Topbar(
                     .conversation_working(&state.conversation, now))
             .then_some(BotActivity::Working(None)),
         };
+        let header_act_kind = match &active_bot {
+            Some(bot) => activity_kind_or(
+                state.state.working.activity_kind_of(bot, now),
+                header.as_ref(),
+            ),
+            None => activity_kind_or(
+                state
+                    .state
+                    .working
+                    .conversation_activity_kind(&state.conversation, now),
+                header.as_ref(),
+            ),
+        };
         let members = team
             .iter()
             .map(|(id, _)| (id.clone(), state.state.working.activity_of(id, now)))
             .collect::<HashMap<_, _>>();
-        (header, members)
+        let member_kinds = team
+            .iter()
+            .map(|(id, _)| (id.clone(), state.state.working.activity_kind_of(id, now)))
+            .collect::<HashMap<_, _>>();
+        (header, header_act_kind, members, member_kinds)
     };
     let header_label = header_act.as_ref().map(BotActivity::label);
+    let header_attr = activity_attr(header_act_kind);
     rsx! {
         header { class: "topbar chat-header",
             button {
@@ -2076,9 +2107,10 @@ pub(super) fn Topbar(
                 onclick: move |_| drawer_open.set(true),
                 Icon { name: "list", size: 16 }
             }
-            span { class: "avatar-wrap", "data-activity": activity_attr(header_act.as_ref()),
+            span { class: "avatar-wrap", "data-activity": header_attr,
                 span {
                     class: "avatar bot",
+                    "data-activity": header_attr,
                     style: active_bot.as_deref().map(avatar_style).unwrap_or_else(|| avatar_style(&title)),
                     "{avatar}"
                 }
@@ -2133,9 +2165,14 @@ pub(super) fn Topbar(
                         span {
                             key: "{id}",
                             class: "avatar-wrap sm",
-                            "data-activity": activity_attr(team_acts.get(&id).and_then(|a| a.as_ref())),
+                            "data-activity": activity_attr(team_kinds.get(&id).copied().unwrap_or_default()),
                             title: team_acts.get(&id).and_then(|a| a.as_ref()).map(BotActivity::label).unwrap_or_default(),
-                            span { class: "avatar sm bot", style: avatar_style(&id), "{avatar}" }
+                            span {
+                                class: "avatar sm bot",
+                                "data-activity": activity_attr(team_kinds.get(&id).copied().unwrap_or_default()),
+                                style: avatar_style(&id),
+                                "{avatar}"
+                            }
                         }
                     }
                 }

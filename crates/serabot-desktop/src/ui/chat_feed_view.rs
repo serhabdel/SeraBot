@@ -167,6 +167,22 @@ pub const FEED_SINK_JS: &str = r#"
 window.__serabotFeedSink = (value) => dioxus.send(value);
 "#;
 
+/// Maximum characters accepted by `Session::add_memory` (`MAX_MEMORY_CONTENT_CHARS`).
+const MAX_PINNED_MEMORY_CHARS: usize = 4_000;
+
+/// Prepare an assistant reply for `Session::add_memory`: strip disallowed
+/// control characters, trim, and bound to `MAX_PINNED_MEMORY_CHARS`.
+pub fn pin_memory_content(reply: &str) -> Option<String> {
+    let cleaned: String = reply
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
+        .take(MAX_PINNED_MEMORY_CHARS)
+        .collect();
+    let trimmed = cleaned.trim().to_owned();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

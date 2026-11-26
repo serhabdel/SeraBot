@@ -690,6 +690,14 @@ Plan: `docs/specs/0.74.15-proposal.md`. Version stays `0.74.14` until the batch 
 - [x] Version bump `0.74.20` (`Cargo.toml`), mobile `0.74.20+94`, `docs/release-0.74.20.md`, `README.md`, `tasks/todo.md`.
 - [ ] Owner: live pass on `services/claude_gateway`, Settings independent scroll, lazy-loaded tabs, and new vendor icons.
 
+## Release 0.74.21 — Windows CI Fix, Animated Bot Avatars, Live Step Timeline & Memory Pills
+
+- [x] Windows CI Test Fix (`session.rs`): `failed_providers_load_sets_section_load_error` uses non-retryable `403 Forbidden` mock response so `desktop (windows-latest)` passes without retry-backoff flake.
+- [x] Animated Bot Avatars & Living Presence (`working.rs`, `ui.rs`, `ui/shell.rs`, `ui/chat.rs`, `ui/wait_cards.rs`, `assets/system.css`): `ActivityKind` (`thinking`, `searching`, `browsing`, `coding`, `delegating`, `waiting_approval`, `done`), activity-keyed `.avatar[data-activity]` CSS animations (respecting `data-motion="reduce"`), and `from_bot → to_bot` `.handoff-pill` in `LiveCardData::Delegating`.
+- [x] Live Step Timeline & Interactive Memory Pills (`turn_trace.rs`, `ui/chat_feed_view.rs`, `ui/chat.rs`, `assets/system.css`): `LiveTimeline` (`Recalled N memories → Tool step(s) → Drafting reply`), interactive `.memory-pill` chips, and **"Pin to memory"** quick action in assistant `.msg-actions`.
+- [x] Version bump `0.74.21` (`Cargo.toml`), mobile `0.74.21+95`, `docs/release-0.74.21.md`, `README.md`, `tasks/todo.md`.
+- [ ] Owner: live visual pass on animated bot avatars, `LiveTimeline`, and memory pills in desktop WebView2.
+
 
 
 

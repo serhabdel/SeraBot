@@ -92,6 +92,193 @@ impl TurnMemory {
         }
         (!parts.is_empty()).then(|| parts.join(" \u{b7} "))
     }
+
+    /// Compact, hoverable memory pills for recalled and saved memories.
+    pub fn pills(&self) -> Vec<MemoryPill> {
+        let mut out = Vec::with_capacity(self.recalled.len() + self.saved.len());
+        for item in &self.recalled {
+            out.push(MemoryPill::from_item(item, MemoryPillRole::Recalled));
+        }
+        for item in &self.saved {
+            out.push(MemoryPill::from_item(item, MemoryPillRole::Saved));
+        }
+        out
+    }
+}
+
+/// Maximum characters shown inside a `.memory-pill` chip before ellipsis.
+const MAX_PILL_SNIPPET: usize = 42;
+/// Maximum characters shown inside a `.live-step-pill` label before ellipsis.
+const MAX_TIMELINE_LABEL: usize = 28;
+/// Maximum tool steps shown directly in the live timeline before collapsing older ones.
+const MAX_TIMELINE_TOOL_STEPS: usize = 4;
+
+/// Whether a memory pill was recalled for the turn or saved by it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryPillRole {
+    Recalled,
+    Saved,
+}
+
+/// Compact chip representation of one recalled or saved memory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryPill {
+    pub id: String,
+    pub role: MemoryPillRole,
+    pub kind: String,
+    pub snippet: String,
+    pub full_text: String,
+    pub origin: String,
+    pub pending: bool,
+    pub replaces: Vec<String>,
+}
+
+impl MemoryPill {
+    fn from_item(item: &MemoryItem, role: MemoryPillRole) -> Self {
+        let full_text = if item.excerpt.is_empty() {
+            "A saved fact (text withheld by policy)".to_owned()
+        } else {
+            item.excerpt.clone()
+        };
+        let kind = if item.kind.is_empty() {
+            "memory".to_owned()
+        } else {
+            item.kind.clone()
+        };
+        Self {
+            id: item.id.clone(),
+            role,
+            kind,
+            snippet: compact_text(&full_text, MAX_PILL_SNIPPET),
+            full_text,
+            origin: item.origin.clone(),
+            pending: item.pending,
+            replaces: item.replaces.clone(),
+        }
+    }
+
+    /// Hover tooltip text with full excerpt and status.
+    pub fn tooltip(&self) -> String {
+        let role = match self.role {
+            MemoryPillRole::Recalled => "Used",
+            MemoryPillRole::Saved => "Remembered",
+        };
+        let mut parts = vec![format!("{role} ({}) — {}", self.kind, self.full_text)];
+        if self.pending {
+            parts.push("Held for review".to_owned());
+        } else if self.origin == "explicit" {
+            parts.push("You saved".to_owned());
+        }
+        if !self.replaces.is_empty() {
+            parts.push(format!("Replaces: {}", self.replaces.join("; ")));
+        }
+        parts.join(" · ")
+    }
+}
+
+/// Visual state of one pill in the live step timeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimelineStepState {
+    Done,
+    Active,
+    Waiting,
+    Failed,
+}
+
+impl TimelineStepState {
+    pub fn class_suffix(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Active => "active",
+            Self::Waiting => "waiting",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// One pill in the live step timeline (`Recalled memories → Tool step → Drafting reply`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimelineStep {
+    pub label: String,
+    pub elapsed: Option<String>,
+    pub state: TimelineStepState,
+}
+
+fn compact_text(raw: &str, max_chars: usize) -> String {
+    let normalized: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = normalized.chars();
+    let head: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{}\u{2026}", head.trim_end())
+    } else {
+        head
+    }
+}
+
+/// Build the compact step timeline for a live or completed turn:
+/// `Recalled memories → Tool step(s) → Drafting reply`, with elapsed time per step.
+pub fn timeline_steps(
+    activity: &Activity,
+    memory: Option<&TurnMemory>,
+    streaming_reply: bool,
+    now: std::time::Instant,
+) -> Vec<TimelineStep> {
+    let mut pills = Vec::new();
+    if let Some(mem) = memory
+        && mem.recalled_total > 0
+    {
+        let label = if mem.recalled_total == 1 {
+            "Recalled 1 memory".to_owned()
+        } else {
+            format!("Recalled {} memories", mem.recalled_total)
+        };
+        pills.push(TimelineStep {
+            label,
+            elapsed: None,
+            state: TimelineStepState::Done,
+        });
+    }
+
+    let total_steps = activity.steps.len();
+    let skip = total_steps.saturating_sub(MAX_TIMELINE_TOOL_STEPS);
+    if skip > 0 {
+        pills.push(TimelineStep {
+            label: format!("+{skip} earlier"),
+            elapsed: None,
+            state: TimelineStepState::Done,
+        });
+    }
+
+    for step in activity.steps.iter().skip(skip) {
+        let state = match step.phase {
+            crate::activity::StepPhase::Running | crate::activity::StepPhase::Progress => {
+                TimelineStepState::Active
+            }
+            crate::activity::StepPhase::WaitingApproval => TimelineStepState::Waiting,
+            crate::activity::StepPhase::Failed => TimelineStepState::Failed,
+            crate::activity::StepPhase::Done => TimelineStepState::Done,
+        };
+        let elapsed = if step.phase.spinning() {
+            step.elapsed_ms(now).map(crate::activity::format_duration)
+        } else {
+            step.duration_ms.map(crate::activity::format_duration)
+        };
+        pills.push(TimelineStep {
+            label: compact_text(&step.label, MAX_TIMELINE_LABEL),
+            elapsed,
+            state,
+        });
+    }
+
+    if streaming_reply {
+        pills.push(TimelineStep {
+            label: "Drafting reply".to_owned(),
+            elapsed: None,
+            state: TimelineStepState::Active,
+        });
+    }
+
+    pills
 }
 
 fn text(value: &Value, key: &str, max: usize) -> String {
@@ -227,6 +414,15 @@ impl TurnLedger {
         self.turns
             .get(newest)
             .and_then(|trace| trace.context.as_ref())
+    }
+
+    /// Memories used/saved by the newest turn, if any.
+    pub fn latest_memory(&self) -> Option<&TurnMemory> {
+        let newest = self.order.back()?;
+        self.turns
+            .get(newest)
+            .map(|trace| &trace.memory)
+            .filter(|mem| !mem.is_empty())
     }
 
     /// Apply one stream or history event. Returns whether anything changed.
@@ -465,5 +661,129 @@ mod tests {
         let mut ledger = TurnLedger::default();
         ledger.reset("dir:main");
         assert!(!ledger.apply("turn.step", &step("bad id!", "a", "done")));
+    }
+
+    #[test]
+    fn timeline_steps_formats_recall_tools_and_drafting_with_elapsed() {
+        let mut activity = Activity::default();
+        activity.apply("turn.step", &step("t1", "c1", "done"));
+        activity.apply(
+            "turn.step",
+            &json!({
+                "task_id": "task-t1",
+                "turn_id": "t1",
+                "conversation_id": "dir:main",
+                "call_id": "c2",
+                "label": "Reading a very long document title that should truncate",
+                "phase": "running",
+            }),
+        );
+        let memory = TurnMemory {
+            recalled_total: 2,
+            ..Default::default()
+        };
+        let steps = timeline_steps(&activity, Some(&memory), true, std::time::Instant::now());
+        assert_eq!(steps.len(), 4);
+        assert_eq!(steps[0].label, "Recalled 2 memories");
+        assert_eq!(steps[0].state, TimelineStepState::Done);
+        assert_eq!(steps[0].elapsed, None);
+
+        assert_eq!(steps[1].label, "Searching the web");
+        assert_eq!(steps[1].state, TimelineStepState::Done);
+        assert_eq!(steps[1].elapsed.as_deref(), Some("2s"));
+
+        assert!(steps[2].label.ends_with('\u{2026}'));
+        assert_eq!(steps[2].state, TimelineStepState::Active);
+        assert!(steps[2].elapsed.is_some());
+
+        assert_eq!(steps[3].label, "Drafting reply");
+        assert_eq!(steps[3].state, TimelineStepState::Active);
+    }
+
+    #[test]
+    fn timeline_steps_collapses_older_steps_and_maps_waiting_and_failed() {
+        let mut activity = Activity::default();
+        for i in 0..5 {
+            activity.apply("turn.step", &step("t1", &format!("c{i}"), "done"));
+        }
+        activity.apply(
+            "turn.step",
+            &json!({
+                "task_id": "task-t1",
+                "call_id": "c5",
+                "label": "Sending email",
+                "phase": "waiting_approval",
+                "approval_id": "ap-1",
+            }),
+        );
+        activity.apply(
+            "turn.step",
+            &json!({
+                "task_id": "task-t1",
+                "call_id": "c6",
+                "label": "Fetching feed",
+                "phase": "failed",
+                "duration_ms": 500,
+            }),
+        );
+
+        let steps = timeline_steps(&activity, None, false, std::time::Instant::now());
+        // 7 total steps -> "+3 earlier" + last 4 steps = 5 pills
+        assert_eq!(steps.len(), 5);
+        assert_eq!(steps[0].label, "+3 earlier");
+        assert_eq!(steps[3].state, TimelineStepState::Waiting);
+        assert_eq!(steps[4].state, TimelineStepState::Failed);
+        assert_eq!(steps[4].elapsed.as_deref(), Some("under 1s"));
+    }
+
+    #[test]
+    fn memory_pills_extract_recalled_and_saved_with_snippets_and_tooltips() {
+        let memory = TurnMemory {
+            recalled: vec![
+                MemoryItem {
+                    id: "m1".into(),
+                    kind: "preference".into(),
+                    origin: "explicit".into(),
+                    excerpt: "Always format dates as YYYY-MM-DD in reports and tables".into(),
+                    pending: false,
+                    replaces: vec![],
+                },
+                MemoryItem {
+                    id: "m2".into(),
+                    kind: String::new(),
+                    origin: "extracted".into(),
+                    excerpt: String::new(),
+                    pending: false,
+                    replaces: vec![],
+                },
+            ],
+            saved: vec![MemoryItem {
+                id: "m3".into(),
+                kind: "fact".into(),
+                origin: "extracted".into(),
+                excerpt: "Lives in Porto".into(),
+                pending: true,
+                replaces: vec!["Lives in Lisbon".into()],
+            }],
+            recalled_total: 2,
+            saved_total: 1,
+        };
+
+        let pills = memory.pills();
+        assert_eq!(pills.len(), 3);
+
+        assert_eq!(pills[0].role, MemoryPillRole::Recalled);
+        assert_eq!(pills[0].kind, "preference");
+        assert!(pills[0].snippet.ends_with('\u{2026}'));
+        assert!(pills[0].snippet.chars().count() <= MAX_PILL_SNIPPET + 1);
+        assert!(pills[0].tooltip().contains("You saved"));
+
+        assert_eq!(pills[1].kind, "memory");
+        assert_eq!(pills[1].full_text, "A saved fact (text withheld by policy)");
+
+        assert_eq!(pills[2].role, MemoryPillRole::Saved);
+        assert!(pills[2].pending);
+        assert!(pills[2].tooltip().contains("Held for review"));
+        assert!(pills[2].tooltip().contains("Replaces: Lives in Lisbon"));
     }
 }
