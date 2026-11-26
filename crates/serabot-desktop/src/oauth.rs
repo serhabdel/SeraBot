@@ -21,6 +21,9 @@ pub const CLAUDE_CALLBACK_PATH: &str = "/callback";
 /// The fixed loopback port and path a Codex (ChatGPT plan) sign-in registers.
 pub const CODEX_PORT: u16 = 1455;
 pub const CODEX_CALLBACK_PATH: &str = "/auth/callback";
+/// The fixed loopback port and path Devin CLI's OAuth client registers.
+pub const DEVIN_PORT: u16 = 59653;
+pub const DEVIN_CALLBACK_PATH: &str = "/callback";
 /// Where the server sends the browser after a native sign-in.
 pub const AUTH_DONE_PATH: &str = "/auth-done";
 const PREFERRED_PORT: u16 = 51121;

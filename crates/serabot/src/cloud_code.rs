@@ -1104,9 +1104,10 @@ pub fn effective_max_output(model: &str, requested: u32) -> u32 {
 /// The `thinkingConfig` for one request, or `None` when none is sent.
 ///
 /// - Level models (Gemini 3 and 4, `-tiered`): `off` becomes
-///   `thinkingBudget: 0`; `low`, `medium` and `high` map to `thinkingLevel`,
-///   `max` to `high`. An id that already ends in `-low`, `-medium` or `-high`
-///   carries its level and gets no config.
+///   `thinkingBudget: 0` (except Pro/Argon which cannot turn thinking off);
+///   `low`, `medium` and `high` map to `thinkingLevel`, `max` to `high`.
+///   An id that already ends in `-low`, `-medium`, `-high`, `-minimal`,
+///   `-xhigh` or `-max` carries its level and gets no config.
 /// - Claude: `off` sends nothing; the others are budgets of 4000, 10000, 24000
 ///   and 32000 tokens, kept inside `[1024, max_out - 1024]` and sent only when
 ///   `max_out` is above the budget. With no level, a `-thinking` id uses
@@ -1160,7 +1161,11 @@ pub fn antigravity_thinking(model: &str, level: Option<&str>, max_out: u32) -> O
     }
     let level = level?;
     Some(match level {
-        "off" => json!({"thinkingBudget": 0}),
+        "off" => {
+            return (lower.ends_with("-tiered")
+                || (!lower.contains("pro") && !lower.contains("argon")))
+            .then(|| json!({"thinkingBudget": 0}));
+        }
         "low" => json!({"thinkingLevel": "low", "includeThoughts": true}),
         "high" | "max" | "xhigh" => json!({"thinkingLevel": "high", "includeThoughts": true}),
         _ => json!({"thinkingLevel": "medium", "includeThoughts": true}),
@@ -1194,7 +1199,13 @@ fn level_thinking_model(model: &str) -> bool {
     if model.ends_with("-tiered") {
         return true;
     }
-    if model.ends_with("-low") || model.ends_with("-medium") || model.ends_with("-high") {
+    if model.ends_with("-low")
+        || model.ends_with("-medium")
+        || model.ends_with("-high")
+        || model.ends_with("-minimal")
+        || model.ends_with("-xhigh")
+        || model.ends_with("-max")
+    {
         return false;
     }
     model.starts_with("gemini-3") || model.starts_with("gemini-4")

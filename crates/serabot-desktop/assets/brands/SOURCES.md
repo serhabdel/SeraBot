@@ -11,6 +11,7 @@ Each PNG is the vendor's own icon, fetched from the vendor's official domain (or
 | `cerebras.png` | https://cdn.sanity.io/images/e4qjo92p/production/e7a55ae5ab7e2c4fdfd4e66a51f628d1f2f44207-967x967.png?w=512&h=512&fit=max&auto=format (icon linked from cerebras.ai) |
 | `composio.png` | https://composio.dev/apple-touch-icon.png |
 | `deepseek.png` | https://www.deepseek.com/favicon.ico |
+| `devin.png` | https://devin.ai/icon.png |
 | `elevenlabs.png` | https://elevenlabs.io/apple-icon.png |
 | `firecrawl.png` | https://www.firecrawl.dev/apple-touch-icon.png |
 | `fireworks.png` | https://fireworks.ai/apple-icon.png |
@@ -22,6 +23,7 @@ Each PNG is the vendor's own icon, fetched from the vendor's official domain (or
 | `groq.png` | https://groq.com/apple-touch-icon.png |
 | `huggingface.png` | https://huggingface.co/favicon.ico |
 | `inception.png` | https://framerusercontent.com/images/y5L2OctMTnQDhiVDBUBArywmSY.png (apple-touch-icon linked from inceptionlabs.ai) |
+| `kiro.png` | https://kiro.dev/apple-icon.png |
 | `minimax.png` | https://www.minimaxi.com/favicon.ico |
 | `mistral.png` | https://mistral.ai/favicon.ico |
 | `moonshot.png` | https://www.kimi.com/favicon.ico |

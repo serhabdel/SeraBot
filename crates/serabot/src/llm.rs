@@ -305,6 +305,18 @@ impl LlmClient {
         Ok(self)
     }
 
+    /// Speak AWS Kiro EventStream wire format.
+    pub fn with_kiro(mut self) -> Self {
+        self.wire = Wire::Kiro;
+        self
+    }
+
+    /// Speak Devin CLI / Codeium Connect-RPC wire format.
+    pub fn with_devin(mut self) -> Self {
+        self.wire = Wire::Devin;
+        self
+    }
+
     /// Send `x-opencode-session` on every request (OpenCode Go). The id comes
     /// from the running conversation, so a retry reuses it; outside one, from
     /// a seed made for this client.
@@ -540,6 +552,12 @@ impl LlmClient {
             Wire::ClaudeGateway => {
                 return self.complete_claude_gateway(messages, tools, &model).await;
             }
+            Wire::Kiro => {
+                return self.complete_kiro(messages, tools, &model, extra).await;
+            }
+            Wire::Devin => {
+                return self.complete_devin(messages, tools, &model, extra).await;
+            }
             Wire::ChatCompletions => {}
         }
         let mut body = json!({
@@ -668,11 +686,16 @@ impl LlmClient {
     }
 
     pub async fn list_models(&self) -> Result<std::collections::BTreeSet<String>> {
-        let url = if self.wire == Wire::ClaudeGateway {
-            let root = self.base_url.strip_suffix("/v1").unwrap_or(&self.base_url);
-            format!("{root}/v1/models")
-        } else {
-            format!("{}/models", self.base_url)
+        let url = match self.wire {
+            Wire::ClaudeGateway => {
+                let root = self.base_url.strip_suffix("/v1").unwrap_or(&self.base_url);
+                format!("{root}/v1/models")
+            }
+            Wire::Kiro => format!("{}/ListAvailableModels", self.base_url),
+            Wire::Devin => {
+                crate::wire::devin::rpc_url(&self.base_url, crate::wire::devin::MODELS_RPC_PATH)?
+            }
+            _ => format!("{}/models", self.base_url),
         };
         self.fetch_model_catalog(&url, false)
             .await
@@ -693,6 +716,12 @@ impl LlmClient {
         }
         if self.wire.is_anthropic() {
             return self.fetch_anthropic_catalog(catalog_url).await;
+        }
+        if self.wire == Wire::Kiro {
+            return self.fetch_kiro_catalog(catalog_url).await;
+        }
+        if self.wire == Wire::Devin {
+            return self.fetch_devin_catalog(catalog_url).await;
         }
         // A Copilot plan lists its models on its own host, which is this
         // client's base (the configured one is the individual plan's).
@@ -952,6 +981,11 @@ impl LlmClient {
             OAuthStyle::CopilotExchange => {
                 return Err(SeraError::Forbidden(
                     "Copilot tokens refresh only through a member account".into(),
+                ));
+            }
+            OAuthStyle::KiroRefresh => {
+                return Err(SeraError::Forbidden(
+                    "AWS Kiro tokens refresh only through a member account".into(),
                 ));
             }
             OAuthStyle::MuseMint => {
@@ -1541,6 +1575,9 @@ async fn exchange_for_grant(
         OAuthStyle::CopilotExchange => {
             crate::auth_flows::copilot::refresh_exchange(http, token_url, refresh_token, client_id)
                 .await
+        }
+        OAuthStyle::KiroRefresh => {
+            crate::auth_flows::kiro::refresh_kiro_token(http, refresh_token).await
         }
         OAuthStyle::RefreshToken => {
             let grant =

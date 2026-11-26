@@ -28,7 +28,9 @@ pub mod claude;
 pub mod codex;
 pub mod copilot;
 pub mod device;
+pub mod devin;
 pub mod google;
+pub mod kiro;
 pub mod mistral;
 pub mod muse;
 pub mod pkce;
@@ -376,6 +378,8 @@ impl SignInRegistry {
         registry.register("openai-codex", Arc::new(codex::CodexSignIn::new()));
         registry.register("github-copilot", Arc::new(copilot::CopilotSignIn::new()));
         registry.register("mistral", Arc::new(mistral::MistralSignIn::new()));
+        registry.register("devin", Arc::new(devin::DevinSignIn::new()));
+        registry.register("kiro", Arc::new(kiro::KiroSignIn::new()));
         registry
     }
 

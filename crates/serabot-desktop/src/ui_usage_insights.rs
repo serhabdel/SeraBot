@@ -54,19 +54,21 @@ pub fn UsageInsights(session: Signal<Session>, days: u32) -> Element {
     }
     let Some(current) = data() else {
         return rsx! {
-            section { class: "usage-section", "aria-labelledby": "usage-insights-title",
+            section { class: "usage-section",
                 div { class: "page-section-head",
                     div {
-                        h2 { class: "usage-section-title", id: "usage-insights-title", "Insights" }
+                        h2 { class: "usage-section-title", "Insights & Relay" }
                         p { class: "usage-section-sub", "Channels, the PC tunnel, model speed and server load." }
                     }
                 }
                 if let Some(message) = error() {
-                    p { class: "tiny", role: "alert", "Insights could not be loaded: {message}" }
+                    div { class: "card usage-card insights-card",
+                        p { class: "tiny", role: "alert", "Insights could not be loaded: {message}" }
+                    }
                 } else {
-                    div { class: "usage-tiles", role: "status", "aria-busy": "true", "aria-label": "Loading insights",
+                    div { class: "usage-hero-grid", role: "status", "aria-busy": "true", "aria-label": "Loading insights",
                         for n in 0..3 {
-                            div { key: "{n}", class: "stat-tile skeleton usage-skeleton", " " }
+                            div { key: "{n}", class: "usage-card skeleton usage-skeleton", " " }
                         }
                     }
                 }
@@ -95,15 +97,15 @@ pub fn UsageInsights(session: Signal<Session>, days: u32) -> Element {
     let models = current.models.clone();
     let resources = current.resources.clone();
     rsx! {
-        section { class: "usage-section", "aria-labelledby": "usage-insights-title",
+        section { class: "usage-section",
             div { class: "page-section-head",
                 div {
-                    h2 { class: "usage-section-title", id: "usage-insights-title", "Insights" }
+                    h2 { class: "usage-section-title", "Insights & Relay" }
                     p { class: "usage-section-sub", "Channels, the PC tunnel, model speed and server load over {days.min(90)} days." }
                 }
             }
             div { class: "insights-grid",
-                div { class: "card insights-card",
+                div { class: "card usage-card insights-card",
                     div { class: "card-head",
                         h3 { class: "card-title", "Where you talk to your bots" }
                         span { class: "page-count", "{group_digits(total_turns)} turns" }
@@ -136,7 +138,7 @@ pub fn UsageInsights(session: Signal<Session>, days: u32) -> Element {
                         }
                     }
                 }
-                div { class: "card insights-card",
+                div { class: "card usage-card insights-card",
                     div { class: "card-head",
                         h3 { class: "card-title", "PC tunnel" }
                         if current.relay_online {
@@ -179,7 +181,7 @@ pub fn UsageInsights(session: Signal<Session>, days: u32) -> Element {
                     }
                 }
             }
-            div { class: "card insights-card",
+            div { class: "card usage-card insights-card",
                 div { class: "card-head",
                     h3 { class: "card-title", "Model speed and reliability" }
                     span { class: "page-count", "{models.len()} models" }
@@ -187,29 +189,31 @@ pub fn UsageInsights(session: Signal<Session>, days: u32) -> Element {
                 if models.is_empty() {
                     p { class: "tiny", "No model calls in this period." }
                 } else {
-                    table { class: "usage-table insights-table",
-                        thead {
-                            tr {
-                                th { scope: "col", "Model" }
-                                th { scope: "col", class: "num", "Calls" }
-                                th { scope: "col", class: "num", "Average" }
-                                th { scope: "col", class: "num", "Slowest 5%" }
-                                th { scope: "col", class: "num", "Via PC" }
-                                th { scope: "col", class: "num", "Failovers" }
+                    div { class: "usage-table-wrap",
+                        table { class: "usage-table insights-table",
+                            thead {
+                                tr {
+                                    th { scope: "col", "Model" }
+                                    th { scope: "col", class: "num", "Calls" }
+                                    th { scope: "col", class: "num", "Average" }
+                                    th { scope: "col", class: "num", "Slowest 5%" }
+                                    th { scope: "col", class: "num", "Via PC" }
+                                    th { scope: "col", class: "num", "Failovers" }
+                                }
                             }
-                        }
-                        tbody {
-                            for row in models {
-                                tr { key: "{row.provider}/{row.model}",
-                                    td {
-                                        span { class: "insights-model", "{row.model}" }
-                                        span { class: "tiny", " {human_provider(&row.provider)}" }
+                            tbody {
+                                for row in models {
+                                    tr { key: "{row.provider}/{row.model}",
+                                        td {
+                                            span { class: "insights-model", "{row.model}" }
+                                            span { class: "tiny", " {human_provider(&row.provider)}" }
+                                        }
+                                        td { class: "num", "{group_digits(row.calls)}" }
+                                        td { class: "num", "{human_latency(row.avg_latency_ms)}" }
+                                        td { class: "num", "{human_latency(row.p95_latency_ms)}" }
+                                        td { class: "num", "{share_percent(row.relayed_calls, row.calls)}%" }
+                                        td { class: if row.failovers > 0 { "num warn-text" } else { "num" }, "{group_digits(row.failovers)}" }
                                     }
-                                    td { class: "num", "{group_digits(row.calls)}" }
-                                    td { class: "num", "{human_latency(row.avg_latency_ms)}" }
-                                    td { class: "num", "{human_latency(row.p95_latency_ms)}" }
-                                    td { class: "num", "{share_percent(row.relayed_calls, row.calls)}%" }
-                                    td { class: if row.failovers > 0 { "num warn-text" } else { "num" }, "{group_digits(row.failovers)}" }
                                 }
                             }
                         }
@@ -235,7 +239,7 @@ fn ServerLoadCard(samples: Vec<insights::ResourceSample>) -> Element {
     let rss = samples.last().map(|s| s.process_rss_bytes).unwrap_or(0);
     let hours = samples.len() as f32 * 5.0 / 60.0;
     rsx! {
-        div { class: "card insights-card",
+        div { class: "card usage-card insights-card",
             div { class: "card-head",
                 h3 { class: "card-title", "Server load" }
                 span { class: "page-count", "last {hours:.0} h \u{b7} owner only" }

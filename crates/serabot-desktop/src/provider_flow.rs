@@ -262,6 +262,11 @@ pub fn redirect_plan(kind: &str) -> RedirectPlan {
             host: "localhost",
             path: oauth::CODEX_CALLBACK_PATH,
         },
+        "devin" => RedirectPlan {
+            fixed_port: Some(oauth::DEVIN_PORT),
+            host: "127.0.0.1",
+            path: oauth::DEVIN_CALLBACK_PATH,
+        },
         "openrouter" => RedirectPlan {
             fixed_port: None,
             host: "localhost",
@@ -593,6 +598,10 @@ mod tests {
         let codex = redirect_plan("openai-codex");
         assert_eq!(codex.fixed_port, Some(1455));
         assert_eq!(codex.uri(1455), "http://localhost:1455/auth/callback");
+        let devin = redirect_plan("devin");
+        assert_eq!(devin.fixed_port, Some(59653));
+        assert_eq!(devin.path, "/callback");
+        assert_eq!(devin.uri(59653), "http://127.0.0.1:59653/callback");
         assert_eq!(
             redirect_plan("openrouter").uri(40000),
             "http://localhost:40000/oauth-callback"

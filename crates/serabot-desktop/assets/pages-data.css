@@ -522,10 +522,93 @@
 /* ---- Usage ---- */
 
 .usage-page .pane-body {
-  gap: 28px;
+  gap: 20px;
+}
+
+.usage-hero-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+  align-items: stretch;
+}
+
+.usage-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: var(--card-pad, 16px);
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: var(--card-radius, 16px);
+  box-shadow: var(--card-shadow);
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+.usage-page .insights-card {
+  padding: var(--card-pad, 16px);
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: var(--card-radius, 16px);
+  box-shadow: var(--card-shadow);
+  min-width: 0;
+}
+
+.usage-kpi-card {
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.usage-kpi-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.usage-kpi-label {
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+  font-weight: 600;
+}
+
+.usage-kpi-badge {
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  color: var(--label-3);
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.usage-kpi-value {
+  color: var(--label-1);
+  font-size: var(--fs-display);
+  font-weight: 650;
+  letter-spacing: -0.025em;
+  line-height: 1.15;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.usage-kpi-sub {
+  color: var(--label-3);
+  font-size: var(--fs-micro);
+  line-height: 1.35;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-tabs {
+  align-self: flex-start;
+  flex-wrap: wrap;
+  max-width: 100%;
 }
 
 .usage-section {
+  display: flex;
+  flex-direction: column;
   gap: 12px;
 }
 
@@ -546,12 +629,17 @@
 }
 
 .usage-skeleton {
-  height: 88px;
-  border-radius: var(--r-md);
+  height: 108px;
+  border-radius: var(--card-radius, 16px);
+}
+
+.usage-chart-skeleton {
+  height: 240px;
+  border-radius: var(--card-radius, 16px);
 }
 
 .usage-chart-card {
-  margin-top: 4px;
+  margin-top: 0;
 }
 
 .usage-chart {
@@ -596,9 +684,59 @@
   }
 }
 
+.usage-overview-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  align-items: start;
+}
+
+.usage-summary-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.usage-summary-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) minmax(60px, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.usage-summary-row:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.usage-summary-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.usage-summary-meta .usage-model {
+  font-weight: 600;
+  color: var(--label-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.usage-summary-val {
+  color: var(--label-1);
+  font-size: var(--fs-body-2);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 .usage-breakdown {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px;
   align-items: start;
 }
@@ -623,6 +761,41 @@
 
 .usage-model {
   overflow-wrap: anywhere;
+}
+
+.usage-share-cell {
+  min-width: 110px;
+}
+
+.usage-share-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.usage-share-bar {
+  flex: 1 1 64px;
+  min-width: 48px;
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  border: 1px solid var(--hairline);
+  overflow: hidden;
+}
+
+.usage-share-fill {
+  height: 100%;
+  border-radius: var(--r-pill);
+  background: linear-gradient(90deg, var(--accent), color-mix(in srgb, var(--accent) 70%, var(--accent-2)));
+  transition: width var(--dur-3) var(--ease);
+}
+
+.usage-share-pct {
+  min-width: 32px;
+  text-align: right;
+  color: var(--label-2);
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
 }
 
 .usage-page .quota-card {
@@ -669,6 +842,52 @@
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.06em;
+}
+
+.usage-hero-grid > * {
+  animation: item-in var(--enter-dur) var(--spring) both;
+}
+
+.usage-hero-grid > :nth-child(2) {
+  animation-delay: calc(var(--enter-step) * 1);
+}
+
+.usage-hero-grid > :nth-child(3) {
+  animation-delay: calc(var(--enter-step) * 2);
+}
+
+.usage-hero-grid > :nth-child(4) {
+  animation-delay: calc(var(--enter-step) * 3);
+}
+
+@media (max-width: 1080px) {
+  .usage-hero-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .usage-breakdown {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 820px) {
+  .usage-overview-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  .usage-hero-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .usage-summary-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .usage-summary-row .usage-share-bar {
+    display: none;
+  }
 }
 
 /* ---- Settings ---- */
@@ -726,6 +945,7 @@
   .vault-provider-grid > *,
   .vault-hero > *,
   .mem-grid > *,
+  .usage-hero-grid > *,
   .usage-tiles > *,
   .usage-breakdown > *,
   .settings-content > *,
@@ -740,7 +960,8 @@
 
   .mem-card,
   .settings-nav-item::before,
-  .meter-fill {
+  .meter-fill,
+  .usage-share-fill {
     transition: none;
   }
 }
@@ -751,6 +972,7 @@
 .root[data-motion="reduce"] .vault-provider-grid > *,
 .root[data-motion="reduce"] .vault-hero > *,
 .root[data-motion="reduce"] .mem-grid > *,
+.root[data-motion="reduce"] .usage-hero-grid > *,
 .root[data-motion="reduce"] .usage-tiles > *,
 .root[data-motion="reduce"] .usage-breakdown > *,
 .root[data-motion="reduce"] .settings-content > *,
@@ -765,6 +987,7 @@
 
 .root[data-motion="reduce"] .mem-card,
 .root[data-motion="reduce"] .settings-nav-item::before,
-.root[data-motion="reduce"] .meter-fill {
+.root[data-motion="reduce"] .meter-fill,
+.root[data-motion="reduce"] .usage-share-fill {
   transition: none;
 }

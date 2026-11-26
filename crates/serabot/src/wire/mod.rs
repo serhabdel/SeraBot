@@ -14,6 +14,8 @@
 //! completions.
 
 pub mod anthropic;
+pub mod devin;
+pub mod kiro;
 pub mod responses;
 pub mod schema;
 pub mod sse;
@@ -32,6 +34,10 @@ pub enum Wire {
     AnthropicPlan,
     /// `POST {base}/v1/turn` on the local loopback Claude Agent SDK gateway.
     ClaudeGateway,
+    /// `POST {base}/generateAssistantResponse` (AWS Kiro EventStream).
+    Kiro,
+    /// `POST {base}/exa.api_server_pb.ApiServerService/GetChatMessage` (Devin Connect-RPC).
+    Devin,
 }
 
 impl Wire {

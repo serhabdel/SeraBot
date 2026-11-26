@@ -62,6 +62,26 @@ pub const RELAY_PROVIDERS: &[(&str, &str, &[&str])] = &[
     ("anthropic", "Anthropic", &["api.anthropic.com"]),
     ("openai", "OpenAI", &["api.openai.com"]),
     ("inception", "Inception Labs", &["api.inceptionlabs.ai"]),
+    (
+        "kiro",
+        "Kiro",
+        &[
+            "oidc.us-east-1.amazonaws.com",
+            "q.us-east-1.amazonaws.com",
+            "codewhisperer.us-east-1.amazonaws.com",
+            "oidc.us-west-2.amazonaws.com",
+            "q.us-west-2.amazonaws.com",
+            "oidc.eu-central-1.amazonaws.com",
+            "q.eu-central-1.amazonaws.com",
+            "oidc.eu-west-1.amazonaws.com",
+            "q.eu-west-1.amazonaws.com",
+            "oidc.ap-southeast-1.amazonaws.com",
+            "q.ap-southeast-1.amazonaws.com",
+            "oidc.ap-northeast-1.amazonaws.com",
+            "q.ap-northeast-1.amazonaws.com",
+        ],
+    ),
+    ("devin", "Devin", &["api.devin.ai", "server.codeium.com"]),
 ];
 
 /// Open tunnels per member, at most.
@@ -775,6 +795,31 @@ mod tests {
             .unwrap()
             .id;
         assert!(!store.relay_settings(&member).unwrap().enabled);
+    }
+
+    #[test]
+    fn kiro_and_devin_hosts_are_allowed_when_enabled() {
+        let settings = RelaySettings {
+            enabled: true,
+            providers: vec!["kiro".into(), "devin".into(), "unknown".into()],
+        }
+        .normalized();
+        assert_eq!(
+            settings.providers,
+            vec!["devin".to_string(), "kiro".to_string()]
+        );
+        for host in [
+            "oidc.us-east-1.amazonaws.com",
+            "q.us-east-1.amazonaws.com",
+            "codewhisperer.us-east-1.amazonaws.com",
+            "oidc.us-west-2.amazonaws.com",
+            "q.us-west-2.amazonaws.com",
+            "api.devin.ai",
+            "server.codeium.com",
+        ] {
+            assert!(settings.allows_host(host), "{host}");
+        }
+        assert!(!settings.allows_host("api.openai.com"));
     }
 
     #[test]

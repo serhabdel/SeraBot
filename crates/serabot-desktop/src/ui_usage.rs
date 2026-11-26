@@ -1,18 +1,20 @@
-//! The Usage page (0.17): what the acting user's bots used in a period.
+//! The Usage page (0.17; redesigned 0.74): what the acting user's bots used in
+//! a period, organized into a 4-card KPI hero strip and segmented sub-views.
 //!
 //! Numbers come from `GET /v1/usage`, which only ever returns the caller's own
-//! rows. The page shows summary tiles, a daily bar chart and tables by model
-//! and by bot. The server does not record prices, so cost is shown as not
-//! available instead of guessed.
+//! rows. Cost and alert summaries come from `/v1/ops/costs` and `/v1/ops/alerts`.
 
 use dioxus::prelude::*;
+use serabot_desktop::ops_view as ops;
 use serabot_desktop::pc_stats::FoldersSize;
 use serabot_desktop::session::{Session, humanize_label};
 use serabot_desktop::status_view::{
     Health, bar_percent, format_bytes, format_percent, format_uptime, health, member_label, percent,
 };
 use serabot_desktop::theme::{Level, Tone};
-use serabot_desktop::{UsageBucket, UsageModel, UsageReport};
+use serabot_desktop::worker::Credentials;
+use serabot_desktop::{UsageBucket, UsageModel, UsageReport, UsageTool};
+use serde_json::Value;
 
 use crate::ui::{Icon, human_provider};
 use crate::ui_bot_health::BotHealthCard;
@@ -28,6 +30,35 @@ const REFRESH_SECS: u64 = 30;
 /// Ranges offered by the picker, in days.
 const RANGES: [(u32, &str); 3] = [(7, "7 days"), (30, "30 days"), (90, "90 days")];
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UsageTab {
+    Overview,
+    ModelsAndBots,
+    InsightsAndRelay,
+    CostsAndAlerts,
+    Health,
+}
+
+impl UsageTab {
+    const ALL: [Self; 5] = [
+        Self::Overview,
+        Self::ModelsAndBots,
+        Self::InsightsAndRelay,
+        Self::CostsAndAlerts,
+        Self::Health,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::ModelsAndBots => "Models & Bots",
+            Self::InsightsAndRelay => "Insights & Relay",
+            Self::CostsAndAlerts => "Costs & Alerts",
+            Self::Health => "Health",
+        }
+    }
+}
+
 fn quota_percent(used: i64, limit: u64) -> u32 {
     if limit == 0 {
         return 0;
@@ -36,6 +67,41 @@ fn quota_percent(used: i64, limit: u64) -> u32 {
         .saturating_mul(100)
         .saturating_div(limit)
         .min(100)) as u32
+}
+
+/// Percentage share of `part` in `total`, clamped to `0..=100`.
+pub fn share_percent(part: i64, total: i64) -> u32 {
+    if part <= 0 || total <= 0 {
+        return 0;
+    }
+    ((part as u64)
+        .saturating_mul(100)
+        .saturating_div(total as u64)
+        .min(100)) as u32
+}
+
+/// `(completed, failed, total)` across all tool rows.
+pub fn tool_summary(tools: &[UsageTool]) -> (i64, i64, i64) {
+    let completed: i64 = tools.iter().map(|t| t.completed.max(0)).sum();
+    let failed: i64 = tools.iter().map(|t| t.failed.max(0)).sum();
+    (completed, failed, completed + failed)
+}
+
+async fn fetch_ops_json(
+    session: Signal<Session>,
+    job: impl FnOnce(&Credentials) -> Result<Value, String> + Send + 'static,
+) -> Option<Value> {
+    let credentials = session.read().credentials.clone()?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name("serabot-usage-ops".into())
+        .spawn(move || {
+            let _ = tx.send(job(&credentials));
+        });
+    if spawned.is_err() {
+        return None;
+    }
+    rx.await.ok().and_then(Result::ok)
 }
 
 /// `12345` -> `12,345`.
@@ -182,36 +248,53 @@ fn chart_axis_summary(bars: &[(String, i64, u32)]) -> (String, String, String) {
 #[component]
 pub fn UsagePage(session: Signal<Session>) -> Element {
     let mut session = session;
+    let mut active_tab = use_signal(|| UsageTab::Overview);
     let mut filter = use_signal(String::new);
     let mut sort_by = use_signal(|| UsageSort::TokensDesc);
     let mut refreshed_at = use_signal(|| Option::<std::time::Instant>::None);
+    let mut costs_summary = use_signal(|| Option::<Value>::None);
+    let mut alerts_summary = use_signal(|| Option::<Value>::None);
+    use_hook(move || {
+        spawn(async move {
+            if let Some(value) = fetch_ops_json(session, ops::get_costs).await {
+                costs_summary.set(Some(value));
+            }
+        });
+        spawn(async move {
+            if let Some(value) = fetch_ops_json(session, ops::get_alerts).await {
+                alerts_summary.set(Some(value));
+            }
+        });
+    });
     use_effect(move || {
         let s = session.read();
         if s.state.usage.is_some() && !s.usage_loading && s.state.error.is_none() {
             refreshed_at.set(Some(std::time::Instant::now()));
         }
     });
-    let (days, loading, report, error) = {
+    let (days, loading, report, error, server_health, is_admin) = {
         let s = session.read();
         (
             s.usage_days,
             s.usage_loading,
             s.state.usage.clone(),
             s.state.error.clone(),
+            s.state.server_health.clone(),
+            s.is_admin(),
         )
     };
     let bars = report.as_ref().map(chart_bars).unwrap_or_default();
     let bar_count = bars.len();
     let label_step = (bar_count / 6).max(1);
     let (axis_start, axis_peak, axis_end) = chart_axis_summary(&bars);
-    let tool_runs: i64 = report
+    let (tool_ok, tool_fail, tool_runs) = report
         .as_ref()
-        .map(|report| report.tools.iter().map(|t| t.completed + t.failed).sum())
-        .unwrap_or(0);
+        .map(|r| tool_summary(&r.tools))
+        .unwrap_or((0, 0, 0));
+    let total_tokens = report.as_ref().map(|r| r.totals.total_tokens).unwrap_or(0);
     let empty = report
         .as_ref()
         .is_some_and(|report| report.totals.calls == 0);
-    let report_ready = report.is_some();
     let filter_text = filter.read().clone();
     let model_rows = report
         .as_ref()
@@ -221,12 +304,73 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
         .as_ref()
         .map(|r| filter_sort_bots(&r.per_bot, &filter_text, sort_by()))
         .unwrap_or_default();
-    let is_admin = session.read().is_admin();
-    let quota_shown = report
+    let top_models = report
         .as_ref()
-        .map(|r| r.quota.daily_tasks.limit > 0)
-        .unwrap_or(false);
+        .map(|r| filter_sort_models(&r.per_model, "", UsageSort::TokensDesc))
+        .unwrap_or_default();
+    let top_bots = report
+        .as_ref()
+        .map(|r| filter_sort_bots(&r.per_bot, "", UsageSort::TokensDesc))
+        .unwrap_or_default();
     let updated_secs = refreshed_at().map(|at| at.elapsed().as_secs());
+
+    let costs_val = costs_summary();
+    let cached_m = costs_val
+        .as_ref()
+        .and_then(|c| c["totals"]["month"]["cached_m"].as_f64())
+        .unwrap_or(0.0);
+    let month_usd = costs_val.as_ref().and_then(|c| c["month_usd"].as_f64());
+    let budget_usd = costs_val
+        .as_ref()
+        .and_then(|c| c["budget_usd"].as_f64())
+        .filter(|b| *b > 0.0);
+    let budget_level = costs_val.as_ref().and_then(|c| c["budget_level"].as_u64());
+    let unpriced_tokens = costs_val
+        .as_ref()
+        .and_then(|c| c["month_unpriced_tokens"].as_i64())
+        .unwrap_or(0);
+    let budget_pct = match (month_usd, budget_usd) {
+        (Some(m), Some(b)) if b > 0.0 => Some(((m / b) * 100.0).round().min(100.0) as u32),
+        _ => None,
+    };
+
+    let alerts_val = alerts_summary();
+    let health_summary_line = {
+        let mut parts: Vec<String> = Vec::new();
+        if is_admin {
+            if let Some(status) = &server_health {
+                let (lvl, _) = health(status);
+                parts.push(if lvl == Health::Ok {
+                    "Server OK".to_owned()
+                } else {
+                    "Server needs a look".to_owned()
+                });
+            } else {
+                parts.push("Checking server".to_owned());
+            }
+        }
+        if let Some(alerts) = &alerts_val {
+            let recent_count = alerts["recent"].as_array().map(|a| a.len()).unwrap_or(0);
+            let alerts_on = alerts["enabled"].as_bool().unwrap_or(true);
+            if recent_count > 0 {
+                parts.push(format!("{recent_count} recent alerts"));
+            } else if alerts_on {
+                parts.push("Alerts on".to_owned());
+            } else {
+                parts.push("Alerts off".to_owned());
+            }
+        }
+        if parts.is_empty() {
+            "All systems nominal".to_owned()
+        } else {
+            parts.join(" \u{b7} ")
+        }
+    };
+    let server_needs_look = is_admin
+        && server_health
+            .as_ref()
+            .is_some_and(|s| health(s).0 != Health::Ok);
+
     // Refresh the health cards every 30 s, only while this page is open
     // (the future ends when the page is left).
     use_future(move || async move {
@@ -264,300 +408,456 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
                 }
             }
             div { class: "pane-body",
-                nav { class: "usage-nav", "aria-label": "Usage sections",
-                    if quota_shown {
-                        a { href: "#usage-quota-title", "Quota" }
+                // 1. 4-Card KPI Hero Strip
+                if loading && report.is_none() {
+                    div { class: "usage-hero-grid", role: "status", "aria-busy": "true", "aria-label": "Loading usage summary",
+                        for n in 0..4 {
+                            div { key: "{n}", class: "usage-card usage-kpi-card skeleton usage-skeleton", " " }
+                        }
                     }
-                    if is_admin {
-                        a { href: "#usage-reliability-title", "Reliability" }
-                    }
-                    a { href: "#usage-ops-title", "Alerts & costs" }
-                    a { href: "#usage-jobs-title", "Job search" }
-                    a { href: "#usage-activity-title", "Activity" }
-                    a { href: "#usage-insights-title", "Insights" }
-                    a { href: "#usage-bot-health-title", "Bot health" }
-                    if report_ready && !empty {
-                        a { href: "#usage-breakdown-title", "Breakdown" }
-                    }
-                }
-                if let Some(quota) = report
-                    .as_ref()
-                    .map(|report| report.quota.daily_tasks.clone())
-                    .filter(|quota| quota.limit > 0)
-                {
-                    section { class: "usage-section", "aria-labelledby": "usage-quota-title",
-                        div { class: "page-section-head",
-                            div {
-                                h2 { class: "usage-section-title", id: "usage-quota-title", "Quota" }
-                                p { class: "usage-section-sub", "Your daily budget of bot tasks." }
+                } else {
+                    div { class: "usage-hero-grid",
+                        // Card 1: Tokens
+                        div { class: "usage-card usage-kpi-card",
+                            div { class: "usage-kpi-head",
+                                span { class: "usage-kpi-label", "Tokens" }
+                                span { class: "usage-kpi-badge", "Last {days}d" }
+                            }
+                            span { class: "usage-kpi-value",
+                                if let Some(ref r) = report {
+                                    "{group_digits(r.totals.total_tokens)}"
+                                } else {
+                                    "\u{2014}"
+                                }
+                            }
+                            span { class: "usage-kpi-sub",
+                                if let Some(ref r) = report {
+                                    "{group_digits(r.totals.prompt_tokens)} in \u{b7} {group_digits(r.totals.completion_tokens)} out \u{b7} {ops::millions(cached_m)} cached"
+                                } else {
+                                    "Input, output and cached"
+                                }
                             }
                         }
-                        DailyTaskQuotaCard { quota }
-                    }
-                }
-                if is_admin {
-                    section { class: "usage-section", "aria-labelledby": "usage-reliability-title",
-                        div { class: "page-section-head",
-                            div {
-                                h2 { class: "usage-section-title", id: "usage-reliability-title", "Reliability" }
-                                p { class: "usage-section-sub", "How your server is doing. Only you, the owner, see this." }
+                        // Card 2: Estimated Cost
+                        div { class: "usage-card usage-kpi-card",
+                            div { class: "usage-kpi-head",
+                                span { class: "usage-kpi-label", "Estimated Cost" }
+                                span { class: "usage-kpi-badge", "This month" }
+                            }
+                            span {
+                                class: if month_usd.is_some() { "usage-kpi-value" } else { "usage-kpi-value muted-value" },
+                                if let Some(usd) = month_usd {
+                                    "{ops::usd(usd)}"
+                                } else {
+                                    "\u{2014}"
+                                }
+                            }
+                            if let (Some(pct), Some(budget)) = (budget_pct, budget_usd) {
+                                Meter {
+                                    percent: pct,
+                                    label: "Monthly budget".to_owned(),
+                                    warn: budget_level == Some(80) || (80..100).contains(&pct),
+                                    danger: budget_level == Some(100) || pct >= 100,
+                                }
+                                span { class: "usage-kpi-sub", "{pct}% of {ops::usd(budget)} monthly budget" }
+                            } else if unpriced_tokens > 0 {
+                                span { class: "usage-kpi-sub", "{group_digits(unpriced_tokens)} unpriced tokens" }
+                            } else {
+                                span { class: "usage-kpi-sub", "No monthly budget set" }
                             }
                         }
-                        ServerHealthCard { session }
-                    }
-                }
-                section { class: "usage-section", "aria-labelledby": "usage-ops-title",
-                    div { class: "page-section-head",
-                        div {
-                            h2 { class: "usage-section-title", id: "usage-ops-title", "Alerts, costs and backups" }
-                            p { class: "usage-section-sub", "Where SeraBot warns you, and whether your data is safe." }
-                        }
-                    }
-                    div { class: "insights-grid",
-                        AlertsCard { session }
-                        CostsCard { session, is_admin }
-                        if is_admin {
-                            BackupsCard { session }
-                        }
-                    }
-                }
-                section { class: "usage-section", "aria-labelledby": "usage-jobs-title",
-                    div { class: "page-section-head",
-                        div {
-                            h2 { class: "usage-section-title", id: "usage-jobs-title", "Job search" }
-                            p { class: "usage-section-sub", "What JobFinder watches for you, and where your applications stand." }
-                        }
-                    }
-                    div { class: "insights-grid",
-                        JobSearchCard { session }
-                    }
-                }
-                section { class: "usage-section", "aria-labelledby": "usage-activity-title",
-                    div { class: "page-section-head",
-                        div {
-                            h2 { class: "usage-section-title", id: "usage-activity-title", "Activity" }
-                            p { class: "usage-section-sub", "Replies, tokens and tool runs in the last {days} days." }
-                        }
-                    }
-                    if loading && report.is_none() {
-                        div { class: "usage-tiles", role: "status", "aria-busy": "true", "aria-label": "Loading your usage",
-                            for n in 0..4 {
-                                div { key: "{n}", class: "stat-tile skeleton usage-skeleton", " " }
+                        // Card 3: Turns & Tools
+                        div { class: "usage-card usage-kpi-card",
+                            div { class: "usage-kpi-head",
+                                span { class: "usage-kpi-label", "Turns & Tools" }
+                                span { class: "usage-kpi-badge", "{group_digits(tool_runs)} tools" }
+                            }
+                            span { class: "usage-kpi-value",
+                                if let Some(ref r) = report {
+                                    "{group_digits(r.totals.calls)}"
+                                } else {
+                                    "\u{2014}"
+                                }
+                            }
+                            span { class: "usage-kpi-sub",
+                                if report.is_some() {
+                                    "LLM calls \u{b7} {group_digits(tool_ok)} ok \u{b7} {group_digits(tool_fail)} failed"
+                                } else {
+                                    "LLM calls and tool runs"
+                                }
                             }
                         }
-                    } else if let Some(report) = report {
-                        if empty {
-                            div { class: "empty",
-                                div { class: "empty-icon", Icon { name: "bolt", size: 20 } }
-                                h3 { class: "empty-title", "Nothing used in the last {days} days" }
-                                p { class: "empty-text", "Once your bots answer, the numbers show up here." }
+                        // Card 4: Health & Quota
+                        div { class: "usage-card usage-kpi-card",
+                            div { class: "usage-kpi-head",
+                                span { class: "usage-kpi-label", "Health & Quota" }
+                                if let Some(quota) = report.as_ref().map(|r| &r.quota.daily_tasks).filter(|q| q.limit > 0) {
+                                    LevelChip { level: Level::from_flags(quota.near_limit, quota.at_limit) }
+                                } else if server_needs_look {
+                                    StatusChip { tone: Tone::Warn, text: "Attention".to_owned() }
+                                } else {
+                                    StatusChip { tone: Tone::Ok, text: "OK".to_owned() }
+                                }
+                            }
+                            if let Some(quota) = report.as_ref().map(|r| &r.quota.daily_tasks).filter(|q| q.limit > 0) {
+                                span { class: "usage-kpi-value",
+                                    "{group_digits(quota.used)} / {group_digits(quota.limit as i64)}"
+                                }
+                                Meter {
+                                    percent: quota_percent(quota.used, quota.limit),
+                                    label: "Daily task quota".to_owned(),
+                                    warn: quota.near_limit,
+                                    danger: quota.at_limit,
+                                }
+                            } else {
+                                span { class: "usage-kpi-value",
+                                    if server_needs_look { "Needs a look" } else { "No daily cap" }
+                                }
+                            }
+                            span { class: "usage-kpi-sub", "{health_summary_line}" }
+                        }
+                    }
+                }
+
+                // 2. Segmented Sub-View Tabs
+                div { class: "seg usage-tabs", role: "tablist", "aria-label": "Usage views",
+                    for tab in UsageTab::ALL {
+                        button {
+                            key: "{tab.label()}",
+                            class: if active_tab() == tab { "seg-btn active" } else { "seg-btn" },
+                            r#type: "button",
+                            role: "tab",
+                            "aria-selected": if active_tab() == tab { "true" } else { "false" },
+                            onclick: move |_| active_tab.set(tab),
+                            "{tab.label()}"
+                        }
+                    }
+                }
+
+                // 3. Active Sub-View Content
+                match active_tab() {
+                    UsageTab::Overview => rsx! {
+                        if loading && report.is_none() {
+                            div { class: "usage-card skeleton usage-chart-skeleton", role: "status", "aria-busy": "true", " " }
+                        } else if report.is_some() {
+                            if empty {
+                                div { class: "usage-card empty",
+                                    div { class: "empty-icon", Icon { name: "bolt", size: 20 } }
+                                    h3 { class: "empty-title", "Nothing used in the last {days} days" }
+                                    p { class: "empty-text", "Once your bots answer, the numbers show up here." }
+                                }
+                            } else {
+                                div { class: "card usage-card usage-chart-card",
+                                    div { class: "card-head",
+                                        h3 { class: "card-title", "Tokens per day" }
+                                        if loading {
+                                            span { class: "spinner", title: "Refreshing" }
+                                        } else if !axis_peak.is_empty() {
+                                            span { class: "page-count", "{axis_peak}" }
+                                        }
+                                    }
+                                    if bars.is_empty() {
+                                        p { class: "tiny", "No daily breakdown reported for this period." }
+                                    } else {
+                                        div { class: "usage-chart-wrap",
+                                            div { class: "usage-chart", role: "img", "aria-label": "Tokens used per day",
+                                                for (index, (day, tokens, height)) in bars.iter().enumerate() {
+                                                    div {
+                                                        key: "{day}",
+                                                        class: "usage-bar-col",
+                                                        title: "{day}: {group_digits(*tokens)} tokens",
+                                                        div {
+                                                            class: "usage-bar",
+                                                            style: "height: {height}%; --bar-delay: {index.min(40) * 12}ms;",
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            div { class: "usage-chart-labels", "aria-hidden": "true",
+                                                for (index, (day, _, _)) in bars.iter().enumerate() {
+                                                    {
+                                                        let label = if index % label_step == 0 || index == bar_count - 1 {
+                                                            day.rsplit('-').next().unwrap_or("").to_owned()
+                                                        } else {
+                                                            String::new()
+                                                        };
+                                                        rsx! {
+                                                            span { key: "{index}", class: "usage-bar-label", "{label}" }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            div { class: "usage-chart-axis",
+                                                span { "{axis_start}" }
+                                                span { "{axis_end}" }
+                                            }
+                                        }
+                                    }
+                                }
+                                div { class: "usage-overview-grid",
+                                    div { class: "card usage-card",
+                                        div { class: "card-head",
+                                            h3 { class: "card-title", "Top models" }
+                                            button {
+                                                class: "btn ghost sm",
+                                                r#type: "button",
+                                                onclick: move |_| active_tab.set(UsageTab::ModelsAndBots),
+                                                "View all"
+                                            }
+                                        }
+                                        if top_models.is_empty() {
+                                            p { class: "tiny", "No per-model breakdown reported for this period." }
+                                        } else {
+                                            div { class: "usage-summary-list",
+                                                for row in top_models.iter().take(5) {
+                                                    {
+                                                        let pct = share_percent(row.total_tokens, total_tokens);
+                                                        let bar_w = if row.total_tokens > 0 { pct.max(2) } else { 0 };
+                                                        rsx! {
+                                                            div { key: "{row.provider}/{row.model}", class: "usage-summary-row",
+                                                                div { class: "usage-summary-meta",
+                                                                    span { class: "usage-model", "{row.model}" }
+                                                                    span { class: "tiny", "{human_provider(&row.provider)} \u{b7} {group_digits(row.calls)} calls" }
+                                                                }
+                                                                div { class: "usage-share-bar",
+                                                                    div { class: "usage-share-fill", style: "width: {bar_w}%;" }
+                                                                }
+                                                                span { class: "usage-summary-val", "{group_digits(row.total_tokens)}" }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    div { class: "card usage-card",
+                                        div { class: "card-head",
+                                            h3 { class: "card-title", "Top bots" }
+                                            button {
+                                                class: "btn ghost sm",
+                                                r#type: "button",
+                                                onclick: move |_| active_tab.set(UsageTab::ModelsAndBots),
+                                                "View all"
+                                            }
+                                        }
+                                        if top_bots.is_empty() {
+                                            p { class: "tiny", "No per-bot breakdown reported for this period." }
+                                        } else {
+                                            div { class: "usage-summary-list",
+                                                for row in top_bots.iter().take(5) {
+                                                    {
+                                                        let bot_id = row.bot.clone().unwrap_or_default();
+                                                        let pct = share_percent(row.total_tokens, total_tokens);
+                                                        let bar_w = if row.total_tokens > 0 { pct.max(2) } else { 0 };
+                                                        rsx! {
+                                                            div { key: "{bot_id}", class: "usage-summary-row",
+                                                                div { class: "usage-summary-meta",
+                                                                    span { class: "usage-model", "{humanize_label(&bot_id)}" }
+                                                                    span { class: "tiny", "{group_digits(row.calls)} replies \u{b7} {pct}%" }
+                                                                }
+                                                                div { class: "usage-share-bar",
+                                                                    div { class: "usage-share-fill", style: "width: {bar_w}%;" }
+                                                                }
+                                                                span { class: "usage-summary-val", "{group_digits(row.total_tokens)}" }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         } else {
-                            div { class: "usage-tiles",
-                                div { class: "stat-tile",
-                                    span { class: "stat-tile-value", "{group_digits(report.totals.calls)}" }
-                                    span { class: "stat-tile-label", "AI replies" }
-                                    span { class: "stat-tile-sub", "Answers your bots gave" }
+                            div { class: "usage-card empty usage-error", role: "alert",
+                                div { class: "empty-icon danger", Icon { name: "alert", size: 20 } }
+                                h3 { class: "empty-title", "Usage could not be loaded" }
+                                p { class: "empty-text",
+                                    "{error.as_deref().unwrap_or(\"The server did not answer. Try again in a moment.\")}"
                                 }
-                                div { class: "stat-tile",
-                                    span { class: "stat-tile-value", "{group_digits(report.totals.total_tokens)}" }
-                                    span { class: "stat-tile-label", "Tokens used" }
-                                    span { class: "stat-tile-sub",
-                                        "{group_digits(report.totals.prompt_tokens)} in \u{b7} {group_digits(report.totals.completion_tokens)} out"
-                                    }
-                                }
-                                div { class: "stat-tile",
-                                    span { class: "stat-tile-value", "{group_digits(tool_runs)}" }
-                                    span { class: "stat-tile-label", "Tool runs" }
-                                    span { class: "stat-tile-sub", "Searches, documents and more" }
-                                }
-                                div { class: "stat-tile",
-                                    span { class: "stat-tile-value muted-value", "\u{2014}" }
-                                    span { class: "stat-tile-label", "Estimated cost" }
-                                    span { class: "stat-tile-sub", "See Costs this month below." }
+                                button {
+                                    class: "btn primary sm",
+                                    r#type: "button",
+                                    onclick: move |_| session.write().load_usage_days(days),
+                                    Icon { name: "refresh", size: 14 }
+                                    "Retry"
                                 }
                             }
-                            div { class: "card usage-chart-card",
-                                div { class: "card-head",
-                                    h3 { class: "card-title", "Tokens per day" }
-                                    if loading {
-                                        span { class: "spinner", title: "Refreshing" }
-                                    } else if !axis_peak.is_empty() {
-                                        span { class: "page-count", "{axis_peak}" }
-                                    }
+                        }
+                    },
+                    UsageTab::ModelsAndBots => rsx! {
+                        if loading && report.is_none() {
+                            div { class: "usage-card skeleton usage-chart-skeleton", role: "status", "aria-busy": "true", " " }
+                        } else if report.is_none() {
+                            div { class: "usage-card empty usage-error", role: "alert",
+                                div { class: "empty-icon danger", Icon { name: "alert", size: 20 } }
+                                h3 { class: "empty-title", "Usage could not be loaded" }
+                                p { class: "empty-text",
+                                    "{error.as_deref().unwrap_or(\"The server did not answer. Try again in a moment.\")}"
                                 }
-                                if bars.is_empty() {
-                                    p { class: "tiny", "No daily breakdown reported for this period." }
-                                } else {
-                                    div { class: "usage-chart-wrap",
-                                        div { class: "usage-chart", role: "img", "aria-label": "Tokens used per day",
-                                            for (index, (day, tokens, height)) in bars.iter().enumerate() {
-                                                div {
-                                                    key: "{day}",
-                                                    class: "usage-bar-col",
-                                                    title: "{day}: {group_digits(*tokens)} tokens",
-                                                    div {
-                                                        class: "usage-bar",
-                                                        style: "height: {height}%; --bar-delay: {index.min(40) * 12}ms;",
-                                                    }
+                                button {
+                                    class: "btn primary sm",
+                                    r#type: "button",
+                                    onclick: move |_| session.write().load_usage_days(days),
+                                    Icon { name: "refresh", size: 14 }
+                                    "Retry"
+                                }
+                            }
+                        } else if empty {
+                            div { class: "usage-card empty",
+                                div { class: "empty-icon", Icon { name: "bolt", size: 20 } }
+                                h3 { class: "empty-title", "Nothing used in the last {days} days" }
+                                p { class: "empty-text", "Once your bots answer, per-model and per-bot tables appear here." }
+                            }
+                        } else {
+                            section { class: "usage-section",
+                                div { class: "page-section-head",
+                                    div {
+                                        h2 { class: "usage-section-title", "Models & Bots" }
+                                        p { class: "usage-section-sub", "Where the tokens went in the last {days} days." }
+                                    }
+                                    div { class: "usage-toolbar",
+                                        div { class: "search-wrap",
+                                            input {
+                                                class: "input",
+                                                r#type: "search",
+                                                placeholder: "Filter models or bots\u{2026}",
+                                                "aria-label": "Filter usage tables",
+                                                value: "{filter}",
+                                                oninput: move |event| filter.set(event.value()),
+                                            }
+                                            if !filter.read().trim().is_empty() {
+                                                button {
+                                                    class: "btn ghost sm",
+                                                    r#type: "button",
+                                                    onclick: move |_| filter.set(String::new()),
+                                                    "Clear"
                                                 }
                                             }
                                         }
-                                        div { class: "usage-chart-labels", "aria-hidden": "true",
-                                            for (index, (day, _, _)) in bars.iter().enumerate() {
-                                                {
-                                                    let label = if index % label_step == 0 || index == bar_count - 1 {
-                                                        day.rsplit('-').next().unwrap_or("").to_owned()
-                                                    } else {
-                                                        String::new()
-                                                    };
-                                                    rsx! {
-                                                        span { key: "{index}", class: "usage-bar-label", "{label}" }
-                                                    }
-                                                }
+                                        div { class: "seg", role: "group", "aria-label": "Sort usage rows",
+                                            button {
+                                                class: if sort_by() == UsageSort::TokensDesc { "seg-btn active" } else { "seg-btn" },
+                                                r#type: "button",
+                                                onclick: move |_| sort_by.set(UsageSort::TokensDesc),
+                                                "By tokens"
+                                            }
+                                            button {
+                                                class: if sort_by() == UsageSort::CallsDesc { "seg-btn active" } else { "seg-btn" },
+                                                r#type: "button",
+                                                onclick: move |_| sort_by.set(UsageSort::CallsDesc),
+                                                "By replies"
+                                            }
+                                            button {
+                                                class: if sort_by() == UsageSort::NameAsc { "seg-btn active" } else { "seg-btn" },
+                                                r#type: "button",
+                                                onclick: move |_| sort_by.set(UsageSort::NameAsc),
+                                                "Name"
                                             }
                                         }
-                                        div { class: "usage-chart-axis",
-                                            span { "{axis_start}" }
-                                            span { "{axis_end}" }
+                                    }
+                                }
+                                div { class: "usage-breakdown",
+                                    div { class: "card usage-card",
+                                        div { class: "card-head",
+                                            h3 { class: "card-title", "Per-Model" }
+                                            span { class: "page-count", "{model_rows.len()} models" }
                                         }
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        div { class: "empty usage-error", role: "alert",
-                            div { class: "empty-icon danger", Icon { name: "alert", size: 20 } }
-                            h3 { class: "empty-title", "Usage could not be loaded" }
-                            p { class: "empty-text",
-                                "{error.as_deref().unwrap_or(\"The server did not answer. Try again in a moment.\")}"
-                            }
-                            button {
-                                class: "btn primary sm",
-                                r#type: "button",
-                                onclick: move |_| session.write().load_usage_days(days),
-                                Icon { name: "refresh", size: 14 }
-                                "Retry"
-                            }
-                        }
-                    }
-                }
-                UsageInsights { session, days: days.min(90) }
-                BotHealthCard { session, days }
-                if report_ready && !empty {
-                    section { class: "usage-section", "aria-labelledby": "usage-breakdown-title",
-                        div { class: "page-section-head",
-                            div {
-                                h2 { class: "usage-section-title", id: "usage-breakdown-title", "Breakdown" }
-                                p { class: "usage-section-sub", "Where the tokens went." }
-                            }
-                            div { class: "usage-toolbar",
-                                div { class: "search-wrap",
-                                    input {
-                                        class: "input",
-                                        r#type: "search",
-                                        placeholder: "Filter models or bots\u{2026}",
-                                        "aria-label": "Filter usage tables",
-                                        value: "{filter}",
-                                        oninput: move |event| filter.set(event.value()),
-                                    }
-                                    if !filter.read().trim().is_empty() {
-                                        button {
-                                            class: "btn ghost sm",
-                                            r#type: "button",
-                                            onclick: move |_| filter.set(String::new()),
-                                            "Clear"
-                                        }
-                                    }
-                                }
-                                div { class: "seg", role: "group", "aria-label": "Sort usage rows",
-                                    button {
-                                        class: if sort_by() == UsageSort::TokensDesc { "seg-btn active" } else { "seg-btn" },
-                                        r#type: "button",
-                                        onclick: move |_| sort_by.set(UsageSort::TokensDesc),
-                                        "By tokens"
-                                    }
-                                    button {
-                                        class: if sort_by() == UsageSort::CallsDesc { "seg-btn active" } else { "seg-btn" },
-                                        r#type: "button",
-                                        onclick: move |_| sort_by.set(UsageSort::CallsDesc),
-                                        "By replies"
-                                    }
-                                    button {
-                                        class: if sort_by() == UsageSort::NameAsc { "seg-btn active" } else { "seg-btn" },
-                                        r#type: "button",
-                                        onclick: move |_| sort_by.set(UsageSort::NameAsc),
-                                        "Name"
-                                    }
-                                }
-                            }
-                        }
-                        div { class: "usage-breakdown",
-                            div { class: "card",
-                                div { class: "card-head",
-                                    h3 { class: "card-title", "By model" }
-                                }
-                                if model_rows.is_empty() {
-                                    p { class: "tiny",
-                                        if filter.read().trim().is_empty() {
-                                            "No per-model breakdown reported for this period."
+                                        if model_rows.is_empty() {
+                                            p { class: "tiny",
+                                                if filter.read().trim().is_empty() {
+                                                    "No per-model breakdown reported for this period."
+                                                } else {
+                                                    "No models match \u{201c}{filter}\u{201d}."
+                                                }
+                                            }
                                         } else {
-                                            "No models match \u{201c}{filter}\u{201d}."
-                                        }
-                                    }
-                                } else {
-                                    div { class: "usage-table-wrap",
-                                        table { class: "usage-table",
-                                            thead {
-                                                tr {
-                                                    th { "Provider" }
-                                                    th { "Model" }
-                                                    th { class: "num", "Replies" }
-                                                    th { class: "num", "Tokens" }
-                                                }
-                                            }
-                                            tbody {
-                                                for row in model_rows {
-                                                    tr { key: "{row.provider}/{row.model}",
-                                                        td { "{human_provider(&row.provider)}" }
-                                                        td { class: "usage-model", "{row.model}" }
-                                                        td { class: "num", "{group_digits(row.calls)}" }
-                                                        td { class: "num", "{group_digits(row.total_tokens)}" }
+                                            div { class: "usage-table-wrap",
+                                                table { class: "usage-table",
+                                                    thead {
+                                                        tr {
+                                                            th { "Provider" }
+                                                            th { "Model" }
+                                                            th { class: "num", "Replies" }
+                                                            th { "Share" }
+                                                            th { class: "num", "Tokens" }
+                                                        }
+                                                    }
+                                                    tbody {
+                                                        for row in model_rows {
+                                                            {
+                                                                let pct = share_percent(row.total_tokens, total_tokens);
+                                                                let bar_w = if row.total_tokens > 0 { pct.max(2) } else { 0 };
+                                                                rsx! {
+                                                                    tr { key: "{row.provider}/{row.model}",
+                                                                        td { "{human_provider(&row.provider)}" }
+                                                                        td { class: "usage-model", "{row.model}" }
+                                                                        td { class: "num", "{group_digits(row.calls)}" }
+                                                                        td { class: "usage-share-cell",
+                                                                            div { class: "usage-share-wrap",
+                                                                                div { class: "usage-share-bar",
+                                                                                    div { class: "usage-share-fill", style: "width: {bar_w}%;" }
+                                                                                }
+                                                                                span { class: "usage-share-pct", "{pct}%" }
+                                                                            }
+                                                                        }
+                                                                        td { class: "num", "{group_digits(row.total_tokens)}" }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
                                     }
-                                }
-                            }
-                            div { class: "card",
-                                div { class: "card-head",
-                                    h3 { class: "card-title", "By bot" }
-                                }
-                                if bot_rows.is_empty() {
-                                    p { class: "tiny",
-                                        if filter.read().trim().is_empty() {
-                                            "No per-bot breakdown reported for this period."
+                                    div { class: "card usage-card",
+                                        div { class: "card-head",
+                                            h3 { class: "card-title", "Per-Bot" }
+                                            span { class: "page-count", "{bot_rows.len()} bots" }
+                                        }
+                                        if bot_rows.is_empty() {
+                                            p { class: "tiny",
+                                                if filter.read().trim().is_empty() {
+                                                    "No per-bot breakdown reported for this period."
+                                                } else {
+                                                    "No bots match \u{201c}{filter}\u{201d}."
+                                                }
+                                            }
                                         } else {
-                                            "No bots match \u{201c}{filter}\u{201d}."
-                                        }
-                                    }
-                                } else {
-                                    div { class: "usage-table-wrap",
-                                        table { class: "usage-table",
-                                            thead {
-                                                tr {
-                                                    th { "Bot" }
-                                                    th { class: "num", "Replies" }
-                                                    th { class: "num", "Tokens" }
-                                                }
-                                            }
-                                            tbody {
-                                                for row in bot_rows {
-                                                    tr { key: "{row.bot.clone().unwrap_or_default()}",
-                                                        td { "{humanize_label(&row.bot.clone().unwrap_or_default())}" }
-                                                        td { class: "num", "{group_digits(row.calls)}" }
-                                                        td { class: "num", "{group_digits(row.total_tokens)}" }
+                                            div { class: "usage-table-wrap",
+                                                table { class: "usage-table",
+                                                    thead {
+                                                        tr {
+                                                            th { "Bot" }
+                                                            th { class: "num", "Replies" }
+                                                            th { "Share" }
+                                                            th { class: "num", "Tokens" }
+                                                        }
+                                                    }
+                                                    tbody {
+                                                        for row in bot_rows {
+                                                            {
+                                                                let bot_id = row.bot.clone().unwrap_or_default();
+                                                                let pct = share_percent(row.total_tokens, total_tokens);
+                                                                let bar_w = if row.total_tokens > 0 { pct.max(2) } else { 0 };
+                                                                rsx! {
+                                                                    tr { key: "{bot_id}",
+                                                                        td { "{humanize_label(&bot_id)}" }
+                                                                        td { class: "num", "{group_digits(row.calls)}" }
+                                                                        td { class: "usage-share-cell",
+                                                                            div { class: "usage-share-wrap",
+                                                                                div { class: "usage-share-bar",
+                                                                                    div { class: "usage-share-fill", style: "width: {bar_w}%;" }
+                                                                                }
+                                                                                span { class: "usage-share-pct", "{pct}%" }
+                                                                            }
+                                                                        }
+                                                                        td { class: "num", "{group_digits(row.total_tokens)}" }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
@@ -566,23 +866,83 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
                                 }
                             }
                         }
-                    }
-                }
-                section { class: "usage-section", "aria-labelledby": "usage-pc-title",
-                    div { class: "page-section-head",
-                        div {
-                            h2 { class: "usage-section-title", id: "usage-pc-title", "This computer" }
-                            p { class: "usage-section-sub", "What SeraBot uses on this computer." }
+                    },
+                    UsageTab::InsightsAndRelay => rsx! {
+                        UsageInsights { session, days: days.min(90) }
+                    },
+                    UsageTab::CostsAndAlerts => rsx! {
+                        section { class: "usage-section",
+                            div { class: "page-section-head",
+                                div {
+                                    h2 { class: "usage-section-title", "Costs & Alerts" }
+                                    p { class: "usage-section-sub", "Where SeraBot warns you, your monthly spend, and whether your data is safe." }
+                                }
+                            }
+                            div { class: "insights-grid",
+                                AlertsCard { session }
+                                CostsCard { session, is_admin }
+                                if is_admin {
+                                    BackupsCard { session }
+                                }
+                            }
                         }
-                        button {
-                            class: "btn ghost sm",
-                            r#type: "button",
-                            onclick: move |_| session.read().refresh_pc(),
-                            Icon { name: "refresh", size: 14 }
-                            "Refresh"
+                    },
+                    UsageTab::Health => rsx! {
+                        if let Some(quota) = report
+                            .as_ref()
+                            .map(|report| report.quota.daily_tasks.clone())
+                            .filter(|quota| quota.limit > 0)
+                        {
+                            section { class: "usage-section",
+                                div { class: "page-section-head",
+                                    div {
+                                        h2 { class: "usage-section-title", "Quota" }
+                                        p { class: "usage-section-sub", "Your daily budget of bot tasks." }
+                                    }
+                                }
+                                DailyTaskQuotaCard { quota }
+                            }
                         }
-                    }
-                    ThisPcCard { session }
+                        if is_admin {
+                            section { class: "usage-section",
+                                div { class: "page-section-head",
+                                    div {
+                                        h2 { class: "usage-section-title", "Reliability" }
+                                        p { class: "usage-section-sub", "How your server is doing. Only you, the owner, see this." }
+                                    }
+                                }
+                                ServerHealthCard { session }
+                            }
+                        }
+                        section { class: "usage-section",
+                            div { class: "page-section-head",
+                                div {
+                                    h2 { class: "usage-section-title", "Job search" }
+                                    p { class: "usage-section-sub", "What JobFinder watches for you, and where your applications stand." }
+                                }
+                            }
+                            div { class: "insights-grid",
+                                JobSearchCard { session }
+                            }
+                        }
+                        BotHealthCard { session, days }
+                        section { class: "usage-section",
+                            div { class: "page-section-head",
+                                div {
+                                    h2 { class: "usage-section-title", "This computer" }
+                                    p { class: "usage-section-sub", "What SeraBot uses on this computer." }
+                                }
+                                button {
+                                    class: "btn ghost sm",
+                                    r#type: "button",
+                                    onclick: move |_| session.read().refresh_pc(),
+                                    Icon { name: "refresh", size: 14 }
+                                    "Refresh"
+                                }
+                            }
+                            ThisPcCard { session }
+                        }
+                    },
                 }
             }
         }
@@ -606,9 +966,9 @@ fn DailyTaskQuotaCard(quota: serabot_desktop::UsageDailyTaskQuota) -> Element {
         Level::Ok => "Queued and completed tasks count toward this UTC-day budget.".to_owned(),
     };
     let class = match level {
-        Level::Ok => "card quota-card",
-        Level::Near => "card quota-card near",
-        Level::AtLimit => "card quota-card at-limit",
+        Level::Ok => "card usage-card quota-card",
+        Level::Near => "card usage-card quota-card near",
+        Level::AtLimit => "card usage-card quota-card at-limit",
     };
     rsx! {
         div {
@@ -707,7 +1067,7 @@ fn ServerHealthCard(session: Signal<Session>) -> Element {
     };
     let Some(status) = status else {
         return rsx! {
-            div { class: "card health-card",
+            div { class: "card usage-card health-card",
                 div { class: "card-head",
                     h3 { class: "card-title", "Your server" }
                     if loading {
@@ -738,7 +1098,7 @@ fn ServerHealthCard(session: Signal<Session>) -> Element {
     let biggest = categories.first().map(|c| c.bytes).unwrap_or(0);
     let process_pct = percent(status.process.memory_bytes, status.host.memory_total_bytes);
     rsx! {
-        div { class: "card health-card",
+        div { class: "card usage-card health-card",
             div { class: "card-head",
                 h3 { class: "card-title", "Your server" }
                 if loading {
@@ -914,7 +1274,7 @@ fn ThisPcCard(session: Signal<Session>) -> Element {
     let view = session.read().pc.view();
     let Some(quick) = view.quick else {
         return rsx! {
-            div { class: "card health-card", "aria-busy": "true",
+            div { class: "card usage-card health-card", "aria-busy": "true",
                 div { class: "health-summary",
                     for n in 0..3 {
                         div { key: "{n}", class: "skeleton usage-skeleton", " " }
@@ -950,7 +1310,7 @@ fn ThisPcCard(session: Signal<Session>) -> Element {
     let clearable = quick.data.clearable();
     let open_confirm = confirming();
     rsx! {
-        div { class: "card health-card",
+        div { class: "card usage-card health-card",
             div { class: "health-summary",
                 HealthItem {
                     label: "App memory",
@@ -1039,6 +1399,36 @@ mod tests {
         assert_eq!(group_digits(1000), "1,000");
         assert_eq!(group_digits(1234567), "1,234,567");
         assert_eq!(group_digits(-5), "0");
+    }
+
+    #[test]
+    fn share_and_tool_summaries_handle_bounds() {
+        assert_eq!(share_percent(0, 100), 0);
+        assert_eq!(share_percent(50, 0), 0);
+        assert_eq!(share_percent(25, 100), 25);
+        assert_eq!(share_percent(150, 100), 100);
+
+        let tools = vec![
+            UsageTool {
+                tool: "web_search".into(),
+                completed: 8,
+                failed: 2,
+            },
+            UsageTool {
+                tool: "file_read".into(),
+                completed: 5,
+                failed: 0,
+            },
+        ];
+        assert_eq!(tool_summary(&tools), (13, 2, 15));
+        assert_eq!(tool_summary(&[]), (0, 0, 0));
+
+        assert_eq!(UsageTab::ALL.len(), 5);
+        assert_eq!(UsageTab::Overview.label(), "Overview");
+        assert_eq!(UsageTab::ModelsAndBots.label(), "Models & Bots");
+        assert_eq!(UsageTab::InsightsAndRelay.label(), "Insights & Relay");
+        assert_eq!(UsageTab::CostsAndAlerts.label(), "Costs & Alerts");
+        assert_eq!(UsageTab::Health.label(), "Health");
     }
 
     #[test]

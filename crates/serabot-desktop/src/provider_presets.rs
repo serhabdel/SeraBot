@@ -131,6 +131,12 @@ pub const PLAN_RISK_CODEX: &str = "This signs in through ChatGPT's own Codex cli
 /// text.
 pub const PLAN_RISK_COPILOT: &str = "This signs in through GitHub Copilot's own editor client, not an API contract. GitHub may restrict or suspend an account used this way. It is your own account and is never shared. A GitHub account without a Copilot plan cannot use it.";
 
+/// Shown beside an AWS Kiro sign-in when the server does not send its own text.
+pub const PLAN_RISK_KIRO: &str = "This signs in through AWS Kiro's own Builder ID / IAM Identity Center client, not an API contract. AWS may restrict or suspend an account used this way. It is your own account and is never shared.";
+
+/// Shown beside a Devin CLI sign-in when the server does not send its own text.
+pub const PLAN_RISK_DEVIN: &str = "This signs in through Devin CLI's own client, not an API contract. Cognition may restrict or suspend an account used this way. It is your own account and is never shared.";
+
 const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "antigravity",
@@ -761,6 +767,40 @@ const PRESETS: &[ProviderPreset] = &[
         risk: "",
     },
     ProviderPreset {
+        id: "kiro",
+        label: "AWS Kiro",
+        subtitle: "AWS Kiro (Amazon Q / CodeWhisperer) — sign in with AWS Builder ID or paste a token",
+        base_url: "https://q.us-east-1.amazonaws.com",
+        kind: "kiro",
+        default_id: "kiro",
+        models: &["claude-sonnet-4-5", "claude-opus-4-5", "claude-haiku-4-5"],
+        secret_name: "kiro_api_key",
+        catalog_fetch: true,
+        auth: "oauth_or_key",
+        badge: "OAuth / API Key",
+        note: "Sign in with AWS Builder ID (device code) or paste a Kiro token",
+        key_url: "https://kiro.dev",
+        sign_in: "device",
+        risk: PLAN_RISK_KIRO,
+    },
+    ProviderPreset {
+        id: "devin",
+        label: "Devin CLI",
+        subtitle: "Devin CLI (SWE-2 & frontier models) — sign in in browser or paste a session token",
+        base_url: "https://server.codeium.com",
+        kind: "devin",
+        default_id: "devin",
+        models: &["swe-2.1", "swe-2", "claude-sonnet-4-5", "gpt-5.6-sol"],
+        secret_name: "devin_api_key",
+        catalog_fetch: true,
+        auth: "oauth_or_key",
+        badge: "OAuth / API Key",
+        note: "Sign in with Devin (browser) or paste a devin-session-token",
+        key_url: "https://app.devin.ai/settings/api-keys",
+        sign_in: "pkce",
+        risk: PLAN_RISK_DEVIN,
+    },
+    ProviderPreset {
         id: "ollama",
         label: "Ollama (Local)",
         subtitle: "Your own Ollama server. No key needed. Change the address for another machine.",
@@ -932,6 +972,8 @@ mod tests {
                         | "sambanova"
                         | "inception"
                         | "claude-agent-sdk"
+                        | "kiro"
+                        | "devin"
                 ),
                 "{:?}",
                 preset.id
@@ -1170,6 +1212,10 @@ mod tests {
                 "github-copilot" => "device",
                 // Mistral: browser sign-in or an API key.
                 "mistral" => "browser",
+                // Kiro: AWS Builder ID device code or pasted token.
+                "kiro" => "device",
+                // Devin CLI: browser PKCE sign-in or pasted session token.
+                "devin" => "pkce",
                 _ => "",
             };
             assert_eq!(preset.sign_in, expected_sign_in, "{:?}", preset.id);
@@ -1212,13 +1258,17 @@ mod tests {
                 "antigravity",
                 "chatgpt-codex",
                 "github-copilot",
-                "anthropic"
+                "anthropic",
+                "kiro",
+                "devin"
             ]
         );
         assert!(PLAN_RISK_COPILOT.contains("suspend"));
         assert!(PLAN_RISK_GOOGLE.contains("suspend"));
         assert!(PLAN_RISK_CODEX.contains("API keys on the OpenAI provider"));
         assert!(PLAN_RISK_CLAUDE.contains("API keys are the supported path"));
+        assert!(PLAN_RISK_KIRO.contains("suspend"));
+        assert!(PLAN_RISK_DEVIN.contains("suspend"));
         // A risk never hides on a plain key provider.
         for id in ["openai", "mistral", "opencode-go", "nous", "muse-code"] {
             assert!(preset_for(id).unwrap().risk.is_empty(), "{id}");

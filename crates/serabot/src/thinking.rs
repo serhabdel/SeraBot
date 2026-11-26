@@ -52,10 +52,10 @@ pub fn levels_for(kind: &str, model: &str, tags: &[String]) -> Vec<&'static str>
                 &[]
             } else if id.starts_with("o1") || id.starts_with("o3") || id.starts_with("o4") {
                 &["low", "medium", "high"]
-            } else if matches!(id.as_str(), "gpt-6-astra" | "gpt-6.1-sol") {
+            } else if id.starts_with("gpt-6-astra") || id.starts_with("gpt-6.1-sol") {
                 // OpenAI's models page: no `none`, and `max` on top.
                 &["low", "medium", "high", "xhigh", "max"]
-            } else if matches!(id.as_str(), "gpt-6.1-terra" | "gpt-6-luna") {
+            } else if id.starts_with("gpt-6.1-terra") || id.starts_with("gpt-6-luna") {
                 &["off", "low", "medium", "high", "xhigh", "max"]
             } else if id.starts_with("gpt-5.") || id.starts_with("gpt-6") {
                 &["off", "low", "medium", "high", "xhigh"]
@@ -88,9 +88,13 @@ pub fn levels_for(kind: &str, model: &str, tags: &[String]) -> Vec<&'static str>
             }
         }
         "gemini" => {
-            if id.starts_with("gemini-2.5-pro") {
+            if is_gemini_pro_or_argon(&id) {
                 &["low", "medium", "high"]
-            } else if id.starts_with("gemini-2.5-flash") {
+            } else if id.starts_with("gemini-2.5-flash")
+                || id.starts_with("gemini-3-flash")
+                || id.starts_with("gemini-3.8-flash")
+                || id.starts_with("gemini-4-flash")
+            {
                 &["off", "low", "medium", "high"]
             } else if id.starts_with("gemini-3") || id.starts_with("gemini-4") {
                 &["low", "medium", "high"]
@@ -112,7 +116,11 @@ pub fn levels_for(kind: &str, model: &str, tags: &[String]) -> Vec<&'static str>
         "xai" => {
             if id.starts_with("grok-3-mini") {
                 &["low", "high"]
-            } else if id.starts_with("grok-4.6") || id.starts_with("grok-4.7") {
+            } else if id.starts_with("grok-4.6")
+                || id.starts_with("grok-4.7")
+                || id.starts_with("grok-4.8")
+                || id.starts_with("grok-5")
+            {
                 &["low", "medium", "high", "xhigh"]
             } else if id.starts_with("grok-4.5") {
                 &["low", "medium", "high"]
@@ -128,10 +136,12 @@ pub fn levels_for(kind: &str, model: &str, tags: &[String]) -> Vec<&'static str>
                 &[]
             }
         }
-        "anthropic" => {
-            if matches!(id.as_str(), "claude-fable-5-2" | "claude-opus-5-5") {
-                // Anthropic marks these two "always on": thinking cannot be off.
-                &["low", "medium", "high", "xhigh"]
+        "anthropic" | "claude-agent-sdk" => {
+            if is_always_on_claude(&id) {
+                // Anthropic marks these "always on": thinking cannot be off.
+                &["low", "medium", "high", "xhigh", "max"]
+            } else if is_non_thinking_claude(&id) {
+                &[]
             } else if anthropic_thinks(&id) || (id.starts_with("claude-") && has_reasoning_tag) {
                 &["off", "low", "medium", "high", "xhigh"]
             } else {
@@ -142,15 +152,32 @@ pub fn levels_for(kind: &str, model: &str, tags: &[String]) -> Vec<&'static str>
             if id.contains("gpt-oss") {
                 &[]
             } else if id.starts_with("claude") {
-                // `off` sends no thinking config; the rest are token budgets.
-                &["off", "low", "medium", "high", "max"]
-            } else if id.ends_with("-low") || id.ends_with("-medium") || id.ends_with("-high") {
+                if is_always_on_claude(&id) {
+                    &["low", "medium", "high", "max"]
+                } else if is_non_thinking_claude(&id) {
+                    &[]
+                } else if id.ends_with("-thinking")
+                    || id.starts_with("claude-sonnet-4-5")
+                    || id.starts_with("claude-opus-4-5")
+                    || id.starts_with("claude-sonnet-4-6")
+                    || id.starts_with("claude-sonnet-5-")
+                    || id.starts_with("claude-haiku-4-5")
+                    || id.starts_with("claude-haiku-5-")
+                    || anthropic_thinks(&id)
+                {
+                    // `off` sends no thinking config; the rest are token budgets.
+                    &["off", "low", "medium", "high", "max"]
+                } else {
+                    &[]
+                }
+            } else if is_gemini_suffixed(&id) {
                 // The level is baked into the id; no thinking config is sent.
                 &[]
-            } else if id.starts_with("gemini-2.5-pro") {
+            } else if id.ends_with("-tiered") {
+                &["off", "low", "medium", "high"]
+            } else if is_gemini_pro_or_argon(&id) {
                 &["low", "medium", "high"]
             } else if id.starts_with("gemini-2.5-flash")
-                || id.ends_with("-tiered")
                 || id.starts_with("gemini-3")
                 || id.starts_with("gemini-4")
             {
@@ -166,14 +193,14 @@ pub fn levels_for(kind: &str, model: &str, tags: &[String]) -> Vec<&'static str>
                 &["off", "low", "medium", "high"]
             } else if id.starts_with("gpt-5") && !id.starts_with("gpt-5-chat") {
                 &["minimal", "low", "medium", "high"]
-            } else if id.starts_with("gemini-2.5-pro") {
+            } else if is_gemini_pro_or_argon(&id) {
                 &["low", "medium", "high"]
             } else if id.starts_with("gemini-2.5-flash")
                 || id.starts_with("gemini-3")
                 || id.starts_with("gemini-4")
             {
                 &["off", "low", "medium", "high"]
-            } else if anthropic_thinks(&id) || has_reasoning_tag {
+            } else if !is_non_thinking_claude(&id) && (anthropic_thinks(&id) || has_reasoning_tag) {
                 &["low", "medium", "high"]
             } else {
                 &[]
@@ -181,6 +208,95 @@ pub fn levels_for(kind: &str, model: &str, tags: &[String]) -> Vec<&'static str>
         }
         // Both take the Responses `reasoning.effort`; `max` clamps to high.
         "muse-code" | "openai-codex" => &["off", "low", "medium", "high"],
+        "kiro" => {
+            if id.starts_with("claude-")
+                && !is_non_thinking_claude(&id)
+                && (anthropic_thinks(&id) || id.contains("thinking") || has_reasoning_tag)
+            {
+                &["off", "low", "medium", "high", "max"]
+            } else if has_reasoning_tag {
+                &["off", "low", "medium", "high", "xhigh", "max"]
+            } else {
+                &[]
+            }
+        }
+        "devin" => {
+            if id.starts_with("swe-2") || is_always_on_claude(&id) {
+                &["low", "medium", "high", "max"]
+            } else if is_non_thinking_claude(&id) {
+                &[]
+            } else if anthropic_thinks(&id) {
+                &["off", "low", "medium", "high", "max"]
+            } else if id.starts_with("gpt-5-chat") || id.contains("chat-latest") {
+                &[]
+            } else if id.starts_with("o1") || id.starts_with("o3") || id.starts_with("o4") {
+                &["low", "medium", "high"]
+            } else if id.starts_with("gpt-6-astra") || id.starts_with("gpt-6.1-sol") {
+                &["low", "medium", "high", "xhigh", "max"]
+            } else if id.starts_with("gpt-6.1-terra") || id.starts_with("gpt-6-luna") {
+                &["off", "low", "medium", "high", "xhigh", "max"]
+            } else if id.starts_with("gpt-5.") || id.starts_with("gpt-6") {
+                &["off", "low", "medium", "high", "xhigh"]
+            } else if id.starts_with("gpt-5") {
+                &["minimal", "low", "medium", "high"]
+            } else if is_gemini_pro_or_argon(&id) {
+                &["low", "medium", "high"]
+            } else if id.starts_with("gemini-2.5-flash")
+                || id.starts_with("gemini-3")
+                || id.starts_with("gemini-4")
+            {
+                &["off", "low", "medium", "high"]
+            } else if has_reasoning_tag {
+                &["low", "medium", "high"]
+            } else {
+                &[]
+            }
+        }
+        "moonshot" => {
+            if id.starts_with("kimi-k2-thinking")
+                || id.starts_with("kimi-k2.5")
+                || id.starts_with("kimi-k2-5")
+            {
+                &["off", "low", "medium", "high"]
+            } else {
+                &[]
+            }
+        }
+        "inception" => {
+            if id.starts_with("mercury-2") || id.starts_with("mercury-3") {
+                &["off", "low", "medium", "high"]
+            } else {
+                &[]
+            }
+        }
+        "ollama" => {
+            if id.starts_with("deepseek-r1")
+                || id.starts_with("qwen3")
+                || id.starts_with("qwq")
+                || id.starts_with("gpt-oss")
+                || has_reasoning_tag
+            {
+                &["off", "low", "medium", "high"]
+            } else {
+                &[]
+            }
+        }
+        "cerebras" | "together" | "fireworks" | "minimax" | "minimax-cn" | "nebius"
+        | "sambanova" => {
+            if id.contains("qwen3") {
+                &["off", "low", "medium", "high"]
+            } else if has_reasoning_tag
+                || id.contains("deepseek-r1")
+                || id.contains("gpt-oss")
+                || id.contains("kimi-k2")
+                || id.contains("minimax-m2")
+                || id.contains("minimax-m3")
+            {
+                &["low", "medium", "high"]
+            } else {
+                &[]
+            }
+        }
         kind if kind.starts_with("opencode-") => {
             // Only what the catalog tags as reasoning; OpenCode serves many
             // vendors' models behind one endpoint.
@@ -193,6 +309,39 @@ pub fn levels_for(kind: &str, model: &str, tags: &[String]) -> Vec<&'static str>
         _ => &[],
     };
     rule.to_vec()
+}
+
+fn is_always_on_claude(id: &str) -> bool {
+    id.starts_with("claude-opus-5-5")
+        || id.starts_with("claude-fable-5-2")
+        || id.starts_with("claude-opus-4-6")
+}
+
+fn is_non_thinking_claude(id: &str) -> bool {
+    id.starts_with("claude-3-5")
+        || id.starts_with("claude-3.5")
+        || id.starts_with("claude-haiku-3")
+        || id.starts_with("claude-3-haiku")
+        || id.starts_with("claude-3-sonnet")
+        || id.starts_with("claude-3-opus")
+        || id.starts_with("claude-2")
+}
+
+fn is_gemini_pro_or_argon(id: &str) -> bool {
+    id.starts_with("gemini-2.5-pro")
+        || id.starts_with("gemini-3-pro")
+        || id.starts_with("gemini-3.1-pro")
+        || id.starts_with("gemini-4-pro")
+        || id.starts_with("gemini-4-argon")
+}
+
+fn is_gemini_suffixed(id: &str) -> bool {
+    id.ends_with("-low")
+        || id.ends_with("-medium")
+        || id.ends_with("-high")
+        || id.ends_with("-minimal")
+        || id.ends_with("-xhigh")
+        || id.ends_with("-max")
 }
 
 /// Whether a Claude model id accepts extended thinking: Claude 3.7 and every
@@ -274,7 +423,7 @@ pub fn wire_fields(
         "openrouter" => {
             fields.insert("reasoning".into(), json!({"effort": level}));
         }
-        "anthropic" => {
+        "anthropic" | "claude-agent-sdk" => {
             // The Messages transport clamps the budget below `max_tokens`
             // and drops `temperature` while thinking is on.
             match anthropic_budget(level) {
@@ -299,7 +448,7 @@ pub fn wire_fields(
                 );
             }
         }
-        "deepseek" => {
+        "deepseek" | "moonshot" => {
             if level == "off" {
                 fields.insert("thinking".into(), json!({"type": "disabled"}));
             } else {
@@ -307,14 +456,38 @@ pub fn wire_fields(
                 fields.insert("reasoning_effort".into(), json!(level));
             }
         }
+        "groq" => {
+            let value = if level == "off" { "none" } else { level };
+            fields.insert("reasoning_effort".into(), json!(value));
+            if level != "off" && !model.to_ascii_lowercase().contains("gpt-oss") {
+                // Ask for the reasoning in its own field, not inline tags.
+                fields.insert("reasoning_format".into(), json!("parsed"));
+            }
+        }
+        "kiro" => {
+            if level != "off" {
+                fields.insert("thinkingLevel".into(), json!(level));
+            }
+        }
+        "devin" => {
+            if level != "off" {
+                fields.insert(
+                    "thinkingConfig".into(),
+                    json!({"enabled": true, "effort": level}),
+                );
+            }
+        }
+        "openai" | "gemini" | "mistral" | "xai" | "github-copilot" | "inception" | "ollama"
+        | "cerebras" | "together" | "fireworks" | "minimax" | "minimax-cn" | "nebius"
+        | "sambanova" => {
+            // OpenAI-style `reasoning_effort`; `off` is spelled `none`.
+            let value = if level == "off" { "none" } else { level };
+            fields.insert("reasoning_effort".into(), json!(value));
+        }
         _ => {
             // OpenAI-style `reasoning_effort`; `off` is spelled `none`.
             let value = if level == "off" { "none" } else { level };
             fields.insert("reasoning_effort".into(), json!(value));
-            if kind == "groq" && level != "off" && !model.to_ascii_lowercase().contains("gpt-oss") {
-                // Ask for the reasoning in its own field, not inline tags.
-                fields.insert("reasoning_format".into(), json!("parsed"));
-            }
         }
     }
     Some(fields)
@@ -507,17 +680,29 @@ mod tests {
         ] {
             assert_eq!(levels_for("anthropic", model, &none()), full, "{model}");
         }
-        // "Always on" models never offer `off`.
-        for model in ["claude-fable-5-2", "claude-opus-5-5"] {
+        // "Always on" models never offer `off`, and include `max`.
+        for model in [
+            "claude-fable-5-2",
+            "claude-opus-5-5",
+            "claude-opus-4-6",
+            "claude-opus-4-6-20260101",
+        ] {
             assert_eq!(
                 levels_for("anthropic", model, &none()),
-                ["low", "medium", "high", "xhigh"],
+                ["low", "medium", "high", "xhigh", "max"],
+                "{model}"
+            );
+            assert_eq!(
+                levels_for("claude-agent-sdk", model, &none()),
+                ["low", "medium", "high", "xhigh", "max"],
                 "{model}"
             );
             assert!(wire_fields("anthropic", model, &[], "off").is_none());
+            assert!(wire_fields("claude-agent-sdk", model, &[], "off").is_none());
         }
         for model in [
             "claude-3-5-sonnet-20241022",
+            "claude-haiku-3-5",
             "claude-3-opus-20240229",
             "claude-3-haiku-20240307",
             "claude-2.1",
@@ -527,6 +712,14 @@ mod tests {
                 levels_for("anthropic", model, &none()).is_empty(),
                 "{model}"
             );
+            assert!(
+                levels_for("anthropic", model, &["reasoning".into()]).is_empty(),
+                "{model}"
+            );
+            assert!(
+                levels_for("claude-agent-sdk", model, &none()).is_empty(),
+                "{model}"
+            );
         }
         // An unknown Claude id is offered levels only when the catalog says so.
         assert!(levels_for("anthropic", "claude-next", &none()).is_empty());
@@ -534,20 +727,67 @@ mod tests {
             levels_for("anthropic", "claude-next", &["reasoning".into()]),
             full
         );
+        assert_eq!(
+            levels_for("claude-agent-sdk", "claude-sonnet-4-5", &none()),
+            full
+        );
 
+        let agy_always_on = ["low", "medium", "high", "max"];
+        for model in [
+            "claude-opus-5-5",
+            "claude-opus-5-5-thinking",
+            "claude-fable-5-2",
+            "claude-opus-4-6",
+            "claude-opus-4-6-thinking",
+        ] {
+            assert_eq!(
+                levels_for("google-antigravity", model, &none()),
+                agy_always_on,
+                "{model}"
+            );
+            assert!(wire_fields("google-antigravity", model, &[], "off").is_none());
+        }
         let agy = ["off", "low", "medium", "high", "max"];
-        for model in ["claude-sonnet-4-5-thinking", "claude-opus-4-6-thinking"] {
+        for model in [
+            "claude-sonnet-4-5-thinking",
+            "claude-sonnet-4-5",
+            "claude-opus-4-5",
+            "claude-sonnet-4-6",
+            "claude-sonnet-5-5",
+            "claude-haiku-4-5",
+            "claude-haiku-5-5",
+        ] {
             assert_eq!(
                 levels_for("google-antigravity", model, &none()),
                 agy,
                 "{model}"
             );
         }
+        for model in ["claude-3-5-sonnet", "claude-haiku-3-5"] {
+            assert!(
+                levels_for("google-antigravity", model, &none()).is_empty(),
+                "{model}"
+            );
+        }
         for model in [
+            "gemini-2.5-pro",
             "gemini-3-pro",
+            "gemini-3.1-pro",
+            "gemini-4-pro",
+            "gemini-4-argon",
+        ] {
+            assert_eq!(
+                levels_for("google-antigravity", model, &none()),
+                ["low", "medium", "high"],
+                "{model}"
+            );
+        }
+        for model in [
+            "gemini-2.5-flash",
+            "gemini-3-flash",
+            "gemini-3.8-flash",
             "gemini-4-flash",
             "gemini-3-pro-tiered",
-            "gemini-2.5-flash",
         ] {
             assert_eq!(
                 levels_for("google-antigravity", model, &none()),
@@ -557,7 +797,11 @@ mod tests {
         }
         for model in [
             "gemini-3-pro-low",
+            "gemini-3-pro-medium",
             "gemini-3-pro-high",
+            "gemini-3-flash-minimal",
+            "gemini-4-pro-xhigh",
+            "gemini-4-argon-max",
             "gpt-oss-120b-medium",
             "gpt-oss-120b",
         ] {
@@ -609,6 +853,10 @@ mod tests {
             Some(json!({"thinking": {"type": "disabled"}}))
         );
         assert_eq!(
+            shape("claude-agent-sdk", "claude-opus-4-6", "max"),
+            Some(json!({"thinking": {"type": "enabled", "budget_tokens": 32000}}))
+        );
+        assert_eq!(
             wire_fields("anthropic", "claude-3-5-sonnet", &[], "high"),
             None
         );
@@ -647,6 +895,32 @@ mod tests {
             None,
             "no reasoning tag, no parameter"
         );
+        assert_eq!(
+            shape("moonshot", "kimi-k2.5", "off"),
+            Some(json!({"thinking": {"type": "disabled"}}))
+        );
+        assert_eq!(
+            shape("moonshot", "kimi-k2-thinking", "high"),
+            Some(json!({"thinking": {"type": "enabled"}, "reasoning_effort": "high"}))
+        );
+        assert_eq!(
+            shape("inception", "mercury-2", "off"),
+            Some(json!({"reasoning_effort": "none"}))
+        );
+        assert_eq!(
+            shape("ollama", "qwen3:32b", "medium"),
+            Some(json!({"reasoning_effort": "medium"}))
+        );
+        assert_eq!(
+            shape("kiro", "claude-sonnet-4-5", "max"),
+            Some(json!({"thinkingLevel": "max"}))
+        );
+        assert_eq!(shape("kiro", "claude-sonnet-4-5", "off"), Some(json!({})));
+        assert_eq!(
+            shape("devin", "swe-2-pro", "high"),
+            Some(json!({"thinkingConfig": {"enabled": true, "effort": "high"}}))
+        );
+        assert_eq!(shape("devin", "claude-sonnet-4-5", "off"), Some(json!({})));
     }
 
     #[test]
@@ -676,8 +950,12 @@ mod tests {
             ["low", "medium", "high"]
         );
         assert!(levels_for("openrouter", "vendor/model", &["tools".into()]).is_empty());
-        // The tag alone grants nothing on a provider with no documented wire.
-        assert!(levels_for("together", "m", &tagged).is_empty());
+        // Together uses the reasoning tag too; an undocumented provider does not.
+        assert_eq!(
+            levels_for("together", "m", &tagged),
+            ["low", "medium", "high"]
+        );
+        assert!(levels_for("huggingface", "m", &tagged).is_empty());
     }
 
     #[test]
@@ -747,6 +1025,10 @@ mod tests {
             levels_for("github-copilot", "gemini-2.5-pro", &[]),
             vec!["low", "medium", "high"]
         );
+        assert_eq!(
+            levels_for("github-copilot", "gemini-3-pro", &[]),
+            vec!["low", "medium", "high"]
+        );
         assert!(levels_for("github-copilot", "gpt-4o", &[]).is_empty());
 
         assert_eq!(
@@ -759,7 +1041,7 @@ mod tests {
         );
         assert_eq!(
             levels_for("google-antigravity", "gemini-3-pro", &[]),
-            vec!["off", "low", "medium", "high"]
+            vec!["low", "medium", "high"]
         );
         assert_eq!(
             levels_for("mistral", "deepseek-v4-flash", &[]),
@@ -769,6 +1051,111 @@ mod tests {
             levels_for("mistral", "custom-reasoner", &["reasoning".into()]),
             vec!["low", "medium", "high"]
         );
+    }
+
+    #[test]
+    fn kiro_devin_moonshot_inception_ollama_and_inference_providers() {
+        // Kiro: Claude thinking + reasoning-tagged.
+        assert_eq!(
+            levels_for("kiro", "claude-sonnet-4-5", &none()),
+            vec!["off", "low", "medium", "high", "max"]
+        );
+        assert!(levels_for("kiro", "claude-3-5-sonnet", &none()).is_empty());
+        assert_eq!(
+            levels_for("kiro", "custom-reasoner", &["reasoning".into()]),
+            vec!["off", "low", "medium", "high", "xhigh", "max"]
+        );
+        assert!(levels_for("kiro", "plain-model", &none()).is_empty());
+
+        // Devin: swe-2* + Claude/GPT/Gemini reasoning.
+        assert_eq!(
+            levels_for("devin", "swe-2-pro", &none()),
+            vec!["low", "medium", "high", "max"]
+        );
+        assert_eq!(
+            levels_for("devin", "claude-opus-4-6", &none()),
+            vec!["low", "medium", "high", "max"]
+        );
+        assert_eq!(
+            levels_for("devin", "claude-sonnet-4-5", &none()),
+            vec!["off", "low", "medium", "high", "max"]
+        );
+        assert_eq!(
+            levels_for("devin", "gpt-5.4", &none()),
+            vec!["off", "low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(
+            levels_for("devin", "gemini-3-pro", &none()),
+            vec!["low", "medium", "high"]
+        );
+        assert_eq!(
+            levels_for("devin", "gemini-2.5-flash", &none()),
+            vec!["off", "low", "medium", "high"]
+        );
+
+        // Moonshot: kimi-k2-thinking and kimi-k2.5.
+        for model in ["kimi-k2-thinking", "kimi-k2.5"] {
+            assert_eq!(
+                levels_for("moonshot", model, &none()),
+                vec!["off", "low", "medium", "high"],
+                "{model}"
+            );
+        }
+        assert!(levels_for("moonshot", "moonshot-v1-8k", &none()).is_empty());
+
+        // Inception: mercury-2* and mercury-3*.
+        for model in ["mercury-2", "mercury-3-pro"] {
+            assert_eq!(
+                levels_for("inception", model, &none()),
+                vec!["off", "low", "medium", "high"],
+                "{model}"
+            );
+        }
+        assert!(levels_for("inception", "mercury-coder-small", &none()).is_empty());
+
+        // Ollama: deepseek-r1*, qwen3*, qwq*, gpt-oss*.
+        for model in ["deepseek-r1:70b", "qwen3:32b", "qwq:32b", "gpt-oss:20b"] {
+            assert_eq!(
+                levels_for("ollama", model, &none()),
+                vec!["off", "low", "medium", "high"],
+                "{model}"
+            );
+        }
+        assert!(levels_for("ollama", "llama3.3:70b", &none()).is_empty());
+
+        // Inference providers: cerebras, together, fireworks, minimax, nebius, sambanova.
+        for kind in [
+            "cerebras",
+            "together",
+            "fireworks",
+            "minimax",
+            "nebius",
+            "sambanova",
+        ] {
+            assert_eq!(
+                levels_for(kind, "qwen/qwen3-235b", &none()),
+                vec!["off", "low", "medium", "high"],
+                "{kind} qwen3"
+            );
+            for model in [
+                "deepseek-r1-0528",
+                "openai/gpt-oss-120b",
+                "kimi-k2-instruct",
+                "MiniMax-M3.1-Flash",
+            ] {
+                assert_eq!(
+                    levels_for(kind, model, &none()),
+                    vec!["low", "medium", "high"],
+                    "{kind} {model}"
+                );
+            }
+            assert_eq!(
+                levels_for(kind, "custom", &["reasoning".into()]),
+                vec!["low", "medium", "high"],
+                "{kind} tagged"
+            );
+            assert!(levels_for(kind, "llama-3.3-70b", &none()).is_empty());
+        }
     }
 
     #[test]

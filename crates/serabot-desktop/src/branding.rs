@@ -329,6 +329,16 @@ static BRANDS: &[Brand] = &[
         label: "Nous Portal",
         mark: png!("nous"),
     },
+    Brand {
+        keys: &["kiro"],
+        label: "AWS Kiro",
+        mark: png!("kiro"),
+    },
+    Brand {
+        keys: &["devin", "devin-cli"],
+        label: "Devin",
+        mark: png!("devin"),
+    },
     // Generic marks that belong to no vendor
     Brand {
         keys: &["openai-compatible"],
@@ -439,6 +449,9 @@ mod tests {
         "opencode-go",
         "opencode-zen",
         "nous",
+        "kiro",
+        "devin",
+        "devin-cli",
         "ollama",
         "gemini",
         "perplexity",
