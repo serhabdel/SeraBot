@@ -545,6 +545,17 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             now: Instant::now(),
         })
     });
+    let live_timeline: Vec<serabot_desktop::turn_trace::TimelineStep> = if live_task.is_some() {
+        let state = session.read();
+        serabot_desktop::turn_trace::timeline_steps(
+            &state.state.activity,
+            state.state.turns.latest_memory(),
+            streaming_reply,
+            Instant::now(),
+        )
+    } else {
+        Vec::new()
+    };
     let failed_live_card: Option<LiveCardData> = show_failed_card.as_ref().map(|_| {
         let activity = session.read().state.activity.clone();
         derive_live_card(LiveCardInputs {
@@ -594,13 +605,21 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             })
             .collect::<Vec<_>>()
     };
-    let member_acts: HashMap<String, Option<BotActivity>> = {
+    let (member_acts, member_kinds): (
+        HashMap<String, Option<BotActivity>>,
+        HashMap<String, ActivityKind>,
+    ) = {
         let state = session.read();
         let now = Instant::now();
-        talking_to
+        let acts = talking_to
             .iter()
             .map(|(id, _, _)| (id.clone(), state.state.working.activity_of(id, now)))
-            .collect()
+            .collect();
+        let kinds = talking_to
+            .iter()
+            .map(|(id, _, _)| (id.clone(), state.state.working.activity_kind_of(id, now)))
+            .collect();
+        (acts, kinds)
     };
     // The team row is collapsed by default: routing state changes rarely, so it
     // sits behind one caption chip instead of a permanent row of pills.
@@ -663,6 +682,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let copied = use_signal(|| Option::<String>::None);
     let mut confirm_regen = use_signal(|| Option::<String>::None);
     let task_added_ids = use_signal(HashSet::<String>::new);
+    let memory_pinned_ids = use_signal(HashSet::<String>::new);
     // The topbar owns the search button, so the open flag is shared; it closes
     // with the conversation (the view is keyed by it).
     let ChatFindOpen(mut search_open) = use_context::<ChatFindOpen>();
@@ -1535,41 +1555,84 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                             style: "height: {feed.top_spacer_px()}px",
                         }
                     }
-                    for (index, view) in row_views.into_iter().enumerate().skip(feed.start).take(feed.end - feed.start) {
-                        Fragment { key: "{view.row.id}",
-                            for card in placed[index].clone() {
-                                ChatCardRow { session, key: "{card.id}", card }
-                            }
-                            for row in switch_placed[index].clone() {
-                                RouteSwitchRow { key: "{row.id}", text: row.text }
-                            }
-                            for (n, row) in compaction_placed[index].clone().into_iter().enumerate() {
-                                CompactionNote { key: "c{index}-{n}", text: row.text }
-                            }
-                            if let Some(heading) = view.row.day.clone() {
-                                div { class: "day-sep", role: "separator",
-                                    span { "{heading}" }
+                    {
+                        let last_bot_row_id = row_views
+                            .iter()
+                            .rev()
+                            .find(|v| !v.row.user)
+                            .map(|v| v.row.id.clone());
+                        let now = Instant::now();
+                        rsx! {
+                            for (index, view) in row_views.into_iter().enumerate().skip(feed.start).take(feed.end - feed.start) {
+                                Fragment { key: "{view.row.id}",
+                                    for card in placed[index].clone() {
+                                        ChatCardRow { session, key: "{card.id}", card }
+                                    }
+                                    for row in switch_placed[index].clone() {
+                                        RouteSwitchRow { key: "{row.id}", text: row.text }
+                                    }
+                                    for (n, row) in compaction_placed[index].clone().into_iter().enumerate() {
+                                        CompactionNote { key: "c{index}-{n}", text: row.text }
+                                    }
+                                    if let Some(heading) = view.row.day.clone() {
+                                        div { class: "day-sep", role: "separator",
+                                            span { "{heading}" }
+                                        }
+                                    }
+                                    {
+                                        let is_streaming = streaming_message_id.as_deref()
+                                            == Some(view.row.id.as_str());
+                                        let is_latest_bot = !view.row.user
+                                            && (is_streaming
+                                                || last_bot_row_id.as_deref()
+                                                    == Some(view.row.id.as_str()));
+                                        let avatar_activity = if is_latest_bot {
+                                            let kind = view
+                                                .row
+                                                .bot
+                                                .as_deref()
+                                                .map(|b| {
+                                                    session
+                                                        .read()
+                                                        .state
+                                                        .working
+                                                        .activity_kind_of(b, now)
+                                                })
+                                                .unwrap_or_default();
+                                            let kind = if is_streaming && kind == ActivityKind::Idle {
+                                                ActivityKind::Thinking
+                                            } else {
+                                                kind
+                                            };
+                                            activity_attr(kind)
+                                        } else {
+                                            "idle"
+                                        };
+                                        rsx! {
+                                            MessageRow {
+                                                session,
+                                                trace: view
+                                                    .row
+                                                    .turn
+                                                    .as_deref()
+                                                    .and_then(|turn| traced_turn(&session.read(), turn)),
+                                                streaming: is_streaming,
+                                                avatar_activity,
+                                                row: view.row,
+                                                class: view.class,
+                                                bot_meta: view.bot_meta,
+                                                media: view.media,
+                                                accepts,
+                                                handwritten: session.read().prefs.handwritten_notes,
+                                                copied,
+                                                confirm_regen,
+                                                task_added_ids,
+                                                memory_pinned_ids,
+                                                composer_draft,
+                                            }
+                                        }
+                                    }
                                 }
-                            }
-                            MessageRow {
-                                session,
-                                trace: view
-                                    .row
-                                    .turn
-                                    .as_deref()
-                                    .and_then(|turn| traced_turn(&session.read(), turn)),
-                                streaming: streaming_message_id.as_deref()
-                                    == Some(view.row.id.as_str()),
-                                row: view.row,
-                                class: view.class,
-                                bot_meta: view.bot_meta,
-                                media: view.media,
-                                accepts,
-                                handwritten: session.read().prefs.handwritten_notes,
-                                copied,
-                                confirm_regen,
-                                task_added_ids,
-                                composer_draft,
                             }
                         }
                     }
@@ -1649,6 +1712,9 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     failed_card: None,
                                     failed_can_act: false,
                                     failed_ondismiss: move |_| {},
+                                }
+                                if !live_timeline.is_empty() {
+                                    LiveTimeline { steps: live_timeline.clone() }
                                 }
                             }
                             if !steps.is_empty() {
@@ -2177,18 +2243,30 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     }
                                     if !team_collapsed() {
                                         for (bot_id, bot_name, bot_avatar) in talking_to.iter() {
-                                            span {
-                                                key: "{bot_id}",
-                                                class: "team-chip",
-                                                "data-activity": activity_attr(member_acts.get(bot_id).and_then(|a| a.as_ref())),
-                                                span {
-                                                    class: "avatar-wrap sm",
-                                                    "data-activity": activity_attr(member_acts.get(bot_id).and_then(|a| a.as_ref())),
-                                                    span { class: "avatar sm bot", style: avatar_style(bot_id), "{bot_avatar}" }
-                                                }
-                                                "{bot_name}"
-                                                if let Some(text) = member_acts.get(bot_id).and_then(|a| a.as_ref()).map(BotActivity::label) {
-                                                    span { class: "working-label", role: "status", "{text}" }
+                                            {
+                                                let member_attr = activity_attr(
+                                                    member_kinds.get(bot_id).copied().unwrap_or_default(),
+                                                );
+                                                rsx! {
+                                                    span {
+                                                        key: "{bot_id}",
+                                                        class: "team-chip",
+                                                        "data-activity": member_attr,
+                                                        span {
+                                                            class: "avatar-wrap sm",
+                                                            "data-activity": member_attr,
+                                                            span {
+                                                                class: "avatar sm bot",
+                                                                "data-activity": member_attr,
+                                                                style: avatar_style(bot_id),
+                                                                "{bot_avatar}"
+                                                            }
+                                                        }
+                                                        "{bot_name}"
+                                                        if let Some(text) = member_acts.get(bot_id).and_then(|a| a.as_ref()).map(BotActivity::label) {
+                                                            span { class: "working-label", role: "status", "{text}" }
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -2526,15 +2604,18 @@ fn MessageRow(
     /// This row is the reply still streaming in: unfinished markdown
     /// renders as plain text and code blocks hide their Copy button.
     streaming: bool,
+    avatar_activity: &'static str,
     mut copied: Signal<Option<String>>,
     mut confirm_regen: Signal<Option<String>>,
     mut task_added_ids: Signal<HashSet<String>>,
+    mut memory_pinned_ids: Signal<HashSet<String>>,
     mut composer_draft: Signal<String>,
 ) -> Element {
     rsx! {
         div { class: "{class}", "data-row-id": "{row.id}",
             span {
                 class: if row.user { "msg-avatar avatar user" } else { "msg-avatar avatar bot" },
+                "data-activity": if row.user { "idle" } else { avatar_activity },
                 style: row.bot.as_deref().map(avatar_style).unwrap_or_default(),
                 "{row.avatar}"
             }
@@ -2665,6 +2746,34 @@ fn MessageRow(
                                 },
                                 Icon { name: "plus", size: 13 }
                                 span { class: "msg-action-label", "Create task" }
+                            }
+                        }
+                    }
+                    if !row.user && !row.content.trim().is_empty() {
+                        if memory_pinned_ids().contains(&row.id) {
+                            span { class: "msg-task-added",
+                                Icon { name: "check", size: 12 }
+                                " Pinned"
+                            }
+                        } else {
+                            button {
+                                class: "msg-action",
+                                r#type: "button",
+                                "aria-label": "Pin reply to memory",
+                                title: "Pin this reply to memory",
+                                onclick: {
+                                    let text = row.content.clone();
+                                    let id = row.id.clone();
+                                    move |_| {
+                                        if let Some(content) = feed_view::pin_memory_content(&text)
+                                            && session.write().pin_memory(content)
+                                        {
+                                            memory_pinned_ids.write().insert(id.clone());
+                                        }
+                                    }
+                                },
+                                Icon { name: "memory", size: 13 }
+                                span { class: "msg-action-label", "Pin to memory" }
                             }
                         }
                     }
@@ -3294,6 +3403,36 @@ fn traced_turn(state: &Session, turn: &str) -> Option<serabot_desktop::turn_trac
     Some(trace.clone())
 }
 
+#[component]
+fn LiveTimeline(steps: Vec<serabot_desktop::turn_trace::TimelineStep>) -> Element {
+    if steps.is_empty() {
+        return rsx! {};
+    }
+    let last_idx = steps.len().saturating_sub(1);
+    rsx! {
+        div { class: "live-timeline", role: "list", "aria-label": "Turn step timeline",
+            for (idx, step) in steps.into_iter().enumerate() {
+                Fragment { key: "tl-{idx}-{step.label}",
+                    span {
+                        class: "live-step-pill {step.state.class_suffix()}",
+                        role: "listitem",
+                        if step.state == serabot_desktop::turn_trace::TimelineStepState::Active {
+                            span { class: "live-step-dot", "aria-hidden": "true" }
+                        }
+                        span { class: "live-step-label", "{step.label}" }
+                        if let Some(elapsed) = step.elapsed {
+                            span { class: "live-step-time", "{elapsed}" }
+                        }
+                    }
+                    if idx < last_idx {
+                        span { class: "live-timeline-sep", "aria-hidden": "true", "\u{2192}" }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// What one turn did, inside the reply it produced (0.61): its tool steps
 /// and the memories it used and saved, collapsed to one line. A step that
 /// failed or waits for approval opens it, so the trace cannot hide either.
@@ -3306,11 +3445,31 @@ fn TurnTraceBlock(
     let attention = trace.activity.needs_attention();
     let dropped = trace.activity.dropped_note();
     let memory = trace.memory.clone();
+    let timeline = serabot_desktop::turn_trace::timeline_steps(
+        &trace.activity,
+        (!memory.is_empty()).then_some(&memory),
+        false,
+        Instant::now(),
+    );
+    let pills = memory.pills();
+    let recalled_pills: Vec<_> = pills
+        .iter()
+        .filter(|p| p.role == serabot_desktop::turn_trace::MemoryPillRole::Recalled)
+        .cloned()
+        .collect();
+    let saved_pills: Vec<_> = pills
+        .iter()
+        .filter(|p| p.role == serabot_desktop::turn_trace::MemoryPillRole::Saved)
+        .cloned()
+        .collect();
     rsx! {
         details { class: "turn-trace", open: attention,
             summary { class: "turn-trace-summary",
                 Icon { name: "chevron-right", size: 12 }
                 span { "{summary}" }
+            }
+            if !timeline.is_empty() {
+                LiveTimeline { steps: timeline }
             }
             if !trace.activity.steps.is_empty() {
                 div { class: "activity-steps",
@@ -3324,19 +3483,19 @@ fn TurnTraceBlock(
             }
             if !memory.is_empty() {
                 div { class: "turn-memory", role: "group", "aria-label": "Memories this reply used and saved",
-                    if !memory.recalled.is_empty() {
+                    if !recalled_pills.is_empty() {
                         p { class: "turn-memory-head", "Used" }
-                        ul { class: "turn-memory-list",
-                            for item in memory.recalled.iter().cloned() {
-                                TurnMemoryItem { key: "u-{item.id}", item }
+                        div { class: "turn-memory-pills",
+                            for pill in recalled_pills {
+                                TurnMemoryPill { key: "u-{pill.id}", session, pill }
                             }
                         }
                     }
-                    if !memory.saved.is_empty() {
+                    if !saved_pills.is_empty() {
                         p { class: "turn-memory-head", "Remembered" }
-                        ul { class: "turn-memory-list",
-                            for item in memory.saved.iter().cloned() {
-                                TurnMemoryItem { key: "s-{item.id}", item }
+                        div { class: "turn-memory-pills",
+                            for pill in saved_pills {
+                                TurnMemoryPill { key: "s-{pill.id}", session, pill }
                             }
                         }
                     }
@@ -3354,26 +3513,51 @@ fn TurnTraceBlock(
 }
 
 #[component]
-fn TurnMemoryItem(item: serabot_desktop::turn_trace::MemoryItem) -> Element {
-    let text = if item.excerpt.is_empty() {
-        "A saved fact (text withheld by policy)".to_owned()
+fn TurnMemoryPill(
+    mut session: Signal<Session>,
+    pill: serabot_desktop::turn_trace::MemoryPill,
+) -> Element {
+    let tooltip = pill.tooltip();
+    let pill_class = if pill.pending {
+        "memory-pill pending"
+    } else if pill.role == serabot_desktop::turn_trace::MemoryPillRole::Saved {
+        "memory-pill saved"
     } else {
-        item.excerpt.clone()
+        "memory-pill"
+    };
+    let query_seed = if pill.full_text == "A saved fact (text withheld by policy)" {
+        String::new()
+    } else {
+        pill.snippet.trim_end_matches('\u{2026}').to_owned()
     };
     rsx! {
-        li { class: "turn-memory-item",
-            Icon { name: "memory", size: 12 }
-            span { class: "turn-memory-text", "{text}" }
-            if item.pending {
-                span { class: "chip warn", "held for review" }
-            } else if item.origin == "explicit" {
-                span { class: "chip", "you saved" }
+        div { class: "memory-pill-wrap",
+            button {
+                class: "{pill_class}",
+                r#type: "button",
+                title: "{tooltip}",
+                "aria-label": "{tooltip}",
+                onclick: move |_| {
+                    let mut s = session.write();
+                    if !query_seed.is_empty() {
+                        s.memory.query = query_seed.clone();
+                    }
+                    s.open_section(Section::Memory);
+                },
+                Icon { name: "memory", size: 11 }
+                span { class: "memory-pill-kind", "{pill.kind}" }
+                span { class: "memory-pill-text", "{pill.snippet}" }
+                if pill.pending {
+                    span { class: "chip warn", "held" }
+                } else if pill.origin == "explicit" {
+                    span { class: "chip", "saved" }
+                }
             }
-        }
-        for old in item.replaces.iter() {
-            li { class: "turn-memory-item replaced",
-                span { class: "turn-memory-replaced", "Replaces: " }
-                s { class: "turn-memory-text", "{old}" }
+            for old in pill.replaces.iter() {
+                div { class: "turn-memory-item replaced",
+                    span { class: "turn-memory-replaced", "Replaces: " }
+                    s { class: "turn-memory-text", "{old}" }
+                }
             }
         }
     }

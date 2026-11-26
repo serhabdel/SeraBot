@@ -7083,6 +7083,18 @@ impl Session {
         });
     }
 
+    pub fn pin_memory(&mut self, content: String) -> bool {
+        if !self.state.connected || self.credentials.is_none() || !valid_memory_content(&content) {
+            return false;
+        }
+        self.start_request(Operation::AddMemory {
+            kind: "note".into(),
+            content: zeroize::Zeroizing::new(content),
+            source: "operator:desktop".into(),
+        });
+        true
+    }
+
     pub fn delete_memory(&mut self, id: String) {
         self.memory.delete_confirm = None;
         self.start_request(Operation::DeleteMemory { id });
@@ -9115,11 +9127,14 @@ mod backlog_tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf);
                 let _ = stream.write_all(
-                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 );
             }
         });
@@ -9159,6 +9174,7 @@ mod backlog_tests {
             session.section_load_error.is_some(),
             "failed Providers load must set section_load_error"
         );
+        let _ = std::net::TcpStream::connect(("127.0.0.1", port));
         let _ = server.join();
     }
 }

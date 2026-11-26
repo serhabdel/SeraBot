@@ -2752,3 +2752,381 @@ html[data-reduce-transparency="true"] .sheet.sheet-palette {
   color: var(--label-3);
   opacity: 0.85;
 }
+
+/* --- Animated Bot Avatars & Living Presence --- */
+.avatar {
+  position: relative;
+}
+
+.thread[data-activity="thinking"] .thread-meta:not(.working-label),
+.thread[data-activity="searching"] .thread-meta:not(.working-label),
+.thread[data-activity="browsing"] .thread-meta:not(.working-label),
+.thread[data-activity="coding"] .thread-meta:not(.working-label),
+.thread[data-activity="delegating"] .thread-meta:not(.working-label),
+.thread[data-activity="waiting_approval"] .thread-meta:not(.working-label) {
+  display: none;
+}
+
+.avatar[data-activity]::before,
+.avatar[data-activity]::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border-radius: calc(var(--r-avatar) + 3px);
+  pointer-events: none;
+  opacity: 0;
+}
+
+.avatar.sm[data-activity]::before,
+.avatar.sm[data-activity]::after,
+.msg-avatar.avatar[data-activity]::before,
+.msg-avatar.avatar[data-activity]::after {
+  inset: -2px;
+  border-radius: calc(var(--r-avatar) + 2px);
+}
+
+/* Static reduced-motion fallback for active states */
+.avatar[data-activity="thinking"]::before,
+.avatar[data-activity="searching"]::before,
+.avatar[data-activity="browsing"]::before,
+.avatar[data-activity="coding"]::before,
+.avatar[data-activity="delegating"]::before {
+  opacity: 0.78;
+  border: 1.5px solid var(--accent);
+}
+
+.avatar[data-activity="coding"]::before {
+  border-color: #38bdf8;
+}
+
+.avatar[data-activity="delegating"]::before {
+  border-style: dashed;
+}
+
+/* waiting_approval: steady warm amber hold ring (never animated) */
+.avatar[data-activity="waiting_approval"]::before {
+  opacity: 1;
+  border: 2px solid var(--warn);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--warn) 22%, transparent);
+}
+
+/* Animated presence (gated by .root:not([data-motion="reduce"])) */
+.root:not([data-motion="reduce"]) .avatar[data-activity="thinking"]::before {
+  opacity: 0.9;
+  border: 1.5px solid var(--accent);
+  animation: avatar-breathe 2.1s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+.root:not([data-motion="reduce"]) .avatar[data-activity="thinking"]::after {
+  opacity: 0.85;
+  border: 1.5px solid transparent;
+  border-top-color: var(--accent);
+  border-right-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  animation: avatar-orbit 1.8s linear infinite;
+}
+
+.root:not([data-motion="reduce"]) .avatar[data-activity="searching"]::before,
+.root:not([data-motion="reduce"]) .avatar[data-activity="browsing"]::before {
+  opacity: 0.85;
+  border: 1.5px solid var(--accent);
+}
+
+.root:not([data-motion="reduce"]) .avatar[data-activity="searching"]::after,
+.root:not([data-motion="reduce"]) .avatar[data-activity="browsing"]::after {
+  border: 1.5px solid var(--accent);
+  animation: avatar-sonar 1.7s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+}
+
+.root:not([data-motion="reduce"]) .avatar[data-activity="coding"]::before {
+  opacity: 0.92;
+  border: 1.5px solid #38bdf8;
+  animation: avatar-code-pulse 1.5s ease-in-out infinite;
+}
+
+.root:not([data-motion="reduce"]) .avatar[data-activity="delegating"]::before {
+  opacity: 0.92;
+  border: 1.5px dashed var(--accent);
+  animation: avatar-orbit 2.8s linear infinite;
+}
+
+.root:not([data-motion="reduce"]) .avatar[data-activity="done"]::before {
+  border: 1.5px solid var(--ok);
+  animation: avatar-done-shimmer 1.8s ease-out forwards;
+}
+
+/* Handoff indicator in LiveCardData::Delegating */
+.handoff-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+  background: var(--surface-1);
+  border: 1px solid var(--hairline-strong);
+  font-size: var(--fs-caption);
+  font-weight: 600;
+  color: var(--label-1);
+}
+
+.handoff-bot {
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.handoff-arrow {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  color: var(--accent-ink);
+}
+
+.handoff-track {
+  position: absolute;
+  left: 2px;
+  right: 2px;
+  height: 1.5px;
+  border-radius: 1px;
+  background: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+.handoff-glyph {
+  position: relative;
+  display: inline-block;
+  line-height: 1;
+}
+
+.root:not([data-motion="reduce"]) .handoff-glyph {
+  animation: handoff-slide 1.2s ease-in-out infinite;
+}
+
+@keyframes avatar-breathe {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 28%, transparent);
+    transform: scale(0.98);
+  }
+  50% {
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 12%, transparent);
+    transform: scale(1.02);
+  }
+}
+
+@keyframes avatar-orbit {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes avatar-sonar {
+  0% {
+    opacity: 0.85;
+    transform: scale(0.96);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.32);
+  }
+}
+
+@keyframes avatar-code-pulse {
+  0%,
+  100% {
+    border-color: #38bdf8;
+    box-shadow: 0 0 0 0 rgba(56, 189, 248, 0.32);
+  }
+  50% {
+    border-color: #6366f1;
+    box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.16);
+  }
+}
+
+@keyframes avatar-done-shimmer {
+  0% {
+    opacity: 0.95;
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 40%, transparent);
+    transform: scale(0.98);
+  }
+  45% {
+    opacity: 0.9;
+    box-shadow: 0 0 0 5px color-mix(in srgb, var(--ok) 15%, transparent);
+    transform: scale(1.02);
+  }
+  100% {
+    opacity: 0;
+    box-shadow: 0 0 0 7px transparent;
+    transform: scale(1);
+  }
+}
+
+@keyframes handoff-slide {
+  0%,
+  100% {
+    transform: translateX(-2px);
+    opacity: 0.7;
+  }
+  50% {
+    transform: translateX(2px);
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .avatar[data-activity]::before,
+  .avatar[data-activity]::after,
+  .handoff-glyph {
+    animation: none !important;
+  }
+}
+
+
+/* Live step timeline (LiveCard & TurnTrace) and interactive memory pills. */
+.live-timeline {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 6px;
+}
+
+.live-timeline-sep {
+  color: var(--label-3);
+  font-size: var(--fs-micro);
+  user-select: none;
+}
+
+.live-step-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--hairline);
+  background: var(--surface-2);
+  color: var(--label-2);
+  font-size: var(--fs-micro);
+  line-height: 1.5;
+  white-space: nowrap;
+  transition: border-color var(--dur-1) var(--ease), background-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+
+.live-step-pill.active {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--hairline));
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface-2));
+  color: var(--label-1);
+}
+
+.live-step-pill.waiting {
+  border-color: color-mix(in srgb, var(--warn, #d97706) 45%, var(--hairline));
+  color: var(--label-1);
+}
+
+.live-step-pill.failed {
+  border-color: color-mix(in srgb, var(--danger, #dc2626) 45%, var(--hairline));
+  color: var(--danger, #dc2626);
+}
+
+.live-step-dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: var(--r-pill);
+  background: var(--accent);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+.live-step-time {
+  color: var(--label-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.turn-memory-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  width: 100%;
+}
+
+.memory-pill-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-width: 100%;
+}
+
+.memory-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  padding: 3px 9px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-pill);
+  background: var(--surface-1);
+  color: var(--label-2);
+  font: inherit;
+  font-size: var(--fs-caption);
+  line-height: 1.4;
+  cursor: pointer;
+  text-align: left;
+  transition: background-color var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease), transform var(--dur-1) var(--ease);
+}
+
+.memory-pill:hover {
+  background: var(--hover);
+  border-color: var(--hairline-strong);
+  color: var(--label-1);
+  transform: translateY(-1px);
+}
+
+.memory-pill:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.memory-pill.saved {
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--hairline));
+}
+
+.memory-pill.pending {
+  border-color: color-mix(in srgb, var(--warn, #d97706) 40%, var(--hairline));
+}
+
+.memory-pill-kind {
+  color: var(--label-3);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  text-transform: lowercase;
+  flex: none;
+}
+
+.memory-pill-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .live-step-dot {
+    animation: none;
+  }
+  .memory-pill:hover {
+    transform: none;
+  }
+}
+
+.root[data-motion="reduce"] .live-step-dot {
+  animation: none;
+}
+
+.root[data-motion="reduce"] .memory-pill:hover {
+  transform: none;
+}
+

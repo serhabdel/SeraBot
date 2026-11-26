@@ -20,7 +20,7 @@ use serabot_desktop::{
     route_chip,
     session::{Section, Session, SettingsSection, SignInPhase, Theme, humanize_label},
     teams, ui_highlight,
-    working::BotActivity,
+    working::{ActivityKind, BotActivity},
 };
 // The UI pacing constants are only read by the Windows message pump below.
 #[cfg(windows)]
@@ -101,13 +101,21 @@ const CSS_PAGES: &str = concat!(
 );
 
 /// The `data-activity` value the stylesheet keys the avatar ring and the
-/// "Working..." label on: `working` (animated ring), `waiting` (static dot)
-/// or `idle`.
-fn activity_attr(activity: Option<&BotActivity>) -> &'static str {
-    match activity {
-        Some(BotActivity::Working(_)) => "working",
-        Some(BotActivity::WaitingApproval) => "waiting",
-        None => "idle",
+/// working label on: `"thinking"`, `"searching"`, `"browsing"`, `"coding"`,
+/// `"delegating"`, `"waiting_approval"`, `"done"`, or `"idle"`.
+fn activity_attr(kind: ActivityKind) -> &'static str {
+    kind.as_str()
+}
+
+/// Fallback when a queued/running task has no `turn.step` yet.
+fn activity_kind_or(kind: ActivityKind, fallback: Option<&BotActivity>) -> ActivityKind {
+    if kind != ActivityKind::Idle {
+        return kind;
+    }
+    match fallback {
+        Some(BotActivity::Working(_)) => ActivityKind::Thinking,
+        Some(BotActivity::WaitingApproval) => ActivityKind::WaitingApproval,
+        None => ActivityKind::Idle,
     }
 }
 

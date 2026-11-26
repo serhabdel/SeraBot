@@ -17,6 +17,8 @@ use serde_json::Value;
 
 /// An entry with no event for this long is treated as finished.
 pub const STALE_AFTER: Duration = Duration::from_secs(15 * 60);
+/// How long a bot keeps the brief `"done"` completion shimmer after `turn.completed`.
+pub const DONE_SHIMMER: Duration = Duration::from_secs(2);
 /// Tasks tracked at once.
 const MAX_ENTRIES: usize = 32;
 const MAX_ID: usize = 80;
@@ -25,6 +27,118 @@ const MAX_LABEL: usize = 80;
 pub const WORKING_LABEL: &str = "Working…";
 /// Shown while a step waits for the owner's approval.
 pub const WAITING_LABEL: &str = "Waiting for approval";
+
+/// Fine-grained activity category for avatar presence rings (`data-activity`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ActivityKind {
+    #[default]
+    Idle,
+    Thinking,
+    Searching,
+    Browsing,
+    Coding,
+    Delegating,
+    WaitingApproval,
+    Done,
+}
+
+impl ActivityKind {
+    /// Value for the DOM `data-activity` attribute.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Thinking => "thinking",
+            Self::Searching => "searching",
+            Self::Browsing => "browsing",
+            Self::Coding => "coding",
+            Self::Delegating => "delegating",
+            Self::WaitingApproval => "waiting_approval",
+            Self::Done => "done",
+        }
+    }
+
+    /// True when the avatar should animate (excludes `Idle`, `WaitingApproval`, `Done`).
+    pub const fn animates(self) -> bool {
+        matches!(
+            self,
+            Self::Thinking | Self::Searching | Self::Browsing | Self::Coding | Self::Delegating
+        )
+    }
+}
+
+/// Map a `turn.step` tool name (and optional display label fallback) to an [`ActivityKind`].
+pub fn classify_step_activity(tool: Option<&str>, label: Option<&str>) -> ActivityKind {
+    if let Some(raw_tool) = tool {
+        let t = raw_tool.trim().to_ascii_lowercase();
+        if t == "delegate" || t == "ask_teammate" || t.starts_with("delegate_") {
+            return ActivityKind::Delegating;
+        }
+        if matches!(
+            t.as_str(),
+            "rag_search"
+                | "job_search"
+                | "job_watch_now"
+                | "tavily_search"
+                | "exa_search"
+                | "firecrawl_search"
+                | "github_search_repos"
+                | "memory_search"
+                | "skill_search"
+        ) || t.ends_with("_search")
+        {
+            return ActivityKind::Searching;
+        }
+        if t.starts_with("browser_")
+            || matches!(
+                t.as_str(),
+                "social_extract" | "fetch_url" | "exa_get_contents" | "watch_now"
+            )
+            || t.starts_with("firecrawl_")
+        {
+            return ActivityKind::Browsing;
+        }
+        if t.starts_with("project_")
+            || t.starts_with("file_")
+            || t.starts_with("mail_")
+            || t.starts_with("outlook_")
+            || t.starts_with("agentmail_")
+            || t.starts_with("github_")
+            || t.starts_with("local_")
+            || t == "document_index"
+        {
+            return ActivityKind::Coding;
+        }
+    }
+    if let Some(raw_label) = label {
+        let l = raw_label.trim().to_ascii_lowercase();
+        if l.contains("handing off") || l.contains("asking ") || l.contains("delegat") {
+            return ActivityKind::Delegating;
+        }
+        if l.contains("brows")
+            || l.contains("opening ")
+            || l.contains("reading the page")
+            || l.contains("clicking ")
+            || l.contains("screenshot")
+            || l.contains("scrolling the page")
+        {
+            return ActivityKind::Browsing;
+        }
+        if l.contains("search") || l.contains("checking job sites") {
+            return ActivityKind::Searching;
+        }
+        if l.contains("project")
+            || l.contains("file")
+            || l.contains("email")
+            || l.contains("inbox")
+            || l.contains("code")
+            || l.contains("spreadsheet")
+            || l.contains("document")
+        {
+            return ActivityKind::Coding;
+        }
+    }
+    ActivityKind::Thinking
+}
 
 /// What one bot is doing.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -57,13 +171,22 @@ struct Entry {
     bot: String,
     conversation: String,
     activity: BotActivity,
+    kind: ActivityKind,
     seen: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct DoneEntry {
+    bot: String,
+    conversation: String,
+    completed_at: Instant,
 }
 
 /// Tasks that are running, by bot and conversation.
 #[derive(Clone, Debug, Default)]
 pub struct WorkingBots {
     entries: Vec<Entry>,
+    done_entries: Vec<DoneEntry>,
 }
 
 fn clean(value: &Value, key: &str, max: usize) -> Option<String> {
@@ -86,6 +209,7 @@ fn same_conversation(a: &str, b: &str) -> bool {
 impl WorkingBots {
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.done_entries.clear();
     }
 
     /// Apply one stream event. Returns whether anything changed.
@@ -93,7 +217,35 @@ impl WorkingBots {
         match kind {
             "turn.step" => self.apply_step(payload, now),
             "turn.progress" => self.apply_progress(payload, now),
-            "turn.completed" | "task.failed" => {
+            "turn.completed" => {
+                let Some(task_id) = clean(payload, "task_id", MAX_ID) else {
+                    return false;
+                };
+                self.prune(now);
+                let mut completed = Vec::new();
+                self.entries.retain(|entry| {
+                    if entry.task_id == task_id {
+                        completed.push((entry.bot.clone(), entry.conversation.clone()));
+                        false
+                    } else {
+                        true
+                    }
+                });
+                let changed = !completed.is_empty();
+                for (bot, conversation) in completed {
+                    self.done_entries.retain(|d| d.bot != bot);
+                    if self.done_entries.len() >= MAX_ENTRIES {
+                        self.done_entries.remove(0);
+                    }
+                    self.done_entries.push(DoneEntry {
+                        bot,
+                        conversation,
+                        completed_at: now,
+                    });
+                }
+                changed
+            }
+            "task.failed" => {
                 let Some(task_id) = clean(payload, "task_id", MAX_ID) else {
                     return false;
                 };
@@ -120,6 +272,7 @@ impl WorkingBots {
             {
                 let conversation = clean(payload, "conversation_id", MAX_ID).unwrap_or_default();
                 let label = elapsed_secs.map(|s| format!("Thinking… ({s}s)"));
+                self.done_entries.retain(|d| d.bot != bot);
                 if self.entries.len() >= MAX_ENTRIES {
                     self.entries.remove(0);
                 }
@@ -128,6 +281,7 @@ impl WorkingBots {
                     bot,
                     conversation,
                     activity: BotActivity::Working(label),
+                    kind: ActivityKind::Thinking,
                     seen: now,
                 });
                 return true;
@@ -141,8 +295,9 @@ impl WorkingBots {
         {
             let next_label = elapsed_secs.map(|s| format!("Thinking… ({s}s)"));
             let next_activity = BotActivity::Working(next_label);
-            if entry.activity != next_activity {
+            if entry.activity != next_activity || entry.kind != ActivityKind::Thinking {
                 entry.activity = next_activity;
+                entry.kind = ActivityKind::Thinking;
                 changed = true;
             }
         }
@@ -158,20 +313,27 @@ impl WorkingBots {
             return false;
         };
         let conversation = clean(payload, "conversation_id", MAX_ID).unwrap_or_default();
-        let activity = match payload.get("phase").and_then(Value::as_str) {
+        let tool = clean(payload, "tool", MAX_ID);
+        let (activity, kind) = match payload.get("phase").and_then(Value::as_str) {
             Some("running" | "progress") => {
-                BotActivity::Working(clean(payload, "label", MAX_LABEL))
+                let label = clean(payload, "label", MAX_LABEL);
+                let kind = classify_step_activity(tool.as_deref(), label.as_deref());
+                (BotActivity::Working(label), kind)
             }
             // The turn goes on between steps: keep the ring, drop the stale name.
-            Some("done" | "failed") => BotActivity::Working(None),
-            Some("waiting_approval") => BotActivity::WaitingApproval,
+            Some("done" | "failed") => (BotActivity::Working(None), ActivityKind::Thinking),
+            Some("waiting_approval") => {
+                (BotActivity::WaitingApproval, ActivityKind::WaitingApproval)
+            }
             _ => return false,
         };
         self.prune(now);
+        self.done_entries.retain(|d| d.bot != bot);
         if let Some(entry) = self.entries.iter_mut().find(|e| e.task_id == task_id) {
             entry.bot = bot;
             entry.conversation = conversation;
             entry.activity = activity;
+            entry.kind = kind;
             entry.seen = now;
         } else {
             if self.entries.len() >= MAX_ENTRIES {
@@ -182,16 +344,19 @@ impl WorkingBots {
                 bot,
                 conversation,
                 activity,
+                kind,
                 seen: now,
             });
         }
         true
     }
 
-    /// Forget entries that have been quiet for [`STALE_AFTER`].
+    /// Forget entries that have been quiet for [`STALE_AFTER`] and expired done shimmers.
     pub fn prune(&mut self, now: Instant) {
         self.entries
             .retain(|entry| now.saturating_duration_since(entry.seen) < STALE_AFTER);
+        self.done_entries
+            .retain(|entry| now.saturating_duration_since(entry.completed_at) < DONE_SHIMMER);
     }
 
     fn live(&self, now: Instant) -> impl Iterator<Item = &Entry> {
@@ -208,6 +373,46 @@ impl WorkingBots {
             .filter(|entry| entry.bot == bot)
             .max_by_key(|entry| (entry.activity.animates(), entry.seen))
             .map(|entry| entry.activity.clone())
+    }
+
+    /// Fine-grained [`ActivityKind`] for `bot` (for `data-activity` on avatars).
+    /// Returns [`ActivityKind::Done`] briefly after `turn.completed`.
+    pub fn activity_kind_of(&self, bot: &str, now: Instant) -> ActivityKind {
+        let bot = bot.strip_prefix("dir:").unwrap_or(bot);
+        if let Some(entry) = self
+            .live(now)
+            .filter(|entry| entry.bot == bot)
+            .max_by_key(|entry| (entry.activity.animates(), entry.seen))
+        {
+            return entry.kind;
+        }
+        if self
+            .done_entries
+            .iter()
+            .rev()
+            .any(|d| d.bot == bot && now.saturating_duration_since(d.completed_at) < DONE_SHIMMER)
+        {
+            return ActivityKind::Done;
+        }
+        ActivityKind::Idle
+    }
+
+    /// Fine-grained [`ActivityKind`] for a conversation (for `data-activity` in the rail).
+    pub fn conversation_activity_kind(&self, conversation: &str, now: Instant) -> ActivityKind {
+        if let Some(entry) = self
+            .live(now)
+            .filter(|entry| same_conversation(&entry.conversation, conversation))
+            .max_by_key(|entry| (entry.activity.animates(), entry.seen))
+        {
+            return entry.kind;
+        }
+        if self.done_entries.iter().rev().any(|d| {
+            same_conversation(&d.conversation, conversation)
+                && now.saturating_duration_since(d.completed_at) < DONE_SHIMMER
+        }) {
+            return ActivityKind::Done;
+        }
+        ActivityKind::Idle
     }
 
     /// Whether anything in this chat or room is working (rail dot / ring).
@@ -239,7 +444,13 @@ impl WorkingBots {
             entry.bot.hash(h);
             entry.conversation.hash(h);
             entry.activity.hash(h);
+            entry.kind.hash(h);
             entry.activity.label().hash(h);
+        }
+        self.done_entries.len().hash(h);
+        for d in &self.done_entries {
+            d.bot.hash(h);
+            d.conversation.hash(h);
         }
     }
 
@@ -500,6 +711,135 @@ mod tests {
         assert_eq!(
             w3.activity_of("main", start).unwrap().label(),
             "Thinking… (15s)"
+        );
+    }
+
+    #[test]
+    fn activity_kind_maps_tools_and_labels_cleanly() {
+        assert_eq!(
+            classify_step_activity(Some("tavily_search"), None),
+            ActivityKind::Searching
+        );
+        assert_eq!(
+            classify_step_activity(Some("rag_search"), None),
+            ActivityKind::Searching
+        );
+        assert_eq!(
+            classify_step_activity(Some("job_search"), None),
+            ActivityKind::Searching
+        );
+        assert_eq!(
+            classify_step_activity(Some("browser_navigate"), None),
+            ActivityKind::Browsing
+        );
+        assert_eq!(
+            classify_step_activity(Some("social_extract"), None),
+            ActivityKind::Browsing
+        );
+        assert_eq!(
+            classify_step_activity(Some("project_check"), None),
+            ActivityKind::Coding
+        );
+        assert_eq!(
+            classify_step_activity(Some("file_write"), None),
+            ActivityKind::Coding
+        );
+        assert_eq!(
+            classify_step_activity(Some("mail_send"), None),
+            ActivityKind::Coding
+        );
+        assert_eq!(
+            classify_step_activity(Some("delegate"), None),
+            ActivityKind::Delegating
+        );
+        assert_eq!(
+            classify_step_activity(Some("ask_teammate"), None),
+            ActivityKind::Delegating
+        );
+        assert_eq!(
+            classify_step_activity(Some("memory_save"), None),
+            ActivityKind::Thinking
+        );
+        // Label fallback when tool is absent.
+        assert_eq!(
+            classify_step_activity(None, Some("Searching the web")),
+            ActivityKind::Searching
+        );
+        assert_eq!(
+            classify_step_activity(None, Some("Handing off to Analyst")),
+            ActivityKind::Delegating
+        );
+        assert_eq!(
+            classify_step_activity(None, Some("Reading files")),
+            ActivityKind::Coding
+        );
+        assert_eq!(
+            classify_step_activity(None, Some("Thinking")),
+            ActivityKind::Thinking
+        );
+    }
+
+    #[test]
+    fn activity_kind_tracks_steps_waiting_and_brief_done_shimmer() {
+        let start = Instant::now();
+        let mut w = WorkingBots::default();
+        assert_eq!(w.activity_kind_of("main", start), ActivityKind::Idle);
+
+        w.apply(
+            "turn.step",
+            &json!({
+                "task_id": "t1",
+                "bot": "main",
+                "conversation_id": "dir:main",
+                "phase": "running",
+                "tool": "browser_snapshot",
+                "label": "Reading the page",
+                "call_id": "c1"
+            }),
+            start,
+        );
+        assert_eq!(w.activity_kind_of("main", start), ActivityKind::Browsing);
+        assert_eq!(
+            w.conversation_activity_kind("dir:main", start),
+            ActivityKind::Browsing
+        );
+        assert_eq!(w.activity_kind_of("main", start).as_str(), "browsing");
+
+        w.apply(
+            "turn.step",
+            &json!({
+                "task_id": "t1",
+                "bot": "main",
+                "conversation_id": "dir:main",
+                "phase": "waiting_approval",
+                "tool": "mail_send",
+                "label": "Sending an email",
+                "call_id": "c2"
+            }),
+            start,
+        );
+        let kind = w.activity_kind_of("main", start);
+        assert_eq!(kind, ActivityKind::WaitingApproval);
+        assert_eq!(kind.as_str(), "waiting_approval");
+        assert!(!kind.animates());
+
+        // Completing the turn triggers a brief Done shimmer that does not animate as working.
+        assert!(w.apply("turn.completed", &json!({"task_id": "t1"}), start));
+        assert!(w.working_bots(start).is_empty());
+        assert_eq!(w.activity_of("main", start), None);
+        assert_eq!(w.activity_kind_of("main", start), ActivityKind::Done);
+        assert_eq!(
+            w.conversation_activity_kind("dir:main", start),
+            ActivityKind::Done
+        );
+        assert!(!ActivityKind::Done.animates());
+
+        // After DONE_SHIMMER, it settles back to Idle.
+        let after_done = start + DONE_SHIMMER + Duration::from_millis(1);
+        assert_eq!(w.activity_kind_of("main", after_done), ActivityKind::Idle);
+        assert_eq!(
+            w.conversation_activity_kind("dir:main", after_done),
+            ActivityKind::Idle
         );
     }
 }
