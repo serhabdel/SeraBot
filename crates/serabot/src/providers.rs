@@ -1440,10 +1440,12 @@ pub fn open_provider_client(
     let endpoint = resolve_base_url(&profile.kind, &profile.base_url)?;
     let kind = canonical_kind(&profile.kind)?;
     // A Claude plan sign-in is an `anthropic` account that carries a refresh
-    // token. It exists only for the admin's own account, only while the
-    // operator has not turned `plan_oauth` off, and is never reachable through
-    // a grant.
-    let claude_plan = kind == "anthropic" && !credential.refresh_token.trim().is_empty();
+    // token or a setup-token (`sk-ant-oat01-...`). It exists only for the
+    // admin's own account, only while the operator has not turned `plan_oauth`
+    // off, and is never reachable through a grant.
+    let claude_plan = kind == "anthropic"
+        && (!credential.refresh_token.trim().is_empty()
+            || credential.api_key.trim().starts_with("sk-ant-oat"));
     if claude_plan && !(profile.plan_oauth_enabled() && owner.account_id != DEFAULT_ACCOUNT) {
         return Err(SeraError::Forbidden(
             "Claude plan sign-in is turned off on this server".into(),

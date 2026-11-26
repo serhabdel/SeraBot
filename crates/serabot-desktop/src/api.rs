@@ -400,7 +400,7 @@ pub const SPECIALIST_TOOLS: &[&str] = &[
 pub const DEFAULT_SPECIALIST_TOOLS: &[&str] = &["skill_list", "skill_search", "skill_load"];
 
 const MAX_BOT_DESCRIPTION_CHARS: usize = 2000;
-const MAX_SCAFFOLD_TOOLS: usize = 32;
+const MAX_SCAFFOLD_TOOLS: usize = 64;
 const MAX_SCAFFOLD_SKILLS: usize = 16;
 pub const MAX_SKILL_DESCRIPTION_CHARS: usize = 500;
 pub const MAX_SKILL_BODY_BYTES: usize = 96_000;
@@ -585,7 +585,7 @@ pub fn validate_tool_edit(tools: &[String]) -> Result<(), ApiError> {
 
 pub fn validate_tool_list(tools: &[String]) -> Result<(), ApiError> {
     if tools.len() > MAX_SCAFFOLD_TOOLS {
-        return Err(ApiError::Validation("Choose at most 32 specialist tools."));
+        return Err(ApiError::Validation("Choose at most 64 specialist tools."));
     }
     let mut seen = HashSet::with_capacity(tools.len());
     for tool in tools {

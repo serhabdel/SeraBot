@@ -533,7 +533,7 @@ impl LlmClient {
         }
         let mut body = json!({
             "model": model,
-            "messages": messages.iter().map(message_to_json).collect::<Vec<_>>(),
+            "messages": messages_to_json(messages),
             "max_tokens": self.max_output_tokens,
         });
         if self.copilot
@@ -1327,7 +1327,12 @@ impl LlmClient {
                                 restart = true;
                                 break;
                             }
-                            return Err(error);
+                            if !target.stream.contains(".sandbox.googleapis.com")
+                                || last_error.is_none()
+                            {
+                                last_error = Some(error);
+                            }
+                            break;
                         }
                         CloudPost::Unauthorized => return Err(cloud_status_error(401)),
                         CloudPost::NotFound | CloudPost::SessionLimited | CloudPost::Transport => {
@@ -1374,7 +1379,11 @@ impl LlmClient {
                         break;
                     }
                     CloudPost::Unauthorized => return Err(catalog_status_error(401)),
-                    CloudPost::NotFound => last_error = Some(catalog_status_error(404)),
+                    CloudPost::NotFound => {
+                        if !url.contains(".sandbox.googleapis.com") || last_error.is_none() {
+                            last_error = Some(catalog_status_error(404));
+                        }
+                    }
                     CloudPost::Retryable(error) => {
                         if !version_retried
                             && matches!(&error, SeraError::Upstream { status: 403, .. })
@@ -1388,9 +1397,15 @@ impl LlmClient {
                             restart = true;
                             break;
                         }
-                        last_error = Some(catalog_retag(error));
+                        if !url.contains(".sandbox.googleapis.com") || last_error.is_none() {
+                            last_error = Some(catalog_retag(error));
+                        }
                     }
-                    CloudPost::SessionLimited => last_error = Some(catalog_status_error(400)),
+                    CloudPost::SessionLimited => {
+                        if !url.contains(".sandbox.googleapis.com") || last_error.is_none() {
+                            last_error = Some(catalog_status_error(400));
+                        }
+                    }
                     CloudPost::BadRequest(error) => {
                         if !version_retried && Self::should_retry_cloud_version(&project, &error) {
                             version_retried = true;
@@ -1402,7 +1417,9 @@ impl LlmClient {
                             restart = true;
                             break;
                         }
-                        last_error = Some(catalog_retag(error));
+                        if !url.contains(".sandbox.googleapis.com") || last_error.is_none() {
+                            last_error = Some(catalog_retag(error));
+                        }
                     }
                     CloudPost::Failed(error) => {
                         if !version_retried && Self::should_retry_cloud_version(&project, &error) {
@@ -1415,7 +1432,9 @@ impl LlmClient {
                             restart = true;
                             break;
                         }
-                        return Err(catalog_retag(error));
+                        if !url.contains(".sandbox.googleapis.com") || last_error.is_none() {
+                            last_error = Some(catalog_retag(error));
+                        }
                     }
                     CloudPost::Transport => {}
                 }
@@ -1799,6 +1818,20 @@ pub(crate) fn copilot_uses_responses(model: &str) -> bool {
         || lower.starts_with("gpt-6")
 }
 
+fn messages_to_json(messages: &[LlmMessage]) -> Vec<Value> {
+    messages
+        .iter()
+        .filter(|message| {
+            message.role != Role::Tool
+                || message
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(|id| !id.trim().is_empty())
+        })
+        .map(message_to_json)
+        .collect()
+}
+
 fn message_to_json(message: &LlmMessage) -> Value {
     let content = if message.role == Role::User && !message.images.is_empty() {
         let mut parts = Vec::with_capacity(message.images.len() + 1);
@@ -1826,9 +1859,15 @@ fn message_to_json(message: &LlmMessage) -> Value {
             message
                 .tool_calls
                 .iter()
-                .map(|call| {
+                .enumerate()
+                .map(|(idx, call)| {
+                    let id = if call.id.trim().is_empty() {
+                        format!("call_{idx}")
+                    } else {
+                        call.id.clone()
+                    };
                     json!({
-                        "id": call.id,
+                        "id": id,
                         "type": "function",
                         "function": {
                             "name": call.name,
@@ -1840,7 +1879,12 @@ fn message_to_json(message: &LlmMessage) -> Value {
         );
         value["content"] = Value::Null;
     }
-    if let Some(tool_call_id) = &message.tool_call_id {
+    if let Some(tool_call_id) = message
+        .tool_call_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
         value["tool_call_id"] = json!(tool_call_id);
     }
     // Only tool results carry `name` on the wire. Assistant, system and user
@@ -2000,6 +2044,77 @@ mod tests {
             images: Vec::new(),
         };
         assert_eq!(message_to_json(&tool)["name"], json!("rag_search"));
+    }
+
+    #[test]
+    fn message_to_json_fills_empty_tool_call_ids_and_drops_orphan_tool_results() {
+        let assistant = LlmMessage {
+            role: Role::Assistant,
+            content: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: "  ".into(),
+                    name: "rag_search".into(),
+                    arguments: json!({"q": "x"}),
+                    reasoning_signature: None,
+                },
+                ToolCall {
+                    id: "call_existing".into(),
+                    name: "other".into(),
+                    arguments: json!({}),
+                    reasoning_signature: None,
+                },
+            ],
+            tool_call_id: None,
+            name: None,
+            is_error: false,
+            images: Vec::new(),
+        };
+        let valid_tool = LlmMessage {
+            role: Role::Tool,
+            content: Some("ok".into()),
+            tool_calls: Vec::new(),
+            tool_call_id: Some("call_existing".into()),
+            name: Some("other".into()),
+            is_error: false,
+            images: Vec::new(),
+        };
+        let empty_id_tool = LlmMessage {
+            role: Role::Tool,
+            content: Some("broken".into()),
+            tool_calls: Vec::new(),
+            tool_call_id: Some("   ".into()),
+            name: Some("rag_search".into()),
+            is_error: false,
+            images: Vec::new(),
+        };
+        let missing_id_tool = LlmMessage {
+            role: Role::Tool,
+            content: Some("broken".into()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: Some("rag_search".into()),
+            is_error: false,
+            images: Vec::new(),
+        };
+
+        let assistant_json = message_to_json(&assistant);
+        assert_eq!(assistant_json["tool_calls"][0]["id"], json!("call_0"));
+        assert_eq!(
+            assistant_json["tool_calls"][1]["id"],
+            json!("call_existing")
+        );
+        assert!(
+            message_to_json(&empty_id_tool)
+                .get("tool_call_id")
+                .is_none()
+        );
+
+        let wire = messages_to_json(&[assistant, empty_id_tool, missing_id_tool, valid_tool]);
+        assert_eq!(wire.len(), 2);
+        assert_eq!(wire[0]["role"], json!("assistant"));
+        assert_eq!(wire[1]["role"], json!("tool"));
+        assert_eq!(wire[1]["tool_call_id"], json!("call_existing"));
     }
 
     fn tool() -> ToolSpec {

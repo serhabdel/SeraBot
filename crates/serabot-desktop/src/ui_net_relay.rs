@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering;
 use dioxus::prelude::*;
 use serde_json::Value;
 
+use crate::ui::Icon;
 use crate::ui_widgets::StatusChip;
 use serabot_desktop::net_relay as relay;
 use serabot_desktop::session::Session;
@@ -120,21 +121,30 @@ pub fn NetRelayCard(session: Signal<Session>) -> Element {
     };
     rsx! {
         div { class: "card net-relay-card",
-            div { class: "card-head",
-                h3 { class: "card-title", "Route model traffic through this PC" }
-                StatusChip { tone, text: label.to_string() }
+            div { class: "settings-card-head",
+                div { class: "settings-card-head-copy",
+                    h3 { class: "card-title", "Route model traffic through this PC" }
+                    p { class: "settings-card-desc",
+                        "Selected providers reach the internet from this PC while the app is open, encrypted end-to-end."
+                    }
+                }
+                div { class: "settings-card-head-actions",
+                    StatusChip { tone, text: label.to_string() }
+                }
             }
-            p { class: "hint",
-                "While this app is open, the providers you pick reach the internet from this PC instead of the server. The connection stays encrypted from the server to the provider: this PC only passes bytes along and never sees keys or messages. When this PC is off, those providers fail over to the next route."
-            }
-            p { class: "hint",
-                "Only the listed provider hosts can be reached, never your home network. The provider's terms still apply to how you use your account."
+            p { class: "tiny muted",
+                "Only the listed provider hosts can be reached, never your home network. When this PC is off, those providers fail over to the next route."
             }
             if let Some(message) = error() {
                 p { class: "field-error", role: "alert", "{message}" }
             }
-            label { class: "toggle-row",
+            label { class: "settings-toggle-row",
+                div { class: "settings-toggle-copy",
+                    span { class: "settings-toggle-title", "Use this PC's internet for selected providers" }
+                    span { class: "settings-toggle-desc", "This PC only relays encrypted TLS bytes and never sees keys or messages." }
+                }
                 input {
+                    class: "switch",
                     r#type: "checkbox",
                     checked: enabled,
                     disabled: busy() || current.is_none(),
@@ -152,7 +162,6 @@ pub fn NetRelayCard(session: Signal<Session>) -> Element {
                         }
                     },
                 }
-                span { "Use this PC's internet for the providers below" }
             }
             div { class: "net-relay-providers", role: "group", "aria-label": "Providers",
                 for (kind, name, on) in providers.clone() {
@@ -181,28 +190,33 @@ pub fn NetRelayCard(session: Signal<Session>) -> Element {
                     }
                 }
             }
-            if enabled && stats.is_some() {
-                p { class: "tiny muted", role: "status",
-                    "{streams} open \u{b7} {human_bytes(up)} sent \u{b7} {human_bytes(down)} received"
+            div { class: "settings-card-foot",
+                if enabled && stats.is_some() {
+                    span { class: "tiny muted mono", role: "status",
+                        "{streams} open \u{b7} {human_bytes(up)} sent \u{b7} {human_bytes(down)} received"
+                    }
+                } else {
+                    span { class: "tiny muted", "Provider terms apply to how you use your account." }
                 }
-            }
-            div { class: "row-actions",
-                button {
-                    class: "btn ghost sm",
-                    r#type: "button",
-                    onclick: move |_| refresh(),
-                    "Refresh"
-                }
-                if enabled {
+                div { class: "settings-card-foot-actions",
                     button {
                         class: "btn ghost sm",
                         r#type: "button",
-                        disabled: busy(),
-                        onclick: {
-                            let selected = selected.clone();
-                            move |_| save(false, selected.clone())
-                        },
-                        "Stop relaying"
+                        onclick: move |_| refresh(),
+                        Icon { name: "refresh", size: 13 }
+                        "Refresh"
+                    }
+                    if enabled {
+                        button {
+                            class: "btn ghost sm",
+                            r#type: "button",
+                            disabled: busy(),
+                            onclick: {
+                                let selected = selected.clone();
+                                move |_| save(false, selected.clone())
+                            },
+                            "Stop relaying"
+                        }
                     }
                 }
             }

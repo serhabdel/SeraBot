@@ -285,113 +285,119 @@ fn BotForm(session: Signal<Session>, id: String) -> Element {
                         span { "Loading bot settings\u{2026}" }
                     }
                 }
-                div { class: "field",
-                    span { class: "field-label", "Picture" }
-                    AvatarPicker {
-                        preview: None,
-                        letter,
-                        style: avatar_style(&id),
-                        has_image,
-                        on_pick: {
-                            let id = id.clone();
-                            move |bytes: Vec<u8>| session.write().pick_image(ImageSlot::Bot(id.clone()), bytes)
-                        },
-                        on_clear: {
-                            let id = id.clone();
-                            move |_| session.write().clear_image(ImageSlot::Bot(id.clone()))
-                        },
+                div { class: "bot-form-group",
+                    h3 { class: "bot-form-group-title", "Identity & behavior" }
+                    div { class: "field",
+                        span { class: "field-label", "Picture" }
+                        AvatarPicker {
+                            preview: None,
+                            letter,
+                            style: avatar_style(&id),
+                            has_image,
+                            on_pick: {
+                                let id = id.clone();
+                                move |bytes: Vec<u8>| session.write().pick_image(ImageSlot::Bot(id.clone()), bytes)
+                            },
+                            on_clear: {
+                                let id = id.clone();
+                                move |_| session.write().clear_image(ImageSlot::Bot(id.clone()))
+                            },
+                        }
+                        span { class: "hint", "The picture is saved as soon as you choose it." }
                     }
-                    span { class: "hint", "The picture is saved as soon as you choose it." }
-                }
-                div { class: "field",
-                    label { class: "field-label", r#for: "bot-name", "Name" }
-                    input {
-                        id: "bot-name",
-                        class: if name_error.is_some() { "input invalid" } else { "input" },
-                        value: "{draft.display_name}",
-                        disabled: !hydrated,
-                        autocomplete: "off",
-                        "aria-invalid": if name_error.is_some() { "true" } else { "false" },
-                        oninput: move |event| {
-                            let mut s = session.write();
-                            s.bot_settings.draft.display_name = event.value();
-                            s.bot_settings.error = None;
-                            s.bot_settings.notice = None;
-                        },
+                    div { class: "field",
+                        label { class: "field-label", r#for: "bot-name", "Name" }
+                        input {
+                            id: "bot-name",
+                            class: if name_error.is_some() { "input invalid" } else { "input" },
+                            value: "{draft.display_name}",
+                            disabled: !hydrated,
+                            autocomplete: "off",
+                            "aria-invalid": if name_error.is_some() { "true" } else { "false" },
+                            oninput: move |event| {
+                                let mut s = session.write();
+                                s.bot_settings.draft.display_name = event.value();
+                                s.bot_settings.error = None;
+                                s.bot_settings.notice = None;
+                            },
+                        }
+                        if let Some(message) = name_error.clone() {
+                            span { class: "field-error", "{message}" }
+                        }
                     }
-                    if let Some(message) = name_error.clone() {
-                        span { class: "field-error", "{message}" }
+                    div { class: "field",
+                        label { class: "field-label", r#for: "bot-description", "What it's for" }
+                        textarea {
+                            id: "bot-description",
+                            class: if description_error.is_some() { "textarea invalid" } else { "textarea" },
+                            rows: "2",
+                            value: "{draft.description}",
+                            disabled: !hydrated,
+                            placeholder: "A short line that explains this bot.",
+                            oninput: move |event| {
+                                let mut s = session.write();
+                                s.bot_settings.draft.description = event.value();
+                                s.bot_settings.error = None;
+                                s.bot_settings.notice = None;
+                            },
+                        }
+                        if let Some(message) = description_error.clone() {
+                            span { class: "field-error", "{message}" }
+                        } else if description_left <= 40 {
+                            span { class: "hint", "{description_left} characters left" }
+                        }
                     }
-                }
-                div { class: "field",
-                    label { class: "field-label", r#for: "bot-description", "What it's for" }
-                    textarea {
-                        id: "bot-description",
-                        class: if description_error.is_some() { "textarea invalid" } else { "textarea" },
-                        rows: "2",
-                        value: "{draft.description}",
-                        disabled: !hydrated,
-                        placeholder: "A short line that explains this bot.",
-                        oninput: move |event| {
-                            let mut s = session.write();
-                            s.bot_settings.draft.description = event.value();
-                            s.bot_settings.error = None;
-                            s.bot_settings.notice = None;
-                        },
-                    }
-                    if let Some(message) = description_error.clone() {
-                        span { class: "field-error", "{message}" }
-                    } else if description_left <= 40 {
-                        span { class: "hint", "{description_left} characters left" }
-                    }
-                }
-                div { class: "field",
-                    label { class: "field-label", r#for: "bot-instructions", "How it should behave" }
-                    textarea {
-                        id: "bot-instructions",
-                        class: if instructions_error.is_some() { "textarea tall invalid" } else { "textarea tall" },
-                        rows: "7",
-                        value: "{draft.instructions}",
-                        disabled: !hydrated,
-                        placeholder: "Its role and rules, in your own words. For example: you book venues, always confirm the date first.",
-                        oninput: move |event| {
-                            let mut s = session.write();
-                            s.bot_settings.draft.instructions = event.value();
-                            s.bot_settings.error = None;
-                            s.bot_settings.notice = None;
-                        },
-                    }
-                    if let Some(message) = instructions_error.clone() {
-                        span { class: "field-error", "{message}" }
+                    div { class: "field",
+                        label { class: "field-label", r#for: "bot-instructions", "How it should behave" }
+                        textarea {
+                            id: "bot-instructions",
+                            class: if instructions_error.is_some() { "textarea tall invalid" } else { "textarea tall" },
+                            rows: "7",
+                            value: "{draft.instructions}",
+                            disabled: !hydrated,
+                            placeholder: "Its role and rules, in your own words. For example: you book venues, always confirm the date first.",
+                            oninput: move |event| {
+                                let mut s = session.write();
+                                s.bot_settings.draft.instructions = event.value();
+                                s.bot_settings.error = None;
+                                s.bot_settings.notice = None;
+                            },
+                        }
+                        if let Some(message) = instructions_error.clone() {
+                            span { class: "field-error", "{message}" }
+                        }
                     }
                 }
                 crate::ui_bots::RouteEditor { session, bot: id.clone() }
-                div { class: "field",
-                    label { class: "field-label", r#for: "bot-profile", "Browser profile" }
-                    select {
-                        id: "bot-profile",
-                        class: "select",
-                        value: "{profile_value}",
-                        disabled: !hydrated,
-                        onchange: move |event| {
-                            let picked = event.value();
-                            let mut s = session.write();
-                            s.bot_settings.draft.browser_profile =
-                                if picked == DEFAULT_PROFILE { String::new() } else { picked };
-                            s.bot_settings.error = None;
-                            s.bot_settings.notice = None;
-                        },
-                        option { value: "{DEFAULT_PROFILE}", selected: profile_value == DEFAULT_PROFILE, "Default profile" }
-                        for profile in profiles.iter().filter(|p| !p.is_default && p.id != DEFAULT_PROFILE) {
-                            option {
-                                key: "{profile.id}",
-                                value: "{profile.id}",
-                                selected: profile_value == profile.id,
-                                "{profile.name}"
+                div { class: "bot-form-group",
+                    h3 { class: "bot-form-group-title", "Browser & tools" }
+                    div { class: "field",
+                        label { class: "field-label", r#for: "bot-profile", "Browser profile" }
+                        select {
+                            id: "bot-profile",
+                            class: "select",
+                            value: "{profile_value}",
+                            disabled: !hydrated,
+                            onchange: move |event| {
+                                let picked = event.value();
+                                let mut s = session.write();
+                                s.bot_settings.draft.browser_profile =
+                                    if picked == DEFAULT_PROFILE { String::new() } else { picked };
+                                s.bot_settings.error = None;
+                                s.bot_settings.notice = None;
+                            },
+                            option { value: "{DEFAULT_PROFILE}", selected: profile_value == DEFAULT_PROFILE, "Default profile" }
+                            for profile in profiles.iter().filter(|p| !p.is_default && p.id != DEFAULT_PROFILE) {
+                                option {
+                                    key: "{profile.id}",
+                                    value: "{profile.id}",
+                                    selected: profile_value == profile.id,
+                                    "{profile.name}"
+                                }
                             }
                         }
+                        span { class: "hint", "Each profile keeps its own logins. Add more on the Browser page." }
                     }
-                    span { class: "hint", "Each profile keeps its own logins. Add more on the Browser page." }
                 }
                 // 0.63: memory sits inside the scrolling form, above the
                 // pinned Save bar, instead of floating under it.

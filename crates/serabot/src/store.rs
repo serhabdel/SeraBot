@@ -3229,7 +3229,9 @@ impl Store {
     /// History for the model: the newest `limit` messages, further trimmed
     /// from the oldest end until their content fits `max_chars` (the newest
     /// message always survives). System messages are dropped: the turn builds
-    /// its own prompt.
+    /// its own prompt. `Tool` messages without a valid `tool_call_id` or
+    /// without a preceding `Assistant` message declaring that `tool_call_id`
+    /// are also dropped so crashed/orphaned tool rows cannot poison future turns.
     pub fn history_for_llm(
         &self,
         user_id: &str,
@@ -3237,7 +3239,7 @@ impl Store {
         limit: usize,
         max_chars: usize,
     ) -> Result<Vec<LlmMessage>> {
-        let mut messages: Vec<LlmMessage> = self
+        let raw_messages: Vec<LlmMessage> = self
             .list_messages(user_id, conversation_id, limit)?
             .into_iter()
             .filter(|message| message.role != Role::System)
@@ -3251,6 +3253,7 @@ impl Store {
                 images: Vec::new(),
             })
             .collect();
+        let mut messages = sanitize_llm_history(raw_messages);
         let mut total: usize = messages
             .iter()
             .map(|message| message.content.as_deref().map_or(0, str::len))
@@ -3261,7 +3264,7 @@ impl Store {
             }
             messages.remove(0);
         }
-        Ok(messages)
+        Ok(sanitize_llm_history(messages))
     }
 
     /// The id of the newest stored message in this conversation with this
@@ -6097,6 +6100,37 @@ pub struct ConversationSearchHit {
     pub created_at: String,
 }
 
+fn sanitize_llm_history(messages: Vec<LlmMessage>) -> Vec<LlmMessage> {
+    let mut declared_tool_call_ids = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(messages.len());
+    for message in messages {
+        match message.role {
+            Role::System => continue,
+            Role::Assistant => {
+                for call in &message.tool_calls {
+                    let id = call.id.trim();
+                    if !id.is_empty() {
+                        declared_tool_call_ids.insert(id.to_owned());
+                    }
+                }
+                out.push(message);
+            }
+            Role::Tool => {
+                let valid = message
+                    .tool_call_id
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|id| !id.is_empty() && declared_tool_call_ids.contains(id));
+                if valid {
+                    out.push(message);
+                }
+            }
+            Role::User => out.push(message),
+        }
+    }
+    out
+}
+
 fn map_conversation_write(error: rusqlite::Error) -> SeraError {
     if let rusqlite::Error::SqliteFailure(err, _) = &error {
         if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
@@ -6900,6 +6934,154 @@ mod tests {
         let messages = store.history_for_llm(&admin, "owner", 50, 0).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn history_for_llm_drops_empty_and_orphaned_tool_messages() {
+        let store = store();
+        let admin = admin(&store);
+        store
+            .append_message(&admin, "owner", None, Role::User, "hello")
+            .unwrap();
+        // Tool message with tool_call_id = None (e.g. tool_digest or crashed turn).
+        store
+            .append_message_named(
+                &admin,
+                "owner",
+                None,
+                Role::Tool,
+                "digest",
+                Some("tool_digest"),
+            )
+            .unwrap();
+        // Tool messages with empty / whitespace tool_call_id.
+        for (id, bad_call_id) in [
+            ("t-empty", ""),
+            ("t-space", "   "),
+            ("t-orphan", "call_orphan"),
+        ] {
+            store
+                .insert_message(
+                    &admin,
+                    &StoredMessage {
+                        id: id.into(),
+                        conversation_id: "owner".into(),
+                        turn_id: None,
+                        role: Role::Tool,
+                        content: format!("tool result {id}"),
+                        name: Some("browser_open".into()),
+                        bot: None,
+                        tool_call_id: Some(bad_call_id.into()),
+                        limit_reached: false,
+                        created_at: utc_now(),
+                    },
+                )
+                .unwrap();
+        }
+        store
+            .append_message(&admin, "owner", None, Role::Assistant, "first reply")
+            .unwrap();
+        store
+            .insert_message(
+                &admin,
+                &StoredMessage {
+                    id: "t-orphan-after".into(),
+                    conversation_id: "owner".into(),
+                    turn_id: None,
+                    role: Role::Tool,
+                    content: "orphaned after assistant".into(),
+                    name: Some("browser_click".into()),
+                    bot: None,
+                    tool_call_id: Some("call_missing".into()),
+                    limit_reached: false,
+                    created_at: utc_now(),
+                },
+            )
+            .unwrap();
+        store
+            .append_message(&admin, "owner", None, Role::User, "follow up")
+            .unwrap();
+        store
+            .append_message(&admin, "owner", None, Role::Assistant, "second reply")
+            .unwrap();
+
+        let messages = store.history_for_llm(&admin, "owner", 50, 60_000).unwrap();
+        let summary: Vec<(Role, Option<&str>)> = messages
+            .iter()
+            .map(|m| (m.role, m.content.as_deref()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (Role::User, Some("hello")),
+                (Role::Assistant, Some("first reply")),
+                (Role::User, Some("follow up")),
+                (Role::Assistant, Some("second reply")),
+            ]
+        );
+    }
+
+    #[test]
+    fn sanitize_llm_history_keeps_paired_tool_calls_and_drops_orphans() {
+        let valid_call = crate::domain::ToolCall {
+            id: "call_1".into(),
+            name: "browser_open".into(),
+            arguments: serde_json::json!({}),
+            reasoning_signature: None,
+        };
+        let messages = vec![
+            LlmMessage {
+                role: Role::User,
+                content: Some("open".into()),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                is_error: false,
+                images: Vec::new(),
+            },
+            LlmMessage {
+                role: Role::Assistant,
+                content: None,
+                tool_calls: vec![valid_call],
+                tool_call_id: None,
+                name: None,
+                is_error: false,
+                images: Vec::new(),
+            },
+            LlmMessage {
+                role: Role::Tool,
+                content: Some("ok".into()),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call_1".into()),
+                name: Some("browser_open".into()),
+                is_error: false,
+                images: Vec::new(),
+            },
+            LlmMessage {
+                role: Role::Tool,
+                content: Some("orphan".into()),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call_2".into()),
+                name: Some("browser_click".into()),
+                is_error: false,
+                images: Vec::new(),
+            },
+            LlmMessage {
+                role: Role::Tool,
+                content: Some("empty".into()),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("".into()),
+                name: None,
+                is_error: false,
+                images: Vec::new(),
+            },
+        ];
+        let sanitized = super::sanitize_llm_history(messages);
+        assert_eq!(sanitized.len(), 3);
+        assert_eq!(sanitized[0].role, Role::User);
+        assert_eq!(sanitized[1].role, Role::Assistant);
+        assert_eq!(sanitized[2].role, Role::Tool);
+        assert_eq!(sanitized[2].tool_call_id.as_deref(), Some("call_1"));
     }
 
     #[test]

@@ -291,6 +291,18 @@
 .reason-chips { display: flex; flex-wrap: wrap; gap: 4px 6px; }
 .failed-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 
+.failed-fallback-btn {
+  max-width: 240px;
+  min-width: 0;
+}
+
+.failed-fallback-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
 .failed-alt {
   grid-column: 1 / -1;
   list-style: none;
@@ -298,9 +310,13 @@
   padding: 4px;
   display: flex;
   flex-direction: column;
+  max-height: 220px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   border-radius: var(--r-sm);
   background: var(--surface);
   border: 1px solid var(--hairline);
+  box-shadow: var(--shadow-md, 0 8px 24px rgba(0,0,0,0.12));
   animation: none;
 }
 
@@ -315,6 +331,9 @@
   font: inherit;
   font-size: var(--fs-body-2);
   text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   cursor: pointer;
   transition: background-color var(--dur-press) var(--ease);
 }

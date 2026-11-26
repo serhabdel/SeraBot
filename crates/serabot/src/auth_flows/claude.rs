@@ -320,6 +320,8 @@ impl SignInProvider for ClaudeSignIn {
         let response = http
             .post(self.token.checked_url()?)
             .header("accept", "application/json")
+            .header("anthropic-beta", OAUTH_BETA)
+            .header("user-agent", PLAN_USER_AGENT)
             .json(&body)
             .send()
             .await
@@ -327,6 +329,20 @@ impl SignInProvider for ClaudeSignIn {
         let status = response.status();
         let bytes = read_capped(response).await?;
         if !status.is_success() {
+            let code = serde_json::from_slice::<Value>(&bytes)
+                .ok()
+                .and_then(|body| body.get("error").and_then(Value::as_str).map(str::to_owned))
+                .unwrap_or_default();
+            tracing::warn!(
+                status = status.as_u16(),
+                error_code = code.as_str(),
+                "Claude OAuth token exchange failed"
+            );
+            if status.as_u16() == 429 || status.is_server_error() {
+                return Err(SeraError::External(
+                    "Claude could not complete sign-in right now. Try again shortly.".into(),
+                ));
+            }
             return Err(SeraError::Rejected {
                 code: "signin_refused",
                 message: "The provider refused the sign-in code. Start the sign-in again.".into(),

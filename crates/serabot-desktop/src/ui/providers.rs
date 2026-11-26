@@ -653,12 +653,6 @@ fn ProviderCard(
                 div { class: "prov-card-title",
                     div { class: "prov-card-name",
                         h3 { "{title}" }
-                        if provider.is_default {
-                            span { class: "prov-badge accent",
-                                Icon { name: "star", size: 11 }
-                                "Default"
-                            }
-                        }
                     }
                     span { class: "prov-card-sub",
                         if title != kind_label && !title.contains(&kind_label) {
@@ -667,15 +661,26 @@ fn ProviderCard(
                         "{model_line}"
                     }
                 }
-                StatusChip { tone: conn.tone(), text: conn.label().to_owned() }
+                div { class: "prov-card-head-right",
+                    if provider.is_default {
+                        span { class: "prov-badge accent",
+                            Icon { name: "star", size: 11 }
+                            "Default"
+                        }
+                    }
+                    StatusChip { tone: conn.tone(), text: conn.label().to_owned() }
+                }
             }
             if !shown.is_empty() {
-                div { class: "prov-models", "aria-label": "Models",
-                    for model in shown {
-                        span { class: "prov-model", "{model}" }
-                    }
-                    if extra > 0 {
-                        span { class: "prov-model more", "+{extra}" }
+                div { class: "prov-models-wrap",
+                    span { class: "prov-models-label", "Models" }
+                    div { class: "prov-models", "aria-label": "Models",
+                        for model in shown {
+                            span { class: "prov-model", "{model}" }
+                        }
+                        if extra > 0 {
+                            span { class: "prov-model more", "+{extra} more" }
+                        }
                     }
                 }
             }
@@ -1026,73 +1031,346 @@ fn UsageCard(session: Signal<Session>) -> Element {
     }
 }
 
-struct BotRouteRowView {
+struct BotChainItemView {
     id: String,
     name: String,
     avatar: String,
-    current_value: String,
-    assigned_label: String,
-    thinking_badge: Option<String>,
+    primary_label: String,
     fallback_count: usize,
-    unlisted_current: bool,
+    is_selected: bool,
+    is_dirty: bool,
 }
 
-fn thinking_badge_label(level: &str) -> &str {
-    match level {
-        "off" => "Off",
-        "low" => "Low",
-        "medium" => "Medium",
-        "high" => "High",
-        "xhigh" => "Extra high",
-        other => other,
-    }
+#[derive(Clone, PartialEq)]
+struct ChainSlotView {
+    row: usize,
+    title: &'static str,
+    slot: serabot_desktop::route_editor::RouteSlot,
+    providers: Vec<serabot_desktop::route_editor::ProviderChoice>,
+    accounts: Vec<(String, String)>,
+    models: Vec<serabot_desktop::route_editor::ModelChoice>,
+    levels: Vec<String>,
+    error: Option<String>,
+    consent_row: bool,
+    consent: bool,
 }
 
-fn quick_set_bot_model(
-    mut session: Signal<Session>,
-    bot_id: String,
-    prev_value: String,
-    next_value: String,
+fn build_chain_slots(
+    session: &Session,
+) -> (
+    Vec<ChainSlotView>,
+    serabot_desktop::route_editor::RouteCheck,
 ) {
-    if prev_value == next_value {
-        return;
-    }
-    let mut s = session.write();
-    if s.bot_settings.saving || !s.can_admin() {
-        return;
-    }
-    let mut display_name = s.bot_display_name(&bot_id);
-    if display_name.trim().is_empty() {
-        display_name = bot_id.clone();
-    }
-    let mut original = serabot_desktop::session::BotDraft {
-        display_name: display_name.clone(),
-        model: prev_value,
-        ..Default::default()
+    use serabot_desktop::route_editor::{MAX_FALLBACKS, RouteCheck};
+    let options = session.route_options();
+    let draft = &session.route_editor.draft;
+    let check = if session.state.catalog.is_some() {
+        draft.check(&options)
+    } else {
+        RouteCheck::default()
     };
-    let mut draft = original.clone();
-    draft.model = next_value;
-    if original.model == draft.model {
-        original.model = if draft.model.is_empty() {
-            "__reset__|__reset__".to_owned()
-        } else {
-            String::new()
-        };
-    }
-    s.bot_settings.bot = Some(bot_id);
-    s.bot_settings.original = original;
-    s.bot_settings.draft = draft;
-    s.bot_settings.hydrated = true;
-    s.save_bot_settings();
-    // Mark unhydrated so opening the full bot settings sheet later reloads
-    // every field cleanly from the server record.
-    s.bot_settings.hydrated = false;
+    let rows = (0..=MAX_FALLBACKS)
+        .map(|row| {
+            let slot = match row {
+                0 => draft.primary.clone(),
+                other => draft.fallbacks[other - 1].clone(),
+            };
+            let (title, error) = match row {
+                0 => ("Primary model", check.primary.clone()),
+                1 => ("Fallback 1", check.fallbacks[0].clone()),
+                _ => ("Fallback 2", check.fallbacks[1].clone()),
+            };
+            let chosen = !slot.is_empty();
+            ChainSlotView {
+                row,
+                title,
+                providers: options.provider_choices(),
+                accounts: if chosen {
+                    options.account_choices(&slot.provider)
+                } else {
+                    Vec::new()
+                },
+                models: if chosen {
+                    options.model_choices(&slot.provider)
+                } else {
+                    Vec::new()
+                },
+                levels: options.thinking_levels(&slot.provider, &slot.model),
+                consent_row: row > 0 && check.needs_consent[row - 1],
+                consent: row > 0 && draft.consent[row - 1],
+                error,
+                slot,
+            }
+        })
+        .collect();
+    (rows, check)
 }
 
-/// Compact per-bot model routing table on the Providers page.
+#[component]
+fn BotChainSlotCard(
+    session: Signal<Session>,
+    view: ChainSlotView,
+    hydrated: bool,
+    can_write: bool,
+    can_move_up: bool,
+    can_move_down: bool,
+) -> Element {
+    let row = view.row;
+    let primary = row == 0;
+    let chosen = !view.slot.is_empty();
+    let segments =
+        serabot_desktop::route_chip::thinking_segments(&view.levels, &view.slot.thinking);
+    let class = match (primary, view.error.is_some()) {
+        (_, true) => "bot-chain-slot has-error",
+        (true, false) => "bot-chain-slot is-primary",
+        (false, false) => "bot-chain-slot",
+    };
+    let none_label = if primary {
+        "Inherit global default"
+    } else {
+        "Choose a provider\u{2026}"
+    };
+    let id = |part: &str| format!("chain-{row}-{part}");
+    rsx! {
+        div { class: "{class}",
+            div { class: "bot-chain-slot-head",
+                div { class: "bot-chain-slot-title",
+                    span { class: if primary { "chip accent" } else { "chip muted" }, "{view.title}" }
+                    if primary && !chosen {
+                        span { class: "tiny muted", "Uses the default model strip above" }
+                    }
+                }
+                if !primary {
+                    div { class: "bot-chain-slot-actions",
+                        button {
+                            class: "btn icon ghost sm",
+                            r#type: "button",
+                            title: "Move fallback earlier",
+                            "aria-label": "Move {view.title} up",
+                            disabled: !hydrated || !can_write || !can_move_up,
+                            onclick: move |_| {
+                                let fb_idx = row - 1;
+                                if fb_idx > 0 {
+                                    session.write().swap_route_fallbacks(fb_idx - 1, fb_idx);
+                                }
+                            },
+                            Icon { name: "chevron-up", size: 14 }
+                        }
+                        button {
+                            class: "btn icon ghost sm",
+                            r#type: "button",
+                            title: "Move fallback later",
+                            "aria-label": "Move {view.title} down",
+                            disabled: !hydrated || !can_write || !can_move_down,
+                            onclick: move |_| {
+                                let fb_idx = row - 1;
+                                session.write().swap_route_fallbacks(fb_idx, fb_idx + 1);
+                            },
+                            Icon { name: "chevron-down", size: 14 }
+                        }
+                        button {
+                            class: "btn ghost sm",
+                            r#type: "button",
+                            "aria-label": "Remove {view.title}",
+                            disabled: !hydrated || !can_write,
+                            onclick: move |_| {
+                                session.write().remove_route_fallback(row - 1);
+                            },
+                            Icon { name: "trash", size: 13 }
+                            "Remove"
+                        }
+                    }
+                }
+            }
+            div { class: "route-grid",
+                div { class: "field",
+                    label { class: "field-label", r#for: "{id(\"provider\")}", "Provider" }
+                    select {
+                        id: "{id(\"provider\")}",
+                        class: "select",
+                        value: "{view.slot.provider}",
+                        disabled: !hydrated || !can_write,
+                        onchange: move |event| {
+                            session.write().route_change(
+                                row,
+                                serabot_desktop::session::RouteChange::Provider(event.value()),
+                            );
+                        },
+                        option { value: "", selected: !chosen, "{none_label}" }
+                        for choice in view.providers.clone() {
+                            option {
+                                key: "{choice.id}",
+                                value: "{choice.id}",
+                                selected: choice.id == view.slot.provider,
+                                disabled: !choice.egress_approved,
+                                if choice.egress_approved {
+                                    "{choice.label}"
+                                } else {
+                                    "{choice.label} (no data-egress approval)"
+                                }
+                            }
+                        }
+                    }
+                }
+                if chosen {
+                    div { class: "field",
+                        label { class: "field-label", r#for: "{id(\"account\")}", "Account" }
+                        select {
+                            id: "{id(\"account\")}",
+                            class: "select",
+                            value: "{view.slot.account}",
+                            disabled: !hydrated || !can_write,
+                            onchange: move |event| {
+                                session.write().route_change(
+                                    row,
+                                    serabot_desktop::session::RouteChange::Account(event.value()),
+                                );
+                            },
+                            for (account_id, label) in view.accounts.clone() {
+                                option {
+                                    key: "{account_id}",
+                                    value: "{account_id}",
+                                    selected: account_id == view.slot.account,
+                                    "{label}"
+                                }
+                            }
+                        }
+                    }
+                    div { class: "field",
+                        label { class: "field-label", r#for: "{id(\"model\")}", "Model" }
+                        select {
+                            id: "{id(\"model\")}",
+                            class: "select",
+                            value: "{view.slot.model}",
+                            disabled: !hydrated || !can_write,
+                            onchange: move |event| {
+                                session.write().route_change(
+                                    row,
+                                    serabot_desktop::session::RouteChange::Model(event.value()),
+                                );
+                            },
+                            if !view.slot.model.is_empty()
+                                && !view.models.iter().any(|choice| choice.model == view.slot.model)
+                            {
+                                option {
+                                    value: "{view.slot.model}",
+                                    selected: true,
+                                    "{view.slot.model} (not in your list)"
+                                }
+                            }
+                            for choice in view.models.clone() {
+                                option {
+                                    key: "{choice.model}",
+                                    value: "{choice.model}",
+                                    selected: choice.model == view.slot.model,
+                                    "{choice.title}"
+                                }
+                            }
+                        }
+                    }
+                    if !segments.is_empty() {
+                        div { class: "field",
+                            span { class: "field-label", "Thinking" }
+                            div { class: "seg", role: "group", "aria-label": "Thinking level for {view.title}",
+                                for segment in segments {
+                                    button {
+                                        key: "{segment.label}",
+                                        r#type: "button",
+                                        class: if segment.active { "seg-btn active" } else { "seg-btn" },
+                                        "aria-pressed": if segment.active { "true" } else { "false" },
+                                        disabled: !hydrated || !can_write,
+                                        onclick: {
+                                            let value = segment.value.clone();
+                                            move |_| {
+                                                session.write().route_change(
+                                                    row,
+                                                    serabot_desktop::session::RouteChange::Thinking(value.clone()),
+                                                );
+                                            }
+                                        },
+                                        "{segment.label}"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if view.consent_row {
+                label { class: "route-consent",
+                    input {
+                        class: "switch",
+                        r#type: "checkbox",
+                        checked: view.consent,
+                        disabled: !hydrated || !can_write,
+                        onchange: move |event| {
+                            let mut s = session.write();
+                            if let Some(slot) = s.route_editor.draft.consent.get_mut(row - 1) {
+                                *slot = event.checked();
+                            }
+                            s.route_editor.error = None;
+                            s.route_editor.notice = None;
+                        },
+                    }
+                    span { "Send prompts to this provider when the primary fails." }
+                }
+            }
+            if let Some(message) = view.error {
+                p { class: "field-error", role: "alert", "{message}" }
+            }
+        }
+    }
+}
+
+/// Per-bot model & fallback chain editor on the AI Providers page.
 #[component]
 fn BotRoutingSection(session: Signal<Session>) -> Element {
-    let (rows, model_groups, can_write, saving_bot, route_error) = {
+    use serabot_desktop::route_editor::{self, MAX_FALLBACKS, MAX_SWITCHES};
+
+    let first_bot_id = {
+        let s = session.read();
+        s.state
+            .listed_bots
+            .iter()
+            .find(|bot| bot.enabled)
+            .map(|bot| bot.id.clone())
+    };
+    let Some(first_bot_id) = first_bot_id else {
+        return rsx! {};
+    };
+
+    use_effect(move || {
+        let needs_select = {
+            let s = session.read();
+            let current = s.route_editor.bot.as_deref();
+            !s.state
+                .listed_bots
+                .iter()
+                .any(|b| b.enabled && Some(b.id.as_str()) == current)
+        };
+        if needs_select {
+            session.write().select_route_bot(&first_bot_id);
+        }
+    });
+
+    let (
+        items,
+        selected_id,
+        selected_name,
+        selected_avatar,
+        slots,
+        check,
+        hydrated,
+        saving,
+        dirty,
+        error,
+        notice,
+        failover,
+        effective,
+        last_switch,
+        can_write,
+        first_approved_provider,
+    ) = {
         let s = session.read();
         let enabled_bots: Vec<_> = s
             .state
@@ -1100,200 +1378,348 @@ fn BotRoutingSection(session: Signal<Session>) -> Element {
             .iter()
             .filter(|bot| bot.enabled)
             .collect();
-        if enabled_bots.is_empty() {
-            return rsx! {};
-        }
-        let options = s.route_options();
-        type ModelGroup = (String, String, Vec<(String, String)>);
-        let mut model_groups: Vec<ModelGroup> = Vec::new();
-        let mut model_to_value: Vec<(String, String)> = Vec::new();
-        let mut ready_values: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for prov in options.provider_choices() {
-            if !prov.egress_approved {
-                continue;
-            }
-            let prov_ready = s
-                .state
-                .providers
-                .iter()
-                .find(|p| p.id == prov.id)
-                .is_none_or(usable);
-            if !prov_ready {
-                continue;
-            }
-            let models: Vec<(String, String)> = options
-                .model_choices(&prov.id)
-                .into_iter()
-                .map(|choice| {
-                    let value = serabot_desktop::session::model_value(&prov.id, &choice.model);
-                    model_to_value.push((choice.model.clone(), value.clone()));
-                    ready_values.insert(value.clone());
-                    (value, human_model(&choice.model))
-                })
-                .collect();
-            if !models.is_empty() {
-                model_groups.push((prov.id, prov.label, models));
-            }
-        }
-        let rows: Vec<BotRouteRowView> = enabled_bots
-            .into_iter()
+        let selected_id = s
+            .route_editor
+            .bot
+            .clone()
+            .filter(|id| enabled_bots.iter().any(|b| &b.id == id))
+            .unwrap_or_else(|| enabled_bots[0].id.clone());
+        let editor_dirty = s.route_editor.dirty();
+        let items: Vec<BotChainItemView> = enabled_bots
+            .iter()
             .map(|bot| {
+                let is_selected = bot.id == selected_id;
                 let detail = s.state.bot_details.get(&bot.id);
                 let route_primary = detail
                     .and_then(|d| d.route.as_ref())
                     .and_then(|r| r.route.as_ref());
-                let current_value = if let Some(primary) = route_primary {
-                    serabot_desktop::session::model_value(&primary.provider, &primary.model)
-                } else if let Some(model_id) = bot.model.as_deref().filter(|m| !m.is_empty()) {
-                    if let Some(d) =
-                        detail.filter(|d| !d.provider.is_empty() && !d.model.is_empty())
-                    {
-                        serabot_desktop::session::model_value(&d.provider, &d.model)
+                let primary_label = if is_selected && s.route_editor.hydrated {
+                    if s.route_editor.draft.primary.is_empty() {
+                        "Default".to_owned()
                     } else {
-                        model_to_value
-                            .iter()
-                            .find(|(raw, _)| raw == model_id)
-                            .map(|(_, val)| val.clone())
-                            .unwrap_or_else(|| model_id.to_owned())
+                        human_model(&s.route_editor.draft.primary.model)
                     }
-                } else {
-                    String::new()
-                };
-                let assigned_label = if let Some(primary) = route_primary {
+                } else if let Some(primary) = route_primary {
                     human_model(&primary.model)
                 } else if let Some(model_id) = bot.model.as_deref().filter(|m| !m.is_empty()) {
                     human_model(model_id)
                 } else {
                     "Default".to_owned()
                 };
-                let thinking_badge = route_primary
-                    .and_then(|p| p.thinking.as_deref())
-                    .or_else(|| detail.and_then(|d| d.thinking.as_deref()))
-                    .filter(|level| !level.is_empty())
-                    .map(|level| thinking_badge_label(level).to_owned());
-                let fallback_count = detail
-                    .and_then(|d| d.route.as_ref())
-                    .map(|r| r.fallbacks.len())
-                    .unwrap_or(0);
-                let unlisted_current =
-                    !current_value.is_empty() && !ready_values.contains(&current_value);
-                BotRouteRowView {
+                let fallback_count = if is_selected && s.route_editor.hydrated {
+                    s.route_editor
+                        .draft
+                        .fallbacks
+                        .iter()
+                        .filter(|slot| !slot.is_empty())
+                        .count()
+                } else {
+                    detail
+                        .and_then(|d| d.route.as_ref())
+                        .map(|r| r.fallbacks.len())
+                        .unwrap_or(0)
+                };
+                BotChainItemView {
                     id: bot.id.clone(),
                     name: s.bot_display_name(&bot.id),
                     avatar: s.bot_avatar(&bot.id),
-                    current_value,
-                    assigned_label,
-                    thinking_badge,
+                    primary_label,
                     fallback_count,
-                    unlisted_current,
+                    is_selected,
+                    is_dirty: is_selected && editor_dirty,
                 }
             })
             .collect();
-        let can_write = s.can_admin() && !s.bot_settings.saving;
-        let saving_bot = if s.bot_settings.saving {
-            s.bot_settings.bot.clone()
-        } else {
-            None
-        };
-        let route_error = s.bot_settings.error.clone();
-        (rows, model_groups, can_write, saving_bot, route_error)
+
+        let (slots, check) = build_chain_slots(&s);
+        let options = s.route_options();
+        let view = s
+            .state
+            .bot_details
+            .get(&selected_id)
+            .and_then(|detail| detail.route.as_ref());
+        let first_approved_provider = options
+            .provider_choices()
+            .into_iter()
+            .find(|p| p.egress_approved)
+            .map(|p| p.id);
+
+        (
+            items,
+            selected_id.clone(),
+            s.bot_display_name(&selected_id),
+            s.bot_avatar(&selected_id),
+            slots,
+            check,
+            s.route_editor.hydrated && s.route_editor.bot.as_deref() == Some(selected_id.as_str()),
+            s.route_editor.saving,
+            editor_dirty,
+            s.route_editor.error.clone(),
+            s.route_editor.notice.clone(),
+            s.route_editor.draft.failover,
+            view.and_then(|v| v.effective.as_ref())
+                .map(|eff| route_editor::effective_line(&options, eff)),
+            view.and_then(|v| v.last_switch.as_ref())
+                .map(|sw| route_editor::switch_line(&options, sw)),
+            s.can_admin(),
+            first_approved_provider,
+        )
     };
-    let count = rows.len();
+
+    let count = items.len();
+    let primary_slot = slots.first().cloned();
+    let active_fallbacks: Vec<ChainSlotView> = slots
+        .iter()
+        .skip(1)
+        .filter(|slot| !slot.slot.is_empty() || slot.error.is_some())
+        .cloned()
+        .collect();
+    let active_fallback_count = active_fallbacks.len();
+    let can_add_fallback = hydrated
+        && can_write
+        && active_fallback_count < MAX_FALLBACKS
+        && first_approved_provider.is_some();
+    let can_save = hydrated && can_write && dirty && !saving && check.is_ok();
+
+    // Summary pills for the visual chain strip
+    let primary_pill_text = primary_slot
+        .as_ref()
+        .filter(|s| !s.slot.is_empty())
+        .map(|s| human_model(&s.slot.model))
+        .unwrap_or_else(|| "Global default".to_owned());
+
     rsx! {
         section { class: "prov-section bot-routing-section", "aria-labelledby": "prov-bot-routing",
             div { class: "prov-section-head",
                 div {
-                    h2 { id: "prov-bot-routing", class: "prov-section-title", "Bot routing" }
-                    p { class: "tiny", "Assign each bot its own model, or leave it on Default to inherit the global route above." }
+                    h2 { id: "prov-bot-routing", class: "prov-section-title", "Bot routing & fallback chains" }
+                    p { class: "tiny", "Pick a bot to configure its primary model, fallback chain, and automatic failover rules." }
                 }
                 span { class: "prov-count", "{count} enabled" }
             }
-            if let Some(err) = route_error {
-                div { class: "banner err", role: "alert",
-                    span { class: "grow", "{err}" }
-                }
-            }
-            div { class: "card bot-routing-card", role: "list", "aria-label": "Bot routing",
-                for row in rows {
-                    {
-                        let bot_id_for_select = row.id.clone();
-                        let bot_id_for_btn = row.id.clone();
-                        let current_for_select = row.current_value.clone();
-                        let is_saving = saving_bot.as_deref() == Some(row.id.as_str());
-                        let select_id = format!("bot-route-select-{}", row.id);
-                        rsx! {
-                            div { key: "{row.id}", class: "bot-route-row", role: "listitem",
-                                div { class: "bot-route-info",
-                                    span { class: "avatar sm bot", style: avatar_style(&row.id), "{row.avatar}" }
-                                    div { class: "bot-route-copy",
-                                        span { class: "bot-route-name", "{row.name}" }
-                                        div { class: "bot-route-meta",
-                                            span { class: "bot-route-assigned", "{row.assigned_label}" }
-                                            if let Some(thinking) = row.thinking_badge {
-                                                span { class: "chip muted", "Thinking: {thinking}" }
+            div { class: "bot-chain-shell",
+                aside { class: "bot-chain-sidebar", "aria-label": "Bots",
+                    div { class: "bot-chain-sidebar-head",
+                        span { "Bots" }
+                        span { "{count}" }
+                    }
+                    div { class: "bot-chain-list", role: "listbox", "aria-label": "Select a bot",
+                        for item in items {
+                            {
+                                let bid = item.id.clone();
+                                rsx! {
+                                    button {
+                                        key: "{item.id}",
+                                        class: if item.is_selected { "bot-chain-item active" } else { "bot-chain-item" },
+                                        r#type: "button",
+                                        role: "option",
+                                        "aria-selected": if item.is_selected { "true" } else { "false" },
+                                        onclick: move |_| session.write().select_route_bot(&bid),
+                                        span { class: "avatar sm bot", style: avatar_style(&item.id), "{item.avatar}" }
+                                        div { class: "bot-chain-item-copy",
+                                            div { class: "bot-chain-item-top",
+                                                span { class: "bot-chain-item-name", "{item.name}" }
+                                                if item.is_dirty {
+                                                    span { class: "bot-chain-dirty-dot", title: "Unsaved changes" }
+                                                }
                                             }
-                                            if is_saving {
-                                                span { class: "chip muted", "Saving\u{2026}" }
-                                            }
-                                        }
-                                    }
-                                }
-                                div { class: "bot-route-controls",
-                                    select {
-                                        id: "{select_id}",
-                                        class: "select bot-route-select",
-                                        "aria-label": "Model for {row.name}",
-                                        value: "{row.current_value}",
-                                        disabled: !can_write,
-                                        onchange: move |event| {
-                                            quick_set_bot_model(
-                                                session,
-                                                bot_id_for_select.clone(),
-                                                current_for_select.clone(),
-                                                event.value(),
-                                            );
-                                        },
-                                        option {
-                                            value: "",
-                                            selected: row.current_value.is_empty(),
-                                            if row.fallback_count > 0 {
-                                                "Default (reset route & fallbacks)"
-                                            } else {
-                                                "Default (inherit)"
-                                            }
-                                        }
-                                        if row.unlisted_current {
-                                            option {
-                                                value: "{row.current_value}",
-                                                selected: true,
-                                                "{row.assigned_label}"
-                                            }
-                                        }
-                                        for (prov_id, prov_label, models) in &model_groups {
-                                            optgroup { key: "{prov_id}", label: "{prov_label}",
-                                                for (val, label) in models {
-                                                    option {
-                                                        key: "{val}",
-                                                        value: "{val}",
-                                                        selected: *val == row.current_value,
-                                                        "{label}"
-                                                    }
+                                            div { class: "bot-chain-item-sub",
+                                                span { "{item.primary_label}" }
+                                                if item.fallback_count > 0 {
+                                                    span { "\u{b7} +{item.fallback_count} fallback" }
                                                 }
                                             }
                                         }
                                     }
-                                    button {
-                                        class: "btn ghost sm",
-                                        r#type: "button",
-                                        title: "Configure primary model, fallbacks and failover rules",
-                                        onclick: move |_| session.write().open_bot_settings(bot_id_for_btn.clone()),
-                                        Icon { name: "settings", size: 13 }
-                                        if row.fallback_count > 0 {
-                                            "Fallbacks ({row.fallback_count})"
+                                }
+                            }
+                        }
+                    }
+                }
+                div { class: "bot-chain-editor",
+                    div { class: "bot-chain-editor-head",
+                        div { class: "bot-chain-editor-title",
+                            span { class: "avatar sm bot", style: avatar_style(&selected_id), "{selected_avatar}" }
+                            div {
+                                h3 { "{selected_name}" }
+                                if let Some(line) = effective {
+                                    span { class: "tiny muted", "Starts on: {line}" }
+                                } else {
+                                    span { class: "tiny muted", "Model route & fallback chain" }
+                                }
+                            }
+                        }
+                        button {
+                            class: "btn ghost sm",
+                            r#type: "button",
+                            onclick: {
+                                let bid = selected_id.clone();
+                                move |_| session.write().open_bot_settings(bid.clone())
+                            },
+                            Icon { name: "settings", size: 13 }
+                            "Bot settings"
+                        }
+                    }
+                    if !hydrated {
+                        div { class: "banner info", role: "status",
+                            span { class: "spinner" }
+                            span { "Loading route for {selected_name}\u{2026}" }
+                        }
+                    } else {
+                        div { class: "bot-chain-pills", "aria-label": "Active route chain",
+                            span { class: "bot-chain-pill is-primary",
+                                span { class: "bot-chain-pill-role", "Primary" }
+                                span { "{primary_pill_text}" }
+                            }
+                            for (idx, fb) in active_fallbacks.iter().enumerate() {
+                                span { key: "arrow-{idx}", class: "bot-chain-arrow", "\u{2192}" }
+                                span { class: "bot-chain-pill",
+                                    span { class: "bot-chain-pill-role", "Fallback {idx + 1}" }
+                                    span {
+                                        if fb.slot.model.is_empty() {
+                                            "Select model"
                                         } else {
-                                            "Fallbacks"
+                                            "{human_model(&fb.slot.model)}"
                                         }
                                     }
+                                }
+                            }
+                        }
+                        if let Some(primary) = primary_slot {
+                            BotChainSlotCard {
+                                session,
+                                view: primary,
+                                hydrated,
+                                can_write,
+                                can_move_up: false,
+                                can_move_down: false,
+                            }
+                        }
+                        div { class: "bot-chain-fallbacks-head",
+                            span { class: "bot-chain-fallbacks-title",
+                                "Fallback chain ({active_fallback_count} of {MAX_FALLBACKS})"
+                            }
+                            if can_add_fallback {
+                                button {
+                                    class: "btn ghost sm",
+                                    r#type: "button",
+                                    onclick: {
+                                        let next_row = active_fallback_count + 1;
+                                        let provider = first_approved_provider.clone().unwrap_or_default();
+                                        move |_| {
+                                            session.write().route_change(
+                                                next_row,
+                                                serabot_desktop::session::RouteChange::Provider(provider.clone()),
+                                            );
+                                        }
+                                    },
+                                    Icon { name: "plus", size: 13 }
+                                    "Add fallback"
+                                }
+                            }
+                        }
+                        if active_fallbacks.is_empty() {
+                            p { class: "tiny muted",
+                                "No fallbacks configured. Add a fallback to automatically try another model or provider if the primary fails."
+                            }
+                        } else {
+                            for (idx, fb) in active_fallbacks.into_iter().enumerate() {
+                                BotChainSlotCard {
+                                    key: "fb-{fb.row}",
+                                    session,
+                                    view: fb,
+                                    hydrated,
+                                    can_write,
+                                    can_move_up: idx > 0,
+                                    can_move_down: idx + 1 < active_fallback_count,
+                                }
+                            }
+                        }
+                        div { class: "bot-chain-policy",
+                            div { class: "bot-chain-policy-toggles",
+                                label { class: "check",
+                                    input {
+                                        class: "switch",
+                                        r#type: "checkbox",
+                                        checked: failover.enabled,
+                                        disabled: !hydrated || !can_write,
+                                        onchange: move |event| {
+                                            let mut s = session.write();
+                                            s.route_editor.draft.failover.enabled = event.checked();
+                                            s.route_editor.error = None;
+                                            s.route_editor.notice = None;
+                                        },
+                                    }
+                                    span { "Switch automatically" }
+                                }
+                                label { class: "check",
+                                    input {
+                                        class: "switch",
+                                        r#type: "checkbox",
+                                        checked: failover.switch_account_first,
+                                        disabled: !hydrated || !can_write || !failover.enabled,
+                                        onchange: move |event| {
+                                            let mut s = session.write();
+                                            s.route_editor.draft.failover.switch_account_first = event.checked();
+                                            s.route_editor.error = None;
+                                            s.route_editor.notice = None;
+                                        },
+                                    }
+                                    span { "Try other accounts first" }
+                                }
+                            }
+                            div { class: "bot-chain-policy-limit",
+                                label { class: "tiny muted", r#for: "chain-max-switches", "Max switches" }
+                                select {
+                                    id: "chain-max-switches",
+                                    class: "select",
+                                    value: "{failover.max_switches}",
+                                    disabled: !hydrated || !can_write || !failover.enabled,
+                                    onchange: move |event| {
+                                        if let Ok(count) = event.value().parse::<u8>() {
+                                            let mut s = session.write();
+                                            s.route_editor.draft.failover.max_switches = count.clamp(1, MAX_SWITCHES);
+                                            s.route_editor.error = None;
+                                            s.route_editor.notice = None;
+                                        }
+                                    },
+                                    for count in 1..=MAX_SWITCHES {
+                                        option { key: "{count}", value: "{count}", selected: count == failover.max_switches, "{count}" }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(line) = last_switch {
+                            p { class: "tiny muted", "Last automatic switch: {line}" }
+                        }
+                        if let Some(message) = error {
+                            div { class: "banner err", role: "alert", span { "{message}" } }
+                        }
+                        if let Some(message) = notice {
+                            div { class: "banner ok", role: "status", span { "{message}" } }
+                        }
+                        div { class: "bot-chain-foot",
+                            div { class: "bot-chain-foot-status",
+                                if dirty {
+                                    span { class: "chip accent", role: "status", "Unsaved changes" }
+                                } else {
+                                    span { class: "tiny muted", "Applies to the next turn. A turn already running keeps its route." }
+                                }
+                            }
+                            div { class: "bot-chain-foot-actions",
+                                button {
+                                    class: "btn ghost sm",
+                                    r#type: "button",
+                                    disabled: !dirty || saving,
+                                    onclick: move |_| session.write().reset_route_editor(),
+                                    "Reset"
+                                }
+                                button {
+                                    class: "btn primary sm",
+                                    r#type: "button",
+                                    disabled: !can_save,
+                                    onclick: move |_| session.write().save_bot_route(),
+                                    if saving { "Saving\u{2026}" } else { "Save route" }
                                 }
                             }
                         }

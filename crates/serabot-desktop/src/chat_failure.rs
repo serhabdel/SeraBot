@@ -179,9 +179,47 @@ fn same(entry: &crate::api::RouteEntry, selection: &Selection) -> bool {
         && entry.account == selection.account
 }
 
+fn is_eligible(
+    selection: &Selection,
+    current: &Selection,
+    skip: Option<&FallbackOffer>,
+    existing: &[FallbackOffer],
+) -> bool {
+    !selection.is_auto()
+        && *selection != *current
+        && !skip.is_some_and(|offer| offer.selection == *selection)
+        && !existing.iter().any(|offer| offer.selection == *selection)
+}
+
+fn push_offer(
+    out: &mut Vec<FallbackOffer>,
+    options: &Options<'_>,
+    current: &Selection,
+    skip: Option<&FallbackOffer>,
+    selection: Selection,
+    thinking: Option<String>,
+) {
+    if out.len() >= MAX_ALTERNATIVES || !is_eligible(&selection, current, skip, out) {
+        return;
+    }
+    let label = route_line(
+        options,
+        &selection.provider,
+        selection.account.as_deref(),
+        &selection.model,
+        None,
+    );
+    out.push(FallbackOffer {
+        selection,
+        thinking,
+        label,
+    });
+}
+
 /// Routes for "Retry on...": the bot's own chain first, then approved models
-/// from the live catalog. The route the conversation is on, and the one the
-/// "Retry on <fallback>" button already offers, are left out.
+/// from the live catalog, diversified across providers before repeating a
+/// provider. The route the conversation is on, and the one the "Retry on
+/// <fallback>" button already offers, are left out.
 pub fn retry_alternatives(
     options: &Options<'_>,
     chain: Option<&RouteView>,
@@ -189,34 +227,16 @@ pub fn retry_alternatives(
     skip: Option<&FallbackOffer>,
 ) -> Vec<FallbackOffer> {
     let mut out: Vec<FallbackOffer> = Vec::new();
-    let mut push = |selection: Selection, thinking: Option<String>| {
-        if out.len() >= MAX_ALTERNATIVES
-            || selection.is_auto()
-            || selection == *current
-            || skip.is_some_and(|offer| offer.selection == selection)
-            || out.iter().any(|offer| offer.selection == selection)
-        {
-            return;
-        }
-        let label = route_line(
-            options,
-            &selection.provider,
-            selection.account.as_deref(),
-            &selection.model,
-            None,
-        );
-        out.push(FallbackOffer {
-            selection,
-            thinking,
-            label,
-        });
-    };
     if let Some(chain) = chain {
         for entry in chain.route.iter().chain(chain.fallbacks.iter()) {
             if same(entry, current) {
                 continue;
             }
-            push(
+            push_offer(
+                &mut out,
+                options,
+                current,
+                skip,
                 Selection {
                     provider: entry.provider.clone(),
                     model: entry.model.clone(),
@@ -226,15 +246,62 @@ pub fn retry_alternatives(
             );
         }
     }
+    if out.len() >= MAX_ALTERNATIVES {
+        return out;
+    }
+
+    // Group remaining approved catalog entries by provider (in first-seen
+    // catalog order) so we interleave providers round-robin instead of
+    // dumping repetitive models from a single provider.
+    let mut groups: Vec<(&str, Vec<Selection>)> = Vec::new();
     for entry in options.entries.iter().filter(|e| e.data_egress_approved) {
-        push(
-            Selection {
-                provider: entry.provider.clone(),
-                model: entry.model.clone(),
-                account: None,
-            },
-            None,
-        );
+        let sel = Selection {
+            provider: entry.provider.clone(),
+            model: entry.model.clone(),
+            account: None,
+        };
+        if !is_eligible(&sel, current, skip, &out) {
+            continue;
+        }
+        if let Some((_, list)) = groups.iter_mut().find(|(p, _)| *p == entry.provider) {
+            list.push(sel);
+        } else {
+            groups.push((entry.provider.as_str(), vec![sel]));
+        }
+    }
+
+    let mut cursors = vec![0usize; groups.len()];
+    for (idx, (provider, list)) in groups.iter().enumerate() {
+        if out.len() >= MAX_ALTERNATIVES {
+            break;
+        }
+        if !out
+            .iter()
+            .any(|offer| offer.selection.provider == *provider)
+            && let Some(sel) = list.first()
+        {
+            cursors[idx] = 1;
+            push_offer(&mut out, options, current, skip, sel.clone(), None);
+        }
+    }
+    loop {
+        if out.len() >= MAX_ALTERNATIVES {
+            break;
+        }
+        let mut progressed = false;
+        for (idx, (_, list)) in groups.iter().enumerate() {
+            if out.len() >= MAX_ALTERNATIVES {
+                break;
+            }
+            if let Some(sel) = list.get(cursors[idx]) {
+                cursors[idx] += 1;
+                progressed = true;
+                push_offer(&mut out, options, current, skip, sel.clone(), None);
+            }
+        }
+        if !progressed {
+            break;
+        }
     }
     out
 }
@@ -505,5 +572,54 @@ mod tests {
         assert!(card.fallback.is_none());
         assert_eq!(card.alternatives.len(), 1);
         assert!(card.ask_main);
+    }
+
+    #[test]
+    fn retry_alternatives_diversifies_across_providers_before_repeating() {
+        let entry = |provider: &str, model: &str| crate::api::CatalogEntry {
+            provider: provider.into(),
+            model: model.into(),
+            data_egress_approved: true,
+            name: None,
+            context_length: None,
+            tags: Vec::new(),
+            thinking: Vec::new(),
+            account_ids: Vec::new(),
+        };
+        let entries = vec![
+            entry("openai", "gpt-6.1-sol"),
+            entry("openai", "gpt-6-astra"),
+            entry("openai", "gpt-6.1-terra"),
+            entry("openai", "gpt-6-luna"),
+            entry("openai", "gpt-6-sol"),
+            entry("openai", "gpt-5.6-sol"),
+            entry("anthropic", "claude-sonnet-4-5"),
+            entry("anthropic", "claude-opus-4-5"),
+            entry("deepseek", "deepseek-flash"),
+            entry("deepseek", "deepseek-v4-pro"),
+        ];
+        let options = Options {
+            entries: &entries,
+            catalog_providers: &[],
+            providers: &[],
+        };
+        let current = selection("openai", "gpt-6.1-sol");
+        let alternatives = retry_alternatives(&options, None, &current, None);
+        assert_eq!(alternatives.len(), MAX_ALTERNATIVES);
+        let picked: Vec<(&str, &str)> = alternatives
+            .iter()
+            .map(|o| (o.selection.provider.as_str(), o.selection.model.as_str()))
+            .collect();
+        assert_eq!(
+            picked,
+            vec![
+                ("openai", "gpt-6-astra"),
+                ("anthropic", "claude-sonnet-4-5"),
+                ("deepseek", "deepseek-flash"),
+                ("openai", "gpt-6.1-terra"),
+                ("anthropic", "claude-opus-4-5"),
+                ("deepseek", "deepseek-v4-pro"),
+            ]
+        );
     }
 }

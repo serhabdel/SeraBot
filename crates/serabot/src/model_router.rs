@@ -156,6 +156,7 @@ struct CatalogSnapshot {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FetchFailure {
     KeyRejected,
+    RequestFailed,
     Unreachable,
 }
 
@@ -766,13 +767,30 @@ impl ModelRouter {
                 })
             }
             Err(error) => {
-                // The error text carries a status code at most, never a body
-                // or a key; it only decides which message the page shows.
-                let text = error.to_string();
-                let failure = if text.contains("status 401") || text.contains("status 403") {
-                    FetchFailure::KeyRejected
-                } else {
-                    FetchFailure::Unreachable
+                // The error carries a typed status at most, never a body or a
+                // key; 401/403/needs_reauth -> KeyRejected, 4xx -> RequestFailed,
+                // transport (status 0) or 5xx -> Unreachable.
+                let failure = match &error {
+                    SeraError::Rejected {
+                        code: "needs_reauth",
+                        ..
+                    } => FetchFailure::KeyRejected,
+                    SeraError::Upstream { status, code, .. } => {
+                        tracing::warn!(provider = id, status, code, "catalog refresh failed");
+                        match *status {
+                            401 | 403 => FetchFailure::KeyRejected,
+                            0 | 500..=599 => FetchFailure::Unreachable,
+                            _ => FetchFailure::RequestFailed,
+                        }
+                    }
+                    _ => {
+                        let text = error.to_string();
+                        if text.contains("status 401") || text.contains("status 403") {
+                            FetchFailure::KeyRejected
+                        } else {
+                            FetchFailure::Unreachable
+                        }
+                    }
                 };
                 provider.record_failure(user_id, failure);
                 Ok(CatalogRefresh {
@@ -1559,6 +1577,7 @@ impl Provider {
         }
         match state.failures.get(user_id) {
             Some(FetchFailure::KeyRejected) => "key_rejected",
+            Some(FetchFailure::RequestFailed) => "request_failed",
             Some(FetchFailure::Unreachable) => "unreachable",
             None => "unchecked",
         }
@@ -1571,6 +1590,12 @@ impl Provider {
                 "error",
                 Some(
                     "The API key was rejected. Open Providers, paste a new key, and test the connection.",
+                ),
+            ),
+            "request_failed" => (
+                "error",
+                Some(
+                    "The provider rejected the catalog request. Check the provider settings, then use Test connection.",
                 ),
             ),
             "unreachable" => (
@@ -3086,6 +3111,22 @@ mod live_catalog_tests {
             .validate_selection(USER, &live("mistral-large-latest"))
             .unwrap();
         assert_eq!(router.catalog(USER)[0].status, "unreachable");
+    }
+
+    #[tokio::test]
+    async fn catalog_4xx_is_request_failed_not_unreachable() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "bad request"}
+            })))
+            .mount(&server)
+            .await;
+        let router = mistral_router(&server).await;
+        router.ensure_catalogs(USER, Duration::from_secs(5)).await;
+        assert_eq!(router.catalog(USER)[0].status, "request_failed");
+        assert_eq!(router.catalog(USER)[0].health, "error");
     }
 
     #[tokio::test]
