@@ -958,7 +958,11 @@ fn ProviderCard(session: Signal<Session>, manager: PasswordManager) -> Element {
                 SecretField {
                     value: token,
                     label: input_label.clone(),
-                    placeholder: "Paste token (write-only)".to_owned(),
+                    placeholder: if manager.id == "protonpass" {
+                        "pst_...::... (write-only)".to_owned()
+                    } else {
+                        "Paste token (write-only)".to_owned()
+                    },
                 }
                 button {
                     class: "btn primary sm",
@@ -1049,6 +1053,14 @@ fn ProviderCard(session: Signal<Session>, manager: PasswordManager) -> Element {
             details { class: "vault-provider-snippet",
                 summary { "Reference format" }
                 code { class: "mono tiny", "{ref_snippet}" }
+            }
+            if manager.id == "protonpass" {
+                details { class: "vault-provider-snippet",
+                    summary { "How to connect Proton Pass" }
+                    p { class: "tiny muted",
+                        "In pass.proton.me → Settings → Access tokens → New token: toggle \"Use for AI agent\" on, grant Viewer access to your chosen vault(s), and paste the full pst_...::... token above. Every autofill is logged in Proton Pass Agent Activity."
+                    }
+                }
             }
         }
     }

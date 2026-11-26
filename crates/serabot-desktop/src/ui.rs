@@ -1517,6 +1517,21 @@ break
     }
 
     #[test]
+    fn modal_sheets_stack_above_scrim_and_stay_crisp() {
+        let css = include_str!("../assets/system.css");
+        let sheet_start = css.find(".sheet,\n.sheet.open {").expect(".sheet rule");
+        let sheet_end = sheet_start + css[sheet_start..].find('}').expect("closing brace");
+        let sheet_block = &css[sheet_start..sheet_end];
+        assert!(sheet_block.contains("z-index: 220;"));
+        assert!(sheet_block.contains("backdrop-filter: none;"));
+
+        let scrim_start = css.find(".scrim.open {").expect(".scrim.open rule");
+        let scrim_end = scrim_start + css[scrim_start..].find('}').expect("closing brace");
+        let scrim_block = &css[scrim_start..scrim_end];
+        assert!(scrim_block.contains("z-index: 210;"));
+    }
+
+    #[test]
     fn chat_switcher_menu_is_opaque_and_memory_css_is_scoped() {
         let system = include_str!("../assets/system.css");
         let block_start = system

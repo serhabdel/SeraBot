@@ -35,8 +35,10 @@ use crate::vault::{self, VaultEntry, VaultField, VaultSource};
 
 /// How long one CLI call may run before it is killed.
 pub const CLI_TIMEOUT: Duration = Duration::from_secs(15);
-/// Largest stdout accepted from a CLI. A password or key is far smaller.
-const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+/// Largest stdout accepted from a CLI.
+const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+/// Largest stderr captured solely for safe error classification.
+const MAX_STDERR_BYTES: usize = 4 * 1024;
 const MAX_REFERENCE_CHARS: usize = 512;
 
 /// A password manager an entry can read from.
@@ -198,50 +200,87 @@ pub fn validate_reference(source: VaultSource, reference: &str) -> Result<()> {
     Ok(())
 }
 
+/// Trim and normalize a pasted provider token (stripping optional `ENV_VAR=`
+/// prefix and surrounding quotes) and validate its structural shape.
+pub fn normalize_provider_token(provider: Provider, raw: &str) -> Result<Zeroizing<String>> {
+    let mut s = raw.trim();
+    if let Some(rest) = s.strip_prefix("export ") {
+        s = rest.trim_start();
+    }
+    if let Some(rest) = s.strip_prefix(provider.token_env())
+        && let Some(val) = rest.trim_start().strip_prefix('=')
+    {
+        s = val.trim();
+    }
+    if ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+        && s.len() >= 2
+    {
+        s = s[1..s.len() - 1].trim();
+    }
+    if s.is_empty() || s.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(SeraError::Validation(format!(
+            "enter a valid {} access token",
+            provider.label()
+        )));
+    }
+    if provider == Provider::ProtonPass {
+        let valid_pat = s
+            .strip_prefix("pst_")
+            .and_then(|rest| rest.split_once("::"))
+            .is_some_and(|(id, key)| !id.is_empty() && !key.is_empty());
+        if !valid_pat {
+            return Err(SeraError::Validation(
+                "Proton Pass access tokens must look like pst_...::... (include the full ::key suffix)"
+                    .into(),
+            ));
+        }
+    }
+    Ok(Zeroizing::new(s.to_owned()))
+}
+
 /// The CLI arguments that print one reference's value to stdout. Pure, so
 /// the shape is tested without a CLI. The access token is never an argument.
 pub fn read_args(provider: Provider, reference: &str) -> Result<Vec<String>> {
     validate_reference(provider.source(), reference)?;
-    let rest = reference
-        .strip_prefix(provider.scheme())
-        .unwrap_or_default();
     match provider {
         Provider::OnePassword => Ok(vec![
             "read".to_owned(),
             "--no-newline".to_owned(),
             reference.to_owned(),
         ]),
-        Provider::ProtonPass => {
-            let parts: Vec<&str> = rest.split('/').collect();
-            let [vault, item, field] = parts.as_slice() else {
-                return Err(SeraError::Validation(
-                    "the reference must look like pass://vault/item/field".into(),
-                ));
-            };
-            Ok(vec![
-                "item".to_owned(),
-                "view".to_owned(),
-                "--vault-name".to_owned(),
-                (*vault).to_owned(),
-                "--item-title".to_owned(),
-                (*item).to_owned(),
-                "--field".to_owned(),
-                (*field).to_owned(),
-            ])
-        }
+        Provider::ProtonPass => Ok(vec![
+            "item".to_owned(),
+            "view".to_owned(),
+            reference.to_owned(),
+        ]),
     }
 }
 
-/// What a CLI call returned: its exit code, and its stdout as the value.
+/// What a CLI call returned: its exit code, its stdout, and bounded stderr
+/// (used solely for safe error classification, never logged or returned).
 pub struct CommandOutput {
     pub status: Option<i32>,
     pub stdout: Zeroizing<String>,
+    pub stderr: Zeroizing<String>,
 }
 
 /// Runs a password manager CLI. The production impl spawns the binary; tests
 /// substitute a fake, so no test ever calls a live account.
 pub trait SecretCommand: Send + Sync {
     fn run(&self, program: &Path, args: &[String], env: &[(&str, &str)]) -> Result<CommandOutput>;
+
+    fn run_batch(
+        &self,
+        program: &Path,
+        commands: &[Vec<String>],
+        env: &[(&str, &str)],
+    ) -> Result<Vec<CommandOutput>> {
+        let mut outputs = Vec::with_capacity(commands.len());
+        for args in commands {
+            outputs.push(self.run(program, args, env)?);
+        }
+        Ok(outputs)
+    }
 }
 
 /// Variables a CLI reads for its config, cache or data. Each one points at the
@@ -252,6 +291,7 @@ const HOME_VARS: &[&str] = &[
     "XDG_CONFIG_HOME",
     "XDG_CACHE_HOME",
     "XDG_DATA_HOME",
+    "PROTON_PASS_SESSION_DIR",
     "APPDATA",
     "LOCALAPPDATA",
     "USERPROFILE",
@@ -297,6 +337,35 @@ impl Default for ProcessCommand {
     }
 }
 
+static PROTON_SESSION_LOCK: Mutex<()> = Mutex::new(());
+
+fn read_bounded_pipe<R: Read + Send + 'static>(
+    pipe: Option<R>,
+    max_bytes: usize,
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::with_capacity(max_bytes + 1);
+        if let Some(mut reader) = pipe {
+            let mut chunk = [0u8; 4096];
+            while bytes.len() <= max_bytes {
+                let room = (max_bytes + 1 - bytes.len()).min(chunk.len());
+                match reader.read(&mut chunk[..room]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => bytes.extend_from_slice(&chunk[..read]),
+                }
+            }
+            chunk.zeroize();
+        }
+        // The receiver is gone when the caller timed out: wipe what was read.
+        if let Err(error) = sender.send(bytes) {
+            let mut bytes = error.0;
+            bytes.zeroize();
+        }
+    });
+    receiver
+}
+
 fn run_in_home(
     home: &Path,
     program: &Path,
@@ -311,34 +380,14 @@ fn run_in_home(
         .envs(child_environment(home, env))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|_| {
         SeraError::External("the password manager command could not be started".into())
     })?;
-    // Read stdout on its own thread so a full pipe cannot block the wait.
-    // The buffer is sized up front and never grows, so no stale copy of
-    // the value is left behind by a reallocation.
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let stdout = child.stdout.take();
-    std::thread::spawn(move || {
-        let mut bytes = Vec::with_capacity(MAX_OUTPUT_BYTES + 1);
-        if let Some(mut stdout) = stdout {
-            let mut chunk = [0u8; 4096];
-            while bytes.len() <= MAX_OUTPUT_BYTES {
-                let room = (MAX_OUTPUT_BYTES + 1 - bytes.len()).min(chunk.len());
-                match stdout.read(&mut chunk[..room]) {
-                    Ok(0) | Err(_) => break,
-                    Ok(read) => bytes.extend_from_slice(&chunk[..read]),
-                }
-            }
-            chunk.zeroize();
-        }
-        // The receiver is gone when the caller timed out: wipe what was read.
-        if let Err(error) = sender.send(bytes) {
-            let mut bytes = error.0;
-            bytes.zeroize();
-        }
-    });
+    // Read stdout and stderr on their own threads so a full pipe cannot block
+    // the wait. Buffers are sized up front and wiped on timeout or error.
+    let stdout_rx = read_bounded_pipe(child.stdout.take(), MAX_OUTPUT_BYTES);
+    let stderr_rx = read_bounded_pipe(child.stderr.take(), MAX_STDERR_BYTES);
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -362,9 +411,7 @@ fn run_in_home(
             }
         }
     };
-    // The pipe closes with the child; the bound keeps a stray grandchild
-    // that holds it open from stalling the call.
-    let mut bytes = receiver
+    let mut bytes = stdout_rx
         .recv_timeout(Duration::from_secs(2))
         .map_err(|_| SeraError::External("the password manager output was lost".into()))?;
     if bytes.len() > MAX_OUTPUT_BYTES {
@@ -383,36 +430,160 @@ fn run_in_home(
             ));
         }
     };
+    let mut stderr_bytes = stderr_rx
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap_or_default();
+    if stderr_bytes.len() > MAX_STDERR_BYTES {
+        stderr_bytes.truncate(MAX_STDERR_BYTES);
+    }
+    let stderr = Zeroizing::new(String::from_utf8_lossy(&stderr_bytes).into_owned());
+    stderr_bytes.zeroize();
     Ok(CommandOutput {
         status: status.code(),
         stdout,
+        stderr,
     })
+}
+
+fn is_proton_session(env: &[(&str, &str)]) -> bool {
+    env.iter()
+        .any(|(k, _)| *k == "PROTON_PASS_PERSONAL_ACCESS_TOKEN")
 }
 
 impl SecretCommand for ProcessCommand {
     fn run(&self, program: &Path, args: &[String], env: &[(&str, &str)]) -> Result<CommandOutput> {
+        let mut results = self.run_batch(program, std::slice::from_ref(&args.to_vec()), env)?;
+        Ok(results.pop().unwrap_or(CommandOutput {
+            status: Some(1),
+            stdout: Zeroizing::new(String::new()),
+            stderr: Zeroizing::new(String::new()),
+        }))
+    }
+
+    fn run_batch(
+        &self,
+        program: &Path,
+        commands: &[Vec<String>],
+        env: &[(&str, &str)],
+    ) -> Result<Vec<CommandOutput>> {
+        if commands.is_empty() {
+            return Ok(Vec::new());
+        }
+        let proton = is_proton_session(env);
+        let _guard = if proton {
+            Some(
+                PROTON_SESSION_LOCK
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
+        } else {
+            None
+        };
         // Private to this call and removed when it returns. The child has
         // exited by then on every path below.
         let home = tempfile::TempDir::new().map_err(|_| {
             SeraError::External("the password manager command could not be started".into())
         })?;
-        let output = run_in_home(home.path(), program, args, env, self.timeout)?;
-        if output.status != Some(0)
-            && env
-                .iter()
-                .any(|(k, _)| *k == "PROTON_PASS_PERSONAL_ACCESS_TOKEN")
-            && args.first().map(String::as_str) != Some("login")
-        {
-            let _ = run_in_home(
+        if proton {
+            let login_out = run_in_home(
                 home.path(),
                 program,
                 &["login".to_owned()],
                 env,
                 self.timeout,
-            );
-            return run_in_home(home.path(), program, args, env, self.timeout);
+            )?;
+            if login_out.status != Some(0) {
+                return Ok(vec![login_out]);
+            }
         }
-        Ok(output)
+        let mut outputs = Vec::with_capacity(commands.len());
+        for args in commands {
+            let out = run_in_home(home.path(), program, args, env, self.timeout)?;
+            outputs.push(out);
+        }
+        if proton {
+            let _ = run_in_home(
+                home.path(),
+                program,
+                &["logout".to_owned(), "--force".to_owned()],
+                env,
+                Duration::from_secs(3),
+            );
+        }
+        Ok(outputs)
+    }
+}
+
+/// Classify bounded CLI stderr into a safe, non-secret user-facing message.
+/// Never logs or returns raw `stderr`.
+pub fn classify_cli_failure(provider: Provider, stderr: &str) -> Option<&'static str> {
+    if provider != Provider::ProtonPass {
+        return None;
+    }
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("invalid") && lower.contains("token")
+        || lower.contains("expired")
+        || lower.contains("has been deleted")
+        || lower.contains("unauthorized")
+        || lower.contains("401")
+    {
+        return Some("Proton Pass access token is invalid, expired, or revoked");
+    }
+    if lower.contains("reason") && (lower.contains("agent") || lower.contains("required")) {
+        return Some("Proton Pass agent token requires an audit reason");
+    }
+    if lower.contains("keyring")
+        || lower.contains("secret service")
+        || lower.contains("dbus")
+        || lower.contains("local key")
+    {
+        return Some("Proton Pass CLI could not initialize local key storage");
+    }
+    if lower.contains("permission")
+        || lower.contains("not allowed")
+        || lower.contains("access denied")
+        || lower.contains("forbidden")
+        || lower.contains("403")
+    {
+        return Some("Proton Pass token does not have access to this vault or item");
+    }
+    if lower.contains("not found")
+        || lower.contains("does not exist")
+        || lower.contains("no item")
+        || lower.contains("no field")
+    {
+        return Some("Proton Pass item or field was not found");
+    }
+    if lower.contains("timed out") || lower.contains("network") || lower.contains("connection") {
+        return Some("Proton Pass could not reach Proton servers");
+    }
+    None
+}
+
+fn sanitize_agent_reason(reason: &str) -> String {
+    let cleaned: String = reason
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return "SeraBot vault operation".to_owned();
+    }
+    trimmed.chars().take(300).collect()
+}
+
+fn provider_env<'a>(
+    provider: Provider,
+    token: &'a str,
+    reason: &'a str,
+) -> Vec<(&'static str, &'a str)> {
+    match provider {
+        Provider::OnePassword => vec![(provider.token_env(), token)],
+        Provider::ProtonPass => vec![
+            (provider.token_env(), token),
+            ("PROTON_PASS_KEY_PROVIDER", "fs"),
+            ("PROTON_PASS_AGENT_REASON", reason),
+        ],
     }
 }
 
@@ -972,6 +1143,19 @@ impl Providers {
         reference: &str,
         token: &str,
     ) -> Result<Zeroizing<String>> {
+        self.read_with_reason(provider, reference, token, "SeraBot vault secret read")
+            .await
+    }
+
+    /// Read one reference's value with an explicit audit reason (used for
+    /// Proton Pass AI Agent tokens).
+    pub async fn read_with_reason(
+        &self,
+        provider: Provider,
+        reference: &str,
+        token: &str,
+        reason: &str,
+    ) -> Result<Zeroizing<String>> {
         self.require_enabled(provider)?;
         let args = read_args(provider, reference)?;
         let program = match program_for(provider, &self.config) {
@@ -995,9 +1179,10 @@ impl Providers {
         };
         let runner = self.runner.clone();
         let token = Zeroizing::new(token.to_owned());
-        let env_name = provider.token_env();
+        let reason = sanitize_agent_reason(reason);
         let output = tokio::task::spawn_blocking(move || {
-            runner.run(&program, &args, &[(env_name, token.as_str())])
+            let env = provider_env(provider, token.as_str(), reason.as_str());
+            runner.run(&program, &args, &env)
         })
         .await
         .map_err(|_| SeraError::Internal("the password manager task failed".into()))??;
@@ -1007,10 +1192,10 @@ impl Providers {
                 exit_code = ?output.status,
                 "password manager read failed"
             );
-            return Err(SeraError::External(format!(
-                "{} could not return this item",
-                provider.label()
-            )));
+            let msg = classify_cli_failure(provider, &output.stderr)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{} could not return this item", provider.label()));
+            return Err(SeraError::External(msg));
         }
         let value = Zeroizing::new(output.stdout.trim_end_matches(['\r', '\n']).to_owned());
         if value.is_empty() {
@@ -1125,10 +1310,10 @@ pub async fn probe(
         ))
     })?;
     let runner = providers.runner.clone();
-    let env_name = provider.token_env();
     let token = Zeroizing::new(token.expose_secret().to_owned());
     let output = tokio::task::spawn_blocking(move || {
-        runner.run(&program, &args, &[(env_name, token.as_str())])
+        let env = provider_env(provider, token.as_str(), "SeraBot connection check");
+        runner.run(&program, &args, &env)
     })
     .await
     .map_err(|_| SeraError::Internal("the password manager probe failed".into()))??;
@@ -1147,11 +1332,14 @@ pub async fn probe(
             exit_code = ?output.status,
             "password manager probe failed"
         );
+        let message = classify_cli_failure(provider, &output.stderr)
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{} rejected the token", provider.label()));
         Ok(ProviderProbe {
             ok: false,
             cli_found,
             configured,
-            message: format!("{} rejected the token", provider.label()),
+            message,
         })
     }
 }
@@ -1365,11 +1553,16 @@ pub fn parse_protonpass_items(
             continue;
         };
         let content = item.get("content");
-        let login = content
-            .and_then(|c| c.get("content"))
+        let inner_content = content.and_then(|c| c.get("content"));
+        let login = inner_content
             .and_then(|c| c.get("Login").or_else(|| c.get("login")))
             .or_else(|| content.and_then(|c| c.get("login")))
             .or_else(|| item.get("login"));
+        // Real `pass-cli` JSON wraps item type under `content.content.{Login,Note,Alias,...}`.
+        // Only Login items carry a `password` field; skip Notes/Aliases/Cards/etc.
+        if inner_content.is_some_and(serde_json::Value::is_object) && login.is_none() {
+            continue;
+        }
         let title = content
             .and_then(|c| c.get("title"))
             .or_else(|| item.get("title"))
@@ -1429,34 +1622,68 @@ pub fn parse_protonpass_items(
     Ok(out)
 }
 
+async fn run_provider_cli_batch(
+    providers: &Providers,
+    provider: Provider,
+    commands: Vec<Vec<String>>,
+    token: &str,
+    reason: &str,
+) -> Result<Vec<Zeroizing<String>>> {
+    if commands.is_empty() {
+        return Ok(Vec::new());
+    }
+    let program = match program_for(provider, &providers.config) {
+        Some(path) => path,
+        None => match providers.ensure_cli(provider).await {
+            Ok(Some(path)) => path,
+            Ok(None) | Err(_) => {
+                return Err(SeraError::External(format!(
+                    "the {} CLI is not installed on the server",
+                    provider.label()
+                )));
+            }
+        },
+    };
+    let runner = providers.runner.clone();
+    let token = Zeroizing::new(token.to_owned());
+    let reason = sanitize_agent_reason(reason);
+    let outputs = tokio::task::spawn_blocking(move || {
+        let env = provider_env(provider, token.as_str(), reason.as_str());
+        runner.run_batch(&program, &commands, &env)
+    })
+    .await
+    .map_err(|_| SeraError::Internal("the password manager command failed".into()))??;
+    let mut stdouts = Vec::with_capacity(outputs.len());
+    for output in outputs {
+        if output.status != Some(0) {
+            let msg = classify_cli_failure(provider, &output.stderr)
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    format!(
+                        "{} CLI exited with status {:?}",
+                        provider.label(),
+                        output.status
+                    )
+                });
+            return Err(SeraError::External(msg));
+        }
+        stdouts.push(output.stdout);
+    }
+    Ok(stdouts)
+}
+
 async fn run_provider_cli(
     providers: &Providers,
     provider: Provider,
     args: Vec<String>,
     token: &str,
+    reason: &str,
 ) -> Result<Zeroizing<String>> {
-    let program = program_for(provider, &providers.config).ok_or_else(|| {
-        SeraError::External(format!(
-            "the {} CLI is not installed on the server",
-            provider.label()
-        ))
-    })?;
-    let runner = providers.runner.clone();
-    let env_name = provider.token_env();
-    let token = Zeroizing::new(token.to_owned());
-    let output = tokio::task::spawn_blocking(move || {
-        runner.run(&program, &args, &[(env_name, token.as_str())])
-    })
-    .await
-    .map_err(|_| SeraError::Internal("the password manager command failed".into()))??;
-    if output.status != Some(0) {
-        return Err(SeraError::External(format!(
-            "{} CLI exited with status {:?}",
-            provider.label(),
-            output.status
-        )));
-    }
-    Ok(output.stdout)
+    let mut results =
+        run_provider_cli_batch(providers, provider, vec![args], token, reason).await?;
+    results
+        .pop()
+        .ok_or_else(|| SeraError::External(format!("{} returned no output", provider.label())))
 }
 
 /// List items from the user's connected 1Password or Proton Pass account using
@@ -1472,6 +1699,7 @@ pub async fn list_provider_items(
             provider.label()
         )));
     }
+    let reason = "SeraBot vault metadata sync";
     match provider {
         Provider::OnePassword => {
             let stdout = run_provider_cli(
@@ -1484,6 +1712,7 @@ pub async fn list_provider_items(
                     "json".into(),
                 ],
                 token,
+                reason,
             )
             .await?;
             parse_onepassword_items(&stdout)
@@ -1499,14 +1728,16 @@ pub async fn list_provider_items(
                     "json".into(),
                 ],
                 token,
+                reason,
             )
             .await?;
             let vaults = parse_protonpass_vaults(&vaults_stdout)?;
-            let mut all = Vec::new();
-            for (share_id, vault_name) in vaults {
-                let items_stdout = run_provider_cli(
-                    providers,
-                    provider,
+            if vaults.is_empty() {
+                return Ok(Vec::new());
+            }
+            let commands: Vec<Vec<String>> = vaults
+                .iter()
+                .map(|(share_id, _)| {
                     vec![
                         "item".into(),
                         "list".into(),
@@ -1514,10 +1745,13 @@ pub async fn list_provider_items(
                         share_id.clone(),
                         "--output".into(),
                         "json".into(),
-                    ],
-                    token,
-                )
-                .await?;
+                    ]
+                })
+                .collect();
+            let item_outputs =
+                run_provider_cli_batch(providers, provider, commands, token, reason).await?;
+            let mut all = Vec::new();
+            for ((share_id, vault_name), items_stdout) in vaults.into_iter().zip(item_outputs) {
                 all.extend(parse_protonpass_items(
                     &items_stdout,
                     &share_id,
@@ -1650,8 +1884,9 @@ pub async fn resolve_for_browser(
             let reference = entry.reference.as_deref().ok_or_else(|| {
                 SeraError::InvalidState("a password manager entry has no reference".into())
             })?;
+            let reason = format!("SeraBot browser autofill for {host} (entry: {name})");
             let value = providers
-                .read(provider, reference, token.expose_secret())
+                .read_with_reason(provider, reference, token.expose_secret(), &reason)
                 .await?;
             providers.resolved.remember(user_id, name, &value);
             value
@@ -1697,6 +1932,7 @@ mod tests {
             Ok(CommandOutput {
                 status: self.status,
                 stdout: Zeroizing::new(self.stdout.clone()),
+                stderr: Zeroizing::new(String::new()),
             })
         }
     }
@@ -1817,16 +2053,7 @@ mod tests {
         );
         assert_eq!(
             read_args(Provider::ProtonPass, "pass://Personal/github/password").unwrap(),
-            [
-                "item",
-                "view",
-                "--vault-name",
-                "Personal",
-                "--item-title",
-                "github",
-                "--field",
-                "password"
-            ]
+            ["item", "view", "pass://Personal/github/password"]
         );
         assert!(read_args(Provider::ProtonPass, "pass://a/b").is_err());
     }
@@ -2061,8 +2288,10 @@ mod tests {
         let output = CommandOutput {
             status: Some(0),
             stdout: Zeroizing::new("synthetic".into()),
+            stderr: Zeroizing::new("synthetic-err".into()),
         };
         assert_zeroizing(&output.stdout);
+        assert_zeroizing(&output.stderr);
         let mut value = Zeroizing::new("synthetic-value".to_owned());
         value.zeroize();
         assert!(value.is_empty());
@@ -2185,6 +2414,7 @@ mod tests {
             "XDG_CONFIG_HOME",
             "XDG_CACHE_HOME",
             "XDG_DATA_HOME",
+            "PROTON_PASS_SESSION_DIR",
             "APPDATA",
             "LOCALAPPDATA",
             "USERPROFILE",
@@ -2531,5 +2761,130 @@ mod tests {
         assert_eq!(pp_items[0].reference, "pass://share99/ppitem1/password");
         assert_eq!(pp_items[0].username.as_deref(), Some("bob@proton.me"));
         assert_eq!(pp_items[0].domains, vec!["account.proton.me".to_owned()]);
+    }
+
+    #[test]
+    fn proton_pass_token_normalization_and_validation() {
+        let bare =
+            normalize_provider_token(Provider::ProtonPass, "  pst_abc123::secretkey456  ").unwrap();
+        assert_eq!(bare.as_str(), "pst_abc123::secretkey456");
+
+        let with_export = normalize_provider_token(
+            Provider::ProtonPass,
+            "export PROTON_PASS_PERSONAL_ACCESS_TOKEN=\"pst_abc123::secretkey456\"",
+        )
+        .unwrap();
+        assert_eq!(with_export.as_str(), "pst_abc123::secretkey456");
+
+        assert!(normalize_provider_token(Provider::ProtonPass, "pst_missing_key").is_err());
+        assert!(normalize_provider_token(Provider::ProtonPass, "not_a_pat::key").is_err());
+        assert!(normalize_provider_token(Provider::ProtonPass, "pst_::key").is_err());
+        assert!(normalize_provider_token(Provider::ProtonPass, "pst_abc::").is_err());
+        assert!(normalize_provider_token(Provider::ProtonPass, "   ").is_err());
+    }
+
+    #[tokio::test]
+    async fn proton_pass_env_includes_fs_key_provider_and_agent_reason() {
+        let mut cfg = config();
+        cfg.pass_cli_path = std::env::current_exe().unwrap().display().to_string();
+        cfg.protonpass_enabled = true;
+        let runner = fake(Some(0), "secret-pw\n");
+        let providers = Providers::with_runner(&cfg, runner.clone());
+        let val = providers
+            .read_with_reason(
+                Provider::ProtonPass,
+                "pass://share99/ppitem1/password",
+                "pst_abc::key",
+                "SeraBot browser autofill for example.com (entry: mail)",
+            )
+            .await
+            .unwrap();
+        assert_eq!(val.as_str(), "secret-pw");
+
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].1,
+            ["item", "view", "pass://share99/ppitem1/password"]
+        );
+        assert!(
+            calls[0]
+                .2
+                .iter()
+                .any(|(k, v)| k == "PROTON_PASS_KEY_PROVIDER" && v == "fs")
+        );
+        assert!(calls[0].2.iter().any(|(k, v)| {
+            k == "PROTON_PASS_AGENT_REASON"
+                && v == "SeraBot browser autofill for example.com (entry: mail)"
+        }));
+        assert!(
+            HOME_VARS.contains(&"PROTON_PASS_SESSION_DIR"),
+            "PROTON_PASS_SESSION_DIR must be isolated per call"
+        );
+    }
+
+    #[test]
+    fn proton_pass_stderr_classification_never_leaks_raw_text() {
+        let msg = classify_cli_failure(
+            Provider::ProtonPass,
+            "Error: This personal access token is invalid, expired or has been deleted (pst_secret)",
+        )
+        .unwrap();
+        assert!(msg.contains("invalid, expired, or revoked"));
+        assert!(!msg.contains("pst_secret"));
+
+        assert_eq!(
+            classify_cli_failure(
+                Provider::ProtonPass,
+                "Agent reason is required for this token",
+            ),
+            Some("Proton Pass agent token requires an audit reason")
+        );
+        assert_eq!(
+            classify_cli_failure(Provider::ProtonPass, "Could not get local key from keyring",),
+            Some("Proton Pass CLI could not initialize local key storage")
+        );
+    }
+
+    #[test]
+    fn proton_pass_sync_skips_non_login_items() {
+        let mixed_json = r#"{
+            "items": [
+                {
+                    "item_id": "login1",
+                    "content": {
+                        "title": "GitHub",
+                        "content": {
+                            "Login": {
+                                "username": "alice",
+                                "urls": ["https://github.com"]
+                            }
+                        }
+                    }
+                },
+                {
+                    "item_id": "note1",
+                    "content": {
+                        "title": "Recovery Note",
+                        "content": {
+                            "Note": {}
+                        }
+                    }
+                },
+                {
+                    "item_id": "alias1",
+                    "content": {
+                        "title": "Shop Alias",
+                        "content": {
+                            "Alias": {}
+                        }
+                    }
+                }
+            ]
+        }"#;
+        let items = parse_protonpass_items(mixed_json, "share1", Some("Personal")).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "login1");
+        assert_eq!(items[0].reference, "pass://share1/login1/password");
     }
 }

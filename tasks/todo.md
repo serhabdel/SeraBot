@@ -707,6 +707,13 @@ Plan: `docs/specs/0.74.15-proposal.md`. Version stays `0.74.14` until the batch 
 - [x] Version bump `0.74.22` (`Cargo.toml`), mobile `0.74.22+96`, `docs/release-0.74.22.md`, `README.md`, `tasks/todo.md`.
 - [ ] Owner: live pass on Kiro OAuth, Devin CLI OAuth, thinking-level selectors, and redesigned Usage page.
 
+## Release 0.74.23 — Modal Sheet Stacking Fix & Proton Pass Vault Connector Overhaul
+
+- [x] Desktop AI Provider Modal Sheet Fix (`assets/system.css`, `ui.rs`): stacked `.sheet, .sheet.open` at `z-index: 220` above `.scrim.open` (`z-index: 210`) with `backdrop-filter: none`, preventing blurry overlays and click-through dismissals; added `modal_sheets_stack_above_scrim_and_stay_crisp` regression test.
+- [x] Proton Pass Vault Connector Overhaul (`vault_providers.rs`, `api/vault.rs`, `vault_import.rs`, `ui_vault.rs`): native `pass://` `item view` resolution (fixing ID-vs-name mismatch), headless `PROTON_PASS_KEY_PROVIDER=fs` + `PROTON_PASS_SESSION_DIR`, `PROTON_PASS_AGENT_REASON` audit logging for AI Agent Access Tokens, serialized single-session `login`/`run_batch`/`logout --force`, token normalization/validation (`pst_...::...`), bounded stderr error classification, Login-only item filtering, and desktop per-vault local import + setup guide.
+- [x] Version bump `0.74.23` (`Cargo.toml`), mobile `0.74.23+97`, `docs/release-0.74.23.md`, `README.md`, `tasks/todo.md`.
+- [ ] Owner: live verification of AI Provider modal sheet and Proton Pass AI Agent token probe/sync/autofill.
+
 
 
 

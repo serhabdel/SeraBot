@@ -129,7 +129,7 @@ pub(super) async fn put_vault_provider(
     Json(request): Json<ProviderTokenRequest>,
 ) -> Result<Json<Value>> {
     let provider = password_manager(&id)?;
-    let token = Zeroizing::new(request.token.trim().to_owned());
+    let token = vault_providers::normalize_provider_token(provider, &request.token)?;
     vault_providers::set_token(&state.users, &user.id, provider, &token)?;
     if state.vault_providers.enabled(provider)
         && !state.vault_providers.cli_found(provider)
