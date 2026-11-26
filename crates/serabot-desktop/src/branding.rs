@@ -6,8 +6,8 @@
 //! logos are trademarks of their owners and only identify the integration.
 //!
 //! Adding a brand is one line in [`BRANDS`] (plus its PNG). Generic marks that
-//! belong to no vendor (custom, OpenAI-compatible, Muse Code) use a neutral
-//! inline SVG. Unknown keys return `None` so callers draw a letter avatar.
+//! belong to no vendor (custom, OpenAI-compatible) use a neutral inline SVG.
+//! Unknown keys return `None` so callers draw a letter avatar.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -38,8 +38,6 @@ const GENERIC_CUSTOM: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox
 
 const GENERIC_PLUG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="2.5" y="2.5" width="19" height="19" rx="5" fill="#475569"/><path d="M9 8V4.8M15 8V4.8M7 8h10v3.5a5 5 0 0 1-10 0zM12 16.5v3.7" fill="none" stroke="#fff" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
 
-const GENERIC_CODE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="2.5" y="2.5" width="19" height="19" rx="5" fill="#0891B2"/><path d="m8.5 8-3.5 4 3.5 4M15.5 8l3.5 4-3.5 4M13.2 6.5l-2.4 11" fill="none" stroke="#fff" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
-
 const SVG_GITHUB: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="5" fill="#181717"/><path d="M12 5.4a6.7 6.7 0 0 0-2.12 13.06c.34.06.46-.14.46-.32v-1.24c-1.86.4-2.25-.79-2.25-.79-.3-.77-.74-.98-.74-.98-.61-.42.05-.41.05-.41.67.05 1.03.69 1.03.69.6 1.03 1.57.73 1.95.56.06-.43.24-.73.43-.9-1.49-.17-3.05-.74-3.05-3.31 0-.73.26-1.33.69-1.8-.07-.17-.3-.85.07-1.78 0 0 .56-.18 1.84.69a6.4 6.4 0 0 1 3.36 0c1.28-.87 1.84-.69 1.84-.69.37.93.14 1.61.07 1.78.43.47.69 1.07.69 1.8 0 2.58-1.57 3.14-3.06 3.3.24.21.46.62.46 1.25v1.85c0 .18.12.39.46.32A6.7 6.7 0 0 0 12 5.4Z" fill="#fff"/></svg>"##;
 
 const SVG_TODOIST: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="5" fill="#E44332"/><path d="M6.5 9.2 10.6 11.6 17.5 7.6M6.5 13 10.6 15.4 17.5 11.4M6.5 16.8 10.6 19.2 17.5 15.2" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
@@ -69,8 +67,6 @@ const SVG_ANTHROPIC: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox=
 const SVG_CLAUDE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="5" fill="#D97757"/><g stroke="#fff" stroke-linecap="round" stroke-width="1.45"><line x1="12" y1="6.3" x2="12" y2="17.7"/><line x1="6.3" y1="12" x2="17.7" y2="12"/><line x1="7.8" y1="7.8" x2="16.2" y2="16.2"/><line x1="16.2" y1="7.8" x2="7.8" y2="16.2"/><line x1="9.2" y1="7.1" x2="14.8" y2="16.9"/><line x1="7.1" y1="14.8" x2="16.9" y2="9.2"/></g><circle cx="12" cy="12" r="1.8" fill="#fff"/></svg>"##;
 
 const SVG_WHATSAPP: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="5" fill="#25D366"/><path d="M12 6.2a5.8 5.8 0 0 0-5 8.7l-.7 2.8 2.9-.7A5.8 5.8 0 1 0 12 6.2Z" fill="none" stroke="#fff" stroke-width="1.65" stroke-linejoin="round"/><path d="M9.9 9.7c-.2-.4-.3-.4-.5-.4h-.5c-.2 0-.4.1-.6.4-.2.2-.8.8-.8 1.9s.8 2.2.9 2.3c.1.2 1.6 2.5 3.9 3.4 1.9.7 2.3.6 2.7.5.4-.1 1.3-.5 1.5-1 .2-.5.2-.9.1-1-.1-.1-.2-.2-.6-.4l-1.3-.6c-.2-.1-.3-.1-.5.1l-.5.6c-.2.2-.3.2-.5.1-.3-.1-1-.4-1.9-1.2-.7-.6-1.2-1.4-1.3-1.6-.1-.2 0-.4.1-.5l.4-.5.2-.4c.1-.2 0-.3 0-.4l-.6-1.3Z" fill="#fff"/></svg>"##;
-
-const SVG_INCEPTION: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="5" fill="#0F172A"/><circle cx="12" cy="12" r="5.2" fill="none" stroke="#6366F1" stroke-width="1.6"/><ellipse cx="12" cy="12" rx="8.2" ry="3.1" transform="rotate(-28 12 12)" fill="none" stroke="#fff" stroke-width="1.5"/><circle cx="12" cy="12" r="2.1" fill="#fff"/></svg>"##;
 
 /// Every known brand. To add one: drop `<key>.png` in `assets/brands/`, list
 /// it in `SOURCES.md`, and add a line here.
@@ -306,7 +302,7 @@ static BRANDS: &[Brand] = &[
     Brand {
         keys: &["inception", "inceptionlabs"],
         label: "Inception Labs",
-        mark: Mark::Svg(SVG_INCEPTION),
+        mark: png!("inception"),
     },
     Brand {
         keys: &["anthropic"],
@@ -314,26 +310,26 @@ static BRANDS: &[Brand] = &[
         mark: Mark::Svg(SVG_ANTHROPIC),
     },
     Brand {
-        keys: &["claude", "claude-code", "claude-agent"],
+        keys: &["claude", "claude-code", "claude-agent", "claude-agent-sdk"],
         label: "Claude",
         mark: Mark::Svg(SVG_CLAUDE),
     },
-    // Generic marks that belong to no vendor
     Brand {
         keys: &["muse-code"],
         label: "Muse Code",
-        mark: Mark::Svg(GENERIC_CODE),
+        mark: png!("muse"),
     },
     Brand {
         keys: &["opencode-go", "opencode-zen"],
         label: "OpenCode",
-        mark: Mark::Svg(GENERIC_CODE),
+        mark: png!("opencode"),
     },
     Brand {
         keys: &["nous"],
         label: "Nous Portal",
-        mark: Mark::Svg(GENERIC_PLUG),
+        mark: png!("nous"),
     },
+    // Generic marks that belong to no vendor
     Brand {
         keys: &["openai-compatible"],
         label: "OpenAI-Compatible",
@@ -439,6 +435,7 @@ mod tests {
         "claude",
         "claude-code",
         "claude-agent",
+        "claude-agent-sdk",
         "opencode-go",
         "opencode-zen",
         "nous",

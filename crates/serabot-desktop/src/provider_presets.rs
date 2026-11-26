@@ -744,6 +744,23 @@ const PRESETS: &[ProviderPreset] = &[
         risk: "",
     },
     ProviderPreset {
+        id: "claude-agent-sdk",
+        label: "Claude Agent SDK (Gateway)",
+        subtitle: "Local loopback Claude Agent SDK gateway (127.0.0.1:8791)",
+        base_url: "http://127.0.0.1:8791",
+        kind: "claude-agent-sdk",
+        default_id: "claude-agent-sdk",
+        models: &["claude-sonnet-4-5", "claude-opus-4-5", "claude-haiku-4-5"],
+        secret_name: "claude_gateway_token",
+        catalog_fetch: true,
+        auth: "api_key",
+        badge: "Gateway",
+        note: "Local loopback Claude Agent SDK gateway — requires a local gateway token",
+        key_url: "",
+        sign_in: "",
+        risk: "",
+    },
+    ProviderPreset {
         id: "ollama",
         label: "Ollama (Local)",
         subtitle: "Your own Ollama server. No key needed. Change the address for another machine.",
@@ -914,6 +931,7 @@ mod tests {
                         | "nebius"
                         | "sambanova"
                         | "inception"
+                        | "claude-agent-sdk"
                 ),
                 "{:?}",
                 preset.id
@@ -1157,7 +1175,9 @@ mod tests {
             assert_eq!(preset.sign_in, expected_sign_in, "{:?}", preset.id);
             match preset.auth {
                 // A key provider names the page where the key is created.
-                "api_key" | "oauth_or_key" if preset.id != "custom" => {
+                "api_key" | "oauth_or_key"
+                    if !matches!(preset.id, "custom" | "claude-agent-sdk") =>
+                {
                     assert!(preset.key_url.starts_with("https://"), "{:?}", preset.id)
                 }
                 // A sign-in-only provider has no key to get.

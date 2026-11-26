@@ -1,18 +1,35 @@
 
 /* Settings page (0.17). Tokens only; nothing here hard-codes a colour. */
-.settings-layout {
+.pane-body.settings-layout {
   display: flex;
-  align-items: flex-start;
-  gap: 24px;
+  align-items: stretch;
+  overflow: hidden;
+  min-height: 0;
+  padding: 0;
+  gap: 0;
+  max-width: none;
 }
 
-.settings-nav {
-  flex: 0 0 180px;
+.pane-body.settings-layout > .settings-nav {
+  flex: 0 0 236px;
+  height: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 14px 12px 24px;
+  border-right: 1px solid var(--hairline);
+  position: static;
   display: flex;
   flex-direction: column;
   gap: 2px;
+}
+
+.pane-body.settings-layout > .settings-nav > .settings-search {
   position: sticky;
   top: 0;
+  z-index: 1;
+  margin: -14px -12px 8px;
+  padding: 14px 12px 10px;
+  background: var(--surface);
 }
 
 .settings-nav-item {
@@ -38,12 +55,24 @@
   font-weight: 600;
 }
 
-.settings-content {
+.pane-body.settings-layout > .settings-content {
   flex: 1;
   min-width: 0;
+  max-width: none;
+  height: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 20px 28px 40px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 16px;
+}
+
+.settings-content > .pane,
+.settings-content > .pane > .pane-body {
+  height: auto;
+  overflow: visible;
+  padding: 0;
 }
 
 /* Text size preference: the root carries data-text. */
@@ -245,15 +274,31 @@
 }
 
 @media (max-width: 720px) {
-  .settings-layout {
+  .pane-body.settings-layout {
     flex-direction: column;
   }
 
-  .settings-nav {
+  .pane-body.settings-layout > .settings-nav {
+    flex: 0 0 auto;
     flex-direction: row;
     flex-wrap: wrap;
-    flex-basis: auto;
+    height: auto;
+    max-height: 40%;
+    width: 100%;
+    border-right: 0;
+    border-bottom: 1px solid var(--hairline);
     position: static;
+  }
+
+  .pane-body.settings-layout > .settings-nav > .settings-search {
+    flex: 1 0 100%;
+    margin: -14px -12px 6px;
+  }
+
+  .pane-body.settings-layout > .settings-content {
+    height: auto;
+    min-height: 0;
+    padding: 16px 16px 28px;
   }
 }
 

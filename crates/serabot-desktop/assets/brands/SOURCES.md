@@ -2,7 +2,7 @@
 
 Each PNG is the vendor's own icon, fetched from the vendor's official domain (or the vendor's CDN named in its own page markup) and resized to 64x64 with transparent padding. The logos are trademarks of their owners and are used only to identify the integration. SeraBot is not affiliated with or endorsed by them.
 
-`outlook.png` also serves Outlook Calendar and `minimax.png` also serves MiniMax (China). Anthropic, Claude, and WhatsApp use clean vector SVG marks in `src/branding.rs`. Muse Code, OpenAI-compatible and Custom belong to no vendor and use neutral inline SVGs in `src/branding.rs`.
+`outlook.png` also serves Outlook Calendar and `minimax.png` also serves MiniMax (China). Anthropic, Claude, and WhatsApp use clean vector SVG marks in `src/branding.rs`. OpenAI-compatible and Custom belong to no vendor and use neutral inline SVGs in `src/branding.rs`.
 
 | File | Source URL |
 |---|---|
@@ -21,14 +21,18 @@ Each PNG is the vendor's own icon, fetched from the vendor's official domain (or
 | `gemini.png` | https://www.gstatic.com/lamda/images/gemini_sparkle_4g_512_lt_f94943af3be039176192d.png (Gemini sparkle served by Google) |
 | `groq.png` | https://groq.com/apple-touch-icon.png |
 | `huggingface.png` | https://huggingface.co/favicon.ico |
+| `inception.png` | https://framerusercontent.com/images/y5L2OctMTnQDhiVDBUBArywmSY.png (apple-touch-icon linked from inceptionlabs.ai) |
 | `minimax.png` | https://www.minimaxi.com/favicon.ico |
 | `mistral.png` | https://mistral.ai/favicon.ico |
 | `moonshot.png` | https://www.kimi.com/favicon.ico |
+| `muse.png` | https://static.xx.fbcdn.net/rsrc.php/yQ/r/0eWKxz9kEoF.webp (apple-touch-icon linked from ai.meta.com) |
 | `nebius.png` | https://nebius.com/apple-touch-icon.png |
 | `notion.png` | https://www.notion.so/images/logo-ios.png |
+| `nous.png` | https://avatars.githubusercontent.com/u/134168893?v=4 (official NousResearch GitHub organization avatar) |
 | `ollama.png` | https://ollama.com/public/apple-touch-icon.png |
 | `onedrive.png` | https://onedrive.live.com/favicon.ico |
 | `openai.png` | https://cdn.oaistatic.com/assets/favicon-180x180-od45eci6.webp (icon linked from openai.com / chatgpt.com) |
+| `opencode.png` | https://opencode.ai/apple-touch-icon-v3.png |
 | `openrouter.png` | https://openrouter.ai/apple-touch-icon.png |
 | `outlook.png` | https://outlook.live.com/owa/favicon.ico |
 | `perplexity.png` | https://www.perplexity.ai/apple-touch-icon.png |

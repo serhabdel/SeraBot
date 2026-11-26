@@ -7418,7 +7418,7 @@ dependencies = [
 
 [[package]]
 name = "serabot"
-version = "0.74.19"
+version = "0.74.20"
 dependencies = [
  "age",
  "anyhow",
@@ -7486,7 +7486,7 @@ dependencies = [
 
 [[package]]
 name = "serabot-desktop"
-version = "0.74.19"
+version = "0.74.20"
 dependencies = [
  "base64 0.22.1",
  "dioxus",

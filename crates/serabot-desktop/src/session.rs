@@ -965,6 +965,7 @@ pub struct Session {
     /// Provider whose Test is running.
     pub provider_testing: Option<String>,
     pub admin_error: Option<String>,
+    pub section_load_error: Option<String>,
     pub restart_pending: bool,
     pub restarting: bool,
     /// The connection dropped while signed in: the reconnect banner shows
@@ -1225,6 +1226,7 @@ impl Session {
             provider_key_drafts: BTreeMap::new(),
             provider_testing: None,
             admin_error: None,
+            section_load_error: None,
             restart_pending: false,
             restarting: false,
             rename: None,
@@ -1895,6 +1897,10 @@ impl Session {
     }
 
     pub fn open_section(&mut self, section: Section) {
+        if self.state.connected && !self.state.unknown_outcome {
+            self.poll_paused = false;
+            self.section_load_error = None;
+        }
         let mapped_settings = match section {
             Section::Memory => Some(SettingsSection::Memory),
             Section::Integrations => Some(SettingsSection::Integrations),
@@ -1928,8 +1934,35 @@ impl Session {
     }
 
     pub fn open_settings_section(&mut self, settings_section: SettingsSection) {
+        if self.state.connected && !self.state.unknown_outcome {
+            self.poll_paused = false;
+            self.section_load_error = None;
+        }
         self.settings_section = settings_section;
         self.trigger_settings_section_load(settings_section);
+        self.ensure_section_data();
+    }
+
+    /// Retry loading the active section's lazy data after an inline load error.
+    pub fn retry_section_load(&mut self) {
+        self.section_load_error = None;
+        if self.state.connected && !self.state.unknown_outcome {
+            self.poll_paused = false;
+        }
+        self.state.error = None;
+        if self.section == Section::Logs
+            || (self.section == Section::Settings && self.settings_section == SettingsSection::Logs)
+        {
+            self.state.logs_error = None;
+            self.refresh_logs();
+            return;
+        }
+        if self.section == Section::Integrations
+            || (self.section == Section::Settings
+                && self.settings_section == SettingsSection::Integrations)
+        {
+            self.state.marketplace_error = None;
+        }
         self.ensure_section_data();
     }
 
@@ -5231,11 +5264,13 @@ impl Session {
                         }
                         OperationKind::Logs => {
                             // The tab shows its own message; no global banner.
-                            self.state.logs_error = Some(if forbidden {
+                            let err = if forbidden {
                                 "Admin access is required to view server logs.".to_owned()
                             } else {
                                 message
-                            });
+                            };
+                            self.state.logs_error = Some(err.clone());
+                            self.section_load_error = Some(err);
                             self.state.logs_loaded = true;
                             self.state.error = None;
                         }
@@ -5263,10 +5298,18 @@ impl Session {
                                     self.state.marketplace_error = None;
                                 }
                                 crate::marketplace::MarketplaceProblem::Message(text) => {
-                                    self.state.marketplace_error = Some(text);
+                                    self.state.marketplace_error = Some(text.clone());
+                                    if completion.kind == OperationKind::MarketplaceList {
+                                        self.section_load_error = Some(text);
+                                    }
                                 }
                             }
                             self.state.error = None;
+                        }
+                        OperationKind::Providers
+                        | OperationKind::Connectors
+                        | OperationKind::ListMemories => {
+                            self.section_load_error = Some(message);
                         }
                         OperationKind::Workflows | OperationKind::WorkflowsWrite => {
                             self.state.workflows_loaded = true;
@@ -5446,6 +5489,16 @@ impl Session {
                         self.state.marketplace_detail = None;
                         self.state.marketplace_error =
                             Some("The plugin changed, but its page could not be reloaded.".into());
+                    }
+                    if matches!(
+                        completion.kind,
+                        OperationKind::Providers
+                            | OperationKind::Connectors
+                            | OperationKind::MarketplaceList
+                            | OperationKind::ListMemories
+                            | OperationKind::Logs
+                    ) {
+                        self.section_load_error = None;
                     }
                     if matches!(completion.kind, OperationKind::Approvals) {
                         self.note_approvals();
@@ -9013,5 +9066,99 @@ mod backlog_tests {
                     && m.id.starts_with("opt-")
                     && m.content == "Check invoice #42")
         );
+    }
+
+    #[test]
+    fn open_settings_section_clears_poll_paused_and_dispatches_providers() {
+        let _guard = crate::creds::test_lock();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let worker = crate::worker::Worker::start().unwrap();
+        let mut session = Session::assemble(
+            String::new(),
+            Theme::Dark,
+            Vec::new(),
+            String::new(),
+            Some(worker),
+        );
+        let endpoint = crate::validate_endpoint(&format!("http://127.0.0.1:{port}")).unwrap();
+        session.credentials = Some(Arc::new(Credentials {
+            endpoint,
+            token: secrecy::SecretString::new("synthetic-test-token-0123456789abcdef".into()),
+        }));
+        session.state.connected = true;
+        session.state.unknown_outcome = false;
+        session.section = Section::Settings;
+        session.poll_paused = true;
+        session.section_load_error = Some("stale error".into());
+        session.next_request = Instant::now() - Duration::from_secs(1);
+
+        session.open_settings_section(SettingsSection::Providers);
+
+        assert!(!session.poll_paused, "poll_paused must be cleared");
+        assert!(
+            session.section_load_error.is_none(),
+            "section_load_error must be cleared on navigation"
+        );
+        assert_eq!(
+            session.pending,
+            Some(crate::worker::OperationKind::Providers),
+            "Providers operation should be dispatched"
+        );
+        drop(listener);
+    }
+
+    #[test]
+    fn failed_providers_load_sets_section_load_error() {
+        use std::io::{Read, Write};
+        let _guard = crate::creds::test_lock();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let worker = crate::worker::Worker::start().unwrap();
+        let mut session = Session::assemble(
+            String::new(),
+            Theme::Dark,
+            Vec::new(),
+            String::new(),
+            Some(worker),
+        );
+        let endpoint = crate::validate_endpoint(&format!("http://127.0.0.1:{port}")).unwrap();
+        session.credentials = Some(Arc::new(Credentials {
+            endpoint,
+            token: secrecy::SecretString::new("synthetic-test-token-0123456789abcdef".into()),
+        }));
+        session.state.connected = true;
+        session.state.unknown_outcome = false;
+        session.section = Section::Settings;
+        session.next_request = Instant::now() - Duration::from_secs(1);
+
+        session.open_settings_section(SettingsSection::Providers);
+        assert_eq!(
+            session.pending,
+            Some(crate::worker::OperationKind::Providers)
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.pending.is_some() && Instant::now() < deadline {
+            session.tick();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(session.pending.is_none(), "Providers request must complete");
+        assert!(!session.state.providers_loaded);
+        assert!(
+            session.section_load_error.is_some(),
+            "failed Providers load must set section_load_error"
+        );
+        let _ = server.join();
     }
 }

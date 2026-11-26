@@ -30,6 +30,8 @@ pub enum Wire {
     AnthropicKey,
     /// `POST {base}/messages` with a Claude plan bearer token.
     AnthropicPlan,
+    /// `POST {base}/v1/turn` on the local loopback Claude Agent SDK gateway.
+    ClaudeGateway,
 }
 
 impl Wire {

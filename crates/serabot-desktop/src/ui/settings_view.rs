@@ -138,6 +138,16 @@ pub(super) fn SettingsView(session: Signal<Session>, overlay: Signal<Overlay>) -
     let gated_empty = gated_tools.is_empty();
     let egress_empty = egress.is_empty();
     let sel = session.read().settings_section;
+    let mut prev_section = use_signal(|| sel);
+    use_effect(move || {
+        let current = session.read().settings_section;
+        if *prev_section.peek() != current {
+            prev_section.set(current);
+            let _ = document::eval(
+                "const el = document.getElementById('settings-content-scroll'); if (el) el.scrollTop = 0;",
+            );
+        }
+    });
     if sel == SettingsSection::Voice && !voice_loaded && !voice_loading && !voice_auto_requested() {
         voice_auto_requested.set(true);
         session.write().load_voice();
@@ -195,7 +205,7 @@ pub(super) fn SettingsView(session: Signal<Session>, overlay: Signal<Overlay>) -
             }
             div { class: "pane-body settings-layout",
                 SettingsNav { session }
-                div { class: "settings-content",
+                div { id: "settings-content-scroll", class: "settings-content",
                     {settings_new_cards}
                     if sel == SettingsSection::Account {
                     div { class: "card",

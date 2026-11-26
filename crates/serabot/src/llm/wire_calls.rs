@@ -126,7 +126,14 @@ impl LlmClient {
                 request = request.query(&call.query);
             }
             if let Some(body) = &call.body {
-                request = request.header("accept", "text/event-stream").json(body);
+                if !call
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("accept"))
+                {
+                    request = request.header("accept", "text/event-stream");
+                }
+                request = request.json(body);
             } else {
                 if !call
                     .headers
@@ -436,4 +443,147 @@ impl LlmClient {
         }
         Ok(catalog)
     }
+
+    /// One completion on the local loopback Claude Agent SDK gateway (`POST {base}/v1/turn`).
+    pub(super) async fn complete_claude_gateway(
+        &self,
+        messages: &[LlmMessage],
+        tools: &[ToolSpec],
+        model: &str,
+    ) -> Result<LlmResponse> {
+        let base = crate::config::validate_loopback_gateway_url(&self.base_url)?;
+        let root = base.strip_suffix("/v1").unwrap_or(&base);
+        let system = messages
+            .iter()
+            .filter(|m| m.role == Role::System)
+            .filter_map(|m| m.content.as_deref())
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let non_system: Vec<LlmMessage> = messages
+            .iter()
+            .filter(|m| m.role != Role::System)
+            .cloned()
+            .collect();
+        let tools_json: Vec<Value> = tools
+            .iter()
+            .map(|tool| {
+                json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                })
+            })
+            .collect();
+        let body = json!({
+            "model": model,
+            "system": system,
+            "messages": messages_to_json(&non_system),
+            "tools": tools_json,
+            "max_tokens": self.max_output_tokens,
+        });
+        let bytes = self
+            .send_wire(WireCall {
+                method: reqwest::Method::POST,
+                url: format!("{root}/v1/turn"),
+                query: Vec::new(),
+                auth: WireAuth::Bearer,
+                headers: vec![("accept", "application/json".to_owned())],
+                body: Some(body),
+                fix_bad_request: None,
+                echo_error: true,
+                idempotent: false,
+            })
+            .await?;
+        parse_claude_gateway_response(&bytes)
+    }
+}
+
+fn parse_claude_gateway_response(bytes: &[u8]) -> Result<LlmResponse> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|error| {
+        SeraError::External(format!("malformed claude-gateway response: {error}"))
+    })?;
+    let content = value
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .map(str::to_owned);
+    let mut tool_calls = Vec::new();
+    if let Some(calls) = value.get("tool_calls").and_then(Value::as_array) {
+        for (idx, call) in calls.iter().enumerate() {
+            let id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("call_{idx}"));
+            let (name, raw_args) = if let Some(func) = call.get("function") {
+                (
+                    func.get("name").and_then(Value::as_str).unwrap_or_default(),
+                    func.get("arguments"),
+                )
+            } else {
+                (
+                    call.get("name").and_then(Value::as_str).unwrap_or_default(),
+                    call.get("arguments"),
+                )
+            };
+            if name.trim().is_empty() {
+                continue;
+            }
+            let arguments = match raw_args {
+                Some(Value::String(text)) => {
+                    serde_json::from_str(text).unwrap_or_else(|_| json!({}))
+                }
+                Some(other) if !other.is_null() => other.clone(),
+                _ => json!({}),
+            };
+            tool_calls.push(ToolCall {
+                id,
+                name: name.to_owned(),
+                arguments,
+                reasoning_signature: None,
+            });
+        }
+    }
+    let usage = match value.get("usage") {
+        Some(u) if !u.is_null() => {
+            let get = |key: &str| u.get(key).and_then(Value::as_u64).unwrap_or(0);
+            let prompt = get("prompt_tokens").max(get("input_tokens"));
+            let completion = get("completion_tokens").max(get("output_tokens"));
+            let cached = get("cached_tokens")
+                .max(get("cache_read_input_tokens"))
+                .min(prompt);
+            let total = get("total_tokens").max(prompt.saturating_add(completion));
+            Usage {
+                prompt_tokens: prompt.saturating_sub(cached),
+                completion_tokens: completion,
+                total_tokens: total,
+                cached_tokens: cached,
+            }
+        }
+        _ => Usage::default(),
+    };
+    let finish_reason = value
+        .get("finish_reason")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let reasoning = value
+        .get("reasoning")
+        .and_then(Value::as_str)
+        .and_then(bounded_reasoning);
+    Ok(LlmResponse {
+        message: LlmMessage {
+            role: Role::Assistant,
+            content,
+            tool_calls,
+            tool_call_id: None,
+            name: None,
+            is_error: false,
+            images: Vec::new(),
+        },
+        usage,
+        finish_reason,
+        reasoning,
+    })
 }
