@@ -141,26 +141,25 @@ const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "antigravity",
         label: "Google Antigravity",
-        subtitle: "Sign in with Google (browser) — Gemini & Claude models",
+        subtitle: "pi-antigravity v0.15.0 — OAuth PKCE (aicode scope), dynamic model discovery, multi-account failover",
         base_url: "https://daily-cloudcode-pa.googleapis.com",
         kind: "google-antigravity",
         default_id: "antigravity",
         models: &[
-            "gemini-4-argon-high",
-            "gemini-4-argon-medium",
-            "gemini-4-argon-low",
-            "gemini-3.8-flash-tiered",
-            "gemini-3.1-pro-low",
-            "claude-opus-5-5-thinking",
-            "claude-opus-5-5",
-            "claude-sonnet-5-5-thinking",
-            "claude-sonnet-5-5",
+            "gemini-3.8-flash",
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+            "gemini-3.1-pro",
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+            "gpt-oss-120b",
         ],
         secret_name: "antigravity_access_token",
         catalog_fetch: true,
         auth: "oauth",
         badge: "OAuth",
-        note: "Sign in with Google (browser) — Gemini & Claude models",
+        note: "pi-antigravity v0.15.0 — OAuth PKCE with aicode scope, dynamic model discovery & multi-account failover",
         key_url: "",
         sign_in: "pkce_google",
         risk: PLAN_RISK_GOOGLE,
@@ -606,7 +605,7 @@ const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "anthropic",
         label: "Anthropic (Claude)",
-        subtitle: "Claude models on the native Messages API. Sign in with Claude or add several API keys; each account is yours alone.",
+        subtitle: "Claude models on the native Messages API using an official Anthropic Console API key (console.anthropic.com/settings/keys). For Claude subscription or CLI access, use Claude Agent SDK (Gateway) or Desktop ACP.",
         base_url: "https://api.anthropic.com/v1",
         kind: "anthropic",
         default_id: "anthropic",
@@ -632,11 +631,11 @@ const PRESETS: &[ProviderPreset] = &[
         secret_name: "anthropic_api_key",
         catalog_fetch: true,
         auth: "api_key",
-        badge: "OAuth / API Key",
-        note: "Sign in with Claude (browser, several accounts) or add API keys",
+        badge: "API Key",
+        note: "Uses an official Anthropic Console API key (console.anthropic.com/settings/keys); for Claude subscription or CLI access, use Claude Agent SDK (Gateway) or Desktop ACP",
         key_url: "https://console.anthropic.com/settings/keys",
-        sign_in: "pkce",
-        risk: PLAN_RISK_CLAUDE,
+        sign_in: "",
+        risk: "",
     },
     ProviderPreset {
         id: "opencode-go",
@@ -752,11 +751,17 @@ const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "claude-agent-sdk",
         label: "Claude Agent SDK (Gateway)",
-        subtitle: "Local loopback Claude Agent SDK gateway (127.0.0.1:8791)",
+        subtitle: "Official Claude Agent SDK via local loopback gateway (October 2026 compliant)",
         base_url: "http://127.0.0.1:8791",
         kind: "claude-agent-sdk",
         default_id: "claude-agent-sdk",
-        models: &["claude-sonnet-4-5", "claude-opus-4-5", "claude-haiku-4-5"],
+        models: &[
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+            "claude-sonnet-4-5",
+            "claude-opus-4-5",
+            "claude-haiku-4-5",
+        ],
         secret_name: "claude_gateway_token",
         catalog_fetch: true,
         auth: "api_key",
@@ -1034,9 +1039,15 @@ mod tests {
         let anthropic = preset_for("anthropic").unwrap();
         assert_eq!(anthropic.kind, "anthropic");
         assert_eq!(anthropic.base_url, "https://api.anthropic.com/v1");
-        assert_eq!(anthropic.badge, "OAuth / API Key");
-        // A key or a Claude browser sign-in (PKCE); the card says both.
-        assert_eq!((anthropic.auth, anthropic.sign_in), ("api_key", "pkce"));
+        assert_eq!(anthropic.badge, "API Key");
+        assert_eq!((anthropic.auth, anthropic.sign_in), ("api_key", ""));
+        assert_eq!(anthropic.risk, "");
+        assert!(
+            anthropic
+                .subtitle
+                .contains("console.anthropic.com/settings/keys")
+        );
+        assert!(anthropic.subtitle.contains("Claude Agent SDK (Gateway)"));
         let go = preset_for("opencode-go").unwrap();
         assert_eq!(go.kind, "opencode-go");
         assert_eq!(go.base_url, "https://opencode.ai/zen/go/v1");
@@ -1184,13 +1195,19 @@ mod tests {
         }
         let antigravity = preset_for("antigravity").unwrap();
         for expected in [
-            "gemini-4-argon-high",
-            "gemini-3.8-flash-tiered",
-            "claude-opus-5-5-thinking",
-            "claude-sonnet-5-5",
+            "gemini-3.8-flash",
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+            "gemini-3.1-pro",
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+            "gpt-oss-120b",
         ] {
             assert!(antigravity.models.contains(&expected), "{expected}");
         }
+        assert!(antigravity.subtitle.contains("pi-antigravity v0.15.0"));
+        assert!(antigravity.note.contains("aicode"));
         let muse = preset_for("muse-code").unwrap();
         assert_eq!(muse.models.first(), Some(&"muse-spark-1.3"));
         assert!(muse.models.contains(&"muse-spark-1.1"));
@@ -1204,8 +1221,6 @@ mod tests {
                 "openrouter" => "pkce",
                 "antigravity" => "pkce_google",
                 "muse-code" => "device",
-                // Claude: a key or a browser sign-in (PKCE) on the same card.
-                "anthropic" => "pkce",
                 // Codex: a ChatGPT browser sign-in (the server adds the device code).
                 "chatgpt-codex" => "pkce",
                 // Copilot: GitHub's device code (it has no browser flow).
@@ -1236,7 +1251,7 @@ mod tests {
             }
         }
         // Key-only providers never claim a sign-in.
-        for id in ["openai", "gemini", "perplexity", "huggingface"] {
+        for id in ["anthropic", "openai", "gemini", "perplexity", "huggingface"] {
             let preset = preset_for(id).unwrap();
             assert_eq!((preset.auth, preset.sign_in), ("api_key", ""), "{id}");
         }
@@ -1258,7 +1273,6 @@ mod tests {
                 "antigravity",
                 "chatgpt-codex",
                 "github-copilot",
-                "anthropic",
                 "kiro",
                 "devin"
             ]
@@ -1266,11 +1280,17 @@ mod tests {
         assert!(PLAN_RISK_COPILOT.contains("suspend"));
         assert!(PLAN_RISK_GOOGLE.contains("suspend"));
         assert!(PLAN_RISK_CODEX.contains("API keys on the OpenAI provider"));
-        assert!(PLAN_RISK_CLAUDE.contains("API keys are the supported path"));
         assert!(PLAN_RISK_KIRO.contains("suspend"));
         assert!(PLAN_RISK_DEVIN.contains("suspend"));
         // A risk never hides on a plain key provider.
-        for id in ["openai", "mistral", "opencode-go", "nous", "muse-code"] {
+        for id in [
+            "anthropic",
+            "openai",
+            "mistral",
+            "opencode-go",
+            "nous",
+            "muse-code",
+        ] {
             assert!(preset_for(id).unwrap().risk.is_empty(), "{id}");
         }
     }

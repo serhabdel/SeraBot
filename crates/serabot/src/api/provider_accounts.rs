@@ -61,11 +61,14 @@ pub(super) fn signin_flows(
 /// member. `None` when it is offered or the kind has no plan sign-in.
 pub(super) fn plan_signin_blocked(
     state: &ApiState,
-    is_admin: bool,
+    _is_admin: bool,
     provider_id: &str,
     kind: &str,
 ) -> Option<&'static str> {
-    if !matches!(kind, "anthropic" | "openai-codex" | "github-copilot") {
+    if kind == "anthropic" {
+        return Some("off");
+    }
+    if !matches!(kind, "openai-codex" | "github-copilot") {
         return None;
     }
     // The copy last saved in the console counts at once; a provider that is
@@ -73,13 +76,7 @@ pub(super) fn plan_signin_blocked(
     let enabled = live_provider_profile(state, provider_id)
         .ok()
         .is_none_or(|profile| profile.plan_oauth_enabled());
-    if !enabled {
-        Some("off")
-    } else if kind == "anthropic" && !is_admin {
-        Some("admin_only")
-    } else {
-        None
-    }
+    if !enabled { Some("off") } else { None }
 }
 
 /// What the server still needs before this provider's sign-in can work, for
@@ -131,14 +128,19 @@ pub(super) fn signin_risk(kind: &str, flows: &[&'static str]) -> Option<&'static
 }
 
 /// A plan sign-in needs a provider that has not turned `plan_oauth` off.
-/// Claude's is for the admin; Codex's is open to members (each account is its
-/// owner's own). Every other provider's sign-in is open to members.
+/// Third-party `claude.ai` OAuth is retired (2026); Codex and Copilot remain
+/// gated by `plan_oauth`.
 pub(super) fn plan_signin_gate(
-    user: &ActingUser,
+    _user: &ActingUser,
     profile: &ProviderConfig,
     kind: &str,
 ) -> Result<()> {
-    if !matches!(kind, "anthropic" | "openai-codex" | "github-copilot") {
+    if kind == "anthropic" {
+        return Err(SeraError::Validation(
+            crate::auth_flows::claude::CLAUDE_OAUTH_SHUTDOWN_MESSAGE.into(),
+        ));
+    }
+    if !matches!(kind, "openai-codex" | "github-copilot") {
         return Ok(());
     }
     if !profile.plan_oauth_enabled() {
@@ -146,11 +148,6 @@ pub(super) fn plan_signin_gate(
             code: "signin_unsupported",
             message: "This provider has no sign-in; add its API key".into(),
         });
-    }
-    if kind == "anthropic" && !user.is_admin() {
-        return Err(SeraError::Forbidden(
-            "Claude plan sign-in is only available to the server admin".into(),
-        ));
     }
     Ok(())
 }

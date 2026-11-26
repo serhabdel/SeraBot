@@ -52,6 +52,9 @@ pub const RELAY_PROVIDERS: &[(&str, &str, &[&str])] = &[
             "daily-cloudcode-pa.googleapis.com",
             "daily-cloudcode-pa.sandbox.googleapis.com",
             "autopush-cloudcode-pa.sandbox.googleapis.com",
+            "businessaicode.googleapis.com",
+            "businessaicode.us.rep.googleapis.com",
+            "businessaicode.eu.rep.googleapis.com",
         ],
     ),
     (
@@ -788,6 +791,9 @@ mod tests {
         assert!(saved.routes("google-antigravity"));
         assert!(!saved.routes("openai"));
         assert!(saved.allows_host("daily-cloudcode-pa.googleapis.com"));
+        assert!(saved.allows_host("businessaicode.googleapis.com"));
+        assert!(saved.allows_host("businessaicode.us.rep.googleapis.com"));
+        assert!(saved.allows_host("businessaicode.eu.rep.googleapis.com"));
         assert!(!saved.allows_host("api.openai.com"));
         assert!(!saved.allows_host("192.168.1.1"));
         let member = store

@@ -454,7 +454,7 @@ async fn the_bots_thinking_level_reaches_the_envelope_and_signatures_round_trip(
     let bodies = chat_bodies(&server.received_requests().await.unwrap());
     assert_eq!(
         bodies[0]["request"]["generationConfig"]["thinkingConfig"],
-        json!({"thinkingLevel": "high", "includeThoughts": true})
+        json!({"thinkingBudget": -1, "includeThoughts": true})
     );
     assert_eq!(
         bodies[1]["request"]["contents"][1]["parts"][0]["thoughtSignature"],

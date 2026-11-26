@@ -149,8 +149,12 @@ pub fn levels_for(kind: &str, model: &str, tags: &[String]) -> Vec<&'static str>
             }
         }
         "google-antigravity" => {
-            if id.contains("gpt-oss") {
+            if id == "gpt-oss-120b" {
+                &["medium"]
+            } else if id.contains("gpt-oss") {
                 &[]
+            } else if id.starts_with("claude-sonnet-4-6") || id.starts_with("claude-opus-4-6") {
+                &["high"]
             } else if id.starts_with("claude") {
                 if is_always_on_claude(&id) {
                     &["low", "medium", "high", "max"]
@@ -159,7 +163,6 @@ pub fn levels_for(kind: &str, model: &str, tags: &[String]) -> Vec<&'static str>
                 } else if id.ends_with("-thinking")
                     || id.starts_with("claude-sonnet-4-5")
                     || id.starts_with("claude-opus-4-5")
-                    || id.starts_with("claude-sonnet-4-6")
                     || id.starts_with("claude-sonnet-5-")
                     || id.starts_with("claude-haiku-4-5")
                     || id.starts_with("claude-haiku-5-")
@@ -175,12 +178,19 @@ pub fn levels_for(kind: &str, model: &str, tags: &[String]) -> Vec<&'static str>
                 &[]
             } else if id.ends_with("-tiered") {
                 &["off", "low", "medium", "high"]
+            } else if id.starts_with("gemini-3.1-pro") {
+                &["low", "high"]
+            } else if id.starts_with("gemini-3.8-flash")
+                || id.starts_with("gemini-3.7-flash")
+                || id.starts_with("gemini-3.6-flash")
+                || id.starts_with("gemini-3.5-flash")
+            {
+                &["low", "medium", "high"]
+            } else if id.starts_with("gemini-4") {
+                &["low", "medium", "high", "max"]
             } else if is_gemini_pro_or_argon(&id) {
                 &["low", "medium", "high"]
-            } else if id.starts_with("gemini-2.5-flash")
-                || id.starts_with("gemini-3")
-                || id.starts_with("gemini-4")
-            {
+            } else if id.starts_with("gemini-2.5-flash") || id.starts_with("gemini-3") {
                 &["off", "low", "medium", "high"]
             } else {
                 &[]
@@ -737,8 +747,6 @@ mod tests {
             "claude-opus-5-5",
             "claude-opus-5-5-thinking",
             "claude-fable-5-2",
-            "claude-opus-4-6",
-            "claude-opus-4-6-thinking",
         ] {
             assert_eq!(
                 levels_for("google-antigravity", model, &none()),
@@ -747,12 +755,26 @@ mod tests {
             );
             assert!(wire_fields("google-antigravity", model, &[], "off").is_none());
         }
+        for model in [
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+            "claude-opus-4-6-thinking",
+        ] {
+            assert_eq!(
+                levels_for("google-antigravity", model, &none()),
+                ["high"],
+                "{model}"
+            );
+        }
+        assert_eq!(
+            levels_for("google-antigravity", "gpt-oss-120b", &none()),
+            ["medium"]
+        );
         let agy = ["off", "low", "medium", "high", "max"];
         for model in [
             "claude-sonnet-4-5-thinking",
             "claude-sonnet-4-5",
             "claude-opus-4-5",
-            "claude-sonnet-4-6",
             "claude-sonnet-5-5",
             "claude-haiku-4-5",
             "claude-haiku-5-5",
@@ -769,12 +791,17 @@ mod tests {
                 "{model}"
             );
         }
+        assert_eq!(
+            levels_for("google-antigravity", "gemini-3.1-pro", &none()),
+            ["low", "high"]
+        );
         for model in [
             "gemini-2.5-pro",
             "gemini-3-pro",
-            "gemini-3.1-pro",
-            "gemini-4-pro",
-            "gemini-4-argon",
+            "gemini-3.8-flash",
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
         ] {
             assert_eq!(
                 levels_for("google-antigravity", model, &none()),
@@ -782,13 +809,14 @@ mod tests {
                 "{model}"
             );
         }
-        for model in [
-            "gemini-2.5-flash",
-            "gemini-3-flash",
-            "gemini-3.8-flash",
-            "gemini-4-flash",
-            "gemini-3-pro-tiered",
-        ] {
+        for model in ["gemini-4-pro", "gemini-4-argon", "gemini-4-flash"] {
+            assert_eq!(
+                levels_for("google-antigravity", model, &none()),
+                ["low", "medium", "high", "max"],
+                "{model}"
+            );
+        }
+        for model in ["gemini-2.5-flash", "gemini-3-flash", "gemini-3-pro-tiered"] {
             assert_eq!(
                 levels_for("google-antigravity", model, &none()),
                 ["off", "low", "medium", "high"],
@@ -803,7 +831,6 @@ mod tests {
             "gemini-4-pro-xhigh",
             "gemini-4-argon-max",
             "gpt-oss-120b-medium",
-            "gpt-oss-120b",
         ] {
             assert!(
                 levels_for("google-antigravity", model, &none()).is_empty(),

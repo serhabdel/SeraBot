@@ -36,7 +36,7 @@ use crate::error::{Result, SeraError};
 use crate::secrets::SharedSecrets;
 use crate::user_secrets::ProviderCredential;
 
-use super::pkce::{RedirectSpec, pkce_token_ok, state_ok, validate_loopback_redirect};
+use super::pkce::{RedirectSpec, pkce_token_ok, validate_loopback_redirect};
 use super::{FlowKind, PinnedEndpoint, SignInProvider, SignedIn, TokenSet, read_capped};
 
 /// The token host and path (pinned).
@@ -120,6 +120,7 @@ pub fn split_pasted_code(input: &str) -> (String, Option<String>) {
 pub struct ClaudeSignIn {
     secrets: SharedSecrets,
     client_id_name: String,
+    #[allow(dead_code)]
     authorize: PinnedEndpoint,
     token: PinnedEndpoint,
 }
@@ -208,6 +209,9 @@ fn who(body: &Value) -> Option<Who> {
     })
 }
 
+/// Message returned when attempting to start or finish a third-party `claude.ai` OAuth flow.
+pub const CLAUDE_OAUTH_SHUTDOWN_MESSAGE: &str = "Anthropic shut down third-party claude.ai OAuth in 2026. Use an Anthropic Console API key or the Claude Agent SDK Gateway instead.";
+
 #[async_trait]
 impl SignInProvider for ClaudeSignIn {
     fn flows(&self) -> &'static [FlowKind] {
@@ -218,26 +222,8 @@ impl SignInProvider for ClaudeSignIn {
         Some(redirect_spec())
     }
 
-    fn authorize_url(&self, redirect_uri: &str, challenge: &str, state: &str) -> Result<String> {
-        validate_loopback_redirect(&redirect_spec(), redirect_uri)?;
-        if !pkce_token_ok(challenge) || !state_ok(state) {
-            return Err(SeraError::Rejected {
-                code: "bad_challenge",
-                message: "The sign-in challenge or state is not valid".into(),
-            });
-        }
-        let client_id = self.client_id()?;
-        let mut url = self.authorize.checked_url()?;
-        url.query_pairs_mut()
-            .append_pair("client_id", &client_id)
-            .append_pair("code", "true")
-            .append_pair("code_challenge", challenge)
-            .append_pair("code_challenge_method", "S256")
-            .append_pair("redirect_uri", redirect_uri)
-            .append_pair("response_type", "code")
-            .append_pair("scope", SCOPE)
-            .append_pair("state", state);
-        Ok(url.to_string())
+    fn authorize_url(&self, _redirect_uri: &str, _challenge: &str, _state: &str) -> Result<String> {
+        Err(SeraError::Validation(CLAUDE_OAUTH_SHUTDOWN_MESSAGE.into()))
     }
 
     async fn exchange_pkce(
@@ -252,6 +238,20 @@ impl SignInProvider for ClaudeSignIn {
     }
 
     async fn exchange_pkce_with_state(
+        &self,
+        _http: &reqwest::Client,
+        _code: &str,
+        _redirect_uri: &str,
+        _verifier: &str,
+        _state: &str,
+    ) -> Result<SignedIn> {
+        Err(SeraError::Validation(CLAUDE_OAUTH_SHUTDOWN_MESSAGE.into()))
+    }
+}
+
+#[allow(dead_code)]
+impl ClaudeSignIn {
+    async fn legacy_exchange_pkce_with_state(
         &self,
         http: &reqwest::Client,
         code: &str,
@@ -549,6 +549,7 @@ mod tests {
         ResponseTemplate::new(200).set_body_json(body)
     }
 
+    #[allow(dead_code)]
     async fn mount_token(server: &MockServer, code: &str, reply: ResponseTemplate) {
         Mock::given(method("POST"))
             .and(path("/token"))
@@ -567,376 +568,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_authorization_url_follows_the_claude_client() {
+    async fn third_party_claude_oauth_pkce_is_refused_with_validation_error() {
         let harness = harness();
-        let alice = member(&harness, "microsoft:claude-url");
+        let alice = member(&harness, "microsoft:claude-retired");
         let server = MockServer::start().await;
         let service = service(&harness, &server, true);
-        let started = service
-            .start(&alice, "claude", "anthropic", start_request())
-            .await
-            .unwrap();
-        let url = url::Url::parse(&started.url).unwrap();
-        let query: BTreeMap<String, String> = url
-            .query_pairs()
-            .map(|(key, value)| (key.into_owned(), value.into_owned()))
-            .collect();
-        assert_eq!(query["client_id"], CLIENT_ID);
-        assert_eq!(query["response_type"], "code");
-        assert_eq!(query["code"], "true");
-        assert_eq!(query["code_challenge_method"], "S256");
-        assert_eq!(query["redirect_uri"], REDIRECT);
-        assert_eq!(query["scope"], SCOPE);
-        assert_eq!(query["state"], started.state.clone().unwrap());
-        // The production endpoint is claude.ai; only fixtures use loopback.
-        let real = ClaudeSignIn::new(age_store(true), CLIENT_NAME);
-        let real_url = real
-            .authorize_url(REDIRECT, &"c".repeat(43), &"s".repeat(16))
-            .unwrap();
-        assert!(real_url.starts_with("https://claude.ai/oauth/authorize?"));
-    }
+        let provider = ClaudeSignIn::new(age_store(true), CLIENT_NAME);
 
-    #[tokio::test]
-    async fn without_a_stored_client_id_the_public_default_is_used() {
-        let harness = harness();
-        let alice = member(&harness, "microsoft:claude-noid");
-        let server = MockServer::start().await;
-        let service = service(&harness, &server, false);
-        let started = service
-            .start(&alice, "claude", "anthropic", start_request())
-            .await
-            .unwrap();
-        let url = url::Url::parse(&started.url).unwrap();
-        let query: BTreeMap<String, String> = url
-            .query_pairs()
-            .map(|(key, value)| (key.into_owned(), value.into_owned()))
-            .collect();
-        assert_eq!(query["client_id"], DEFAULT_CLIENT_ID);
-        // No name configured at all is the same answer, and a stored value wins.
-        let unnamed = ClaudeSignIn::new(age_store(true), "");
-        let url = unnamed
+        let auth_err = provider
             .authorize_url(REDIRECT, &"c".repeat(43), &"s".repeat(16))
-            .unwrap();
-        assert!(url.contains(DEFAULT_CLIENT_ID));
-        assert_eq!(client_id_for(&age_store(true), CLIENT_NAME), CLIENT_ID);
-        assert_eq!(DEFAULT_CLIENT_ID, "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
-    }
+            .unwrap_err();
+        assert!(matches!(auth_err, SeraError::Validation(_)), "{auth_err:?}");
+        let msg = auth_err.to_string();
+        assert!(msg.contains("2026"));
+        assert!(msg.contains("Anthropic Console API key"));
+        assert!(msg.contains("Claude Agent SDK Gateway"));
 
-    #[tokio::test]
-    async fn the_code_is_exchanged_as_json_and_stored_sealed_with_a_stable_identity() {
-        let harness = harness();
-        let alice = member(&harness, "microsoft:claude-exchange");
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/token"))
-            .and(body_partial_json(json!({
-                "grant_type": "authorization_code",
-                "code": "code-synthetic",
-                "redirect_uri": REDIRECT,
-                "client_id": CLIENT_ID,
-            })))
-            .respond_with(token_reply("access-1", Some("refresh-1"), Some("uuid-1")))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let service = service(&harness, &server, true);
-        let started = service
+        let http = crate::auth_flows::http_client().unwrap();
+        let exchange_err = provider
+            .exchange_pkce(&http, "code-1", REDIRECT, &"v".repeat(43))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(exchange_err, SeraError::Validation(_)),
+            "{exchange_err:?}"
+        );
+
+        let start_err = service
             .start(&alice, "claude", "anthropic", start_request())
             .await
+            .unwrap_err();
+        assert!(
+            matches!(start_err, SeraError::Validation(_)),
+            "{start_err:?}"
+        );
+        let exchange_state_err = provider
+            .exchange_pkce_with_state(&http, "code-1", REDIRECT, &"v".repeat(43), "state-1")
+            .await
+            .err()
             .unwrap();
-        let outcome = service
+        assert!(
+            matches!(exchange_state_err, SeraError::Validation(_)),
+            "{exchange_state_err:?}"
+        );
+        let complete_err = service
             .complete(
                 &alice,
                 "claude",
                 "anthropic",
-                complete_request(&started.flow_id, "code-synthetic"),
+                complete_request("flow-1", "code-1"),
             )
             .await
-            .unwrap();
-        assert!(outcome.created);
-        let body: Value =
-            serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
-        // The verifier and the flow's own state go to the token endpoint.
-        assert!(body["code_verifier"].as_str().unwrap().len() >= 43);
-        assert_eq!(body["state"], started.state.clone().unwrap());
-        let account = harness
-            .accounts
-            .get(&alice, "claude", &outcome.account_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(account.auth_kind, AuthKind::Oauth);
-        assert_eq!(account.label, "plan@example.example");
-        assert_eq!(account.identity["email"], "plan@example.example");
-        assert_eq!(account.identity["org"], "Synthetic Org");
-        let stored = harness
-            .accounts
-            .credential(&alice, "claude", &outcome.account_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(stored.api_key, "access-1");
-        assert_eq!(stored.refresh_token, "refresh-1");
-        assert!(stored.expires_at.is_some());
-        // No token, code or verifier in anything the account shows.
-        let shown = serde_json::to_string(&account).unwrap();
-        for secret in ["access-1", "refresh-1", "code-synthetic"] {
-            assert!(!shown.contains(secret), "{secret}");
-        }
-    }
-
-    #[tokio::test]
-    async fn signing_in_twice_updates_the_same_account_and_two_accounts_stay_apart() {
-        let harness = harness();
-        let alice = member(&harness, "microsoft:claude-dupe");
-        let server = MockServer::start().await;
-        mount_token(
-            &server,
-            "c1",
-            token_reply("access-a", Some("refresh-a"), Some("uuid-1")),
-        )
-        .await;
-        mount_token(
-            &server,
-            "c2",
-            token_reply("access-b", Some("refresh-b"), Some("uuid-1")),
-        )
-        .await;
-        mount_token(
-            &server,
-            "c3",
-            token_reply("access-c", Some("refresh-c"), Some("uuid-2")),
-        )
-        .await;
-        let service = service(&harness, &server, true);
-        let mut ids = Vec::new();
-        for code in ["c1", "c2", "c3"] {
-            let started = service
-                .start(&alice, "claude", "anthropic", start_request())
-                .await
-                .unwrap();
-            ids.push(
-                service
-                    .complete(
-                        &alice,
-                        "claude",
-                        "anthropic",
-                        complete_request(&started.flow_id, code),
-                    )
-                    .await
-                    .unwrap(),
-            );
-        }
-        assert!(ids[0].created);
-        // The same Claude account again: one row, new tokens.
-        assert!(!ids[1].created);
-        assert_eq!(ids[0].account_id, ids[1].account_id);
-        // A different Claude account is another row.
-        assert!(ids[2].created);
-        assert_ne!(ids[0].account_id, ids[2].account_id);
-        assert_eq!(harness.accounts.list(&alice, "claude").unwrap().len(), 2);
-        let first = harness
-            .accounts
-            .credential(&alice, "claude", &ids[0].account_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(first.api_key, "access-b");
-        assert_eq!(first.refresh_token, "refresh-b");
-    }
-
-    #[tokio::test]
-    async fn a_login_with_no_stable_id_or_no_refresh_token_stores_nothing() {
-        let harness = harness();
-        let alice = member(&harness, "microsoft:claude-refuse");
-        let server = MockServer::start().await;
-        mount_token(&server, "no-id", token_reply("a", Some("r"), None)).await;
-        mount_token(
-            &server,
-            "no-refresh",
-            token_reply("a", None, Some("uuid-9")),
-        )
-        .await;
-        let service = service(&harness, &server, true);
-        for (code, expected) in [
-            ("no-id", "no_stable_identity"),
-            ("no-refresh", "no_refresh_token"),
-        ] {
-            let started = service
-                .start(&alice, "claude", "anthropic", start_request())
-                .await
-                .unwrap();
-            let error = service
-                .complete(
-                    &alice,
-                    "claude",
-                    "anthropic",
-                    complete_request(&started.flow_id, code),
-                )
-                .await
-                .unwrap_err();
-            match error {
-                SeraError::Rejected { code, .. } => assert_eq!(code, expected),
-                other => panic!("{other:?}"),
-            }
-        }
+            .unwrap_err();
+        assert!(
+            matches!(complete_err, SeraError::NotFound(_)),
+            "{complete_err:?}"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
         assert!(harness.accounts.list(&alice, "claude").unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn a_pasted_code_must_carry_this_flows_state() {
-        let harness = harness();
-        let alice = member(&harness, "microsoft:claude-paste");
-        let server = MockServer::start().await;
-        mount_token(
-            &server,
-            "pasted",
-            token_reply("access-p", Some("refresh-p"), Some("uuid-p")),
-        )
-        .await;
-        let service = service(&harness, &server, true);
-        let started = service
-            .start(&alice, "claude", "anthropic", start_request())
-            .await
-            .unwrap();
-        let state = started.state.clone().unwrap();
-        // Another sign-in's state is refused before anything is sent.
-        let wrong = service
-            .complete(
-                &alice,
-                "claude",
-                "anthropic",
-                complete_request(&started.flow_id, "pasted#some-other-state-value"),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            wrong,
-            SeraError::Rejected {
-                code: "bad_code",
-                ..
-            }
-        ));
-        assert!(server.received_requests().await.unwrap().is_empty());
-        // That did not burn the flow? It did: a refused code is a used code.
-        let again = service
-            .complete(
-                &alice,
-                "claude",
-                "anthropic",
-                complete_request(&started.flow_id, &format!("pasted#{state}")),
-            )
-            .await;
-        assert!(again.is_err());
-        // A fresh flow takes `code#state` as the page shows it.
-        let started = service
-            .start(&alice, "claude", "anthropic", start_request())
-            .await
-            .unwrap();
-        let state = started.state.clone().unwrap();
-        let ok = service
-            .complete(
-                &alice,
-                "claude",
-                "anthropic",
-                complete_request(&started.flow_id, &format!("pasted#{state}")),
-            )
-            .await
-            .unwrap();
-        assert!(ok.created);
-    }
-
-    #[tokio::test]
-    async fn a_flow_belongs_to_its_member_and_is_single_use() {
-        let harness = harness();
-        let alice = member(&harness, "microsoft:claude-owner");
-        let bob = member(&harness, "microsoft:claude-thief");
-        let server = MockServer::start().await;
-        mount_token(
-            &server,
-            "mine",
-            token_reply("access-m", Some("refresh-m"), Some("uuid-m")),
-        )
-        .await;
-        let service = service(&harness, &server, true);
-        let started = service
-            .start(&alice, "claude", "anthropic", start_request())
-            .await
-            .unwrap();
-        // Bob finds no such flow, and nothing is sent upstream.
-        let stolen = service
-            .complete(
-                &bob,
-                "claude",
-                "anthropic",
-                complete_request(&started.flow_id, "mine"),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(stolen, SeraError::NotFound(_)));
-        assert!(server.received_requests().await.unwrap().is_empty());
-        assert!(harness.accounts.list(&bob, "claude").unwrap().is_empty());
-        service
-            .complete(
-                &alice,
-                "claude",
-                "anthropic",
-                complete_request(&started.flow_id, "mine"),
-            )
-            .await
-            .unwrap();
-        let reused = service
-            .complete(
-                &alice,
-                "claude",
-                "anthropic",
-                complete_request(&started.flow_id, "mine"),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            reused,
-            SeraError::Rejected {
-                code: "flow_used",
-                ..
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn only_the_fixed_loopback_redirect_is_accepted() {
+    async fn device_flow_is_unsupported_for_claude() {
         let harness = harness();
         let alice = member(&harness, "microsoft:claude-redirect");
         let server = MockServer::start().await;
         let service = service(&harness, &server, true);
-        for bad in [
-            "http://localhost:54546/callback",
-            "http://localhost:54545/oauth-callback",
-            "https://claude.ai/callback",
-            "http://evil.example:54545/callback",
-        ] {
-            let error = service
-                .start(
-                    &alice,
-                    "claude",
-                    "anthropic",
-                    StartRequest {
-                        flow: Some(FlowKind::Pkce),
-                        redirect_uri: Some(bad.into()),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .unwrap_err();
-            assert!(
-                matches!(
-                    error,
-                    SeraError::Rejected {
-                        code: "bad_redirect",
-                        ..
-                    }
-                ),
-                "{bad}"
-            );
-        }
-        // No device flow exists for Claude.
         let device = service
             .start(
                 &alice,
@@ -956,45 +654,6 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    #[tokio::test]
-    async fn a_refused_code_leaves_no_secret_in_the_error() {
-        let harness = harness();
-        let alice = member(&harness, "microsoft:claude-refused");
-        let server = MockServer::start().await;
-        mount_token(
-            &server,
-            "bad-code",
-            ResponseTemplate::new(400).set_body_json(
-                json!({"error": "invalid_grant", "error_description": "code-secret"}),
-            ),
-        )
-        .await;
-        let service = service(&harness, &server, true);
-        let started = service
-            .start(&alice, "claude", "anthropic", start_request())
-            .await
-            .unwrap();
-        let error = service
-            .complete(
-                &alice,
-                "claude",
-                "anthropic",
-                complete_request(&started.flow_id, "bad-code"),
-            )
-            .await
-            .unwrap_err();
-        let text = format!("{error:?} {error}");
-        assert!(matches!(
-            error,
-            SeraError::Rejected {
-                code: "signin_refused",
-                ..
-            }
-        ));
-        assert!(!text.contains("bad-code") && !text.contains("code-secret"));
-        assert!(harness.accounts.list(&alice, "claude").unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1084,64 +743,5 @@ mod tests {
             validate_loopback_redirect(&spec, "http://localhost:54545/oauth-callback").is_err()
         );
         assert!(validate_loopback_redirect(&spec, "https://claude.ai/callback").is_err());
-    }
-
-    #[tokio::test]
-    async fn pasted_setup_token_is_stored_directly_without_token_exchange() {
-        let token = "sk-ant-oat01-synthetic-setup-token-1234";
-        assert_eq!(
-            split_pasted_code(&format!("  {token}  ")),
-            (token.to_owned(), None)
-        );
-        let harness = harness();
-        let alice = member(&harness, "microsoft:claude-setup-token");
-        let server = MockServer::start().await;
-        let service = service(&harness, &server, true);
-        let started = service
-            .start(&alice, "claude", "anthropic", start_request())
-            .await
-            .unwrap();
-        let outcome = service
-            .complete(
-                &alice,
-                "claude",
-                "anthropic",
-                complete_request(&started.flow_id, token),
-            )
-            .await
-            .unwrap();
-        assert!(outcome.created);
-        assert!(server.received_requests().await.unwrap().is_empty());
-        let account = harness
-            .accounts
-            .get(&alice, "claude", &outcome.account_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(account.auth_kind, AuthKind::Oauth);
-        assert_eq!(account.label, "Claude setup-token");
-        let stored = harness
-            .accounts
-            .credential(&alice, "claude", &outcome.account_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(stored.api_key, token);
-        assert!(stored.refresh_token.is_empty());
-
-        // Pasting the same setup-token again updates the existing account.
-        let started2 = service
-            .start(&alice, "claude", "anthropic", start_request())
-            .await
-            .unwrap();
-        let outcome2 = service
-            .complete(
-                &alice,
-                "claude",
-                "anthropic",
-                complete_request(&started2.flow_id, token),
-            )
-            .await
-            .unwrap();
-        assert!(!outcome2.created);
-        assert_eq!(outcome.account_id, outcome2.account_id);
     }
 }
