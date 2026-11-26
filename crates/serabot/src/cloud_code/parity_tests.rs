@@ -96,11 +96,83 @@ fn the_envelope_uses_the_deterministic_session_and_a_hielcowork_request_id() {
 #[test]
 fn thinking_follows_the_hielcowork_table() {
     let t = antigravity_thinking;
-    // Level models.
+    // pi-antigravity v0.15.0 routed models with integer thinkingBudget.
     assert_eq!(
         t("gemini-3.8-flash", Some("off"), 65_536),
         Some(json!({"thinkingBudget": 0}))
     );
+    for model in ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"] {
+        for (level, budget, wire_suffix) in [
+            ("low", 1_000, "low"),
+            ("medium", 4_000, "medium"),
+            ("high", -1, "high"),
+            ("max", -1, "high"),
+        ] {
+            assert_eq!(
+                t(model, Some(level), 65_536),
+                Some(json!({"thinkingBudget": budget, "includeThoughts": true})),
+                "{model} {level}"
+            );
+            assert_eq!(
+                runtime_model_for(model, Some(level)),
+                format!("{model}-{wire_suffix}"),
+                "{model} {level}"
+            );
+        }
+    }
+    for (level, budget, wire) in [
+        ("low", 1_000, "gemini-3.5-flash-extra-low"),
+        ("medium", 4_000, "gemini-3.5-flash-low"),
+        ("high", 10_000, "gemini-3-flash-agent"),
+    ] {
+        assert_eq!(
+            t("gemini-3.5-flash", Some(level), 65_536),
+            Some(json!({"thinkingBudget": budget, "includeThoughts": true})),
+            "3.5 {level}"
+        );
+        assert_eq!(runtime_model_for("gemini-3.5-flash", Some(level)), wire);
+    }
+    assert_eq!(
+        t("gemini-3.1-pro", Some("low"), 65_536),
+        Some(json!({"thinkingBudget": 1_001, "includeThoughts": true}))
+    );
+    assert_eq!(
+        runtime_model_for("gemini-3.1-pro", Some("low")),
+        "gemini-3.1-pro-low"
+    );
+    assert_eq!(
+        t("gemini-3.1-pro", Some("high"), 65_536),
+        Some(json!({"thinkingBudget": 10_001, "includeThoughts": true}))
+    );
+    assert_eq!(
+        runtime_model_for("gemini-3.1-pro", Some("high")),
+        "gemini-pro-agent"
+    );
+    assert_eq!(
+        t("claude-sonnet-4-6", Some("high"), 64_000),
+        Some(json!({"thinkingBudget": 1_024, "includeThoughts": true}))
+    );
+    assert_eq!(
+        runtime_model_for("claude-sonnet-4-6", Some("high")),
+        "claude-sonnet-4-6"
+    );
+    assert_eq!(
+        t("claude-opus-4-6", Some("high"), 64_000),
+        Some(json!({"thinkingBudget": 1_024, "includeThoughts": true}))
+    );
+    assert_eq!(
+        runtime_model_for("claude-opus-4-6", Some("high")),
+        "claude-opus-4-6-thinking"
+    );
+    assert_eq!(
+        t("gpt-oss-120b", Some("medium"), 65_536),
+        Some(json!({"thinkingBudget": 8_192, "includeThoughts": true}))
+    );
+    assert_eq!(
+        runtime_model_for("gpt-oss-120b", Some("medium")),
+        "gpt-oss-120b-medium"
+    );
+    // Level models (Gemini 4 / tiered).
     for (level, wire) in [
         ("low", "low"),
         ("medium", "medium"),
@@ -108,7 +180,7 @@ fn thinking_follows_the_hielcowork_table() {
         ("max", "high"),
     ] {
         assert_eq!(
-            t("gemini-3.8-flash", Some(level), 65_536),
+            t("gemini-4-flash", Some(level), 65_536),
             Some(json!({"thinkingLevel": wire, "includeThoughts": true})),
             "{level}"
         );
@@ -122,8 +194,7 @@ fn thinking_follows_the_hielcowork_table() {
         assert_eq!(t(model, Some("high"), 65_536), None, "{model}");
         assert_eq!(t(model, Some("off"), 65_536), None, "{model}");
     }
-    assert_eq!(t("gpt-oss-120b", Some("high"), 65_536), None);
-    // Claude: budgets, clamped, off sends nothing.
+    // Claude 5.5: budgets, clamped, off sends nothing.
     for (level, budget) in [
         ("low", 4_000),
         ("medium", 10_000),
@@ -155,7 +226,7 @@ fn thinking_follows_the_hielcowork_table() {
     assert_eq!(t("gemini-3.8-flash", None, 65_536), None);
     assert_eq!(
         t("gemini-3.8-flash", Some("medium"), 65_536),
-        Some(json!({"thinkingLevel": "medium", "includeThoughts": true}))
+        Some(json!({"thinkingBudget": 4_000, "includeThoughts": true}))
     );
     assert_eq!(
         t("gemini-2.5-pro", Some("low"), 65_536),
@@ -180,7 +251,10 @@ fn output_caps_and_temperature_follow_the_model_family() {
     assert!(plain.get("thinkingConfig").is_none());
     let gemini = generation_config("gemini-3.8-flash", 8_000, Some(0.5), Some("high"));
     assert_eq!(gemini["temperature"], 0.5);
-    assert_eq!(gemini["thinkingConfig"]["thinkingLevel"], "high");
+    assert_eq!(gemini["thinkingConfig"]["thinkingBudget"], -1);
+    let gemini4 = generation_config("gemini-4-argon", 8_000, Some(0.5), Some("high"));
+    assert_eq!(gemini4["temperature"], 0.5);
+    assert_eq!(gemini4["thinkingConfig"]["thinkingLevel"], "high");
 }
 
 #[test]
@@ -549,8 +623,16 @@ fn the_user_agent_version_can_be_configured() {
     assert_eq!(cloud_code_user_agent(None), CLOUD_CODE_USER_AGENT);
     assert_eq!(cloud_code_user_agent(Some("")), CLOUD_CODE_USER_AGENT);
     assert_eq!(
-        cloud_code_user_agent(Some("2.31.4")),
-        "antigravity/hub/2.31.4 (aidev_client; os_type=windows; arch=amd64; cl=1003475615)"
+        cloud_code_user_agent(Some(IDE_VERSION)),
+        CLOUD_CODE_USER_AGENT
+    );
+    assert_eq!(
+        cloud_code_user_agent(Some("1.6.0")),
+        format!(
+            "antigravity/cli/1.6.0 (aidev_client; os_type={}; arch={}; cl=982146307; auth_method=consumer)",
+            host_os_type(),
+            host_arch(),
+        )
     );
     for bad in ["x", "2..1", "2.", "2.1; drop", "a.b", "99999999999999999"] {
         assert_eq!(
@@ -762,4 +844,69 @@ fn discovery_asks_daily_then_prod_only() {
         discovery_origins("http://127.0.0.1:9").unwrap(),
         ["http://127.0.0.1:9"]
     );
+}
+
+#[test]
+fn system_instruction_auto_folds_above_126_chars_and_keeps_short_prompts() {
+    let short_sys = "s".repeat(SYSTEM_INSTRUCTION_PART_LIMIT);
+    let short_env = envelope(
+        "gemini-3.8-flash",
+        &[LlmMessage::system(&short_sys), LlmMessage::user("hi")],
+        &[],
+    );
+    assert_eq!(
+        short_env["request"]["systemInstruction"]["parts"][0]["text"],
+        short_sys
+    );
+    assert_eq!(
+        short_env["request"]["contents"][0]["parts"][0]["text"],
+        "hi"
+    );
+
+    let long_sys = "s".repeat(SYSTEM_INSTRUCTION_PART_LIMIT + 1);
+    let long_env = envelope(
+        "gemini-3.8-flash",
+        &[LlmMessage::system(&long_sys), LlmMessage::user("hi")],
+        &[],
+    );
+    assert!(long_env["request"].get("systemInstruction").is_none());
+    let first_text = long_env["request"]["contents"][0]["parts"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(first_text.starts_with(&long_sys));
+    assert!(first_text.ends_with("hi"));
+}
+
+#[test]
+fn capacity_backoff_and_validation_required_detection() {
+    assert_eq!(
+        CAPACITY_BACKOFFS,
+        &[Duration::from_secs(2), Duration::from_secs(5)]
+    );
+    assert!(is_capacity_backoff(
+        429,
+        r#"{"error":{"code":429,"message":"Resource exhausted","status":"RESOURCE_EXHAUSTED"}}"#,
+        None
+    ));
+    assert!(!is_capacity_backoff(
+        429,
+        r#"{"error":{"code":429,"message":"Your quota will reset after 1h.","status":"RESOURCE_EXHAUSTED"}}"#,
+        None
+    ));
+    assert!(!is_capacity_backoff(
+        429,
+        r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}"#,
+        Some(Duration::from_secs(3))
+    ));
+    assert!(is_capacity_backoff(
+        503,
+        r#"{"error":{"code":503,"message":"No capacity available for model"}}"#,
+        None
+    ));
+    assert!(is_validation_required(
+        403,
+        r#"{"error":{"code":403,"message":"VALIDATION_REQUIRED"}}"#
+    ));
+    assert!(!is_validation_required(403, "permission denied"));
+    assert!(VALIDATION_REQUIRED_MESSAGE.contains("browser"));
 }

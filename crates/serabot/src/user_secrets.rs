@@ -66,8 +66,8 @@ pub const KEY_BYTES: usize = 32;
 pub const NONCE_BYTES: usize = 12;
 /// Longest provider id accepted by the store.
 pub const MAX_PROVIDER_CHARS: usize = 64;
-/// Hard cap on one credential value, matching the age store's limit.
-pub const MAX_VALUE_BYTES: usize = 16 * 1024;
+/// Hard cap on one credential value (128 KiB, accommodating 64 KiB HTML signatures).
+pub const MAX_VALUE_BYTES: usize = 128 * 1024;
 
 /// The per-user credential store. Cheap to clone behind an `Arc`; the master
 /// key stays in memory for the process lifetime.

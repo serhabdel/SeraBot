@@ -719,6 +719,16 @@ Plan: `docs/specs/0.74.15-proposal.md`. Version stays `0.74.14` until the batch 
 - [x] Windows CI Test Fix (`session.rs`): hardened `failed_providers_load_sets_section_load_error` mock TCP server (`flush` + `shutdown(Shutdown::Write)` to avoid Windows loopback `RST`, `AtomicBool` stop flag, and 15 s deadline).
 - [x] Version bump `0.74.24` (`Cargo.toml`), mobile `0.74.24+98`, `docs/release-0.74.24.md`, `README.md`, `tasks/todo.md`.
 
+## Release 0.74.25 — Rich HTML Mail, Embedded-Logo Signatures, AI Mail Tools & UI Upgrade
+
+- [x] Server HTML Mail & Inline `cid:` Pipeline (`mail.rs`): raised `MAX_SIGNATURE_HTML_CHARS` to 64 KiB, preserved safe `<style>` blocks in `sanitize_email_html` (`sanitize_style_sheet`), added `extract_inline_data_images` (`data:image/*` → `multipart/related` `cid:inline-N@serabot`), and added `In-Reply-To`/`References` header support in `build_message_with_inline`.
+- [x] AI Mail Management Tools (`mail.rs`, `main.rs`, `gateway.rs`, `bots/hostinger.toml`, `bots/mailbox.toml`): upgraded `mail_send` with `body_html`, `cc`, `in_reply_to`, `references`, and automatic HTML signature + inline logo attachment; added `mail_reply` (approval-gated in `DESTRUCTIVE_TOOLS`), `mail_draft` (IMAP `Drafts`), and `mail_triage` (read-only inbox/signature/unread overview).
+- [x] Desktop Rich HTML Editor, Reader CSP Fix & UI Upgrade (`ui_mail_reader.rs`, `ui_mail.rs`, `mail.css`): fixed `MailReader` to pass `*ctx.remote_loaded.read()` to `wrap_email_html_srcdoc_with_remote`, framed HTML bodies in `.mail-paper-card`, added **Visual / Paste** `contenteditable` editors in `SignatureBuilderModal` and `MailComposeModal` with formatting toolbar + live signature preview (`cid:` → `data:` resolution) + **AI Assist**.
+- [x] Compliant Claude Setup (`provider_presets.rs`, `ui/providers.rs`, `provider_flow.rs`, `api/accounts.rs`, `auth_flows/claude.rs`): removed shut-down third-party `claude.ai` OAuth PKCE; `anthropic` is API Key only, paired with `claude-agent-sdk` (loopback Python SDK gateway) and Desktop ACP.
+- [x] Antigravity `pi-antigravity` v0.15.0 Overhaul (`cloud_code.rs`, `thinking.rs`, `relay_net.rs`, `provider_presets.rs`): added `aicode` OAuth scope, `antigravity/cli/1.5.5` UA, 126-char `systemInstruction` auto-folding (`ANTIGRAVITY_INLINE_SYSTEM`), public→runtime tier & integer `thinkingBudget` routing, `businessaicode*.googleapis.com` enterprise hosts, capacity backoff, and `403 VALIDATION_REQUIRED` diagnostics.
+- [x] Version bump `0.74.25` (`Cargo.toml`), mobile `0.74.25+99`, `docs/release-0.74.25.md`, `README.md`, `tasks/todo.md`.
+- [ ] Owner: live pass pasting a rich HTML signature with embedded logo, sending HTML mail, loading remote images, testing `mail_triage`/`mail_draft`/`mail_reply`, and re-signing into Antigravity (`aicode` scope).
+
 
 
 

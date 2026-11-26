@@ -167,6 +167,14 @@ pub fn wrap_email_html_srcdoc_with_remote(body_html: &str, allow_remote_images: 
     )
 }
 
+/// Replace `cid:signature-logo@serabot` with the resolved `data:` URL for live previews.
+pub fn resolve_signature_preview_html(html: &str, logo_data_url: Option<&str>) -> String {
+    match logo_data_url.filter(|u| !u.trim().is_empty()) {
+        Some(url) => html.replace("cid:signature-logo@serabot", url),
+        None => html.to_owned(),
+    }
+}
+
 fn escape_html_text(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for ch in raw.chars() {
@@ -214,7 +222,9 @@ fn has_explicit_html_tags(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     const TAG_PREFIXES: &[&str] = &[
         "<b>",
+        "<strong>",
         "<i>",
+        "<em>",
         "<u>",
         "<p>",
         "<p ",
@@ -230,6 +240,8 @@ fn has_explicit_html_tags(text: &str) -> bool {
         "<div ",
         "<span>",
         "<span ",
+        "<table",
+        "<img ",
         "<h1>",
         "<h2>",
         "<h3>",
@@ -2132,6 +2144,7 @@ pub fn MailView(session: Signal<Session>) -> Element {
                 session,
                 ctx,
                 account: account(),
+                account_status: active_account_status.clone(),
                 initial: draft,
                 on_close: move |_| {
                     let mut compose = compose;
@@ -2178,6 +2191,111 @@ pub fn MailView(session: Signal<Session>) -> Element {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComposeHtmlTab {
+    Visual,
+    Source,
+    Preview,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SigEditorMode {
+    Visual,
+    Fields,
+    Source,
+}
+
+fn compose_seed_html(raw: &str) -> String {
+    if raw.trim().is_empty() {
+        String::new()
+    } else if has_explicit_html_tags(raw) {
+        raw.to_owned()
+    } else {
+        escape_html_text(raw).replace('\n', "<br>")
+    }
+}
+
+fn rich_editor_wire_js(visual_id: &str, sync_id: &str, seed_html: Option<&str>) -> String {
+    let vid = serde_json::to_string(visual_id).unwrap_or_else(|_| "\"\"".to_owned());
+    let sid = serde_json::to_string(sync_id).unwrap_or_else(|_| "\"\"".to_owned());
+    let seed_stmt = match seed_html {
+        Some(html) => {
+            let encoded = serde_json::to_string(html).unwrap_or_else(|_| "\"\"".to_owned());
+            format!("v.innerHTML = {encoded};")
+        }
+        None => String::new(),
+    };
+    format!(
+        r#"(function() {{
+  const v = document.getElementById({vid});
+  const s = document.getElementById({sid});
+  if (!v || !s) return;
+  {seed_stmt}
+  function sync() {{
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+    setter.call(s, v.innerHTML);
+    s.dispatchEvent(new Event('input', {{ bubbles: true }}));
+  }}
+  function sanitizeHtml(raw) {{
+    const tpl = document.createElement('template');
+    tpl.innerHTML = raw;
+    tpl.content.querySelectorAll('script,iframe,object,embed,link,meta,base').forEach(function(el) {{ el.remove(); }});
+    tpl.content.querySelectorAll('*').forEach(function(el) {{
+      Array.from(el.attributes).forEach(function(attr) {{
+        const n = attr.name.toLowerCase();
+        const val = (attr.value || '').trim().toLowerCase();
+        if (n.startsWith('on') || ((n === 'href' || n === 'src') && val.startsWith('javascript:'))) {{
+          el.removeAttribute(attr.name);
+        }}
+      }});
+    }});
+    return tpl.innerHTML;
+  }}
+  if (v.dataset.serabotWired !== '1') {{
+    v.dataset.serabotWired = '1';
+    v.addEventListener('input', sync);
+    v.addEventListener('paste', function(e) {{
+      const cd = e.clipboardData || window.clipboardData;
+      if (!cd) return;
+      e.preventDefault();
+      const html = cd.getData('text/html');
+      if (html) {{
+        document.execCommand('insertHTML', false, sanitizeHtml(html));
+      }} else {{
+        const text = cd.getData('text/plain') || '';
+        document.execCommand('insertText', false, text);
+      }}
+      sync();
+    }});
+  }}
+}})();"#
+    )
+}
+
+fn rich_editor_exec_js(visual_id: &str, sync_id: &str, cmd: &str, arg: Option<&str>) -> String {
+    let vid = serde_json::to_string(visual_id).unwrap_or_else(|_| "\"\"".to_owned());
+    let sid = serde_json::to_string(sync_id).unwrap_or_else(|_| "\"\"".to_owned());
+    let cmd_json = serde_json::to_string(cmd).unwrap_or_else(|_| "\"\"".to_owned());
+    let arg_json = match arg {
+        Some(a) => serde_json::to_string(a).unwrap_or_else(|_| "null".to_owned()),
+        None => "null".to_owned(),
+    };
+    format!(
+        r#"(function() {{
+  const v = document.getElementById({vid});
+  const s = document.getElementById({sid});
+  if (!v) return;
+  v.focus();
+  document.execCommand({cmd_json}, false, {arg_json});
+  if (s) {{
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+    setter.call(s, v.innerHTML);
+    s.dispatchEvent(new Event('input', {{ bubbles: true }}));
+  }}
+}})();"#
+    )
+}
+
 fn compose_fingerprint(to: &str, cc: &str, subject: &str, body: &str) -> String {
     format!("{to}\u{1}{cc}\u{1}{subject}\u{1}{body}")
 }
@@ -2187,6 +2305,7 @@ fn MailComposeModal(
     session: Signal<Session>,
     ctx: MailCtx,
     account: Option<String>,
+    account_status: Option<MailAccountStatus>,
     initial: ComposeState,
     on_close: EventHandler<()>,
     on_sent: EventHandler<()>,
@@ -2198,7 +2317,17 @@ fn MailComposeModal(
     let mut subject = use_signal(|| initial.subject.clone());
     let mut body = use_signal(|| initial.body.clone());
     let mut html_mode = use_signal(|| true);
-    let mut preview_open = use_signal(|| false);
+    let mut html_tab = use_signal(|| ComposeHtmlTab::Visual);
+    let mut compose_visual_seed_gen = use_signal(|| 0u64);
+    let mut sig_preview_open = use_signal(|| false);
+    let sig_logo_data_url = use_signal(|| Option::<String>::None);
+    let sig_plain = account_status.as_ref().and_then(|a| a.signature.clone());
+    let sig_html = account_status
+        .as_ref()
+        .and_then(|a| a.signature_html.clone());
+    let sig_logo_hash = account_status
+        .as_ref()
+        .and_then(|a| a.signature_logo_hash.clone());
     let mut link_open = use_signal(|| false);
     let mut link_url = use_signal(|| "https://".to_owned());
     let mut link_label = use_signal(String::new);
@@ -2463,8 +2592,30 @@ fn MailComposeModal(
         }
     });
 
+    let sig_logo_for_hook = sig_logo_hash.clone();
+    use_hook(move || {
+        if let Some(hash) = sig_logo_for_hook {
+            load_logo_preview_data_url(session, hash, sig_logo_data_url);
+        }
+    });
+
+    use_effect(move || {
+        let is_visual = html_mode() && html_tab() == ComposeHtmlTab::Visual;
+        let _gen = compose_visual_seed_gen();
+        if !is_visual {
+            return;
+        }
+        let seed = compose_seed_html(&body.peek());
+        let js = rich_editor_wire_js("mail-compose-visual", "mail-compose-html-sync", Some(&seed));
+        let _ = dioxus::document::eval(&js);
+    });
+
+    let account_for_ai = account.clone();
     let (_, preview_html_opt) = compose_to_body_and_html(&body(), true);
-    let preview_srcdoc = wrap_email_html_srcdoc(preview_html_opt.as_deref().unwrap_or(""));
+    let preview_srcdoc =
+        wrap_email_html_srcdoc_with_remote(preview_html_opt.as_deref().unwrap_or(""), true);
+    let has_signature = sig_html.as_deref().is_some_and(|s| !s.trim().is_empty())
+        || sig_plain.as_deref().is_some_and(|s| !s.trim().is_empty());
 
     rsx! {
         div { class: "mp-sheet-scrim", onclick: move |_| on_close.call(()) }
@@ -2489,13 +2640,43 @@ fn MailComposeModal(
             }
             div { class: "mp-sheet-head",
                 h2 { class: "mp-sheet-title", "{modal_title}" }
-                button {
-                    class: "icon-btn",
-                    r#type: "button",
-                    title: "Close",
-                    "aria-label": "Close",
-                    onclick: move |_| on_close.call(()),
-                    Icon { name: "x", size: 16 }
+                div { class: "row",
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        title: "Open Chat with this draft for the mail bot to polish",
+                        disabled: sending(),
+                        onclick: move |_| {
+                            let acct = account_for_ai
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or("default");
+                            let prompt = format!(
+                                "Help me polish this email draft (account: {acct}) using the mail tools if needed:\n\
+                                 To: {}\nCc: {}\nSubject: {}\n\n{}",
+                                to(),
+                                cc(),
+                                subject(),
+                                body()
+                            );
+                            let mut guard = session.write();
+                            guard.composer = prompt;
+                            guard.open_section(Section::Chat);
+                            drop(guard);
+                            on_close.call(());
+                        },
+                        Icon { name: "robot", size: 14 }
+                        "AI Assist"
+                    }
+                    button {
+                        class: "icon-btn",
+                        r#type: "button",
+                        title: "Close",
+                        "aria-label": "Close",
+                        onclick: move |_| on_close.call(()),
+                        Icon { name: "x", size: 16 }
+                    }
                 }
             }
             div { class: "mp-sheet-body mail-compose-body",
@@ -2548,56 +2729,156 @@ fn MailComposeModal(
                 div { class: "field",
                     div { class: "mail-field-head-row",
                         label { class: "field-label", r#for: "mail-compose-text", "Message" }
-                        div { class: "mail-format-pill", role: "group", "aria-label": "Compose mode",
-                            button {
-                                class: if html_mode() { "seg-btn active" } else { "seg-btn" },
-                                r#type: "button",
-                                onclick: move |_| html_mode.set(true),
-                                "HTML"
+                        div { class: "row",
+                            if html_mode() {
+                                div { class: "mail-format-pill", role: "group", "aria-label": "HTML editor view",
+                                    button {
+                                        class: if html_tab() == ComposeHtmlTab::Visual { "seg-btn active" } else { "seg-btn" },
+                                        r#type: "button",
+                                        onclick: move |_| {
+                                            html_tab.set(ComposeHtmlTab::Visual);
+                                            let next = compose_visual_seed_gen().saturating_add(1);
+                                            compose_visual_seed_gen.set(next);
+                                        },
+                                        "Visual"
+                                    }
+                                    button {
+                                        class: if html_tab() == ComposeHtmlTab::Source { "seg-btn active" } else { "seg-btn" },
+                                        r#type: "button",
+                                        onclick: move |_| {
+                                            html_tab.set(ComposeHtmlTab::Source);
+                                            link_open.set(false);
+                                        },
+                                        "Source"
+                                    }
+                                    button {
+                                        class: if html_tab() == ComposeHtmlTab::Preview { "seg-btn active" } else { "seg-btn" },
+                                        r#type: "button",
+                                        onclick: move |_| {
+                                            html_tab.set(ComposeHtmlTab::Preview);
+                                            link_open.set(false);
+                                        },
+                                        "Preview"
+                                    }
+                                }
                             }
-                            button {
-                                class: if !html_mode() { "seg-btn active" } else { "seg-btn" },
-                                r#type: "button",
-                                onclick: move |_| {
-                                    html_mode.set(false);
-                                    preview_open.set(false);
-                                    link_open.set(false);
-                                },
-                                "Plain"
+                            div { class: "mail-format-pill", role: "group", "aria-label": "Compose mode",
+                                button {
+                                    class: if html_mode() { "seg-btn active" } else { "seg-btn" },
+                                    r#type: "button",
+                                    onclick: move |_| {
+                                        html_mode.set(true);
+                                        html_tab.set(ComposeHtmlTab::Visual);
+                                        let next = compose_visual_seed_gen().saturating_add(1);
+                                        compose_visual_seed_gen.set(next);
+                                    },
+                                    "HTML"
+                                }
+                                button {
+                                    class: if !html_mode() { "seg-btn active" } else { "seg-btn" },
+                                    r#type: "button",
+                                    onclick: move |_| {
+                                        html_mode.set(false);
+                                        link_open.set(false);
+                                    },
+                                    "Plain"
+                                }
                             }
                         }
                     }
 
-                    if html_mode() {
-                        div { class: "mail-compose-toolbar", role: "toolbar", "aria-label": "Formatting",
+                    if html_mode() && html_tab() != ComposeHtmlTab::Preview {
+                        div { class: "mail-rich-toolbar", role: "toolbar", "aria-label": "Formatting",
                             button {
                                 class: "btn ghost sm mail-fmt-btn",
                                 r#type: "button",
                                 title: "Bold",
-                                onclick: move |_| append_snippet("<b>bold</b>"),
+                                onclick: move |_| {
+                                    if html_tab() == ComposeHtmlTab::Visual {
+                                        let _ = dioxus::document::eval(&rich_editor_exec_js(
+                                            "mail-compose-visual",
+                                            "mail-compose-html-sync",
+                                            "bold",
+                                            None,
+                                        ));
+                                    } else {
+                                        append_snippet("<b>bold</b>");
+                                    }
+                                },
                                 strong { "B" }
                             }
                             button {
                                 class: "btn ghost sm mail-fmt-btn",
                                 r#type: "button",
                                 title: "Italic",
-                                onclick: move |_| append_snippet("<i>italic</i>"),
+                                onclick: move |_| {
+                                    if html_tab() == ComposeHtmlTab::Visual {
+                                        let _ = dioxus::document::eval(&rich_editor_exec_js(
+                                            "mail-compose-visual",
+                                            "mail-compose-html-sync",
+                                            "italic",
+                                            None,
+                                        ));
+                                    } else {
+                                        append_snippet("<i>italic</i>");
+                                    }
+                                },
                                 em { "I" }
                             }
                             button {
                                 class: "btn ghost sm mail-fmt-btn",
                                 r#type: "button",
                                 title: "Underline",
-                                onclick: move |_| append_snippet("<u>underline</u>"),
+                                onclick: move |_| {
+                                    if html_tab() == ComposeHtmlTab::Visual {
+                                        let _ = dioxus::document::eval(&rich_editor_exec_js(
+                                            "mail-compose-visual",
+                                            "mail-compose-html-sync",
+                                            "underline",
+                                            None,
+                                        ));
+                                    } else {
+                                        append_snippet("<u>underline</u>");
+                                    }
+                                },
                                 span { style: "text-decoration: underline;", "U" }
                             }
                             button {
                                 class: "btn ghost sm mail-fmt-btn",
                                 r#type: "button",
-                                title: "Bullet list",
-                                onclick: move |_| append_snippet("\n<ul>\n  <li>Item</li>\n</ul>"),
+                                title: "Bullets",
+                                onclick: move |_| {
+                                    if html_tab() == ComposeHtmlTab::Visual {
+                                        let _ = dioxus::document::eval(&rich_editor_exec_js(
+                                            "mail-compose-visual",
+                                            "mail-compose-html-sync",
+                                            "insertUnorderedList",
+                                            None,
+                                        ));
+                                    } else {
+                                        append_snippet("\n<ul>\n  <li>Item</li>\n</ul>");
+                                    }
+                                },
                                 Icon { name: "list", size: 13 }
-                                "List"
+                                "Bullets"
+                            }
+                            button {
+                                class: "btn ghost sm mail-fmt-btn",
+                                r#type: "button",
+                                title: "Quote",
+                                onclick: move |_| {
+                                    if html_tab() == ComposeHtmlTab::Visual {
+                                        let _ = dioxus::document::eval(&rich_editor_exec_js(
+                                            "mail-compose-visual",
+                                            "mail-compose-html-sync",
+                                            "formatBlock",
+                                            Some("blockquote"),
+                                        ));
+                                    } else {
+                                        append_snippet("\n<blockquote>Quote</blockquote>");
+                                    }
+                                },
+                                "Quote"
                             }
                             button {
                                 class: "btn ghost sm mail-fmt-btn",
@@ -2610,21 +2891,26 @@ fn MailComposeModal(
                             button {
                                 class: "btn ghost sm mail-fmt-btn",
                                 r#type: "button",
-                                title: "Block quote",
-                                onclick: move |_| append_snippet("\n<blockquote>Quote</blockquote>"),
-                                "Quote"
-                            }
-                            button {
-                                class: if preview_open() { "btn ghost sm mail-fmt-btn active" } else { "btn ghost sm mail-fmt-btn" },
-                                r#type: "button",
-                                onclick: move |_| preview_open.set(!preview_open()),
-                                Icon { name: "eye", size: 13 }
-                                if preview_open() { "Edit" } else { "Preview" }
+                                title: "Clear formatting",
+                                onclick: move |_| {
+                                    if html_tab() == ComposeHtmlTab::Visual {
+                                        let _ = dioxus::document::eval(&rich_editor_exec_js(
+                                            "mail-compose-visual",
+                                            "mail-compose-html-sync",
+                                            "removeFormat",
+                                            None,
+                                        ));
+                                    } else {
+                                        let stripped = strip_html_tags(&body());
+                                        body.set(stripped);
+                                    }
+                                },
+                                "Clear"
                             }
                         }
                     }
 
-                    if html_mode() && link_open() {
+                    if html_mode() && html_tab() != ComposeHtmlTab::Preview && link_open() {
                         div { class: "mail-link-bar",
                             input {
                                 class: "input",
@@ -2656,7 +2942,16 @@ fn MailComposeModal(
                                             escape_html_text(&url),
                                             escape_html_text(&label)
                                         );
-                                        append_snippet(&snippet);
+                                        if html_tab() == ComposeHtmlTab::Visual {
+                                            let _ = dioxus::document::eval(&rich_editor_exec_js(
+                                                "mail-compose-visual",
+                                                "mail-compose-html-sync",
+                                                "insertHTML",
+                                                Some(&snippet),
+                                            ));
+                                        } else {
+                                            append_snippet(&snippet);
+                                        }
                                     }
                                     link_open.set(false);
                                     link_label.set(String::new());
@@ -2666,12 +2961,29 @@ fn MailComposeModal(
                         }
                     }
 
-                    if html_mode() && preview_open() {
-                        iframe {
-                            class: "mail-html-frame mail-compose-preview",
-                            "sandbox": "",
-                            srcdoc: "{preview_srcdoc}",
-                            title: "Compose HTML preview",
+                    if html_mode() && html_tab() == ComposeHtmlTab::Preview {
+                        div { class: "mail-paper-card",
+                            iframe {
+                                class: "mail-html-frame mail-compose-preview",
+                                "sandbox": "",
+                                srcdoc: "{preview_srcdoc}",
+                                title: "Compose HTML preview",
+                            }
+                        }
+                    } else if html_mode() && html_tab() == ComposeHtmlTab::Visual {
+                        div {
+                            id: "mail-compose-visual",
+                            class: "mail-rich-editor",
+                            contenteditable: if sending() { "false" } else { "true" },
+                            role: "textbox",
+                            "aria-multiline": "true",
+                            "aria-label": "Rich HTML message editor",
+                        }
+                        textarea {
+                            id: "mail-compose-html-sync",
+                            style: "display:none",
+                            value: "{body}",
+                            oninput: move |e| body.set(e.value()),
                         }
                     } else {
                         textarea {
@@ -2681,6 +2993,37 @@ fn MailComposeModal(
                             disabled: sending(),
                             value: "{body}",
                             oninput: move |e| body.set(e.value()),
+                        }
+                    }
+                }
+
+                if has_signature {
+                    div { class: "mail-sig-preview-card",
+                        button {
+                            class: "mail-sig-preview-toggle",
+                            r#type: "button",
+                            "aria-expanded": if sig_preview_open() { "true" } else { "false" },
+                            onclick: move |_| sig_preview_open.set(!sig_preview_open()),
+                            Icon {
+                                name: if sig_preview_open() { "chevron-down" } else { "chevron-right" },
+                                size: 13,
+                            }
+                            span { "Signature preview" }
+                            span { class: "tiny muted", "Appended automatically on send" }
+                        }
+                        if sig_preview_open() {
+                            if let Some(ref html) = sig_html
+                                && !html.trim().is_empty()
+                            {
+                                iframe {
+                                    class: "mail-html-frame mail-sig-preview",
+                                    "sandbox": "",
+                                    srcdoc: "{wrap_email_html_srcdoc_with_remote(&resolve_signature_preview_html(html, sig_logo_data_url().as_deref()), true)}",
+                                    title: "Active signature preview",
+                                }
+                            } else if let Some(ref plain) = sig_plain {
+                                pre { class: "mail-plain-body", "{plain}" }
+                            }
                         }
                     }
                 }
@@ -2941,7 +3284,14 @@ fn MailSignatureModal(
     let mut sig_company = use_signal(String::new);
     let mut sig_phone = use_signal(String::new);
     let mut sig_website = use_signal(String::new);
-    let mut custom_html_mode = use_signal(|| !initial_html.trim().is_empty());
+    let mut sig_mode = use_signal(|| {
+        if !initial_html.trim().is_empty() {
+            SigEditorMode::Visual
+        } else {
+            SigEditorMode::Fields
+        }
+    });
+    let mut sig_visual_seed_gen = use_signal(|| 0u64);
     let mut custom_html = use_signal(|| initial_html.clone());
     let mut custom_plain = use_signal(|| initial_plain.clone());
     let mut logo_hash = use_signal(|| initial_logo.clone());
@@ -2959,6 +3309,18 @@ fn MailSignatureModal(
         }
     });
 
+    use_effect(move || {
+        let mode = sig_mode();
+        let _gen = sig_visual_seed_gen();
+        if mode != SigEditorMode::Visual {
+            return;
+        }
+        let seed =
+            resolve_signature_preview_html(&custom_html.peek(), logo_data_url.peek().as_deref());
+        let js = rich_editor_wire_js("mail-sig-visual", "mail-sig-html-sync", Some(&seed));
+        let _ = dioxus::document::eval(&js);
+    });
+
     let fields = SignatureFields {
         name: sig_name(),
         title: sig_title(),
@@ -2968,12 +3330,15 @@ fn MailSignatureModal(
     };
     let (built_plain, built_html) =
         build_signature_html_and_plain(&fields, logo_data_url().as_deref());
-    let preview_html = if custom_html_mode() {
-        custom_html()
-    } else {
+    let preview_html = if sig_mode() == SigEditorMode::Fields {
         built_html.clone()
+    } else {
+        custom_html()
     };
-    let preview_srcdoc = wrap_email_html_srcdoc(&preview_html);
+    let preview_srcdoc = wrap_email_html_srcdoc_with_remote(
+        &resolve_signature_preview_html(&preview_html, logo_data_url().as_deref()),
+        true,
+    );
 
     let open_library_picker = move |_| {
         let next = !library_picker_open();
@@ -3029,7 +3394,7 @@ fn MailSignatureModal(
         sig_error.set(None);
         let acct = account_for_save.clone();
         let hash = logo_hash();
-        let (final_plain, final_html) = if custom_html_mode() {
+        let (final_plain, final_html) = if sig_mode() != SigEditorMode::Fields {
             let p = if custom_plain().trim().is_empty() {
                 strip_html_tags(&custom_html())
             } else {
@@ -3092,29 +3457,67 @@ fn MailSignatureModal(
                     }
                     div { class: "mail-format-pill", role: "group", "aria-label": "Signature editor mode",
                         button {
-                            class: if !custom_html_mode() { "seg-btn active" } else { "seg-btn" },
+                            class: if sig_mode() == SigEditorMode::Visual { "seg-btn active" } else { "seg-btn" },
                             r#type: "button",
-                            onclick: move |_| custom_html_mode.set(false),
+                            onclick: {
+                                let built_html = built_html.clone();
+                                let built_plain = built_plain.clone();
+                                move |_| {
+                                    if custom_html().trim().is_empty() && !built_html.trim().is_empty() {
+                                        custom_html.set(built_html.clone());
+                                    }
+                                    if custom_plain().trim().is_empty() && !built_plain.trim().is_empty() {
+                                        custom_plain.set(built_plain.clone());
+                                    }
+                                    sig_mode.set(SigEditorMode::Visual);
+                                    let next = sig_visual_seed_gen().saturating_add(1);
+                                    sig_visual_seed_gen.set(next);
+                                }
+                            },
+                            "Visual / Paste"
+                        }
+                        button {
+                            class: if sig_mode() == SigEditorMode::Fields { "seg-btn active" } else { "seg-btn" },
+                            r#type: "button",
+                            onclick: move |_| sig_mode.set(SigEditorMode::Fields),
                             "Fields"
                         }
                         button {
-                            class: if custom_html_mode() { "seg-btn active" } else { "seg-btn" },
+                            class: if sig_mode() == SigEditorMode::Source { "seg-btn active" } else { "seg-btn" },
                             r#type: "button",
                             onclick: move |_| {
-                                if custom_html().trim().is_empty() {
+                                if custom_html().trim().is_empty() && !built_html.trim().is_empty() {
                                     custom_html.set(built_html.clone());
                                 }
-                                if custom_plain().trim().is_empty() {
+                                if custom_plain().trim().is_empty() && !built_plain.trim().is_empty() {
                                     custom_plain.set(built_plain.clone());
                                 }
-                                custom_html_mode.set(true);
+                                sig_mode.set(SigEditorMode::Source);
                             },
-                            "Custom HTML"
+                            "HTML Source"
                         }
                     }
                 }
 
-                if custom_html_mode() {
+                if sig_mode() == SigEditorMode::Visual {
+                    div { class: "field",
+                        label { class: "field-label", r#for: "mail-sig-visual", "Paste or edit formatted signature" }
+                        div {
+                            id: "mail-sig-visual",
+                            class: "mail-rich-editor mail-sig-visual",
+                            contenteditable: if saving() { "false" } else { "true" },
+                            role: "textbox",
+                            "aria-multiline": "true",
+                            "aria-label": "Visual signature editor",
+                        }
+                        textarea {
+                            id: "mail-sig-html-sync",
+                            style: "display:none",
+                            value: "{custom_html}",
+                            oninput: move |e| custom_html.set(e.value()),
+                        }
+                    }
+                } else if sig_mode() == SigEditorMode::Source {
                     div { class: "field",
                         label { class: "field-label", r#for: "mail-sig-html", "Signature HTML" }
                         textarea {
@@ -3536,6 +3939,30 @@ mod tests {
                 "day:This week",
                 "3:0:false"
             ]
+        );
+    }
+
+    #[test]
+    fn wrap_email_html_srcdoc_with_remote_toggles_img_csp() {
+        let blocked =
+            wrap_email_html_srcdoc_with_remote("<img src=\"https://a.test/x.png\">", false);
+        assert!(blocked.contains("img-src data:;"));
+        assert!(!blocked.contains("img-src data: https: http:;"));
+
+        let allowed =
+            wrap_email_html_srcdoc_with_remote("<img src=\"https://a.test/x.png\">", true);
+        assert!(allowed.contains("img-src data: https: http:;"));
+    }
+
+    #[test]
+    fn resolve_signature_preview_html_replaces_cid_when_data_url_present() {
+        let raw = "<img src=\"cid:signature-logo@serabot\" alt=\"Logo\">";
+        assert_eq!(resolve_signature_preview_html(raw, None), raw);
+        assert_eq!(resolve_signature_preview_html(raw, Some("   ")), raw);
+        let resolved = resolve_signature_preview_html(raw, Some("data:image/png;base64,QUJD"));
+        assert_eq!(
+            resolved,
+            "<img src=\"data:image/png;base64,QUJD\" alt=\"Logo\">"
         );
     }
 }

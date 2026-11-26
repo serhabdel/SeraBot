@@ -242,8 +242,7 @@ pub struct RedirectPlan {
 /// The loopback redirect for a provider kind. Antigravity's registration is
 /// `localhost:51121/oauth-callback` (51121 preferred, any free port after it,
 /// exactly as the owner's HielCowork client signs in; Google matches the host
-/// literally, so `127.0.0.1` is refused there). Claude's registration allows
-/// only `localhost:54545/callback` and Codex's only
+/// literally, so `127.0.0.1` is refused there). Codex's registration allows only
 /// `localhost:1455/auth/callback`; OpenRouter documents `localhost`.
 pub fn redirect_plan(kind: &str) -> RedirectPlan {
     match kind {
@@ -251,11 +250,6 @@ pub fn redirect_plan(kind: &str) -> RedirectPlan {
             fixed_port: None,
             host: "localhost",
             path: oauth::CALLBACK_PATH,
-        },
-        "anthropic" => RedirectPlan {
-            fixed_port: Some(oauth::CLAUDE_PORT),
-            host: "localhost",
-            path: oauth::CLAUDE_CALLBACK_PATH,
         },
         "openai-codex" => RedirectPlan {
             fixed_port: Some(oauth::CODEX_PORT),
@@ -592,9 +586,6 @@ mod tests {
         let google = redirect_plan("google-antigravity");
         assert_eq!(google.fixed_port, None, "51121 is preferred, not required");
         assert_eq!(google.uri(51121), "http://localhost:51121/oauth-callback");
-        let claude = redirect_plan("anthropic");
-        assert_eq!(claude.fixed_port, Some(54545));
-        assert_eq!(claude.uri(54545), "http://localhost:54545/callback");
         let codex = redirect_plan("openai-codex");
         assert_eq!(codex.fixed_port, Some(1455));
         assert_eq!(codex.uri(1455), "http://localhost:1455/auth/callback");

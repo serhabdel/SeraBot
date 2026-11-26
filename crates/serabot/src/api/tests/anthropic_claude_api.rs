@@ -20,6 +20,7 @@ struct Env {
     app: Router,
     server: MockServer,
     alice: String,
+    #[allow(dead_code)]
     alice_id: String,
     bob: String,
 }
@@ -181,6 +182,7 @@ async fn catalog_accepting(server: &MockServer, key: &str) {
         .await;
 }
 
+#[allow(dead_code)]
 async fn plan_token(server: &MockServer, code: &str, uuid: &str) {
     Mock::given(method("POST"))
         .and(path("/token"))
@@ -307,96 +309,50 @@ async fn a_key_anthropic_refuses_is_not_stored() {
 }
 
 #[tokio::test]
-async fn members_cannot_start_the_plan_sign_in_but_the_admin_can() {
+async fn members_and_admin_are_refused_third_party_claude_oauth() {
     let env = env().await;
-    plan_token(&env.server, "admin-code", "uuid-admin").await;
     let start = json!({"flow": "pkce", "redirect_uri": REDIRECT});
-    let (status, body) = call(
-        &env,
-        &env.alice,
-        "POST",
-        "/v1/providers/claude/signin/start",
-        Some(start.clone()),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    // The old spelling is closed to members too.
-    let (status, _) = call(
-        &env,
-        &env.alice,
-        "POST",
-        "/v1/providers/claude/oauth/start",
-        Some(json!({
-            "challenge": "c".repeat(43), "state": "s".repeat(20), "redirect_uri": REDIRECT
-        })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    let (status, done) = call(
-        &env,
-        &env.alice,
-        "POST",
-        "/v1/providers/claude/signin/complete",
-        Some(json!({"flow_id": "x", "code": "admin-code", "redirect_uri": REDIRECT})),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{done}");
+    for token in [OWNER, env.alice.as_str()] {
+        let (status, body) = call(
+            &env,
+            token,
+            "POST",
+            "/v1/providers/claude/signin/start",
+            Some(start.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "validation", "{body}");
 
-    let (status, started) = call(
-        &env,
-        OWNER,
-        "POST",
-        "/v1/providers/claude/signin/start",
-        Some(start),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{started}");
-    let url = started["url"].as_str().unwrap();
-    assert!(url.contains("code=true") && url.contains("code_challenge_method=S256"));
-    let (status, done) = call(
-        &env,
-        OWNER,
-        "POST",
-        "/v1/providers/claude/signin/complete",
-        Some(json!({
-            "flow_id": started["flow_id"], "code": "admin-code", "redirect_uri": REDIRECT
-        })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{done}");
-    assert_eq!(done["created"], true);
-    let text = done.to_string();
-    assert!(!text.contains("plan-access") && !text.contains("plan-refresh"));
-    // It is the admin's account, masked, and nobody else sees it.
-    let (_, mine) = call(&env, OWNER, "GET", "/v1/providers/claude/accounts", None).await;
-    let accounts = mine["accounts"].as_array().unwrap();
-    assert_eq!(accounts.len(), 1);
-    assert_eq!(accounts[0]["auth_kind"], "oauth");
-    assert_eq!(accounts[0]["identity"]["email"], "p***@example.example");
-    assert!(!mine.to_string().contains("plan-access"));
-    for token in [&env.alice, &env.bob] {
-        let (_, theirs) = call(&env, token, "GET", "/v1/providers/claude/accounts", None).await;
-        assert!(theirs["accounts"].as_array().unwrap().is_empty());
+        let (status, body) = call(
+            &env,
+            token,
+            "POST",
+            "/v1/providers/claude/oauth/start",
+            Some(json!({
+                "challenge": "c".repeat(43), "state": "s".repeat(20), "redirect_uri": REDIRECT
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "validation", "{body}");
+
+        let (status, done) = call(
+            &env,
+            token,
+            "POST",
+            "/v1/providers/claude/signin/complete",
+            Some(json!({"flow_id": "x", "code": "admin-code", "redirect_uri": REDIRECT})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{done}");
+        assert_eq!(done["code"], "validation", "{done}");
     }
-    // Members never get a token through the plan account: the admin cannot
-    // share it with a grant either (a grant shares only the default key).
-    let (status, granted) = call(
-        &env,
-        OWNER,
-        "POST",
-        "/v1/admin/grants",
-        Some(json!({"grantee": env.alice_id, "provider": "claude"})),
-    )
-    .await;
-    assert_ne!(status, StatusCode::OK, "{granted}");
-    let (_, grants) = call(&env, OWNER, "GET", "/v1/admin/grants", None).await;
-    assert!(grants["grants"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn the_plan_sign_in_is_off_when_the_operator_turned_it_off() {
     let env = env().await;
-    // `anthropic` sets `plan_oauth = false`: not even the admin can start one.
     let (status, body) = call(
         &env,
         OWNER,
@@ -406,7 +362,7 @@ async fn the_plan_sign_in_is_off_when_the_operator_turned_it_off() {
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert_eq!(body["code"], "signin_unsupported");
+    assert_eq!(body["code"], "validation", "{body}");
     let (status, _) = call(
         &env,
         OWNER,
@@ -423,9 +379,8 @@ async fn the_plan_sign_in_is_off_when_the_operator_turned_it_off() {
 }
 
 #[tokio::test]
-async fn listings_show_the_plan_sign_in_and_its_risk_only_to_the_admin() {
+async fn listings_hide_retired_claude_plan_sign_in() {
     let env = env().await;
-    // A provider is listed once the caller holds an account on it.
     catalog_accepting(&env.server, "sk-ant-listed").await;
     for token in [OWNER, env.alice.as_str()] {
         for provider in ["claude", "anthropic"] {
@@ -440,37 +395,20 @@ async fn listings_show_the_plan_sign_in_and_its_risk_only_to_the_admin() {
             assert_eq!(status, StatusCode::OK, "{body}");
         }
     }
-    let (_, admin) = call(&env, OWNER, "GET", "/v1/providers", None).await;
-    let claude = provider(&admin, "claude");
-    assert_eq!(claude["signin"], json!(["pkce"]));
-    let risk = claude["signin_risk"].as_str().unwrap();
-    assert!(risk.contains("Claude's own client") && risk.contains("never shared"));
-    assert_eq!(provider(&admin, "anthropic")["signin"], json!([]));
-    assert!(provider(&admin, "anthropic")["signin_risk"].is_null());
-    let (_, member) = call(&env, &env.alice, "GET", "/v1/providers", None).await;
-    assert_eq!(provider(&member, "claude")["signin"], json!([]));
-    assert!(provider(&member, "claude")["signin_risk"].is_null());
-    // The admin's own listing of the provider's accounts agrees.
-    let (_, flows) = call(&env, OWNER, "GET", "/v1/providers/claude/accounts", None).await;
-    assert_eq!(flows["signin"], json!(["pkce"]));
-    let (_, flows) = call(
-        &env,
-        &env.alice,
-        "GET",
-        "/v1/providers/claude/accounts",
-        None,
-    )
-    .await;
-    assert_eq!(flows["signin"], json!([]));
-    assert!(flows["signin_risk"].is_null());
+    for token in [OWNER, env.alice.as_str()] {
+        let (_, listed) = call(&env, token, "GET", "/v1/providers", None).await;
+        assert_eq!(provider(&listed, "claude")["signin"], json!([]));
+        assert!(provider(&listed, "claude")["signin_risk"].is_null());
+        assert_eq!(provider(&listed, "anthropic")["signin"], json!([]));
+        assert!(provider(&listed, "anthropic")["signin_risk"].is_null());
+        let (_, flows) = call(&env, token, "GET", "/v1/providers/claude/accounts", None).await;
+        assert_eq!(flows["signin"], json!([]));
+        assert!(flows["signin_risk"].is_null());
+    }
 }
 
-/// "Sign in with Claude" on a card that was never saved: the console posts the
-/// Anthropic preset with no key. The save must work with exactly that, the
-/// admin's sign-in must start at once, and bots must be able to use the
-/// provider at once too: the console save swaps the model router (0.53).
 #[tokio::test]
-async fn a_console_saved_claude_provider_signs_in_without_a_key() {
+async fn a_console_saved_claude_provider_accepts_keys_and_refuses_oauth() {
     let env = env().await;
     let (status, saved) = call(
         &env,
@@ -495,17 +433,13 @@ async fn a_console_saved_claude_provider_signs_in_without_a_key() {
         Some(json!({"flow": "pkce", "redirect_uri": REDIRECT})),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{started}");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{started}");
+    assert_eq!(started["code"], "validation", "{started}");
     let (_, admin) = call(&env, OWNER, "GET", "/v1/providers", None).await;
     let listed = provider(&admin, "claude-console");
-    assert_eq!(listed["signin"], json!(["pkce"]), "{listed}");
-    assert!(listed["plan_signin"].is_null(), "{listed}");
-    assert_eq!(listed["pending_restart"], false, "{listed}");
-    // A member sees why there is no sign-in button instead of nothing.
-    let (_, member) = call(&env, &env.alice, "GET", "/v1/providers", None).await;
-    let listed = provider(&member, "claude-console");
     assert_eq!(listed["signin"], json!([]), "{listed}");
-    assert_eq!(listed["plan_signin"], "admin_only", "{listed}");
+    assert_eq!(listed["plan_signin"], "off", "{listed}");
+    assert_eq!(listed["pending_restart"], false, "{listed}");
 }
 
 #[tokio::test]
@@ -514,19 +448,10 @@ async fn the_accounts_listing_says_why_a_plan_sign_in_is_missing() {
     let (_, off) = call(&env, OWNER, "GET", "/v1/providers/anthropic/accounts", None).await;
     assert_eq!(off["plan_signin"], "off", "{off}");
     assert_eq!(off["signin"], json!([]));
-    let (_, on) = call(&env, OWNER, "GET", "/v1/providers/claude/accounts", None).await;
-    assert!(on["plan_signin"].is_null(), "{on}");
-    assert!(on["signin_setup"].is_null(), "{on}");
-    assert_eq!(on["pending_restart"], false, "{on}");
-    let (_, member) = call(
-        &env,
-        &env.alice,
-        "GET",
-        "/v1/providers/claude/accounts",
-        None,
-    )
-    .await;
-    assert_eq!(member["plan_signin"], "admin_only", "{member}");
+    let (_, claude) = call(&env, OWNER, "GET", "/v1/providers/claude/accounts", None).await;
+    assert_eq!(claude["plan_signin"], "off", "{claude}");
+    assert!(claude["signin_setup"].is_null(), "{claude}");
+    assert_eq!(claude["pending_restart"], false, "{claude}");
 }
 
 /// Saving and removing a console provider reach the bots without a restart:

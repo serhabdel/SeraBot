@@ -3709,12 +3709,11 @@ mod tests {
             )
             .unwrap(),
         );
-        // The age store holds 16 KiB, but wrapped as a credential the value no
-        // longer fits: the write fails, so nothing is removed.
-        let too_large = "a".repeat(16 * 1024);
+        // A failing per-user write (e.g. nonexistent user id violating FK) must
+        // leave the server-wide secrets untouched so nothing is lost.
         secrets
             .persist(&[
-                ("elevenlabs_access_token", too_large.as_str()),
+                ("elevenlabs_access_token", "server-access"),
                 ("elevenlabs_refresh_token", "server-refresh"),
             ])
             .unwrap();
@@ -3722,7 +3721,7 @@ mod tests {
             migrate_server_sign_in(
                 &secrets,
                 &users,
-                &owner,
+                "nonexistent-owner",
                 "elevenlabs_access_token",
                 "elevenlabs_refresh_token"
             )

@@ -307,12 +307,13 @@ impl AddMethod {
 /// The provider kinds whose sign-in is a vendor plan, which the operator can
 /// turn off (`plan_oauth = false`).
 fn is_plan_kind(kind: &str) -> bool {
-    matches!(kind, "anthropic" | "openai-codex" | "github-copilot")
+    matches!(kind, "openai-codex" | "github-copilot")
 }
 
 /// The ways to add an account to `provider`. The server's own list of
 /// sign-in flows wins; an older server that sends none falls back to what
-/// the preset documents. A sign-in-only provider offers no key.
+/// the preset documents. A sign-in-only provider offers no key. Anthropic
+/// uses official API keys only.
 pub fn add_methods(provider: &ProviderStatus, preset: Option<&ProviderPreset>) -> Vec<AddMethod> {
     let mut methods = Vec::new();
     let sign_in_only = provider.auth == "oauth" || preset.is_some_and(|p| p.auth == "oauth");
@@ -320,9 +321,12 @@ pub fn add_methods(provider: &ProviderStatus, preset: Option<&ProviderPreset>) -
     if takes_key {
         methods.push(AddMethod::Key);
     }
-    // The server's list is authoritative for the plan sign-ins (Claude, Codex):
-    // an empty list means the operator turned them off, not that the server is
-    // old.
+    if provider.kind == "anthropic" || preset.is_some_and(|p| p.kind == "anthropic") {
+        return methods;
+    }
+    // The server's list is authoritative for the plan sign-ins (Codex,
+    // Copilot): an empty list means the operator turned them off, not that the
+    // server is old.
     let is_plan = is_plan_kind(&provider.kind) || preset.is_some_and(|p| is_plan_kind(p.kind));
     let flows: Vec<&str> = if provider.signin.is_empty() && !is_plan {
         match preset.map(|p| p.sign_in) {
@@ -818,14 +822,14 @@ mod tests {
             add_methods(&provider("oauth", &["device"]), preset_for("muse-code")),
             [AddMethod::Device]
         );
-        // Claude: keys, and the plan sign-in only when the server offers it.
+        // Claude: API keys only, even if an older server lists pkce.
         assert_eq!(
             add_methods(&provider("api_key", &[]), preset_for("anthropic")),
             [AddMethod::Key]
         );
         assert_eq!(
             add_methods(&provider("api_key", &["pkce"]), preset_for("anthropic")),
-            [AddMethod::Key, AddMethod::Browser]
+            [AddMethod::Key]
         );
         // A local server needs nothing.
         assert!(add_methods(&provider("none", &[]), preset_for("ollama")).is_empty());
@@ -835,20 +839,20 @@ mod tests {
 
     #[test]
     fn a_plan_sign_in_carries_its_risk_and_a_key_does_not() {
-        use crate::provider_presets::{PLAN_RISK_CLAUDE, PLAN_RISK_GOOGLE};
+        use crate::provider_presets::PLAN_RISK_GOOGLE;
         // Antigravity always rides on a Google consumer client.
         assert_eq!(
             risk_text(&provider("oauth", &["pkce"]), preset_for("antigravity")).as_deref(),
             Some(PLAN_RISK_GOOGLE)
         );
-        // Claude shows its risk only while the plan sign-in is on offer.
+        // Anthropic is API-key-only and carries no plan risk.
         assert_eq!(
             risk_text(&provider("api_key", &[]), preset_for("anthropic")),
             None
         );
         assert_eq!(
-            risk_text(&provider("api_key", &["pkce"]), preset_for("anthropic")).as_deref(),
-            Some(PLAN_RISK_CLAUDE)
+            risk_text(&provider("api_key", &["pkce"]), preset_for("anthropic")),
+            None
         );
         // The server's own sentence wins.
         let mut sent = provider("api_key", &["pkce"]);
@@ -949,11 +953,10 @@ mod tests {
         assert_eq!(methods, vec![AddMethod::Key, AddMethod::Browser]);
         assert_eq!((empty, first), ("Sign in", Some(AddMethod::Browser)));
         assert_eq!(text, "No account yet. Sign in, or add an API key.");
-        // Claude with the plan sign-in on: a key or a browser sign-in.
-        let (methods, ..) = card(&kinded("anthropic", "api_key", &["pkce"]), "anthropic");
-        assert_eq!(methods, vec![AddMethod::Key, AddMethod::Browser]);
-        // Claude with it off (the server lists no flow), and OpenAI: a key only.
+        // Claude (even if server lists pkce) and OpenAI: a key only.
         // No sign-in words anywhere.
+        let (methods, ..) = card(&kinded("anthropic", "api_key", &["pkce"]), "anthropic");
+        assert_eq!(methods, vec![AddMethod::Key]);
         for (kind, preset) in [("anthropic", "anthropic"), ("openai", "openai")] {
             let (methods, empty, filled, first, text) = card(&kinded(kind, "api_key", &[]), preset);
             assert_eq!(methods, vec![AddMethod::Key], "{kind}");
@@ -1122,16 +1125,16 @@ mod tests {
     fn the_directory_offers_sign_in_without_any_setup() {
         let agy = preset_for("antigravity").unwrap();
         let claude = preset_for("anthropic").unwrap();
-        // Never saved: Antigravity and Claude both offer Sign in at once.
+        // Never saved: Antigravity offers Sign in at once; Anthropic is API-key-only.
         assert!(directory_offers_sign_in(None, agy));
-        assert!(directory_offers_sign_in(None, claude));
+        assert!(!directory_offers_sign_in(None, claude));
         // A key-only provider never does.
         assert!(!directory_offers_sign_in(
             None,
             preset_for("openai").unwrap()
         ));
-        // A saved Claude provider follows the server's own flow list.
-        assert!(directory_offers_sign_in(
+        // Anthropic never offers sign-in even if an older server lists pkce.
+        assert!(!directory_offers_sign_in(
             Some(&kinded("anthropic", "api_key", &["pkce"])),
             claude
         ));

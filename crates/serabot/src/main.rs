@@ -711,7 +711,12 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         config.clone(),
         Some(Arc::new(store.clone())),
     )?;
-    serabot::mail::register(&mut registry, users.clone())?;
+    serabot::mail::register_with_artifacts(
+        &mut registry,
+        users.clone(),
+        store.clone(),
+        artifacts.clone(),
+    )?;
     serabot::tools::register_memory_tools(
         &mut registry,
         store.clone(),

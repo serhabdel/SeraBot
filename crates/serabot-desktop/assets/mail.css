@@ -778,3 +778,121 @@
     display: none;
   }
 }
+
+/* ---- 0.74.25 rich HTML editor, paper card & signature preview ---- */
+
+.mail-paper-card {
+  margin: 0 16px 12px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: #ffffff;
+  box-shadow: var(--shadow-1);
+  overflow: hidden;
+}
+
+.mail-paper-card .mail-html-frame {
+  border: 0;
+  border-radius: 0;
+}
+
+.mail-compose-body .mail-paper-card {
+  margin: 0;
+}
+
+.mail-rich-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 8px;
+  border: 1px solid var(--hairline);
+  border-bottom: none;
+  border-radius: var(--r-sm) var(--r-sm) 0 0;
+  background: var(--surface-2);
+}
+
+.mail-rich-editor {
+  min-height: 200px;
+  max-height: 360px;
+  overflow-y: auto;
+  padding: 12px 14px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  background: #ffffff;
+  color: #1a1d21;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 14px;
+  line-height: 1.55;
+  word-break: break-word;
+  outline: none;
+}
+
+.mail-rich-editor:focus {
+  border-color: var(--accent);
+}
+
+.mail-rich-toolbar + .mail-rich-editor,
+.mail-rich-toolbar + .mail-link-bar + .mail-rich-editor,
+.mail-rich-toolbar + .mail-compose-textarea,
+.mail-rich-toolbar + .mail-link-bar + .mail-compose-textarea {
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+
+.mail-rich-editor img {
+  max-width: 100%;
+  height: auto;
+}
+
+.mail-rich-editor blockquote {
+  margin: 8px 0;
+  padding-left: 12px;
+  border-left: 3px solid #d1d5db;
+  color: #4b5563;
+}
+
+.mail-sig-visual {
+  min-height: 120px;
+  max-height: 220px;
+}
+
+.mail-sig-preview-card {
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.mail-sig-preview-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--label-1);
+  font: inherit;
+  font-size: var(--fs-caption);
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.mail-sig-preview-toggle:hover {
+  background: var(--hover);
+}
+
+.mail-sig-preview-toggle .tiny.muted {
+  margin-left: auto;
+  font-weight: 400;
+}
+
+.mail-sig-preview-card .mail-sig-preview,
+.mail-sig-preview-card .mail-plain-body {
+  border: 0;
+  border-top: 1px solid var(--hairline);
+  border-radius: 0;
+  margin: 0;
+}
+

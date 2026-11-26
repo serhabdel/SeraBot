@@ -196,11 +196,7 @@ pub(super) fn AddProviderSheet(session: Signal<Session>, overlay: Signal<Overlay
                         } else if matches!(preset.sign_in, "pkce" | "browser") {
                             div { class: "banner info",
                                 span {
-                                    if preset.kind == "anthropic" {
-                                        "Paste an API key below, or leave it empty and press Save and sign in to sign in with Claude in your browser (port 54545; you can also paste the callback URL or code#state)."
-                                    } else {
-                                        "Paste an API key below, or leave it empty and press Save and sign in to sign in with your browser."
-                                    }
+                                    "Paste an API key below, or leave it empty and press Save and sign in to sign in with your browser."
                                 }
                             }
                         } else if preset.auth == "none" {

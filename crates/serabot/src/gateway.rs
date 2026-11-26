@@ -63,6 +63,8 @@ pub const DESTRUCTIVE_TOOLS: &[&str] = &[
     "project_check",
     // 0.74.1: sends email to third parties via the member's own SMTP mailbox.
     "mail_send",
+    // 0.74.25: replies to an email via the member's own SMTP mailbox.
+    "mail_reply",
     // 0.74.5: change or destroy mailbox contents (flags, move, delete).
     "mail_flag",
     "mail_move",

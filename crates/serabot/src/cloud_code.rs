@@ -249,11 +249,35 @@ pub fn with_configured_models<'a>(
     catalog
 }
 
-pub const ANTIGRAVITY_SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs";
-pub const CLOUD_CODE_USER_AGENT: &str =
-    "antigravity/hub/2.31.4 (aidev_client; os_type=windows; arch=amd64; cl=1003475615)";
+pub const ANTIGRAVITY_SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs https://www.googleapis.com/auth/aicode";
+pub const ANTIGRAVITY_USER_AGENT_ENV: &str = "ANTIGRAVITY_USER_AGENT";
+pub const DEFAULT_CLI_VERSION: &str = "1.5.5";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub const CLOUD_CODE_USER_AGENT: &str = "antigravity/cli/1.5.5 (aidev_client; os_type=linux; arch=amd64; cl=982146307; auth_method=consumer)";
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+pub const CLOUD_CODE_USER_AGENT: &str = "antigravity/cli/1.5.5 (aidev_client; os_type=linux; arch=arm64; cl=982146307; auth_method=consumer)";
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub const CLOUD_CODE_USER_AGENT: &str = "antigravity/cli/1.5.5 (aidev_client; os_type=windows; arch=amd64; cl=982146307; auth_method=consumer)";
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+pub const CLOUD_CODE_USER_AGENT: &str = "antigravity/cli/1.5.5 (aidev_client; os_type=windows; arch=arm64; cl=982146307; auth_method=consumer)";
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+pub const CLOUD_CODE_USER_AGENT: &str = "antigravity/cli/1.5.5 (aidev_client; os_type=darwin; arch=amd64; cl=982146307; auth_method=consumer)";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub const CLOUD_CODE_USER_AGENT: &str = "antigravity/cli/1.5.5 (aidev_client; os_type=darwin; arch=arm64; cl=982146307; auth_method=consumer)";
+#[cfg(not(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "aarch64"),
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "windows", target_arch = "aarch64"),
+    all(target_os = "macos", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64"),
+)))]
+pub const CLOUD_CODE_USER_AGENT: &str = "antigravity/cli/1.5.5 (aidev_client; os_type=linux; arch=amd64; cl=982146307; auth_method=consumer)";
 pub const CLOUD_CODE_API_CLIENT: &str = "google-cloud-sdk vscode/1.96.0";
 pub const THOUGHT_SIGNATURE_SENTINEL: &str = "skip_thought_signature_validator";
+pub const SYSTEM_INSTRUCTION_PART_LIMIT: usize = 126;
+pub const ANTIGRAVITY_INLINE_SYSTEM_ENV: &str = "ANTIGRAVITY_INLINE_SYSTEM";
+pub const CAPACITY_BACKOFFS: &[Duration] = &[Duration::from_secs(2), Duration::from_secs(5)];
 
 /// The Antigravity Hub version the user agent and `ideVersion` carry when the
 /// provider sets no `client_version`.
@@ -273,7 +297,11 @@ pub const CLOUD_CODE_HOSTS: &[&str] = &[
     "cloudcode-pa.googleapis.com",
     "daily-cloudcode-pa.sandbox.googleapis.com",
     "autopush-cloudcode-pa.sandbox.googleapis.com",
+    "businessaicode.googleapis.com",
+    "businessaicode.us.rep.googleapis.com",
+    "businessaicode.eu.rep.googleapis.com",
 ];
+pub const ALLOWED_CLOUD_CODE_HOSTS: &[&str] = CLOUD_CODE_HOSTS;
 
 #[derive(Clone, Debug)]
 pub struct ChatTarget {
@@ -342,15 +370,70 @@ pub fn client_version_ok(version: &str) -> bool {
         && !version.ends_with('.')
 }
 
-/// The Cloud Code user agent for `version`; the pinned default when none is set
-/// (or the one given is not a plain version).
-pub fn cloud_code_user_agent(version: Option<&str>) -> String {
-    match version.map(str::trim).filter(|v| client_version_ok(v)) {
-        Some(version) => format!(
-            "antigravity/hub/{version} (aidev_client; os_type=windows; arch=amd64; cl=1003475615)"
-        ),
-        None => CLOUD_CODE_USER_AGENT.to_owned(),
+fn host_os_type() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
     }
+}
+
+fn host_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        "x86" => "386",
+        other => other,
+    }
+}
+
+/// The Cloud Code user agent for `version`; honors `ANTIGRAVITY_USER_AGENT`
+/// when set, and otherwise formats `antigravity/cli/1.5.5` (or an explicit
+/// `version`) with the host `os_type` and `arch`.
+pub fn cloud_code_user_agent(version: Option<&str>) -> String {
+    if let Ok(override_ua) = std::env::var(ANTIGRAVITY_USER_AGENT_ENV) {
+        let trimmed = override_ua.trim();
+        if !trimmed.is_empty() && trimmed.len() <= 256 && !trimmed.chars().any(char::is_control) {
+            return trimmed.to_owned();
+        }
+    }
+    let ver = version
+        .map(str::trim)
+        .filter(|v| client_version_ok(v) && *v != IDE_VERSION)
+        .unwrap_or(DEFAULT_CLI_VERSION);
+    format!(
+        "antigravity/cli/{ver} (aidev_client; os_type={}; arch={}; cl=982146307; auth_method=consumer)",
+        host_os_type(),
+        host_arch(),
+    )
+}
+
+/// Actionable message when Cloud Code returns 403 `VALIDATION_REQUIRED`.
+pub const VALIDATION_REQUIRED_MESSAGE: &str = "Cloud Code returned 403 VALIDATION_REQUIRED: verify your Google account in a browser, then try again.";
+
+/// Whether a Cloud Code error response is `403 VALIDATION_REQUIRED`.
+pub fn is_validation_required(status: u16, body: &str) -> bool {
+    status == 403 && body.to_ascii_uppercase().contains("VALIDATION_REQUIRED")
+}
+
+/// Whether a Cloud Code failure is a load-shaped `429 RESOURCE_EXHAUSTED`
+/// (without a reset time) or `503 No capacity available` that warrants bounded
+/// capacity backoff across endpoints.
+pub fn is_capacity_backoff(status: u16, body: &str, retry_after: Option<Duration>) -> bool {
+    if retry_after.is_some() {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    if status == 503 && lower.contains("no capacity available") {
+        return true;
+    }
+    if status == 429
+        && lower.contains("resource_exhausted")
+        && !lower.contains("reset after")
+        && !lower.contains("retry in ")
+    {
+        return true;
+    }
+    false
 }
 
 pub fn validate_project_id(kind: &str, project_id: &str) -> Result<()> {
@@ -884,6 +967,29 @@ pub fn build_cloud_code_envelope_with(
     if turns.is_empty() {
         push_turn(&mut turns, "user", vec![json!({"text": "Hello"})], false);
     }
+    let system_text = system.join("\n\n");
+    let inline_system = should_inline_system(&system_text);
+    if inline_system {
+        if let Some(first_user) = turns.iter_mut().find(|turn| turn.role == "user") {
+            if let Some(first_part) = first_user.parts.first_mut()
+                && let Some(existing) = first_part.get("text").and_then(Value::as_str)
+            {
+                let combined = format!("{system_text}\n\n{existing}");
+                *first_part = json!({"text": combined});
+            } else {
+                first_user.parts.insert(0, json!({"text": system_text}));
+            }
+        } else {
+            turns.insert(
+                0,
+                DraftTurn {
+                    role: "user",
+                    parts: vec![json!({"text": system_text})],
+                    function_only: false,
+                },
+            );
+        }
+    }
     let contents = turns
         .into_iter()
         .map(|turn| json!({"role": turn.role, "parts": turn.parts}))
@@ -898,16 +1004,17 @@ pub fn build_cloud_code_envelope_with(
             options.thinking_level,
         ),
     });
-    if !system.is_empty() {
-        request["systemInstruction"] = json!({"parts": [{"text": system.join("\n\n")}]});
+    if !system_text.is_empty() && !inline_system {
+        request["systemInstruction"] = json!({"parts": [{"text": system_text}]});
     }
     let declarations = tool_declarations(tools);
     if !declarations.is_empty() {
         request["tools"] = json!([{"functionDeclarations": declarations}]);
         request["toolConfig"] = json!({"functionCallingConfig": {"mode": "VALIDATED"}});
     }
+    let runtime_model = runtime_model_for(model, options.thinking_level);
     let mut envelope = json!({
-        "model": model,
+        "model": runtime_model,
         "userAgent": "antigravity",
         "requestType": "agent",
         "requestId": fresh_request_id(),
@@ -917,6 +1024,20 @@ pub fn build_cloud_code_envelope_with(
         envelope["project"] = json!(project_id);
     }
     Ok(envelope)
+}
+
+fn should_inline_system(system_text: &str) -> bool {
+    if system_text.is_empty() {
+        return false;
+    }
+    if let Ok(raw) = std::env::var(ANTIGRAVITY_INLINE_SYSTEM_ENV) {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" | "off" => return false,
+            "1" | "true" | "on" => return true,
+            _ => {}
+        }
+    }
+    system_text.chars().count() > SYSTEM_INSTRUCTION_PART_LIMIT
 }
 
 /// Finish a PKCE sign-in whose browser leg ran on the owner's machine: the
@@ -1101,19 +1222,124 @@ pub fn effective_max_output(model: &str, requested: u32) -> u32 {
     wanted.clamp(1_024, cap)
 }
 
+/// Map a public `pi-antigravity` v0.15.0 model id + thinking level to the
+/// runtime wire model id. Unknown or already-suffixed ids pass through.
+pub fn runtime_model_for(model: &str, level: Option<&str>) -> String {
+    let lower = model.trim().to_ascii_lowercase();
+    let lvl = level.map(|s| s.trim().to_ascii_lowercase());
+    match lower.as_str() {
+        "gemini-3.8-flash" | "gemini-3.7-flash" | "gemini-3.6-flash" => match lvl.as_deref() {
+            Some("low") => format!("{lower}-low"),
+            Some("medium") => format!("{lower}-medium"),
+            Some("high" | "max" | "xhigh") => format!("{lower}-high"),
+            _ => model.to_owned(),
+        },
+        "gemini-3.5-flash" => match lvl.as_deref() {
+            Some("low") => "gemini-3.5-flash-extra-low".to_owned(),
+            Some("medium") => "gemini-3.5-flash-low".to_owned(),
+            Some("high" | "max" | "xhigh") => "gemini-3-flash-agent".to_owned(),
+            _ => model.to_owned(),
+        },
+        "gemini-3.1-pro" => match lvl.as_deref() {
+            Some("low") => "gemini-3.1-pro-low".to_owned(),
+            Some("high" | "max" | "xhigh") => "gemini-pro-agent".to_owned(),
+            _ => model.to_owned(),
+        },
+        "claude-sonnet-4-6" => "claude-sonnet-4-6".to_owned(),
+        "claude-opus-4-6" => "claude-opus-4-6-thinking".to_owned(),
+        "gpt-oss-120b" => "gpt-oss-120b-medium".to_owned(),
+        _ => model.to_owned(),
+    }
+}
+
 /// The `thinkingConfig` for one request, or `None` when none is sent.
 ///
-/// - Level models (Gemini 3 and 4, `-tiered`): `off` becomes
+/// - `pi-antigravity` v0.15.0 routed models use integer `thinkingBudget`:
+///   - `gemini-3.8-flash` / `gemini-3.7-flash` / `gemini-3.6-flash`:
+///     `low` -> `1000`, `medium` -> `4000`, `high` -> `-1`, `off` -> `0`.
+///   - `gemini-3.5-flash`:
+///     `low` -> `1000`, `medium` -> `4000`, `high` -> `10000`, `off` -> `0`.
+///   - `gemini-3.1-pro`: `low` -> `1001`, `high` -> `10001`.
+///   - `claude-sonnet-4-6` / `claude-opus-4-6`: `1024`.
+///   - `gpt-oss-120b`: `8192`.
+/// - Other level models (Gemini 3 and 4, `-tiered`): `off` becomes
 ///   `thinkingBudget: 0` (except Pro/Argon which cannot turn thinking off);
 ///   `low`, `medium` and `high` map to `thinkingLevel`, `max` to `high`.
 ///   An id that already ends in `-low`, `-medium`, `-high`, `-minimal`,
 ///   `-xhigh` or `-max` carries its level and gets no config.
-/// - Claude: `off` sends nothing; the others are budgets of 4000, 10000, 24000
-///   and 32000 tokens, kept inside `[1024, max_out - 1024]` and sent only when
-///   `max_out` is above the budget. With no level, a `-thinking` id uses
+/// - Other Claude: `off` sends nothing; the others are budgets of 4000, 10000,
+///   24000 and 32000 tokens, kept inside `[1024, max_out - 1024]` and sent only
+///   when `max_out` is above the budget. With no level, a `-thinking` id uses
 ///   `medium` and any other id sends nothing.
 pub fn antigravity_thinking(model: &str, level: Option<&str>, max_out: u32) -> Option<Value> {
     let lower = model.to_ascii_lowercase();
+    match lower.as_str() {
+        "gemini-3.8-flash" | "gemini-3.7-flash" | "gemini-3.6-flash" => {
+            let level = level?;
+            return Some(match level {
+                "off" => json!({"thinkingBudget": 0}),
+                "low" => json!({"thinkingBudget": 1_000, "includeThoughts": true}),
+                "high" | "max" | "xhigh" => json!({"thinkingBudget": -1, "includeThoughts": true}),
+                _ => json!({"thinkingBudget": 4_000, "includeThoughts": true}),
+            });
+        }
+        "gemini-3.5-flash" => {
+            let level = level?;
+            return Some(match level {
+                "off" => json!({"thinkingBudget": 0}),
+                "low" => json!({"thinkingBudget": 1_000, "includeThoughts": true}),
+                "high" | "max" | "xhigh" => {
+                    json!({"thinkingBudget": 10_000, "includeThoughts": true})
+                }
+                _ => json!({"thinkingBudget": 4_000, "includeThoughts": true}),
+            });
+        }
+        "gemini-3.1-pro" => {
+            let level = level?;
+            return match level {
+                "low" => Some(json!({"thinkingBudget": 1_001, "includeThoughts": true})),
+                "high" | "max" | "xhigh" => {
+                    Some(json!({"thinkingBudget": 10_001, "includeThoughts": true}))
+                }
+                _ => None,
+            };
+        }
+        "claude-sonnet-4-6" => {
+            let level = level?;
+            if level == "off" {
+                return None;
+            }
+            let budget = 1_024u32;
+            return (max_out > budget).then(|| {
+                json!({
+                    "thinkingBudget": budget,
+                    "includeThoughts": true,
+                })
+            });
+        }
+        "claude-opus-4-6" => {
+            if level == Some("off") {
+                return None;
+            }
+            let budget = 1_024u32;
+            return (max_out > budget).then(|| {
+                json!({
+                    "thinkingBudget": budget,
+                    "includeThoughts": true,
+                })
+            });
+        }
+        "gpt-oss-120b" => {
+            if level == Some("off") {
+                return None;
+            }
+            return Some(json!({
+                "thinkingBudget": 8_192,
+                "includeThoughts": true,
+            }));
+        }
+        _ => {}
+    }
     if lower.contains("claude") {
         let level = match level {
             Some(level) => level,
@@ -2560,12 +2786,19 @@ mod tests {
     fn origins_pin_documented_hosts_and_keep_loopback_alone() {
         let origins = cloud_code_origins("https://cloudcode-pa.googleapis.com").unwrap();
         assert_eq!(origins[0], "https://cloudcode-pa.googleapis.com");
-        assert_eq!(origins.len(), 4);
+        assert_eq!(origins.len(), 7);
         assert!(origins.iter().all(|origin| {
             CLOUD_CODE_HOSTS
                 .iter()
                 .any(|host| origin == &format!("https://{host}"))
         }));
+        assert!(pinned_cloud_code_host("businessaicode.googleapis.com"));
+        assert!(pinned_cloud_code_host(
+            "businessaicode.us.rep.googleapis.com"
+        ));
+        assert!(pinned_cloud_code_host(
+            "businessaicode.eu.rep.googleapis.com"
+        ));
         let loopback = cloud_code_origins("http://127.0.0.1:9").unwrap();
         assert_eq!(loopback, vec!["http://127.0.0.1:9".to_string()]);
         assert!(cloud_code_origins("https://evil.example").is_err());
@@ -2877,7 +3110,9 @@ mod tests {
             Some("2.35.0")
         );
         assert_eq!(IDE_VERSION, "2.31.4");
-        assert!(CLOUD_CODE_USER_AGENT.contains("antigravity/hub/2.31.4"));
+        assert!(CLOUD_CODE_USER_AGENT.contains("antigravity/cli/1.5.5"));
+        assert!(CLOUD_CODE_USER_AGENT.contains("auth_method=consumer"));
+        assert!(ANTIGRAVITY_SCOPES.contains("https://www.googleapis.com/auth/aicode"));
         *live_version_cache().write().await = Some(CachedVersion::Live(
             "2.99.0".to_owned(),
             std::time::Instant::now(),

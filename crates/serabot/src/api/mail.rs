@@ -548,6 +548,8 @@ async fn send_message(
             subject: &req.subject,
             body: &req.body,
             body_html: req.body_html.as_deref(),
+            in_reply_to: None,
+            references: None,
             attachment_hashes: &hashes,
         },
     )

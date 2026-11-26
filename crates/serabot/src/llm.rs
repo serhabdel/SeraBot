@@ -1235,6 +1235,7 @@ impl LlmClient {
         let mut tried_wire = false;
         let mut effective_thinking = thinking_level;
         let mut stripped_thinking = false;
+        let mut capacity_attempt = 0usize;
         let mut last_error: Option<SeraError> = None;
         for _ in 0..3 {
             let mut restart = false;
@@ -1315,6 +1316,20 @@ impl LlmClient {
                             session_bumped = true;
                             self.bump_session(generation);
                             continue;
+                        }
+                        CloudPost::CapacityRetryable(error) => {
+                            if !target.stream.contains(".sandbox.googleapis.com")
+                                || last_error.is_none()
+                            {
+                                last_error = Some(error);
+                            }
+                            if let Some(&delay) =
+                                cloud_code::CAPACITY_BACKOFFS.get(capacity_attempt)
+                            {
+                                capacity_attempt += 1;
+                                tokio::time::sleep(delay).await;
+                            }
+                            break;
                         }
                         CloudPost::Retryable(error) => {
                             if !version_retried
@@ -1437,7 +1452,7 @@ impl LlmClient {
                             last_error = Some(catalog_status_error(404));
                         }
                     }
-                    CloudPost::Retryable(error) => {
+                    CloudPost::CapacityRetryable(error) | CloudPost::Retryable(error) => {
                         if !version_retried
                             && matches!(&error, SeraError::Upstream { status: 403, .. })
                         {
@@ -1607,6 +1622,8 @@ enum CloudPost {
     BadRequest(SeraError),
     /// A status worth trying the next endpoint for, already typed.
     Retryable(SeraError),
+    /// A load-shaped 429/503 capacity failure eligible for bounded backoff.
+    CapacityRetryable(SeraError),
     Failed(SeraError),
     Transport,
 }
@@ -1729,6 +1746,15 @@ async fn classify_cloud(response: reqwest::Response, allow_session: bool) -> Clo
         detail = detail.as_deref().unwrap_or(""),
         "Cloud Code upstream error"
     );
+    if cloud_code::is_validation_required(status, &text) {
+        let error = llm_failure::upstream_error(
+            status,
+            &text,
+            hold,
+            cloud_code::VALIDATION_REQUIRED_MESSAGE.to_owned(),
+        );
+        return CloudPost::Failed(error);
+    }
     let error = llm_failure::upstream_error(
         status,
         &text,
@@ -1745,6 +1771,9 @@ async fn classify_cloud(response: reqwest::Response, allow_session: bool) -> Clo
         return CloudPost::BadRequest(error);
     }
     if status == 403 || status == 429 || status >= 500 {
+        if cloud_code::is_capacity_backoff(status, &text, hold) {
+            return CloudPost::CapacityRetryable(error);
+        }
         return CloudPost::Retryable(error);
     }
     CloudPost::Failed(error)
