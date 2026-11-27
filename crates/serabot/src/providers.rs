@@ -1575,15 +1575,17 @@ pub fn open_provider_client(
         ));
     }
     // AWS Kiro OAuth accounts carry packed refresh material; API keys / pasted
-    // tokens have an empty refresh_token.
+    // tokens have an empty refresh_token. `plan_oauth_enabled()` only covers
+    // the anthropic/codex/copilot kinds, so Kiro is gated on the raw flag.
     let kiro_oauth = kind == "kiro" && !credential.refresh_token.trim().is_empty();
-    if kiro_oauth && !(profile.plan_oauth_enabled() && owner.account_id != DEFAULT_ACCOUNT) {
+    if kiro_oauth && !(profile.plan_oauth && owner.account_id != DEFAULT_ACCOUNT) {
         return Err(SeraError::Forbidden(
             "AWS Kiro sign-in is turned off on this server".into(),
         ));
     }
     // Devin OAuth accounts (PKCE or pasted `devin-session-token$...`) are
-    // gated on `plan_oauth_enabled()`; plain API keys remain allowed.
+    // gated on the raw `plan_oauth` flag (like Kiro); plain API keys remain
+    // allowed.
     let devin_oauth_from_row = if kind == "devin"
         && owner.account_id != DEFAULT_ACCOUNT
         && let Some(refresher) = owner.refresher
@@ -1603,7 +1605,7 @@ pub fn open_provider_client(
                 .api_key
                 .trim()
                 .starts_with(crate::auth_flows::devin::SESSION_TOKEN_PREFIX));
-    if devin_oauth && !(profile.plan_oauth_enabled() && owner.account_id != DEFAULT_ACCOUNT) {
+    if devin_oauth && !(profile.plan_oauth && owner.account_id != DEFAULT_ACCOUNT) {
         return Err(SeraError::Forbidden(
             "Devin sign-in is turned off on this server".into(),
         ));
@@ -2496,6 +2498,65 @@ mod tests {
             0
         );
         assert!(users.get(&admin, "antigravity").unwrap().is_none());
+    }
+
+    #[test]
+    fn kiro_and_devin_oauth_accounts_are_gated_on_the_raw_plan_oauth_flag() {
+        let store = Store::open_in_memory(385).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let users = Arc::new(UserSecrets::with_master_key(store, [4u8; 32]).unwrap());
+        let secrets = SharedSecrets::new(crate::secrets::SecretStore::from_map(
+            std::collections::BTreeMap::<String, String>::new(),
+        ));
+        let credential = ProviderCredential {
+            api_key: "oauth-token".into(),
+            refresh_token: "packed-refresh".into(),
+            ..Default::default()
+        };
+        let owner = CredentialOwner {
+            users: &users,
+            user_id: &admin,
+            provider: "kiro",
+            account_id: "acct-1",
+            refresher: None,
+        };
+        // `plan_oauth_enabled()` is kind-restricted to anthropic/codex/copilot
+        // and is always false for kiro/devin; the raw flag (on by default)
+        // must gate these accounts instead.
+        let mut profile = ProviderConfig {
+            kind: "kiro".into(),
+            auth: "oauth_or_key".into(),
+            ..ProviderConfig::default()
+        };
+        assert!(profile.plan_oauth && !profile.plan_oauth_enabled());
+        open_provider_client(&profile, &credential, &secrets, 30, 1024, owner).unwrap();
+        profile.plan_oauth = false;
+        let error =
+            open_provider_client(&profile, &credential, &secrets, 30, 1024, owner).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("AWS Kiro sign-in is turned off on this server"),
+            "{error}"
+        );
+        let devin = ProviderConfig {
+            kind: "devin".into(),
+            auth: "oauth_or_key".into(),
+            plan_oauth: false,
+            ..ProviderConfig::default()
+        };
+        let devin_owner = CredentialOwner {
+            provider: "devin",
+            ..owner
+        };
+        let error =
+            open_provider_client(&devin, &credential, &secrets, 30, 1024, devin_owner).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Devin sign-in is turned off on this server"),
+            "{error}"
+        );
     }
 
     #[test]

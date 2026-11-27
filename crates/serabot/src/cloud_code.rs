@@ -277,6 +277,9 @@ pub const CLOUD_CODE_API_CLIENT: &str = "google-cloud-sdk vscode/1.96.0";
 pub const THOUGHT_SIGNATURE_SENTINEL: &str = "skip_thought_signature_validator";
 pub const SYSTEM_INSTRUCTION_PART_LIMIT: usize = 126;
 pub const ANTIGRAVITY_INLINE_SYSTEM_ENV: &str = "ANTIGRAVITY_INLINE_SYSTEM";
+/// Cap on the tool declarations one Cloud Code request carries. A bot whose
+/// full tool set exceeds it is truncated (with a warning), never failed.
+pub const MAX_WIRE_TOOLS: usize = 128;
 pub const CAPACITY_BACKOFFS: &[Duration] = &[Duration::from_secs(2), Duration::from_secs(5)];
 
 /// The Antigravity Hub version the user agent and `ideVersion` carry when the
@@ -851,9 +854,16 @@ pub fn build_cloud_code_envelope_with(
     if !project_id.is_empty() && !project_id_ok(project_id) {
         return Err(SeraError::Config("invalid Cloud Code project id".into()));
     }
-    if tools.len() > 128 {
-        return Err(SeraError::Validation("too many tools".into()));
-    }
+    let tools = if tools.len() > MAX_WIRE_TOOLS {
+        tracing::warn!(
+            kept = MAX_WIRE_TOOLS,
+            dropped = tools.len() - MAX_WIRE_TOOLS,
+            "cloud code envelope tool cap: dropping the excess tool declarations"
+        );
+        &tools[..MAX_WIRE_TOOLS]
+    } else {
+        tools
+    };
     let mut system = Vec::new();
     let mut names = std::collections::BTreeMap::new();
     for message in messages {
@@ -2923,6 +2933,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(with_project["project"], "proj-synthetic");
+    }
+
+    #[test]
+    fn envelope_truncates_beyond_the_wire_tool_cap_instead_of_failing() {
+        let tools: Vec<ToolSpec> = (0..MAX_WIRE_TOOLS + 5)
+            .map(|index| ToolSpec {
+                name: format!("tool_{index:03}"),
+                description: "synthetic".into(),
+                parameters: json!({"type": "object", "properties": {}}),
+                external_effect: false,
+            })
+            .collect();
+        let envelope = build_cloud_code_envelope(
+            "gemini-3.8-flash",
+            "",
+            &[LlmMessage::user("hello")],
+            &tools,
+            100,
+            None,
+        )
+        .unwrap();
+        let declarations = envelope["request"]["tools"][0]["functionDeclarations"]
+            .as_array()
+            .unwrap();
+        assert_eq!(declarations.len(), MAX_WIRE_TOOLS);
+        assert_eq!(declarations[0]["name"], "tool_000");
+        assert_eq!(declarations[MAX_WIRE_TOOLS - 1]["name"], "tool_127");
     }
 
     #[test]

@@ -732,3 +732,10 @@ Plan: `docs/specs/0.74.15-proposal.md`. Version stays `0.74.14` until the batch 
 
 
 
+## Release 0.74.26 — Provider Sign-in & Antigravity Routing Fixes
+
+- [x] Retired Claude plan sign-in shows a terminal notice instead of a dead "Turn on Claude sign-in" button (`serabot-desktop/src/provider_accounts.rs`): `anthropic` + `plan_signin = "off"` maps to `SigninBlocker::Retired` (no fix button), since the server hard-rejects third-party claude.ai OAuth since 0.74.25.
+- [x] Kiro / Devin OAuth accounts gated on the raw `plan_oauth` flag (`providers.rs`): `plan_oauth_enabled()` is kind-restricted to anthropic/codex/copilot, so kiro/devin sign-in accounts were always refused with `forbidden: … sign-in is turned off on this server`.
+- [x] Cloud Code (Antigravity) envelope truncates beyond `MAX_WIRE_TOOLS` (128) with a `warn` instead of failing the task with `validation error: too many tools` (`cloud_code.rs`).
+- [x] Version bump `0.74.26` (`Cargo.toml`), mobile `0.74.26+100`, `docs/release-0.74.26.md`, `README.md`, `tasks/todo.md`.
+- [ ] Owner: re-pin any route still on provider id `kiro` (`unknown_provider` in logs) to the current provider id; live pass on Kiro/Devin OAuth accounts and an Antigravity turn with a large tool set.
