@@ -766,7 +766,7 @@ const PRESETS: &[ProviderPreset] = &[
         catalog_fetch: true,
         auth: "api_key",
         badge: "Gateway",
-        note: "Local loopback Claude Agent SDK gateway — requires a local gateway token",
+        note: "Local loopback Claude Agent SDK gateway — requires a local gateway token. One gateway per Claude login on its own loopback port: add each as its own provider (edit the base URL, keep it loopback). See docs/specs/claude-agent-sdk-gateway.md",
         key_url: "",
         sign_in: "",
         risk: "",

@@ -33,6 +33,23 @@ pub fn rejection_message(body: &[u8]) -> Option<String> {
     (!message.is_empty() && message.len() <= 200 && !message.chars().any(char::is_control))
         .then(|| message.to_owned())
 }
+
+/// The `(code, error)` pair of a coded error body, if both are safe to show:
+/// bounded, single-line, no control characters. `None` keeps the generic
+/// status text.
+pub fn coded_message(body: &[u8]) -> Option<(String, String)> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let code = value.get("code")?.as_str()?.trim();
+    let message = value.get("error")?.as_str()?.trim();
+    let safe_code = !code.is_empty()
+        && code.len() <= 64
+        && code
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'));
+    let safe_message =
+        !message.is_empty() && message.len() <= 200 && !message.chars().any(char::is_control);
+    (safe_code && safe_message).then(|| (code.to_owned(), message.to_owned()))
+}
 /// Server cap for one artifact download (100 MiB).
 const MAX_ARTIFACT_BYTES: u64 = 100 * 1024 * 1024;
 
@@ -3472,17 +3489,31 @@ impl ApiClient {
         note_rate_limit(&response);
         let status = response.status();
         if !status.is_success() {
+            let code = status.as_u16();
+            let mut body = Vec::new();
+            let body_read = response.take(MAX_ERROR_BODY).read_to_end(&mut body).is_ok();
             // A 422 names the field that failed. Show that server-authored
             // sentence; any other rejection keeps the generic status text.
-            if status.as_u16() == 422 {
-                let mut body = Vec::new();
-                if response.take(MAX_ERROR_BODY).read_to_end(&mut body).is_ok()
-                    && let Some(message) = rejection_message(&body)
-                {
-                    return Err(ApiError::Rejected(message));
-                }
+            if code == 422
+                && let Some(message) = rejection_message(&body)
+            {
+                return Err(ApiError::Rejected(message));
             }
-            return Err(ApiError::Http(status.as_u16()));
+            // Every other status except the ones with their own fixed wording
+            // (401 session, 403/409 policy, 429 retry-after) also shows the
+            // server-authored sentence when it is safe — a 502 from an
+            // upstream must not read as "SeraBot server unavailable".
+            if body_read
+                && !matches!(code, 401 | 403 | 409 | 429)
+                && let Some((c, message)) = coded_message(&body)
+            {
+                return Err(ApiError::Coded {
+                    status: code,
+                    code: c,
+                    message,
+                });
+            }
+            return Err(ApiError::Http(code));
         }
         if response
             .content_length()
