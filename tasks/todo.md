@@ -753,3 +753,10 @@ Plan: `docs/specs/0.74.15-proposal.md`. Version stays `0.74.14` until the batch 
 - [x] Desktop: preset `sign_in = "pkce"` + "Sign in with browser" tile label, so the gateway card offers browser sign-in next to the API key.
 - [x] Docs: `docs/specs/claude-agent-sdk-gateway.md` browser sign-in section; `docs/release-0.74.28.md`; version bump `0.74.28` (`Cargo.toml`), mobile `0.74.28+102`, `README.md`, `tasks/todo.md`.
 - [ ] Owner: on the `claude-agent-sdk` card press "Sign in with browser" and complete the claude.ai login; then run a turn and `GET /v1/auth/status` on the gateway.
+## Release 0.74.29 — Gateway provider can be saved keyless (both ways on the card)
+
+- [x] `admin.rs`: `claude-agent-sdk` providers may save without an API key (browser sign-in available), like OpenRouter — no more "secret claude_gateway_token is empty; provide an API key" forcing a key.
+- [x] `api/provider_accounts.rs` `gateway_endpoint`: browser sign-in relay token falls back to the server-level `[claude_gateway] token_secret` age secret when the provider has no saved key; plain error when neither is set.
+- [x] Desktop `provider_accounts.rs`: "secret … is empty; provide an API key" maps to a friendly "Sign in to Claude Agent SDK Gateway…" (kind `claude-agent-sdk`), never the raw secret name.
+- [x] Version bump `0.74.29` (`Cargo.toml`), mobile `0.74.29+103`, `docs/release-0.74.29.md`, `README.md`, `tasks/todo.md`.
+- [ ] Owner: save the gateway provider with no key, press "Sign in with browser"; also try "Add a key".
