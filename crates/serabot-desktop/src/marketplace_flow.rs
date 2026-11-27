@@ -292,6 +292,26 @@ mod tests {
         listener.local_addr().unwrap().port()
     }
 
+    /// `free_port()` only probes the port; on a busy runner another parallel
+    /// test can take it before the flow binds it, so a listen failure retries
+    /// the whole attempt on a fresh port. Returns the flow's end, the port the
+    /// final attempt used, and whatever the attempt produced.
+    fn retry_listen<T>(mut attempt: impl FnMut(u16) -> (FlowEnd, T)) -> (FlowEnd, u16, T) {
+        let mut port = free_port();
+        let (mut end, mut rest) = attempt(port);
+        for _ in 0..7 {
+            match &end {
+                FlowEnd::Failed(message) if message.contains("Could not listen on port") => {}
+                _ => break,
+            }
+            port = free_port();
+            let (next_end, next_rest) = attempt(port);
+            end = next_end;
+            rest = next_rest;
+        }
+        (end, port, rest)
+    }
+
     const STATE: &str = "stateabcdefghijkl";
 
     /// A server that plays the marketplace half of a plugin sign-in.
@@ -337,19 +357,21 @@ mod tests {
 
     #[test]
     fn a_plugin_sign_in_opens_the_page_waits_for_the_redirect_and_hands_the_code_over() {
-        let port = free_port();
-        let server = plugin_server(port, 200);
-        let seen: RefCell<Vec<FlowMsg>> = RefCell::new(Vec::new());
-        let end = run_plugin_signin(
-            &server.client(),
-            "canva",
-            "default",
-            Some("Work"),
-            false,
-            &AtomicBool::new(false),
-            &|msg| seen.borrow_mut().push(msg),
-            &browser(port, vec![format!("code=synthetic-code&state={STATE}")]),
-        );
+        let (end, _port, (server, seen)) = retry_listen(|port| {
+            let server = plugin_server(port, 200);
+            let seen: RefCell<Vec<FlowMsg>> = RefCell::new(Vec::new());
+            let end = run_plugin_signin(
+                &server.client(),
+                "canva",
+                "default",
+                Some("Work"),
+                false,
+                &AtomicBool::new(false),
+                &|msg| seen.borrow_mut().push(msg),
+                &browser(port, vec![format!("code=synthetic-code&state={STATE}")]),
+            );
+            (end, (server, seen))
+        });
         assert_eq!(
             end,
             FlowEnd::Done {
@@ -377,18 +399,20 @@ mod tests {
 
     #[test]
     fn signing_in_an_existing_account_again_is_not_reported_as_added() {
-        let port = free_port();
-        let server = plugin_server(port, 200);
-        let end = run_plugin_signin(
-            &server.client(),
-            "canva",
-            "default",
-            None,
-            true,
-            &AtomicBool::new(false),
-            &|_| {},
-            &browser(port, vec![format!("code=c1&state={STATE}")]),
-        );
+        let (end, _port, _server) = retry_listen(|port| {
+            let server = plugin_server(port, 200);
+            let end = run_plugin_signin(
+                &server.client(),
+                "canva",
+                "default",
+                None,
+                true,
+                &AtomicBool::new(false),
+                &|_| {},
+                &browser(port, vec![format!("code=c1&state={STATE}")]),
+            );
+            (end, server)
+        });
         assert_eq!(
             end,
             FlowEnd::Done {
@@ -400,21 +424,23 @@ mod tests {
 
     #[test]
     fn a_redirect_with_the_wrong_state_ends_the_sign_in_and_hands_nothing_over() {
-        let port = free_port();
-        let server = plugin_server(port, 200);
-        let end = run_plugin_signin(
-            &server.client(),
-            "canva",
-            "default",
-            None,
-            false,
-            &AtomicBool::new(false),
-            &|_| {},
-            &browser(
-                port,
-                vec!["code=forged&state=otherstateotherstate".to_owned()],
-            ),
-        );
+        let (end, _port, server) = retry_listen(|port| {
+            let server = plugin_server(port, 200);
+            let end = run_plugin_signin(
+                &server.client(),
+                "canva",
+                "default",
+                None,
+                false,
+                &AtomicBool::new(false),
+                &|_| {},
+                &browser(
+                    port,
+                    vec!["code=forged&state=otherstateotherstate".to_owned()],
+                ),
+            );
+            (end, server)
+        });
         let FlowEnd::Failed(text) = end else {
             panic!("a forged redirect fails: {end:?}");
         };
@@ -424,23 +450,25 @@ mod tests {
 
     #[test]
     fn backing_out_closes_the_listener_and_never_calls_complete() {
-        let port = free_port();
-        let server = plugin_server(port, 200);
-        let cancel = AtomicBool::new(false);
-        let end = run_plugin_signin(
-            &server.client(),
-            "canva",
-            "default",
-            None,
-            false,
-            &cancel,
-            &|_| {},
-            // The member cancels instead of finishing in the browser.
-            &|_| {
-                cancel.store(true, Ordering::SeqCst);
-                true
-            },
-        );
+        let (end, port, server) = retry_listen(|port| {
+            let server = plugin_server(port, 200);
+            let cancel = AtomicBool::new(false);
+            let end = run_plugin_signin(
+                &server.client(),
+                "canva",
+                "default",
+                None,
+                false,
+                &cancel,
+                &|_| {},
+                // The member cancels instead of finishing in the browser.
+                &|_| {
+                    cancel.store(true, Ordering::SeqCst);
+                    true
+                },
+            );
+            (end, server)
+        });
         assert_eq!(end, FlowEnd::Cancelled);
         assert!(server.hits_to("/oauth/complete").is_empty());
         // The port is free again at once.
@@ -491,18 +519,20 @@ mod tests {
         assert!(text.contains("Install the plugin"), "{text}");
 
         // The service refuses the code: a plain failure, nothing stored here.
-        let port = free_port();
-        let refusing = plugin_server(port, 502);
-        let end = run_plugin_signin(
-            &refusing.client(),
-            "canva",
-            "default",
-            None,
-            false,
-            &AtomicBool::new(false),
-            &|_| {},
-            &browser(port, vec![format!("code=c1&state={STATE}")]),
-        );
+        let (end, _port, _refusing) = retry_listen(|port| {
+            let refusing = plugin_server(port, 502);
+            let end = run_plugin_signin(
+                &refusing.client(),
+                "canva",
+                "default",
+                None,
+                false,
+                &AtomicBool::new(false),
+                &|_| {},
+                &browser(port, vec![format!("code=c1&state={STATE}")]),
+            );
+            (end, refusing)
+        });
         let FlowEnd::Failed(text) = end else {
             panic!("a refused code fails");
         };

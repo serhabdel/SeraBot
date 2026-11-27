@@ -686,7 +686,9 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub client_version: String,
     /// Allow plan sign-in (`anthropic`, `openai-codex` and `github-copilot`
-    /// providers only; ignored for every other kind). On by default, by the owner's decision;
+    /// providers only; `kiro` and `devin` OAuth accounts are gated on this raw
+    /// flag instead, since `plan_oauth_enabled()` is kind-restricted to the
+    /// first three). On by default, by the owner's decision;
     /// set `plan_oauth = false` to turn it off. A plan is consumer access, not
     /// an API contract (Anthropic's terms do not allow a third-party product to
     /// offer a Claude plan sign-in), so the page shows a risk banner and each

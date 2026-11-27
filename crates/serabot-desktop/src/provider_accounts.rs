@@ -474,6 +474,9 @@ pub enum SigninBlocker {
     PlanOff { brand: &'static str, can_fix: bool },
     /// Claude's plan sign-in is for the server admin only.
     AdminOnly,
+    /// Third-party `claude.ai` OAuth was shut down by Anthropic (2026): no
+    /// save can turn it back on, so no fix is offered.
+    Retired,
 }
 
 impl SigninBlocker {
@@ -494,6 +497,9 @@ impl SigninBlocker {
             }
             Self::AdminOnly => {
                 "Sign in with Claude is only for the server admin. Add an Anthropic API key to use Claude."
+            }
+            Self::Retired => {
+                "Anthropic shut down third-party claude.ai sign-in in 2026. Use an Anthropic Console API key, the Claude Agent SDK Gateway, or Desktop ACP instead."
             }
         }
     }
@@ -525,7 +531,9 @@ fn plan_brand(kind: &str) -> &'static str {
 }
 
 /// What stops this provider's sign-in, if anything. Older servers send none of
-/// these fields, so this is `None` there and the page behaves as before.
+/// these fields, so this is `None` there and the page behaves as before. An
+/// anthropic provider always reports `plan_signin = "off"` since the 2026
+/// claude.ai OAuth shutdown, which is terminal (`Retired`), not fixable.
 pub fn signin_blocker(provider: &ProviderStatus, is_admin: bool) -> Option<SigninBlocker> {
     if provider.signin_setup.as_deref() == Some("client_secret") {
         return Some(SigninBlocker::ClientSecret {
@@ -533,6 +541,9 @@ pub fn signin_blocker(provider: &ProviderStatus, is_admin: bool) -> Option<Signi
         });
     }
     match provider.plan_signin.as_deref() {
+        // The server reports `off` for every anthropic provider since the
+        // third-party claude.ai OAuth shutdown: there is nothing to turn on.
+        Some("off") if provider.kind == "anthropic" => Some(SigninBlocker::Retired),
         Some("off") => Some(SigninBlocker::PlanOff {
             brand: plan_brand(&provider.kind),
             can_fix: is_admin && provider.managed,
@@ -661,9 +672,13 @@ mod tests {
         let mut claude = provider("api_key", &[]);
         claude.kind = "anthropic".into();
         claude.managed = true;
+        // The server reports `off` for every anthropic provider since the 2026
+        // claude.ai OAuth shutdown: terminal, no fix button.
         claude.plan_signin = Some("off".into());
         let off = signin_blocker(&claude, true).unwrap();
-        assert_eq!(off.fix_label(), Some("Turn on Claude sign-in"));
+        assert_eq!(off, SigninBlocker::Retired);
+        assert_eq!(off.fix_label(), None);
+        assert!(off.message().contains("shut down"));
         assert!(
             signin_blocker(&claude, false)
                 .unwrap()
