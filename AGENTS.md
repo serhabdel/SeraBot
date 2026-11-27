@@ -44,7 +44,13 @@ binds strictly to loopback (`127.0.0.1` / `::1`), requires constant-time
 Bearer token auth (`SERABOT_CLAUDE_GATEWAY_TOKEN`), passes `tools=[]` and
 `setting_sources=[]` to `ClaudeAgentOptions`, and captures `mcp__serabot__*`
 tool calls so all tool execution routes back through SeraBot's Rust `gateway`
-with SeraBot's own permissions, approvals, and audit log.
+with SeraBot's own permissions, approvals, and audit log. There is no
+third-party claude.ai OAuth (shut down by Anthropic in 2026, retired here in
+0.74.25): the SDK authenticates inside the gateway with `claude auth login`
+or an API key. Multiple Claude logins = one gateway per login on its own
+loopback port, each registered as its own `claude-agent-sdk` provider; the
+Rust side already speaks the gateway's loopback HTTP contract natively
+(`Wire::ClaudeGateway`). Details: `docs/specs/claude-agent-sdk-gateway.md`.
 
 WhatsApp as a linked device (0.58, `docs/specs/whatsapp-linked-device.md`)
 uses the unofficial `whatsapp-rust` client with the owner's approval and a

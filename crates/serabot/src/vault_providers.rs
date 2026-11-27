@@ -554,6 +554,16 @@ pub fn classify_cli_failure(provider: Provider, stderr: &str) -> Option<&'static
     {
         return Some("Proton Pass item or field was not found");
     }
+    if lower.contains("502")
+        || lower.contains("503")
+        || lower.contains("504")
+        || lower.contains("bad gateway")
+        || lower.contains("service unavailable")
+        || lower.contains("gateway timeout")
+        || lower.contains("upstream")
+    {
+        return Some("Proton Pass servers answered with an outage (HTTP 5xx). Try again shortly.");
+    }
     if lower.contains("timed out") || lower.contains("network") || lower.contains("connection") {
         return Some("Proton Pass could not reach Proton servers");
     }
@@ -1195,14 +1205,20 @@ impl Providers {
             let msg = classify_cli_failure(provider, &output.stderr)
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("{} could not return this item", provider.label()));
-            return Err(SeraError::External(msg));
+            // A Rejected (422), not External (502): the classified sentence is
+            // server-authored and safe, and 422 bodies are shown by both
+            // clients — a 502 would only show a generic "server unavailable".
+            return Err(SeraError::Rejected {
+                code: "vault_cli_failed",
+                message: msg,
+            });
         }
         let value = Zeroizing::new(output.stdout.trim_end_matches(['\r', '\n']).to_owned());
         if value.is_empty() {
-            return Err(SeraError::External(format!(
-                "the {} item has no value",
-                provider.label()
-            )));
+            return Err(SeraError::Rejected {
+                code: "vault_cli_failed",
+                message: format!("the {} item has no value", provider.label()),
+            });
         }
         Ok(value)
     }
@@ -1665,7 +1681,13 @@ async fn run_provider_cli_batch(
                         output.status
                     )
                 });
-            return Err(SeraError::External(msg));
+            // A Rejected (422), not External (502): the classified sentence is
+            // server-authored and safe, and 422 bodies are shown by both
+            // clients — a 502 would only show a generic "server unavailable".
+            return Err(SeraError::Rejected {
+                code: "vault_cli_failed",
+                message: msg,
+            });
         }
         stdouts.push(output.stdout);
     }
@@ -2106,6 +2128,12 @@ mod tests {
         let text = error.to_string();
         assert!(text.contains("could not return this item"));
         assert!(!text.contains("synthetic-leak-value"));
+        // A Rejected (422) so clients show the classified sentence instead of
+        // a generic "HTTP 502".
+        assert!(
+            matches!(&error, SeraError::Rejected { code, .. } if *code == "vault_cli_failed"),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]
@@ -2844,6 +2872,18 @@ mod tests {
             classify_cli_failure(Provider::ProtonPass, "Could not get local key from keyring",),
             Some("Proton Pass CLI could not initialize local key storage")
         );
+
+        // An upstream outage (the CLI surfacing Proton's 502/503) is its own
+        // sentence, never raw stderr.
+        for stderr in [
+            "Error: server returned 502 Bad Gateway",
+            "request failed: 503 Service Unavailable",
+            "upstream connect error",
+        ] {
+            let msg = classify_cli_failure(Provider::ProtonPass, stderr).unwrap();
+            assert!(msg.contains("outage"), "{stderr}: {msg}");
+            assert!(!msg.contains("502") || msg.contains("HTTP 5xx"));
+        }
     }
 
     #[test]

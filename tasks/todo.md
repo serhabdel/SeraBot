@@ -739,3 +739,10 @@ Plan: `docs/specs/0.74.15-proposal.md`. Version stays `0.74.14` until the batch 
 - [x] Cloud Code (Antigravity) envelope truncates beyond `MAX_WIRE_TOOLS` (128) with a `warn` instead of failing the task with `validation error: too many tools` (`cloud_code.rs`).
 - [x] Version bump `0.74.26` (`Cargo.toml`), mobile `0.74.26+100`, `docs/release-0.74.26.md`, `README.md`, `tasks/todo.md`.
 - [ ] Owner: re-pin any route still on provider id `kiro` (`unknown_provider` in logs) to the current provider id; live pass on Kiro/Devin OAuth accounts and an Antigravity turn with a large tool set.
+## Release 0.74.27 — Proton Pass Sync Errors & Agent SDK Multi-Account Docs
+
+- [x] Proton Pass sync/read failures surface the classified reason instead of a bare "HTTP 502" (`vault_providers.rs`): pass-cli stderr with 502/503/504/bad-gateway/upstream maps to "Proton Pass servers answered with an outage (HTTP 5xx)"; CLI exit failures are now `SeraError::Rejected` (422) carrying the safe sentence.
+- [x] Clients show the server's `error` body beyond 422: desktop `api.rs` parses `{error, code}` for all non-success statuses except 401/403/409/429 (`ApiError::Coded`); mobile `serverErrorText` also parses 500/502.
+- [x] Agent SDK documented (`docs/specs/claude-agent-sdk-gateway.md`, AGENTS.md, preset note): no third-party claude.ai OAuth (retired 0.74.25); SDK auth = `claude auth login`/API key inside the gateway; multi-account = one loopback gateway per login on its own port, one `claude-agent-sdk` provider each (config test `multiple_claude_agent_sdk_gateways_each_on_their_own_loopback_port`); Rust already speaks the gateway natively via `Wire::ClaudeGateway`.
+- [x] Version bump `0.74.27` (`Cargo.toml`), mobile `0.74.27+101`, `docs/release-0.74.27.md`, `README.md`, `tasks/todo.md`.
+- [ ] Owner: re-run Proton Pass sync (previously "Server returned HTTP 502") and try a second gateway on `127.0.0.1:8792` as provider `claude-agent-sdk-2`.

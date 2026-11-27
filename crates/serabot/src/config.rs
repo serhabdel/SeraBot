@@ -3350,6 +3350,43 @@ mod tests {
         config.validate().unwrap();
     }
 
+    #[test]
+    fn multiple_claude_agent_sdk_gateways_each_on_their_own_loopback_port() {
+        // Multi-account Agent SDK: one loopback gateway per Claude login on
+        // its own port, each registered as its own provider of kind
+        // `claude-agent-sdk`. All must validate.
+        let mut config = valid_config();
+        for (id, url) in [
+            ("claude-agent-sdk", "http://127.0.0.1:8791"),
+            ("claude-agent-sdk-2", "http://127.0.0.1:8792"),
+            ("claude-agent-sdk-3", "http://[::1]:8793"),
+        ] {
+            let profile = ProviderConfig {
+                kind: "claude-agent-sdk".into(),
+                base_url: url.into(),
+                api_key_secret: "claude_gateway_token".into(),
+                models: vec!["claude-sonnet-4-6".into()],
+                data_egress_approved: true,
+                auth: "api_key".into(),
+                catalog_fetch: true,
+                ..ProviderConfig::default()
+            };
+            crate::providers::check_profile(
+                &profile.kind,
+                &profile.base_url,
+                &profile.auth,
+                &profile.refresh_token_secret,
+                &profile.oauth_client_secret_secret,
+                profile.catalog_fetch,
+                profile.catalog_ttl_secs,
+            )
+            .unwrap_or_else(|e| panic!("{id}: {e}"));
+            config.llm.providers.insert(id.into(), profile);
+        }
+        config.validate().unwrap();
+        assert_eq!(config.llm.providers.len(), 3);
+    }
+
     fn route(provider: &str, model: &str) -> BotRoute {
         BotRoute {
             provider: provider.into(),

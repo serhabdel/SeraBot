@@ -91,8 +91,11 @@ class ApiException implements Exception {
 
 /// The server's own `{"error": "..."}` sentence for client errors that are
 /// safe to show (bounded, no control characters). Null for anything else.
+/// 500/502 carry the server-authored upstream sentence (a connected service
+/// failed) — showing it beats "Server returned HTTP 502", which wrongly
+/// blames this app's own server.
 String? serverErrorText(int status, List<int> body) {
-  if (!const {400, 404, 409, 413, 422, 503}.contains(status) ||
+  if (!const {400, 404, 409, 413, 422, 500, 502, 503}.contains(status) ||
       body.length > 8192) {
     return null;
   }

@@ -177,6 +177,35 @@ fn safe_errors_never_include_response_bodies() {
 }
 
 #[test]
+fn a_coded_502_shows_the_server_sentence_not_the_generic_502_text() {
+    // A 502 from a connected service carries the server's coded sentence.
+    let (client, handle) = server(vec![(
+        502,
+        r#"{"error":"A connected service failed. Try again, or use Test connection on that provider or connector.","code":"external"}"#.into(),
+    )]);
+    let error = client.health().unwrap_err();
+    let ApiError::Coded {
+        status,
+        code,
+        message,
+    } = &error
+    else {
+        panic!("expected a coded error, got {error:?}");
+    };
+    assert_eq!(*status, 502);
+    assert_eq!(code, "external");
+    assert!(message.contains("connected service failed"));
+    assert!(!error.to_string().contains("Server returned HTTP"));
+    assert!(error.unknown_outcome());
+    handle.join().unwrap();
+
+    // Without a code field the generic status text stays.
+    let (client, handle) = server(vec![(502, r#"{"error":"no code here"}"#.into())]);
+    assert_eq!(client.health().unwrap_err(), ApiError::Http(502));
+    handle.join().unwrap();
+}
+
+#[test]
 fn bounds_response_and_rejects_unexpected_json() {
     let (client, handle) = server(vec![(200, "x".repeat(2 * 1024 * 1024 + 1))]);
     assert_eq!(client.health().unwrap_err(), ApiError::TooLarge);
