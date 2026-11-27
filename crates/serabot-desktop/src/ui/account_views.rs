@@ -605,8 +605,11 @@ fn FlowPanel(
 ) -> Element {
     let mut pasted_callback = use_signal(String::new);
     let mut paste_error = use_signal(|| Option::<String>::None);
+    let mut gateway_code = use_signal(String::new);
+    let gateway_completing = session.read().accounts_ui.gateway_completing;
     let device = method == AddMethod::Device;
     let is_claude_pkce = !device && kind == "anthropic";
+    let is_gateway_pkce = !device && kind == "claude-agent-sdk";
     let is_browser_device = device && kind == "mistral";
     let Some(flow) = flow else {
         return rsx! {
@@ -619,6 +622,8 @@ fn FlowPanel(
                         "You get a short code to type on {title}'s own page. This window updates when it is approved."
                     } else if is_claude_pkce {
                         "Your browser opens {title}'s sign-in page (port 54545). Sign in there, or paste the callback URL or code#state if the redirect does not complete."
+                    } else if is_gateway_pkce {
+                        "Your browser opens {title}'s sign-in page. Local gateways finish automatically, or you can paste the authorization code below if the gateway is on a remote server."
                     } else {
                         "Your browser opens {title}'s sign-in page. Sign in there, then come back."
                     }
@@ -792,6 +797,62 @@ fn FlowPanel(
                             }
                             if let Some(err) = paste_error() {
                                 p { class: "field-error", role: "alert", "{err}" }
+                            }
+                        }
+                    } else if is_gateway_pkce {
+                        if let Some(flow_id) = flow.flow_id.clone() {
+                            div { class: "field",
+                                label { class: "field-label", r#for: "gateway-auth-code-input",
+                                    "Paste authorization code"
+                                }
+                                p { class: "hint",
+                                    "For a headless or remote gateway, paste the authorization code from Claude here:"
+                                }
+                                div { class: "row",
+                                    input {
+                                        id: "gateway-auth-code-input",
+                                        class: "input grow",
+                                        autocomplete: "off",
+                                        spellcheck: false,
+                                        value: "{gateway_code}",
+                                        placeholder: "Paste authorization code",
+                                        oninput: move |event| gateway_code.set(event.value()),
+                                        onkeydown: {
+                                            let provider = provider.clone();
+                                            let flow_id = flow_id.clone();
+                                            move |event: KeyboardEvent| {
+                                                if event.key() == Key::Enter {
+                                                    event.prevent_default();
+                                                    let code = gateway_code();
+                                                    if !code.trim().is_empty() && can_write && !gateway_completing {
+                                                        session.write().complete_gateway_signin(
+                                                            provider.clone(),
+                                                            flow_id.clone(),
+                                                            code,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        },
+                                    }
+                                    button {
+                                        class: "btn primary sm",
+                                        r#type: "button",
+                                        disabled: !can_write || gateway_completing || gateway_code().trim().is_empty(),
+                                        onclick: {
+                                            let provider = provider.clone();
+                                            let flow_id = flow_id.clone();
+                                            move |_| {
+                                                session.write().complete_gateway_signin(
+                                                    provider.clone(),
+                                                    flow_id.clone(),
+                                                    gateway_code(),
+                                                );
+                                            }
+                                        },
+                                        if gateway_completing { "Submitting\u{2026}" } else { "Submit" }
+                                    }
+                                }
                             }
                         }
                     }

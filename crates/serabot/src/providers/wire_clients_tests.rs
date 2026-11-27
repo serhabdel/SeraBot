@@ -2298,3 +2298,67 @@ async fn claude_gateway_turn_and_models_list() {
     assert!(models.contains("claude-sonnet-4-5"));
     assert!(models.contains("claude-opus-4-5"));
 }
+
+#[tokio::test]
+async fn claude_gateway_sends_profile_and_effort() {
+    let env = env();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/turn"))
+        .and(header("authorization", "Bearer gw-secret-456"))
+        .and(header("x-claude-profile", "work"))
+        .respond_with(|req: &Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap();
+            assert_eq!(body["profile"], "work");
+            assert_eq!(body["effort"], "high");
+            ResponseTemplate::new(200).set_body_json(json!({
+                "content": "Done.",
+                "tool_calls": [],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                "finish_reason": "stop"
+            }))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let added = env
+        .accounts
+        .add(
+            &env.alice,
+            crate::accounts::AddAccount {
+                provider: "claude-agent-sdk".into(),
+                label: "Work".into(),
+                auth_kind: crate::accounts::AuthKind::Oauth,
+                fingerprint: "fp-gw-work".into(),
+                identity: json!({"source": "claude-agent-sdk-gateway", "profile": "work"}),
+                credential: ProviderCredential {
+                    api_key: "gw-secret-456".into(),
+                    ..Default::default()
+                },
+                priority: 0,
+            },
+        )
+        .unwrap();
+
+    let profile = ProviderConfig {
+        kind: "claude-agent-sdk".into(),
+        base_url: server.uri(),
+        models: vec!["claude-sonnet-4-5".into()],
+        data_egress_approved: true,
+        ..Default::default()
+    };
+    let client = env
+        .credentials
+        .client_for_account(&env.alice, "claude-agent-sdk", &profile, &added.account_id)
+        .unwrap()
+        .with_model("claude-sonnet-4-5");
+
+    let extra =
+        crate::thinking::wire_fields("claude-agent-sdk", "claude-sonnet-4-5", &[], "high").unwrap();
+    let response = client
+        .complete_with(&[LlmMessage::user("Hi")], &[], None, None, Some(&extra))
+        .await
+        .unwrap();
+    assert_eq!(response.message.content.as_deref(), Some("Done."));
+}

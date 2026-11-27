@@ -1534,6 +1534,32 @@ pub struct SigninStatus {
     pub reason: Option<String>,
 }
 
+/// Reply of `GET /v1/providers/{id}/gateway/status`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct GatewayStatusResponse {
+    #[serde(default)]
+    pub reachable: bool,
+    #[serde(default)]
+    pub token_configured: bool,
+    #[serde(default)]
+    pub cli_installed: bool,
+    #[serde(default)]
+    pub default_cli_login: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Reply of `POST /v1/providers/{id}/gateway/token`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct GatewayTokenResponse {
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub configured: bool,
+    #[serde(default)]
+    pub startup_command: Option<String>,
+}
+
 /// One entry of a bot route: a provider, a model, an optional thinking level
 /// and an optional account (`None` means "any of the member's accounts").
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -7867,26 +7893,32 @@ impl ApiClient {
         check_signin_started(started)
     }
 
-    /// Finish a browser sign-in with the code the redirect carried.
+    /// Finish a browser sign-in with the code the redirect carried (or pasted
+    /// directly for a remote gateway).
     pub fn provider_signin_complete(
         &self,
         provider: &str,
         flow_id: &str,
         code: &str,
-        redirect_uri: &str,
+        redirect_uri: Option<&str>,
         verifier: &str,
     ) -> Result<SigninDone, ApiError> {
         check_id(provider)?;
         check_id(flow_id)?;
+        let mut body = serde_json::json!({
+            "flow_id": flow_id,
+            "code": code,
+        });
+        if let Some(uri) = redirect_uri.map(str::trim).filter(|s| !s.is_empty()) {
+            body["redirect_uri"] = serde_json::json!(uri);
+        }
+        if !verifier.trim().is_empty() {
+            body["verifier"] = serde_json::json!(verifier);
+        }
         self.admin_request(
             Method::POST,
             &["v1", "providers", provider, "signin", "complete"],
-            &serde_json::json!({
-                "flow_id": flow_id,
-                "code": code,
-                "redirect_uri": redirect_uri,
-                "verifier": verifier,
-            }),
+            &body,
         )
     }
 
@@ -7907,6 +7939,41 @@ impl ApiClient {
             return Err(ApiError::InvalidResponse);
         }
         Ok(status)
+    }
+
+    /// Check the status of a `claude-agent-sdk` loopback gateway.
+    pub fn provider_gateway_status(&self, id: &str) -> Result<GatewayStatusResponse, ApiError> {
+        check_id(id)?;
+        self.get(&["v1", "providers", id, "gateway", "status"], &[])
+    }
+
+    /// Generate or save the bearer token for a `claude-agent-sdk` gateway.
+    pub fn provider_gateway_token(
+        &self,
+        id: &str,
+        generate: bool,
+        token: Option<&str>,
+    ) -> Result<GatewayTokenResponse, ApiError> {
+        check_id(id)?;
+        let mut body = serde_json::json!({ "generate": generate });
+        if let Some(tok) = token.map(str::trim).filter(|s| !s.is_empty()) {
+            body["token"] = serde_json::json!(tok);
+        }
+        self.admin_request(
+            Method::POST,
+            &["v1", "providers", id, "gateway", "token"],
+            &body,
+        )
+    }
+
+    /// Import the gateway host's existing Claude CLI login as an account.
+    pub fn provider_gateway_import_cli(&self, id: &str) -> Result<SigninDone, ApiError> {
+        check_id(id)?;
+        self.admin_request(
+            Method::POST,
+            &["v1", "providers", id, "gateway", "import-cli"],
+            &serde_json::json!({}),
+        )
     }
 
     /// Set a bot's route, fallbacks and auto-switch policy.

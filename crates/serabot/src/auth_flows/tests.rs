@@ -684,6 +684,8 @@ fn a_member_keeps_at_most_eight_open_flows() {
         client_holds_verifier: true,
         expires: Instant::now() + FLOW_TTL,
         gateway: None,
+        gateway_flow_id: None,
+        gateway_profile: None,
 
         created: Instant::now(),
         status: FlowStatus::Pending,
@@ -718,6 +720,8 @@ fn device_flow_record(provider: &str) -> FlowRecord {
         verifier: None,
         client_holds_verifier: false,
         gateway: None,
+        gateway_flow_id: None,
+        gateway_profile: None,
         expires: Instant::now() + FLOW_TTL,
         created: Instant::now(),
         status: FlowStatus::Pending,

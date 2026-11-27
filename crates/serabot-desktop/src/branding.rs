@@ -310,8 +310,13 @@ static BRANDS: &[Brand] = &[
         mark: Mark::Svg(SVG_ANTHROPIC),
     },
     Brand {
-        keys: &["claude", "claude-code", "claude-agent", "claude-agent-sdk"],
+        keys: &["claude", "claude-code", "claude-agent"],
         label: "Claude",
+        mark: Mark::Svg(SVG_CLAUDE),
+    },
+    Brand {
+        keys: &["claude-agent-sdk"],
+        label: "Claude Agent SDK (Gateway)",
         mark: Mark::Svg(SVG_CLAUDE),
     },
     Brand {
@@ -551,5 +556,10 @@ mod tests {
         assert_eq!(brand_label("onedrive"), Some("OneDrive"));
         assert_eq!(brand_label("openai-compatible"), Some("OpenAI-Compatible"));
         assert_eq!(brand_label("minimax-cn"), Some("MiniMax (China)"));
+        assert_eq!(brand_label("claude"), Some("Claude"));
+        assert_eq!(
+            brand_label("claude-agent-sdk"),
+            Some("Claude Agent SDK (Gateway)")
+        );
     }
 }

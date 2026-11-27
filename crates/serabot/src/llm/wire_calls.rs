@@ -213,8 +213,9 @@ impl LlmClient {
                     .await;
                 }
                 Err(error) => {
+                    let reason = crate::llm::transport_reason(&error);
                     last_error = Some(llm_failure::transport_error(format!(
-                        "LLM request failed: {error}"
+                        "LLM request failed ({reason})"
                     )));
                     if !retry::transport_retryable(&error, call.idempotent)
                         || attempt == self.max_retries
@@ -450,6 +451,7 @@ impl LlmClient {
         messages: &[LlmMessage],
         tools: &[ToolSpec],
         model: &str,
+        extra: Option<&Map<String, Value>>,
     ) -> Result<LlmResponse> {
         let base = crate::config::validate_loopback_gateway_url(&self.base_url)?;
         let root = base.strip_suffix("/v1").unwrap_or(&base);
@@ -475,20 +477,28 @@ impl LlmClient {
                 })
             })
             .collect();
-        let body = json!({
+        let mut body = json!({
             "model": model,
             "system": system,
             "messages": messages_to_json(&non_system),
             "tools": tools_json,
             "max_tokens": self.max_output_tokens,
         });
+        let mut headers = vec![("accept", "application/json".to_owned())];
+        if let Some(profile) = &self.claude_profile {
+            headers.push(("X-Claude-Profile", profile.clone()));
+            body["profile"] = json!(profile);
+        }
+        if let Some(effort) = Self::claude_gateway_effort(extra) {
+            body["effort"] = json!(effort);
+        }
         let bytes = self
             .send_wire(WireCall {
                 method: reqwest::Method::POST,
                 url: format!("{root}/v1/turn"),
                 query: Vec::new(),
                 auth: WireAuth::Bearer,
-                headers: vec![("accept", "application/json".to_owned())],
+                headers,
                 body: Some(body),
                 fix_bad_request: None,
                 echo_error: true,
@@ -496,6 +506,41 @@ impl LlmClient {
             })
             .await?;
         parse_claude_gateway_response(&bytes)
+    }
+
+    /// Extract an `effort` level (`"low"`, `"medium"`, `"high"`, `"max"`) from
+    /// thinking extra fields for the Claude Agent SDK gateway.
+    fn claude_gateway_effort(extra: Option<&Map<String, Value>>) -> Option<&'static str> {
+        let fields = extra?;
+        if let Some(level) = fields
+            .get("effort")
+            .or_else(|| fields.get("thinking_level"))
+            .or_else(|| fields.get("thinkingLevel"))
+            .or_else(|| fields.get("reasoning").and_then(|r| r.get("effort")))
+            .and_then(Value::as_str)
+        {
+            return match level {
+                "low" => Some("low"),
+                "medium" => Some("medium"),
+                "high" => Some("high"),
+                "xhigh" | "max" => Some("max"),
+                _ => None,
+            };
+        }
+        let thinking = fields.get("thinking")?;
+        if thinking.get("type").and_then(Value::as_str) != Some("enabled") {
+            return None;
+        }
+        let budget = thinking.get("budget_tokens").and_then(Value::as_u64)?;
+        Some(if budget <= 4_000 {
+            "low"
+        } else if budget <= 10_000 {
+            "medium"
+        } else if budget <= 24_000 {
+            "high"
+        } else {
+            "max"
+        })
     }
 
     /// One completion on the AWS Kiro EventStream transport.

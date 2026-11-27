@@ -443,13 +443,65 @@ pub fn sign_in_needed_for(message: &str) -> Option<&'static str> {
         .filter(|kind| !kind.is_empty())
 }
 
+/// Clear, friendly, actionable messages for Claude Agent SDK gateway error codes.
+pub fn gateway_error_message(code: &str) -> Option<&'static str> {
+    match code.trim() {
+        "gateway_token_missing" => Some(
+            "No gateway token is configured. Click \"Generate token\" on the Claude Agent SDK card or paste the token into the API key field.",
+        ),
+        "gateway_unreachable" => Some(
+            "Could not reach the Claude Agent SDK gateway. Make sure the gateway is running on its loopback port (for example 127.0.0.1:8791) and try again.",
+        ),
+        "claude_cli_missing" => Some(
+            "The Claude Code CLI (`claude`) is not installed or not on PATH on the gateway host. Install `@anthropic-ai/claude-code` and restart the gateway.",
+        ),
+        "claude_oauth_retired" => Some(
+            "Anthropic shut down third-party claude.ai OAuth in 2026. Use an Anthropic Console API key, the Claude Agent SDK Gateway, or Desktop ACP instead.",
+        ),
+        "gateway_unauthorized" => Some(
+            "The gateway rejected the bearer token (401). Generate a new token or update the token in both the gateway environment and SeraBot.",
+        ),
+        _ => None,
+    }
+}
+
 /// An API refusal in plain words. A raw "secret ..._refresh_token is empty"
 /// never reaches the member: it becomes "Sign in to <Provider>".
 pub fn plain_error(message: &str) -> String {
     if let Some((_, title)) = sign_in_target(message) {
         return format!("Sign in to {title} to use it. Press Sign in on its card.");
     }
+    for code in [
+        "gateway_token_missing",
+        "gateway_unreachable",
+        "claude_cli_missing",
+        "claude_oauth_retired",
+        "gateway_unauthorized",
+    ] {
+        if message.contains(code)
+            && let Some(friendly) = gateway_error_message(code)
+        {
+            return friendly.to_owned();
+        }
+    }
     message.to_owned()
+}
+
+/// Map a server-coded error (`code` + fallback `message`) into a plain user message.
+pub fn plain_coded_error(code: &str, message: &str) -> String {
+    if let Some(friendly) = gateway_error_message(code) {
+        return friendly.to_owned();
+    }
+    plain_error(message)
+}
+
+/// Format an `ApiError` into a plain user-facing message.
+pub fn plain_api_error(error: &crate::api::ApiError) -> String {
+    match error {
+        crate::api::ApiError::Coded { code, message, .. } => plain_coded_error(code, message),
+        crate::api::ApiError::Rejected(message) => plain_error(message),
+        other => plain_error(&other.to_string()),
+    }
 }
 
 /// Whether the server refused a Remove because bots pin the account. It says
@@ -1201,5 +1253,31 @@ mod tests {
             parse_claude_callback("http://localhost:54545/callback?error=access_denied"),
             None
         );
+    }
+
+    #[test]
+    fn gateway_error_codes_map_to_actionable_messages() {
+        for code in [
+            "gateway_token_missing",
+            "gateway_unreachable",
+            "claude_cli_missing",
+            "claude_oauth_retired",
+            "gateway_unauthorized",
+        ] {
+            let mapped = gateway_error_message(code).expect(code);
+            assert!(!mapped.is_empty());
+            assert_eq!(plain_error(code), mapped);
+            assert_eq!(plain_coded_error(code, "raw"), mapped);
+            assert_eq!(
+                plain_api_error(&crate::api::ApiError::Coded {
+                    status: 422,
+                    code: code.to_owned(),
+                    message: "raw".to_owned(),
+                }),
+                mapped
+            );
+        }
+        assert_eq!(gateway_error_message("unknown_code"), None);
+        assert_eq!(plain_coded_error("unknown_code", "fallback"), "fallback");
     }
 }

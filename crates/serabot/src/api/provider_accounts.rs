@@ -136,9 +136,10 @@ pub(super) fn plan_signin_gate(
     kind: &str,
 ) -> Result<()> {
     if kind == "anthropic" {
-        return Err(SeraError::Validation(
-            crate::auth_flows::claude::CLAUDE_OAUTH_SHUTDOWN_MESSAGE.into(),
-        ));
+        return Err(SeraError::Rejected {
+            code: "claude_oauth_retired",
+            message: crate::auth_flows::claude::CLAUDE_OAUTH_SHUTDOWN_MESSAGE.into(),
+        });
     }
     if !matches!(kind, "openai-codex" | "github-copilot") {
         return Ok(());
@@ -743,10 +744,10 @@ fn gateway_endpoint(
     };
     let token = token.or_else(|| state.secrets.get(&state.config.claude_gateway.token_secret));
     let Some(token) = token else {
-        return Err(SeraError::Validation(
-            "the gateway token is not set on this server: set the [claude_gateway] token_secret, or save it as this provider's API key"
-                .into(),
-        ));
+        return Err(SeraError::Rejected {
+            code: "gateway_token_missing",
+            message: "The Claude Agent SDK gateway token is not set yet. Generate or save a gateway token on this card first.".into(),
+        });
     };
     Ok(Some(GatewayEndpoint::validated(
         &base_url,
@@ -793,13 +794,14 @@ pub(super) async fn provider_signin_start(
 pub(super) struct SigninCompleteRequest {
     flow_id: String,
     code: String,
-    redirect_uri: String,
+    #[serde(default)]
+    redirect_uri: Option<String>,
     /// Only when the desktop made the challenge and kept the verifier.
     #[serde(default)]
     verifier: Option<String>,
 }
 
-/// Finish a browser sign-in with the code the redirect carried.
+/// Finish a browser sign-in with the code the redirect carried (or pasted code).
 pub(super) async fn provider_signin_complete(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
@@ -811,7 +813,7 @@ pub(super) async fn provider_signin_complete(
     let request = CompleteRequest {
         flow_id: Some(request.flow_id),
         code: request.code,
-        redirect_uri: Some(request.redirect_uri),
+        redirect_uri: request.redirect_uri.filter(|uri| !uri.trim().is_empty()),
         verifier: request.verifier,
     };
     let outcome = match gateway_endpoint(&state, &user, &id, &profile, &kind)? {
@@ -836,10 +838,20 @@ pub(super) async fn provider_signin_status(
     Extension(user): Extension<ActingUser>,
     Path((id, flow_id)): Path<(String, String)>,
 ) -> Result<Json<Value>> {
-    provider_context(&state, &id)?;
-    let status = state.signin.status(&user.id, &id, &flow_id)?;
+    let (profile, kind) = provider_context(&state, &id)?;
+    let gateway = if kind == "claude-agent-sdk" {
+        gateway_endpoint(&state, &user, &id, &profile, &kind)
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let status = state
+        .signin
+        .status_with_gateway(&user.id, &id, &flow_id, gateway.as_ref())
+        .await?;
     if matches!(status, FlowStatus::Ok { .. }) {
-        // A device flow finishes in the background; drop clients built before.
+        // A device or gateway flow finishes in the background; drop clients built before.
         state.runtime.invalidate_model_credentials(Some(&user.id));
     }
     let mut body = json!({"status": status.word()});
@@ -855,6 +867,186 @@ pub(super) async fn provider_signin_status(
         _ => {}
     }
     Ok(Json(body))
+}
+
+/// `GET /v1/providers/{id}/gateway-status`: probes `/health` and, if token
+/// exists, `/v1/auth/status`.
+pub(super) async fn provider_gateway_status(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    let (profile, kind) = provider_context(&state, &id)?;
+    if kind != "claude-agent-sdk" {
+        return Err(SeraError::Rejected {
+            code: "not_gateway_provider",
+            message: "This provider is not a Claude Agent SDK gateway.".into(),
+        });
+    }
+    let base_url = crate::providers::resolve_base_url(&kind, &profile.base_url)?;
+    let health = crate::auth_flows::gateway::gateway_health(&base_url)
+        .await
+        .ok();
+    let reachable = health.is_some();
+    let endpoint = gateway_endpoint(&state, &user, &id, &profile, &kind)
+        .ok()
+        .flatten();
+    let token_configured = endpoint.is_some();
+    let auth_status = if let (true, Some(ep)) = (reachable, endpoint.as_ref()) {
+        crate::auth_flows::gateway::gateway_auth_status(ep)
+            .await
+            .ok()
+    } else {
+        None
+    };
+    let auth_ok = auth_status.is_some();
+    let pick_bool = |key: &str| {
+        auth_status
+            .as_ref()
+            .and_then(|v| v.get(key))
+            .or_else(|| health.as_ref().and_then(|v| v.get(key)))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
+    let cli_version = auth_status
+        .as_ref()
+        .and_then(|v| v.get("cli_version"))
+        .or_else(|| health.as_ref().and_then(|v| v.get("cli_version")))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let default_cli_login = auth_status
+        .as_ref()
+        .and_then(|v| v.get("default_cli_login"))
+        .or_else(|| health.as_ref().and_then(|v| v.get("default_cli_login")))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let profiles = auth_status
+        .as_ref()
+        .and_then(|v| v.get("profiles"))
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    Ok(Json(json!({
+        "reachable": reachable,
+        "token_configured": token_configured,
+        "auth_ok": auth_ok,
+        "cli_installed": pick_bool("cli_installed"),
+        "cli_version": cli_version,
+        "sdk_installed": pick_bool("sdk_installed"),
+        "default_cli_login": default_cli_login,
+        "profiles": profiles,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct GatewayTokenRequest {
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    generate: bool,
+}
+
+/// `POST /v1/providers/{id}/gateway-token`: admin-only; saves or generates the
+/// gateway bearer token in the age secret store and invalidates cached clients.
+pub(super) async fn provider_gateway_token(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+    Json(request): Json<GatewayTokenRequest>,
+) -> Result<Json<Value>> {
+    require_admin(&user)?;
+    let (profile, kind) = provider_context(&state, &id)?;
+    if kind != "claude-agent-sdk" {
+        return Err(SeraError::Rejected {
+            code: "not_gateway_provider",
+            message: "This provider is not a Claude Agent SDK gateway.".into(),
+        });
+    }
+    let (token, generated) = if request.generate {
+        let mut bytes = [0u8; 24];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        (format!("gw_{}", hex::encode(bytes)), true)
+    } else if let Some(raw) = request.token {
+        let trimmed = raw.trim();
+        if crate::user_secrets::validate_value(trimmed).is_err() {
+            return Err(SeraError::Rejected {
+                code: "bad_token",
+                message: "That gateway token is not valid".into(),
+            });
+        }
+        (trimmed.to_owned(), false)
+    } else {
+        return Err(SeraError::Rejected {
+            code: "bad_token",
+            message: "Provide a token or set generate = true".into(),
+        });
+    };
+
+    let primary_secret = state.config.claude_gateway.token_secret.trim();
+    let provider_secret = profile.api_key_secret.trim();
+    let mut updates: Vec<(&str, &str)> = Vec::new();
+    if !primary_secret.is_empty() {
+        updates.push((primary_secret, token.as_str()));
+    }
+    if !provider_secret.is_empty() && provider_secret != primary_secret {
+        updates.push((provider_secret, token.as_str()));
+    }
+    if updates.is_empty() {
+        updates.push(("claude_gateway_token", token.as_str()));
+    }
+    state.secrets.persist(&updates)?;
+    state.runtime.invalidate_model_credentials(None);
+    audit_auth(
+        &state,
+        &user.id,
+        "provider.gateway_token_updated",
+        json!({"provider": id, "generated": generated}),
+    )?;
+
+    if generated {
+        let base_url = crate::providers::resolve_base_url(&kind, &profile.base_url)?;
+        let parsed = url::Url::parse(&base_url).ok();
+        let host = parsed
+            .as_ref()
+            .and_then(|u| u.host_str())
+            .unwrap_or("127.0.0.1");
+        let port = parsed.as_ref().and_then(|u| u.port()).unwrap_or(8791);
+        let startup_command = format!(
+            "SERABOT_CLAUDE_GATEWAY_TOKEN={token} serabot-claude-gateway --host {host} --port {port}"
+        );
+        Ok(Json(json!({
+            "ok": true,
+            "token": token,
+            "startup_command": startup_command,
+        })))
+    } else {
+        Ok(Json(json!({ "ok": true })))
+    }
+}
+
+/// `POST /v1/providers/{id}/gateway-import-cli`: imports the existing `claude`
+/// CLI login from the gateway into the member's `"default"` profile account.
+pub(super) async fn provider_gateway_import_cli(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    let (profile, kind) = provider_context(&state, &id)?;
+    let endpoint = gateway_endpoint(&state, &user, &id, &profile, &kind)?.ok_or_else(|| {
+        SeraError::Rejected {
+            code: "not_gateway_provider",
+            message: "This provider is not a Claude Agent SDK gateway.".into(),
+        }
+    })?;
+    let outcome = state
+        .signin
+        .import_gateway_cli_account(&user.id, &id, &endpoint)
+        .await?;
+    state.runtime.invalidate_model_credentials(Some(&user.id));
+    Ok(Json(json!({
+        "account_id": outcome.account_id,
+        "created": outcome.created,
+    })))
 }
 
 #[derive(Debug, Deserialize)]

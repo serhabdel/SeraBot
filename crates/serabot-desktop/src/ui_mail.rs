@@ -189,31 +189,99 @@ fn escape_html_text(raw: &str) -> String {
     out
 }
 
-/// Strip simple HTML tags to produce a clean plain-text fallback.
-pub fn strip_html_tags(html: &str) -> String {
-    let normalized = html
-        .replace("<br>", "\n")
-        .replace("<br/>", "\n")
-        .replace("<br />", "\n")
-        .replace("</p>", "\n")
-        .replace("</div>", "\n")
-        .replace("</li>", "\n")
-        .replace("</blockquote>", "\n");
-    let mut out = String::with_capacity(normalized.len());
-    let mut in_tag = false;
-    for ch in normalized.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(ch),
-            _ => {}
+/// Remove `<tag ...>...</tag>` blocks (case-insensitive) so CSS/metadata never leaks into plain text.
+fn strip_tag_block(input: &str, tag_name: &str) -> String {
+    let lower = input.to_ascii_lowercase();
+    let open_pat = format!("<{tag_name}");
+    let close_pat = format!("</{tag_name}>");
+    let mut out = String::with_capacity(input.len());
+    let mut pos = 0;
+    while pos < input.len() {
+        let Some(rel_start) = lower[pos..].find(&open_pat) else {
+            out.push_str(&input[pos..]);
+            break;
+        };
+        let start = pos + rel_start;
+        let after = start + open_pat.len();
+        let is_exact_tag = lower[after..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_whitespace() || c == '>' || c == '/');
+        if !is_exact_tag {
+            out.push_str(&input[pos..after]);
+            pos = after;
+            continue;
+        }
+        out.push_str(&input[pos..start]);
+        if let Some(rel_end) = lower[after..].find(&close_pat) {
+            pos = after + rel_end + close_pat.len();
+        } else {
+            break;
         }
     }
-    out.replace("&nbsp;", " ")
+    out
+}
+
+/// Strip HTML tags (and `<style>`/`<head>`/`<script>` blocks) to produce a clean plain-text fallback.
+pub fn strip_html_tags(html: &str) -> String {
+    let no_head = strip_tag_block(html, "head");
+    let no_style = strip_tag_block(&no_head, "style");
+    let no_script = strip_tag_block(&no_style, "script");
+
+    let mut normalized = String::with_capacity(no_script.len());
+    let mut pos = 0;
+    let bytes = no_script.as_bytes();
+    while pos < bytes.len() {
+        if bytes[pos] == b'<'
+            && let Some(rel_gt) = no_script[pos..].find('>')
+        {
+            let tag = &no_script[pos..pos + rel_gt + 1];
+            let tag_lower = tag.to_ascii_lowercase();
+            let compact: String = tag_lower
+                .chars()
+                .filter(|c| !c.is_ascii_whitespace())
+                .collect();
+            if matches!(
+                compact.as_str(),
+                "<br>"
+                    | "<br/>"
+                    | "</p>"
+                    | "</div>"
+                    | "</li>"
+                    | "</blockquote>"
+                    | "</tr>"
+                    | "</h1>"
+                    | "</h2>"
+                    | "</h3>"
+                    | "</h4>"
+                    | "</h5>"
+                    | "</h6>"
+            ) {
+                normalized.push('\n');
+            } else if matches!(compact.as_str(), "</td>" | "</th>") {
+                normalized.push(' ');
+            }
+            pos += rel_gt + 1;
+            continue;
+        }
+        let ch = no_script[pos..].chars().next().unwrap();
+        normalized.push(ch);
+        pos += ch.len_utf8();
+    }
+
+    normalized
+        .replace("&nbsp;", " ")
         .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&middot;", "\u{00b7}")
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
         .trim()
         .to_owned()
 }
@@ -460,6 +528,231 @@ fn build_signature_html_and_plain(
     }
     html.push_str("</td></tr></table>");
     (plain, html)
+}
+
+const MAX_SIG_INLINE_IMAGE_BYTES: usize = 512 * 1024;
+const MAX_SIG_HTML_CHARS: usize = 65_536;
+const SIG_INLINE_UPLOAD_THRESHOLD_BYTES: usize = 32 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExtractedDataUriImage {
+    val_start: usize,
+    val_end: usize,
+    mime: String,
+    bytes: Vec<u8>,
+    filename: String,
+}
+
+fn find_img_src_data_uri(
+    tag: &str,
+    tag_offset: usize,
+    index: usize,
+) -> Option<ExtractedDataUriImage> {
+    let bytes = tag.as_bytes();
+    let mut i = 4; // skip "<img"
+    while i < bytes.len() {
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'>' {
+            break;
+        }
+        let name_start = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'='
+            && bytes[i] != b'>'
+        {
+            i += 1;
+        }
+        let attr_name = &tag[name_start..i];
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'=' {
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let (val_start, val_end) = if bytes[i] == b'"' || bytes[i] == b'\'' {
+            let q = bytes[i];
+            i += 1;
+            let s = i;
+            while i < bytes.len() && bytes[i] != q {
+                i += 1;
+            }
+            let e = i;
+            if i < bytes.len() {
+                i += 1;
+            }
+            (s, e)
+        } else {
+            let s = i;
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' {
+                i += 1;
+            }
+            (s, i)
+        };
+        if !attr_name.eq_ignore_ascii_case("src") {
+            continue;
+        }
+        let val = tag[val_start..val_end].trim();
+        let lower = val.to_ascii_lowercase();
+        let (mime, ext, prefix_len) = if lower.starts_with("data:image/png;base64,") {
+            ("image/png", "png", "data:image/png;base64,".len())
+        } else if lower.starts_with("data:image/jpeg;base64,") {
+            ("image/jpeg", "jpg", "data:image/jpeg;base64,".len())
+        } else if lower.starts_with("data:image/jpg;base64,") {
+            ("image/jpeg", "jpg", "data:image/jpg;base64,".len())
+        } else if lower.starts_with("data:image/gif;base64,") {
+            ("image/gif", "gif", "data:image/gif;base64,".len())
+        } else if lower.starts_with("data:image/webp;base64,") {
+            ("image/webp", "webp", "data:image/webp;base64,".len())
+        } else {
+            return None;
+        };
+        let b64_raw: String = val[prefix_len..]
+            .chars()
+            .filter(|c| !c.is_ascii_whitespace())
+            .collect();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64_raw.as_bytes())
+            .ok()?;
+        if decoded.is_empty() || decoded.len() > MAX_SIG_INLINE_IMAGE_BYTES {
+            return None;
+        }
+        return Some(ExtractedDataUriImage {
+            val_start: tag_offset + val_start,
+            val_end: tag_offset + val_end,
+            mime: mime.to_owned(),
+            bytes: decoded,
+            filename: format!("signature-image-{index}.{ext}"),
+        });
+    }
+    None
+}
+
+/// Find `<img ... src="data:image/(png|jpeg|gif|webp);base64,...">` tags in signature HTML.
+fn extract_data_uri_images(html: &str) -> Vec<ExtractedDataUriImage> {
+    let mut found = Vec::new();
+    let mut pos = 0;
+    let bytes = html.as_bytes();
+    while pos < bytes.len() {
+        let Some(rel_lt) = html[pos..].find('<') else {
+            break;
+        };
+        let tag_start = pos + rel_lt;
+        let is_img = html.get(tag_start + 1..tag_start + 4).is_some_and(|s| {
+            s.eq_ignore_ascii_case("img")
+                && html[tag_start + 4..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_whitespace() || c == '/' || c == '>')
+        });
+        let mut i = tag_start + 1;
+        let mut quote: Option<u8> = None;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if let Some(q) = quote {
+                if b == q {
+                    quote = None;
+                }
+            } else if b == b'"' || b == b'\'' {
+                quote = Some(b);
+            } else if b == b'>' {
+                i += 1;
+                break;
+            }
+            i += 1;
+        }
+        let tag_end = i;
+        if is_img
+            && let Some(img) =
+                find_img_src_data_uri(&html[tag_start..tag_end], tag_start, found.len())
+        {
+            found.push(img);
+        }
+        pos = tag_end;
+    }
+    found
+}
+
+fn apply_signature_image_replacements(
+    html: &str,
+    replacements: &[(usize, usize, String)],
+) -> String {
+    if replacements.is_empty() {
+        return html.to_owned();
+    }
+    let mut out = String::with_capacity(html.len());
+    let mut cursor = 0;
+    for (start, end, cid) in replacements {
+        if *start >= cursor && *end <= html.len() {
+            out.push_str(&html[cursor..*start]);
+            out.push_str(cid);
+            cursor = *end;
+        }
+    }
+    out.push_str(&html[cursor..]);
+    out
+}
+
+async fn extract_and_prepare_signature_images(
+    session: Signal<Session>,
+    mut html: String,
+    mut logo_hash: Option<String>,
+    existing_logo_data_url: Option<String>,
+) -> Result<(String, Option<String>), String> {
+    if logo_hash.is_some()
+        && let Some(d_url) = existing_logo_data_url
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        && html.contains(d_url)
+    {
+        html = html.replace(d_url, "cid:signature-logo@serabot");
+    }
+
+    let found = extract_data_uri_images(&html);
+    if found.is_empty() {
+        return Ok((html, logo_hash));
+    }
+
+    let has_primary_cid = html.contains("cid:signature-logo@serabot");
+    let mut projected_len = html.len();
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+
+    for (idx, img) in found.into_iter().enumerate() {
+        let is_primary = idx == 0 && !has_primary_cid;
+        let needs_upload = is_primary
+            || projected_len > MAX_SIG_HTML_CHARS
+            || img.bytes.len() > SIG_INLINE_UPLOAD_THRESHOLD_BYTES;
+        if !needs_upload {
+            continue;
+        }
+        let filename = img.filename;
+        let bytes = img.bytes;
+        let reply = run_mail_job(session, move |c| c.library_upload(&filename, &bytes)).await?;
+        let Some(item) = reply.item else {
+            return Err("Uploaded signature image did not return a Library item.".to_owned());
+        };
+        let cid = if is_primary {
+            logo_hash = Some(item.id);
+            "cid:signature-logo@serabot".to_owned()
+        } else {
+            format!("cid:sig-img-{}@serabot", item.id)
+        };
+        let old_len = img.val_end.saturating_sub(img.val_start);
+        projected_len = projected_len.saturating_sub(old_len) + cid.len();
+        replacements.push((img.val_start, img.val_end, cid));
+    }
+
+    let rewritten = apply_signature_image_replacements(&html, &replacements);
+    Ok((rewritten, logo_hash))
 }
 
 /// Run one blocking mail API call on a dedicated background thread.
@@ -2215,9 +2508,8 @@ fn compose_seed_html(raw: &str) -> String {
     }
 }
 
-fn rich_editor_wire_js(visual_id: &str, sync_id: &str, seed_html: Option<&str>) -> String {
+fn rich_editor_bridge_js(visual_id: &str, seed_html: Option<&str>) -> String {
     let vid = serde_json::to_string(visual_id).unwrap_or_else(|_| "\"\"".to_owned());
-    let sid = serde_json::to_string(sync_id).unwrap_or_else(|_| "\"\"".to_owned());
     let seed_stmt = match seed_html {
         Some(html) => {
             let encoded = serde_json::to_string(html).unwrap_or_else(|_| "\"\"".to_owned());
@@ -2227,54 +2519,185 @@ fn rich_editor_wire_js(visual_id: &str, sync_id: &str, seed_html: Option<&str>) 
     };
     format!(
         r#"(function() {{
-  const v = document.getElementById({vid});
-  const s = document.getElementById({sid});
-  if (!v || !s) return;
-  {seed_stmt}
-  function sync() {{
-    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
-    setter.call(s, v.innerHTML);
-    s.dispatchEvent(new Event('input', {{ bubbles: true }}));
-  }}
-  function sanitizeHtml(raw) {{
-    const tpl = document.createElement('template');
-    tpl.innerHTML = raw;
-    tpl.content.querySelectorAll('script,iframe,object,embed,link,meta,base').forEach(function(el) {{ el.remove(); }});
-    tpl.content.querySelectorAll('*').forEach(function(el) {{
-      Array.from(el.attributes).forEach(function(attr) {{
-        const n = attr.name.toLowerCase();
-        const val = (attr.value || '').trim().toLowerCase();
-        if (n.startsWith('on') || ((n === 'href' || n === 'src') && val.startsWith('javascript:'))) {{
-          el.removeAttribute(attr.name);
-        }}
-      }});
-    }});
-    return tpl.innerHTML;
-  }}
-  if (v.dataset.serabotWired !== '1') {{
+  let attempts = 0;
+  function init() {{
+    const v = document.getElementById({vid});
+    if (!v) {{
+      if (attempts < 15) {{
+        attempts += 1;
+        requestAnimationFrame(init);
+      }}
+      return;
+    }}
+    v.__serabotSend = function(val) {{
+      dioxus.send({{ kind: 'html', value: val }});
+    }};
+    {seed_stmt}
+    if (v.dataset.serabotWired === '1') return;
     v.dataset.serabotWired = '1';
+
+    function sync() {{
+      if (v.__serabotSend) v.__serabotSend(v.innerHTML);
+    }}
+    let moTimer = null;
+    function debouncedSync() {{
+      if (moTimer) clearTimeout(moTimer);
+      moTimer = setTimeout(sync, 60);
+    }}
+
+    function extractClipboardHtml(raw) {{
+      const startMarker = '<!--StartFragment-->';
+      const endMarker = '<!--EndFragment-->';
+      const sIdx = raw.indexOf(startMarker);
+      const eIdx = raw.lastIndexOf(endMarker);
+      if (sIdx !== -1 && eIdx !== -1 && eIdx > sIdx) {{
+        const before = raw.slice(0, sIdx);
+        const styles = (before.match(/<style\b[^>]*>[\s\S]*?<\/style>/gi) || []).join('');
+        const frag = raw.slice(sIdx + startMarker.length, eIdx);
+        return styles + frag;
+      }}
+      return raw;
+    }}
+
+    function sanitizeHtml(raw) {{
+      const tpl = document.createElement('template');
+      tpl.innerHTML = extractClipboardHtml(raw);
+      tpl.content
+        .querySelectorAll('script,iframe,object,embed,form,link,meta,base')
+        .forEach(function(el) {{ el.remove(); }});
+      tpl.content.querySelectorAll('*').forEach(function(el) {{
+        Array.from(el.attributes).forEach(function(attr) {{
+          const n = attr.name.toLowerCase();
+          const val = (attr.value || '').replace(/[\s\u0000-\u001f]+/g, '').toLowerCase();
+          if (
+            n.startsWith('on') ||
+            ((n === 'href' || n === 'src' || n === 'action' || n === 'formaction' || n === 'xlink:href') &&
+              (val.startsWith('javascript:') || val.startsWith('vbscript:')))
+          ) {{
+            el.removeAttribute(attr.name);
+          }}
+        }});
+      }});
+      return tpl.innerHTML;
+    }}
+
+    function insertHtmlAtSelection(html) {{
+      const sel = window.getSelection();
+      const isEmpty = !v.textContent.trim() && !v.querySelector('img,table,hr');
+      let allSelected = false;
+      if (sel && sel.rangeCount > 0) {{
+        const r = sel.getRangeAt(0);
+        if (
+          !r.collapsed &&
+          v.contains(r.commonAncestorContainer) &&
+          v.textContent.length > 0 &&
+          r.toString().length >= v.textContent.trim().length
+        ) {{
+          allSelected = true;
+        }}
+      }}
+      if (isEmpty || allSelected) {{
+        v.innerHTML = html;
+        if (sel) {{
+          const range = document.createRange();
+          range.selectNodeContents(v);
+          range.collapse(false);
+          sel.removeAllRanges();
+          sel.addRange(range);
+        }}
+        return;
+      }}
+      if (sel && sel.rangeCount > 0) {{
+        const range = sel.getRangeAt(0);
+        if (v.contains(range.commonAncestorContainer)) {{
+          range.deleteContents();
+          const frag = range.createContextualFragment(html);
+          const lastNode = frag.lastChild;
+          range.insertNode(frag);
+          if (lastNode) {{
+            const after = document.createRange();
+            after.setStartAfter(lastNode);
+            after.collapse(true);
+            sel.removeAllRanges();
+            sel.addRange(after);
+          }}
+          return;
+        }}
+      }}
+      const tpl = document.createElement('template');
+      tpl.innerHTML = html;
+      v.appendChild(tpl.content);
+    }}
+
     v.addEventListener('input', sync);
+    v.addEventListener('cut', function() {{ setTimeout(sync, 0); }});
+    v.addEventListener('keyup', debouncedSync);
+    v.addEventListener('blur', sync);
+
+    const mo = new MutationObserver(debouncedSync);
+    mo.observe(v, {{ childList: true, subtree: true, characterData: true, attributes: true }});
+
     v.addEventListener('paste', function(e) {{
       const cd = e.clipboardData || window.clipboardData;
       if (!cd) return;
       e.preventDefault();
       const html = cd.getData('text/html');
-      if (html) {{
-        document.execCommand('insertHTML', false, sanitizeHtml(html));
-      }} else {{
-        const text = cd.getData('text/plain') || '';
-        document.execCommand('insertText', false, text);
+      if (html && html.trim().length > 0) {{
+        insertHtmlAtSelection(sanitizeHtml(html));
+        sync();
+        return;
       }}
+      const allowedImgTypes = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+      let imageFile = null;
+      if (cd.items) {{
+        for (let i = 0; i < cd.items.length; i++) {{
+          const item = cd.items[i];
+          if (item.kind === 'file' && allowedImgTypes.indexOf((item.type || '').toLowerCase()) !== -1) {{
+            imageFile = item.getAsFile();
+            if (imageFile) break;
+          }}
+        }}
+      }}
+      if (!imageFile && cd.files) {{
+        for (let i = 0; i < cd.files.length; i++) {{
+          const f = cd.files[i];
+          if (allowedImgTypes.indexOf((f.type || '').toLowerCase()) !== -1) {{
+            imageFile = f;
+            break;
+          }}
+        }}
+      }}
+      if (imageFile) {{
+        const reader = new FileReader();
+        reader.onload = function() {{
+          if (typeof reader.result === 'string') {{
+            insertHtmlAtSelection(
+              '<img src="' + reader.result + '" alt="Image" style="max-width:100%;height:auto;">'
+            );
+            sync();
+          }}
+        }};
+        reader.readAsDataURL(imageFile);
+        return;
+      }}
+      const text = cd.getData('text/plain') || '';
+      const escaped = text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/\r?\n/g, '<br>');
+      insertHtmlAtSelection(escaped);
       sync();
     }});
   }}
+  init();
 }})();"#
     )
 }
 
-fn rich_editor_exec_js(visual_id: &str, sync_id: &str, cmd: &str, arg: Option<&str>) -> String {
+fn rich_editor_exec_js(visual_id: &str, cmd: &str, arg: Option<&str>) -> String {
     let vid = serde_json::to_string(visual_id).unwrap_or_else(|_| "\"\"".to_owned());
-    let sid = serde_json::to_string(sync_id).unwrap_or_else(|_| "\"\"".to_owned());
     let cmd_json = serde_json::to_string(cmd).unwrap_or_else(|_| "\"\"".to_owned());
     let arg_json = match arg {
         Some(a) => serde_json::to_string(a).unwrap_or_else(|_| "null".to_owned()),
@@ -2283,15 +2706,10 @@ fn rich_editor_exec_js(visual_id: &str, sync_id: &str, cmd: &str, arg: Option<&s
     format!(
         r#"(function() {{
   const v = document.getElementById({vid});
-  const s = document.getElementById({sid});
   if (!v) return;
   v.focus();
   document.execCommand({cmd_json}, false, {arg_json});
-  if (s) {{
-    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
-    setter.call(s, v.innerHTML);
-    s.dispatchEvent(new Event('input', {{ bubbles: true }}));
-  }}
+  v.dispatchEvent(new Event('input', {{ bubbles: true }}));
 }})();"#
     )
 }
@@ -2606,8 +3024,20 @@ fn MailComposeModal(
             return;
         }
         let seed = compose_seed_html(&body.peek());
-        let js = rich_editor_wire_js("mail-compose-visual", "mail-compose-html-sync", Some(&seed));
-        let _ = dioxus::document::eval(&js);
+        let js = rich_editor_bridge_js("mail-compose-visual", Some(&seed));
+        let mut eval = dioxus::document::eval(&js);
+        spawn(async move {
+            while let Ok(msg) = eval.recv::<serde_json::Value>().await {
+                if !*html_mode.peek() || *html_tab.peek() != ComposeHtmlTab::Visual {
+                    continue;
+                }
+                if msg.get("kind").and_then(|v| v.as_str()) == Some("html")
+                    && let Some(val) = msg.get("value").and_then(|v| v.as_str())
+                {
+                    body.set(val.to_owned());
+                }
+            }
+        });
     });
 
     let account_for_ai = account.clone();
@@ -2797,7 +3227,6 @@ fn MailComposeModal(
                                     if html_tab() == ComposeHtmlTab::Visual {
                                         let _ = dioxus::document::eval(&rich_editor_exec_js(
                                             "mail-compose-visual",
-                                            "mail-compose-html-sync",
                                             "bold",
                                             None,
                                         ));
@@ -2815,7 +3244,6 @@ fn MailComposeModal(
                                     if html_tab() == ComposeHtmlTab::Visual {
                                         let _ = dioxus::document::eval(&rich_editor_exec_js(
                                             "mail-compose-visual",
-                                            "mail-compose-html-sync",
                                             "italic",
                                             None,
                                         ));
@@ -2833,7 +3261,6 @@ fn MailComposeModal(
                                     if html_tab() == ComposeHtmlTab::Visual {
                                         let _ = dioxus::document::eval(&rich_editor_exec_js(
                                             "mail-compose-visual",
-                                            "mail-compose-html-sync",
                                             "underline",
                                             None,
                                         ));
@@ -2851,7 +3278,6 @@ fn MailComposeModal(
                                     if html_tab() == ComposeHtmlTab::Visual {
                                         let _ = dioxus::document::eval(&rich_editor_exec_js(
                                             "mail-compose-visual",
-                                            "mail-compose-html-sync",
                                             "insertUnorderedList",
                                             None,
                                         ));
@@ -2870,7 +3296,6 @@ fn MailComposeModal(
                                     if html_tab() == ComposeHtmlTab::Visual {
                                         let _ = dioxus::document::eval(&rich_editor_exec_js(
                                             "mail-compose-visual",
-                                            "mail-compose-html-sync",
                                             "formatBlock",
                                             Some("blockquote"),
                                         ));
@@ -2896,7 +3321,6 @@ fn MailComposeModal(
                                     if html_tab() == ComposeHtmlTab::Visual {
                                         let _ = dioxus::document::eval(&rich_editor_exec_js(
                                             "mail-compose-visual",
-                                            "mail-compose-html-sync",
                                             "removeFormat",
                                             None,
                                         ));
@@ -2945,7 +3369,6 @@ fn MailComposeModal(
                                         if html_tab() == ComposeHtmlTab::Visual {
                                             let _ = dioxus::document::eval(&rich_editor_exec_js(
                                                 "mail-compose-visual",
-                                                "mail-compose-html-sync",
                                                 "insertHTML",
                                                 Some(&snippet),
                                             ));
@@ -2978,12 +3401,6 @@ fn MailComposeModal(
                             role: "textbox",
                             "aria-multiline": "true",
                             "aria-label": "Rich HTML message editor",
-                        }
-                        textarea {
-                            id: "mail-compose-html-sync",
-                            style: "display:none",
-                            value: "{body}",
-                            oninput: move |e| body.set(e.value()),
                         }
                     } else {
                         textarea {
@@ -3317,8 +3734,36 @@ fn MailSignatureModal(
         }
         let seed =
             resolve_signature_preview_html(&custom_html.peek(), logo_data_url.peek().as_deref());
-        let js = rich_editor_wire_js("mail-sig-visual", "mail-sig-html-sync", Some(&seed));
-        let _ = dioxus::document::eval(&js);
+        let js = rich_editor_bridge_js("mail-sig-visual", Some(&seed));
+        let mut eval = dioxus::document::eval(&js);
+        spawn(async move {
+            while let Ok(msg) = eval.recv::<serde_json::Value>().await {
+                if *sig_mode.peek() != SigEditorMode::Visual {
+                    continue;
+                }
+                if msg.get("kind").and_then(|v| v.as_str()) == Some("html")
+                    && let Some(val) = msg.get("value").and_then(|v| v.as_str())
+                {
+                    custom_html.set(val.to_owned());
+                }
+            }
+        });
+    });
+
+    use_effect(move || {
+        let Some(url) = logo_data_url() else {
+            return;
+        };
+        if *sig_mode.peek() != SigEditorMode::Visual {
+            return;
+        }
+        if custom_html.peek().contains("cid:signature-logo@serabot") {
+            let url_json = serde_json::to_string(&url).unwrap_or_else(|_| "\"\"".to_owned());
+            let js = format!(
+                "(function(){{const v=document.getElementById('mail-sig-visual');if(!v)return;v.querySelectorAll('img').forEach(function(img){{if((img.getAttribute('src')||'')==='cid:signature-logo@serabot')img.setAttribute('src',{url_json});}});}})();"
+            );
+            let _ = dioxus::document::eval(&js);
+        }
     });
 
     let fields = SignatureFields {
@@ -3374,6 +3819,14 @@ fn MailSignatureModal(
                             if let Some(item) = reply.item {
                                 let hash = item.id.clone();
                                 logo_hash.set(Some(hash.clone()));
+                                if sig_mode() == SigEditorMode::Visual
+                                    && !custom_html().contains("cid:signature-logo@serabot")
+                                {
+                                    let prefix = "<img src=\"cid:signature-logo@serabot\" alt=\"Logo\" style=\"max-height:64px;max-width:180px;display:block;margin-bottom:8px;\">";
+                                    custom_html.set(format!("{prefix}{}", custom_html()));
+                                    let next = sig_visual_seed_gen().saturating_add(1);
+                                    sig_visual_seed_gen.set(next);
+                                }
                                 load_logo_preview_data_url(session, hash, logo_data_url);
                                 session.write().toast =
                                     Some("Logo uploaded to Library.".to_owned());
@@ -3393,31 +3846,64 @@ fn MailSignatureModal(
         saving.set(true);
         sig_error.set(None);
         let acct = account_for_save.clone();
-        let hash = logo_hash();
-        let (final_plain, final_html) = if sig_mode() != SigEditorMode::Fields {
-            let p = if custom_plain().trim().is_empty() {
-                strip_html_tags(&custom_html())
-            } else {
-                custom_plain()
-            };
-            (Some(p), Some(custom_html()))
-        } else {
-            let f = SignatureFields {
-                name: sig_name(),
-                title: sig_title(),
-                company: sig_company(),
-                phone: sig_phone(),
-                website: sig_website(),
-            };
-            let (p, h) = build_signature_html_and_plain(&f, None);
-            (Some(p), Some(h))
+        let mode = sig_mode();
+        let initial_hash = logo_hash();
+        let existing_logo_url = logo_data_url();
+        let initial_custom_html = custom_html();
+        let initial_custom_plain = custom_plain();
+        let fields_snapshot = SignatureFields {
+            name: sig_name(),
+            title: sig_title(),
+            company: sig_company(),
+            phone: sig_phone(),
+            website: sig_website(),
         };
-        let plain_cb = final_plain.clone();
-        let html_cb = final_html.clone();
-        let hash_cb = hash.clone();
         spawn(async move {
+            let (final_plain, final_html, final_hash) = if mode != SigEditorMode::Fields {
+                let mut raw_html = initial_custom_html;
+                if mode == SigEditorMode::Visual
+                    && let Ok(val) = dioxus::document::eval(
+                        "return document.getElementById('mail-sig-visual')?.innerHTML ?? null;",
+                    )
+                    .await
+                    && let Some(live_html) = val.as_str()
+                {
+                    raw_html = live_html.to_owned();
+                    custom_html.set(raw_html.clone());
+                }
+                let (prepared_html, prepared_hash) = match extract_and_prepare_signature_images(
+                    session,
+                    raw_html,
+                    initial_hash,
+                    existing_logo_url,
+                )
+                .await
+                {
+                    Ok(res) => res,
+                    Err(err) => {
+                        saving.set(false);
+                        sig_error.set(Some(err));
+                        return;
+                    }
+                };
+                custom_html.set(prepared_html.clone());
+                logo_hash.set(prepared_hash.clone());
+                let p = if initial_custom_plain.trim().is_empty() {
+                    strip_html_tags(&prepared_html)
+                } else {
+                    initial_custom_plain
+                };
+                (Some(p), Some(prepared_html), prepared_hash)
+            } else {
+                let logo_cid = initial_hash.as_ref().map(|_| "cid:signature-logo@serabot");
+                let (p, h) = build_signature_html_and_plain(&fields_snapshot, logo_cid);
+                (Some(p), Some(h), initial_hash)
+            };
+            let plain_cb = final_plain.clone();
+            let html_cb = final_html.clone();
+            let hash_cb = final_hash.clone();
             let res = run_mail_job(session, move |c| {
-                c.mail_update_signature(acct.as_deref(), final_plain, final_html, hash)
+                c.mail_update_signature(acct.as_deref(), final_plain, final_html, final_hash)
             })
             .await;
             saving.set(false);
@@ -3509,12 +3995,6 @@ fn MailSignatureModal(
                             role: "textbox",
                             "aria-multiline": "true",
                             "aria-label": "Visual signature editor",
-                        }
-                        textarea {
-                            id: "mail-sig-html-sync",
-                            style: "display:none",
-                            value: "{custom_html}",
-                            oninput: move |e| custom_html.set(e.value()),
                         }
                     }
                 } else if sig_mode() == SigEditorMode::Source {
@@ -3652,6 +4132,14 @@ fn MailSignatureModal(
                                             onclick: move |_| {
                                                 logo_hash.set(Some(hash_pick.clone()));
                                                 library_picker_open.set(false);
+                                                if sig_mode() == SigEditorMode::Visual
+                                                    && !custom_html().contains("cid:signature-logo@serabot")
+                                                {
+                                                    let prefix = "<img src=\"cid:signature-logo@serabot\" alt=\"Logo\" style=\"max-height:64px;max-width:180px;display:block;margin-bottom:8px;\">";
+                                                    custom_html.set(format!("{prefix}{}", custom_html()));
+                                                    let next = sig_visual_seed_gen().saturating_add(1);
+                                                    sig_visual_seed_gen.set(next);
+                                                }
                                                 load_logo_preview_data_url(session, hash_pick.clone(), logo_data_url);
                                             },
                                             Icon { name: "image", size: 13 }
@@ -3964,5 +4452,65 @@ mod tests {
             resolved,
             "<img src=\"data:image/png;base64,QUJD\" alt=\"Logo\">"
         );
+    }
+
+    #[test]
+    fn strip_html_tags_removes_style_head_and_formats_tables_and_entities() {
+        let html = "<html><head><style>.sig{color:#111;}</style></head>\
+                    <body><style>p{margin:0;}</style>\
+                    <h2>Jane&#39;s &amp; Co</h2>\
+                    <table><tr><td>CEO &middot; Acme</td><td>+1&nbsp;555</td></tr>\
+                    <tr><td>Web: &lt;acme.test&gt; &quot;hi&quot;</td></tr></table></body></html>";
+        let plain = strip_html_tags(html);
+        assert!(!plain.contains(".sig"));
+        assert!(!plain.contains("margin:0"));
+        assert_eq!(
+            plain,
+            "Jane's & Co\nCEO \u{00b7} Acme +1 555\nWeb: <acme.test> \"hi\""
+        );
+    }
+
+    #[test]
+    fn extract_data_uri_images_and_rich_signature_roundtrip() {
+        let png_b64 = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\n123");
+        let jpg_b64 = base64::engine::general_purpose::STANDARD.encode(b"\xff\xd8\xff\xe0abc");
+        let html = format!(
+            "<style>.n{{font-weight:700;}}</style>\
+             <table><tr><td><img src=\"data:image/png;base64,{png_b64}\" width=\"80\"></td>\
+             <td><div class=\"n\">Alice</div><div><img src='DATA:IMAGE/JPEG;BASE64,{jpg_b64}'></div></td></tr></table>"
+        );
+        let found = extract_data_uri_images(&html);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].mime, "image/png");
+        assert_eq!(found[0].bytes, b"\x89PNG\r\n\x1a\n123");
+        assert_eq!(found[1].mime, "image/jpeg");
+        assert_eq!(found[1].bytes, b"\xff\xd8\xff\xe0abc");
+
+        let hash2 = "b".repeat(64);
+        let rewritten = apply_signature_image_replacements(
+            &html,
+            &[
+                (
+                    found[0].val_start,
+                    found[0].val_end,
+                    "cid:signature-logo@serabot".to_owned(),
+                ),
+                (
+                    found[1].val_start,
+                    found[1].val_end,
+                    format!("cid:sig-img-{hash2}@serabot"),
+                ),
+            ],
+        );
+        assert!(rewritten.contains("src=\"cid:signature-logo@serabot\""));
+        assert!(rewritten.contains(&format!("src='cid:sig-img-{hash2}@serabot'")));
+        assert!(rewritten.contains("<style>.n{font-weight:700;}</style>"));
+
+        let preview = resolve_signature_preview_html(
+            &rewritten,
+            Some(&format!("data:image/png;base64,{png_b64}")),
+        );
+        assert!(preview.contains(&format!("src=\"data:image/png;base64,{png_b64}\"")));
+        assert_eq!(strip_html_tags(&rewritten), "Alice");
     }
 }

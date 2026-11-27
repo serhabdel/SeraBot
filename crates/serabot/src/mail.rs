@@ -1070,6 +1070,70 @@ fn load_inline_logo_attachment(
     }))
 }
 
+/// Extract unique 64-hex-char hashes from `cid:sig-img-<64hex>@serabot` references in HTML.
+fn extract_sig_img_cid_hashes(html: &str) -> Vec<String> {
+    const PREFIX: &str = "cid:sig-img-";
+    const SUFFIX: &str = "@serabot";
+    let mut hashes = Vec::new();
+    let mut rest = html;
+    while let Some(pos) = rest.find(PREFIX) {
+        let after_prefix = &rest[pos + PREFIX.len()..];
+        if after_prefix.len() >= 64 + SUFFIX.len() {
+            let candidate = &after_prefix[..64];
+            let tail = &after_prefix[64..];
+            if tail.starts_with(SUFFIX) && candidate.chars().all(|c| c.is_ascii_hexdigit()) {
+                let hash = candidate.to_owned();
+                if !hashes.contains(&hash) {
+                    hashes.push(hash);
+                    if hashes.len() >= MAX_ATTACHMENTS {
+                        break;
+                    }
+                }
+                rest = &tail[SUFFIX.len()..];
+                continue;
+            }
+        }
+        rest = after_prefix;
+    }
+    hashes
+}
+
+fn load_inline_signature_images(
+    store: &Store,
+    artifacts: &ArtifactStore,
+    user_id: &str,
+    sig_cfg: &MailSignatureConfig,
+) -> Result<Vec<InlineAttachment>> {
+    let Some(sig_html) = sig_cfg.signature_html.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let hashes = extract_sig_img_cid_hashes(sig_html);
+    let mut out = Vec::with_capacity(hashes.len());
+    for hash in hashes {
+        if !store.user_owns_artifact(user_id, &hash)? {
+            return Err(SeraError::Forbidden("artifact".into()));
+        }
+        let stored = artifacts.load(&hash)?;
+        let mime = inline_image_mime_for_filename(&stored.filename).to_owned();
+        if !is_safe_inline_image_mime(&mime) {
+            return Err(SeraError::Validation(
+                "signature image must be png, jpeg, gif, or webp".into(),
+            ));
+        }
+        if stored.bytes.is_empty() || stored.bytes.len() > MAX_INLINE_ATTACHMENT_BYTES {
+            return Err(SeraError::Validation(
+                "signature image must be 1 byte to 512 KiB".into(),
+            ));
+        }
+        out.push(InlineAttachment {
+            content_id: format!("sig-img-{hash}@serabot"),
+            content_type: mime,
+            bytes: stored.bytes,
+        });
+    }
+    Ok(out)
+}
+
 /// Validate policy, load attachments & signature logo from the user's artifact
 /// store, build the MIME message, and send via SMTP. Shared by `/v1/mail/send`
 /// and the 30-second scheduled-mail background loop.
@@ -1135,6 +1199,7 @@ pub async fn send_account_mail(
     let creds = require_creds(secrets, params.user_id, account)?;
     let sig_cfg = load_signature_config(secrets, params.user_id, account).unwrap_or_default();
     let inline_logo = load_inline_logo_attachment(store, artifacts, params.user_id, &sig_cfg)?;
+    let sig_images = load_inline_signature_images(store, artifacts, params.user_id, &sig_cfg)?;
 
     let from = from_address(&creds);
     let final_plain = body_with_signature(&creds, params.body.to_owned())?;
@@ -1159,6 +1224,7 @@ pub async fn send_account_mail(
     if let Some(logo) = inline_logo {
         inline_parts.push(logo);
     }
+    inline_parts.extend(sig_images);
 
     let msg = build_message_with_inline(
         &from,
@@ -3785,6 +3851,10 @@ fn prepare_html_and_inline(
         (Some(s), Some(a)) => load_inline_logo_attachment(s, a, user_id, &sig_cfg)?,
         _ => None,
     };
+    let sig_images = match (store, artifacts) {
+        (Some(s), Some(a)) => load_inline_signature_images(s, a, user_id, &sig_cfg)?,
+        _ => Vec::new(),
+    };
     let mut final_html = html_with_signature(
         creds,
         &sig_cfg,
@@ -3801,6 +3871,7 @@ fn prepare_html_and_inline(
     if let Some(logo) = inline_logo {
         inline_parts.push(logo);
     }
+    inline_parts.extend(sig_images);
     Ok((final_html, inline_parts))
 }
 
@@ -5654,5 +5725,107 @@ mod tests {
         let triage = reg.get(MAIL_TRIAGE_TOOL).unwrap().spec();
         assert!(!triage.external_effect);
         assert!(!crate::gateway::is_destructive_tool(MAIL_TRIAGE_TOOL));
+    }
+
+    #[test]
+    fn load_inline_signature_images_resolves_uid_scoped_cid_refs_and_rejects_other_users() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory(384).unwrap();
+        let user_a = store
+            .create_user("sig-img-a", "a@example.example", "Alice")
+            .unwrap();
+        let user_b = store
+            .create_user("sig-img-b", "b@example.example", "Bob")
+            .unwrap();
+        let artifacts = ArtifactStore::new(dir.path()).unwrap();
+
+        let meta_a = crate::maker::ArtifactMeta {
+            title: "badge.png".into(),
+            filename: "badge.png".into(),
+            language: crate::domain::Language::En,
+            source_artifact: None,
+            created_at: chrono::Utc::now(),
+        };
+        let png_a = b"\x89PNG\r\n\x1a\nAAAA";
+        let stored_a = artifacts.save(png_a, "badge.png", meta_a).unwrap();
+        store
+            .record_conversation_artifact(
+                &user_a.id,
+                "library",
+                None,
+                "upload",
+                &stored_a.hash,
+                &stored_a.filename,
+                None,
+            )
+            .unwrap();
+
+        let meta_b = crate::maker::ArtifactMeta {
+            title: "secret.png".into(),
+            filename: "secret.png".into(),
+            language: crate::domain::Language::En,
+            source_artifact: None,
+            created_at: chrono::Utc::now(),
+        };
+        let png_b = b"\x89PNG\r\n\x1a\nBBBB";
+        let stored_b = artifacts.save(png_b, "secret.png", meta_b).unwrap();
+        store
+            .record_conversation_artifact(
+                &user_b.id,
+                "library",
+                None,
+                "upload",
+                &stored_b.hash,
+                &stored_b.filename,
+                None,
+            )
+            .unwrap();
+
+        let sig_html = format!(
+            "<table><tr><td><img src=\"cid:sig-img-{0}@serabot\"></td><td><img src=\"cid:sig-img-{0}@serabot\"></td></tr></table>",
+            stored_a.hash
+        );
+        let cfg_a = MailSignatureConfig {
+            signature: "Alice".into(),
+            signature_html: Some(sig_html.clone()),
+            signature_logo_hash: None,
+        };
+        let loaded = load_inline_signature_images(&store, &artifacts, &user_a.id, &cfg_a).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0].content_id,
+            format!("sig-img-{}@serabot", stored_a.hash)
+        );
+        assert_eq!(loaded[0].content_type, "image/png");
+        assert_eq!(loaded[0].bytes, png_a);
+
+        let raw = build_message_with_inline(
+            "a@example.example",
+            &["to@example.example".into()],
+            &[],
+            "Sig test",
+            "Alice",
+            Some(&sig_html),
+            None,
+            None,
+            &loaded,
+            &[],
+        )
+        .unwrap();
+        let text = String::from_utf8(raw).unwrap();
+        assert!(text.contains(&format!("Content-ID: <sig-img-{}@serabot>", stored_a.hash)));
+
+        // Cross-user reference must be rejected.
+        let cfg_cross = MailSignatureConfig {
+            signature: "Alice".into(),
+            signature_html: Some(format!(
+                "<img src=\"cid:sig-img-{}@serabot\">",
+                stored_b.hash
+            )),
+            signature_logo_hash: None,
+        };
+        let err =
+            load_inline_signature_images(&store, &artifacts, &user_a.id, &cfg_cross).unwrap_err();
+        assert!(matches!(err, SeraError::Forbidden(_)));
     }
 }

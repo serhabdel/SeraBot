@@ -95,6 +95,14 @@ pub enum OperationKind {
     DefaultRoute,
     /// Add, change, remove or test one of the member's provider accounts.
     ProviderAccount,
+    /// Check a `claude-agent-sdk` gateway's status.
+    GatewayStatus,
+    /// Generate or save a `claude-agent-sdk` gateway bearer token.
+    GatewayToken,
+    /// Import an existing Claude CLI login from the gateway host.
+    GatewayImportCli,
+    /// Finish a `claude-agent-sdk` gateway browser sign-in with a pasted code.
+    GatewaySigninComplete,
     /// Save a bot's route chain.
     RouteWrite,
     /// Read the open conversation's route switches and the bot's chain.
@@ -460,6 +468,26 @@ pub enum Operation {
         provider: String,
         account: String,
     },
+    /// GET /v1/providers/{id}/gateway/status.
+    GatewayStatus {
+        provider: String,
+    },
+    /// POST /v1/providers/{id}/gateway/token.
+    GatewayToken {
+        provider: String,
+        generate: bool,
+        token: Option<Zeroizing<String>>,
+    },
+    /// POST /v1/providers/{id}/gateway/import-cli.
+    GatewayImportCli {
+        provider: String,
+    },
+    /// POST /v1/providers/{id}/signin/complete (without redirect_uri, for gateway paste-code).
+    CompleteGatewaySignin {
+        provider: String,
+        flow_id: String,
+        code: String,
+    },
     /// PUT /v1/bots/{id}/route.
     SaveBotRoute {
         id: String,
@@ -688,6 +716,10 @@ impl Operation {
             | Self::RemoveProviderAccount { .. }
             | Self::TestProviderAccount { .. }
             | Self::RefreshAccountQuota { .. } => OperationKind::ProviderAccount,
+            Self::GatewayStatus { .. } => OperationKind::GatewayStatus,
+            Self::GatewayToken { .. } => OperationKind::GatewayToken,
+            Self::GatewayImportCli { .. } => OperationKind::GatewayImportCli,
+            Self::CompleteGatewaySignin { .. } => OperationKind::GatewaySigninComplete,
             Self::SaveBotRoute { .. } => OperationKind::RouteWrite,
             Self::RouteEvents { .. } => OperationKind::RouteEvents,
             Self::Handoffs => OperationKind::Runs,
@@ -830,6 +862,26 @@ pub enum Reply {
     DefaultRouteSaved,
     /// One account change landed.
     AccountDone(AccountDone),
+    /// A `claude-agent-sdk` gateway's status.
+    GatewayStatus {
+        provider: String,
+        status: crate::api::GatewayStatusResponse,
+    },
+    /// A `claude-agent-sdk` gateway token was generated or saved.
+    GatewayToken {
+        provider: String,
+        response: crate::api::GatewayTokenResponse,
+    },
+    /// An existing Claude CLI login was imported from the gateway.
+    GatewayCliImported {
+        provider: String,
+        done: crate::api::SigninDone,
+    },
+    /// A `claude-agent-sdk` gateway sign-in completed via pasted code.
+    GatewaySigninCompleted {
+        provider: String,
+        done: crate::api::SigninDone,
+    },
     /// The bot's route chain was saved.
     RouteSaved,
     /// The open conversation's route switches and the bot's chain.
@@ -1419,6 +1471,40 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         Operation::RefreshAccountQuota { provider, account } => client
             .provider_account_quota(provider, account, true)
             .map(|_| Reply::AccountDone(AccountDone::QuotaRead)),
+        Operation::GatewayStatus { provider } => {
+            client
+                .provider_gateway_status(provider)
+                .map(|status| Reply::GatewayStatus {
+                    provider: provider.clone(),
+                    status,
+                })
+        }
+        Operation::GatewayToken {
+            provider,
+            generate,
+            token,
+        } => client
+            .provider_gateway_token(provider, *generate, token.as_deref().map(String::as_str))
+            .map(|response| Reply::GatewayToken {
+                provider: provider.clone(),
+                response,
+            }),
+        Operation::GatewayImportCli { provider } => client
+            .provider_gateway_import_cli(provider)
+            .map(|done| Reply::GatewayCliImported {
+                provider: provider.clone(),
+                done,
+            }),
+        Operation::CompleteGatewaySignin {
+            provider,
+            flow_id,
+            code,
+        } => client
+            .provider_signin_complete(provider, flow_id, code, None, "")
+            .map(|done| Reply::GatewaySigninCompleted {
+                provider: provider.clone(),
+                done,
+            }),
         Operation::SaveBotRoute { id, update } => {
             client.put_bot_route(id, update).map(|()| Reply::RouteSaved)
         }

@@ -28,6 +28,14 @@ pub enum AccountOp {
     Quota,
 }
 
+/// Ephemeral one-time generated token + startup command shown to the user
+/// after clicking "Generate token" on a `claude-agent-sdk` provider card.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GatewayGeneratedToken {
+    pub token: Option<String>,
+    pub startup_command: String,
+}
+
 /// The Providers page's account state.
 #[derive(Default)]
 pub struct AccountsUi {
@@ -59,6 +67,16 @@ pub struct AccountsUi {
     /// A saved provider waiting to show up on the page so its sign-in can
     /// start, and since when (it gives up after [`PENDING_SIGNIN_WAIT`]).
     pub pending_signin: Option<(String, Instant)>,
+    /// Cached gateway status per `claude-agent-sdk` provider id.
+    pub gateway_statuses: std::collections::HashMap<String, crate::api::GatewayStatusResponse>,
+    /// One-time generated token + startup command per provider id (ephemeral).
+    pub gateway_tokens: std::collections::HashMap<String, GatewayGeneratedToken>,
+    /// Gateway action in flight per provider id (`"status"`, `"token"`, `"import"`).
+    pub gateway_busy: std::collections::HashMap<String, &'static str>,
+    /// Gateway-specific error per provider id.
+    pub gateway_errors: std::collections::HashMap<String, String>,
+    /// Whether a manual paste-code completion is in flight in `AddAccountSheet`.
+    pub gateway_completing: bool,
 }
 
 /// How long a saved provider may take to appear before the page says so.
@@ -82,6 +100,7 @@ impl AccountsUi {
         }
         self.flow_rx = None;
         self.flow_since = None;
+        self.gateway_completing = false;
     }
 
     fn clear_secrets(&mut self) {
@@ -93,6 +112,12 @@ impl AccountsUi {
 impl Drop for AccountsUi {
     fn drop(&mut self) {
         self.key.zeroize();
+        for generated in self.gateway_tokens.values_mut() {
+            if let Some(token) = generated.token.as_mut() {
+                token.zeroize();
+            }
+            generated.startup_command.zeroize();
+        }
         self.stop_flow();
     }
 }
@@ -730,7 +755,7 @@ impl Session {
                 "That account is gone, or this server has no accounts yet. Refresh the page."
                     .to_owned()
             }
-            other => accounts::plain_error(&other.to_string()),
+            other => accounts::plain_api_error(other),
         };
         let last = self.accounts_ui.last_op.take();
         if let Some(AccountOp::Remove {
@@ -747,6 +772,218 @@ impl Session {
             self.accounts_ui.sheet_error = Some(message);
         } else {
             self.admin_error = Some(message);
+        }
+    }
+
+    // ---- Claude Agent SDK Gateway ----
+
+    /// Fetch the gateway's reachability, token state, and Claude CLI status.
+    pub fn check_gateway_status(&mut self, provider: &str) {
+        if !self.ready() || !self.state.connected {
+            return;
+        }
+        self.accounts_ui.gateway_errors.remove(provider);
+        self.accounts_ui
+            .gateway_busy
+            .insert(provider.to_owned(), "status");
+        self.start_request(Operation::GatewayStatus {
+            provider: provider.to_owned(),
+        });
+    }
+
+    /// Generate a new bearer token for the `claude-agent-sdk` gateway and store
+    /// it on the server, keeping the one-time token & startup command in
+    /// ephemeral UI state so the user can copy it.
+    pub fn generate_gateway_token(&mut self, provider: &str) {
+        if !self.can_admin() {
+            self.admin_error = Some("Wait for the current request, then retry.".into());
+            return;
+        }
+        self.accounts_ui.gateway_errors.remove(provider);
+        self.accounts_ui
+            .gateway_busy
+            .insert(provider.to_owned(), "token");
+        self.start_request(Operation::GatewayToken {
+            provider: provider.to_owned(),
+            generate: true,
+            token: None,
+        });
+    }
+
+    /// Save a user-supplied bearer token for the `claude-agent-sdk` gateway.
+    pub fn save_gateway_token(&mut self, provider: &str, token: String) {
+        let trimmed = token.trim().to_owned();
+        if trimmed.is_empty() {
+            self.accounts_ui
+                .gateway_errors
+                .insert(provider.to_owned(), "Paste a gateway token first.".into());
+            return;
+        }
+        if !self.can_admin() {
+            self.admin_error = Some("Wait for the current request, then retry.".into());
+            return;
+        }
+        self.accounts_ui.gateway_errors.remove(provider);
+        self.accounts_ui
+            .gateway_busy
+            .insert(provider.to_owned(), "token");
+        self.start_request(Operation::GatewayToken {
+            provider: provider.to_owned(),
+            generate: false,
+            token: Some(zeroize::Zeroizing::new(trimmed)),
+        });
+    }
+
+    /// Dismiss the one-time generated token banner for `provider` and zeroize it.
+    pub fn dismiss_gateway_token(&mut self, provider: &str) {
+        if let Some(mut entry) = self.accounts_ui.gateway_tokens.remove(provider) {
+            if let Some(tok) = entry.token.as_mut() {
+                tok.zeroize();
+            }
+            entry.startup_command.zeroize();
+        }
+    }
+
+    /// Connect the gateway host's existing Claude CLI login (`claude auth login`).
+    pub fn import_gateway_cli(&mut self, provider: &str) {
+        if !self.can_admin() {
+            self.admin_error = Some("Wait for the current request, then retry.".into());
+            return;
+        }
+        self.accounts_ui.gateway_errors.remove(provider);
+        self.accounts_ui
+            .gateway_busy
+            .insert(provider.to_owned(), "import");
+        self.start_request(Operation::GatewayImportCli {
+            provider: provider.to_owned(),
+        });
+    }
+
+    /// Complete a `claude-agent-sdk` gateway browser sign-in by submitting a
+    /// pasted authorization code directly to `POST /v1/providers/{id}/signin/complete`.
+    pub fn complete_gateway_signin(&mut self, provider: String, flow_id: String, code: String) {
+        let code = code.trim().to_owned();
+        if code.is_empty() {
+            self.accounts_ui.sheet_error = Some("Paste the authorization code first.".into());
+            return;
+        }
+        if !self.can_admin() {
+            self.accounts_ui.sheet_error = Some("Wait a moment, then try again.".into());
+            return;
+        }
+        self.accounts_ui.sheet_error = None;
+        self.accounts_ui.gateway_completing = true;
+        self.start_request(Operation::CompleteGatewaySignin {
+            provider,
+            flow_id,
+            code,
+        });
+    }
+
+    pub(super) fn gateway_status_done(
+        &mut self,
+        provider: String,
+        status: crate::api::GatewayStatusResponse,
+    ) {
+        self.accounts_ui.gateway_busy.remove(&provider);
+        self.accounts_ui.gateway_errors.remove(&provider);
+        self.accounts_ui.gateway_statuses.insert(provider, status);
+    }
+
+    pub(super) fn gateway_token_done(
+        &mut self,
+        provider: String,
+        response: crate::api::GatewayTokenResponse,
+    ) {
+        self.accounts_ui.gateway_busy.remove(&provider);
+        self.accounts_ui.gateway_errors.remove(&provider);
+        let startup_command = response.startup_command.unwrap_or_else(|| {
+            if let Some(tok) = response.token.as_deref() {
+                format!(
+                    "SERABOT_CLAUDE_GATEWAY_TOKEN={tok} python3 -m uvicorn server:app --host 127.0.0.1 --port 8791"
+                )
+            } else {
+                String::new()
+            }
+        });
+        if response.token.is_some() || !startup_command.is_empty() {
+            self.accounts_ui.gateway_tokens.insert(
+                provider.clone(),
+                GatewayGeneratedToken {
+                    token: response.token,
+                    startup_command,
+                },
+            );
+        }
+        if let Some(status) = self.accounts_ui.gateway_statuses.get_mut(&provider) {
+            status.token_configured = response.configured;
+        }
+        self.admin_notice = Some("Gateway token saved.".into());
+        self.check_gateway_status(&provider);
+    }
+
+    pub(super) fn gateway_cli_imported(&mut self, provider: String, done: crate::api::SigninDone) {
+        self.accounts_ui.gateway_busy.remove(&provider);
+        self.accounts_ui.gateway_errors.remove(&provider);
+        self.admin_notice = Some(if done.created {
+            "Connected existing Claude login.".into()
+        } else {
+            "Existing Claude login is already connected.".into()
+        });
+        self.state.providers_loaded = false;
+        self.schedule(Operation::Catalog, Duration::ZERO);
+        self.check_gateway_status(&provider);
+    }
+
+    pub(super) fn gateway_signin_completed(&mut self, done: crate::api::SigninDone) {
+        self.accounts_ui.stop_flow();
+        self.accounts_ui.sheet_error = None;
+        if let Some(flow) = self.accounts_ui.flow.as_mut() {
+            flow.apply(FlowMsg::Ended(FlowEnd::Done {
+                account_id: done.account_id,
+                created: done.created,
+            }));
+        }
+        self.state.providers_loaded = false;
+        self.schedule(Operation::Catalog, Duration::ZERO);
+        self.admin_notice = Some("Account added.".into());
+    }
+
+    pub(super) fn gateway_op_failed(&mut self, kind: OperationKind, error: &ApiError) {
+        let message = accounts::plain_api_error(error);
+        match kind {
+            OperationKind::GatewaySigninComplete => {
+                self.accounts_ui.gateway_completing = false;
+                self.accounts_ui.sheet_error = Some(message);
+            }
+            OperationKind::GatewayStatus => {
+                let target: Vec<String> = self
+                    .accounts_ui
+                    .gateway_busy
+                    .iter()
+                    .filter(|(_, op)| **op == "status")
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for id in target {
+                    self.accounts_ui.gateway_busy.remove(&id);
+                    self.accounts_ui.gateway_errors.insert(id, message.clone());
+                }
+            }
+            OperationKind::GatewayToken | OperationKind::GatewayImportCli => {
+                let target: Vec<String> = self
+                    .accounts_ui
+                    .gateway_busy
+                    .iter()
+                    .filter(|(_, op)| **op == "token" || **op == "import")
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for id in target {
+                    self.accounts_ui.gateway_busy.remove(&id);
+                    self.accounts_ui.gateway_errors.insert(id, message.clone());
+                }
+                self.admin_error = Some(message);
+            }
+            _ => {}
         }
     }
 
