@@ -712,6 +712,40 @@ pub(super) struct SigninStartRequest {
     state: Option<String>,
 }
 
+/// The loopback gateway a `claude-agent-sdk` sign-in is relayed to, with the
+/// gateway bearer token (the provider's stored credential). `None` for every
+/// other kind.
+fn gateway_endpoint(
+    state: &ApiState,
+    user: &ActingUser,
+    id: &str,
+    profile: &ProviderConfig,
+    kind: &str,
+) -> Result<Option<crate::auth_flows::gateway::GatewayEndpoint>> {
+    use crate::auth_flows::gateway::GatewayEndpoint;
+    if kind != "claude-agent-sdk" {
+        return Ok(None);
+    }
+    let base_url = crate::providers::resolve_base_url(kind, &profile.base_url)?;
+    let Some((_, secret)) = state.users.resolve_with_owner(&user.id, id)? else {
+        return Err(SeraError::Validation(
+            "save this provider's gateway token first; the browser sign-in is relayed through it"
+                .into(),
+        ));
+    };
+    let credential = crate::user_secrets::ProviderCredential::parse(&secret)?;
+    if credential.api_key.trim().is_empty() {
+        return Err(SeraError::Validation(
+            "save this provider's gateway token first; the browser sign-in is relayed through it"
+                .into(),
+        ));
+    }
+    Ok(Some(GatewayEndpoint::validated(
+        &base_url,
+        zeroize::Zeroizing::new(credential.api_key),
+    )?))
+}
+
 /// Begin a sign-in: a browser (PKCE) or a device code.
 pub(super) async fn provider_signin_start(
     State(state): State<Arc<ApiState>>,
@@ -728,20 +762,21 @@ pub(super) async fn provider_signin_start(
             message: "The sign-in flow must be pkce or device".into(),
         })?),
     };
-    let started = state
-        .signin
-        .start(
-            &user.id,
-            &id,
-            &kind,
-            StartRequest {
-                flow,
-                redirect_uri: request.redirect_uri,
-                challenge: request.challenge,
-                state: request.state,
-            },
-        )
-        .await?;
+    let request = StartRequest {
+        flow,
+        redirect_uri: request.redirect_uri,
+        challenge: request.challenge,
+        state: request.state,
+    };
+    let started = match gateway_endpoint(&state, &user, &id, &profile, &kind)? {
+        Some(gateway) => {
+            state
+                .signin
+                .start_with_gateway(&user.id, &id, &kind, request, gateway)
+                .await?
+        }
+        None => state.signin.start(&user.id, &id, &kind, request).await?,
+    };
     Ok(Json(serde_json::to_value(started)?))
 }
 
@@ -765,20 +800,21 @@ pub(super) async fn provider_signin_complete(
 ) -> Result<Json<Value>> {
     let (profile, kind) = provider_context(&state, &id)?;
     plan_signin_gate(&user, &profile, &kind)?;
-    let outcome = state
-        .signin
-        .complete(
-            &user.id,
-            &id,
-            &kind,
-            CompleteRequest {
-                flow_id: Some(request.flow_id),
-                code: request.code,
-                redirect_uri: Some(request.redirect_uri),
-                verifier: request.verifier,
-            },
-        )
-        .await?;
+    let request = CompleteRequest {
+        flow_id: Some(request.flow_id),
+        code: request.code,
+        redirect_uri: Some(request.redirect_uri),
+        verifier: request.verifier,
+    };
+    let outcome = match gateway_endpoint(&state, &user, &id, &profile, &kind)? {
+        Some(gateway) => {
+            state
+                .signin
+                .complete_with_gateway(&user.id, &id, &kind, request, gateway)
+                .await?
+        }
+        None => state.signin.complete(&user.id, &id, &kind, request).await?,
+    };
     state.runtime.invalidate_model_credentials(Some(&user.id));
     Ok(Json(json!({
         "account_id": outcome.account_id,

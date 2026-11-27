@@ -6,14 +6,14 @@ unchanged: the opt-in Python loopback gateway (`services/claude_gateway/`)
 is the one approved bridge, and Desktop ACP is the other. Do not add a new
 local runtime or a third-party OAuth client.
 
-## 1. There is no claude.ai OAuth to support
+## 1. There is no claude.ai OAuth to support in SeraBot itself
 
 Anthropic shut down third-party `claude.ai` OAuth in 2026; SeraBot retired
 it in 0.74.25 (`CLAUDE_OAUTH_SHUTDOWN_MESSAGE`, hard `plan_signin = "off"`
 for `anthropic`, and the desktop shows a terminal "retired" notice since
-0.74.26). The Claude Agent SDK does not use OAuth either: it authenticates
-with an **API key** (`ANTHROPIC_API_KEY`) or the **Claude CLI login**
-(`claude auth login`, a setup token stored by the CLI) — and that
+0.74.26). The Claude Agent SDK does not use third-party OAuth either: it
+authenticates with an **API key** (`ANTHROPIC_API_KEY`) or the **Claude CLI
+login** (`claude auth login`, a setup token stored by the CLI) — and that
 authentication happens *inside the gateway process*, on the member's own
 machine, never inside SeraBot. SeraBot only ever holds the gateway's
 shared bearer token (`SERABOT_CLAUDE_GATEWAY_TOKEN`), which is not a
@@ -26,6 +26,39 @@ So the supported Claude paths are:
   gateway → the member's own CLI login or API key.
 - **Claude Code (Desktop ACP)** — Windows desktop only, pinned
   `@agentclientprotocol/claude-agent-acp`, per `docs/specs/claude-code-acp.md`.
+
+### "Sign in with browser" on the gateway card (0.74.28)
+
+The provider card offers **Sign in with browser** (the preset documents a
+`pkce` flow for the kind). It is *not* SeraBot doing claude.ai OAuth: the
+flow is relayed to the loopback gateway, which runs the **first-party**
+claude.ai OAuth PKCE flow — the same client id `claude auth login` uses:
+
+1. Desktop → `POST /v1/providers/{id}/signin/start` (flow `pkce`) → the
+   server asks the gateway `POST {gateway}/v1/auth/start` with the desktop's
+   loopback `redirect_uri` (validated: http loopback, port ≥ 1024, no
+   credentials/query/fragment).
+2. The gateway generates the PKCE verifier/challenge, remembers them keyed
+   by `state` (TTL 600 s), and returns the claude.ai authorize URL. SeraBot
+   stores only the flow record (provider, redirect, state, gateway URL) —
+   never a verifier.
+3. The member's browser completes the login; the desktop catches the
+   loopback redirect and posts the code to
+   `POST /v1/providers/{id}/signin/complete`.
+4. The server relays `POST {gateway}/v1/auth/complete` `{state, code}` with
+   the gateway bearer token. The gateway swaps the code at the pinned token
+   URL (`https://api.anthropic.com/api/oauth/token`, redirects refused,
+   body capped), writes the tokens where the CLI/SDK reads them
+   (`~/.claude/.credentials.json` by default, mode 0600; override with
+   `SERABOT_CLAUDE_GATEWAY_CREDS_PATH`), and returns only the non-secret
+   account summary (email, subscription).
+5. SeraBot stores the provider account: credential = the gateway bearer
+   token (that is what authenticates turns to the gateway), identity =
+   the gateway-reported account, `AuthKind::Oauth`.
+
+`GET {gateway}/v1/auth/status` reports whether a login is stored. All
+`/v1/auth/*` endpoints require the gateway bearer token like every other
+`/v1/*` route.
 
 ## 2. Multiple accounts = one gateway per Claude login, one provider each
 

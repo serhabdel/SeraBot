@@ -888,6 +888,7 @@ fn PlanTile(session: Signal<Session>, overlay: Signal<Overlay>, preset: Provider
         "google-antigravity" => "Sign in with Google",
         "github-copilot" => "Sign in with GitHub",
         "mistral" => "Sign in with Mistral",
+        "claude-agent-sdk" => "Sign in with browser",
         _ => "Sign in",
     };
     let how = match preset.sign_in {

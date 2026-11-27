@@ -208,6 +208,8 @@ mod tests {
             verifier: None,
             client_holds_verifier: false,
             expires: now + Duration::from_secs(900),
+            gateway: None,
+
             created: now,
             status: FlowStatus::Pending,
             consumed: false,

@@ -334,6 +334,138 @@ class TestClaudeGateway(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(mock_sdk._created_servers), 1)
         self.assertEqual(mock_sdk._created_servers[0]["name"], "serabot")
 
+    async def test_auth_endpoints_require_the_bearer_token(self) -> None:
+        for method, path in (
+            ("POST", "/v1/auth/start"),
+            ("POST", "/v1/auth/complete"),
+            ("GET", "/v1/auth/status"),
+        ):
+            status, _ = await _asgi_request(method, path)
+            self.assertEqual(status, 401, path)
+
+    async def test_auth_start_rejects_non_loopback_redirects(self) -> None:
+        headers = {"Authorization": "Bearer test-secret-token-123"}
+        for bad in (
+            "https://127.0.0.1:54545/callback",
+            "http://192.168.1.10:54545/callback",
+            "http://127.0.0.1:80/callback",
+            "http://user@127.0.0.1:54545/callback",
+            "http://127.0.0.1:54545/callback?x=1",
+            "",
+        ):
+            status, body = await _asgi_request(
+                "POST",
+                "/v1/auth/start",
+                headers=headers,
+                json_body={"redirect_uri": bad},
+            )
+            self.assertEqual(status, 400, bad)
+            self.assertIn("error", body)
+
+    async def test_auth_start_returns_a_pkce_url_and_complete_swaps_the_code(
+        self,
+    ) -> None:
+        import tempfile
+
+        headers = {"Authorization": "Bearer test-secret-token-123"}
+        server._pending_auth_flows.clear()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            creds = os.path.join(tmp, "creds.json")
+            os.environ[server.CREDS_PATH_ENV_VAR] = creds
+            try:
+                status, body = await _asgi_request(
+                    "POST",
+                    "/v1/auth/start",
+                    headers=headers,
+                    json_body={"redirect_uri": "http://127.0.0.1:54545/callback"},
+                )
+                self.assertEqual(status, 200)
+                self.assertTrue(body["url"].startswith(server.CLAUDE_OAUTH_AUTHORIZE_URL))
+                self.assertIn("code_challenge=", body["url"])
+                self.assertIn("code_challenge_method=S256", body["url"])
+                self.assertIn(f"state={body['state']}", body["url"])
+                self.assertIn(
+                    "redirect_uri=http%3A%2F%2F127.0.0.1%3A54545%2Fcallback",
+                    body["url"],
+                )
+                state = body["state"]
+
+                # Unknown state is refused and does not burn anything.
+                status, _ = await _asgi_request(
+                    "POST",
+                    "/v1/auth/complete",
+                    headers=headers,
+                    json_body={"state": "nope-nope-nope-nope", "code": "c"},
+                )
+                self.assertEqual(status, 404)
+
+                exchanged: list[tuple[str, str, str]] = []
+
+                def fake_exchange(code: str, redirect_uri: str, verifier: str) -> dict:
+                    exchanged.append((code, redirect_uri, verifier))
+                    return {
+                        "access_token": "at-secret",
+                        "refresh_token": "rt-secret",
+                        "expires_at": 1893456000000,
+                        "scope": "user:profile user:inference",
+                        "account": {
+                            "emailAddress": "owner@example.com",
+                            "accountId": "acct_1",
+                            "subscriptionType": "pro",
+                        },
+                    }
+
+                with patch.object(server, "_exchange_code", fake_exchange):
+                    status, done = await _asgi_request(
+                        "POST",
+                        "/v1/auth/complete",
+                        headers=headers,
+                        json_body={"state": state, "code": "the-code"},
+                    )
+                self.assertEqual(status, 200)
+                self.assertTrue(done["ok"])
+                self.assertEqual(done["account"]["emailAddress"], "owner@example.com")
+                self.assertEqual(exchanged[0][0], "the-code")
+                self.assertEqual(
+                    exchanged[0][1], "http://127.0.0.1:54545/callback"
+                )
+                self.assertTrue(exchanged[0][2])  # the verifier left the process
+
+                # Credentials land in the CLI-shaped file, mode 0600, and the
+                # verifier never appears in it.
+                with open(creds, "r", encoding="utf-8") as handle:
+                    document = json.load(handle)
+                self.assertEqual(
+                    document["claudeAiOauth"]["accessToken"], "at-secret"
+                )
+                self.assertEqual(document["claudeAiOauth"]["account"]["emailAddress"], "owner@example.com")
+                self.assertEqual(os.stat(creds).st_mode & 0o777, 0o600)
+                with open(creds, "rb") as handle:
+                    raw = handle.read()
+                self.assertNotIn(exchanged[0][2].encode(), raw)
+
+                # The state is single-use.
+                status, _ = await _asgi_request(
+                    "POST",
+                    "/v1/auth/complete",
+                    headers=headers,
+                    json_body={"state": state, "code": "again"},
+                )
+                self.assertEqual(status, 404)
+
+                # Status now reports the stored login, without secrets.
+                status, info = await _asgi_request(
+                    "GET", "/v1/auth/status", headers=headers
+                )
+                self.assertEqual(status, 200)
+                self.assertTrue(info["signed_in"])
+                self.assertEqual(info["account"]["emailAddress"], "owner@example.com")
+                self.assertNotIn("accessToken", json.dumps(info))
+            finally:
+                os.environ.pop(server.CREDS_PATH_ENV_VAR, None)
+        server._pending_auth_flows.clear()
+
 
 if __name__ == "__main__":
     unittest.main()

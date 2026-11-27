@@ -29,6 +29,7 @@ pub mod codex;
 pub mod copilot;
 pub mod device;
 pub mod devin;
+pub mod gateway;
 pub mod google;
 pub mod kiro;
 pub mod mistral;
@@ -449,9 +450,13 @@ struct FlowRecord {
     redirect_uri: Option<String>,
     /// The `state` a browser flow started with.
     state: Option<String>,
-    /// The verifier the server generated. `None` when the desktop holds it.
+    /// The verifier the server generated. `None` when the desktop holds it,
+    /// or when a gateway holds it (`gateway` is then set).
     verifier: Option<Zeroizing<String>>,
     client_holds_verifier: bool,
+    /// A `claude-agent-sdk` flow: the loopback gateway base URL the browser
+    /// sign-in is relayed to.
+    gateway: Option<String>,
     expires: Instant,
     created: Instant,
     status: FlowStatus,
@@ -470,6 +475,8 @@ struct TakenFlow {
     redirect_uri: String,
     /// The `state` the flow started with.
     state: String,
+    /// The gateway a `claude-agent-sdk` flow is relayed to, if any.
+    gateway: Option<String>,
 }
 
 /// The open flows, keyed by `(user, flow id)`.
@@ -548,6 +555,8 @@ impl FlowStore {
             });
         }
         // A request that cannot be finished must not burn the member's flow.
+        // A gateway flow keeps its verifier inside the gateway, so the
+        // desktop sends none.
         if record.client_holds_verifier && !has_verifier {
             return Err(SeraError::Rejected {
                 code: "bad_code",
@@ -560,6 +569,7 @@ impl FlowStore {
             client_holds_verifier: record.client_holds_verifier,
             redirect_uri: record.redirect_uri.clone().unwrap_or_default(),
             state: record.state.clone().unwrap_or_default(),
+            gateway: record.gateway.clone(),
         })
     }
 
@@ -704,6 +714,32 @@ impl SignInService {
         kind: &str,
         request: StartRequest,
     ) -> Result<StartedFlow> {
+        self.start_inner(user_id, provider_id, kind, request, None)
+            .await
+    }
+
+    /// Start a browser sign-in relayed to a `claude-agent-sdk` loopback
+    /// gateway (the gateway holds the PKCE verifier and builds the URL).
+    pub async fn start_with_gateway(
+        self: &Arc<Self>,
+        user_id: &str,
+        provider_id: &str,
+        kind: &str,
+        request: StartRequest,
+        gateway: gateway::GatewayEndpoint,
+    ) -> Result<StartedFlow> {
+        self.start_inner(user_id, provider_id, kind, request, Some(gateway))
+            .await
+    }
+
+    async fn start_inner(
+        self: &Arc<Self>,
+        user_id: &str,
+        provider_id: &str,
+        kind: &str,
+        request: StartRequest,
+        gateway: Option<gateway::GatewayEndpoint>,
+    ) -> Result<StartedFlow> {
         let provider = self.provider_for(kind)?;
         let flows = provider.flows();
         let flow = match request.flow {
@@ -718,6 +754,10 @@ impl SignInService {
             });
         }
         let started = match flow {
+            FlowKind::Pkce if gateway.is_some() => {
+                self.start_gateway(user_id, provider_id, &*provider, request, gateway)
+                    .await?
+            }
             FlowKind::Pkce => self.start_pkce(user_id, provider_id, &*provider, request)?,
             FlowKind::Device => self.start_device(user_id, provider_id, provider).await?,
         };
@@ -775,6 +815,68 @@ impl SignInService {
                 state: Some(state.clone()),
                 verifier,
                 client_holds_verifier: client_holds,
+                gateway: None,
+                expires: now + self.flows.ttl,
+                created: now,
+                status: FlowStatus::Pending,
+                consumed: false,
+            },
+        );
+        Ok(StartedFlow {
+            flow_id,
+            flow: FlowKind::Pkce,
+            url,
+            expires_in: self.flows.ttl.as_secs(),
+            user_code: None,
+            interval: None,
+            state: Some(state),
+        })
+    }
+
+    /// Start a browser sign-in relayed to a `claude-agent-sdk` loopback
+    /// gateway. The gateway builds the authorize URL and keeps the PKCE
+    /// verifier; the desktop only sees the URL and the `state`.
+    async fn start_gateway(
+        &self,
+        user_id: &str,
+        provider_id: &str,
+        provider: &dyn SignInProvider,
+        request: StartRequest,
+        gateway: Option<gateway::GatewayEndpoint>,
+    ) -> Result<StartedFlow> {
+        let endpoint = gateway
+            .ok_or_else(|| SeraError::Internal("gateway flow without an endpoint".into()))?;
+        let redirect_uri = request.redirect_uri.ok_or_else(|| SeraError::Rejected {
+            code: "bad_redirect",
+            message: "A sign-in redirect is required".into(),
+        })?;
+        if let Some(spec) = provider.redirect_spec() {
+            pkce::validate_loopback_redirect(&spec, &redirect_uri)?;
+        }
+        // The desktop may pass its state so it can check the redirect; the
+        // challenge/verifier are the gateway's alone.
+        let state = match request.state {
+            Some(state) if pkce::state_ok(&state) => state,
+            Some(_) => {
+                return Err(SeraError::Rejected {
+                    code: "bad_challenge",
+                    message: "The sign-in state is not valid".into(),
+                });
+            }
+            None => pkce::random_state(),
+        };
+        let (url, state) = gateway::gateway_auth_start(&endpoint, &redirect_uri, &state).await?;
+        let now = Instant::now();
+        let flow_id = self.flows.insert(
+            user_id,
+            FlowRecord {
+                provider: provider_id.to_owned(),
+                kind: FlowKind::Pkce,
+                redirect_uri: Some(redirect_uri),
+                state: Some(state.clone()),
+                verifier: None,
+                client_holds_verifier: false,
+                gateway: Some(endpoint.base_url.clone()),
                 expires: now + self.flows.ttl,
                 created: now,
                 status: FlowStatus::Pending,
@@ -810,6 +912,7 @@ impl SignInService {
                 state: None,
                 verifier: None,
                 client_holds_verifier: false,
+                gateway: None,
                 expires: now + lifetime,
                 created: now,
                 status: FlowStatus::Pending,
@@ -924,6 +1027,32 @@ impl SignInService {
         kind: &str,
         request: CompleteRequest,
     ) -> Result<AddOutcome> {
+        self.complete_inner(user_id, provider_id, kind, request, None)
+            .await
+    }
+
+    /// Finish a sign-in whose flow runs on a `claude-agent-sdk` loopback
+    /// gateway.
+    pub async fn complete_with_gateway(
+        &self,
+        user_id: &str,
+        provider_id: &str,
+        kind: &str,
+        request: CompleteRequest,
+        gateway: gateway::GatewayEndpoint,
+    ) -> Result<AddOutcome> {
+        self.complete_inner(user_id, provider_id, kind, request, Some(gateway))
+            .await
+    }
+
+    async fn complete_inner(
+        &self,
+        user_id: &str,
+        provider_id: &str,
+        kind: &str,
+        request: CompleteRequest,
+        gateway: Option<gateway::GatewayEndpoint>,
+    ) -> Result<AddOutcome> {
         let provider = self.provider_for(kind)?;
         let flow_id = match request.flow_id {
             Some(id) => id,
@@ -939,26 +1068,60 @@ impl SignInService {
             request.redirect_uri.as_deref(),
             request.verifier.is_some(),
         )?;
-        let verifier = if taken.client_holds_verifier {
-            Zeroizing::new(request.verifier.ok_or_else(|| SeraError::Rejected {
-                code: "bad_code",
-                message: "The sign-in verifier is required".into(),
-            })?)
-        } else {
-            taken
-                .verifier
-                .ok_or_else(|| SeraError::Internal("a sign-in flow lost its verifier".into()))?
-        };
-        let result = provider
-            .exchange_pkce_with_state(
-                &self.http,
+        // A gateway flow: the gateway holds the verifier and swaps the code;
+        // the account credential is the gateway bearer token.
+        let result = if let (Some(base), Some(endpoint)) = (&taken.gateway, gateway) {
+            debug_assert_eq!(base, &endpoint.base_url);
+            gateway::gateway_auth_complete(
+                &endpoint,
+                &taken.state,
                 &request.code,
                 &taken.redirect_uri,
-                &verifier,
-                &taken.state,
             )
             .await
-            .and_then(|signed_in| self.store_account(user_id, provider_id, signed_in));
+            .and_then(|account| {
+                let identity = json!({
+                    "source": "claude-agent-sdk-gateway",
+                    "account": account,
+                });
+                let fingerprint = crate::accounts::identity_fingerprint(
+                    provider_id,
+                    &serde_json::to_string(&identity).unwrap_or_default(),
+                );
+                let signed_in = SignedIn {
+                    label: "Claude (browser sign-in)".into(),
+                    auth_kind: AuthKind::Oauth,
+                    fingerprint: Some(fingerprint),
+                    identity,
+                    credential: ProviderCredential {
+                        api_key: endpoint.token.as_str().to_owned(),
+                        ..Default::default()
+                    },
+                };
+                self.store_account(user_id, provider_id, signed_in)
+            })
+        } else {
+            let verifier = if taken.client_holds_verifier {
+                Zeroizing::new(request.verifier.ok_or_else(|| SeraError::Rejected {
+                    code: "bad_code",
+                    message: "The sign-in verifier is required".into(),
+                })?)
+            } else {
+                taken
+                    .verifier
+                    .ok_or_else(|| SeraError::Internal("a sign-in flow lost its verifier".into()))?
+            };
+            provider
+                .exchange_pkce_with_state(
+                    &self.http,
+                    &request.code,
+                    &taken.redirect_uri,
+                    &verifier,
+                    &taken.state,
+                )
+                .await
+                .and_then(|signed_in| self.store_account(user_id, provider_id, signed_in))
+        };
         let status = match &result {
             Ok(outcome) => FlowStatus::Ok {
                 account_id: outcome.account_id.clone(),
