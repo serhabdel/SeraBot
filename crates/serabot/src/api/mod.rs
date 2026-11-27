@@ -293,6 +293,13 @@ impl ApiState {
                 secrets.clone(),
             )?),
         );
+        // The claude-agent-sdk gateway's browser sign-in is relayed to the
+        // loopback gateway (first-party claude.ai OAuth); the endpoint and
+        // token come per request from the provider profile.
+        sign_ins.register(
+            "claude-agent-sdk",
+            Arc::new(crate::auth_flows::gateway::ClaudeGatewaySignIn),
+        );
         // Claude plan sign-in is on by default; a provider's `plan_oauth = false`
         // turns it off (checked per request).
         sign_ins.register(

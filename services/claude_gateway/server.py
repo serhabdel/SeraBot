@@ -21,6 +21,8 @@ import ipaddress
 import json
 import logging
 import os
+import time
+from pathlib import Path
 from typing import Any
 import uuid
 
@@ -36,6 +38,26 @@ HOST_ENV_VAR = "SERABOT_CLAUDE_GATEWAY_HOST"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8791
 DEFAULT_MODEL = "claude-sonnet-4-5"
+
+# Browser sign-in ("Sign in with browser" on the provider card) drives the
+# SAME first-party OAuth flow `claude auth login` uses: Anthropic's own CLI
+# client id against claude.ai. This is not the third-party claude.ai OAuth
+# that Anthropic shut down in 2026 — that one SeraBot retired in 0.74.25.
+# The gateway is the only component that ever sees these URLs/tokens; it
+# stores the result where the Claude CLI/SDK reads its login
+# (~/.claude/.credentials.json by default), mode 0600.
+CLAUDE_CLI_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5c5e196af2c3"
+CLAUDE_OAUTH_AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
+CLAUDE_OAUTH_TOKEN_URL = "https://api.anthropic.com/api/oauth/token"
+CLAUDE_OAUTH_SCOPES = "user:profile user:inference"
+AUTH_FLOW_TTL_SECS = 600
+MAX_AUTH_BODY_BYTES = 64 * 1024
+CREDS_PATH_ENV_VAR = "SERABOT_CLAUDE_GATEWAY_CREDS_PATH"
+DEFAULT_CREDS_PATH = os.path.expanduser("~/.claude/.credentials.json")
+
+# Pending browser sign-ins: state -> {verifier, redirect_uri, expires}.
+# Verifiers never leave this process.
+_pending_auth_flows: dict[str, dict[str, Any]] = {}
 
 SUPPORTED_MODELS: list[dict[str, str]] = [
     {"id": "claude-sonnet-4-5"},
@@ -339,6 +361,222 @@ async def turn(request: Request) -> JSONResponse:
     return JSONResponse(result)
 
 
+def _validate_loopback_redirect_uri(uri: str) -> str:
+    """The browser redirect must be an http loopback URL on an unprivileged
+    port with no credentials, query or fragment (the member's desktop runs
+    the loopback listener)."""
+    from urllib.parse import urlparse
+
+    parsed = urlparse(uri)
+    host = (parsed.hostname or "").strip("[]")
+    if (
+        parsed.scheme != "http"
+        or host not in ("127.0.0.1", "localhost", "::1")
+        or parsed.port is None
+        or parsed.port < 1024
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("redirect_uri must be an http loopback URL (port >= 1024)")
+    return uri
+
+
+def _new_pkce() -> tuple[str, str]:
+    import base64
+    import hashlib
+    import secrets
+
+    verifier = secrets.token_urlsafe(64)
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return verifier, challenge
+
+
+def _exchange_code(code: str, redirect_uri: str, verifier: str) -> dict[str, Any]:
+    """Exchange the one-time code at the pinned token URL. Redirects are
+    refused, the body is capped, and only non-secret account fields return."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    form = urllib.parse.urlencode(
+        {
+            "grant_type": "authorization_code",
+            "client_id": CLAUDE_CLI_CLIENT_ID,
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "code_verifier": verifier,
+        }
+    ).encode("utf-8")
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+            return None
+
+    request = urllib.request.Request(
+        CLAUDE_OAUTH_TOKEN_URL,
+        data=form,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(request, timeout=30) as response:
+            body = response.read(MAX_AUTH_BODY_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        raise ValueError(f"token exchange refused with HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise ValueError("could not reach the token endpoint") from exc
+    if len(body) > MAX_AUTH_BODY_BYTES:
+        raise ValueError("token response too large")
+    try:
+        payload = json.loads(body)
+    except ValueError as exc:
+        raise ValueError("token response was not JSON") from exc
+    if not isinstance(payload, dict) or not payload.get("access_token"):
+        raise ValueError("token response had no access token")
+    return payload
+
+
+def _write_credentials(payload: dict[str, Any]) -> dict[str, Any]:
+    """Write the OAuth tokens where the Claude CLI/SDK reads its login
+    (``~/.claude/.credentials.json`` by default), mode 0600. Returns the
+    non-secret account summary."""
+    creds_path = os.environ.get(CREDS_PATH_ENV_VAR, DEFAULT_CREDS_PATH)
+    account = payload.get("account") if isinstance(payload.get("account"), dict) else {}
+    summary = {
+        "emailAddress": account.get("emailAddress"),
+        "accountId": account.get("accountId"),
+        "subscriptionType": account.get("subscriptionType"),
+    }
+    document = {
+        "claudeAiOauth": {
+            "accessToken": payload.get("access_token"),
+            "refreshToken": payload.get("refresh_token"),
+            "expiresAt": payload.get("expires_at"),
+            "scopes": payload.get("scope", "").split() if payload.get("scope") else [],
+            "subscriptionType": account.get("subscriptionType"),
+            "account": summary,
+        }
+    }
+    path = Path(creds_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(document, handle)
+    os.chmod(path, 0o600)
+    return summary
+
+
+def _read_credentials() -> dict[str, Any] | None:
+    creds_path = os.environ.get(CREDS_PATH_ENV_VAR, DEFAULT_CREDS_PATH)
+    try:
+        with open(creds_path, "r", encoding="utf-8") as handle:
+            document = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    oauth = document.get("claudeAiOauth") if isinstance(document, dict) else None
+    if not isinstance(oauth, dict) or not oauth.get("accessToken"):
+        return None
+    account = oauth.get("account") if isinstance(oauth.get("account"), dict) else {}
+    return {
+        "emailAddress": account.get("emailAddress"),
+        "subscriptionType": account.get("subscriptionType"),
+    }
+
+
+async def auth_start(request: Request) -> JSONResponse:
+    """Begin the first-party browser sign-in: build the claude.ai authorize
+    URL (PKCE S256, verifier stays in this process) for the member's desktop
+    loopback redirect."""
+    auth_error = _check_bearer_auth(request)
+    if auth_error is not None:
+        return auth_error
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "JSON body must be an object"}, status_code=400)
+    try:
+        redirect_uri = _validate_loopback_redirect_uri(str(payload.get("redirect_uri") or ""))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    state = payload.get("state")
+    if state is not None:
+        state = str(state)
+        if not 16 <= len(state) <= 128 or not all(
+            c.isalnum() or c in "_-" for c in state
+        ):
+            return JSONResponse({"error": "invalid state"}, status_code=400)
+    else:
+        import secrets
+
+        state = secrets.token_urlsafe(24)
+    verifier, challenge = _new_pkce()
+    expires = time.time() + AUTH_FLOW_TTL_SECS
+    _pending_auth_flows[state] = {
+        "verifier": verifier,
+        "redirect_uri": redirect_uri,
+        "expires": expires,
+    }
+    from urllib.parse import urlencode
+
+    url = CLAUDE_OAUTH_AUTHORIZE_URL + "?" + urlencode(
+        {
+            "client_id": CLAUDE_CLI_CLIENT_ID,
+            "response_type": "code",
+            "redirect_uri": redirect_uri,
+            "scope": CLAUDE_OAUTH_SCOPES,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": state,
+        }
+    )
+    return JSONResponse({"url": url, "state": state, "expires_in": AUTH_FLOW_TTL_SECS})
+
+
+async def auth_complete(request: Request) -> JSONResponse:
+    """Finish the browser sign-in: swap the code at the pinned token endpoint
+    and store the login where the SDK reads it."""
+    auth_error = _check_bearer_auth(request)
+    if auth_error is not None:
+        return auth_error
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "JSON body must be an object"}, status_code=400)
+    state = str(payload.get("state") or "")
+    code = str(payload.get("code") or "")
+    if not state or not code:
+        return JSONResponse({"error": "state and code are required"}, status_code=400)
+    pending = _pending_auth_flows.pop(state, None)
+    if pending is None:
+        return JSONResponse({"error": "unknown or used sign-in state"}, status_code=404)
+    if time.time() >= pending["expires"]:
+        return JSONResponse({"error": "sign-in expired; start again"}, status_code=410)
+    try:
+        tokens = _exchange_code(code, pending["redirect_uri"], pending["verifier"])
+    except ValueError as exc:
+        logger.warning("auth complete failed: %s", exc)
+        return JSONResponse({"error": "token exchange failed"}, status_code=502)
+    account = _write_credentials(tokens)
+    logger.info("browser sign-in stored credentials for a Claude account")
+    return JSONResponse({"ok": True, "account": account})
+
+
+async def auth_status(request: Request) -> JSONResponse:
+    auth_error = _check_bearer_auth(request)
+    if auth_error is not None:
+        return auth_error
+    account = _read_credentials()
+    return JSONResponse({"signed_in": account is not None, "account": account})
+
+
 @asynccontextmanager
 async def lifespan(_app: Starlette):
     env_host = os.environ.get(HOST_ENV_VAR, DEFAULT_HOST)
@@ -351,6 +589,9 @@ app = Starlette(
         Route("/health", health, methods=["GET"]),
         Route("/v1/models", list_models, methods=["GET"]),
         Route("/v1/turn", turn, methods=["POST"]),
+        Route("/v1/auth/start", auth_start, methods=["POST"]),
+        Route("/v1/auth/complete", auth_complete, methods=["POST"]),
+        Route("/v1/auth/status", auth_status, methods=["GET"]),
     ],
     lifespan=lifespan,
 )

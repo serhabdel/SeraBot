@@ -746,3 +746,10 @@ Plan: `docs/specs/0.74.15-proposal.md`. Version stays `0.74.14` until the batch 
 - [x] Agent SDK documented (`docs/specs/claude-agent-sdk-gateway.md`, AGENTS.md, preset note): no third-party claude.ai OAuth (retired 0.74.25); SDK auth = `claude auth login`/API key inside the gateway; multi-account = one loopback gateway per login on its own port, one `claude-agent-sdk` provider each (config test `multiple_claude_agent_sdk_gateways_each_on_their_own_loopback_port`); Rust already speaks the gateway natively via `Wire::ClaudeGateway`.
 - [x] Version bump `0.74.27` (`Cargo.toml`), mobile `0.74.27+101`, `docs/release-0.74.27.md`, `README.md`, `tasks/todo.md`.
 - [ ] Owner: re-run Proton Pass sync (previously "Server returned HTTP 502") and try a second gateway on `127.0.0.1:8792` as provider `claude-agent-sdk-2`.
+## Release 0.74.28 — "Sign in with browser" for the Claude Agent SDK gateway
+
+- [x] Gateway auth endpoints (`services/claude_gateway/server.py`): `POST /v1/auth/start`, `POST /v1/auth/complete`, `GET /v1/auth/status` — first-party claude.ai OAuth PKCE (the `claude auth login` client id), verifier stays in the gateway, pinned token URL, redirect_uri validated loopback, tokens written to the CLI credentials file 0600.
+- [x] Server relays the flow for kind `claude-agent-sdk` (`auth_flows/gateway.rs`, `auth_flows/mod.rs` `start_with_gateway`/`complete_with_gateway`, `api/provider_accounts.rs`, registry in `api/mod.rs`); account credential = gateway bearer token, identity from the gateway.
+- [x] Desktop: preset `sign_in = "pkce"` + "Sign in with browser" tile label, so the gateway card offers browser sign-in next to the API key.
+- [x] Docs: `docs/specs/claude-agent-sdk-gateway.md` browser sign-in section; `docs/release-0.74.28.md`; version bump `0.74.28` (`Cargo.toml`), mobile `0.74.28+102`, `README.md`, `tasks/todo.md`.
+- [ ] Owner: on the `claude-agent-sdk` card press "Sign in with browser" and complete the claude.ai login; then run a turn and `GET /v1/auth/status` on the gateway.

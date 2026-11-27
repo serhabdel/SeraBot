@@ -768,7 +768,9 @@ const PRESETS: &[ProviderPreset] = &[
         badge: "Gateway",
         note: "Local loopback Claude Agent SDK gateway — requires a local gateway token. One gateway per Claude login on its own loopback port: add each as its own provider (edit the base URL, keep it loopback). See docs/specs/claude-agent-sdk-gateway.md",
         key_url: "",
-        sign_in: "",
+        // "Sign in with browser": relayed to the gateway, which runs the
+        // first-party claude.ai OAuth flow (the `claude auth login` client).
+        sign_in: "pkce",
         risk: "",
     },
     ProviderPreset {
@@ -1231,6 +1233,9 @@ mod tests {
                 "kiro" => "device",
                 // Devin CLI: browser PKCE sign-in or pasted session token.
                 "devin" => "pkce",
+                // Gateway: "Sign in with browser", relayed to the loopback
+                // gateway (first-party claude.ai OAuth there).
+                "claude-agent-sdk" => "pkce",
                 _ => "",
             };
             assert_eq!(preset.sign_in, expected_sign_in, "{:?}", preset.id);

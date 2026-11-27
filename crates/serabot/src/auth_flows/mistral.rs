@@ -588,6 +588,7 @@ mod tests {
                 state: None,
                 verifier: None,
                 client_holds_verifier: false,
+                gateway: None,
                 expires: std::time::Instant::now() + std::time::Duration::from_secs(60),
                 created: std::time::Instant::now(),
                 status: FlowStatus::Pending,
