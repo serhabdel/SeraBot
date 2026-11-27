@@ -419,6 +419,7 @@ pub fn directory_offers_sign_in(
 fn sign_in_target(message: &str) -> Option<(&'static str, &'static str)> {
     let lower = message.to_ascii_lowercase();
     if !(lower.contains("is empty; provide credentials")
+        || lower.contains("is empty; provide an api key")
         || lower.contains("refresh_token is empty")
         || lower.contains("_identity is empty"))
     {
@@ -426,6 +427,8 @@ fn sign_in_target(message: &str) -> Option<(&'static str, &'static str)> {
     }
     if lower.contains("antigravity") {
         Some(("google-antigravity", "Google Antigravity"))
+    } else if lower.contains("claude_gateway") {
+        Some(("claude-agent-sdk", "Claude Agent SDK Gateway"))
     } else if lower.contains("muse") {
         Some(("muse-code", "Muse Code"))
     } else {
@@ -1008,6 +1011,7 @@ mod tests {
         for raw in [
             "secret antigravity_refresh_token is empty; provide credentials",
             "secret muse_code_identity is empty; provide credentials",
+            "secret claude_gateway_token is empty; provide an API key",
         ] {
             let plain = plain_error(raw);
             assert!(plain.starts_with("Sign in to "), "{plain}");
@@ -1024,6 +1028,14 @@ mod tests {
         assert!(
             plain_error("secret muse_code_identity is empty; provide credentials")
                 .contains("Muse Code")
+        );
+        assert_eq!(
+            sign_in_needed_for("secret claude_gateway_token is empty; provide an API key"),
+            Some("claude-agent-sdk")
+        );
+        assert!(
+            plain_error("secret claude_gateway_token is empty; provide an API key")
+                .contains("Claude Agent SDK Gateway")
         );
         assert_eq!(
             sign_in_needed_for("secret antigravity_refresh_token is empty; provide credentials"),

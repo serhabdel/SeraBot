@@ -572,8 +572,14 @@ impl AdminStore {
         // without any, and the owner's Sign in button does the rest. OpenRouter
         // takes either a key or a sign-in, so it may save without a key too, and
         // so does Claude while its plan sign-in is on: "Sign in with Claude" on
-        // a provider that was never saved must not ask for a key first.
-        let signs_in = is_oauth || profile.kind == "openrouter" || profile.plan_oauth_enabled();
+        // a provider that was never saved must not ask for a key first. The
+        // claude-agent-sdk gateway is the same shape: "Sign in with browser"
+        // works without a saved key — the gateway's own bearer token comes from
+        // the server-level [claude_gateway] token_secret.
+        let signs_in = is_oauth
+            || profile.kind == "openrouter"
+            || profile.kind == "claude-agent-sdk"
+            || profile.plan_oauth_enabled();
         if !signs_in && !secrets.has(&profile.api_key_secret) {
             return Err(SeraError::Validation(format!(
                 "secret {} is empty; provide an API key",
@@ -1045,6 +1051,13 @@ mod tests {
         );
         store
             .add_provider(&config, &creds, "or", profile("openrouter"), None)
+            .unwrap();
+        // The gateway provider likewise saves without a key: the browser
+        // sign-in is relayed with the server-level gateway token.
+        let mut gateway = profile("claude-agent-sdk");
+        gateway.base_url = "http://127.0.0.1:8791".into();
+        store
+            .add_provider(&config, &creds, "claude-agent-sdk", gateway, None)
             .unwrap();
         std::fs::remove_dir_all(&root).ok();
     }

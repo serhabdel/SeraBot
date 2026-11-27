@@ -713,8 +713,11 @@ pub(super) struct SigninStartRequest {
 }
 
 /// The loopback gateway a `claude-agent-sdk` sign-in is relayed to, with the
-/// gateway bearer token (the provider's stored credential). `None` for every
-/// other kind.
+/// gateway bearer token. The token comes from the provider's stored credential
+/// (the per-user key) when there is one, else from the server-level
+/// `[claude_gateway] token_secret` in the age store — so "Sign in with
+/// browser" works on a provider saved without a key. `None` for every other
+/// kind.
 fn gateway_endpoint(
     state: &ApiState,
     user: &ActingUser,
@@ -727,22 +730,27 @@ fn gateway_endpoint(
         return Ok(None);
     }
     let base_url = crate::providers::resolve_base_url(kind, &profile.base_url)?;
-    let Some((_, secret)) = state.users.resolve_with_owner(&user.id, id)? else {
+    let token = match state.users.resolve_with_owner(&user.id, id)? {
+        Some((_, secret)) => {
+            let credential = crate::user_secrets::ProviderCredential::parse(&secret)?;
+            if credential.api_key.trim().is_empty() {
+                None
+            } else {
+                Some(credential.api_key)
+            }
+        }
+        None => None,
+    };
+    let token = token.or_else(|| state.secrets.get(&state.config.claude_gateway.token_secret));
+    let Some(token) = token else {
         return Err(SeraError::Validation(
-            "save this provider's gateway token first; the browser sign-in is relayed through it"
+            "the gateway token is not set on this server: set the [claude_gateway] token_secret, or save it as this provider's API key"
                 .into(),
         ));
     };
-    let credential = crate::user_secrets::ProviderCredential::parse(&secret)?;
-    if credential.api_key.trim().is_empty() {
-        return Err(SeraError::Validation(
-            "save this provider's gateway token first; the browser sign-in is relayed through it"
-                .into(),
-        ));
-    }
     Ok(Some(GatewayEndpoint::validated(
         &base_url,
-        zeroize::Zeroizing::new(credential.api_key),
+        zeroize::Zeroizing::new(token),
     )?))
 }
 
