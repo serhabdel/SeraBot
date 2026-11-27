@@ -1045,8 +1045,12 @@ impl State {
                         .insert(format!("{provider}/{account}"), result);
                 }
             }
-            // The session applies the saved route (it owns the editor).
-            Reply::RouteSaved => {}
+            // The session applies the saved route and gateway state.
+            Reply::RouteSaved
+            | Reply::GatewayStatus { .. }
+            | Reply::GatewayToken { .. }
+            | Reply::GatewayCliImported { .. }
+            | Reply::GatewaySigninCompleted { .. } => {}
             Reply::Runs(handoffs) => self.runs.set_ledger(handoffs),
             // The session asks for the list again after an action.
             Reply::RunActed => self.runs.stale = true,

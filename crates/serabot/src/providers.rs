@@ -1807,6 +1807,21 @@ pub fn open_provider_client(
                 "muse-code" | "anthropic" | "openai-codex" | "github-copilot" | "kiro" | "devin"
             ),
         );
+        if kind == "claude-agent-sdk" {
+            let gw_profile = row
+                .as_ref()
+                .and_then(|row| row.identity.get("profile"))
+                .and_then(Value::as_str)
+                .filter(|p| {
+                    (1..=64).contains(&p.len())
+                        && p.chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+                })
+                .map(str::to_owned);
+            if let Some(gw_profile) = gw_profile {
+                client = client.with_claude_profile(gw_profile);
+            }
+        }
         if kind == "openai-codex" {
             // The ChatGPT workspace the sign-in named goes on every request.
             let chatgpt_account = row

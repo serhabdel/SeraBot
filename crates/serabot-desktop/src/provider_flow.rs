@@ -86,6 +86,8 @@ pub struct ProviderFlow {
     pub provider: String,
     pub kind: FlowKind,
     pub phase: FlowPhase,
+    /// Server flow id, kept so manual paste-code completion can target it.
+    pub flow_id: Option<String>,
     /// The provider's page: opened for the member, and kept for "Open page".
     pub url: Option<String>,
     pub browser_opened: bool,
@@ -103,6 +105,7 @@ impl ProviderFlow {
             provider: provider.to_owned(),
             kind,
             phase: FlowPhase::Starting,
+            flow_id: None,
             url: None,
             browser_opened: false,
             user_code: None,
@@ -117,6 +120,7 @@ impl ProviderFlow {
         }
         match msg {
             FlowMsg::Started { started, opened } => {
+                self.flow_id = Some(started.flow_id);
                 self.url = Some(started.url);
                 self.user_code = started.user_code;
                 self.expires_in = started.expires_in;
@@ -293,14 +297,48 @@ pub(crate) fn oauth_end(error: OAuthError) -> FlowEnd {
 /// shown when it sent one; a raw status never is.
 pub(crate) fn api_end(error: ApiError) -> FlowEnd {
     FlowEnd::Failed(match error {
+        ApiError::Coded { code, message, .. } => {
+            crate::provider_accounts::plain_coded_error(&code, &message)
+        }
         ApiError::Rejected(message) => crate::provider_accounts::plain_error(&message),
         ApiError::Http(404) => {
             "This server does not offer that sign-in. Update the server.".to_owned()
         }
         ApiError::Http(403) => "You are not allowed to sign in to this provider here.".to_owned(),
         ApiError::Transport => "Could not reach the server. Check the connection.".to_owned(),
-        other => other.to_string(),
+        other => crate::provider_accounts::plain_error(&other.to_string()),
     })
+}
+
+/// Run a gateway browser sign-in (`claude-agent-sdk`): no desktop loopback
+/// listener is bound; the server relays to the gateway, opens the returned
+/// `claude.ai` URL, and polls `signin/status/{flow_id}` every 2s so local
+/// gateways finish automatically while the UI also allows manual paste-code
+/// completion for remote gateways.
+pub fn run_gateway_browser(
+    client: &ApiClient,
+    provider: &str,
+    cancel: &AtomicBool,
+    report: &dyn Fn(FlowMsg),
+    open: &dyn Fn(&str) -> bool,
+) -> FlowEnd {
+    let started =
+        match client.provider_signin_start(provider, &serde_json::json!({ "flow": "pkce" })) {
+            Ok(started) => started,
+            Err(error) => return api_end(error),
+        };
+    let opened = open(&started.url);
+    let flow_id = started.flow_id.clone();
+    let mut poll_started = started.clone();
+    poll_started.interval = Some(2);
+    report(FlowMsg::Started { started, opened });
+    poll_device(
+        &poll_started,
+        cancel,
+        &mut || client.provider_signin_status(provider, &flow_id),
+        &mut std::thread::sleep,
+        report,
+    )
 }
 
 /// Run a browser sign-in: listen on loopback, get the page from the server,
@@ -314,6 +352,9 @@ pub fn run_browser(
     report: &dyn Fn(FlowMsg),
     open: &dyn Fn(&str) -> bool,
 ) -> FlowEnd {
+    if kind == "claude-agent-sdk" {
+        return run_gateway_browser(client, provider, cancel, report, open);
+    }
     let plan = redirect_plan(kind);
     // A `localhost` redirect may arrive on `::1` or `127.0.0.1`, whichever the
     // browser tries first: listen on both where the system has IPv6.
@@ -357,7 +398,13 @@ pub fn run_browser(
         Err(error) => return oauth_end(error),
     };
     drop(loopback);
-    match client.provider_signin_complete(provider, &flow_id, &code, &redirect, &pkce.verifier) {
+    match client.provider_signin_complete(
+        provider,
+        &flow_id,
+        &code,
+        Some(redirect.as_str()),
+        &pkce.verifier,
+    ) {
         Ok(done) => FlowEnd::Done {
             account_id: done.account_id,
             created: done.created,

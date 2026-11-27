@@ -180,6 +180,9 @@ pub struct LlmClient {
     /// A GitHub Copilot account: the editor headers are on every request, and
     /// the model list comes from the plan's own host.
     copilot: bool,
+    /// The profile name for a `claude-agent-sdk` gateway account, sent as
+    /// `X-Claude-Profile` and `"profile"`.
+    claude_profile: Option<String>,
 }
 
 /// What a Codex request carries beyond the bearer: the ChatGPT workspace the
@@ -245,6 +248,7 @@ impl LlmClient {
             opencode_session: None,
             codex: None,
             copilot: false,
+            claude_profile: None,
         })
     }
 
@@ -303,6 +307,16 @@ impl LlmClient {
         self.base_url = crate::config::validate_loopback_gateway_url(&self.base_url)?;
         self.wire = Wire::ClaudeGateway;
         Ok(self)
+    }
+
+    /// Set the Claude Agent SDK gateway profile name (`X-Claude-Profile`).
+    pub fn with_claude_profile(mut self, profile: impl Into<String>) -> Self {
+        let profile = profile.into();
+        let trimmed = profile.trim();
+        if !trimmed.is_empty() {
+            self.claude_profile = Some(trimmed.to_owned());
+        }
+        self
     }
 
     /// Speak AWS Kiro EventStream wire format.
@@ -550,7 +564,9 @@ impl LlmClient {
                     .await;
             }
             Wire::ClaudeGateway => {
-                return self.complete_claude_gateway(messages, tools, &model).await;
+                return self
+                    .complete_claude_gateway(messages, tools, &model, extra)
+                    .await;
             }
             Wire::Kiro => {
                 return self.complete_kiro(messages, tools, &model, extra).await;
@@ -799,10 +815,11 @@ impl LlmClient {
                     .await;
                 }
                 Err(error) => {
+                    let reason = transport_reason(&error);
                     // A catalog GET is idempotent, so timeouts are retried too.
-                    last_error = Some(llm_failure::transport_error(
-                        "model catalog request failed".into(),
-                    ));
+                    last_error = Some(llm_failure::transport_error(format!(
+                        "model catalog transport failed ({reason})"
+                    )));
                     if !retry::transport_retryable(&error, true) || attempt == self.max_retries {
                         break;
                     }
@@ -1403,7 +1420,9 @@ impl LlmClient {
                             break;
                         }
                         CloudPost::Unauthorized => return Err(cloud_status_error(401)),
-                        CloudPost::NotFound | CloudPost::SessionLimited | CloudPost::Transport => {
+                        CloudPost::NotFound
+                        | CloudPost::SessionLimited
+                        | CloudPost::Transport(_) => {
                             break;
                         }
                     }
@@ -1504,7 +1523,13 @@ impl LlmClient {
                             last_error = Some(catalog_retag(error));
                         }
                     }
-                    CloudPost::Transport => {}
+                    CloudPost::Transport(reason) => {
+                        if !url.contains(".sandbox.googleapis.com") || last_error.is_none() {
+                            last_error = Some(llm_failure::transport_error(format!(
+                                "model catalog transport failed ({reason})"
+                            )));
+                        }
+                    }
                 }
             }
             if !restart {
@@ -1548,10 +1573,60 @@ impl LlmClient {
         key.zeroize();
         let response = match response {
             Ok(response) => response,
-            Err(_) => return Ok(CloudPost::Transport),
+            Err(err) => {
+                let reason = transport_reason(&err);
+                tracing::warn!(reason, "cloud code transport failed");
+                return Ok(CloudPost::Transport(reason));
+            }
         };
         Ok(classify_cloud(response, stream).await)
     }
+}
+
+/// Safe, URL-free and secret-free classification of a `reqwest::Error`
+/// transport failure for logs and diagnostics.
+pub(crate) fn transport_reason(err: &reqwest::Error) -> &'static str {
+    if err.is_timeout() {
+        return "timeout";
+    }
+    if err.is_connect() {
+        let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+        while let Some(source) = cur {
+            let msg = source.to_string().to_ascii_lowercase();
+            if msg.contains("dns")
+                || msg.contains("failed to lookup")
+                || msg.contains("name or service not known")
+                || msg.contains("no such host")
+                || msg.contains("nodename nor servname")
+            {
+                return "dns";
+            }
+            if msg.contains("tls")
+                || msg.contains("ssl")
+                || msg.contains("certificate")
+                || msg.contains("handshake")
+                || msg.contains("rustls")
+            {
+                return "tls";
+            }
+            cur = source.source();
+        }
+        return "connect";
+    }
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(source) = cur {
+        let msg = source.to_string().to_ascii_lowercase();
+        if msg.contains("tls")
+            || msg.contains("ssl")
+            || msg.contains("certificate")
+            || msg.contains("handshake")
+            || msg.contains("rustls")
+        {
+            return "tls";
+        }
+        cur = source.source();
+    }
+    "transport"
 }
 
 /// Run one token exchange for an account: a Google-style refresh grant, or a
@@ -1625,7 +1700,7 @@ enum CloudPost {
     /// A load-shaped 429/503 capacity failure eligible for bounded backoff.
     CapacityRetryable(SeraError),
     Failed(SeraError),
-    Transport,
+    Transport(&'static str),
 }
 
 /// A Cloud Code status failure with no body to classify.
@@ -1684,7 +1759,8 @@ async fn read_cloud_sse(response: reqwest::Response) -> CloudPost {
     loop {
         let next = match tokio::time::timeout(CLOUD_IDLE_TIMEOUT, stream.next()).await {
             Ok(Some(Ok(chunk))) => chunk,
-            Ok(Some(Err(_))) | Err(_) => return CloudPost::Transport,
+            Ok(Some(Err(_))) => return CloudPost::Transport("transport"),
+            Err(_) => return CloudPost::Transport("timeout"),
             Ok(None) => break,
         };
         if let Err(error) = reader.push_chunk(&next) {
@@ -1703,7 +1779,8 @@ async fn read_cloud_bytes(response: reqwest::Response) -> CloudPost {
     loop {
         let next = match tokio::time::timeout(CLOUD_IDLE_TIMEOUT, stream.next()).await {
             Ok(Some(Ok(chunk))) => chunk,
-            Ok(Some(Err(_))) | Err(_) => return CloudPost::Transport,
+            Ok(Some(Err(_))) => return CloudPost::Transport("transport"),
+            Err(_) => return CloudPost::Transport("timeout"),
             Ok(None) => break,
         };
         if bytes.len().saturating_add(next.len()) > CLOUD_MAX_BYTES {

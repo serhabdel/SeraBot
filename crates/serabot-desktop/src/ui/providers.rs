@@ -726,6 +726,9 @@ fn ProviderCard(
                     StatusChip { tone, text }
                 }
             }
+            if provider.kind == "claude-agent-sdk" {
+                GatewayStatusStrip { session, provider_id: id.clone(), can_write }
+            }
             AccountsBlock { session, provider_id: id.clone(), overlay }
             footer { class: "prov-card-foot",
                 if !provider.is_default && conn.is_connected() && star_model.is_some() {
@@ -801,6 +804,161 @@ fn ProviderCard(
                             Icon { name: "trash", size: 14 }
                             "Remove"
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Compact gateway health strip + setup helper for `claude-agent-sdk` cards.
+#[component]
+fn GatewayStatusStrip(session: Signal<Session>, provider_id: String, can_write: bool) -> Element {
+    let pid_effect = provider_id.clone();
+    use_effect(move || {
+        let needs_fetch = {
+            let s = session.read();
+            s.ready()
+                && s.state.connected
+                && !s.accounts_ui.gateway_statuses.contains_key(&pid_effect)
+                && !s.accounts_ui.gateway_busy.contains_key(&pid_effect)
+                && !s.accounts_ui.gateway_errors.contains_key(&pid_effect)
+        };
+        if needs_fetch {
+            session.write().check_gateway_status(&pid_effect);
+        }
+    });
+
+    let (status, generated, busy, error) = {
+        let s = session.read();
+        (
+            s.accounts_ui.gateway_statuses.get(&provider_id).cloned(),
+            s.accounts_ui.gateway_tokens.get(&provider_id).cloned(),
+            s.accounts_ui.gateway_busy.get(&provider_id).copied(),
+            s.accounts_ui.gateway_errors.get(&provider_id).cloned(),
+        )
+    };
+    let checking = busy == Some("status");
+    let generating = busy == Some("token");
+    let importing = busy == Some("import");
+    let needs_setup = status
+        .as_ref()
+        .is_some_and(|st| !st.token_configured || !st.reachable);
+    let can_import_cli = status.as_ref().is_some_and(|st| st.default_cli_login);
+    let pid_check = provider_id.clone();
+    let pid_gen = provider_id.clone();
+    let pid_recheck = provider_id.clone();
+    let pid_dismiss = provider_id.clone();
+    let pid_import = provider_id.clone();
+
+    rsx! {
+        div { class: "acct-block",
+            div { class: "acct-head",
+                span { class: "micro", "Gateway status" }
+                div { class: "row",
+                    if let Some(st) = &status {
+                        StatusChip {
+                            tone: if st.reachable { serabot_desktop::theme::Tone::Ok } else { serabot_desktop::theme::Tone::Danger },
+                            text: if st.reachable { "Reachable".to_owned() } else { "Offline".to_owned() },
+                        }
+                        StatusChip {
+                            tone: if st.token_configured { serabot_desktop::theme::Tone::Ok } else { serabot_desktop::theme::Tone::Warn },
+                            text: if st.token_configured { "Token configured".to_owned() } else { "Token missing".to_owned() },
+                        }
+                        StatusChip {
+                            tone: if st.cli_installed { serabot_desktop::theme::Tone::Ok } else { serabot_desktop::theme::Tone::Warn },
+                            text: if st.cli_installed { "Claude CLI installed".to_owned() } else { "Claude CLI missing".to_owned() },
+                        }
+                    } else if checking {
+                        span { class: "tiny", "Checking gateway\u{2026}" }
+                    }
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        disabled: !can_write || busy.is_some(),
+                        onclick: move |_| session.write().check_gateway_status(&pid_check),
+                        Icon { name: "refresh", size: 14 }
+                        if checking { "Checking\u{2026}" } else { "Check status" }
+                    }
+                }
+            }
+            if let Some(err) = error {
+                div { class: "prov-note warn", role: "alert",
+                    Icon { name: "alert", size: 14 }
+                    span { "{err}" }
+                }
+            }
+            if needs_setup || generated.is_some() {
+                div { class: "prov-note action", role: "note",
+                    Icon { name: "lock", size: 14 }
+                    div { class: "prov-note-body",
+                        span { "Set up gateway" }
+                        span { class: "tiny",
+                            "Generate a bearer token for this gateway, start the loopback gateway with it, then check again."
+                        }
+                        div { class: "row",
+                            button {
+                                class: "btn primary sm",
+                                r#type: "button",
+                                disabled: !can_write || busy.is_some(),
+                                onclick: move |_| session.write().generate_gateway_token(&pid_gen),
+                                if generating { "Generating\u{2026}" } else { "Generate token" }
+                            }
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                disabled: !can_write || busy.is_some(),
+                                onclick: move |_| session.write().check_gateway_status(&pid_recheck),
+                                "Check again"
+                            }
+                        }
+                        if let Some(generated_token) = generated {
+                            div { class: "field",
+                                if let Some(tok) = generated_token.token.as_ref() {
+                                    span { class: "tiny", "One-time token (save now, shown once):" }
+                                    code { class: "flow-link", "{tok}" }
+                                }
+                                if !generated_token.startup_command.is_empty() {
+                                    span { class: "tiny", "Start the gateway with:" }
+                                    code { class: "flow-link", "{generated_token.startup_command}" }
+                                }
+                                div { class: "row",
+                                    if !generated_token.startup_command.is_empty() {
+                                        button {
+                                            class: "btn ghost sm",
+                                            r#type: "button",
+                                            onclick: {
+                                                let cmd = generated_token.startup_command.clone();
+                                                move |_| {
+                                                    let _ = dioxus::document::eval(&copy_script(&cmd));
+                                                }
+                                            },
+                                            Icon { name: "copy", size: 14 }
+                                            "Copy command"
+                                        }
+                                    }
+                                    button {
+                                        class: "btn ghost sm",
+                                        r#type: "button",
+                                        onclick: move |_| session.write().dismiss_gateway_token(&pid_dismiss),
+                                        "Dismiss"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if can_import_cli {
+                div { class: "prov-note info", role: "note",
+                    Icon { name: "external", size: 14 }
+                    span { class: "grow", "An existing Claude CLI login is available on this gateway." }
+                    button {
+                        class: "btn primary sm",
+                        r#type: "button",
+                        disabled: !can_write || busy.is_some(),
+                        onclick: move |_| session.write().import_gateway_cli(&pid_import),
+                        if importing { "Connecting\u{2026}" } else { "Connect existing Claude login" }
                     }
                 }
             }

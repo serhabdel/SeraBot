@@ -775,8 +775,19 @@ impl ModelRouter {
                         code: "needs_reauth",
                         ..
                     } => FetchFailure::KeyRejected,
-                    SeraError::Upstream { status, code, .. } => {
-                        tracing::warn!(provider = id, status, code, "catalog refresh failed");
+                    SeraError::Upstream {
+                        status,
+                        code,
+                        message,
+                        ..
+                    } => {
+                        tracing::warn!(
+                            provider = id,
+                            status,
+                            code,
+                            reason = %message,
+                            "catalog refresh failed"
+                        );
                         match *status {
                             401 | 403 => FetchFailure::KeyRejected,
                             0 | 500..=599 => FetchFailure::Unreachable,

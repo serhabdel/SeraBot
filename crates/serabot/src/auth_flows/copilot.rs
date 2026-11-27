@@ -416,6 +416,8 @@ mod tests {
             client_holds_verifier: false,
             expires: now + Duration::from_secs(900),
             gateway: None,
+            gateway_flow_id: None,
+            gateway_profile: None,
 
             created: now,
             status: FlowStatus::Pending,

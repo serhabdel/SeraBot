@@ -457,6 +457,10 @@ struct FlowRecord {
     /// A `claude-agent-sdk` flow: the loopback gateway base URL the browser
     /// sign-in is relayed to.
     gateway: Option<String>,
+    /// The gateway-side flow id for a `claude-agent-sdk` sign-in.
+    gateway_flow_id: Option<String>,
+    /// The gateway-side profile name for a `claude-agent-sdk` sign-in.
+    gateway_profile: Option<String>,
     expires: Instant,
     created: Instant,
     status: FlowStatus,
@@ -477,6 +481,8 @@ struct TakenFlow {
     state: String,
     /// The gateway a `claude-agent-sdk` flow is relayed to, if any.
     gateway: Option<String>,
+    gateway_flow_id: Option<String>,
+    gateway_profile: Option<String>,
 }
 
 /// The open flows, keyed by `(user, flow id)`.
@@ -570,6 +576,8 @@ impl FlowStore {
             redirect_uri: record.redirect_uri.clone().unwrap_or_default(),
             state: record.state.clone().unwrap_or_default(),
             gateway: record.gateway.clone(),
+            gateway_flow_id: record.gateway_flow_id.clone(),
+            gateway_profile: record.gateway_profile.clone(),
         })
     }
 
@@ -579,6 +587,36 @@ impl FlowStore {
             .get_mut(&(user_id.to_owned(), flow_id.to_owned()))
         {
             record.status = status;
+        }
+    }
+
+    fn mark_gateway_finished(&self, user_id: &str, flow_id: &str, status: FlowStatus) {
+        if let Some(record) = self
+            .lock()
+            .get_mut(&(user_id.to_owned(), flow_id.to_owned()))
+        {
+            record.status = status;
+            record.consumed = true;
+        }
+    }
+
+    fn gateway_flow(
+        &self,
+        user_id: &str,
+        provider: &str,
+        flow_id: &str,
+    ) -> Option<(String, String, Option<String>)> {
+        let flows = self.lock();
+        let record = flows
+            .get(&(user_id.to_owned(), flow_id.to_owned()))
+            .filter(|record| record.provider == provider && record.status == FlowStatus::Pending)?;
+        match (&record.gateway, &record.gateway_flow_id) {
+            (Some(base), Some(gw_flow_id)) => Some((
+                base.clone(),
+                gw_flow_id.clone(),
+                record.gateway_profile.clone(),
+            )),
+            _ => None,
         }
     }
 
@@ -816,6 +854,8 @@ impl SignInService {
                 verifier,
                 client_holds_verifier: client_holds,
                 gateway: None,
+                gateway_flow_id: None,
+                gateway_profile: None,
                 expires: now + self.flows.ttl,
                 created: now,
                 status: FlowStatus::Pending,
@@ -834,50 +874,35 @@ impl SignInService {
     }
 
     /// Start a browser sign-in relayed to a `claude-agent-sdk` loopback
-    /// gateway. The gateway builds the authorize URL and keeps the PKCE
-    /// verifier; the desktop only sees the URL and the `state`.
+    /// gateway. `claude auth login` owns the redirect/paste flow, so no
+    /// desktop `redirect_uri` is required.
     async fn start_gateway(
         &self,
         user_id: &str,
         provider_id: &str,
-        provider: &dyn SignInProvider,
-        request: StartRequest,
+        _provider: &dyn SignInProvider,
+        _request: StartRequest,
         gateway: Option<gateway::GatewayEndpoint>,
     ) -> Result<StartedFlow> {
         let endpoint = gateway
             .ok_or_else(|| SeraError::Internal("gateway flow without an endpoint".into()))?;
-        let redirect_uri = request.redirect_uri.ok_or_else(|| SeraError::Rejected {
-            code: "bad_redirect",
-            message: "A sign-in redirect is required".into(),
-        })?;
-        if let Some(spec) = provider.redirect_spec() {
-            pkce::validate_loopback_redirect(&spec, &redirect_uri)?;
-        }
-        // The desktop may pass its state so it can check the redirect; the
-        // challenge/verifier are the gateway's alone.
-        let state = match request.state {
-            Some(state) if pkce::state_ok(&state) => state,
-            Some(_) => {
-                return Err(SeraError::Rejected {
-                    code: "bad_challenge",
-                    message: "The sign-in state is not valid".into(),
-                });
-            }
-            None => pkce::random_state(),
-        };
-        let (url, state) = gateway::gateway_auth_start(&endpoint, &redirect_uri, &state).await?;
+        let started = gateway::gateway_auth_start(&endpoint, None).await?;
         let now = Instant::now();
+        let ttl = Duration::from_secs(started.expires_in.min(self.flows.ttl.as_secs()))
+            .max(Duration::from_secs(1));
         let flow_id = self.flows.insert(
             user_id,
             FlowRecord {
                 provider: provider_id.to_owned(),
                 kind: FlowKind::Pkce,
-                redirect_uri: Some(redirect_uri),
-                state: Some(state.clone()),
+                redirect_uri: None,
+                state: None,
                 verifier: None,
                 client_holds_verifier: false,
                 gateway: Some(endpoint.base_url.clone()),
-                expires: now + self.flows.ttl,
+                gateway_flow_id: Some(started.flow_id),
+                gateway_profile: Some(started.profile),
+                expires: now + ttl,
                 created: now,
                 status: FlowStatus::Pending,
                 consumed: false,
@@ -886,11 +911,11 @@ impl SignInService {
         Ok(StartedFlow {
             flow_id,
             flow: FlowKind::Pkce,
-            url,
-            expires_in: self.flows.ttl.as_secs(),
+            url: started.url,
+            expires_in: ttl.as_secs(),
             user_code: None,
             interval: None,
-            state: Some(state),
+            state: None,
         })
     }
 
@@ -913,6 +938,8 @@ impl SignInService {
                 verifier: None,
                 client_holds_verifier: false,
                 gateway: None,
+                gateway_flow_id: None,
+                gateway_profile: None,
                 expires: now + lifetime,
                 created: now,
                 status: FlowStatus::Pending,
@@ -1072,34 +1099,19 @@ impl SignInService {
         // the account credential is the gateway bearer token.
         let result = if let (Some(base), Some(endpoint)) = (&taken.gateway, gateway) {
             debug_assert_eq!(base, &endpoint.base_url);
-            gateway::gateway_auth_complete(
-                &endpoint,
-                &taken.state,
-                &request.code,
-                &taken.redirect_uri,
-            )
-            .await
-            .and_then(|account| {
-                let identity = json!({
-                    "source": "claude-agent-sdk-gateway",
-                    "account": account,
-                });
-                let fingerprint = crate::accounts::identity_fingerprint(
-                    provider_id,
-                    &serde_json::to_string(&identity).unwrap_or_default(),
-                );
-                let signed_in = SignedIn {
-                    label: "Claude (browser sign-in)".into(),
-                    auth_kind: AuthKind::Oauth,
-                    fingerprint: Some(fingerprint),
-                    identity,
-                    credential: ProviderCredential {
-                        api_key: endpoint.token.as_str().to_owned(),
-                        ..Default::default()
-                    },
-                };
-                self.store_account(user_id, provider_id, signed_in)
-            })
+            let gw_flow_id = taken.gateway_flow_id.as_deref().unwrap_or(&taken.state);
+            gateway::gateway_auth_complete(&endpoint, gw_flow_id, &request.code)
+                .await
+                .and_then(|reply| {
+                    let signed_in = gateway_signed_in(
+                        provider_id,
+                        &endpoint,
+                        &reply,
+                        taken.gateway_profile.as_deref(),
+                        "Claude (browser sign-in)",
+                    );
+                    self.store_account(user_id, provider_id, signed_in)
+                })
         } else {
             let verifier = if taken.client_holds_verifier {
                 Zeroizing::new(request.verifier.ok_or_else(|| SeraError::Rejected {
@@ -1134,6 +1146,20 @@ impl SignInService {
         self.flows.set_status(user_id, &flow_id, status.clone());
         self.publish(user_id, provider_id, &flow_id, &status);
         result
+    }
+
+    /// Import the existing `claude` CLI login on the gateway into the member's
+    /// `"default"` profile account.
+    pub async fn import_gateway_cli_account(
+        &self,
+        user_id: &str,
+        provider_id: &str,
+        endpoint: &gateway::GatewayEndpoint,
+    ) -> Result<AddOutcome> {
+        let reply = gateway::gateway_auth_import_cli(endpoint).await?;
+        let signed_in =
+            gateway_signed_in(provider_id, endpoint, &reply, Some("default"), "Claude CLI");
+        self.store_account(user_id, provider_id, signed_in)
     }
 
     /// Store a finished sign-in as the member's account.
@@ -1207,6 +1233,68 @@ impl SignInService {
         self.flows.status(user_id, provider_id, flow_id)
     }
 
+    /// The state of one flow, polling the loopback gateway when the flow is
+    /// pending on a `claude-agent-sdk` gateway.
+    pub async fn status_with_gateway(
+        &self,
+        user_id: &str,
+        provider_id: &str,
+        flow_id: &str,
+        gateway: Option<&gateway::GatewayEndpoint>,
+    ) -> Result<FlowStatus> {
+        let current = self.flows.status(user_id, provider_id, flow_id)?;
+        if current != FlowStatus::Pending {
+            return Ok(current);
+        }
+        let Some((_base, gw_flow_id, gw_profile)) =
+            self.flows.gateway_flow(user_id, provider_id, flow_id)
+        else {
+            return Ok(current);
+        };
+        let Some(endpoint) = gateway else {
+            return Ok(current);
+        };
+        let reply = gateway::gateway_auth_flow_status(endpoint, &gw_flow_id).await?;
+        let gw_status = reply
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("pending");
+        let next = match gw_status {
+            "ok" => {
+                let signed_in = gateway_signed_in(
+                    provider_id,
+                    endpoint,
+                    &reply,
+                    gw_profile.as_deref(),
+                    "Claude (browser sign-in)",
+                );
+                match self.store_account(user_id, provider_id, signed_in) {
+                    Ok(outcome) => FlowStatus::Ok {
+                        account_id: outcome.account_id,
+                        created: outcome.created,
+                    },
+                    Err(error) => FlowStatus::Denied {
+                        reason: failure_reason(&error),
+                    },
+                }
+            }
+            "denied" | "error" | "failed" => FlowStatus::Denied {
+                reason: reply
+                    .get("error")
+                    .or_else(|| reply.get("reason"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("sign-in denied")
+                    .to_owned(),
+            },
+            "expired" => FlowStatus::Expired,
+            _ => return Ok(FlowStatus::Pending),
+        };
+        self.flows
+            .mark_gateway_finished(user_id, flow_id, next.clone());
+        self.publish(user_id, provider_id, flow_id, &next);
+        Ok(next)
+    }
+
     fn publish(&self, user_id: &str, provider_id: &str, flow_id: &str, status: &FlowStatus) {
         let mut payload = json!({
             "provider": provider_id,
@@ -1230,6 +1318,64 @@ impl SignInService {
         {
             tracing::warn!(%error, "could not publish a sign-in event");
         }
+    }
+}
+
+fn gateway_signed_in(
+    provider_id: &str,
+    endpoint: &gateway::GatewayEndpoint,
+    reply: &Value,
+    fallback_profile: Option<&str>,
+    default_label: &str,
+) -> SignedIn {
+    let account = reply.get("account").cloned().unwrap_or(Value::Null);
+    let profile = reply
+        .get("profile")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or(fallback_profile)
+        .unwrap_or("default")
+        .to_owned();
+    let email = account
+        .get("emailAddress")
+        .or_else(|| account.get("email"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let plan = account
+        .get("subscriptionType")
+        .or_else(|| account.get("plan"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let mut identity = json!({
+        "source": "claude-agent-sdk-gateway",
+        "profile": profile,
+        "account": account,
+    });
+    if let Some(ref email) = email {
+        identity["email"] = json!(email);
+    }
+    if let Some(ref plan) = plan {
+        identity["plan"] = json!(plan);
+    }
+    let stable_id = match &email {
+        Some(email) => format!("gateway:{profile}:{}", email.to_ascii_lowercase()),
+        None => format!("gateway:{profile}"),
+    };
+    let fingerprint = crate::accounts::identity_fingerprint(provider_id, &stable_id);
+    let label = match &email {
+        Some(email) => format!("Claude ({email})"),
+        None if profile != "default" => format!("Claude ({profile})"),
+        None => default_label.to_owned(),
+    };
+    SignedIn {
+        label,
+        auth_kind: AuthKind::Oauth,
+        fingerprint: Some(fingerprint),
+        identity,
+        credential: ProviderCredential {
+            api_key: endpoint.token.as_str().to_owned(),
+            ..Default::default()
+        },
     }
 }
 

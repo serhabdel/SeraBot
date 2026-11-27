@@ -5042,6 +5042,17 @@ impl Session {
                 Err(error) if completion.kind == OperationKind::ProviderAccount => {
                     self.account_write_failed(&error);
                 }
+                Err(error)
+                    if matches!(
+                        completion.kind,
+                        OperationKind::GatewayStatus
+                            | OperationKind::GatewayToken
+                            | OperationKind::GatewayImportCli
+                            | OperationKind::GatewaySigninComplete
+                    ) =>
+                {
+                    self.gateway_op_failed(completion.kind, &error);
+                }
                 Err(error) if completion.kind == OperationKind::RouteWrite => {
                     self.route_save_failed(&error);
                 }
@@ -5440,6 +5451,28 @@ impl Session {
                         Reply::AccountDone(crate::worker::AccountDone::Added(added)) => {
                             Some(added.clone())
                         }
+                        _ => None,
+                    };
+                    let gateway_status = match &reply {
+                        Reply::GatewayStatus { provider, status } => {
+                            Some((provider.clone(), status.clone()))
+                        }
+                        _ => None,
+                    };
+                    let gateway_token = match &reply {
+                        Reply::GatewayToken { provider, response } => {
+                            Some((provider.clone(), response.clone()))
+                        }
+                        _ => None,
+                    };
+                    let gateway_cli_imported = match &reply {
+                        Reply::GatewayCliImported { provider, done } => {
+                            Some((provider.clone(), done.clone()))
+                        }
+                        _ => None,
+                    };
+                    let gateway_signin_completed = match &reply {
+                        Reply::GatewaySigninCompleted { done, .. } => Some(done.clone()),
                         _ => None,
                     };
                     let avatar_saved = match &reply {
@@ -5862,6 +5895,26 @@ impl Session {
                             self.schedule(Operation::Connectors, Duration::ZERO);
                         }
                         OperationKind::ProviderAccount => self.account_write_done(account_added),
+                        OperationKind::GatewayStatus => {
+                            if let Some((provider, status)) = gateway_status {
+                                self.gateway_status_done(provider, status);
+                            }
+                        }
+                        OperationKind::GatewayToken => {
+                            if let Some((provider, response)) = gateway_token {
+                                self.gateway_token_done(provider, response);
+                            }
+                        }
+                        OperationKind::GatewayImportCli => {
+                            if let Some((provider, done)) = gateway_cli_imported {
+                                self.gateway_cli_imported(provider, done);
+                            }
+                        }
+                        OperationKind::GatewaySigninComplete => {
+                            if let Some(done) = gateway_signin_completed {
+                                self.gateway_signin_completed(done);
+                            }
+                        }
                         OperationKind::RouteWrite => self.route_saved(),
                         OperationKind::Apply => self.after_route_applied(),
                         OperationKind::ProviderKey => {

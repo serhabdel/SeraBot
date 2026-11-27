@@ -62,6 +62,7 @@ pub fn human_kind(kind: &str) -> &str {
         "github-copilot" => "GitHub Copilot",
         "openai-compatible" => "OpenAI-compatible",
         "anthropic" => "Anthropic",
+        "claude-agent-sdk" => "Claude Agent SDK (Gateway)",
         "google" | "gemini" => "Google Gemini",
         "google-antigravity" => "Google Cloud Code",
         "mistral" => "Mistral AI",

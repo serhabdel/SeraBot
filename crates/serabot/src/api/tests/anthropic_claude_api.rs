@@ -322,7 +322,7 @@ async fn members_and_admin_are_refused_third_party_claude_oauth() {
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-        assert_eq!(body["code"], "validation", "{body}");
+        assert_eq!(body["code"], "claude_oauth_retired", "{body}");
 
         let (status, body) = call(
             &env,
@@ -335,7 +335,7 @@ async fn members_and_admin_are_refused_third_party_claude_oauth() {
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-        assert_eq!(body["code"], "validation", "{body}");
+        assert_eq!(body["code"], "claude_oauth_retired", "{body}");
 
         let (status, done) = call(
             &env,
@@ -346,7 +346,7 @@ async fn members_and_admin_are_refused_third_party_claude_oauth() {
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{done}");
-        assert_eq!(done["code"], "validation", "{done}");
+        assert_eq!(done["code"], "claude_oauth_retired", "{done}");
     }
 }
 
@@ -362,7 +362,7 @@ async fn the_plan_sign_in_is_off_when_the_operator_turned_it_off() {
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert_eq!(body["code"], "validation", "{body}");
+    assert_eq!(body["code"], "claude_oauth_retired", "{body}");
     let (status, _) = call(
         &env,
         OWNER,
@@ -434,7 +434,7 @@ async fn a_console_saved_claude_provider_accepts_keys_and_refuses_oauth() {
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{started}");
-    assert_eq!(started["code"], "validation", "{started}");
+    assert_eq!(started["code"], "claude_oauth_retired", "{started}");
     let (_, admin) = call(&env, OWNER, "GET", "/v1/providers", None).await;
     let listed = provider(&admin, "claude-console");
     assert_eq!(listed["signin"], json!([]), "{listed}");
@@ -521,4 +521,281 @@ async fn console_provider_changes_apply_without_a_restart() {
             .all(|provider| provider["id"] != "claude-live"),
         "{listed}"
     );
+}
+
+#[tokio::test]
+async fn claude_agent_sdk_gateway_status_token_import_and_signin_flow() {
+    let gw_server = MockServer::start().await;
+    let dir = std::env::temp_dir().join(format!("serabot-gw-api-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut config = Config::default();
+    config.api.enabled = true;
+    config.api.token_hash = sha256_hex(OWNER);
+    config.llm.model = "test".into();
+    config.llm.base_url = "https://example.com/v1".into();
+    config.memory.auto_extract = false;
+    config.base_dir = dir.clone();
+    config.llm.providers.insert(
+        "claude-sdk".into(),
+        ProviderConfig {
+            kind: "claude-agent-sdk".into(),
+            api_key_secret: "claude_gateway_token".into(),
+            base_url: gw_server.uri(),
+            models: vec!["claude-sonnet-4-5".into()],
+            data_egress_approved: true,
+            catalog_fetch: false,
+            ..Default::default()
+        },
+    );
+    let database = dir.join("serabot.db");
+    config.database.path = database.to_string_lossy().into_owned();
+    let config = Arc::new(config);
+    let store = Store::open(&database, 384, 5000).unwrap();
+    let users = Arc::new(UserSecrets::with_master_key(store.clone(), [8u8; 32]).unwrap());
+    let mut secret_store =
+        crate::secrets::SecretStore::open_paths(dir.join("secrets.age"), dir.join("identity.txt"))
+            .unwrap();
+    secret_store
+        .set(&config.llm.api_key_secret, "synthetic-llm")
+        .unwrap();
+    secret_store.save().unwrap();
+    let secrets = SharedSecrets::new(secret_store);
+    let credentials = Arc::new(UserProviderCredentials::new(
+        users.clone(),
+        secrets.clone(),
+        5,
+        64,
+    ));
+    let refresher = credentials.refresher().clone();
+    let model_router = ModelRouter::with_credentials(&config.llm, credentials).unwrap();
+    let gateway = Gateway::new(
+        store.clone(),
+        Arc::new(Policy::empty()),
+        ToolRegistry::default(),
+        1,
+        false,
+    );
+    let runtime = Runtime::new(
+        config.clone(),
+        store.clone(),
+        gateway,
+        model_router,
+        vec![test_bot(
+            "main",
+            crate::orchestration::BotRole::Orchestrator,
+        )],
+        Arc::new(NullNotifier),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .unwrap();
+    let artifacts = Arc::new(ArtifactStore::new(dir.join("artifacts")).unwrap());
+    let state = ApiState::new(
+        runtime,
+        store.clone(),
+        config,
+        artifacts,
+        secrets,
+        users,
+        None,
+    )
+    .unwrap()
+    .with_refresher(refresher)
+    .unwrap();
+    let alice_user = store
+        .create_user("gw-alice", "gw-alice@example.example", "gw-alice")
+        .unwrap();
+    let alice = mint_for(&store, &alice_user.id, "gw-alice");
+    let app = router(state);
+
+    let send = |token: String, method: &'static str, uri: String, body: Option<Value>| {
+        let app = app.clone();
+        async move {
+            let response = app
+                .oneshot(request_with_token(method, &uri, &token, body))
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice::<Value>(&bytes)
+                    .unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(&bytes)})),
+            )
+        }
+    };
+
+    Mock::given(method("GET"))
+        .and(path("/health"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "ok",
+            "cli_installed": true,
+            "cli_version": "2.1.0",
+            "sdk_installed": true,
+        })))
+        .mount(&gw_server)
+        .await;
+
+    // 1. Before token is set: gateway-status reports token_configured = false, signin/start returns gateway_token_missing.
+    let (status, gw_status) = send(
+        OWNER.into(),
+        "GET",
+        "/v1/providers/claude-sdk/gateway-status".into(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{gw_status}");
+    assert_eq!(gw_status["reachable"], true);
+    assert_eq!(gw_status["token_configured"], false);
+    assert_eq!(gw_status["auth_ok"], false);
+    assert_eq!(gw_status["cli_installed"], true);
+
+    let (status, missing) = send(
+        OWNER.into(),
+        "POST",
+        "/v1/providers/claude-sdk/signin/start".into(),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{missing}");
+    assert_eq!(missing["code"], "gateway_token_missing");
+
+    // 2. Non-admin cannot generate token; admin can.
+    let (status, _) = send(
+        alice.clone(),
+        "POST",
+        "/v1/providers/claude-sdk/gateway-token".into(),
+        Some(json!({"generate": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, tok_resp) = send(
+        OWNER.into(),
+        "POST",
+        "/v1/providers/claude-sdk/gateway-token".into(),
+        Some(json!({"generate": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{tok_resp}");
+    assert_eq!(tok_resp["ok"], true);
+    let generated_token = tok_resp["token"].as_str().unwrap().to_owned();
+    assert!(generated_token.starts_with("gw_"));
+    assert!(
+        tok_resp["startup_command"]
+            .as_str()
+            .unwrap()
+            .contains(&generated_token)
+    );
+
+    // 3. With token set, gateway-status probes /v1/auth/status with bearer auth.
+    Mock::given(method("GET"))
+        .and(path("/v1/auth/status"))
+        .and(header(
+            "authorization",
+            format!("Bearer {generated_token}").as_str(),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "signed_in": true,
+            "profiles": [{"profile": "default", "email": "owner@example.com"}],
+            "default_cli_login": {"emailAddress": "cli@example.com"},
+        })))
+        .mount(&gw_server)
+        .await;
+
+    let (status, gw_status) = send(
+        OWNER.into(),
+        "GET",
+        "/v1/providers/claude-sdk/gateway-status".into(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{gw_status}");
+    assert_eq!(gw_status["token_configured"], true);
+    assert_eq!(gw_status["auth_ok"], true);
+    assert_eq!(gw_status["profiles"].as_array().unwrap().len(), 1);
+
+    // 4. Import existing CLI login.
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/import-cli"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "profile": "default",
+            "account": {"emailAddress": "cli@example.com", "subscriptionType": "max"},
+        })))
+        .mount(&gw_server)
+        .await;
+
+    let (status, imported) = send(
+        OWNER.into(),
+        "POST",
+        "/v1/providers/claude-sdk/gateway-import-cli".into(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{imported}");
+    assert_eq!(imported["created"], true);
+
+    // 5. Start sign-in without redirect_uri, poll pending, then complete with pasted code (no redirect_uri).
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/start"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "flow_id": "gw-flow-1",
+            "url": "https://claude.ai/oauth/authorize?code_challenge=xyz",
+            "profile": "default",
+            "expires_in": 600,
+        })))
+        .mount(&gw_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/auth/flow/gw-flow-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "pending",
+        })))
+        .mount(&gw_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/complete"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "profile": "default",
+            "account": {"emailAddress": "browser@example.com", "subscriptionType": "pro"},
+        })))
+        .mount(&gw_server)
+        .await;
+
+    let (status, started) = send(
+        OWNER.into(),
+        "POST",
+        "/v1/providers/claude-sdk/signin/start".into(),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    let flow_id = started["flow_id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        started["url"],
+        "https://claude.ai/oauth/authorize?code_challenge=xyz"
+    );
+
+    let (status, poll) = send(
+        OWNER.into(),
+        "GET",
+        format!("/v1/providers/claude-sdk/signin/{flow_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{poll}");
+    assert_eq!(poll["status"], "pending");
+
+    let (status, completed) = send(
+        OWNER.into(),
+        "POST",
+        "/v1/providers/claude-sdk/signin/complete".into(),
+        Some(json!({"flow_id": flow_id, "code": "pasted-auth-code"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{completed}");
+    assert_eq!(completed["created"], true);
 }

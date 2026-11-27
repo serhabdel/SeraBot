@@ -667,6 +667,18 @@ pub fn router(state: ApiState) -> Router {
             "/v1/providers/{id}/signin/{flow_id}",
             get(provider_signin_status),
         )
+        .route(
+            "/v1/providers/{id}/gateway-status",
+            get(provider_gateway_status),
+        )
+        .route(
+            "/v1/providers/{id}/gateway-token",
+            post(provider_gateway_token),
+        )
+        .route(
+            "/v1/providers/{id}/gateway-import-cli",
+            post(provider_gateway_import_cli),
+        )
         // The routes that predate accounts stay, as aliases of signin/*.
         .route("/v1/providers/{id}/oauth/start", post(provider_oauth_start))
         .route(
@@ -1358,6 +1370,11 @@ const SAFE_VALIDATION_PREFIXES: &[&str] = &[
     "memory kind must be ",
     "category must be ",
     "connector id must be ",
+    "signature must be ",
+    "signature_html must be ",
+    "signature logo must be ",
+    "body plus signature must stay under ",
+    "HTML body plus signature must stay under ",
 ];
 
 /// A gateway failure the owner can act on, without the upstream body.

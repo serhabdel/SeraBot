@@ -15,16 +15,28 @@ Security invariants:
 from __future__ import annotations
 
 import argparse
+import asyncio
 from contextlib import asynccontextmanager
 import hmac
+import inspect
 import ipaddress
 import json
 import logging
 import os
+import re
+import secrets
+import select
+import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
 import uuid
+
+try:
+    import pty
+except ImportError:  # pragma: no cover - Windows
+    pty = None  # type: ignore[assignment]
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -33,30 +45,64 @@ from starlette.routing import Route
 
 logger = logging.getLogger("serabot.claude_gateway")
 
+GATEWAY_VERSION = "0.74.30"
 TOKEN_ENV_VAR = "SERABOT_CLAUDE_GATEWAY_TOKEN"
 HOST_ENV_VAR = "SERABOT_CLAUDE_GATEWAY_HOST"
+STATE_DIR_ENV_VAR = "SERABOT_CLAUDE_GATEWAY_STATE_DIR"
+CLI_PATH_ENV_VAR = "SERABOT_CLAUDE_CLI_PATH"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8791
 DEFAULT_MODEL = "claude-sonnet-4-5"
 
-# Browser sign-in ("Sign in with browser" on the provider card) drives the
-# SAME first-party OAuth flow `claude auth login` uses: Anthropic's own CLI
-# client id against claude.ai. This is not the third-party claude.ai OAuth
-# that Anthropic shut down in 2026 — that one SeraBot retired in 0.74.25.
-# The gateway is the only component that ever sees these URLs/tokens; it
-# stores the result where the Claude CLI/SDK reads its login
-# (~/.claude/.credentials.json by default), mode 0600.
-CLAUDE_CLI_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5c5e196af2c3"
-CLAUDE_OAUTH_AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
-CLAUDE_OAUTH_TOKEN_URL = "https://api.anthropic.com/api/oauth/token"
-CLAUDE_OAUTH_SCOPES = "user:profile user:inference"
 AUTH_FLOW_TTL_SECS = 600
-MAX_AUTH_BODY_BYTES = 64 * 1024
-CREDS_PATH_ENV_VAR = "SERABOT_CLAUDE_GATEWAY_CREDS_PATH"
-DEFAULT_CREDS_PATH = os.path.expanduser("~/.claude/.credentials.json")
+MAX_AUTH_FLOWS = 8
+AUTH_START_TIMEOUT_SECS = 10.0
+AUTH_COMPLETE_TIMEOUT_SECS = 20.0
+CLI_STATUS_TIMEOUT_SECS = 10.0
 
-# Pending browser sign-ins: state -> {verifier, redirect_uri, expires}.
-# Verifiers never leave this process.
+PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
+VALID_EFFORTS = frozenset({"low", "medium", "high", "max"})
+
+_ANSI_RE = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])"
+)
+_HTTPS_URL_RE = re.compile(r"https://[^\s\"'<>\]\)]+")
+_SECRET_REDACT_RE = re.compile(
+    r"(?:sk-ant-[A-Za-z0-9_-]+|Bearer\s+\S+|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?)"
+)
+
+_STRIPPED_CLAUDE_ENV_VARS = frozenset(
+    {
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_CODE_SESSION_ACCESS_TOKEN",
+        "CLAUDE_CODE_SESSION_ATTENDED",
+        "CLAUDE_CODE_SESSION_KIND",
+        "CLAUDE_CODE_SESSION_NAME",
+        "CLAUDE_CODE_SESSION_ORIGIN",
+        "CLAUDE_CODE_SSE_PORT",
+        "CLAUDE_CODE_BRIDGE_SESSION_ID",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_CHROME_MCP_ORG_DENIED",
+        "CLAUDE_CODE_EVAL_INTERVIEW_SESSION",
+        "CLAUDE_CODE_EXECPATH",
+        "CLAUDE_CODE_MESSAGING_SOCKET",
+        "CLAUDE_CODE_MESSAGING_TOKEN",
+        "CLAUDE_EFFORT",
+        "CLAUDE_PID",
+    }
+)
+
+_PRESERVED_CLAUDE_HOST_VARS = frozenset(
+    {
+        "CLAUDE_CODE_HOST_AUTH_ENV_VAR",
+        "CLAUDE_CODE_HOST_AUTH_REFRESH_TIMEOUT_MS",
+        "CLAUDE_CODE_HOST_CREDS_FILE",
+    }
+)
+
+# Pending CLI sign-in flows: flow_id -> flow state dict.
 _pending_auth_flows: dict[str, dict[str, Any]] = {}
 
 SUPPORTED_MODELS: list[dict[str, str]] = [
@@ -94,10 +140,232 @@ def validate_loopback_host(host: str) -> str:
     return str(addr)
 
 
+def _state_dir() -> Path:
+    raw = os.environ.get(STATE_DIR_ENV_VAR, "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path.home() / ".serabot" / "claude-gateway"
+
+
+def _validate_profile_id(profile: str) -> str:
+    if not isinstance(profile, str) or not PROFILE_ID_RE.match(profile):
+        raise ValueError(
+            "invalid profile id; must match ^[a-z0-9][a-z0-9_-]{0,47}$"
+        )
+    return profile
+
+
+def _resolve_profile_dir(
+    profile: str | None, *, create: bool = False
+) -> tuple[str, Path | None]:
+    if profile is None or profile == "" or profile == "default":
+        return "default", None
+    validated = _validate_profile_id(profile)
+    profile_dir = _state_dir() / "profiles" / validated
+    if create:
+        profile_dir.parent.mkdir(parents=True, exist_ok=True)
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(profile_dir, 0o700)
+        except OSError:
+            pass
+    return validated, profile_dir
+
+
+def _clean_claude_env(
+    profile_dir: Path | None, strip_api_key: bool = False
+) -> dict[str, str]:
+    """Build a sanitized environment for spawning the Claude CLI / SDK."""
+    env: dict[str, str] = {}
+    for key, value in os.environ.items():
+        if key in _STRIPPED_CLAUDE_ENV_VARS:
+            continue
+        if key.startswith("CLAUDE_BG_"):
+            continue
+        if (
+            key.startswith("CLAUDE_CODE_HOST_")
+            and key not in _PRESERVED_CLAUDE_HOST_VARS
+        ):
+            continue
+        if key == "AI_AGENT" and value.startswith("claude-code"):
+            continue
+        env[key] = value
+
+    env["CLAUDE_AGENT_SDK_CLIENT_APP"] = f"serabot-gateway/{GATEWAY_VERSION}"
+    env["DISABLE_AUTOUPDATER"] = "1"
+
+    if profile_dir is not None and str(profile_dir) != "default":
+        env["CLAUDE_CONFIG_DIR"] = str(profile_dir)
+    else:
+        env.pop("CLAUDE_CONFIG_DIR", None)
+
+    if strip_api_key:
+        env.pop("ANTHROPIC_API_KEY", None)
+
+    return env
+
+
+def _find_claude_cli() -> str | None:
+    override = os.environ.get(CLI_PATH_ENV_VAR)
+    if override is not None:
+        cleaned = override.strip()
+        if not cleaned:
+            return None
+        if os.path.isfile(cleaned):
+            return cleaned
+        return shutil.which(cleaned)
+    return shutil.which("claude")
+
+
+def _cli_version(cli_path: str | None = None) -> str | None:
+    resolved = cli_path if cli_path is not None else _find_claude_cli()
+    if not resolved:
+        return None
+    try:
+        proc = subprocess.run(
+            [resolved, "--version"],
+            env=_clean_claude_env(None),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    out = (proc.stdout or "").strip()
+    return out.splitlines()[0].strip() if out else None
+
+
+def _read_credentials_fallback(profile_dir: Path | None) -> dict[str, Any] | None:
+    base_dir = profile_dir if profile_dir is not None else Path.home() / ".claude"
+    creds_path = base_dir / ".credentials.json"
+    claude_json_path = base_dir / ".claude.json"
+
+    oauth_account: dict[str, Any] = {}
+    try:
+        with open(claude_json_path, "r", encoding="utf-8") as handle:
+            cj = json.load(handle)
+        if isinstance(cj, dict) and isinstance(cj.get("oauthAccount"), dict):
+            oauth_account = cj["oauthAccount"]
+    except (OSError, ValueError):
+        pass
+
+    try:
+        with open(creds_path, "r", encoding="utf-8") as handle:
+            doc = json.load(handle)
+    except (OSError, ValueError):
+        doc = None
+
+    oauth = doc.get("claudeAiOauth") if isinstance(doc, dict) else None
+    if isinstance(oauth, dict) and oauth.get("accessToken"):
+        acct = oauth.get("account") if isinstance(oauth.get("account"), dict) else {}
+        return {
+            "loggedIn": True,
+            "authMethod": "claudeai",
+            "email": acct.get("emailAddress") or oauth_account.get("emailAddress"),
+            "orgId": acct.get("organizationUuid")
+            or oauth_account.get("organizationUuid"),
+            "orgName": acct.get("organizationName")
+            or oauth_account.get("organizationName"),
+            "subscriptionType": oauth.get("subscriptionType")
+            or acct.get("subscriptionType")
+            or oauth_account.get("billingType"),
+        }
+
+    if oauth_account and (
+        oauth_account.get("emailAddress") or oauth_account.get("accountUuid")
+    ):
+        return {
+            "loggedIn": True,
+            "authMethod": "claudeai",
+            "email": oauth_account.get("emailAddress"),
+            "orgId": oauth_account.get("organizationUuid"),
+            "orgName": oauth_account.get("organizationName"),
+            "subscriptionType": oauth_account.get("billingType"),
+        }
+
+    return None
+
+
+def _read_cli_status(profile_dir: Path | None) -> dict[str, Any] | None:
+    cli_path = _find_claude_cli()
+    if cli_path:
+        try:
+            proc = subprocess.run(
+                [cli_path, "auth", "status", "--json"],
+                env=_clean_claude_env(profile_dir),
+                capture_output=True,
+                text=True,
+                timeout=CLI_STATUS_TIMEOUT_SECS,
+                check=False,
+            )
+            raw_out = (proc.stdout or "").strip()
+            if proc.returncode == 0 and raw_out:
+                data = json.loads(raw_out)
+                if isinstance(data, dict) and "loggedIn" in data:
+                    if not data.get("loggedIn"):
+                        return None
+                    return {
+                        "loggedIn": True,
+                        "authMethod": data.get("authMethod"),
+                        "email": data.get("email"),
+                        "orgId": data.get("orgId"),
+                        "orgName": data.get("orgName"),
+                        "subscriptionType": data.get("subscriptionType"),
+                    }
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+
+    return _read_credentials_fallback(profile_dir)
+
+
+def _list_profiles() -> list[dict[str, Any]]:
+    profiles: list[dict[str, Any]] = []
+    default_acct = _read_cli_status(None)
+    profiles.append(
+        {
+            "profile": "default",
+            "signed_in": default_acct is not None,
+            "account": default_acct,
+        }
+    )
+
+    profiles_root = _state_dir() / "profiles"
+    if profiles_root.is_dir():
+        try:
+            entries = sorted(profiles_root.iterdir(), key=lambda p: p.name)
+        except OSError:
+            entries = []
+        for entry in entries:
+            if not entry.is_dir():
+                continue
+            if not PROFILE_ID_RE.match(entry.name) or entry.name == "default":
+                continue
+            acct = _read_cli_status(entry)
+            profiles.append(
+                {
+                    "profile": entry.name,
+                    "signed_in": acct is not None,
+                    "account": acct,
+                }
+            )
+    return profiles
+
+
 def _import_sdk() -> Any:
     import claude_agent_sdk  # type: ignore[import-not-found]
 
     return claude_agent_sdk
+
+
+def _is_sdk_installed() -> bool:
+    try:
+        _import_sdk()
+        return True
+    except ImportError:
+        return False
 
 
 def _check_bearer_auth(request: Request) -> JSONResponse | None:
@@ -120,6 +388,66 @@ def _check_bearer_auth(request: Request) -> JSONResponse | None:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
     return None
+
+
+def _redact_secrets(text: str) -> str:
+    redacted = _SECRET_REDACT_RE.sub("[REDACTED]", text)
+    if len(redacted) > 300:
+        return redacted[:297] + "..."
+    return redacted
+
+
+def _classify_turn_error(exc: Exception) -> tuple[int, str, str]:
+    if isinstance(exc, ImportError):
+        return 503, "sdk_missing", "claude-agent-sdk is not installed"
+
+    name = type(exc).__name__.lower()
+    raw = str(exc)
+    lower = raw.lower()
+
+    if (
+        isinstance(exc, FileNotFoundError)
+        or "clinotfound" in name
+        or "cli not found" in lower
+        or "claude not found" in lower
+        or "enoent" in lower
+    ):
+        return 503, "cli_missing", "claude CLI is not installed or not found"
+
+    if any(
+        tok in lower
+        for tok in (
+            "unauthorized",
+            "authentication",
+            "not logged in",
+            "invalid api key",
+            "invalid_api_key",
+            "expired token",
+            "oauth",
+            "401",
+        )
+    ):
+        return 401, "auth_failed", _redact_secrets(raw) or "authentication failed"
+
+    if any(
+        tok in lower
+        for tok in ("rate limit", "rate_limit", "429", "too many requests", "overloaded")
+    ):
+        return 429, "rate_limited", _redact_secrets(raw) or "rate limited"
+
+    if any(
+        tok in lower
+        for tok in ("billing", "credit", "quota", "payment", "402", "insufficient")
+    ):
+        return 402, "billing_failed", _redact_secrets(raw) or "billing error"
+
+    if any(
+        tok in lower
+        for tok in ("model not found", "unknown model", "not_found_error", "404")
+    ):
+        return 404, "model_not_found", _redact_secrets(raw) or "model not found"
+
+    return 502, "turn_failed", _redact_secrets(raw) or "turn failed"
 
 
 def _render_content(content: Any) -> str:
@@ -170,7 +498,49 @@ def _is_instance_or_attr(obj: Any, cls: Any, attr_name: str) -> bool:
     return hasattr(obj, attr_name)
 
 
-async def _run_turn(payload: dict[str, Any]) -> dict[str, Any]:
+def _build_agent_options(
+    sdk: Any,
+    *,
+    model: str,
+    system_prompt: str,
+    mcp_servers: dict[str, Any],
+    allowed_tools: list[str],
+    max_turns: int,
+    clean_env: dict[str, str],
+    effort: str | None,
+) -> Any:
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "system_prompt": system_prompt,
+        "tools": [],
+        "setting_sources": [],
+        "permission_mode": "default",
+        "mcp_servers": mcp_servers,
+        "allowed_tools": allowed_tools,
+        "max_turns": max_turns,
+    }
+    try:
+        sig = inspect.signature(sdk.ClaudeAgentOptions)
+        params = sig.parameters
+        accepts_varkw = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+        if accepts_varkw or "env" in params:
+            kwargs["env"] = clean_env
+        if effort is not None and (accepts_varkw or "effort" in params):
+            kwargs["effort"] = effort
+    except (TypeError, ValueError):
+        pass
+
+    return sdk.ClaudeAgentOptions(**kwargs)
+
+
+async def _run_turn(
+    payload: dict[str, Any],
+    *,
+    profile_dir: Path | None = None,
+    effort: str | None = None,
+) -> dict[str, Any]:
     sdk = _import_sdk()
 
     model = str(payload.get("model") or DEFAULT_MODEL)
@@ -233,15 +603,18 @@ async def _run_turn(payload: dict[str, Any]) -> dict[str, Any]:
         )
         mcp_servers[MCP_SERVER_NAME] = mcp_server
 
-    options = sdk.ClaudeAgentOptions(
+    clean_env = _clean_claude_env(
+        profile_dir, strip_api_key=(profile_dir is not None)
+    )
+    options = _build_agent_options(
+        sdk,
         model=model,
         system_prompt=system_prompt,
-        tools=[],
-        setting_sources=[],
-        permission_mode="default",
         mcp_servers=mcp_servers,
         allowed_tools=allowed_tools,
         max_turns=2 if sdk_tools else 1,
+        clean_env=clean_env,
+        effort=effort,
     )
 
     assistant_msg_cls = getattr(sdk, "AssistantMessage", None)
@@ -317,12 +690,221 @@ async def _run_turn(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
+
+
+def _extract_https_url(text: str) -> str | None:
+    cleaned = _strip_ansi(text)
+    match = _HTTPS_URL_RE.search(cleaned)
+    return match.group(0) if match else None
+
+
+def _terminate_proc(proc: Any) -> None:
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+    except Exception:
+        pass
+
+
+def _cleanup_flow(flow: dict[str, Any]) -> None:
+    _terminate_proc(flow.get("proc"))
+    master_fd = flow.get("master_fd")
+    if master_fd is not None:
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+        flow["master_fd"] = None
+    proc = flow.get("proc")
+    if proc is not None:
+        for stream_name in ("stdin", "stdout", "stderr"):
+            stream = getattr(proc, stream_name, None)
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+
+def _prune_flows() -> None:
+    now = time.time()
+    expired_ids = [
+        fid for fid, fl in _pending_auth_flows.items() if now >= fl["expires"]
+    ]
+    for fid in expired_ids:
+        fl = _pending_auth_flows.pop(fid, None)
+        if fl is not None:
+            _cleanup_flow(fl)
+
+    while len(_pending_auth_flows) >= MAX_AUTH_FLOWS:
+        oldest_id = min(
+            _pending_auth_flows,
+            key=lambda fid: _pending_auth_flows[fid].get("created_at", 0.0),
+        )
+        fl = _pending_auth_flows.pop(oldest_id, None)
+        if fl is not None:
+            _cleanup_flow(fl)
+
+
+def _drain_flow_output(flow: dict[str, Any]) -> None:
+    master_fd = flow.get("master_fd")
+    if master_fd is not None:
+        while True:
+            try:
+                ready, _, _ = select.select([master_fd], [], [], 0.0)
+            except (OSError, ValueError):
+                break
+            if not ready:
+                break
+            try:
+                chunk = os.read(master_fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            flow["output_buf"] += chunk.decode("utf-8", errors="replace")
+        return
+
+    proc = flow.get("proc")
+    stdout = getattr(proc, "stdout", None) if proc is not None else None
+    if stdout is not None and proc.poll() is not None:
+        try:
+            rest = stdout.read()
+            if rest:
+                flow["output_buf"] += (
+                    rest.decode("utf-8", errors="replace")
+                    if isinstance(rest, bytes)
+                    else str(rest)
+                )
+        except Exception:
+            pass
+
+
+def _spawn_login_and_wait_for_url(
+    cli_path: str, profile_dir: Path | None
+) -> tuple[Any, int | None, str, str]:
+    env = _clean_claude_env(profile_dir, strip_api_key=True)
+    env["BROWSER"] = "true"
+    env["NO_BROWSER"] = "1"
+    cmd = [cli_path, "auth", "login", "--claudeai"]
+
+    master_fd: int | None = None
+    output_buf = ""
+
+    if pty is not None and os.name != "nt":
+        master_fd, slave_fd = pty.openpty()
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                env=env,
+                close_fds=True,
+            )
+        finally:
+            os.close(slave_fd)
+
+        deadline = time.monotonic() + AUTH_START_TIMEOUT_SECS
+        url: str | None = None
+        while time.monotonic() < deadline:
+            remaining = max(0.05, min(0.2, deadline - time.monotonic()))
+            try:
+                ready, _, _ = select.select([master_fd], [], [], remaining)
+            except (OSError, ValueError):
+                break
+            if ready:
+                try:
+                    chunk = os.read(master_fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                output_buf += chunk.decode("utf-8", errors="replace")
+                url = _extract_https_url(output_buf)
+                if url:
+                    return proc, master_fd, url, output_buf
+            elif proc.poll() is not None:
+                break
+
+        _terminate_proc(proc)
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+        raise RuntimeError("claude auth login did not emit an authorization URL")
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+    )
+    deadline = time.monotonic() + AUTH_START_TIMEOUT_SECS
+    url = None
+    while time.monotonic() < deadline and proc.stdout is not None:
+        line = proc.stdout.readline()
+        if not line:
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+            continue
+        output_buf += (
+            line.decode("utf-8", errors="replace")
+            if isinstance(line, bytes)
+            else str(line)
+        )
+        url = _extract_https_url(output_buf)
+        if url:
+            return proc, None, url, output_buf
+
+    _terminate_proc(proc)
+    raise RuntimeError("claude auth login did not emit an authorization URL")
+
+
+def _write_code_and_wait(flow: dict[str, Any], code: str) -> int:
+    payload = (code.strip() + "\n").encode("utf-8")
+    master_fd = flow.get("master_fd")
+    proc = flow.get("proc")
+
+    if master_fd is not None:
+        os.write(master_fd, payload)
+    elif proc is not None and proc.stdin is not None:
+        proc.stdin.write(payload)
+        proc.stdin.flush()
+
+    deadline = time.monotonic() + AUTH_COMPLETE_TIMEOUT_SECS
+    while time.monotonic() < deadline:
+        _drain_flow_output(flow)
+        rc = proc.poll() if proc is not None else None
+        if rc is not None:
+            return int(rc)
+        time.sleep(0.05)
+
+    _terminate_proc(proc)
+    raise TimeoutError("timed out waiting for claude auth login to finish")
+
+
 async def health(request: Request) -> JSONResponse:
+    cli_path = _find_claude_cli()
     return JSONResponse(
         {
             "status": "ok",
             "sdk": "claude-agent-sdk",
+            "version": GATEWAY_VERSION,
             "auth_configured": bool(os.environ.get(TOKEN_ENV_VAR)),
+            "cli_installed": cli_path is not None,
+            "sdk_installed": _is_sdk_installed(),
         }
     )
 
@@ -347,10 +929,44 @@ async def turn(request: Request) -> JSONResponse:
     if not isinstance(payload, dict):
         return JSONResponse({"error": "JSON body must be an object"}, status_code=400)
 
+    raw_profile = payload.get("profile")
+    if raw_profile is None:
+        raw_profile = request.headers.get("x-claude-profile")
+    if raw_profile is not None and not isinstance(raw_profile, str):
+        return JSONResponse(
+            {"error": "profile must be a string", "code": "invalid_profile"},
+            status_code=400,
+        )
     try:
-        result = await _run_turn(payload)
+        _, profile_dir = _resolve_profile_dir(raw_profile, create=False)
+    except ValueError as exc:
+        return JSONResponse(
+            {"error": str(exc), "code": "invalid_profile"}, status_code=400
+        )
+
+    effort = payload.get("effort")
+    if effort is not None:
+        if not isinstance(effort, str) or effort not in VALID_EFFORTS:
+            return JSONResponse(
+                {
+                    "error": "effort must be one of: low, medium, high, max",
+                    "code": "invalid_effort",
+                },
+                status_code=400,
+            )
+
+    try:
+        result = await _run_turn(
+            payload, profile_dir=profile_dir, effort=effort
+        )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        status_code, err_code, err_msg = _classify_turn_error(exc)
+        logger.warning("turn failed code=%s status=%d", err_code, status_code)
+        return JSONResponse(
+            {"error": err_msg, "code": err_code}, status_code=status_code
+        )
 
     logger.info(
         "turn completed model=%s finish_reason=%s tool_calls=%d",
@@ -361,227 +977,285 @@ async def turn(request: Request) -> JSONResponse:
     return JSONResponse(result)
 
 
-def _validate_loopback_redirect_uri(uri: str) -> str:
-    """The browser redirect must be an http loopback URL on an unprivileged
-    port with no credentials, query or fragment (the member's desktop runs
-    the loopback listener)."""
-    from urllib.parse import urlparse
-
-    parsed = urlparse(uri)
-    host = (parsed.hostname or "").strip("[]")
-    if (
-        parsed.scheme != "http"
-        or host not in ("127.0.0.1", "localhost", "::1")
-        or parsed.port is None
-        or parsed.port < 1024
-        or parsed.username
-        or parsed.password
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ValueError("redirect_uri must be an http loopback URL (port >= 1024)")
-    return uri
-
-
-def _new_pkce() -> tuple[str, str]:
-    import base64
-    import hashlib
-    import secrets
-
-    verifier = secrets.token_urlsafe(64)
-    digest = hashlib.sha256(verifier.encode("ascii")).digest()
-    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-    return verifier, challenge
-
-
-def _exchange_code(code: str, redirect_uri: str, verifier: str) -> dict[str, Any]:
-    """Exchange the one-time code at the pinned token URL. Redirects are
-    refused, the body is capped, and only non-secret account fields return."""
-    import urllib.error
-    import urllib.parse
-    import urllib.request
-
-    form = urllib.parse.urlencode(
-        {
-            "grant_type": "authorization_code",
-            "client_id": CLAUDE_CLI_CLIENT_ID,
-            "code": code,
-            "redirect_uri": redirect_uri,
-            "code_verifier": verifier,
-        }
-    ).encode("utf-8")
-
-    class _NoRedirect(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
-            return None
-
-    request = urllib.request.Request(
-        CLAUDE_OAUTH_TOKEN_URL,
-        data=form,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
-    )
-    opener = urllib.request.build_opener(_NoRedirect)
-    try:
-        with opener.open(request, timeout=30) as response:
-            body = response.read(MAX_AUTH_BODY_BYTES + 1)
-    except urllib.error.HTTPError as exc:
-        raise ValueError(f"token exchange refused with HTTP {exc.code}") from exc
-    except urllib.error.URLError as exc:
-        raise ValueError("could not reach the token endpoint") from exc
-    if len(body) > MAX_AUTH_BODY_BYTES:
-        raise ValueError("token response too large")
-    try:
-        payload = json.loads(body)
-    except ValueError as exc:
-        raise ValueError("token response was not JSON") from exc
-    if not isinstance(payload, dict) or not payload.get("access_token"):
-        raise ValueError("token response had no access token")
-    return payload
-
-
-def _write_credentials(payload: dict[str, Any]) -> dict[str, Any]:
-    """Write the OAuth tokens where the Claude CLI/SDK reads its login
-    (``~/.claude/.credentials.json`` by default), mode 0600. Returns the
-    non-secret account summary."""
-    creds_path = os.environ.get(CREDS_PATH_ENV_VAR, DEFAULT_CREDS_PATH)
-    account = payload.get("account") if isinstance(payload.get("account"), dict) else {}
-    summary = {
-        "emailAddress": account.get("emailAddress"),
-        "accountId": account.get("accountId"),
-        "subscriptionType": account.get("subscriptionType"),
-    }
-    document = {
-        "claudeAiOauth": {
-            "accessToken": payload.get("access_token"),
-            "refreshToken": payload.get("refresh_token"),
-            "expiresAt": payload.get("expires_at"),
-            "scopes": payload.get("scope", "").split() if payload.get("scope") else [],
-            "subscriptionType": account.get("subscriptionType"),
-            "account": summary,
-        }
-    }
-    path = Path(creds_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump(document, handle)
-    os.chmod(path, 0o600)
-    return summary
-
-
-def _read_credentials() -> dict[str, Any] | None:
-    creds_path = os.environ.get(CREDS_PATH_ENV_VAR, DEFAULT_CREDS_PATH)
-    try:
-        with open(creds_path, "r", encoding="utf-8") as handle:
-            document = json.load(handle)
-    except (OSError, ValueError):
-        return None
-    oauth = document.get("claudeAiOauth") if isinstance(document, dict) else None
-    if not isinstance(oauth, dict) or not oauth.get("accessToken"):
-        return None
-    account = oauth.get("account") if isinstance(oauth.get("account"), dict) else {}
-    return {
-        "emailAddress": account.get("emailAddress"),
-        "subscriptionType": account.get("subscriptionType"),
-    }
-
-
-async def auth_start(request: Request) -> JSONResponse:
-    """Begin the first-party browser sign-in: build the claude.ai authorize
-    URL (PKCE S256, verifier stays in this process) for the member's desktop
-    loopback redirect."""
-    auth_error = _check_bearer_auth(request)
-    if auth_error is not None:
-        return auth_error
-    try:
-        payload = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-    if not isinstance(payload, dict):
-        return JSONResponse({"error": "JSON body must be an object"}, status_code=400)
-    try:
-        redirect_uri = _validate_loopback_redirect_uri(str(payload.get("redirect_uri") or ""))
-    except ValueError as exc:
-        return JSONResponse({"error": str(exc)}, status_code=400)
-    state = payload.get("state")
-    if state is not None:
-        state = str(state)
-        if not 16 <= len(state) <= 128 or not all(
-            c.isalnum() or c in "_-" for c in state
-        ):
-            return JSONResponse({"error": "invalid state"}, status_code=400)
-    else:
-        import secrets
-
-        state = secrets.token_urlsafe(24)
-    verifier, challenge = _new_pkce()
-    expires = time.time() + AUTH_FLOW_TTL_SECS
-    _pending_auth_flows[state] = {
-        "verifier": verifier,
-        "redirect_uri": redirect_uri,
-        "expires": expires,
-    }
-    from urllib.parse import urlencode
-
-    url = CLAUDE_OAUTH_AUTHORIZE_URL + "?" + urlencode(
-        {
-            "client_id": CLAUDE_CLI_CLIENT_ID,
-            "response_type": "code",
-            "redirect_uri": redirect_uri,
-            "scope": CLAUDE_OAUTH_SCOPES,
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-            "state": state,
-        }
-    )
-    return JSONResponse({"url": url, "state": state, "expires_in": AUTH_FLOW_TTL_SECS})
-
-
-async def auth_complete(request: Request) -> JSONResponse:
-    """Finish the browser sign-in: swap the code at the pinned token endpoint
-    and store the login where the SDK reads it."""
-    auth_error = _check_bearer_auth(request)
-    if auth_error is not None:
-        return auth_error
-    try:
-        payload = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-    if not isinstance(payload, dict):
-        return JSONResponse({"error": "JSON body must be an object"}, status_code=400)
-    state = str(payload.get("state") or "")
-    code = str(payload.get("code") or "")
-    if not state or not code:
-        return JSONResponse({"error": "state and code are required"}, status_code=400)
-    pending = _pending_auth_flows.pop(state, None)
-    if pending is None:
-        return JSONResponse({"error": "unknown or used sign-in state"}, status_code=404)
-    if time.time() >= pending["expires"]:
-        return JSONResponse({"error": "sign-in expired; start again"}, status_code=410)
-    try:
-        tokens = _exchange_code(code, pending["redirect_uri"], pending["verifier"])
-    except ValueError as exc:
-        logger.warning("auth complete failed: %s", exc)
-        return JSONResponse({"error": "token exchange failed"}, status_code=502)
-    account = _write_credentials(tokens)
-    logger.info("browser sign-in stored credentials for a Claude account")
-    return JSONResponse({"ok": True, "account": account})
-
-
 async def auth_status(request: Request) -> JSONResponse:
     auth_error = _check_bearer_auth(request)
     if auth_error is not None:
         return auth_error
-    account = _read_credentials()
-    return JSONResponse({"signed_in": account is not None, "account": account})
+
+    cli_path = _find_claude_cli()
+    cli_installed = cli_path is not None
+    cli_ver = _cli_version(cli_path) if cli_installed else None
+    profiles = _list_profiles()
+    default_entry = profiles[0]
+    default_cli_login = bool(default_entry["signed_in"])
+
+    signed_in_entry = next((p for p in profiles if p["signed_in"]), None)
+    return JSONResponse(
+        {
+            "signed_in": signed_in_entry is not None,
+            "account": signed_in_entry["account"] if signed_in_entry else None,
+            "cli_installed": cli_installed,
+            "cli_version": cli_ver,
+            "sdk_installed": _is_sdk_installed(),
+            "default_cli_login": default_cli_login,
+            "profiles": profiles,
+        }
+    )
+
+
+async def auth_start(request: Request) -> JSONResponse:
+    auth_error = _check_bearer_auth(request)
+    if auth_error is not None:
+        return auth_error
+
+    body_bytes = await request.body()
+    if body_bytes.strip():
+        try:
+            payload = json.loads(body_bytes)
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        if not isinstance(payload, dict):
+            return JSONResponse(
+                {"error": "JSON body must be an object"}, status_code=400
+            )
+    else:
+        payload = {}
+
+    raw_profile = payload.get("profile")
+    if raw_profile is None or raw_profile == "":
+        profile = f"acct_{secrets.token_hex(4)}"
+    else:
+        if not isinstance(raw_profile, str):
+            return JSONResponse(
+                {"error": "profile must be a string", "code": "invalid_profile"},
+                status_code=400,
+            )
+        try:
+            profile = _validate_profile_id(raw_profile)
+        except ValueError as exc:
+            return JSONResponse(
+                {"error": str(exc), "code": "invalid_profile"}, status_code=400
+            )
+
+    cli_path = _find_claude_cli()
+    if not cli_path:
+        return JSONResponse(
+            {
+                "error": "claude CLI is not installed on this machine",
+                "code": "claude_cli_missing",
+            },
+            status_code=503,
+        )
+
+    _prune_flows()
+    profile_name, profile_dir = _resolve_profile_dir(profile, create=True)
+
+    try:
+        proc, master_fd, url, output_buf = await asyncio.to_thread(
+            _spawn_login_and_wait_for_url, cli_path, profile_dir
+        )
+    except Exception as exc:
+        logger.warning("auth start failed: %s", exc)
+        return JSONResponse(
+            {
+                "error": "failed to start claude auth login",
+                "code": "auth_start_failed",
+            },
+            status_code=502,
+        )
+
+    flow_id = secrets.token_urlsafe(16)
+    now = time.time()
+    _pending_auth_flows[flow_id] = {
+        "flow_id": flow_id,
+        "profile": profile_name,
+        "profile_dir": profile_dir,
+        "proc": proc,
+        "master_fd": master_fd,
+        "url": url,
+        "output_buf": output_buf,
+        "created_at": now,
+        "expires": now + AUTH_FLOW_TTL_SECS,
+    }
+    return JSONResponse(
+        {
+            "flow_id": flow_id,
+            "url": url,
+            "profile": profile_name,
+            "expires_in": AUTH_FLOW_TTL_SECS,
+            "mode": "cli_browser_or_paste",
+        }
+    )
+
+
+async def auth_flow_status(request: Request) -> JSONResponse:
+    auth_error = _check_bearer_auth(request)
+    if auth_error is not None:
+        return auth_error
+
+    flow_id = request.path_params.get("flow_id", "")
+    flow = _pending_auth_flows.get(flow_id)
+    if flow is None:
+        return JSONResponse(
+            {"error": "unknown sign-in flow", "code": "flow_not_found"},
+            status_code=404,
+        )
+
+    if time.time() >= flow["expires"]:
+        _pending_auth_flows.pop(flow_id, None)
+        _cleanup_flow(flow)
+        return JSONResponse({"status": "expired"})
+
+    _drain_flow_output(flow)
+    proc = flow.get("proc")
+    rc = proc.poll() if proc is not None else None
+    if rc is None:
+        return JSONResponse({"status": "pending", "profile": flow["profile"]})
+
+    _pending_auth_flows.pop(flow_id, None)
+    _cleanup_flow(flow)
+    if rc == 0:
+        account = _read_cli_status(flow["profile_dir"])
+        if account is not None:
+            return JSONResponse(
+                {
+                    "status": "ok",
+                    "profile": flow["profile"],
+                    "account": account,
+                }
+            )
+        return JSONResponse(
+            {
+                "status": "denied",
+                "error": "login completed but no credentials were found",
+            }
+        )
+
+    cleaned = _strip_ansi(flow.get("output_buf", "")).strip()
+    last_line = cleaned.splitlines()[-1].strip() if cleaned else ""
+    return JSONResponse(
+        {
+            "status": "denied",
+            "error": _redact_secrets(last_line) or f"claude auth login exited {rc}",
+        }
+    )
+
+
+async def auth_complete(request: Request) -> JSONResponse:
+    auth_error = _check_bearer_auth(request)
+    if auth_error is not None:
+        return auth_error
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "JSON body must be an object"}, status_code=400)
+
+    flow_id = str(payload.get("flow_id") or "")
+    code = str(payload.get("code") or "")
+    if not flow_id or not code.strip():
+        return JSONResponse(
+            {"error": "flow_id and code are required"}, status_code=400
+        )
+
+    flow = _pending_auth_flows.pop(flow_id, None)
+    if flow is None:
+        return JSONResponse(
+            {"error": "unknown or used sign-in flow", "code": "flow_not_found"},
+            status_code=404,
+        )
+
+    if time.time() >= flow["expires"]:
+        _cleanup_flow(flow)
+        return JSONResponse(
+            {"error": "sign-in expired; start again", "code": "flow_expired"},
+            status_code=410,
+        )
+
+    try:
+        rc = await asyncio.to_thread(_write_code_and_wait, flow, code)
+    except Exception as exc:
+        _cleanup_flow(flow)
+        logger.warning("auth complete failed: %s", exc)
+        return JSONResponse(
+            {"error": "claude auth login failed", "code": "auth_complete_failed"},
+            status_code=502,
+        )
+    finally:
+        _cleanup_flow(flow)
+
+    if rc != 0:
+        return JSONResponse(
+            {"error": "claude auth login failed", "code": "auth_complete_failed"},
+            status_code=502,
+        )
+
+    account = _read_cli_status(flow["profile_dir"])
+    if account is None:
+        return JSONResponse(
+            {
+                "error": "login completed but credentials were not found",
+                "code": "auth_complete_failed",
+            },
+            status_code=502,
+        )
+
+    logger.info("CLI sign-in stored credentials for profile=%s", flow["profile"])
+    return JSONResponse(
+        {"ok": True, "profile": flow["profile"], "account": account}
+    )
+
+
+async def auth_import_cli(request: Request) -> JSONResponse:
+    auth_error = _check_bearer_auth(request)
+    if auth_error is not None:
+        return auth_error
+
+    account = _read_cli_status(None)
+    if account is None:
+        return JSONResponse(
+            {
+                "error": "no existing claude CLI login found",
+                "code": "not_signed_in",
+            },
+            status_code=404,
+        )
+    return JSONResponse({"ok": True, "profile": "default", "account": account})
+
+
+async def auth_cancel(request: Request) -> JSONResponse:
+    auth_error = _check_bearer_auth(request)
+    if auth_error is not None:
+        return auth_error
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "JSON body must be an object"}, status_code=400)
+
+    flow_id = str(payload.get("flow_id") or "")
+    if flow_id:
+        flow = _pending_auth_flows.pop(flow_id, None)
+        if flow is not None:
+            _cleanup_flow(flow)
+    return JSONResponse({"ok": True})
 
 
 @asynccontextmanager
 async def lifespan(_app: Starlette):
     env_host = os.environ.get(HOST_ENV_VAR, DEFAULT_HOST)
     validate_loopback_host(env_host)
-    yield
+    try:
+        yield
+    finally:
+        for fid in list(_pending_auth_flows):
+            fl = _pending_auth_flows.pop(fid, None)
+            if fl is not None:
+                _cleanup_flow(fl)
 
 
 app = Starlette(
@@ -589,9 +1263,12 @@ app = Starlette(
         Route("/health", health, methods=["GET"]),
         Route("/v1/models", list_models, methods=["GET"]),
         Route("/v1/turn", turn, methods=["POST"]),
-        Route("/v1/auth/start", auth_start, methods=["POST"]),
-        Route("/v1/auth/complete", auth_complete, methods=["POST"]),
         Route("/v1/auth/status", auth_status, methods=["GET"]),
+        Route("/v1/auth/start", auth_start, methods=["POST"]),
+        Route("/v1/auth/flow/{flow_id}", auth_flow_status, methods=["GET"]),
+        Route("/v1/auth/complete", auth_complete, methods=["POST"]),
+        Route("/v1/auth/import-cli", auth_import_cli, methods=["POST"]),
+        Route("/v1/auth/cancel", auth_cancel, methods=["POST"]),
     ],
     lifespan=lifespan,
 )
