@@ -590,6 +590,18 @@ impl FlowStore {
         }
     }
 
+    /// Give a taken flow back: the gateway kept it open (an incomplete
+    /// pasted code), so the member may try again.
+    fn reopen(&self, user_id: &str, flow_id: &str) {
+        if let Some(record) = self
+            .lock()
+            .get_mut(&(user_id.to_owned(), flow_id.to_owned()))
+            && record.status == FlowStatus::Pending
+        {
+            record.consumed = false;
+        }
+    }
+
     fn mark_gateway_finished(&self, user_id: &str, flow_id: &str, status: FlowStatus) {
         if let Some(record) = self
             .lock()
@@ -609,7 +621,13 @@ impl FlowStore {
         let flows = self.lock();
         let record = flows
             .get(&(user_id.to_owned(), flow_id.to_owned()))
-            .filter(|record| record.provider == provider && record.status == FlowStatus::Pending)?;
+            // A flow taken by a complete call is that call's to finish; a
+            // poll in the meantime just says it is still pending.
+            .filter(|record| {
+                record.provider == provider
+                    && record.status == FlowStatus::Pending
+                    && !record.consumed
+            })?;
         match (&record.gateway, &record.gateway_flow_id) {
             (Some(base), Some(gw_flow_id)) => Some((
                 base.clone(),
@@ -689,6 +707,19 @@ pub struct StartedFlow {
     /// check the redirect.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
+    /// A `claude-agent-sdk` flow: the manual sign-in page, whose last step
+    /// shows a `code#state` to paste (the fallback when the redirect to
+    /// `localhost` cannot load).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manual_url: Option<String>,
+    /// A `claude-agent-sdk` flow: the loopback port and path `claude auth
+    /// login` redirects to. The desktop listens there too and hands a caught
+    /// redirect back with `state`, so a gateway on another machine than the
+    /// browser still finishes without a pasted code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callback_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callback_path: Option<String>,
 }
 
 /// A member's request to finish a PKCE flow.
@@ -870,12 +901,17 @@ impl SignInService {
             user_code: None,
             interval: None,
             state: Some(state),
+            manual_url: None,
+            callback_port: None,
+            callback_path: None,
         })
     }
 
     /// Start a browser sign-in relayed to a `claude-agent-sdk` loopback
-    /// gateway. `claude auth login` owns the redirect/paste flow, so no
-    /// desktop `redirect_uri` is required.
+    /// gateway. `claude auth login` owns the redirect (its own `localhost`
+    /// listener) and the paste prompt, so no desktop `redirect_uri` is
+    /// required; the desktop gets the CLI's callback port to relay a caught
+    /// redirect when the browser is not on the gateway's machine.
     async fn start_gateway(
         &self,
         user_id: &str,
@@ -900,8 +936,8 @@ impl SignInService {
                 verifier: None,
                 client_holds_verifier: false,
                 gateway: Some(endpoint.base_url.clone()),
-                gateway_flow_id: Some(started.flow_id),
-                gateway_profile: Some(started.profile),
+                gateway_flow_id: Some(started.flow_id.clone()),
+                gateway_profile: Some(started.profile.clone()),
                 expires: now + ttl,
                 created: now,
                 status: FlowStatus::Pending,
@@ -915,7 +951,10 @@ impl SignInService {
             expires_in: ttl.as_secs(),
             user_code: None,
             interval: None,
-            state: None,
+            state: started.state,
+            manual_url: started.manual_url,
+            callback_port: started.callback.as_ref().map(|cb| cb.port),
+            callback_path: started.callback.map(|cb| cb.path),
         })
     }
 
@@ -977,6 +1016,9 @@ impl SignInService {
             user_code: (!started.user_code.is_empty()).then_some(started.user_code),
             interval: Some(started.interval),
             state: None,
+            manual_url: None,
+            callback_port: None,
+            callback_path: None,
         })
     }
 
@@ -1067,9 +1109,16 @@ impl SignInService {
         kind: &str,
         request: CompleteRequest,
         gateway: gateway::GatewayEndpoint,
+        callback_state: Option<String>,
     ) -> Result<AddOutcome> {
-        self.complete_inner(user_id, provider_id, kind, request, Some(gateway))
-            .await
+        self.complete_inner(
+            user_id,
+            provider_id,
+            kind,
+            request,
+            Some((gateway, callback_state)),
+        )
+        .await
     }
 
     async fn complete_inner(
@@ -1078,7 +1127,7 @@ impl SignInService {
         provider_id: &str,
         kind: &str,
         request: CompleteRequest,
-        gateway: Option<gateway::GatewayEndpoint>,
+        gateway: Option<(gateway::GatewayEndpoint, Option<String>)>,
     ) -> Result<AddOutcome> {
         let provider = self.provider_for(kind)?;
         let flow_id = match request.flow_id {
@@ -1097,10 +1146,16 @@ impl SignInService {
         )?;
         // A gateway flow: the gateway holds the verifier and swaps the code;
         // the account credential is the gateway bearer token.
-        let result = if let (Some(base), Some(endpoint)) = (&taken.gateway, gateway) {
-            debug_assert_eq!(base, &endpoint.base_url);
-            let gw_flow_id = taken.gateway_flow_id.as_deref().unwrap_or(&taken.state);
-            gateway::gateway_auth_complete(&endpoint, gw_flow_id, &request.code)
+        let result =
+            if let (Some(base), Some((endpoint, callback_state))) = (&taken.gateway, gateway) {
+                debug_assert_eq!(base, &endpoint.base_url);
+                let gw_flow_id = taken.gateway_flow_id.as_deref().unwrap_or(&taken.state);
+                gateway::gateway_auth_complete(
+                    &endpoint,
+                    gw_flow_id,
+                    &request.code,
+                    callback_state.as_deref(),
+                )
                 .await
                 .and_then(|reply| {
                     let signed_in = gateway_signed_in(
@@ -1112,28 +1167,38 @@ impl SignInService {
                     );
                     self.store_account(user_id, provider_id, signed_in)
                 })
-        } else {
-            let verifier = if taken.client_holds_verifier {
-                Zeroizing::new(request.verifier.ok_or_else(|| SeraError::Rejected {
-                    code: "bad_code",
-                    message: "The sign-in verifier is required".into(),
-                })?)
             } else {
-                taken
-                    .verifier
-                    .ok_or_else(|| SeraError::Internal("a sign-in flow lost its verifier".into()))?
+                let verifier = if taken.client_holds_verifier {
+                    Zeroizing::new(request.verifier.ok_or_else(|| SeraError::Rejected {
+                        code: "bad_code",
+                        message: "The sign-in verifier is required".into(),
+                    })?)
+                } else {
+                    taken.verifier.ok_or_else(|| {
+                        SeraError::Internal("a sign-in flow lost its verifier".into())
+                    })?
+                };
+                provider
+                    .exchange_pkce_with_state(
+                        &self.http,
+                        &request.code,
+                        &taken.redirect_uri,
+                        &verifier,
+                        &taken.state,
+                    )
+                    .await
+                    .and_then(|signed_in| self.store_account(user_id, provider_id, signed_in))
             };
-            provider
-                .exchange_pkce_with_state(
-                    &self.http,
-                    &request.code,
-                    &taken.redirect_uri,
-                    &verifier,
-                    &taken.state,
-                )
-                .await
-                .and_then(|signed_in| self.store_account(user_id, provider_id, signed_in))
-        };
+        // Claude asked for the code again (an incomplete paste): the CLI is
+        // still waiting, so the flow stays open for another try.
+        if let Err(SeraError::Rejected {
+            code: "code_incomplete",
+            ..
+        }) = &result
+        {
+            self.flows.reopen(user_id, &flow_id);
+            return result;
+        }
         let status = match &result {
             Ok(outcome) => FlowStatus::Ok {
                 account_id: outcome.account_id.clone(),
@@ -1254,7 +1319,15 @@ impl SignInService {
         let Some(endpoint) = gateway else {
             return Ok(current);
         };
-        let reply = gateway::gateway_auth_flow_status(endpoint, &gw_flow_id).await?;
+        let reply = match gateway::gateway_auth_flow_status(endpoint, &gw_flow_id).await {
+            Ok(reply) => reply,
+            // The gateway forgot the flow (it restarted, or the flow aged out).
+            Err(SeraError::Rejected {
+                code: "flow_expired",
+                ..
+            }) => json!({ "status": "expired" }),
+            Err(error) => return Err(error),
+        };
         let gw_status = reply
             .get("status")
             .and_then(Value::as_str)
@@ -1382,6 +1455,11 @@ fn gateway_signed_in(
 /// A short, secret-free word for why a flow failed.
 fn failure_reason(error: &SeraError) -> String {
     match error {
+        // Claude's own reason for a refused code (the gateway masks the code).
+        SeraError::Rejected {
+            code: "code_rejected",
+            message,
+        } => message.clone(),
         SeraError::Rejected { code, .. } => (*code).to_owned(),
         SeraError::External(_) | SeraError::Upstream { .. } => "provider_error".into(),
         _ => "failed".into(),

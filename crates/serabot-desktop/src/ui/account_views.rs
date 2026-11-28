@@ -631,7 +631,7 @@ fn FlowPanel(
                     } else if is_claude_pkce {
                         "Your browser opens {title}'s sign-in page (port 54545). Sign in there, or paste the callback URL or code#state if the redirect does not complete."
                     } else if is_gateway_pkce {
-                        "Your browser opens {title}'s sign-in page. Local gateways finish automatically, or you can paste the authorization code below if the gateway is on a remote server."
+                        "Your browser opens Claude's sign-in page. Approve there and this window finishes by itself."
                     } else {
                         "Your browser opens {title}'s sign-in page. Sign in there, then come back."
                     }
@@ -809,21 +809,33 @@ fn FlowPanel(
                         }
                     } else if is_gateway_pkce {
                         if let Some(flow_id) = flow.flow_id.clone() {
-                            div { class: "field",
-                                label { class: "field-label", r#for: "gateway-auth-code-input",
-                                    "Paste authorization code"
+                            details { class: "field gateway-paste",
+                                summary { class: "field-label",
+                                    "Browser shows a code, or cannot reach localhost?"
                                 }
                                 p { class: "hint",
-                                    "For a headless or remote gateway, paste the authorization code from Claude here:"
+                                    "Open the code page, approve, and paste the code it shows (it has a # in the middle). If the browser stopped on a localhost address instead, paste that whole address."
+                                }
+                                if let Some(manual) = flow.manual_url.clone() {
+                                    div { class: "route-actions",
+                                        button {
+                                            class: "btn ghost sm",
+                                            r#type: "button",
+                                            onclick: move |_| session.write().open_in_browser(manual.clone()),
+                                            Icon { name: "external", size: 14 }
+                                            "Open code page"
+                                        }
+                                    }
                                 }
                                 div { class: "row",
                                     input {
                                         id: "gateway-auth-code-input",
                                         class: "input grow",
+                                        "aria-label": "Sign-in code",
                                         autocomplete: "off",
                                         spellcheck: false,
                                         value: "{gateway_code}",
-                                        placeholder: "Paste authorization code",
+                                        placeholder: "code#state, or http://localhost:…/callback?…",
                                         oninput: move |event| gateway_code.set(event.value()),
                                         onkeydown: {
                                             let provider = provider.clone();
@@ -858,7 +870,7 @@ fn FlowPanel(
                                                 );
                                             }
                                         },
-                                        if gateway_completing { "Submitting\u{2026}" } else { "Submit" }
+                                        if gateway_completing { "Checking\u{2026}" } else { "Finish sign-in" }
                                     }
                                 }
                             }

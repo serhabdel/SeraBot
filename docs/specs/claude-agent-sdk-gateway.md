@@ -27,34 +27,66 @@ So the supported Claude paths are:
 - **Claude Code (Desktop ACP)** — Windows desktop only, pinned
   `@agentclientprotocol/claude-agent-acp`, per `docs/specs/claude-code-acp.md`.
 
-### "Sign in with browser" on the gateway card (0.74.28)
+### "Sign in with browser" on the gateway card (0.74.28, reworked 0.74.33)
 
-The provider card offers **Sign in with browser** (the preset documents a
-`pkce` flow for the kind). It is *not* SeraBot doing claude.ai OAuth: the
-flow is relayed to the loopback gateway, which runs the **first-party**
-claude.ai OAuth PKCE flow — the same client id `claude auth login` uses:
+The provider card offers **Sign in with browser**. It is *not* SeraBot doing
+claude.ai OAuth: the gateway runs the member's own `claude auth login
+--claudeai` (first-party CLI, its own client id), in a per-account
+`CLAUDE_CONFIG_DIR` profile, and SeraBot only relays.
 
-1. Desktop → `POST /v1/providers/{id}/signin/start` (flow `pkce`) → the
-   server asks the gateway `POST {gateway}/v1/auth/start` with the desktop's
-   loopback `redirect_uri` (validated: http loopback, port ≥ 1024, no
-   credentials/query/fragment).
-2. The gateway generates the PKCE verifier/challenge, remembers them keyed
-   by `state` (TTL 600 s), and returns the claude.ai authorize URL. SeraBot
-   stores only the flow record (provider, redirect, state, gateway URL) —
-   never a verifier.
-3. The member's browser completes the login; the desktop catches the
-   loopback redirect and posts the code to
-   `POST /v1/providers/{id}/signin/complete`.
-4. The server relays `POST {gateway}/v1/auth/complete` `{state, code}` with
-   the gateway bearer token. The gateway swaps the code at the pinned token
-   URL (`https://api.anthropic.com/api/oauth/token`, redirects refused,
-   body capped), writes the tokens where the CLI/SDK reads them
-   (`~/.claude/.credentials.json` by default, mode 0600; override with
-   `SERABOT_CLAUDE_GATEWAY_CREDS_PATH`), and returns only the non-secret
-   account summary (email, subscription).
-5. SeraBot stores the provider account: credential = the gateway bearer
-   token (that is what authenticates turns to the gateway), identity =
-   the gateway-reported account, `AuthKind::Oauth`.
+`claude auth login` offers two ways to finish, and the gateway uses both:
+
+- **Automatic URL** — handed to `$BROWSER`; its redirect is the CLI's own
+  listener, `http://localhost:<port>/callback`. The gateway sets `$BROWSER` to
+  a one-shot capture script (POSIX) to learn that URL, its port and its
+  `state`. (Before 0.74.33 `$BROWSER` was `true`, so this URL was thrown away
+  and every sign-in ended on a page with a code nobody was told to paste.)
+- **Manual URL** — printed to the terminal; its last page shows a
+  `code#state` that the CLI's `Paste code here if prompted >` prompt accepts.
+
+Flow:
+
+1. Desktop → `POST /v1/providers/{id}/signin/start` (flow `pkce`) → server →
+   gateway `POST /v1/auth/start`. The reply carries `url` (the automatic URL
+   when captured, else the manual one), `manual_url`, and — when captured —
+   `callback {port, path}` and `state`. The server passes them to the desktop
+   as `callback_port` / `callback_path` / `state` / `manual_url` (a callback
+   on a port below 1024 or with an odd path is dropped).
+2. The desktop opens `url` and tries to listen on the callback port on its
+   own loopback:
+   - **Gateway on this computer**: the CLI already holds the port, the
+     browser reaches it directly, and the CLI exits 0 by itself. The
+     desktop's status poll (`GET .../signin/status/{flow}` → gateway
+     `GET /v1/auth/flow/{id}`) sees `ok`.
+   - **Gateway on the server**: the port is free on the desktop, so the
+     desktop catches the redirect (state checked) and posts
+     `POST .../signin/complete {flow_id, code, state}`. The gateway checks
+     `state` in constant time and hands the redirect to the CLI's own
+     listener on its loopback (`127.0.0.1`, then `::1`; only the port and
+     path the CLI announced; never through a proxy). The CLI swaps the code
+     with its own PKCE verifier.
+3. Fallback, folded in the sheet ("Browser shows a code, or cannot reach
+   localhost?"): **Open code page** opens `manual_url`; the member pastes the
+   `code#state` it shows, or the whole `http://localhost:…/callback?…`
+   address if the browser stopped there (the gateway relays that one like a
+   caught redirect). A paste without the `#` makes the CLI ask again; the
+   gateway answers `code_incomplete` and the flow **stays open**.
+4. On success the gateway reads the stored login (`claude auth status
+   --json`, or the profile's `.credentials.json`) and returns only the
+   non-secret account summary (email, plan). SeraBot stores the provider
+   account: credential = the gateway bearer token, identity = that summary
+   plus the gateway profile, `AuthKind::Oauth`. Turns send the profile as
+   `X-Claude-Profile`.
+
+A finished gateway flow keeps answering `GET /v1/auth/flow/{id}` with its
+result until it expires, so a poll that races a complete still sees how it
+ended; a flow the gateway forgot (restart) reads as `expired`. A refused code
+reports the CLI's own reason (the pasted code is masked). Codes are capped at
+4096 characters and control characters are refused before anything reaches
+the CLI's terminal.
+
+Windows gateways cannot capture `$BROWSER` (no POSIX helper), so they fall
+back to the manual URL and a pasted code.
 
 `GET {gateway}/v1/auth/status` reports whether a login is stored. All
 `/v1/auth/*` endpoints require the gateway bearer token like every other

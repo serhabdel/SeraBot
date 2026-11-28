@@ -844,6 +844,11 @@ pub(super) struct SigninCompleteRequest {
     /// Only when the desktop made the challenge and kept the verifier.
     #[serde(default)]
     verifier: Option<String>,
+    /// A `claude-agent-sdk` flow: the `state` of a browser redirect the
+    /// desktop caught on the CLI's callback port; the gateway hands it to
+    /// `claude auth login`'s own listener. Absent for a pasted code.
+    #[serde(default)]
+    state: Option<String>,
 }
 
 /// Finish a browser sign-in with the code the redirect carried (or pasted code).
@@ -855,6 +860,7 @@ pub(super) async fn provider_signin_complete(
 ) -> Result<Json<Value>> {
     let (profile, kind) = provider_context(&state, &id)?;
     plan_signin_gate(&user, &profile, &kind)?;
+    let callback_state = request.state.filter(|s| !s.trim().is_empty());
     let request = CompleteRequest {
         flow_id: Some(request.flow_id),
         code: request.code,
@@ -865,7 +871,7 @@ pub(super) async fn provider_signin_complete(
         Some(gateway) => {
             state
                 .signin
-                .complete_with_gateway(&user.id, &id, &kind, request, gateway)
+                .complete_with_gateway(&user.id, &id, &kind, request, gateway, callback_state)
                 .await?
         }
         None => state.signin.complete(&user.id, &id, &kind, request).await?,

@@ -63,9 +63,27 @@ pub struct GatewayEndpoint {
 #[derive(Debug, Clone)]
 pub struct GatewayAuthStarted {
     pub flow_id: String,
+    /// The page to open: the CLI's automatic URL (its redirect is the CLI's
+    /// own `localhost` listener) when the gateway caught it, else the manual
+    /// URL whose last page shows a code to paste.
     pub url: String,
+    /// The manual URL, whose last page shows a `code#state` to paste.
+    pub manual_url: Option<String>,
+    /// The CLI's loopback callback, when `url` is the automatic URL: the
+    /// desktop listens on the same port so a browser on another machine than
+    /// the gateway can still hand the redirect over.
+    pub callback: Option<GatewayCallback>,
+    /// The `state` the automatic URL carries.
+    pub state: Option<String>,
     pub profile: String,
     pub expires_in: u64,
+}
+
+/// Where `claude auth login` waits for its browser redirect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayCallback {
+    pub port: u16,
+    pub path: String,
 }
 
 fn gateway_unreachable_error() -> SeraError {
@@ -84,6 +102,45 @@ fn map_gateway_error(status: reqwest::StatusCode, bytes: &[u8]) -> SeraError {
         };
     }
     let value: Value = serde_json::from_slice(bytes).unwrap_or(Value::Null);
+    let code = value.get("code").and_then(Value::as_str);
+    let gateway_message = || {
+        value
+            .get("error")
+            .and_then(Value::as_str)
+            .map(|m| m.chars().take(240).collect::<String>())
+    };
+    match (status.as_u16(), code) {
+        (404 | 410, Some("flow_not_found" | "flow_expired")) => {
+            return SeraError::Rejected {
+                code: "flow_expired",
+                message: "This sign-in is no longer open. Start a new one.".into(),
+            };
+        }
+        (409, Some("flow_used" | "flow_busy")) => {
+            return SeraError::Rejected {
+                code: "flow_used",
+                message: gateway_message()
+                    .unwrap_or_else(|| "This sign-in was already used.".into()),
+            };
+        }
+        // Claude refused the code, or the CLI asked for it again (the
+        // sign-in stays open then): show the CLI's own reason.
+        (
+            400,
+            Some("auth_code_rejected" | "code_incomplete" | "invalid_code" | "state_mismatch"),
+        ) => {
+            return SeraError::Rejected {
+                code: if code == Some("code_incomplete") {
+                    "code_incomplete"
+                } else {
+                    "code_rejected"
+                },
+                message: gateway_message()
+                    .unwrap_or_else(|| "Claude did not accept that code.".into()),
+            };
+        }
+        _ => {}
+    }
     if status.as_u16() == 503
         && value.get("code").and_then(Value::as_str) == Some("claude_cli_missing")
     {
@@ -209,9 +266,36 @@ pub async fn gateway_auth_start(
         .get("expires_in")
         .and_then(Value::as_u64)
         .unwrap_or(600);
+    let text = |key: &str| {
+        reply
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    let manual_url = text("manual_url").filter(|u| u.starts_with("https://"));
+    let state = text("state");
+    // Only a callback the desktop can safely listen for: an unprivileged
+    // port and a plain path, together with the state that guards it.
+    let callback = reply.get("callback").and_then(|cb| {
+        let port = u16::try_from(cb.get("port")?.as_u64()?).ok()?;
+        let path = cb.get("path")?.as_str()?;
+        let plain = path.starts_with('/')
+            && path.len() <= 64
+            && path
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-'));
+        (port >= 1024 && plain && state.is_some()).then(|| GatewayCallback {
+            port,
+            path: path.to_owned(),
+        })
+    });
     Ok(GatewayAuthStarted {
         flow_id,
         url,
+        manual_url,
+        state: if callback.is_some() { state } else { None },
+        callback,
         profile,
         expires_in,
     })
@@ -237,19 +321,21 @@ pub async fn gateway_auth_flow_status(
         .await
 }
 
-/// Finish a browser sign-in gateway-side by submitting the pasted code
-/// (`POST /v1/auth/complete`). Returns the full gateway reply (`{ok, account, profile}`).
+/// Finish a browser sign-in gateway-side (`POST /v1/auth/complete`): a
+/// pasted `code#state`, or — with `state` — a browser redirect the desktop
+/// caught, which the gateway hands to the CLI's own loopback listener.
+/// Returns the full gateway reply (`{ok, account, profile}`).
 pub async fn gateway_auth_complete(
     endpoint: &GatewayEndpoint,
     gateway_flow_id: &str,
     code: &str,
+    state: Option<&str>,
 ) -> Result<Value> {
-    let reply = endpoint
-        .post(
-            "/v1/auth/complete",
-            json!({ "flow_id": gateway_flow_id, "code": code }),
-        )
-        .await?;
+    let mut body = json!({ "flow_id": gateway_flow_id, "code": code });
+    if let Some(state) = state.filter(|s| !s.is_empty()) {
+        body["state"] = json!(state);
+    }
+    let reply = endpoint.post("/v1/auth/complete", body).await?;
     if reply.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err(SeraError::External(
             "the local gateway did not finish the sign-in".into(),
@@ -386,7 +472,7 @@ mod tests {
         let flow = gateway_auth_flow_status(&ep, "gw-flow-1").await.unwrap();
         assert_eq!(flow["status"], "pending");
 
-        let reply = gateway_auth_complete(&ep, "gw-flow-1", "the-code")
+        let reply = gateway_auth_complete(&ep, "gw-flow-1", "the-code", None)
             .await
             .unwrap();
         assert_eq!(reply["account"]["emailAddress"], "owner@example.com");
@@ -456,6 +542,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_keeps_only_a_safe_callback_and_complete_relays_the_state() {
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/start"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "flow_id": "gw-flow-2",
+                "url": "https://claude.example/cai/oauth/authorize?x=1",
+                "manual_url": "https://claude.example/oauth/authorize?z-1",
+                "callback": {"port": 80, "path": "/callback"},
+                "state": "s1",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/complete"))
+            .and(body_partial_json(
+                json!({"flow_id": "gw-flow-2", "code": "c", "state": "s1"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let ep = endpoint(&server);
+        let started = gateway_auth_start(&ep, None).await.unwrap();
+        // A privileged port is never handed to the desktop to listen on.
+        assert_eq!(started.callback, None);
+        assert_eq!(started.state, None);
+        assert_eq!(
+            started.manual_url.as_deref(),
+            Some("https://claude.example/oauth/authorize?z-1")
+        );
+        gateway_auth_complete(&ep, "gw-flow-2", "c", Some("s1"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn gateway_flow_errors_map_to_their_own_codes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/auth/flow/gone"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": "unknown sign-in flow", "code": "flow_not_found",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/complete"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": "Copy all of it, including the # in the middle.",
+                "code": "code_incomplete",
+            })))
+            .mount(&server)
+            .await;
+        let ep = endpoint(&server);
+        let err = gateway_auth_flow_status(&ep, "gone").await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SeraError::Rejected {
+                    code: "flow_expired",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let err = gateway_auth_complete(&ep, "f", "half", None)
+            .await
+            .unwrap_err();
+        match err {
+            SeraError::Rejected {
+                code: "code_incomplete",
+                message,
+            } => assert!(message.contains('#'), "{message}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn a_refused_exchange_surfaces_the_gateway_error() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -465,7 +631,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let error = gateway_auth_complete(&endpoint(&server), "gw-flow-1", "bad")
+        let error = gateway_auth_complete(&endpoint(&server), "gw-flow-1", "bad", None)
             .await
             .unwrap_err();
         assert!(

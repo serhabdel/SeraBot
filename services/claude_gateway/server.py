@@ -19,6 +19,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import hmac
+import http.client
 import inspect
 import ipaddress
 import json
@@ -28,12 +29,15 @@ import os
 import re
 import secrets
 import select
+import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -49,7 +53,7 @@ from starlette.routing import Route
 
 logger = logging.getLogger("serabot.claude_gateway")
 
-GATEWAY_VERSION = "0.74.30"
+GATEWAY_VERSION = "0.74.33"
 TOKEN_ENV_VAR = "SERABOT_CLAUDE_GATEWAY_TOKEN"
 HOST_ENV_VAR = "SERABOT_CLAUDE_GATEWAY_HOST"
 STATE_DIR_ENV_VAR = "SERABOT_CLAUDE_GATEWAY_STATE_DIR"
@@ -60,7 +64,9 @@ DEFAULT_MODEL = "claude-sonnet-4-5"
 
 AUTH_FLOW_TTL_SECS = 600
 MAX_AUTH_FLOWS = 8
-AUTH_START_TIMEOUT_SECS = 10.0
+AUTH_START_TIMEOUT_SECS = 20.0
+BROWSER_CAPTURE_GRACE_SECS = 2.0
+MAX_AUTH_CODE_CHARS = 4096
 AUTH_COMPLETE_TIMEOUT_SECS = 20.0
 CLI_STATUS_TIMEOUT_SECS = 10.0
 
@@ -70,6 +76,7 @@ VALID_EFFORTS = frozenset({"low", "medium", "high", "max"})
 _ANSI_RE = re.compile(
     r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])"
 )
+_CALLBACK_PATH_RE = re.compile(r"/[A-Za-z0-9/_-]{0,63}")
 _HTTPS_URL_RE = re.compile(r"https://[^\s\"'<>\]\)]+")
 _SECRET_REDACT_RE = re.compile(
     r"(?:sk-ant-[A-Za-z0-9_-]+|Bearer\s+\S+|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?)"
@@ -922,9 +929,94 @@ def _strip_ansi(text: str) -> str:
 
 
 def _extract_https_url(text: str) -> str | None:
+    """The first https URL the CLI printed, once it is complete.
+
+    A URL counts only when something follows it (the line break the CLI
+    prints after it), so a URL split across two reads is never cut short.
+    """
     cleaned = _strip_ansi(text)
-    match = _HTTPS_URL_RE.search(cleaned)
-    return match.group(0) if match else None
+    for match in _HTTPS_URL_RE.finditer(cleaned):
+        if match.end() < len(cleaned):
+            return match.group(0)
+    return None
+
+
+def _make_browser_capture() -> tuple[str, Path, Path] | None:
+    """A one-shot ``$BROWSER`` that records the URL the CLI wants opened.
+
+    ``claude auth login`` hands its *automatic* sign-in URL (whose redirect is
+    the CLI's own ``http://localhost:<port>/callback`` listener) to
+    ``$BROWSER`` and only prints the *manual* URL (whose last page shows a
+    code to paste). Capturing the first lets the desktop finish the sign-in
+    without any copy and paste. POSIX only; Windows falls back to the
+    printed URL and a pasted code.
+    """
+    if os.name == "nt":
+        return None
+    try:
+        capture_dir = Path(tempfile.mkdtemp(prefix="serabot-claude-login-"))
+        os.chmod(capture_dir, 0o700)
+        url_file = capture_dir / "url"
+        script = capture_dir / "open-browser"
+        script.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\n' \"$1\" > {shlex.quote(str(url_file))}\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        os.chmod(script, 0o700)
+    except OSError:
+        return None
+    return str(script), url_file, capture_dir
+
+
+def _read_captured_url(url_file: Path | None) -> str | None:
+    if url_file is None:
+        return None
+    try:
+        text = url_file.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+    first = text.splitlines()[0].strip() if text else ""
+    if not first.startswith("https://") or len(first) > 4096:
+        return None
+    return first
+
+
+def _parse_cli_callback(auth_url: str | None) -> dict[str, Any] | None:
+    """The CLI's own loopback callback, read from its automatic sign-in URL.
+
+    Only a plain-HTTP loopback redirect on an unprivileged port is accepted;
+    anything else means the URL is not the CLI's localhost flow.
+    """
+    if not auth_url:
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(auth_url)
+        query = urllib.parse.parse_qs(parsed.query)
+    except ValueError:
+        return None
+    if parsed.scheme != "https":
+        return None
+    redirect = (query.get("redirect_uri") or [""])[0]
+    state = (query.get("state") or [""])[0]
+    if not redirect or not state or len(state) > 512:
+        return None
+    try:
+        target = urllib.parse.urlsplit(redirect)
+        port = target.port
+    except ValueError:
+        return None
+    if target.scheme != "http" or target.hostname not in ("localhost", "127.0.0.1", "::1"):
+        return None
+    if port is None or port < 1024:
+        return None
+    if target.query or target.fragment or target.username or target.password:
+        return None
+    path = target.path or "/"
+    if not _CALLBACK_PATH_RE.fullmatch(path):
+        return None
+    return {"port": port, "path": path, "state": state}
 
 
 def _terminate_proc(proc: Any) -> None:
@@ -960,6 +1052,10 @@ def _cleanup_flow(flow: dict[str, Any]) -> None:
                     stream.close()
                 except OSError:
                     pass
+    capture_dir = flow.get("capture_dir")
+    if capture_dir is not None:
+        shutil.rmtree(capture_dir, ignore_errors=True)
+        flow["capture_dir"] = None
 
 
 def _prune_flows() -> None:
@@ -1016,90 +1112,144 @@ def _drain_flow_output(flow: dict[str, Any]) -> None:
             pass
 
 
-def _spawn_login_and_wait_for_url(
-    cli_path: str, profile_dir: Path | None
-) -> tuple[Any, int | None, str, str]:
+def _spawn_login(cli_path: str, profile_dir: Path | None) -> dict[str, Any]:
+    """Start ``claude auth login`` and wait for its sign-in URLs.
+
+    Returns the flow pieces: the process (and pty), the printed manual URL,
+    and — when ``$BROWSER`` could be captured — the automatic URL with the
+    CLI's loopback callback.
+    """
     env = _clean_claude_env(profile_dir, strip_api_key=True)
-    env["BROWSER"] = "true"
-    env["NO_BROWSER"] = "1"
+    env.pop("NO_BROWSER", None)
+    capture = _make_browser_capture()
+    url_file: Path | None = None
+    capture_dir: Path | None = None
+    if capture is not None:
+        env["BROWSER"], url_file, capture_dir = capture
+    else:
+        env["BROWSER"] = "true"
     cmd = [cli_path, "auth", "login", "--claudeai"]
 
     master_fd: int | None = None
     output_buf = ""
+    manual_url: str | None = None
+    deadline = time.monotonic() + AUTH_START_TIMEOUT_SECS
 
-    if pty is not None and os.name != "nt":
-        master_fd, slave_fd = pty.openpty()
-        try:
+    try:
+        if pty is not None and os.name != "nt":
+            master_fd, slave_fd = pty.openpty()
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=slave_fd,
+                    stdout=slave_fd,
+                    stderr=slave_fd,
+                    env=env,
+                    close_fds=True,
+                )
+            finally:
+                os.close(slave_fd)
+            while time.monotonic() < deadline:
+                remaining = max(0.05, min(0.2, deadline - time.monotonic()))
+                try:
+                    ready, _, _ = select.select([master_fd], [], [], remaining)
+                except (OSError, ValueError):
+                    break
+                if ready:
+                    try:
+                        chunk = os.read(master_fd, 4096)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    output_buf += chunk.decode("utf-8", errors="replace")
+                    manual_url = _extract_https_url(output_buf)
+                    if manual_url:
+                        break
+                elif proc.poll() is not None:
+                    break
+        else:
             proc = subprocess.Popen(
                 cmd,
-                stdin=slave_fd,
-                stdout=slave_fd,
-                stderr=slave_fd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 env=env,
-                close_fds=True,
             )
-        finally:
-            os.close(slave_fd)
-
-        deadline = time.monotonic() + AUTH_START_TIMEOUT_SECS
-        url: str | None = None
-        while time.monotonic() < deadline:
-            remaining = max(0.05, min(0.2, deadline - time.monotonic()))
-            try:
-                ready, _, _ = select.select([master_fd], [], [], remaining)
-            except (OSError, ValueError):
-                break
-            if ready:
-                try:
-                    chunk = os.read(master_fd, 4096)
-                except OSError:
+            while time.monotonic() < deadline and proc.stdout is not None:
+                line = proc.stdout.readline()
+                if not line:
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.05)
+                    continue
+                output_buf += (
+                    line.decode("utf-8", errors="replace")
+                    if isinstance(line, bytes)
+                    else str(line)
+                )
+                manual_url = _extract_https_url(output_buf)
+                if manual_url:
                     break
-                if not chunk:
-                    break
-                output_buf += chunk.decode("utf-8", errors="replace")
-                url = _extract_https_url(output_buf)
-                if url:
-                    return proc, master_fd, url, output_buf
-            elif proc.poll() is not None:
-                break
+    except Exception:
+        if capture_dir is not None:
+            shutil.rmtree(capture_dir, ignore_errors=True)
+        raise
 
-        _terminate_proc(proc)
-        try:
-            os.close(master_fd)
-        except OSError:
-            pass
+    flow: dict[str, Any] = {
+        "proc": proc,
+        "master_fd": master_fd,
+        "output_buf": output_buf,
+        "capture_dir": capture_dir,
+    }
+    if not manual_url:
+        _cleanup_flow(flow)
         raise RuntimeError("claude auth login did not emit an authorization URL")
 
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        env=env,
-    )
-    deadline = time.monotonic() + AUTH_START_TIMEOUT_SECS
-    url = None
-    while time.monotonic() < deadline and proc.stdout is not None:
-        line = proc.stdout.readline()
-        if not line:
-            if proc.poll() is not None:
-                break
-            time.sleep(0.05)
-            continue
-        output_buf += (
-            line.decode("utf-8", errors="replace")
-            if isinstance(line, bytes)
-            else str(line)
-        )
-        url = _extract_https_url(output_buf)
-        if url:
-            return proc, None, url, output_buf
+    # The CLI calls $BROWSER before it prints the fallback URL; allow a
+    # moment for the helper's write to land.
+    auto_url = _read_captured_url(url_file)
+    grace = time.monotonic() + BROWSER_CAPTURE_GRACE_SECS
+    while auto_url is None and url_file is not None and time.monotonic() < grace:
+        time.sleep(0.05)
+        auto_url = _read_captured_url(url_file)
+
+    callback = _parse_cli_callback(auto_url)
+    flow["manual_url"] = manual_url
+    flow["auto_url"] = auto_url if callback is not None else None
+    flow["callback"] = callback
+    return flow
+
+
+PASTE_PROMPT = "Paste code here if prompted >"
+
+
+def _wait_for_exit(flow: dict[str, Any], since: int | None = None) -> int | None:
+    """Wait for ``claude auth login`` to exit and return its code.
+
+    With ``since`` (the output length before a code was pasted), returns
+    ``None`` when the CLI asked for the code again instead of exiting: the
+    paste was refused but the sign-in is still open.
+    """
+    proc = flow.get("proc")
+    deadline = time.monotonic() + AUTH_COMPLETE_TIMEOUT_SECS
+    while time.monotonic() < deadline:
+        _drain_flow_output(flow)
+        rc = proc.poll() if proc is not None else None
+        if rc is not None:
+            _drain_flow_output(flow)
+            return int(rc)
+        if since is not None and PASTE_PROMPT in _strip_ansi(flow["output_buf"][since:]):
+            return None
+        time.sleep(0.05)
 
     _terminate_proc(proc)
-    raise RuntimeError("claude auth login did not emit an authorization URL")
+    raise TimeoutError("timed out waiting for claude auth login to finish")
 
 
-def _write_code_and_wait(flow: dict[str, Any], code: str) -> int:
+def _write_code_and_wait(flow: dict[str, Any], code: str) -> int | None:
+    _drain_flow_output(flow)
+    since = len(flow["output_buf"])
     payload = (code.strip() + "\n").encode("utf-8")
     master_fd = flow.get("master_fd")
     proc = flow.get("proc")
@@ -1110,16 +1260,109 @@ def _write_code_and_wait(flow: dict[str, Any], code: str) -> int:
         proc.stdin.write(payload)
         proc.stdin.flush()
 
-    deadline = time.monotonic() + AUTH_COMPLETE_TIMEOUT_SECS
-    while time.monotonic() < deadline:
-        _drain_flow_output(flow)
-        rc = proc.poll() if proc is not None else None
-        if rc is not None:
-            return int(rc)
-        time.sleep(0.05)
+    return _wait_for_exit(flow, since=since if master_fd is not None else None)
 
-    _terminate_proc(proc)
-    raise TimeoutError("timed out waiting for claude auth login to finish")
+
+def _relay_callback_and_wait(
+    flow: dict[str, Any], code: str, state: str
+) -> int | None:
+    """Hand a browser redirect to the CLI's own loopback listener.
+
+    The browser that finished the sign-in may sit on another machine than
+    this gateway (the desktop caught the redirect there); the CLI that is
+    waiting for it only listens on this machine's loopback. Only the
+    callback port and path the CLI itself announced are ever contacted.
+    """
+    callback = flow["callback"]
+    target = callback["path"] + "?" + urllib.parse.urlencode(
+        {"code": code, "state": state}
+    )
+    delivered = False
+    for host in ("127.0.0.1", "::1"):
+        conn = http.client.HTTPConnection(
+            host, callback["port"], timeout=AUTH_COMPLETE_TIMEOUT_SECS
+        )
+        try:
+            conn.request(
+                "GET", target, headers={"Host": f"localhost:{callback['port']}"}
+            )
+            response = conn.getresponse()
+            response.read(64 * 1024)
+            delivered = True
+            break
+        except (OSError, http.client.HTTPException):
+            continue
+        finally:
+            conn.close()
+    if not delivered:
+        raise ConnectionError("the Claude CLI sign-in listener is not reachable")
+    return _wait_for_exit(flow)
+
+
+def _cli_lines(text: str) -> list[str]:
+    """The CLI's output as lines, with the paste prompt split off its own
+    line (the CLI prints its answer right after the prompt)."""
+    cleaned = _strip_ansi(text).replace("\r", "\n").replace(PASTE_PROMPT, "\n")
+    return [line.strip() for line in cleaned.splitlines() if line.strip()]
+
+
+def _cli_failure_message(text: str, rc: int | None, code: str | None) -> str:
+    """The CLI's own reason for a refused sign-in, safe to show the member.
+
+    The pty echoes a pasted code back, so the code is masked wherever it
+    appears and the echo line itself is skipped.
+    """
+    secret = (code or "").strip()
+    for line in reversed(_cli_lines(text)):
+        if secret and line == secret:
+            continue
+        if line.startswith(("Signing in", "Opening browser", "If the browser")):
+            continue
+        if line.startswith("https://"):
+            continue
+        if secret:
+            line = line.replace(secret, "…")
+        if line.startswith("Couldn't log in:"):
+            line = line[len("Couldn't log in:") :].strip()
+        if "status code 400" in line or "status code 401" in line:
+            return (
+                "Claude did not accept the sign-in. The code may have expired or "
+                "been used already. Start the sign-in again."
+            )
+        message = _redact_secrets(line)
+        if message:
+            return message[:240]
+    if rc is None:
+        return "Claude asked for the code again. Copy all of it, including the # in the middle."
+    return f"Claude did not finish the sign-in (claude auth login exited {rc})."
+
+
+def _finish_flow(
+    flow: dict[str, Any], rc: int, code: str | None = None
+) -> dict[str, Any]:
+    """Close the CLI and remember how the sign-in ended, for later polls."""
+    _cleanup_flow(flow)
+    flow["proc"] = None
+    if rc == 0:
+        account = _read_cli_status(flow["profile_dir"])
+        if account is not None:
+            result = {"status": "ok", "profile": flow["profile"], "account": account}
+            logger.info("CLI sign-in stored credentials for profile=%s", flow["profile"])
+        else:
+            result = {
+                "status": "denied",
+                "code": "auth_complete_failed",
+                "error": "Claude finished the sign-in but no login was stored.",
+            }
+    else:
+        result = {
+            "status": "denied",
+            "code": "auth_code_rejected",
+            "error": _cli_failure_message(flow.get("output_buf", ""), rc, code),
+        }
+    flow["result"] = result
+    flow["completing"] = False
+    return result
 
 
 async def health(request: Request) -> JSONResponse:
@@ -1278,14 +1521,12 @@ async def auth_start(request: Request) -> JSONResponse:
     profile_name, profile_dir = _resolve_profile_dir(profile, create=True)
 
     try:
-        proc, master_fd, url, output_buf = await asyncio.to_thread(
-            _spawn_login_and_wait_for_url, cli_path, profile_dir
-        )
+        flow = await asyncio.to_thread(_spawn_login, cli_path, profile_dir)
     except Exception as exc:
-        logger.warning("auth start failed: %s", exc)
+        logger.warning("auth start failed: %s", type(exc).__name__)
         return JSONResponse(
             {
-                "error": "failed to start claude auth login",
+                "error": "claude auth login did not start; check that `claude --version` works on the gateway host",
                 "code": "auth_start_failed",
             },
             status_code=502,
@@ -1293,26 +1534,53 @@ async def auth_start(request: Request) -> JSONResponse:
 
     flow_id = secrets.token_urlsafe(16)
     now = time.time()
-    _pending_auth_flows[flow_id] = {
-        "flow_id": flow_id,
-        "profile": profile_name,
-        "profile_dir": profile_dir,
-        "proc": proc,
-        "master_fd": master_fd,
-        "url": url,
-        "output_buf": output_buf,
-        "created_at": now,
-        "expires": now + AUTH_FLOW_TTL_SECS,
-    }
-    return JSONResponse(
+    flow.update(
         {
             "flow_id": flow_id,
-            "url": url,
             "profile": profile_name,
-            "expires_in": AUTH_FLOW_TTL_SECS,
-            "mode": "cli_browser_or_paste",
+            "profile_dir": profile_dir,
+            "created_at": now,
+            "expires": now + AUTH_FLOW_TTL_SECS,
+            "completing": False,
         }
     )
+    _pending_auth_flows[flow_id] = flow
+    callback = flow.get("callback")
+    reply: dict[str, Any] = {
+        "flow_id": flow_id,
+        # The automatic URL when the CLI's callback is known: the browser
+        # redirect then finishes the sign-in with no code to paste.
+        "url": flow.get("auto_url") or flow["manual_url"],
+        "manual_url": flow["manual_url"],
+        "profile": profile_name,
+        "expires_in": AUTH_FLOW_TTL_SECS,
+        "mode": "callback" if callback is not None else "paste",
+    }
+    if callback is not None:
+        reply["callback"] = {"port": callback["port"], "path": callback["path"]}
+        reply["state"] = callback["state"]
+    return JSONResponse(reply)
+
+
+def _parse_pasted_callback(text: str) -> tuple[str, str] | None:
+    """``code`` and ``state`` from a pasted ``http://localhost:…/callback?…`` URL."""
+    if not text.startswith(("http://localhost", "http://127.0.0.1", "http://[::1]")):
+        return None
+    try:
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(text).query)
+    except ValueError:
+        return None
+    code = (query.get("code") or [""])[0].strip()
+    state = (query.get("state") or [""])[0].strip()
+    if not code or not state:
+        return None
+    return code, state
+
+
+def _flow_result_reply(flow: dict[str, Any]) -> dict[str, Any]:
+    result = dict(flow["result"])
+    result.setdefault("profile", flow["profile"])
+    return result
 
 
 async def auth_flow_status(request: Request) -> JSONResponse:
@@ -1328,10 +1596,18 @@ async def auth_flow_status(request: Request) -> JSONResponse:
             status_code=404,
         )
 
+    # A finished flow keeps answering until it expires, so a poll that
+    # races a pasted code or a relayed callback still sees how it ended.
+    if "result" in flow:
+        return JSONResponse(_flow_result_reply(flow))
+
     if time.time() >= flow["expires"]:
         _pending_auth_flows.pop(flow_id, None)
         _cleanup_flow(flow)
         return JSONResponse({"status": "expired"})
+
+    if flow.get("completing"):
+        return JSONResponse({"status": "pending", "profile": flow["profile"]})
 
     _drain_flow_output(flow)
     proc = flow.get("proc")
@@ -1339,33 +1615,9 @@ async def auth_flow_status(request: Request) -> JSONResponse:
     if rc is None:
         return JSONResponse({"status": "pending", "profile": flow["profile"]})
 
-    _pending_auth_flows.pop(flow_id, None)
-    _cleanup_flow(flow)
-    if rc == 0:
-        account = _read_cli_status(flow["profile_dir"])
-        if account is not None:
-            return JSONResponse(
-                {
-                    "status": "ok",
-                    "profile": flow["profile"],
-                    "account": account,
-                }
-            )
-        return JSONResponse(
-            {
-                "status": "denied",
-                "error": "login completed but no credentials were found",
-            }
-        )
-
-    cleaned = _strip_ansi(flow.get("output_buf", "")).strip()
-    last_line = cleaned.splitlines()[-1].strip() if cleaned else ""
-    return JSONResponse(
-        {
-            "status": "denied",
-            "error": _redact_secrets(last_line) or f"claude auth login exited {rc}",
-        }
-    )
+    # The CLI finished by itself: its own localhost callback was reached.
+    _finish_flow(flow, rc)
+    return JSONResponse(_flow_result_reply(flow))
 
 
 async def auth_complete(request: Request) -> JSONResponse:
@@ -1380,58 +1632,135 @@ async def auth_complete(request: Request) -> JSONResponse:
     if not isinstance(payload, dict):
         return JSONResponse({"error": "JSON body must be an object"}, status_code=400)
 
-    flow_id = str(payload.get("flow_id") or "")
-    code = str(payload.get("code") or "")
-    if not flow_id or not code.strip():
+    flow_id = payload.get("flow_id")
+    code = payload.get("code")
+    state = payload.get("state")
+    if not isinstance(flow_id, str) or not isinstance(code, str):
         return JSONResponse(
             {"error": "flow_id and code are required"}, status_code=400
         )
+    code = code.strip()
+    if not flow_id or not code:
+        return JSONResponse(
+            {"error": "flow_id and code are required"}, status_code=400
+        )
+    if len(code) > MAX_AUTH_CODE_CHARS or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in code):
+        return JSONResponse(
+            {"error": "that does not look like a sign-in code", "code": "invalid_code"},
+            status_code=400,
+        )
+    if state is not None and (not isinstance(state, str) or not state):
+        return JSONResponse(
+            {"error": "state must be a non-empty string", "code": "invalid_state"},
+            status_code=400,
+        )
 
-    flow = _pending_auth_flows.pop(flow_id, None)
+    flow = _pending_auth_flows.get(flow_id)
     if flow is None:
         return JSONResponse(
             {"error": "unknown or used sign-in flow", "code": "flow_not_found"},
             status_code=404,
         )
 
+    if "result" in flow:
+        result = flow["result"]
+        if result.get("status") == "ok":
+            return JSONResponse(
+                {"ok": True, "profile": flow["profile"], "account": result["account"]}
+            )
+        return JSONResponse(
+            {
+                "error": "this sign-in already ended; start a new one",
+                "code": "flow_used",
+            },
+            status_code=409,
+        )
+
+    if flow.get("completing"):
+        return JSONResponse(
+            {"error": "this sign-in is already finishing", "code": "flow_busy"},
+            status_code=409,
+        )
+
     if time.time() >= flow["expires"]:
+        _pending_auth_flows.pop(flow_id, None)
         _cleanup_flow(flow)
         return JSONResponse(
             {"error": "sign-in expired; start again", "code": "flow_expired"},
             status_code=410,
         )
 
+    if state is None and flow.get("callback") is not None:
+        # The member copied the browser's address bar after a localhost
+        # redirect that did not load: relay it like a caught redirect.
+        pasted = _parse_pasted_callback(code)
+        if pasted is not None:
+            code, state = pasted
+
+    if state is not None:
+        callback = flow.get("callback")
+        if callback is None:
+            return JSONResponse(
+                {
+                    "error": "this sign-in has no browser callback; paste the code instead",
+                    "code": "no_callback",
+                },
+                status_code=400,
+            )
+        if not hmac.compare_digest(state.encode("utf-8"), callback["state"].encode("utf-8")):
+            return JSONResponse(
+                {"error": "the sign-in state does not match", "code": "state_mismatch"},
+                status_code=400,
+            )
+
+        def runner() -> int:
+            return _relay_callback_and_wait(flow, code, state)
+    else:
+
+        def runner() -> int:
+            return _write_code_and_wait(flow, code)
+
+    proc = flow.get("proc")
+    flow["completing"] = True
     try:
-        rc = await asyncio.to_thread(_write_code_and_wait, flow, code)
+        if proc is not None and proc.poll() is not None:
+            # Finished on its own (the CLI's localhost callback was reached).
+            rc = int(proc.returncode)
+        else:
+            rc = await asyncio.to_thread(runner)
     except Exception as exc:
+        logger.warning("auth complete failed: %s", type(exc).__name__)
         _cleanup_flow(flow)
-        logger.warning("auth complete failed: %s", exc)
+        flow["proc"] = None
+        flow["completing"] = False
+        flow["result"] = {
+            "status": "denied",
+            "code": "auth_complete_failed",
+            "error": "Claude did not finish the sign-in. Start again.",
+        }
         return JSONResponse(
-            {"error": "claude auth login failed", "code": "auth_complete_failed"},
+            {"error": flow["result"]["error"], "code": "auth_complete_failed"},
             status_code=502,
         )
-    finally:
-        _cleanup_flow(flow)
 
-    if rc != 0:
-        return JSONResponse(
-            {"error": "claude auth login failed", "code": "auth_complete_failed"},
-            status_code=502,
-        )
-
-    account = _read_cli_status(flow["profile_dir"])
-    if account is None:
+    if rc is None:
+        # The CLI asked for the code again: the sign-in stays open.
+        flow["completing"] = False
         return JSONResponse(
             {
-                "error": "login completed but credentials were not found",
-                "code": "auth_complete_failed",
+                "error": _cli_failure_message(flow.get("output_buf", ""), None, code),
+                "code": "code_incomplete",
             },
-            status_code=502,
+            status_code=400,
         )
 
-    logger.info("CLI sign-in stored credentials for profile=%s", flow["profile"])
+    result = _finish_flow(flow, rc, code)
+    if result["status"] == "ok":
+        return JSONResponse(
+            {"ok": True, "profile": flow["profile"], "account": result["account"]}
+        )
     return JSONResponse(
-        {"ok": True, "profile": flow["profile"], "account": account}
+        {"error": result["error"], "code": result["code"]}, status_code=400
     )
 
 

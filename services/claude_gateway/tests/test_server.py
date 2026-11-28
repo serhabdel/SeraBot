@@ -184,35 +184,68 @@ if args[:3] == ["auth", "status", "--json"]:
 
 if args[:2] == ["auth", "login"]:
     mode = os.environ.get("MOCK_LOGIN_MODE", "interactive")
-    print("\\x1b[36mOpen this URL:\\x1b[0m https://claude.ai/oauth/authorize?client_id=test&state=abc123", flush=True)
+
+    def store(email):
+        config_dir.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(json.dumps({
+            "loggedIn": True,
+            "authMethod": "claudeai",
+            "email": email,
+            "orgId": "org_1",
+            "orgName": "Test Org",
+            "subscriptionType": "pro",
+        }), encoding="utf-8")
+
+    listener = None
+    browser = os.environ.get("BROWSER", "")
+    if browser and browser != "true":
+        import socket
+        import subprocess
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(4)
+        port = listener.getsockname()[1]
+        auto = (
+            "https://claude.com/cai/oauth/authorize?code=true&client_id=test"
+            f"&redirect_uri=http%3A%2F%2Flocalhost%3A{port}%2Fcallback&state=abc123"
+        )
+        subprocess.run([browser, auto], check=False)
+    print("\x1b[36mOpen this URL:\x1b[0m https://claude.ai/oauth/authorize?client_id=test&state=abc123", flush=True)
     if mode == "fail":
         print("Authentication denied by user", flush=True)
         sys.exit(1)
     if mode == "auto":
         time.sleep(0.15)
-        config_dir.mkdir(parents=True, exist_ok=True)
-        state_file.write_text(json.dumps({
-            "loggedIn": True,
-            "authMethod": "claudeai",
-            "email": "auto@example.com",
-            "orgId": "org_1",
-            "orgName": "Auto Org",
-            "subscriptionType": "max",
-        }), encoding="utf-8")
+        store("auto@example.com")
         sys.exit(0)
-    code = sys.stdin.readline().strip()
-    if code == "bad-code":
-        print("Invalid code", flush=True)
+    if mode == "callback" and listener is not None:
+        from urllib.parse import parse_qs, urlsplit
+        conn, _ = listener.accept()
+        head = conn.recv(65536).decode("latin-1")
+        target = head.split(" ")[1]
+        query = parse_qs(urlsplit(target).query)
+        code = query.get("code", [""])[0]
+        state = query.get("state", [""])[0]
+        if state != "abc123" or code == "bad-code":
+            conn.sendall(b"HTTP/1.1 200 OK\\r\\nContent-Length: 6\\r\\n\\r\\nfailed")
+            conn.close()
+            print("Couldn't log in: Request failed with status code 400", flush=True)
+            sys.exit(1)
+        conn.sendall(b"HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\nok")
+        conn.close()
+        store(f"{code}@example.com")
+        sys.exit(0)
+    while True:
+        print("Paste code here if prompted > ", end="", flush=True)
+        code = sys.stdin.readline().strip()
+        if "#" not in code:
+            print("That doesn't look like the full code. Copy all of it, including the # in the middle.", flush=True)
+            continue
+        break
+    if code.startswith("bad-code"):
+        print(f"Couldn't log in: That code wasn't accepted ({code}).", flush=True)
         sys.exit(1)
-    config_dir.mkdir(parents=True, exist_ok=True)
-    state_file.write_text(json.dumps({
-        "loggedIn": True,
-        "authMethod": "claudeai",
-        "email": f"{code}@example.com",
-        "orgId": "org_1",
-        "orgName": "Test Org",
-        "subscriptionType": "pro",
-    }), encoding="utf-8")
+    store(f"{code}@example.com")
     sys.exit(0)
 
 sys.exit(2)
@@ -652,10 +685,10 @@ class TestClaudeGateway(unittest.IsolatedAsyncioTestCase):
             "POST", "/v1/auth/start", headers=headers, json_body={}
         )
         self.assertEqual(status, 200)
-        self.assertEqual(started["mode"], "cli_browser_or_paste")
+        self.assertIn(started["mode"], ("callback", "paste"))
         self.assertTrue(started["profile"].startswith("acct_"))
         self.assertEqual(
-            started["url"],
+            started["manual_url"],
             "https://claude.ai/oauth/authorize?client_id=test&state=abc123",
         )
         flow_id = started["flow_id"]
@@ -763,6 +796,179 @@ class TestClaudeGateway(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["profile"], "default")
         self.assertEqual(body["account"]["email"], "default@example.com")
+
+    @unittest.skipIf(os.name == "nt", "the $BROWSER capture is POSIX only")
+    async def test_cli_auth_browser_callback_is_relayed_to_the_cli(self) -> None:
+        headers = {"Authorization": "Bearer test-secret-token-123"}
+        cli_path = _write_mock_claude_cli(Path(self._tmp_dir.name))
+        os.environ[server.CLI_PATH_ENV_VAR] = str(cli_path)
+
+        with patch.dict(os.environ, {"MOCK_LOGIN_MODE": "callback"}):
+            status, started = await _asgi_request(
+                "POST", "/v1/auth/start", headers=headers, json_body={"profile": "cb"}
+            )
+        self.assertEqual(status, 200)
+        # The automatic URL (the CLI's localhost redirect) is what opens.
+        self.assertEqual(started["mode"], "callback")
+        self.assertTrue(started["url"].startswith("https://claude.com/cai/oauth/authorize"))
+        self.assertIn("redirect_uri=http%3A%2F%2Flocalhost", started["url"])
+        self.assertEqual(
+            started["manual_url"],
+            "https://claude.ai/oauth/authorize?client_id=test&state=abc123",
+        )
+        self.assertEqual(started["callback"]["path"], "/callback")
+        self.assertGreaterEqual(started["callback"]["port"], 1024)
+        self.assertEqual(started["state"], "abc123")
+        flow_id = started["flow_id"]
+
+        # A wrong state never reaches the CLI.
+        status, body = await _asgi_request(
+            "POST",
+            "/v1/auth/complete",
+            headers=headers,
+            json_body={"flow_id": flow_id, "code": "alice", "state": "other"},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(body["code"], "state_mismatch")
+
+        status, done = await _asgi_request(
+            "POST",
+            "/v1/auth/complete",
+            headers=headers,
+            json_body={"flow_id": flow_id, "code": "alice", "state": "abc123"},
+        )
+        self.assertEqual(status, 200, done)
+        self.assertTrue(done["ok"])
+        self.assertEqual(done["profile"], "cb")
+        self.assertEqual(done["account"]["email"], "alice@example.com")
+
+        # A poll that races the completion still sees how it ended.
+        status, flow_state = await _asgi_request(
+            "GET", f"/v1/auth/flow/{flow_id}", headers=headers
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(flow_state["status"], "ok")
+        self.assertEqual(flow_state["account"]["email"], "alice@example.com")
+        # Completing again is idempotent for a finished, successful flow.
+        status, again = await _asgi_request(
+            "POST",
+            "/v1/auth/complete",
+            headers=headers,
+            json_body={"flow_id": flow_id, "code": "alice", "state": "abc123"},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(again["ok"])
+
+        # A pasted localhost URL from the address bar is relayed the same way;
+        # a refused exchange reports Claude's reason, not a generic failure.
+        with patch.dict(os.environ, {"MOCK_LOGIN_MODE": "callback"}):
+            status, started = await _asgi_request(
+                "POST", "/v1/auth/start", headers=headers, json_body={"profile": "cb2"}
+            )
+        pasted = (
+            f"http://localhost:{started['callback']['port']}/callback"
+            "?code=bad-code&state=abc123"
+        )
+        status, body = await _asgi_request(
+            "POST",
+            "/v1/auth/complete",
+            headers=headers,
+            json_body={"flow_id": started["flow_id"], "code": pasted},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(body["code"], "auth_code_rejected")
+        self.assertIn("did not accept", body["error"])
+        status, flow_state = await _asgi_request(
+            "GET", f"/v1/auth/flow/{started['flow_id']}", headers=headers
+        )
+        self.assertEqual(flow_state["status"], "denied")
+
+    async def test_cli_auth_paste_reprompt_keeps_the_flow_open(self) -> None:
+        headers = {"Authorization": "Bearer test-secret-token-123"}
+        cli_path = _write_mock_claude_cli(Path(self._tmp_dir.name))
+        os.environ[server.CLI_PATH_ENV_VAR] = str(cli_path)
+
+        status, started = await _asgi_request(
+            "POST", "/v1/auth/start", headers=headers, json_body={"profile": "paste"}
+        )
+        self.assertEqual(status, 200)
+        flow_id = started["flow_id"]
+
+        # Control characters are refused before anything reaches the CLI.
+        status, body = await _asgi_request(
+            "POST",
+            "/v1/auth/complete",
+            headers=headers,
+            json_body={"flow_id": flow_id, "code": "abc\x1b[2Jdef"},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(body["code"], "invalid_code")
+
+        if server.pty is not None and os.name != "nt":
+            status, body = await _asgi_request(
+                "POST",
+                "/v1/auth/complete",
+                headers=headers,
+                json_body={"flow_id": flow_id, "code": "half-a-code"},
+            )
+            self.assertEqual(status, 400)
+            self.assertEqual(body["code"], "code_incomplete")
+            self.assertIn("#", body["error"])
+            status, flow_state = await _asgi_request(
+                "GET", f"/v1/auth/flow/{flow_id}", headers=headers
+            )
+            self.assertEqual(flow_state["status"], "pending")
+
+        status, body = await _asgi_request(
+            "POST",
+            "/v1/auth/complete",
+            headers=headers,
+            json_body={"flow_id": flow_id, "code": "bad-code#secret-state"},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(body["code"], "auth_code_rejected")
+        # The echoed code never comes back in the message.
+        self.assertNotIn("secret-state", body["error"])
+        self.assertIn("wasn't accepted", body["error"])
+
+    def test_cli_failure_message_and_callback_parsing(self) -> None:
+        out = (
+            "Opening browser to sign in\u2026\r\nIf the browser didn't open, visit:\r\n"
+            "https://claude.ai/oauth/authorize?z-abc\r\n"
+            "Paste code here if prompted > Couldn't log in: Request failed with status code 400\r\n"
+        )
+        self.assertIn("did not accept", server._cli_failure_message(out, 1, None))
+        echoed = "Paste code here if prompted > tok#st\r\r\nBoom tok#st here\r\n"
+        self.assertEqual(server._cli_failure_message(echoed, 1, "tok#st"), "Boom … here")
+
+        good = (
+            "https://claude.com/cai/oauth/authorize?code=true&client_id=x"
+            "&redirect_uri=http%3A%2F%2Flocalhost%3A40123%2Fcallback&state=s1"
+        )
+        self.assertEqual(
+            server._parse_cli_callback(good),
+            {"port": 40123, "path": "/callback", "state": "s1"},
+        )
+        for bad in (
+            good.replace("http%3A%2F%2Flocalhost", "http%3A%2F%2Fevil.example"),
+            good.replace("40123", "80"),
+            good.replace("https://", "http://"),
+            good.replace("&state=s1", ""),
+            None,
+        ):
+            self.assertIsNone(server._parse_cli_callback(bad), bad)
+
+        # A URL split across two reads is not taken until it is complete.
+        self.assertIsNone(server._extract_https_url("visit: https://claude.ai/oauth/auth"))
+        self.assertEqual(
+            server._extract_https_url("visit: https://claude.ai/oauth/x?y=1\r\n"),
+            "https://claude.ai/oauth/x?y=1",
+        )
+        self.assertEqual(
+            server._parse_pasted_callback("http://localhost:1234/callback?code=c&state=s"),
+            ("c", "s"),
+        )
+        self.assertIsNone(server._parse_pasted_callback("c#s"))
 
     async def test_auth_usage_live_oauth_and_validation(self) -> None:
         headers = {"Authorization": "Bearer test-secret-token-123"}
