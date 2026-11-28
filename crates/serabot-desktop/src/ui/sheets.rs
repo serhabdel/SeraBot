@@ -725,7 +725,7 @@ fn run_palette_action(
             let mut next = s.prefs.clone();
             next.reduce_motion = !next.reduce_motion;
             let on = next.reduce_motion;
-            s.save_prefs(next);
+            s.set_prefs(next);
             s.push_toast(
                 serabot_desktop::session::ToastTone::Info,
                 if on {

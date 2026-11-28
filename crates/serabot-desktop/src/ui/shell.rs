@@ -12,7 +12,7 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
     crate::ui_mail_actions::use_mail_unread_poll(session);
     let chat = section == Section::Chat;
     let mut drawer_open = use_signal(|| false);
-    let mut toast = use_signal(|| Option::<(String, bool)>::None);
+    let toast = use_signal(|| Option::<(String, bool)>::None);
     let undo = use_signal(|| Option::<String>::None);
     // The topbar's search button and the chat view's find bar share this flag.
     use_context_provider(|| ChatFindOpen(Signal::new(false)));
@@ -106,9 +106,17 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
                 if onboarding_open {
                     OnboardingView { session }
                 } else {
-                div {
-                    key: if chat { "pane-chat".to_owned() } else { format!("pane-{section:?}") },
-                    class: if chat { "pane" } else { "pane pane-enter" },
+                    {
+                        let pane_key = if chat {
+                            "pane-chat".to_owned()
+                        } else {
+                            format!("pane-{section:?}")
+                        };
+                        let pane_cls = if chat { "pane" } else { "pane pane-enter" };
+                        rsx! {
+                            div {
+                                key: "{pane_key}",
+                                class: "{pane_cls}",
                     {match section {
                         // Kept mounted across conversation switches so the DOM,
                         // observers, and WebView bridges stay warm and instant.
@@ -132,6 +140,8 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
                         Section::Settings => rsx! { SettingsView { session, overlay } },
                     }}
                 }
+                        }
+                    }
                 }
             }
             div {
