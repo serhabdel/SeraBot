@@ -35,15 +35,16 @@ async def _asgi_request(
         body_bytes = json.dumps(json_body).encode("utf-8")
         raw_headers.append((b"content-type", b"application/json"))
 
+    route_path, _, query_str = path.partition("?")
     scope = {
         "type": "http",
         "asgi": {"version": "3.0"},
         "http_version": "1.1",
         "method": method,
         "scheme": "http",
-        "path": path,
-        "raw_path": path.encode("ascii"),
-        "query_string": b"",
+        "path": route_path,
+        "raw_path": route_path.encode("ascii"),
+        "query_string": query_str.encode("ascii"),
         "headers": raw_headers,
         "client": ("127.0.0.1", 50000),
         "server": ("127.0.0.1", 8791),
@@ -234,8 +235,10 @@ class TestClaudeGateway(unittest.IsolatedAsyncioTestCase):
         os.environ[server.STATE_DIR_ENV_VAR] = self._tmp_dir.name
         os.environ[server.CLI_PATH_ENV_VAR] = ""
         server._pending_auth_flows.clear()
+        server._last_rate_limits.clear()
 
     def tearDown(self) -> None:
+        server._last_rate_limits.clear()
         for fid in list(server._pending_auth_flows):
             fl = server._pending_auth_flows.pop(fid, None)
             if fl is not None:
@@ -618,6 +621,7 @@ class TestClaudeGateway(unittest.IsolatedAsyncioTestCase):
             ("POST", "/v1/auth/complete"),
             ("POST", "/v1/auth/import-cli"),
             ("POST", "/v1/auth/cancel"),
+            ("GET", "/v1/auth/usage"),
         ):
             status, _ = await _asgi_request(method, path)
             self.assertEqual(status, 401, path)
@@ -759,6 +763,176 @@ class TestClaudeGateway(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["profile"], "default")
         self.assertEqual(body["account"]["email"], "default@example.com")
+
+    async def test_auth_usage_live_oauth_and_validation(self) -> None:
+        headers = {"Authorization": "Bearer test-secret-token-123"}
+
+        # Rejects invalid profile id
+        status, body = await _asgi_request(
+            "GET", "/v1/auth/usage?profile=../bad", headers=headers
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(body["code"], "invalid_profile")
+
+        # Write OAuth credentials for named profile
+        secret_oauth_token = "sk-ant-oat01-very-secret-token-xyz"
+        profile_dir = Path(self._tmp_dir.name) / "profiles" / "work_1"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": secret_oauth_token}}),
+            encoding="utf-8",
+        )
+
+        seen_requests: list[tuple[Any, float]] = []
+
+        class _FakeResp:
+            status = 200
+
+            def __init__(self, raw: bytes) -> None:
+                self._raw = raw
+
+            def read(self, n: int = -1) -> bytes:
+                return self._raw[:n] if n >= 0 else self._raw
+
+            def __enter__(self) -> "_FakeResp":
+                return self
+
+            def __exit__(self, *args: Any) -> bool:
+                return False
+
+        class _FakeOpener:
+            def open(self, req: Any, timeout: float = 0.0) -> _FakeResp:
+                seen_requests.append((req, timeout))
+                payload = json.dumps(
+                    {
+                        "five_hour": {
+                            "utilization": 37.5,
+                            "resets_at": "2026-11-28T05:00:00Z",
+                        },
+                        "seven_day": {
+                            "utilization": 12.0,
+                            "resets_at": "2026-12-04T00:00:00Z",
+                        },
+                        "seven_day_sonnet": None,
+                        "seven_day_opus": {
+                            "utilization": 5.0,
+                            "resets_at": "2026-12-04T00:00:00Z",
+                        },
+                    }
+                ).encode("utf-8")
+                return _FakeResp(payload)
+
+        with patch.object(
+            server.urllib.request, "build_opener", return_value=_FakeOpener()
+        ) as mock_build:
+            status, body = await _asgi_request(
+                "GET", "/v1/auth/usage?profile=work_1", headers=headers
+            )
+
+        self.assertEqual(status, 200)
+        mock_build.assert_called_once_with(server._NoRedirect)
+        self.assertEqual(len(seen_requests), 1)
+        req, timeout = seen_requests[0]
+        self.assertEqual(req.full_url, "https://api.anthropic.com/api/oauth/usage")
+        self.assertEqual(timeout, 15.0)
+        req_headers = {k.lower(): v for k, v in req.header_items()}
+        self.assertEqual(req_headers["authorization"], f"Bearer {secret_oauth_token}")
+        self.assertEqual(req_headers["anthropic-beta"], "oauth-2025-04-20")
+        self.assertEqual(req_headers["user-agent"], "claude-code/2.0.0")
+
+        self.assertTrue(body["available"])
+        quota = body["quota"]
+        self.assertEqual(quota["source"], "claude")
+        self.assertEqual(quota["state"], "ok")
+        self.assertTrue(quota["sampled_at"].endswith("Z"))
+        self.assertEqual(
+            quota["windows"],
+            [
+                {
+                    "scope": "subscription",
+                    "label": "5h",
+                    "used_percent": 37.5,
+                    "remaining": 0.625,
+                    "resets_at": "2026-11-28T05:00:00Z",
+                },
+                {
+                    "scope": "subscription",
+                    "label": "7d",
+                    "used_percent": 12.0,
+                    "remaining": 0.88,
+                    "resets_at": "2026-12-04T00:00:00Z",
+                },
+                {
+                    "scope": "subscription",
+                    "label": "7d_opus",
+                    "used_percent": 5.0,
+                    "remaining": 0.95,
+                    "resets_at": "2026-12-04T00:00:00Z",
+                },
+            ],
+        )
+        # Never leak the OAuth token
+        self.assertNotIn(secret_oauth_token, json.dumps(body))
+
+    async def test_auth_usage_falls_back_to_cached_rate_limits(self) -> None:
+        headers = {"Authorization": "Bearer test-secret-token-123"}
+
+        # No credentials and no cache -> unavailable
+        with patch.object(Path, "home", return_value=Path(self._tmp_dir.name)):
+            status, body = await _asgi_request("GET", "/v1/auth/usage", headers=headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"available": False, "quota": None})
+
+        # Run a turn on profile "work_2" that emits rate_limit_info on ResultMessage
+        async def fake_query(*, prompt: str, options: _FakeClaudeAgentOptions):
+            yield _FakeAssistantMessage(content=[_FakeTextBlock(text="ok")])
+            yield SimpleNamespace(
+                subtype="success",
+                usage={"input_tokens": 5, "output_tokens": 2},
+                result=None,
+                rate_limit_info={
+                    "status": "allowed_warning",
+                    "rateLimitType": "five_hour",
+                    "utilization": 0.42,
+                    "resetsAt": 1795824000,
+                },
+            )
+
+        mock_sdk = _build_mock_sdk(fake_query)
+        with patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}):
+            status, _ = await _asgi_request(
+                "POST",
+                "/v1/turn",
+                headers=headers,
+                json_body={
+                    "profile": "work_2",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+        self.assertEqual(status, 200)
+
+        # Profile "work_2" now falls back to its cached rate_limit_info
+        status, body = await _asgi_request(
+            "GET", "/v1/auth/usage?profile=work_2", headers=headers
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(body["available"])
+        quota = body["quota"]
+        self.assertEqual(quota["source"], "claude")
+        self.assertEqual(quota["state"], "ok")
+        self.assertEqual(len(quota["windows"]), 1)
+        win = quota["windows"][0]
+        self.assertEqual(win["scope"], "subscription")
+        self.assertEqual(win["label"], "5h")
+        self.assertAlmostEqual(win["used_percent"], 42.0)
+        self.assertAlmostEqual(win["remaining"], 0.58)
+        self.assertEqual(win["resets_at"], "2026-11-28T00:00:00Z")
+
+        # Default profile remains unaffected by work_2's cache
+        with patch.object(Path, "home", return_value=Path(self._tmp_dir.name)):
+            status, body = await _asgi_request("GET", "/v1/auth/usage", headers=headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"available": False, "quota": None})
 
 
 if __name__ == "__main__":

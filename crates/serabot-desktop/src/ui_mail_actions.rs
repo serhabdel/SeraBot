@@ -22,8 +22,6 @@ use crate::ui_mail::{MailCtx, run_mail_job, toggle_flag_local, update_message_fl
 pub(crate) const DEFER_MS: u32 = 6000;
 /// How long a finished action keeps its Undo button.
 pub(crate) const TOAST_MS: u32 = 6000;
-/// The Undo send hold on the server (seconds). The toast lasts a second less.
-pub(crate) const SEND_HOLD_SECS: i64 = 10;
 
 /// A move or delete that has left the list but not yet the server.
 #[derive(Clone, PartialEq)]

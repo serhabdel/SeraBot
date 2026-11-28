@@ -444,9 +444,33 @@ pub async fn process_due_snoozes(
     Ok(due.len())
 }
 
-/// Background loop (every 5 seconds, so the Undo send hold ends on time) that
-/// delivers due scheduled emails, wakes snoozed messages, and fails sends that a
-/// restart left half-done.
+/// Shared wake signal for the scheduled mail loop so newly queued or
+/// `send-now` emails dispatch without waiting for the next timer tick.
+pub fn scheduled_mail_wake() -> &'static std::sync::Arc<tokio::sync::Notify> {
+    static WAKE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Notify>> =
+        std::sync::OnceLock::new();
+    WAKE.get_or_init(|| std::sync::Arc::new(tokio::sync::Notify::new()))
+}
+
+fn has_imminent_scheduled_mail(store: &Store, horizon_unix: i64) -> bool {
+    let Ok(conn) = store.connection() else {
+        return false;
+    };
+    conn.query_row(
+        "SELECT 1 FROM scheduled_mail WHERE status = 'pending' AND send_at <= ?1 LIMIT 1",
+        params![horizon_unix],
+        |_| Ok(()),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .is_some()
+}
+
+/// Background loop (2s while a pending email is due within 30s, otherwise 30s,
+/// plus immediate wake via [`scheduled_mail_wake`]) that delivers due scheduled
+/// emails, wakes snoozed messages, and fails sends that a restart left
+/// half-done.
 pub async fn run_scheduled_mail_loop(
     store: Store,
     secrets: std::sync::Arc<crate::user_secrets::UserSecrets>,
@@ -454,30 +478,51 @@ pub async fn run_scheduled_mail_loop(
     policy: crate::policy::Policy,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    run_scheduled_mail_loop_with_wake(
+        store,
+        secrets,
+        artifacts,
+        policy,
+        shutdown,
+        Some(scheduled_mail_wake().clone()),
+    )
+    .await
+}
+
+/// Same as [`run_scheduled_mail_loop`], accepting an explicit `mail_wake`
+/// notifier.
+pub async fn run_scheduled_mail_loop_with_wake(
+    store: Store,
+    secrets: std::sync::Arc<crate::user_secrets::UserSecrets>,
+    artifacts: std::sync::Arc<crate::maker::ArtifactStore>,
+    policy: crate::policy::Policy,
+    shutdown: tokio_util::sync::CancellationToken,
+    mail_wake: Option<std::sync::Arc<tokio::sync::Notify>>,
+) -> Result<()> {
+    let wake = mail_wake.unwrap_or_else(|| scheduled_mail_wake().clone());
     loop {
+        let now_unix = Utc::now().timestamp();
+        let delay = if has_imminent_scheduled_mail(&store, now_unix + 30) {
+            std::time::Duration::from_secs(2)
+        } else {
+            std::time::Duration::from_secs(30)
+        };
         tokio::select! {
             _ = shutdown.cancelled() => break,
-            _ = interval.tick() => {
-                let now_unix = Utc::now().timestamp();
-                if let Err(error) = store.recover_stale_scheduled_mail(now_unix) {
-                    tracing::warn!(%error, "stale scheduled mail recovery failed");
-                }
-                if let Err(error) = process_due_snoozes(&store, &secrets, now_unix).await {
-                    tracing::warn!(%error, "snooze wake check failed");
-                }
-                if let Err(error) = process_due_scheduled_mail(
-                    &store,
-                    &secrets,
-                    &artifacts,
-                    &policy,
-                    now_unix,
-                )
-                .await
-                {
-                    tracing::warn!(%error, "scheduled mail check failed");
-                }
-            }
+            _ = tokio::time::sleep(delay) => {}
+            _ = wake.notified() => {}
+        }
+        let now_unix = Utc::now().timestamp();
+        if let Err(error) = store.recover_stale_scheduled_mail(now_unix) {
+            tracing::warn!(%error, "stale scheduled mail recovery failed");
+        }
+        if let Err(error) = process_due_snoozes(&store, &secrets, now_unix).await {
+            tracing::warn!(%error, "snooze wake check failed");
+        }
+        if let Err(error) =
+            process_due_scheduled_mail(&store, &secrets, &artifacts, &policy, now_unix).await
+        {
+            tracing::warn!(%error, "scheduled mail check failed");
         }
     }
     Ok(())

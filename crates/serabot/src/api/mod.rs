@@ -244,6 +244,11 @@ pub struct ApiState {
     quota_readers: Arc<HashMap<String, Arc<dyn QuotaReader>>>,
     /// When each account's quota was last read from its provider.
     quota_read_at: Arc<std::sync::Mutex<QuotaReadTimes>>,
+    /// Process supervisor for the loopback Claude Agent SDK gateway.
+    claude_gateway: Arc<crate::claude_gateway_proc::ClaudeGatewaySupervisor>,
+    /// Wake-up signal for the outbound mail send worker.
+    #[allow(dead_code)]
+    mail_wake: Arc<tokio::sync::Notify>,
 }
 
 impl ApiState {
@@ -357,8 +362,16 @@ impl ApiState {
             signin,
             quota_readers: Arc::new(provider_quota::standard_readers()),
             quota_read_at: Arc::default(),
+            claude_gateway: Arc::new(crate::claude_gateway_proc::ClaudeGatewaySupervisor::new()),
+            mail_wake: Arc::new(tokio::sync::Notify::new()),
             config,
         })
+    }
+
+    /// Wake-up handle for the background mail send worker.
+    #[allow(dead_code)]
+    pub(crate) fn mail_wake(&self) -> Arc<tokio::sync::Notify> {
+        self.mail_wake.clone()
     }
 
     /// Share the account refresher the model clients use, so a token renewed
@@ -670,6 +683,10 @@ pub fn router(state: ApiState) -> Router {
         .route(
             "/v1/providers/{id}/gateway-status",
             get(provider_gateway_status),
+        )
+        .route(
+            "/v1/providers/{id}/gateway-start",
+            post(provider_gateway_start),
         )
         .route(
             "/v1/providers/{id}/gateway-token",

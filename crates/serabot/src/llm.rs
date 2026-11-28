@@ -1575,7 +1575,7 @@ impl LlmClient {
             Ok(response) => response,
             Err(err) => {
                 let reason = transport_reason(&err);
-                tracing::warn!(reason, "cloud code transport failed");
+                tracing::debug!(reason, "cloud code transport failed");
                 return Ok(CloudPost::Transport(reason));
             }
         };

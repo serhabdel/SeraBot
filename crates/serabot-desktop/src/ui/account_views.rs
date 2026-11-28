@@ -7,7 +7,15 @@ use serabot_desktop::theme::Tone;
 use serabot_desktop::{ProviderAccount, ProviderStatus};
 
 /// Providers whose servers report a quota the page can read again.
-const QUOTA_KINDS: [&str; 3] = ["muse-code", "google-antigravity", "opencode-go"];
+const QUOTA_KINDS: [&str; 7] = [
+    "muse-code",
+    "google-antigravity",
+    "opencode-go",
+    "claude-agent-sdk",
+    "kiro",
+    "github-copilot",
+    "openai-codex",
+];
 
 fn preset_of(provider: &ProviderStatus) -> Option<&'static ProviderPreset> {
     provider_presets::presets()

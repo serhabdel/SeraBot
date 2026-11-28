@@ -170,6 +170,7 @@ pub fn quota_view(quota: &Value) -> Option<QuotaView> {
         .max_by(|a, b| a.0.total_cmp(&b.0))?;
     let (used, window) = tightest;
     let percent_used = used.round().clamp(0.0, 100.0) as u32;
+    let percent_remaining = 100u32.saturating_sub(percent_used);
     let scope = window
         .get("label")
         .or_else(|| window.get("scope"))
@@ -177,8 +178,8 @@ pub fn quota_view(quota: &Value) -> Option<QuotaView> {
         .map(str::trim)
         .filter(|text| !text.is_empty() && text.len() <= 32 && !text.chars().any(char::is_control));
     let label = match scope {
-        Some(scope) => format!("{percent_used}% of {scope} used"),
-        None => format!("{percent_used}% used"),
+        Some(scope) => format!("{scope}: {percent_remaining}% remaining"),
+        None => format!("{percent_remaining}% remaining"),
     };
     let resets_at = window
         .get("resets_at")
@@ -804,7 +805,7 @@ mod tests {
             panic!("a meter");
         };
         assert_eq!(meter.percent_used, 90);
-        assert_eq!(meter.label, "90% of week used");
+        assert_eq!(meter.label, "week: 10% remaining");
         assert_eq!(meter.tone, Tone::Warn);
         assert_eq!(meter.resets_at.as_deref(), Some("2099-01-02T00:00:00Z"));
 
@@ -813,7 +814,7 @@ mod tests {
             panic!("a meter");
         };
         assert_eq!((spent.percent_used, spent.tone), (100, Tone::Danger));
-        assert_eq!(spent.label, "100% used");
+        assert_eq!(spent.label, "0% remaining");
 
         assert!(matches!(
             quota_view(&json!({"state":"payment_required"})),

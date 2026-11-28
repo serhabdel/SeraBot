@@ -4684,6 +4684,12 @@ pub struct ClaudeGatewayConfig {
     pub token_secret: String,
     #[serde(default = "default_claude_gateway_timeout_secs")]
     pub timeout_secs: u64,
+    #[serde(default = "default_true")]
+    pub auto_start: bool,
+    #[serde(default)]
+    pub python_bin: String,
+    #[serde(default)]
+    pub script_path: String,
 }
 
 impl Default for ClaudeGatewayConfig {
@@ -4693,6 +4699,9 @@ impl Default for ClaudeGatewayConfig {
             url: default_claude_gateway_url(),
             token_secret: default_claude_gateway_token_secret(),
             timeout_secs: default_claude_gateway_timeout_secs(),
+            auto_start: true,
+            python_bin: String::new(),
+            script_path: String::new(),
         }
     }
 }

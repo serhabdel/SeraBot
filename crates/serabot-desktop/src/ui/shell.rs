@@ -1872,6 +1872,12 @@ pub(super) fn UserMenu(session: Signal<Session>, toast: Signal<Option<(String, b
                     span { class: "rail-badge rail-dot", title: "Offline" }
                 }
             }
+            if open() {
+                div {
+                    class: "rail-menu-scrim",
+                    onclick: move |_| open.set(false),
+                }
+            }
             div {
                 class: if open() { "menu rail-menu open" } else { "menu rail-menu" },
                 onkeydown: move |event: KeyboardEvent| {

@@ -894,7 +894,7 @@
 
 .settings-nav-item {
   position: relative;
-  padding: 8px 12px 8px 14px;
+  padding: 8px 10px 8px 14px;
   transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
 }
 
