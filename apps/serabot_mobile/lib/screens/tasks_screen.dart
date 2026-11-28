@@ -27,6 +27,7 @@ class _TasksScreenState extends State<TasksScreen> {
   String? _error;
   TasksResponse _data = const TasksResponse();
   List<CalendarEventItem> _events = const [];
+  List<CalendarProviderWarning> _calendarWarnings = const [];
 
   @override
   void initState() {
@@ -42,9 +43,12 @@ class _TasksScreenState extends State<TasksScreen> {
     try {
       final resp = await widget.app.client.tasks();
       List<CalendarEventItem> events = const [];
+      List<CalendarProviderWarning> warnings = const [];
       if (resp.supported) {
         try {
-          events = await widget.app.client.calendarEvents();
+          final cal = await widget.app.client.calendarEventsWithWarnings();
+          events = cal.events;
+          warnings = cal.warnings;
         } on ApiException {
           // Calendar endpoint is optional; fall back to due-dated tasks.
         }
@@ -53,6 +57,7 @@ class _TasksScreenState extends State<TasksScreen> {
       setState(() {
         _data = resp;
         _events = events;
+        _calendarWarnings = warnings;
         _loading = false;
       });
     } on ApiException catch (e) {
@@ -650,9 +655,14 @@ class _TasksScreenState extends State<TasksScreen> {
 
   Widget _calendarAgenda(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final isDark = scheme.brightness == Brightness.dark;
+    final warnBg = isDark ? const Color(0xFF3E2A00) : const Color(0xFFFFF8E1);
+    final warnBorder =
+        isDark ? const Color(0xFFFFB300) : const Color(0xFFF59E0B);
+    final warnFg = isDark ? const Color(0xFFFFE082) : const Color(0xFF78350F);
     final dueTasks =
         _data.tasks.where((t) => t.due != null && t.due!.isNotEmpty).toList();
-    if (_events.isEmpty && dueTasks.isEmpty) {
+    if (_events.isEmpty && dueTasks.isEmpty && _calendarWarnings.isEmpty) {
       return _emptyState(
         context,
         icon: Icons.event_available_outlined,
@@ -663,6 +673,61 @@ class _TasksScreenState extends State<TasksScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        for (final w in _calendarWarnings)
+          Card(
+            key: Key('calendar-warning-${w.provider}'),
+            margin: const EdgeInsets.only(bottom: 10),
+            elevation: 0,
+            color: warnBg,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+              side: BorderSide(color: warnBorder.withValues(alpha: 0.5)),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(Icons.warning_amber_rounded, color: warnBorder, size: 20),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          w.message,
+                          style: Theme.of(context)
+                              .textTheme
+                              .bodyMedium
+                              ?.copyWith(
+                                color: warnFg,
+                                fontWeight: FontWeight.w600,
+                              ),
+                        ),
+                        if (w.hint != null && w.hint!.isNotEmpty) ...[
+                          const SizedBox(height: 4),
+                          Text(
+                            w.hint!,
+                            style: Theme.of(context)
+                                .textTheme
+                                .bodySmall
+                                ?.copyWith(color: warnFg),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        if (_events.isEmpty && dueTasks.isEmpty)
+          _emptyState(
+            context,
+            icon: Icons.event_available_outlined,
+            title: 'Nothing coming up',
+            subtitle: 'No calendar events or due tasks in this view.',
+          ),
         for (final e in _events)
           Card(
             margin: const EdgeInsets.only(bottom: 8),

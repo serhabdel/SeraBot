@@ -672,6 +672,10 @@ enum PaletteAction {
     Conversation(String),
     Overlay(Overlay),
     ToggleTheme,
+    ToggleReduceMotion,
+    RefreshModels,
+    ReconnectStream,
+    CheckUpdates,
     /// A section of the Settings page.
     Settings(SettingsSection),
     /// Open Mail with a new message.
@@ -680,20 +684,24 @@ enum PaletteAction {
 
 #[derive(Clone)]
 struct PaletteEntry {
+    key: String,
     group: &'static str,
     title: String,
     subtitle: String,
+    keywords: &'static str,
     icon: &'static str,
     shortcut: &'static str,
     action: PaletteAction,
 }
 
 fn run_palette_action(
+    key: &str,
     action: PaletteAction,
     mut session: Signal<Session>,
     mut overlay: Signal<Overlay>,
 ) {
     overlay.set(Overlay::None);
+    session.write().touch_palette_recent(key);
     match action {
         PaletteAction::Section(section) => session.write().open_section(section),
         PaletteAction::Bot(id) => session.write().open_bot_chat(id),
@@ -712,6 +720,40 @@ fn run_palette_action(
             };
             session.write().set_theme(next);
         }
+        PaletteAction::ToggleReduceMotion => {
+            let mut s = session.write();
+            let mut next = s.prefs.clone();
+            next.reduce_motion = !next.reduce_motion;
+            let on = next.reduce_motion;
+            s.set_prefs(next);
+            s.push_toast(
+                serabot_desktop::session::ToastTone::Info,
+                if on {
+                    "Reduced motion enabled"
+                } else {
+                    "Reduced motion disabled"
+                },
+            );
+        }
+        PaletteAction::RefreshModels => {
+            let mut s = session.write();
+            s.refresh_providers();
+            s.push_toast(
+                serabot_desktop::session::ToastTone::Info,
+                "Refreshing AI providers & quotas…",
+            );
+        }
+        PaletteAction::ReconnectStream => {
+            let mut s = session.write();
+            s.reconnect_events_now();
+            s.push_toast(
+                serabot_desktop::session::ToastTone::Info,
+                "Reconnecting live stream…",
+            );
+        }
+        PaletteAction::CheckUpdates => {
+            session.write().check_updates_manual();
+        }
     }
 }
 
@@ -728,158 +770,250 @@ pub(super) fn CommandPaletteSheet(session: Signal<Session>, overlay: Signal<Over
         ));
     });
 
-    let entries: Vec<PaletteEntry> = {
+    let (entries, recent_keys): (Vec<PaletteEntry>, Vec<String>) = {
         let s = session.read();
+        let is_admin = s.can_admin();
+        let mem0_available = s
+            .state
+            .memory_settings
+            .as_ref()
+            .is_some_and(|view| view.mem0.available);
         let mut out = Vec::new();
-        for (section, icon, label, sub) in [
+        for (section, icon, label, sub, keywords) in [
             (
                 Section::Chat,
                 "chat",
                 "Chats",
                 "Conversations & live agents",
+                "chat messages threads bots",
             ),
             (
                 Section::Mail,
                 "send",
                 "Mail",
                 "Inbox, search, compose & attachments",
-            ),
-            (
-                Section::Workflows,
-                "workflows",
-                "Workflows",
-                "Multi-step plans & schedules",
+                "email hostinger smtp imap inbox",
             ),
             (
                 Section::Tasks,
                 "list",
                 "Tasks",
                 "Approvals, deadlines & runs",
+                "todo calendar google outlook",
             ),
             (
                 Section::Projects,
                 "folder",
                 "Projects",
                 "Server project folders & files",
+                "workspace code files checks",
+            ),
+            (
+                Section::Library,
+                "library",
+                "Library",
+                "Generated artifacts & uploads",
+                "files docs images pdf pptx xlsx",
+            ),
+            (
+                Section::Workflows,
+                "workflows",
+                "Workflows",
+                "Multi-step plans & schedules",
+                "routines automation cron",
             ),
             (
                 Section::Browser,
                 "globe",
                 "Browser",
                 "Managed profiles & pages",
+                "web chrome playwright",
             ),
             (
                 Section::Memory,
                 "memory",
                 "Memory",
                 "Saved facts & retrieval",
+                "facts recall mem0",
             ),
-            (Section::Vault, "lock", "Vault", "Sealed secrets & autofill"),
+            (
+                Section::Vault,
+                "lock",
+                "Vault",
+                "Sealed secrets & autofill",
+                "proton pass passwords keys",
+            ),
             (
                 Section::Integrations,
                 "connectors",
                 "Integrations",
                 "Plugins, MCP apps & bots",
+                "oauth github google microsoft whatsapp",
             ),
             (
                 Section::Providers,
                 "providers",
                 "AI providers",
-                "Models, keys & sign-in accounts",
+                "Models, keys, quotas & sign-in accounts",
+                "claude antigravity kiro openai gemini quota",
             ),
-            (Section::Usage, "usage", "Usage", "Tokens, quotas & latency"),
-            (Section::Logs, "logs", "Logs", "Runtime & audit logs"),
+            (
+                Section::Usage,
+                "usage",
+                "Usage",
+                "Tokens, quotas & latency",
+                "costs budget tokens",
+            ),
+            (
+                Section::Logs,
+                "logs",
+                "Logs",
+                "Runtime & audit logs",
+                "debug diagnostics errors",
+            ),
             (
                 Section::Settings,
                 "settings",
                 "Settings",
                 "Appearance, folders & server",
+                "preferences theme motion",
             ),
         ] {
             out.push(PaletteEntry {
+                key: format!("sec:{section:?}"),
                 group: "Workspace",
                 title: label.to_owned(),
                 subtitle: sub.to_owned(),
+                keywords,
                 icon,
                 shortcut: "",
                 action: PaletteAction::Section(section),
             });
         }
         out.push(PaletteEntry {
+            key: "act:new-chat".into(),
             group: "Actions",
             title: "New conversation".to_owned(),
             subtitle: "Start a fresh thread or room".to_owned(),
+            keywords: "create chat thread",
             icon: "plus",
             shortcut: "",
             action: PaletteAction::Overlay(Overlay::NewConversation),
         });
         out.push(PaletteEntry {
+            key: "act:new-bot".into(),
             group: "Actions",
             title: "New bot".to_owned(),
             subtitle: "Create a custom specialist bot".to_owned(),
+            keywords: "agent assistant",
             icon: "bot",
             shortcut: "",
             action: PaletteAction::Overlay(Overlay::NewBot),
         });
         out.push(PaletteEntry {
+            key: "act:new-group".into(),
             group: "Actions",
             title: "New group".to_owned(),
             subtitle: "Assemble bots into a room".to_owned(),
+            keywords: "team room",
             icon: "group",
             shortcut: "",
             action: PaletteAction::Overlay(Overlay::NewGroup),
         });
         out.push(PaletteEntry {
+            key: "act:compose-mail".into(),
             group: "Actions",
             title: "Compose email".to_owned(),
             subtitle: "Open Mail with a new message".to_owned(),
+            keywords: "cmail send message hostinger",
             icon: "edit",
             shortcut: "",
             action: PaletteAction::ComposeMail,
         });
-        for section in [
-            SettingsSection::Account,
-            SettingsSection::Appearance,
-            SettingsSection::Notifications,
-            SettingsSection::Chat,
-            SettingsSection::Voice,
-            SettingsSection::LocalFolders,
-            SettingsSection::Telegram,
-            SettingsSection::WebSearch,
-            SettingsSection::About,
-        ] {
-            out.push(PaletteEntry {
-                group: "Settings",
-                title: format!("Settings: {}", section.label()),
-                subtitle: section.description().to_owned(),
-                icon: "settings",
-                shortcut: "",
-                action: PaletteAction::Settings(section),
-            });
-        }
         out.push(PaletteEntry {
+            key: "act:refresh-models".into(),
+            group: "Actions",
+            title: "Refresh AI models & quotas".to_owned(),
+            subtitle: "Reload provider catalogs and remaining quotas".to_owned(),
+            keywords: "claude antigravity kiro quota sync",
+            icon: "refresh",
+            shortcut: "",
+            action: PaletteAction::RefreshModels,
+        });
+        out.push(PaletteEntry {
+            key: "act:reconnect".into(),
+            group: "Actions",
+            title: "Reconnect live server stream".to_owned(),
+            subtitle: "Wake SSE event stream immediately".to_owned(),
+            keywords: "sse live connection retry",
+            icon: "refresh",
+            shortcut: "",
+            action: PaletteAction::ReconnectStream,
+        });
+        out.push(PaletteEntry {
+            key: "act:toggle-theme".into(),
             group: "Actions",
             title: "Toggle Light / Dark theme".to_owned(),
             subtitle: "Switch studio appearance".to_owned(),
+            keywords: "dark light mode",
             icon: "spark",
             shortcut: "",
             action: PaletteAction::ToggleTheme,
         });
         out.push(PaletteEntry {
+            key: "act:toggle-motion".into(),
+            group: "Actions",
+            title: "Toggle Reduce motion".to_owned(),
+            subtitle: "Enable or disable UI animations".to_owned(),
+            keywords: "animations transitions accessibility",
+            icon: "sliders",
+            shortcut: "",
+            action: PaletteAction::ToggleReduceMotion,
+        });
+        out.push(PaletteEntry {
+            key: "act:check-updates".into(),
+            group: "Actions",
+            title: "Check for updates".to_owned(),
+            subtitle: "Check GitHub releases for a newer SeraBot".to_owned(),
+            keywords: "version release upgrade",
+            icon: "sparkles",
+            shortcut: "",
+            action: PaletteAction::CheckUpdates,
+        });
+        out.push(PaletteEntry {
+            key: "act:shortcuts".into(),
             group: "Actions",
             title: "Keyboard shortcuts".to_owned(),
             subtitle: "View all keyboard shortcuts".to_owned(),
+            keywords: "help keys",
             icon: "sliders",
             shortcut: "F1",
             action: PaletteAction::Overlay(Overlay::Shortcuts),
         });
+        for section in SettingsSection::ALL
+            .into_iter()
+            .filter(|sec| sec.visible_with_memory(is_admin, mem0_available))
+        {
+            out.push(PaletteEntry {
+                key: format!("set:{section:?}"),
+                group: "Settings",
+                title: format!("Settings: {}", section.label()),
+                subtitle: section.description().to_owned(),
+                keywords: section.keywords(),
+                icon: crate::ui_settings_page::section_icon(section),
+                shortcut: "",
+                action: PaletteAction::Settings(section),
+            });
+        }
         for bot in s.state.listed_bots.iter().filter(|b| b.enabled) {
             let name = s.bot_display_name(&bot.id);
             let sub = format!("{} · Server route", bot.role);
             out.push(PaletteEntry {
+                key: format!("bot:{}", bot.id),
                 group: "Bots",
                 title: name,
                 subtitle: sub,
+                keywords: "",
                 icon: "bot",
                 shortcut: "",
                 action: PaletteAction::Bot(bot.id.clone()),
@@ -895,28 +1029,57 @@ pub(super) fn CommandPaletteSheet(session: Signal<Session>, overlay: Signal<Over
             let label = s.conversation_label(conv);
             let kind = conv.normalized_kind();
             out.push(PaletteEntry {
+                key: format!("conv:{}", conv.id),
                 group: "Conversations",
                 title: label,
                 subtitle: kind.to_owned(),
+                keywords: "",
                 icon: "chat",
                 shortcut: "",
                 action: PaletteAction::Conversation(conv.id.clone()),
             });
         }
-        out
+        (out, s.palette_recent.clone())
     };
 
-    let needle = query().trim().to_lowercase();
-    let filtered: Vec<PaletteEntry> = entries
-        .into_iter()
-        .filter(|entry| {
-            needle.is_empty()
-                || entry.title.to_lowercase().contains(&needle)
-                || entry.subtitle.to_lowercase().contains(&needle)
-                || entry.group.to_lowercase().contains(&needle)
-        })
-        .take(36)
-        .collect();
+    let needle = query().trim().to_owned();
+    let filtered: Vec<PaletteEntry> = if needle.is_empty() {
+        let mut recent_entries: Vec<PaletteEntry> = recent_keys
+            .iter()
+            .filter_map(|rk| {
+                entries.iter().find(|e| e.key == *rk).map(|e| {
+                    let mut cloned = e.clone();
+                    cloned.group = "Recent";
+                    cloned
+                })
+            })
+            .collect();
+        let remaining: Vec<PaletteEntry> = entries
+            .into_iter()
+            .filter(|e| !recent_keys.contains(&e.key))
+            .collect();
+        recent_entries.extend(remaining);
+        recent_entries.truncate(36);
+        recent_entries
+    } else {
+        let mut scored: Vec<(i32, PaletteEntry)> = entries
+            .into_iter()
+            .filter_map(|entry| {
+                serabot_desktop::picker_search::best_score(
+                    &needle,
+                    &[
+                        (&entry.title, 4),
+                        (&entry.subtitle, 2),
+                        (entry.keywords, 2),
+                        (entry.group, 1),
+                    ],
+                )
+                .map(|score| (score, entry))
+            })
+            .collect();
+        scored.sort_by_key(|a| std::cmp::Reverse(a.0));
+        scored.into_iter().map(|(_, e)| e).take(36).collect()
+    };
     let count = filtered.len();
     let active = if count == 0 {
         0
@@ -950,7 +1113,7 @@ pub(super) fn CommandPaletteSheet(session: Signal<Session>, overlay: Signal<Over
                     Key::Enter => {
                         event.prevent_default();
                         if let Some(item) = keyed.get(active) {
-                            run_palette_action(item.action.clone(), session, overlay);
+                            run_palette_action(&item.key, item.action.clone(), session, overlay);
                         }
                     }
                     Key::Escape => {
@@ -1000,8 +1163,10 @@ pub(super) fn CommandPaletteSheet(session: Signal<Session>, overlay: Signal<Over
                                     let show_group = item.group != prev_group;
                                     prev_group = item.group;
                                     let action = item.action.clone();
+                                    let item_key = item.key.clone();
+                                    let title_parts = serabot_desktop::picker_search::split_highlights(&needle, &item.title);
                                     rsx! {
-                                        div { key: "{item.group}-{idx}-{item.title}",
+                                        div { key: "{item.group}-{idx}-{item.key}",
                                             if show_group {
                                                 div { class: "palette-group", "{item.group}" }
                                             }
@@ -1011,12 +1176,20 @@ pub(super) fn CommandPaletteSheet(session: Signal<Session>, overlay: Signal<Over
                                                 r#type: "button",
                                                 role: "option",
                                                 "aria-selected": if idx == active { "true" } else { "false" },
-                                                onclick: move |_| run_palette_action(action.clone(), session, overlay),
+                                                onclick: move |_| run_palette_action(&item_key, action.clone(), session, overlay),
                                                 span { class: "palette-item-icon",
                                                     Icon { name: item.icon, size: 16 }
                                                 }
                                                 span { class: "palette-item-copy",
-                                                    span { class: "palette-item-title", "{item.title}" }
+                                                    span { class: "palette-item-title",
+                                                        for (seg_idx, (seg, is_hit)) in title_parts.into_iter().enumerate() {
+                                                            if is_hit {
+                                                                mark { key: "{seg_idx}", class: "palette-hit", "{seg}" }
+                                                            } else {
+                                                                span { key: "{seg_idx}", "{seg}" }
+                                                            }
+                                                        }
+                                                    }
                                                     span { class: "palette-item-sub", "{item.subtitle}" }
                                                 }
                                                 if !item.shortcut.is_empty() {

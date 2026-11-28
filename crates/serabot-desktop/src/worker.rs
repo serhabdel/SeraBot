@@ -806,7 +806,7 @@ pub enum Reply {
     TaskPrefs(crate::api::TaskPrefs),
     TaskSyncStatus(crate::api::TaskSyncStatus),
     TaskSyncReport(crate::api::TaskSyncReport),
-    TaskEvents(Vec<crate::api::TaskEvent>),
+    TaskEvents(crate::api::TaskCalendarResult),
     Providers(Vec<ProviderStatus>),
     Connectors(Vec<ConnectorStatus>),
     Team(Team),

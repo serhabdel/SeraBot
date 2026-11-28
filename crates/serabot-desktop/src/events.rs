@@ -39,6 +39,7 @@ const BACKOFF: [Duration; 5] = [
 /// A live event stream backed by one detached thread.
 pub struct EventStream {
     stop: Arc<AtomicBool>,
+    reconnect_wake: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     receiver: Receiver<EventUpdate>,
 }
 
@@ -51,15 +52,30 @@ impl EventStream {
     pub fn start(credentials: Arc<Credentials>, after: i64, wake: Box<dyn Fn() + Send>) -> Self {
         let (sender, receiver) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
+        let reconnect_wake = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let thread_stop = Arc::clone(&stop);
+        let thread_wake = Arc::clone(&reconnect_wake);
         if std::thread::Builder::new()
             .name("serabot-events".into())
-            .spawn(move || run(credentials, after.max(0), wake, sender, thread_stop))
+            .spawn(move || {
+                run(
+                    credentials,
+                    after.max(0),
+                    wake,
+                    sender,
+                    thread_stop,
+                    thread_wake,
+                )
+            })
             .is_err()
         {
             stop.store(true, Ordering::SeqCst);
         }
-        Self { stop, receiver }
+        Self {
+            stop,
+            reconnect_wake,
+            receiver,
+        }
     }
 
     /// Pops the next pending update without blocking.
@@ -67,9 +83,23 @@ impl EventStream {
         self.receiver.try_recv().ok()
     }
 
+    /// Wakes a sleeping backoff immediately so the stream dials right away.
+    pub fn reconnect_now(&self) {
+        let (lock, cvar) = &*self.reconnect_wake;
+        if let Ok(mut woken) = lock.lock() {
+            *woken = true;
+            cvar.notify_all();
+        }
+    }
+
     /// Requests that the background thread stop; the thread is not joined.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
+        let (lock, cvar) = &*self.reconnect_wake;
+        if let Ok(mut woken) = lock.lock() {
+            *woken = true;
+            cvar.notify_all();
+        }
     }
 }
 
@@ -348,6 +378,7 @@ fn run(
     wake: Box<dyn Fn() + Send>,
     sender: Sender<EventUpdate>,
     stop: Arc<AtomicBool>,
+    reconnect_wake: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
 ) {
     let Some(client) = build_client(&credentials.endpoint) else {
         emit(&sender, &*wake, EventUpdate::Disconnected);
@@ -371,7 +402,11 @@ fn run(
                 // A proxy or auth hiccup can answer 401 once. Look again
                 // before ending the session for good.
                 rejected_once = true;
-                if !sleep_backoff(&stop, crate::net_policy::jitter(Duration::from_secs(2))) {
+                if !sleep_backoff(
+                    &stop,
+                    &reconnect_wake,
+                    crate::net_policy::jitter(Duration::from_secs(2)),
+                ) {
                     return;
                 }
             }
@@ -386,7 +421,7 @@ fn run(
                     return;
                 }
                 let pause = crate::net_policy::jitter(BACKOFF[backoff.min(BACKOFF.len() - 1)]);
-                if !sleep_backoff(&stop, pause) {
+                if !sleep_backoff(&stop, &reconnect_wake, pause) {
                     return;
                 }
                 backoff = (backoff + 1).min(BACKOFF.len() - 1);
@@ -560,13 +595,32 @@ fn emit(sender: &Sender<EventUpdate>, wake: &(dyn Fn() + Send), update: EventUpd
     true
 }
 
-fn sleep_backoff(stop: &AtomicBool, mut remaining: Duration) -> bool {
+fn sleep_backoff(
+    stop: &AtomicBool,
+    reconnect_wake: &(std::sync::Mutex<bool>, std::sync::Condvar),
+    mut remaining: Duration,
+) -> bool {
+    let (lock, cvar) = reconnect_wake;
     while !remaining.is_zero() {
         if stop.load(Ordering::SeqCst) {
             return false;
         }
         let step = remaining.min(STOP_POLL);
-        std::thread::sleep(step);
+        if let Ok(mut woken) = lock.lock() {
+            if *woken {
+                *woken = false;
+                return !stop.load(Ordering::SeqCst);
+            }
+            let (mut guard, _) = cvar
+                .wait_timeout(woken, step)
+                .unwrap_or_else(|e| e.into_inner());
+            if *guard {
+                *guard = false;
+                return !stop.load(Ordering::SeqCst);
+            }
+        } else {
+            std::thread::sleep(step);
+        }
         remaining = remaining.saturating_sub(step);
     }
     !stop.load(Ordering::SeqCst)
@@ -1094,6 +1148,28 @@ Content-Type: text/event-stream
         assert!(matches!(end, StreamEnd::Disconnected));
         assert!(waited < Duration::from_secs(5), "{waited:?}");
         assert_eq!(rx.try_recv().ok(), Some(EventUpdate::Connected));
+    }
+
+    #[test]
+    fn sleep_backoff_wakes_immediately_on_reconnect_signal() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let wake_thread = Arc::clone(&wake);
+        let stop_thread = Arc::clone(&stop);
+        let started = Instant::now();
+        let handle = std::thread::spawn(move || {
+            sleep_backoff(&stop_thread, &wake_thread, Duration::from_secs(30))
+        });
+        std::thread::sleep(Duration::from_millis(40));
+        {
+            let (lock, cvar) = &*wake;
+            let mut guard = lock.lock().unwrap();
+            *guard = true;
+            cvar.notify_all();
+        }
+        let completed = handle.join().unwrap();
+        assert!(completed);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     fn read_request(stream: &mut TcpStream) -> String {

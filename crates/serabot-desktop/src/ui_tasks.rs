@@ -551,7 +551,7 @@ pub fn TasksView(mut session: Signal<Session>) -> Element {
         s.load_task_prefs();
     });
 
-    let (tasks, tasks_loaded, prefs, sync, events) = {
+    let (tasks, tasks_loaded, prefs, sync, events, cal_warnings) = {
         let s = session.read();
         (
             s.state.tasks.clone(),
@@ -559,6 +559,7 @@ pub fn TasksView(mut session: Signal<Session>) -> Element {
             s.state.task_prefs.clone(),
             s.state.task_sync.clone(),
             s.state.task_events.clone(),
+            s.state.task_calendar_warnings.clone(),
         )
     };
     let current_provider = sync
@@ -1206,6 +1207,24 @@ pub fn TasksView(mut session: Signal<Session>) -> Element {
                                                 onclick: move |_| session.write().open_section(Section::Integrations),
                                                 "Open Integrations"
                                             }
+                                        }
+                                    }
+                                }
+                                for warn_item in cal_warnings.iter() {
+                                    div { class: "banner warn tasks-cal-warn", role: "alert",
+                                        Icon { name: "alert-circle", size: 15 }
+                                        div { class: "grow",
+                                            strong { "{event_provider_label(&warn_item.provider)}: " }
+                                            span { "{warn_item.message}" }
+                                            if !warn_item.hint.is_empty() {
+                                                div { class: "tiny muted", "{warn_item.hint}" }
+                                            }
+                                        }
+                                        button {
+                                            class: "btn ghost sm",
+                                            r#type: "button",
+                                            onclick: move |_| session.write().open_section(Section::Integrations),
+                                            "Open Integrations"
                                         }
                                     }
                                 }

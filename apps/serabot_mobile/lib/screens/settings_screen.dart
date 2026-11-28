@@ -4,6 +4,7 @@ import 'package:package_info_plus/package_info_plus.dart';
 import '../api_client.dart';
 import '../app_state.dart';
 import '../chat_models.dart';
+import '../models.dart';
 import '../session.dart';
 import '../theme.dart';
 import '../status.dart';
@@ -43,6 +44,9 @@ class SettingsScreen extends StatefulWidget {
 class _SettingsScreenState extends State<SettingsScreen> {
   List<ConnectorStatus>? _connectors;
   String? _connectorsError;
+  List<AiProviderSummary>? _providers;
+  String? _providersError;
+  final Set<String> _refreshingQuotas = {};
   UsageReport? _usage;
   String? _usageError;
   String _version = '';
@@ -57,6 +61,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
     setState(() {
       _connectors = null;
       _connectorsError = null;
+      _providers = null;
+      _providersError = null;
       _usage = null;
       _usageError = null;
     });
@@ -73,6 +79,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _connectorsError = e.messageForUser();
     }
     try {
+      _providers = await c.providers();
+      _providersError = null;
+    } on ApiException catch (e) {
+      _providersError = e.messageForUser();
+    }
+    try {
       _usage = await c.usage();
       _usageError = null;
     } on ApiException catch (e) {
@@ -80,6 +92,47 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
     if (mounted) {
       setState(() {});
+    }
+  }
+
+  Future<void> _refreshQuota(String providerId, String accountId) async {
+    final key = '$providerId/$accountId';
+    if (_refreshingQuotas.contains(key)) return;
+    setState(() => _refreshingQuotas.add(key));
+    try {
+      final next = await widget.app.client
+          .providerAccountQuota(providerId, accountId, refresh: true);
+      if (!mounted) return;
+      if (next != null && _providers != null) {
+        setState(() {
+          _providers = [
+            for (final p in _providers!)
+              if (p.id == providerId)
+                AiProviderSummary(
+                  id: p.id,
+                  kind: p.kind,
+                  auth: p.auth,
+                  status: p.status,
+                  health: p.health,
+                  accounts: [
+                    for (final a in p.accounts)
+                      if (a.id == accountId) a.copyWithQuota(next) else a,
+                  ],
+                )
+              else
+                p,
+          ];
+        });
+      }
+    } on ApiException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text(e.messageForUser())));
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _refreshingQuotas.remove(key));
+      }
     }
   }
 
@@ -156,6 +209,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
           const Divider(),
           _section(context, 'Connectors'),
           ..._connectorTiles(context),
+          const Divider(),
+          _section(context, 'AI Providers & Quotas'),
+          ..._providerQuotaTiles(context),
           const Divider(),
           _section(context, 'Mail'),
           ListTile(
@@ -359,6 +415,161 @@ class _SettingsScreenState extends State<SettingsScreen> {
           'your PC. Do it in the desktop app; it shows here afterwards.',
         ),
       ),
+    ];
+  }
+
+  List<Widget> _providerQuotaTiles(BuildContext context) {
+    if (_providersError != null) {
+      return [_errorTile(_providersError!)];
+    }
+    final list = _providers;
+    if (list == null) {
+      return [const ListTile(title: Text('Loading\u2026'))];
+    }
+    final items = <({AiProviderSummary provider, ProviderAccountSummary account})>[
+      for (final p in list)
+        for (final a in p.accounts) (provider: p, account: a),
+    ];
+    if (items.isEmpty) {
+      return [
+        const ListTile(
+          key: Key('provider-quotas-empty'),
+          title: Text('No AI provider accounts connected.'),
+        ),
+      ];
+    }
+    final scheme = Theme.of(context).colorScheme;
+    final textTheme = Theme.of(context).textTheme;
+    return [
+      for (final item in items)
+        Padding(
+          key: Key('provider-quota-${item.provider.id}-${item.account.id}'),
+          padding: const EdgeInsets.fromLTRB(16, 6, 8, 8),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          item.account.label.isNotEmpty
+                              ? '${item.provider.id} \u00b7 ${item.account.label}'
+                              : item.provider.id,
+                          style: textTheme.bodyLarge
+                              ?.copyWith(fontWeight: FontWeight.w600),
+                        ),
+                        if (item.account.email != null ||
+                            item.account.plan != null ||
+                            (item.account.status.isNotEmpty &&
+                                item.account.status != 'ok'))
+                          Text(
+                            [
+                              if (item.account.email != null)
+                                item.account.email!,
+                              if (item.account.plan != null) item.account.plan!,
+                              if (item.account.status.isNotEmpty &&
+                                  item.account.status != 'ok')
+                                item.account.status,
+                            ].join(' \u00b7 '),
+                            style: textTheme.bodySmall
+                                ?.copyWith(color: scheme.onSurfaceVariant),
+                          ),
+                      ],
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Refresh quota',
+                    onPressed: _refreshingQuotas
+                            .contains('${item.provider.id}/${item.account.id}')
+                        ? null
+                        : () =>
+                            _refreshQuota(item.provider.id, item.account.id),
+                    icon: _refreshingQuotas
+                            .contains('${item.provider.id}/${item.account.id}')
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.refresh, size: 20),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 4),
+              ..._quotaWindowWidgets(context, item.account.quota),
+            ],
+          ),
+        ),
+    ];
+  }
+
+  List<Widget> _quotaWindowWidgets(
+    BuildContext context,
+    ProviderQuotaSnapshot? quota,
+  ) {
+    final scheme = Theme.of(context).colorScheme;
+    final textTheme = Theme.of(context).textTheme;
+    if (quota == null) {
+      return [
+        Text(
+          'Quota unavailable',
+          style: textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
+        ),
+      ];
+    }
+    if (quota.state == 'inactive') {
+      return [
+        Text(
+          'Subscription inactive',
+          style: textTheme.bodySmall?.copyWith(color: scheme.error),
+        ),
+      ];
+    }
+    if (quota.state == 'payment_required') {
+      return [
+        Text(
+          'Payment required',
+          style: textTheme.bodySmall?.copyWith(color: scheme.error),
+        ),
+      ];
+    }
+    if (quota.windows.isEmpty) {
+      return [
+        Text(
+          'Quota unavailable',
+          style: textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
+        ),
+      ];
+    }
+    return [
+      for (final w in quota.windows) ...[
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                w.label.isNotEmpty ? w.label : w.scope,
+                style: textTheme.bodySmall,
+              ),
+            ),
+            Text(
+              '${w.remainingPercent}% left'
+              '${w.resetsAt != null && w.resetsAt!.isNotEmpty ? ' \u00b7 Resets ${shortTime(w.resetsAt!)}' : ''}',
+              style: textTheme.bodySmall
+                  ?.copyWith(color: scheme.onSurfaceVariant),
+            ),
+          ],
+        ),
+        const SizedBox(height: 4),
+        LinearProgressIndicator(
+          value: w.remainingFraction,
+          minHeight: 5,
+          borderRadius: BorderRadius.circular(3),
+        ),
+        const SizedBox(height: 6),
+      ],
     ];
   }
 

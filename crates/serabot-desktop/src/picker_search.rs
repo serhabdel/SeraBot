@@ -67,6 +67,65 @@ pub fn best_score(needle: &str, fields: &[(&str, i32)]) -> Option<i32> {
         .max()
 }
 
+/// Character indices (into `haystack.chars()`) that match `needle` in order,
+/// preferring contiguous substring matches over scattered subsequences.
+pub fn fuzzy_match_indices(needle: &str, haystack: &str) -> Vec<usize> {
+    let needle: Vec<char> = needle
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let hay: Vec<char> = haystack.chars().flat_map(char::to_lowercase).collect();
+    if needle.len() > hay.len() {
+        return Vec::new();
+    }
+    if let Some(at) = find_sub(&hay, &needle) {
+        return (at..at + needle.len()).collect();
+    }
+    let mut out = Vec::with_capacity(needle.len());
+    let mut pos = 0usize;
+    for &want in &needle {
+        let Some(found) = hay[pos..].iter().position(|c| *c == want) else {
+            return Vec::new();
+        };
+        let idx = pos + found;
+        out.push(idx);
+        pos = idx + 1;
+    }
+    out
+}
+
+/// Splits `haystack` into `(segment, is_highlighted)` chunks for rendering.
+pub fn split_highlights(needle: &str, haystack: &str) -> Vec<(String, bool)> {
+    let indices = fuzzy_match_indices(needle, haystack);
+    if indices.is_empty() {
+        return if haystack.is_empty() {
+            Vec::new()
+        } else {
+            vec![(haystack.to_owned(), false)]
+        };
+    }
+    let mut out: Vec<(String, bool)> = Vec::new();
+    let mut hit_pos = 0usize;
+    for (ci, ch) in haystack.chars().enumerate() {
+        let is_hit = indices.get(hit_pos).copied() == Some(ci);
+        if is_hit {
+            hit_pos += 1;
+        }
+        if let Some((last_text, last_hit)) = out.last_mut()
+            && *last_hit == is_hit
+        {
+            last_text.push(ch);
+        } else {
+            out.push((ch.to_string(), is_hit));
+        }
+    }
+    out
+}
+
 /// Star or unstar `value`. Returns `true` when it is now a favorite. A full list
 /// refuses new stars (`false`, unchanged).
 pub fn toggle_favorite(list: &mut Vec<String>, value: &str) -> bool {
@@ -222,5 +281,30 @@ mod tests {
         assert_eq!(standing("d|4", &favs, &recent), Standing::Other);
         assert!(Standing::Favorite(5) < Standing::Recent(0));
         assert!(Standing::Recent(3) < Standing::Other);
+    }
+
+    #[test]
+    fn split_highlights_marks_contiguous_and_subsequence_hits() {
+        assert_eq!(
+            split_highlights("prov", "AI Providers"),
+            vec![
+                ("AI ".to_owned(), false),
+                ("Prov".to_owned(), true),
+                ("iders".to_owned(), false),
+            ]
+        );
+        assert_eq!(
+            split_highlights("ap", "AI Providers"),
+            vec![
+                ("A".to_owned(), true),
+                ("I ".to_owned(), false),
+                ("P".to_owned(), true),
+                ("roviders".to_owned(), false),
+            ]
+        );
+        assert_eq!(
+            split_highlights("zzz", "AI Providers"),
+            vec![("AI Providers".to_owned(), false)]
+        );
     }
 }

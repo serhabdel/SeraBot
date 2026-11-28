@@ -777,3 +777,214 @@ class CalendarEventItem {
   final bool allDay;
   final String? provider;
 }
+
+class CalendarProviderWarning {
+  const CalendarProviderWarning({
+    required this.provider,
+    this.statusCode,
+    required this.message,
+    this.hint,
+  });
+
+  factory CalendarProviderWarning.fromJson(Map<String, dynamic> json) {
+    final hintRaw = json['hint'] as String?;
+    return CalendarProviderWarning(
+      provider: json['provider'] as String? ?? '',
+      statusCode: (json['status_code'] as num?)?.toInt() ??
+          (json['statusCode'] as num?)?.toInt(),
+      message: json['message'] as String? ?? '',
+      hint: hintRaw != null && hintRaw.trim().isNotEmpty ? hintRaw : null,
+    );
+  }
+
+  final String provider;
+  final int? statusCode;
+  final String message;
+  final String? hint;
+}
+
+class CalendarEventsResult {
+  const CalendarEventsResult({
+    this.events = const [],
+    this.warnings = const [],
+  });
+
+  factory CalendarEventsResult.fromJson(Map<String, dynamic> json) {
+    final evList = json['events'] as List<dynamic>? ?? const [];
+    final warnList = (json['provider_warnings'] ?? json['warnings'])
+            as List<dynamic>? ??
+        const [];
+    return CalendarEventsResult(
+      events: evList
+          .whereType<Map<String, dynamic>>()
+          .map(CalendarEventItem.fromJson)
+          .toList(),
+      warnings: warnList
+          .whereType<Map<String, dynamic>>()
+          .map(CalendarProviderWarning.fromJson)
+          .toList(),
+    );
+  }
+
+  final List<CalendarEventItem> events;
+  final List<CalendarProviderWarning> warnings;
+}
+
+class ProviderQuotaWindow {
+  const ProviderQuotaWindow({
+    required this.scope,
+    required this.label,
+    this.usedPercent,
+    this.remaining,
+    this.resetsAt,
+  });
+
+  factory ProviderQuotaWindow.fromJson(Map<String, dynamic> json) {
+    return ProviderQuotaWindow(
+      scope: json['scope'] as String? ?? '',
+      label: json['label'] as String? ?? '',
+      usedPercent: (json['used_percent'] as num?)?.toDouble(),
+      remaining: (json['remaining'] as num?)?.toDouble(),
+      resetsAt: json['resets_at'] as String?,
+    );
+  }
+
+  final String scope;
+  final String label;
+  final double? usedPercent;
+  final double? remaining;
+  final String? resetsAt;
+
+  /// Fraction remaining in `[0.0, 1.0]`.
+  double get remainingFraction {
+    if (remaining != null) {
+      return remaining!.clamp(0.0, 1.0);
+    }
+    if (usedPercent != null) {
+      return ((100.0 - usedPercent!) / 100.0).clamp(0.0, 1.0);
+    }
+    return 0.0;
+  }
+
+  int get remainingPercent => (remainingFraction * 100).round().clamp(0, 100);
+}
+
+class ProviderQuotaSnapshot {
+  const ProviderQuotaSnapshot({
+    this.sampledAt,
+    this.source,
+    this.state = 'ok',
+    this.windows = const [],
+  });
+
+  factory ProviderQuotaSnapshot.fromJson(Map<String, dynamic> json) {
+    final rawWindows = json['windows'] as List<dynamic>? ?? const [];
+    return ProviderQuotaSnapshot(
+      sampledAt: json['sampled_at'] as String?,
+      source: json['source'] as String?,
+      state: json['state'] as String? ?? 'ok',
+      windows: rawWindows
+          .whereType<Map<String, dynamic>>()
+          .map(ProviderQuotaWindow.fromJson)
+          .toList(),
+    );
+  }
+
+  final String? sampledAt;
+  final String? source;
+  final String state;
+  final List<ProviderQuotaWindow> windows;
+}
+
+class ProviderAccountSummary {
+  const ProviderAccountSummary({
+    required this.id,
+    required this.label,
+    required this.authKind,
+    required this.status,
+    this.email,
+    this.plan,
+    this.quota,
+  });
+
+  factory ProviderAccountSummary.fromJson(Map<String, dynamic> json) {
+    final identity = json['identity'];
+    String? email;
+    String? plan;
+    if (identity is Map<String, dynamic>) {
+      final rawEmail = identity['email'] as String?;
+      if (rawEmail != null && rawEmail.trim().isNotEmpty) {
+        email = rawEmail;
+      }
+      final rawPlan = identity['plan'] as String?;
+      if (rawPlan != null && rawPlan.trim().isNotEmpty) {
+        plan = rawPlan;
+      }
+    }
+    final quotaRaw = json['quota'];
+    return ProviderAccountSummary(
+      id: json['id']?.toString() ?? '',
+      label: json['label'] as String? ?? '',
+      authKind: json['auth_kind'] as String? ?? '',
+      status: json['status'] as String? ?? '',
+      email: email,
+      plan: plan,
+      quota: quotaRaw is Map<String, dynamic>
+          ? ProviderQuotaSnapshot.fromJson(quotaRaw)
+          : null,
+    );
+  }
+
+  final String id;
+  final String label;
+  final String authKind;
+  final String status;
+  final String? email;
+  final String? plan;
+  final ProviderQuotaSnapshot? quota;
+
+  ProviderAccountSummary copyWithQuota(ProviderQuotaSnapshot? nextQuota) {
+    return ProviderAccountSummary(
+      id: id,
+      label: label,
+      authKind: authKind,
+      status: status,
+      email: email,
+      plan: plan,
+      quota: nextQuota,
+    );
+  }
+}
+
+class AiProviderSummary {
+  const AiProviderSummary({
+    required this.id,
+    required this.kind,
+    required this.auth,
+    required this.status,
+    required this.health,
+    this.accounts = const [],
+  });
+
+  factory AiProviderSummary.fromJson(Map<String, dynamic> json) {
+    final rawAccounts = json['accounts'] as List<dynamic>? ?? const [];
+    return AiProviderSummary(
+      id: json['id']?.toString() ?? '',
+      kind: json['kind'] as String? ?? '',
+      auth: json['auth'] as String? ?? '',
+      status: json['status'] as String? ?? '',
+      health: json['health'] as String? ?? '',
+      accounts: rawAccounts
+          .whereType<Map<String, dynamic>>()
+          .map(ProviderAccountSummary.fromJson)
+          .toList(),
+    );
+  }
+
+  final String id;
+  final String kind;
+  final String auth;
+  final String status;
+  final String health;
+  final List<ProviderAccountSummary> accounts;
+}
