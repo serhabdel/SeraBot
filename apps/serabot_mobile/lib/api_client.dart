@@ -1249,6 +1249,53 @@ class ApiClient {
     }
   }
 
+  /// Configured AI providers and the caller's connected accounts with any
+  /// cached quota snapshots (`GET /v1/providers`). Returns an empty list on
+  /// older servers returning 404.
+  Future<List<AiProviderSummary>> providers() async {
+    final json = await _requestOptional('GET', ['v1', 'providers']);
+    if (json == null) {
+      return const [];
+    }
+    final list = json['providers'];
+    if (list is! List) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
+    try {
+      return list
+          .whereType<Map<String, dynamic>>()
+          .map(AiProviderSummary.fromJson)
+          .toList();
+    } catch (_) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
+  }
+
+  /// Cached or refreshed quota snapshot for one provider account
+  /// (`GET /v1/providers/{id}/accounts/{aid}/quota`). Returns null when no
+  /// reading is available or the server returns 404.
+  Future<ProviderQuotaSnapshot?> providerAccountQuota(
+    String providerId,
+    String accountId, {
+    bool refresh = false,
+  }) async {
+    _checkId(providerId);
+    _checkId(accountId);
+    final json = await _requestOptional(
+      'GET',
+      ['v1', 'providers', providerId, 'accounts', accountId, 'quota'],
+      query: refresh ? const {'refresh': '1'} : null,
+    );
+    if (json == null) {
+      return null;
+    }
+    final raw = json['quota'];
+    if (raw is! Map<String, dynamic>) {
+      return null;
+    }
+    return ProviderQuotaSnapshot.fromJson(raw);
+  }
+
   /// Per-user SMTP/IMAP mail status (`GET /v1/mail`, 0.74.1–0.74.2). Never
   /// returns the password. A 404 means the server predates mail, which
   /// reads as "not connected" instead of an error.
@@ -1764,7 +1811,7 @@ class ApiClient {
     await _request('POST', ['v1', 'tasks', 'sync', 'run']);
   }
 
-  Future<List<CalendarEventItem>> calendarEvents({
+  Future<CalendarEventsResult> calendarEventsWithWarnings({
     String? from,
     String? to,
   }) async {
@@ -1776,14 +1823,17 @@ class ApiClient {
       _uri(['v1', 'tasks', 'calendar'], query.isEmpty ? null : query),
     );
     if (response.statusCode == 404) {
-      return const [];
+      return const CalendarEventsResult();
     }
     final json = _decode(response);
-    final list = json['events'] as List<dynamic>? ?? const [];
-    return list
-        .whereType<Map<String, dynamic>>()
-        .map(CalendarEventItem.fromJson)
-        .toList();
+    return CalendarEventsResult.fromJson(json);
+  }
+
+  Future<List<CalendarEventItem>> calendarEvents({
+    String? from,
+    String? to,
+  }) async {
+    return (await calendarEventsWithWarnings(from: from, to: to)).events;
   }
 
   /// Scaffolds a disabled specialist. An empty [tools] list is sent as-is;

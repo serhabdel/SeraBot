@@ -178,6 +178,7 @@ pub struct State {
     pub task_prefs: Option<crate::api::TaskPrefs>,
     pub task_sync: Option<crate::api::TaskSyncStatus>,
     pub task_events: Vec<crate::api::TaskEvent>,
+    pub task_calendar_warnings: Vec<crate::api::TaskCalendarWarning>,
     /// Header counts for the Memory page; `None` until fetched or after a change.
     pub memory_stats: Option<MemoryStatsView>,
     pub providers: Vec<ProviderStatus>,
@@ -366,6 +367,7 @@ impl Default for State {
             task_prefs: None,
             task_sync: None,
             task_events: Vec::new(),
+            task_calendar_warnings: Vec::new(),
             memory_stats: None,
             providers: Vec::new(),
             providers_loaded: false,
@@ -494,6 +496,7 @@ impl State {
         let task_prefs = std::mem::take(&mut self.task_prefs);
         let task_sync = std::mem::take(&mut self.task_sync);
         let task_events = std::mem::take(&mut self.task_events);
+        let task_calendar_warnings = std::mem::take(&mut self.task_calendar_warnings);
         let providers = std::mem::take(&mut self.providers);
         let providers_loaded = self.providers_loaded;
         let connectors = std::mem::take(&mut self.connectors);
@@ -550,6 +553,7 @@ impl State {
             task_prefs,
             task_sync,
             task_events,
+            task_calendar_warnings,
             providers,
             providers_loaded,
             connectors,
@@ -593,6 +597,7 @@ impl State {
         self.task_prefs = None;
         self.task_sync = None;
         self.task_events.clear();
+        self.task_calendar_warnings.clear();
         self.providers.clear();
         self.providers_loaded = false;
         self.connectors.clear();
@@ -893,8 +898,9 @@ impl State {
             Reply::TaskSyncReport(_report) => {
                 // The next ListTasks picks up whatever the sync changed.
             }
-            Reply::TaskEvents(events) => {
-                self.task_events = events;
+            Reply::TaskEvents(result) => {
+                self.task_events = result.events;
+                self.task_calendar_warnings = result.warnings;
             }
             Reply::AddedMemory(memory) => {
                 if let Some(existing) = self

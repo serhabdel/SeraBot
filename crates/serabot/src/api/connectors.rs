@@ -970,7 +970,9 @@ pub(super) async fn disconnect_personal(
         state.token_connectors.disconnect(&user.id, &id)?
     } else {
         let kind = personal_kind(&id)?;
-        state.personal.disconnect(&user.id, kind).await?
+        let disconnected = state.personal.disconnect(&user.id, kind).await?;
+        clear_calendar_cooldowns_for_user(&state, &user.id);
+        disconnected
     };
     audit_auth(
         &state,
@@ -1013,6 +1015,7 @@ pub(super) async fn personal_callback_inner(
     };
     match state.personal.complete(&params.state, code).await {
         Ok((user_id, kind)) => {
+            clear_calendar_cooldowns_for_user(state, &user_id);
             if let Err(error) = audit_auth(
                 state,
                 &user_id,

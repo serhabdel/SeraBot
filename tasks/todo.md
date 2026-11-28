@@ -779,3 +779,14 @@ Plan: `docs/specs/0.74.15-proposal.md`. Version stays `0.74.14` until the batch 
 - [x] **Desktop UI/UX (`system.css`, `app.css`, `settings.css`, `ux.css`, `pages-data.css`, `shell.rs`, `ui_settings_page.rs`)**: fixed right-edge clipping on `.header-model-pop` (`left: auto; right: 0;`), floated `.menu.rail-menu` at `z-index: 120` with click-outside scrim, added icons to all 16 Settings sections and fixed `Search settings...` scroll overlap.
 - [x] Version bump `0.74.31` (`Cargo.toml`), mobile `0.74.31+105`, `docs/release-0.74.31.md`, `README.md`, `tasks/todo.md`.
 - [ ] Owner: verify Claude Agent SDK auto-setup, Claude/Antigravity/Kiro quota bars, Proton Pass sync, Hostinger email speed, and Desktop UI fixes.
+
+## Release 0.74.32 — Fluid UI Motion, Stacked Toasts, Spotlight `Ctrl+K`, Global Live Recovery, Calendar 403 Diagnostics & Mobile Desktop Parity
+
+- [x] **Desktop Motion & Tactile UI (`system.css`, `ui/shell.rs`, `ui/settings_view.rs`)**: `pane-enter` cross-fades for non-Chat sections & Settings tabs (`ChatView` kept mounted), springy popovers/sheets, animated rail/Settings active pills, tactile button press scale, streaming caret, all `prefers-reduced-motion` / `data-motion="reduce"` compliant.
+- [x] **Multi-Toast Notification Stack (`session.rs`, `ui/shell.rs`, `system.css`)**: typed `ToastTone` (`Ok`/`Info`/`Warn`/`Error`), up to 3 stacked toasts, deduplication, optional `ToastAction`, auto-dismiss with hover-paused countdown bar.
+- [x] **Spotlight `Ctrl+K` Command Palette (`picker_search.rs`, `ui/sheets.rs`)**: fuzzy scoring + `<mark class="palette-hit">` highlighting, `Library`, all 16 `SettingsSection::ALL` entries, power actions, keyword aliases, and recent jumps.
+- [x] **Global SSE Recovery (`events.rs`, `session.rs`, `ui/shell.rs`, `ui/chat.rs`)**: `EventStream::reconnect_now()` `Condvar` wake, global `StatusBanner` reconnecting bar across all sections, `"Live connection restored"` toast.
+- [x] **Calendar 403 Diagnostics & Cooldown (`api/mod.rs`, `api/tasks.rs`, `api/connectors.rs`, `ui_tasks.rs`)**: structured `provider_warnings`, 5-minute negative cooldown cache for `401`/`403`, inline warning banner with **Open Integrations**.
+- [x] **Mobile Desktop Parity (`apps/serabot_mobile/`)**: global `_ReconnectingBanner` + recovery SnackBar, smooth tab transitions, Spotlight-style `QuickJumpSheet`, `CalendarProviderWarning` cards in `TasksScreen`, and **AI Providers & Quotas** in `SettingsScreen`.
+- [x] Version bump `0.74.32` (`Cargo.toml`), mobile `0.74.32+106`, `docs/release-0.74.32.md`, `README.md`, `tasks/todo.md`.
+

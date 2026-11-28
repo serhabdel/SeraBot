@@ -840,10 +840,6 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         .as_ref()
         .filter(|msg| dismissed_transcript_err().as_deref() != Some(msg.as_str()))
         .cloned();
-    let reconnecting = {
-        let state = session.read();
-        state.state.connected && state.events_seen && !state.events_active
-    };
     use_effect(move || {
         let transcript = session.read().state.transcript.clone();
         let Some(text) = transcript else {
@@ -1666,24 +1662,6 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     // What the bot is doing right now, in plain words: a
                     // shimmer while it thinks, one row per step, and a small
                     // "N steps" summary once the reply has landed.
-                    if reconnecting {
-                        div { class: "banner warn", role: "status", "aria-live": "polite",
-                            span { class: "step-spin", "aria-hidden": "true" }
-                            "Reconnecting to live updates…"
-                            button {
-                                class: "btn ghost sm",
-                                r#type: "button",
-                                disabled: link_retrying,
-                                "aria-label": "Try the live connection again",
-                                onclick: move |_| session.write().retry_link(),
-                                if link_retrying {
-                                    "Retrying…"
-                                } else {
-                                    "Retry"
-                                }
-                            }
-                        }
-                    }
                     if cards_degraded {
                         div { class: "banner info", role: "status",
                             "Some questions or requests from your bots could not be refreshed. Reload to try again."

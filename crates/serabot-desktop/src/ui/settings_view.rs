@@ -206,6 +206,7 @@ pub(super) fn SettingsView(session: Signal<Session>, overlay: Signal<Overlay>) -
             div { class: "pane-body settings-layout",
                 SettingsNav { session }
                 div { id: "settings-content-scroll", class: "settings-content",
+                    div { key: "settings-{sel:?}", class: "settings-pane-enter",
                     {settings_new_cards}
                     if sel == SettingsSection::Account {
                     div { class: "card",
@@ -828,6 +829,7 @@ pub(super) fn SettingsView(session: Signal<Session>, overlay: Signal<Overlay>) -
                                 span { class: "kv-val mono", "Esc" }
                             }
                         }
+                    }
                     }
                     }
                 }

@@ -1,4 +1,4 @@
-﻿import 'dart:async';
+import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
@@ -40,6 +40,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   bool loadingConversations = false;
   String? conversationsError;
   bool live = false;
+  bool seenLive = false;
 
   final _events = StreamController<ServerEvent>.broadcast();
   Stream<ServerEvent> get events => _events.stream;
@@ -332,6 +333,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
             onOpen: () {
               // HTTP 200: the link is up even if the stream is quiet.
               attempt = 0;
+              seenLive = true;
               if (!live) {
                 live = true;
                 _notify();

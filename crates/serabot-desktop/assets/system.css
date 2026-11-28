@@ -3141,3 +3141,270 @@ html[data-reduce-transparency="true"] .sheet.sheet-palette {
   transform: none;
 }
 
+/* ==========================================================================
+   v0.74.32 — Fluid Motion, Multi-Toast Stack, Palette Hits & Streaming Caret
+   ========================================================================== */
+
+@keyframes pane-enter {
+  from {
+    opacity: 0;
+    transform: translateY(5px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes pop-enter {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.975);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes pill-grow {
+  from {
+    transform: scaleY(0.25);
+    opacity: 0;
+  }
+  to {
+    transform: scaleY(1);
+    opacity: 1;
+  }
+}
+
+@keyframes toast-countdown {
+  from {
+    transform: scaleX(1);
+  }
+  to {
+    transform: scaleX(0);
+  }
+}
+
+@keyframes caret-blink {
+  0%, 49% {
+    opacity: 1;
+  }
+  50%, 100% {
+    opacity: 0.18;
+  }
+}
+
+.root:not([data-motion="reduce"]) .pane-enter,
+.root:not([data-motion="reduce"]) .settings-pane-enter {
+  animation: pane-enter 160ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.root:not([data-motion="reduce"]) .sheet.open,
+.root:not([data-motion="reduce"]) .sheet-palette.open,
+.root:not([data-motion="reduce"]) .model-picker-pop,
+.root:not([data-motion="reduce"]) .user-menu-pop {
+  animation: pop-enter 170ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.scrim.open {
+  backdrop-filter: blur(4px);
+}
+
+.rail-btn,
+.settings-nav-item {
+  position: relative;
+}
+
+.root:not([data-motion="reduce"]) .rail-btn.on::before,
+.root:not([data-motion="reduce"]) .settings-nav-item.on::before {
+  animation: pill-grow 170ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.root:not([data-motion="reduce"]) .btn,
+.root:not([data-motion="reduce"]) .rail-btn,
+.root:not([data-motion="reduce"]) .icon-btn {
+  transition: background-color 110ms ease, border-color 110ms ease, color 110ms ease, transform 80ms ease;
+}
+
+.root:not([data-motion="reduce"]) .btn:active:not(:disabled),
+.root:not([data-motion="reduce"]) .rail-btn:active:not(:disabled),
+.root:not([data-motion="reduce"]) .icon-btn:active:not(:disabled) {
+  transform: scale(0.975);
+}
+
+.root:not([data-motion="reduce"]) .msg.assistant.streaming .md > :last-child::after {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 1.05em;
+  margin-left: 3px;
+  vertical-align: text-bottom;
+  border-radius: 2px;
+  background: var(--accent);
+  animation: caret-blink 900ms steps(2, start) infinite;
+}
+
+/* Stacked Toast Notifications */
+.toast-stack {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 95;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: min(390px, calc(100vw - 32px));
+  pointer-events: none;
+}
+
+.toast-card {
+  position: relative;
+  overflow: hidden;
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px 12px;
+  border-radius: var(--r-md);
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  box-shadow: var(--shadow-lg, 0 12px 28px rgba(0, 0, 0, 0.22));
+  color: var(--label-1);
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.root:not([data-motion="reduce"]) .toast-card {
+  animation: pop-enter 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.toast-card.ok {
+  border-left-color: var(--ok, #16a34a);
+}
+
+.toast-card.ok .toast-ico {
+  color: var(--ok, #16a34a);
+}
+
+.toast-card.info {
+  border-left-color: var(--accent);
+}
+
+.toast-card.info .toast-ico {
+  color: var(--accent);
+}
+
+.toast-card.warn {
+  border-left-color: var(--warn, #d97706);
+}
+
+.toast-card.warn .toast-ico {
+  color: var(--warn, #d97706);
+}
+
+.toast-card.err {
+  border-left-color: var(--err, #dc2626);
+}
+
+.toast-card.err .toast-ico {
+  color: var(--err, #dc2626);
+}
+
+.toast-ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+}
+
+.toast-msg {
+  flex: 1 1 auto;
+  min-width: 0;
+  word-break: break-word;
+}
+
+.toast-act {
+  flex: none;
+}
+
+.toast-close {
+  flex: none;
+}
+
+.toast-progress {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--accent);
+  opacity: 0.45;
+  transform-origin: left center;
+  animation-name: toast-countdown;
+  animation-timing-function: linear;
+  animation-fill-mode: forwards;
+}
+
+.toast-card.ok .toast-progress {
+  background: var(--ok, #16a34a);
+}
+
+.toast-card.warn .toast-progress {
+  background: var(--warn, #d97706);
+}
+
+.toast-card.err .toast-progress {
+  background: var(--err, #dc2626);
+}
+
+.toast-card:hover .toast-progress {
+  animation-play-state: paused;
+}
+
+/* Command Palette Highlight */
+mark.palette-hit {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  color: inherit;
+  border-radius: 3px;
+  padding: 0 1px;
+  font-weight: 600;
+}
+
+/* Calendar Warning Strip */
+.tasks-cal-warn {
+  margin-bottom: 10px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pane-enter,
+  .settings-pane-enter,
+  .sheet.open,
+  .sheet-palette.open,
+  .model-picker-pop,
+  .user-menu-pop,
+  .toast-card,
+  .rail-btn.on::before,
+  .settings-nav-item.on::before,
+  .msg.assistant.streaming .md > :last-child::after {
+    animation: none !important;
+  }
+  .btn,
+  .rail-btn,
+  .icon-btn {
+    transition: none !important;
+  }
+  .btn:active:not(:disabled),
+  .rail-btn:active:not(:disabled),
+  .icon-btn:active:not(:disabled) {
+    transform: none !important;
+  }
+}
+
+.root[data-motion="reduce"] .toast-progress {
+  animation-play-state: running;
+}
+
+

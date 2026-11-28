@@ -249,7 +249,21 @@ pub struct ApiState {
     /// Wake-up signal for the outbound mail send worker.
     #[allow(dead_code)]
     mail_wake: Arc<tokio::sync::Notify>,
+    /// Negative cooldown cache for calendar providers returning 401/403.
+    calendar_cooldowns: CalendarCooldownMap,
 }
+
+type CalendarCooldownMap = Arc<
+    std::sync::Mutex<
+        HashMap<
+            (String, String),
+            (
+                std::time::Instant,
+                crate::api::tasks::CalendarProviderWarning,
+            ),
+        >,
+    >,
+>;
 
 impl ApiState {
     /// Fails fast when sign-in is enabled but misconfigured: a missing auth
@@ -364,6 +378,7 @@ impl ApiState {
             quota_read_at: Arc::default(),
             claude_gateway: Arc::new(crate::claude_gateway_proc::ClaudeGatewaySupervisor::new()),
             mail_wake: Arc::new(tokio::sync::Notify::new()),
+            calendar_cooldowns: Arc::default(),
             config,
         })
     }

@@ -34,15 +34,51 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
         if wants && overlay_for_signin() == Overlay::None {
             overlay_for_signin.set(Overlay::AddAccount);
         }
-        let pending_toast = session.read().toast.clone();
-        if let Some(msg) = pending_toast {
-            let is_err = msg.to_ascii_lowercase().contains("fail")
-                || msg.to_ascii_lowercase().contains("error")
-                || msg.to_ascii_lowercase().contains("could not");
-            toast_for_session.set(Some((msg, is_err)));
-            session.write().toast = None;
+        if session.read().toast.is_some() {
+            session.write().flush_legacy_toast();
+        }
+        if let Some((msg, is_err)) = toast_for_session.take() {
+            let tone = if is_err {
+                serabot_desktop::session::ToastTone::Error
+            } else {
+                Session::infer_toast_tone(&msg)
+            };
+            session.write().push_toast(tone, msg);
         }
     });
+    let mut hovered_toast = use_signal(|| Option::<u64>::None);
+    let mut scheduled_toasts = use_signal(std::collections::HashSet::<u64>::new);
+    let toast_items = session.read().toast_queue.clone();
+    {
+        let mut new_timers = Vec::new();
+        let mut seen = scheduled_toasts.write();
+        for item in &toast_items {
+            if seen.insert(item.id) {
+                new_timers.push((item.id, item.duration_ms));
+            }
+        }
+        drop(seen);
+        for (toast_id, duration_ms) in new_timers {
+            spawn(async move {
+                let mut remaining_ms = duration_ms;
+                let step_ms = 250u64;
+                while remaining_ms > 0 {
+                    let _ = dioxus::document::eval(&format!(
+                        "new Promise(r => setTimeout(r, {step_ms}))"
+                    ))
+                    .await;
+                    if !session.read().toast_queue.iter().any(|t| t.id == toast_id) {
+                        return;
+                    }
+                    if hovered_toast() != Some(toast_id) {
+                        remaining_ms = remaining_ms.saturating_sub(step_ms);
+                    }
+                }
+                session.write().dismiss_toast(toast_id);
+                scheduled_toasts.write().remove(&toast_id);
+            });
+        }
+    }
     let onboarding_open = chat && session.read().onboarding_ui.open;
     let settings_open = session.read().bot_settings.open;
     let preview_open = session.read().state.preview_dock_hash.is_some();
@@ -70,7 +106,9 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
                 if onboarding_open {
                     OnboardingView { session }
                 } else {
-                div { class: "pane",
+                div {
+                    key: if chat { "pane-chat".to_owned() } else { format!("pane-{section:?}") },
+                    class: if chat { "pane" } else { "pane pane-enter" },
                     {match section {
                         // Kept mounted across conversation switches so the DOM,
                         // observers, and WebView bridges stay warm and instant.
@@ -148,15 +186,67 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
                 Overlay::None => rsx! {},
             }}
             UndoBar { session, undo }
-            if let Some((message, failed)) = toast() {
-                div { class: if failed { "toast err" } else { "toast" }, role: "status",
-                    span { "{message}" }
-                    button {
-                        class: "icon-btn escape-close",
-                        title: "Dismiss",
-                        "aria-label": "Dismiss",
-                        onclick: move |_| toast.set(None),
-                        Icon { name: "x", size: 16 }
+            if !toast_items.is_empty() {
+                div { class: "toast-stack", "aria-live": "polite",
+                    for item in toast_items {
+                        {
+                            let toast_id = item.id;
+                            let tone_cls = item.tone.class();
+                            let icon_name = item.tone.icon();
+                            let dur_ms = item.duration_ms;
+                            let action = item.action.clone();
+                            rsx! {
+                                div {
+                                    key: "{toast_id}",
+                                    class: "toast-card {tone_cls}",
+                                    role: "status",
+                                    onmouseenter: move |_| hovered_toast.set(Some(toast_id)),
+                                    onmouseleave: move |_| {
+                                        if hovered_toast() == Some(toast_id) {
+                                            hovered_toast.set(None);
+                                        }
+                                    },
+                                    span { class: "toast-ico",
+                                        Icon { name: icon_name, size: 15 }
+                                    }
+                                    span { class: "toast-msg", "{item.message}" }
+                                    if let Some(act) = action {
+                                        button {
+                                            class: "btn ghost sm toast-act",
+                                            r#type: "button",
+                                            onclick: move |_| {
+                                                let mut s = session.write();
+                                                match &act {
+                                                    serabot_desktop::session::ToastAction::OpenLogs => {
+                                                        s.open_settings_section(SettingsSection::Logs);
+                                                    }
+                                                    serabot_desktop::session::ToastAction::OpenSection(sec) => {
+                                                        s.open_section(*sec);
+                                                    }
+                                                    serabot_desktop::session::ToastAction::OpenSettings(sec) => {
+                                                        s.open_settings_section(*sec);
+                                                    }
+                                                }
+                                                s.dismiss_toast(toast_id);
+                                            },
+                                            "{act.label()}"
+                                        }
+                                    }
+                                    button {
+                                        class: "icon-btn escape-close toast-close",
+                                        r#type: "button",
+                                        title: "Dismiss",
+                                        "aria-label": "Dismiss",
+                                        onclick: move |_| session.write().dismiss_toast(toast_id),
+                                        Icon { name: "x", size: 14 }
+                                    }
+                                    div {
+                                        class: "toast-progress",
+                                        style: "animation-duration: {dur_ms}ms;",
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -2465,11 +2555,36 @@ pub(super) fn StatusBanner(session: Signal<Session>) -> Element {
             }
         }
     });
+    let events_reconnecting = {
+        let s = session.read();
+        s.events_seen && !s.events_active && !restarting && !link_down
+    };
+    let events_reconnecting_view = events_reconnecting.then(|| {
+        rsx! {
+            div { class: "banner warn", role: "status", "aria-live": "polite",
+                span { class: "step-spin", "aria-hidden": "true" }
+                span { class: "grow", "Live updates paused — reconnecting…" }
+                button {
+                    class: "btn ghost sm",
+                    r#type: "button",
+                    onclick: move |_| session.write().reconnect_events_now(),
+                    "Reconnect now"
+                }
+                button {
+                    class: "btn ghost sm",
+                    r#type: "button",
+                    onclick: move |_| session.write().open_settings_section(SettingsSection::Logs),
+                    "View logs"
+                }
+            }
+        }
+    });
     rsx! {
         {admin_error_view}
         {admin_notice_view}
         {restarting_view}
         {link_view}
+        {events_reconnecting_view}
         {error_view}
         {credential_view}
         {unknown_view}

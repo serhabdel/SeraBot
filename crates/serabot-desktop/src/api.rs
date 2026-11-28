@@ -1297,7 +1297,7 @@ pub struct TaskSyncStatus {
 }
 
 /// One calendar event from the chosen calendar provider (read-only).
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct TaskEvent {
     pub id: String,
     pub title: String,
@@ -1305,6 +1305,23 @@ pub struct TaskEvent {
     pub end: String,
     pub all_day: bool,
     pub provider: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct TaskCalendarWarning {
+    pub provider: String,
+    #[serde(default)]
+    pub status_code: Option<u16>,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub hint: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskCalendarResult {
+    pub events: Vec<TaskEvent>,
+    pub warnings: Vec<TaskCalendarWarning>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -6966,17 +6983,26 @@ impl ApiClient {
     }
 
     /// Read-only calendar events in `[from, to]` from the chosen provider.
-    pub fn task_calendar_events(&self, from: &str, to: &str) -> Result<Vec<TaskEvent>, ApiError> {
+    pub fn task_calendar_events(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<TaskCalendarResult, ApiError> {
         #[derive(Deserialize)]
         struct Envelope {
             events: Vec<TaskEvent>,
+            #[serde(default)]
+            provider_warnings: Vec<TaskCalendarWarning>,
         }
         let response: Envelope =
             self.get(&["v1", "tasks", "calendar"], &[("from", from), ("to", to)])?;
         if response.events.len() > 250 {
             return Err(ApiError::InvalidResponse);
         }
-        Ok(response.events)
+        Ok(TaskCalendarResult {
+            events: response.events,
+            warnings: response.provider_warnings,
+        })
     }
 
     /// Begin the per-user Google/Microsoft sign-in for task sync (PKCE). The

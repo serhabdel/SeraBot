@@ -332,7 +332,7 @@ fn choose_event_kind(current: &mut String, dirty: &mut bool, conversation: &str,
     *dirty = true;
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
     Chat,
     Mail,
@@ -878,6 +878,72 @@ enum PendingOpen {
     SaveAs,
 }
 
+/// Visual tone for a desktop notification toast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastTone {
+    Ok,
+    Info,
+    Warn,
+    Error,
+}
+
+impl ToastTone {
+    pub fn class(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "err",
+        }
+    }
+
+    pub fn icon(self) -> &'static str {
+        match self {
+            Self::Ok => "check",
+            Self::Info => "info",
+            Self::Warn => "alert-circle",
+            Self::Error => "x",
+        }
+    }
+
+    pub fn default_duration_ms(self) -> u64 {
+        match self {
+            Self::Ok | Self::Info => 4_500,
+            Self::Warn | Self::Error => 7_000,
+        }
+    }
+}
+
+/// Optional quick action button inside a toast.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToastAction {
+    OpenLogs,
+    OpenSection(Section),
+    OpenSettings(SettingsSection),
+}
+
+impl ToastAction {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::OpenLogs => "View logs",
+            Self::OpenSection(Section::Integrations) => "Integrations",
+            Self::OpenSection(Section::Providers) => "AI Providers",
+            Self::OpenSection(_) => "Open",
+            Self::OpenSettings(_) => "Settings",
+        }
+    }
+}
+
+/// One notification in the stacked toast queue (capped at 3 visible).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToastItem {
+    pub id: u64,
+    pub tone: ToastTone,
+    pub message: String,
+    pub action: Option<ToastAction>,
+    pub duration_ms: u64,
+}
+
 pub struct Session {
     pub state: State,
     pub worker: Option<Worker>,
@@ -892,6 +958,7 @@ pub struct Session {
     /// True after the event stream has connected once this session. A later
     /// drop is "reconnecting", not the first connect.
     pub events_seen: bool,
+    pub events_was_disconnected: bool,
     /// Browser dock and vault sheet state; its own worker thread.
     pub panel: PanelState,
     panel_worker: Option<PanelWorker>,
@@ -914,6 +981,7 @@ pub struct Session {
     pub settings_section: SettingsSection,
     /// Set by the command palette: the Mail page opens a new message when it sees this.
     pub mail_compose_request: bool,
+    pub palette_recent: Vec<String>,
     seen_approvals: Option<usize>,
     /// Usage page range in days (7, 30 or 90) and whether a load is running.
     pub usage_days: u32,
@@ -991,6 +1059,8 @@ pub struct Session {
     pub sign_out: SignOutUi,
     pub telegram: TelegramUi,
     pub toast: Option<String>,
+    pub toast_queue: Vec<ToastItem>,
+    next_toast_id: u64,
     /// Artifact download in flight (worker) or file write in flight (thread).
     pub downloading: bool,
     download_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
@@ -1182,6 +1252,7 @@ impl Session {
             ui_wake,
             events_active: false,
             events_seen: false,
+            events_was_disconnected: false,
             events_dirty: false,
             event_frames: crate::events::FrameCoalescer::new(),
             event_frame_writes: 0,
@@ -1196,6 +1267,7 @@ impl Session {
             prefs: creds::UiPrefs::default(),
             settings_section: SettingsSection::Account,
             mail_compose_request: false,
+            palette_recent: Vec::new(),
             seen_approvals: None,
             pins,
             usage_days: 30,
@@ -1242,6 +1314,8 @@ impl Session {
             sign_out: SignOutUi::default(),
             telegram: TelegramUi::default(),
             toast: None,
+            toast_queue: Vec::new(),
+            next_toast_id: 1,
             downloading: false,
             download_rx: None,
             pending_open: None,
@@ -1423,6 +1497,9 @@ impl Session {
     /// polling that the failure paused resumes and a cheap read probes it.
     /// The banner stays up until something answers.
     pub fn retry_link(&mut self) {
+        if let Some(stream) = &self.events {
+            stream.reconnect_now();
+        }
         if !self.state.connected || self.pending.is_some() {
             return;
         }
@@ -1442,6 +1519,105 @@ impl Session {
             self.refreshing = true;
         }
         self.schedule(Operation::History, Duration::ZERO);
+    }
+
+    /// Immediately wakes the SSE stream and probes the server.
+    pub fn reconnect_events_now(&mut self) {
+        if let Some(stream) = &self.events {
+            stream.reconnect_now();
+        }
+        self.retry_link();
+    }
+
+    /// Infers a semantic toast tone from a plain-text notification message.
+    pub fn infer_toast_tone(message: &str) -> ToastTone {
+        let lower = message.to_ascii_lowercase();
+        if lower.contains("fail")
+            || lower.contains("error")
+            || lower.contains("could not")
+            || lower.contains("rejected")
+        {
+            ToastTone::Error
+        } else if lower.contains("warn")
+            || lower.contains("expired")
+            || lower.contains("missing")
+            || lower.contains("not set")
+        {
+            ToastTone::Warn
+        } else if lower.contains("saved")
+            || lower.contains("copied")
+            || lower.contains("restored")
+            || lower.contains("connected")
+            || lower.contains("sent")
+            || lower.contains("done")
+            || lower.contains("synced")
+        {
+            ToastTone::Ok
+        } else {
+            ToastTone::Info
+        }
+    }
+
+    /// Pushes a typed notification into the stacked toast queue (capped at 3,
+    /// deduplicating identical consecutive messages).
+    pub fn push_toast(&mut self, tone: ToastTone, message: impl Into<String>) {
+        self.push_toast_inner(tone, message.into(), None);
+    }
+
+    /// Pushes a typed notification with a quick action button.
+    pub fn push_toast_with_action(
+        &mut self,
+        tone: ToastTone,
+        message: impl Into<String>,
+        action: ToastAction,
+    ) {
+        self.push_toast_inner(tone, message.into(), Some(action));
+    }
+
+    fn push_toast_inner(&mut self, tone: ToastTone, message: String, action: Option<ToastAction>) {
+        let trimmed = message.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let message = trimmed.to_owned();
+        if let Some(pos) = self.toast_queue.iter().position(|t| t.message == message) {
+            self.toast_queue.remove(pos);
+        }
+        let id = self.next_toast_id;
+        self.next_toast_id = self.next_toast_id.saturating_add(1);
+        self.toast_queue.push(ToastItem {
+            id,
+            tone,
+            message,
+            action,
+            duration_ms: tone.default_duration_ms(),
+        });
+        while self.toast_queue.len() > 3 {
+            self.toast_queue.remove(0);
+        }
+    }
+
+    /// Moves any legacy `session.toast = Some(...)` into `toast_queue`.
+    pub fn flush_legacy_toast(&mut self) {
+        if let Some(msg) = self.toast.take() {
+            let tone = Self::infer_toast_tone(&msg);
+            self.push_toast(tone, msg);
+        }
+    }
+
+    /// Removes one toast by id.
+    pub fn dismiss_toast(&mut self, id: u64) {
+        self.toast_queue.retain(|t| t.id != id);
+    }
+
+    /// Records a Command Palette jump key (newest first, capped at 4).
+    pub fn touch_palette_recent(&mut self, key: &str) {
+        if key.trim().is_empty() {
+            return;
+        }
+        self.palette_recent.retain(|k| k != key);
+        self.palette_recent.insert(0, key.to_owned());
+        self.palette_recent.truncate(4);
     }
 
     /// The "Retry" button of the "Could not load this conversation" panel.
@@ -4571,18 +4747,29 @@ impl Session {
             events.stop();
         }
         self.events_active = false;
+        self.events_was_disconnected = false;
     }
 
     fn poll_events(&mut self) {
         let mut unauthorized = false;
+        let mut restored = false;
         if let Some(stream) = &self.events {
             while let Some(update) = stream.try_recv() {
                 match update {
                     EventUpdate::Connected => {
+                        if self.events_was_disconnected {
+                            restored = true;
+                        }
                         self.events_active = true;
                         self.events_seen = true;
+                        self.events_was_disconnected = false;
                     }
-                    EventUpdate::Disconnected => self.events_active = false,
+                    EventUpdate::Disconnected => {
+                        self.events_active = false;
+                        if self.events_seen {
+                            self.events_was_disconnected = true;
+                        }
+                    }
                     EventUpdate::Unauthorized => unauthorized = true,
                     EventUpdate::Event { id, kind, payload } => {
                         self.last_event_id = self.last_event_id.max(id);
@@ -4590,6 +4777,9 @@ impl Session {
                     }
                 }
             }
+        }
+        if restored {
+            self.push_toast(ToastTone::Ok, "Live connection restored");
         }
         self.apply_event_frame(Instant::now());
         if unauthorized {
@@ -9238,5 +9428,41 @@ mod backlog_tests {
         stop.store(true, Ordering::Relaxed);
         let _ = std::net::TcpStream::connect(("127.0.0.1", port));
         let _ = server.join();
+    }
+
+    #[test]
+    fn toast_queue_caps_at_three_and_deduplicates() {
+        let mut session = Session::new();
+        session.push_toast(ToastTone::Info, "First");
+        session.push_toast(ToastTone::Ok, "Second");
+        session.push_toast(ToastTone::Warn, "Third");
+        session.push_toast(ToastTone::Error, "Fourth");
+        assert_eq!(session.toast_queue.len(), 3);
+        assert_eq!(session.toast_queue[0].message, "Second");
+        assert_eq!(session.toast_queue[2].message, "Fourth");
+
+        // Duplicate moves to newest instead of creating two entries.
+        session.push_toast(ToastTone::Ok, "Second");
+        assert_eq!(session.toast_queue.len(), 3);
+        assert_eq!(session.toast_queue[2].message, "Second");
+
+        // Legacy toast bridges with tone inference.
+        session.toast = Some("Request failed: timeout".into());
+        session.flush_legacy_toast();
+        assert!(session.toast.is_none());
+        assert_eq!(session.toast_queue.last().unwrap().tone, ToastTone::Error);
+
+        let last_id = session.toast_queue.last().unwrap().id;
+        session.dismiss_toast(last_id);
+        assert_eq!(session.toast_queue.len(), 2);
+    }
+
+    #[test]
+    fn palette_recent_keeps_four_most_recent_unique_keys() {
+        let mut session = Session::new();
+        for key in ["a", "b", "c", "d", "e", "b"] {
+            session.touch_palette_recent(key);
+        }
+        assert_eq!(session.palette_recent, vec!["b", "e", "d", "c"]);
     }
 }

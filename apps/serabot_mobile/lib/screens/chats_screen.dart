@@ -7,6 +7,7 @@ import '../app_state.dart';
 import '../chat_models.dart';
 import '../device.dart';
 import '../models.dart';
+import '../quick_jump.dart';
 import '../widgets.dart';
 import 'chat_screen.dart';
 
@@ -39,10 +40,16 @@ enum ChatFilter { all, bots, channels, unread }
 /// Redesigned Chats list: search, quick `+ New Chat` / `+ New Channel`,
 /// horizontal Bot Quick-Launch Strip, filter chips, and rich chat cards.
 class ChatsScreen extends StatefulWidget {
-  const ChatsScreen({super.key, required this.app, required this.device});
+  const ChatsScreen({
+    super.key,
+    required this.app,
+    required this.device,
+    this.onSelectTab,
+  });
 
   final AppState app;
   final DeviceActions device;
+  final ValueChanged<int>? onSelectTab;
 
   @override
   State<ChatsScreen> createState() => _ChatsScreenState();
@@ -354,6 +361,19 @@ class _ChatsScreenState extends State<ChatsScreen> {
                   )
                 : const Text('Chats'),
             actions: [
+              IconButton(
+                key: const Key('quick-jump-button'),
+                tooltip: 'Quick Jump',
+                icon: const Icon(Icons.bolt_rounded),
+                onPressed: () => showQuickJumpSheet(
+                  context,
+                  app: app,
+                  device: widget.device,
+                  onSelectTab: widget.onSelectTab,
+                  onOpenBot: _launchBot,
+                  onOpenConversation: _open,
+                ),
+              ),
               IconButton(
                 tooltip: _searching ? 'Close search' : 'Search',
                 icon: Icon(_searching ? Icons.close : Icons.search),

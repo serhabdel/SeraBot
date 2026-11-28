@@ -8,6 +8,7 @@ import '../app_state.dart';
 import '../device.dart';
 import '../session.dart';
 import '../theme.dart';
+import '../widgets.dart';
 import 'approvals_screen.dart';
 import 'bots_screen.dart';
 import 'chats_screen.dart';
@@ -39,15 +40,34 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen>
+    with SingleTickerProviderStateMixin {
   int _index = 0;
   late final AppState _app;
   late final DeviceActions _device;
   StreamSubscription<int>? _alertSub;
+  bool _wasDisconnected = false;
+  late final AnimationController _tabAnim;
+  late final Animation<double> _tabOpacity;
+  late final Animation<Offset> _tabSlide;
 
   @override
   void initState() {
     super.initState();
+    _tabAnim = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 180),
+      value: 1.0,
+    );
+    final curved = CurvedAnimation(
+      parent: _tabAnim,
+      curve: Curves.easeOutCubic,
+    );
+    _tabOpacity = Tween<double>(begin: 0.4, end: 1.0).animate(curved);
+    _tabSlide = Tween<Offset>(
+      begin: const Offset(0, 0.016),
+      end: Offset.zero,
+    ).animate(curved);
     _app = AppState(
       widget.session.client,
       // Plugins are not available in widget tests, which also run without
@@ -56,7 +76,36 @@ class _HomeScreenState extends State<HomeScreen> {
     );
     _device = widget.device ?? PlatformDeviceActions();
     _alertSub = _app.approvalAlerts.listen(_onApprovalAlert);
+    _app.addListener(_onAppChanged);
     _app.start(events: widget.startEvents);
+  }
+
+  void _onAppChanged() {
+    if (_app.seenLive && !_app.live && _app.foreground) {
+      _wasDisconnected = true;
+    } else if (_app.live && _wasDisconnected) {
+      _wasDisconnected = false;
+      if (mounted) {
+        final messenger = ScaffoldMessenger.of(context);
+        messenger.hideCurrentSnackBar();
+        messenger.showSnackBar(
+          const SnackBar(
+            content: Text('Live connection restored'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      }
+    }
+  }
+
+  void _selectTab(int i) {
+    if (i == _index) return;
+    setState(() => _index = i);
+    if (MediaQuery.disableAnimationsOf(context)) {
+      _tabAnim.value = 1.0;
+    } else {
+      _tabAnim.forward(from: 0.0);
+    }
   }
 
   /// A new approval arrived: a short buzz and a notice with a way to review it.
@@ -94,6 +143,8 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void dispose() {
     _alertSub?.cancel();
+    _app.removeListener(_onAppChanged);
+    _tabAnim.dispose();
     _app.dispose();
     super.dispose();
   }
@@ -106,36 +157,67 @@ class _HomeScreenState extends State<HomeScreen> {
       builder: (context, _) {
         final unread = _app.unread;
         final pending = _app.pendingApprovals;
+        final reconnecting = _app.seenLive && !_app.live && _app.foreground;
         return Scaffold(
           body: ListenableBuilder(
             listenable: widget.session,
             builder: (context, _) {
               final failed = widget.session.saveFailed;
+              final hasTopBanner = failed || reconnecting;
               return Column(
                 children: [
-                  if (failed)
-                    SafeArea(
-                      bottom: false,
-                      child: _SaveFailedBanner(session: widget.session),
+                  AnimatedSize(
+                    duration: motionDuration(
+                      context,
+                      const Duration(milliseconds: 200),
                     ),
+                    curve: Curves.easeOutCubic,
+                    alignment: Alignment.topCenter,
+                    child: hasTopBanner
+                        ? SafeArea(
+                            bottom: false,
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                if (failed)
+                                  _SaveFailedBanner(session: widget.session),
+                                if (reconnecting)
+                                  _ReconnectingBanner(
+                                    onReconnect: _app.reconnectNow,
+                                  ),
+                              ],
+                            ),
+                          )
+                        : const SizedBox.shrink(),
+                  ),
                   Expanded(
                     child: MediaQuery.removePadding(
                       context: context,
-                      removeTop: failed,
-                      child: IndexedStack(
-                        index: _index,
-                        children: [
-                          ChatsScreen(app: _app, device: _device),
-                          TasksScreen(app: _app),
-                          WorkflowsScreen(app: _app),
-                          LibraryScreen(app: _app, device: _device),
-                          BotsScreen(app: _app, device: _device),
-                          SettingsScreen(
-                            session: widget.session,
-                            app: _app,
-                            theme: widget.theme,
+                      removeTop: hasTopBanner,
+                      child: FadeTransition(
+                        opacity: _tabOpacity,
+                        child: SlideTransition(
+                          position: _tabSlide,
+                          child: IndexedStack(
+                            index: _index,
+                            children: [
+                              ChatsScreen(
+                                app: _app,
+                                device: _device,
+                                onSelectTab: _selectTab,
+                              ),
+                              TasksScreen(app: _app),
+                              WorkflowsScreen(app: _app),
+                              LibraryScreen(app: _app, device: _device),
+                              BotsScreen(app: _app, device: _device),
+                              SettingsScreen(
+                                session: widget.session,
+                                app: _app,
+                                theme: widget.theme,
+                              ),
+                            ],
                           ),
-                        ],
+                        ),
                       ),
                     ),
                   ),
@@ -161,7 +243,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             child: NavigationBar(
               selectedIndex: _index,
-              onDestinationSelected: (i) => setState(() => _index = i),
+              onDestinationSelected: _selectTab,
               labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
               destinations: [
                 NavigationDestination(
@@ -476,6 +558,44 @@ class _SaveFailedBanner extends StatelessWidget {
             TextButton(
               onPressed: session.retrySave,
               child: const Text('Try saving again'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Sleek amber banner shown when the SSE stream drops after having been live.
+class _ReconnectingBanner extends StatelessWidget {
+  const _ReconnectingBanner({required this.onReconnect});
+
+  final VoidCallback onReconnect;
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final bg = isDark ? const Color(0xFF422C00) : const Color(0xFFFFF3CD);
+    final fg = isDark ? const Color(0xFFFFE082) : const Color(0xFF663C00);
+    final accent = isDark ? const Color(0xFFFFB300) : const Color(0xFFD97706);
+    return Material(
+      key: const Key('reconnecting-banner'),
+      color: bg,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 6, 8, 6),
+        child: Row(
+          children: [
+            Icon(Icons.sync_problem_rounded, color: accent, size: 18),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                'Live updates paused — reconnecting\u2026',
+                style: TextStyle(color: fg, fontWeight: FontWeight.w500),
+              ),
+            ),
+            TextButton(
+              onPressed: onReconnect,
+              child: const Text('Reconnect'),
             ),
           ],
         ),
