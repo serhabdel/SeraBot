@@ -456,7 +456,7 @@ impl Session {
         let flow_kind = match method {
             AddMethod::Browser => FlowKind::Browser,
             AddMethod::Device => FlowKind::Device,
-            AddMethod::Key => return,
+            AddMethod::Key | AddMethod::SetupToken => return,
         };
         let Some(credentials) = self.credentials.clone() else {
             self.accounts_ui.sheet_error = Some("Connect to the server first.".into());

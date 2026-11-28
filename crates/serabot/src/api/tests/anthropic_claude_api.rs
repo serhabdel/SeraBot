@@ -801,4 +801,33 @@ async fn claude_agent_sdk_gateway_status_token_import_and_signin_flow() {
     .await;
     assert_eq!(status, StatusCode::OK, "{completed}");
     assert_eq!(completed["created"], true);
+    let account_id = completed["account_id"].as_str().unwrap().to_owned();
+
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/verify"))
+        .and(header(
+            "authorization",
+            format!("Bearer {generated_token}").as_str(),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "profile": "default",
+            "billing": "plan",
+            "model_count": 5,
+        })))
+        .expect(1)
+        .mount(&gw_server)
+        .await;
+
+    let (status, tested) = send(
+        OWNER.into(),
+        "POST",
+        format!("/v1/providers/claude-sdk/accounts/{account_id}/test"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{tested}");
+    assert_eq!(tested["ok"], true);
+    assert_eq!(tested["status"], "ok");
+    assert_eq!(tested["model_count"], 5);
 }

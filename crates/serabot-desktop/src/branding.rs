@@ -316,7 +316,7 @@ static BRANDS: &[Brand] = &[
     },
     Brand {
         keys: &["claude-agent-sdk"],
-        label: "Claude Agent SDK (Gateway)",
+        label: "Claude Agent (Pro / Max / Ultra)",
         mark: Mark::Svg(SVG_CLAUDE),
     },
     Brand {
@@ -559,7 +559,7 @@ mod tests {
         assert_eq!(brand_label("claude"), Some("Claude"));
         assert_eq!(
             brand_label("claude-agent-sdk"),
-            Some("Claude Agent SDK (Gateway)")
+            Some("Claude Agent (Pro / Max / Ultra)")
         );
     }
 }

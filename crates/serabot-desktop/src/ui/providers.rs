@@ -841,36 +841,45 @@ fn GatewayStatusStrip(session: Signal<Session>, provider_id: String, can_write: 
     let checking = busy == Some("status");
     let generating = busy == Some("token");
     let importing = busy == Some("import");
+    let ready = status
+        .as_ref()
+        .is_some_and(|st| st.reachable && st.token_configured && st.auth_ok);
     let needs_setup = status
         .as_ref()
-        .is_some_and(|st| !st.token_configured || !st.reachable);
+        .is_some_and(|st| !st.reachable || !st.token_configured || !st.auth_ok);
     let can_import_cli = status.as_ref().is_some_and(|st| st.default_cli_login);
     let pid_check = provider_id.clone();
     let pid_gen = provider_id.clone();
     let pid_recheck = provider_id.clone();
     let pid_dismiss = provider_id.clone();
     let pid_import = provider_id.clone();
+    let install_cmd = "python3 -m venv services/claude_gateway/.venv && services/claude_gateway/.venv/bin/pip install -r services/claude_gateway/requirements.txt";
 
     rsx! {
         div { class: "acct-block",
             div { class: "acct-head",
-                span { class: "micro", "Gateway status" }
+                span { class: "micro", "Claude Agent service" }
                 div { class: "row",
                     if let Some(st) = &status {
-                        StatusChip {
-                            tone: if st.reachable { serabot_desktop::theme::Tone::Ok } else { serabot_desktop::theme::Tone::Danger },
-                            text: if st.reachable { "Reachable".to_owned() } else { "Offline".to_owned() },
-                        }
-                        StatusChip {
-                            tone: if st.token_configured { serabot_desktop::theme::Tone::Ok } else { serabot_desktop::theme::Tone::Warn },
-                            text: if st.token_configured { "Token configured".to_owned() } else { "Token missing".to_owned() },
-                        }
-                        StatusChip {
-                            tone: if st.cli_installed { serabot_desktop::theme::Tone::Ok } else { serabot_desktop::theme::Tone::Warn },
-                            text: if st.cli_installed { "Claude CLI installed".to_owned() } else { "Claude CLI missing".to_owned() },
+                        if ready {
+                            StatusChip {
+                                tone: serabot_desktop::theme::Tone::Ok,
+                                text: "Claude Agent Ready".to_owned(),
+                            }
+                            if st.cli_installed {
+                                StatusChip {
+                                    tone: serabot_desktop::theme::Tone::Ok,
+                                    text: "CLI ready".to_owned(),
+                                }
+                            }
+                        } else {
+                            StatusChip {
+                                tone: if st.reachable { serabot_desktop::theme::Tone::Warn } else { serabot_desktop::theme::Tone::Danger },
+                                text: if st.reachable { "Needs auth".to_owned() } else { "Offline".to_owned() },
+                            }
                         }
                     } else if checking {
-                        span { class: "tiny", "Checking gateway\u{2026}" }
+                        span { class: "tiny", "Checking service\u{2026}" }
                     }
                     button {
                         class: "btn ghost sm",
@@ -878,7 +887,7 @@ fn GatewayStatusStrip(session: Signal<Session>, provider_id: String, can_write: 
                         disabled: !can_write || busy.is_some(),
                         onclick: move |_| session.write().check_gateway_status(&pid_check),
                         Icon { name: "refresh", size: 14 }
-                        if checking { "Checking\u{2026}" } else { "Check status" }
+                        if checking { "Checking\u{2026}" } else { "Refresh" }
                     }
                 }
             }
@@ -892,56 +901,73 @@ fn GatewayStatusStrip(session: Signal<Session>, provider_id: String, can_write: 
                 div { class: "prov-note action", role: "note",
                     Icon { name: "lock", size: 14 }
                     div { class: "prov-note-body",
-                        span { "Set up gateway" }
+                        span { "Claude Agent service is not running yet" }
                         span { class: "tiny",
-                            "Generate a bearer token for this gateway, start the loopback gateway with it, then check again."
+                            "On the SeraBot server, install the Python Agent SDK once and click Retry auto-start:"
+                        }
+                        div { class: "row",
+                            code { class: "flow-link grow", "{install_cmd}" }
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                onclick: move |_| {
+                                    let _ = dioxus::document::eval(&copy_script(install_cmd));
+                                },
+                                Icon { name: "copy", size: 14 }
+                                "Copy"
+                            }
                         }
                         div { class: "row",
                             button {
                                 class: "btn primary sm",
                                 r#type: "button",
                                 disabled: !can_write || busy.is_some(),
-                                onclick: move |_| session.write().generate_gateway_token(&pid_gen),
-                                if generating { "Generating\u{2026}" } else { "Generate token" }
-                            }
-                            button {
-                                class: "btn ghost sm",
-                                r#type: "button",
-                                disabled: !can_write || busy.is_some(),
                                 onclick: move |_| session.write().check_gateway_status(&pid_recheck),
-                                "Check again"
+                                "Retry auto-start"
                             }
                         }
-                        if let Some(generated_token) = generated {
-                            div { class: "field",
-                                if let Some(tok) = generated_token.token.as_ref() {
-                                    span { class: "tiny", "One-time token (save now, shown once):" }
-                                    code { class: "flow-link", "{tok}" }
+                        details { class: "field",
+                            summary { class: "tiny", "Advanced: manual gateway bearer token" }
+                            div { class: "row",
+                                button {
+                                    class: "btn ghost sm",
+                                    r#type: "button",
+                                    disabled: !can_write || busy.is_some(),
+                                    onclick: move |_| session.write().generate_gateway_token(&pid_gen),
+                                    if generating { "Generating\u{2026}" } else { "Rotate / generate token" }
                                 }
-                                if !generated_token.startup_command.is_empty() {
-                                    span { class: "tiny", "Start the gateway with:" }
-                                    code { class: "flow-link", "{generated_token.startup_command}" }
-                                }
-                                div { class: "row",
+                            }
+                            if let Some(generated_token) = generated {
+                                div { class: "field",
+                                    if let Some(tok) = generated_token.token.as_ref() {
+                                        span { class: "tiny", "One-time token (save now, shown once):" }
+                                        code { class: "flow-link", "{tok}" }
+                                    }
                                     if !generated_token.startup_command.is_empty() {
+                                        span { class: "tiny", "Start the gateway with:" }
+                                        code { class: "flow-link", "{generated_token.startup_command}" }
+                                    }
+                                    div { class: "row",
+                                        if !generated_token.startup_command.is_empty() {
+                                            button {
+                                                class: "btn ghost sm",
+                                                r#type: "button",
+                                                onclick: {
+                                                    let cmd = generated_token.startup_command.clone();
+                                                    move |_| {
+                                                        let _ = dioxus::document::eval(&copy_script(&cmd));
+                                                    }
+                                                },
+                                                Icon { name: "copy", size: 14 }
+                                                "Copy command"
+                                            }
+                                        }
                                         button {
                                             class: "btn ghost sm",
                                             r#type: "button",
-                                            onclick: {
-                                                let cmd = generated_token.startup_command.clone();
-                                                move |_| {
-                                                    let _ = dioxus::document::eval(&copy_script(&cmd));
-                                                }
-                                            },
-                                            Icon { name: "copy", size: 14 }
-                                            "Copy command"
+                                            onclick: move |_| session.write().dismiss_gateway_token(&pid_dismiss),
+                                            "Dismiss"
                                         }
-                                    }
-                                    button {
-                                        class: "btn ghost sm",
-                                        r#type: "button",
-                                        onclick: move |_| session.write().dismiss_gateway_token(&pid_dismiss),
-                                        "Dismiss"
                                     }
                                 }
                             }

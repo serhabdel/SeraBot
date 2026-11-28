@@ -45,6 +45,7 @@ pub(super) enum WireAuth {
 /// whether anything changed.
 pub(super) type BadRequestFix<'a> = &'a (dyn Fn(&mut Value, &str) -> bool + Send + Sync);
 
+#[derive(Clone)]
 pub(super) struct WireCall<'a> {
     pub method: reqwest::Method,
     pub url: String,
@@ -492,19 +493,37 @@ impl LlmClient {
         if let Some(effort) = Self::claude_gateway_effort(extra) {
             body["effort"] = json!(effort);
         }
-        let bytes = self
-            .send_wire(WireCall {
-                method: reqwest::Method::POST,
-                url: format!("{root}/v1/turn"),
-                query: Vec::new(),
-                auth: WireAuth::Bearer,
-                headers,
-                body: Some(body),
-                fix_bad_request: None,
-                echo_error: true,
-                idempotent: false,
-            })
-            .await?;
+        let call = WireCall {
+            method: reqwest::Method::POST,
+            url: format!("{root}/v1/turn"),
+            query: Vec::new(),
+            auth: WireAuth::Bearer,
+            headers,
+            body: Some(body),
+            fix_bad_request: None,
+            echo_error: true,
+            idempotent: false,
+        };
+        let bytes = match self.send_wire(call.clone()).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                if let Some((supervisor, cfg)) = &self.claude_gateway_supervisor
+                    && cfg.auto_start
+                {
+                    let token = self
+                        .api_key
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .expose_secret()
+                        .to_owned();
+                    if supervisor.ensure_running(&base, &token, cfg).await.is_ok() {
+                        let bytes = self.send_wire(call).await?;
+                        return parse_claude_gateway_response(&bytes);
+                    }
+                }
+                return Err(err);
+            }
+        };
         parse_claude_gateway_response(&bytes)
     }
 

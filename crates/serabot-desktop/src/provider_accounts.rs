@@ -280,6 +280,8 @@ pub fn priority_moves(
 pub enum AddMethod {
     /// Paste an API key.
     Key,
+    /// Paste a `claude setup-token` (`sk-ant-oat01-...`) 1-year subscription token.
+    SetupToken,
     /// Sign in through the browser (PKCE, loopback redirect).
     Browser,
     /// Type a one-time code on the provider's page.
@@ -290,15 +292,16 @@ impl AddMethod {
     pub fn label(self) -> &'static str {
         match self {
             Self::Key => "API key",
+            Self::SetupToken => "Setup token",
             Self::Browser => "Sign in with browser",
             Self::Device => "Sign in with a code",
         }
     }
 
-    /// The `flow` word the server takes; `None` for a pasted key.
+    /// The `flow` word the server takes; `None` for a pasted key or setup token.
     pub fn flow(self) -> Option<&'static str> {
         match self {
-            Self::Key => None,
+            Self::Key | Self::SetupToken => None,
             Self::Browser => Some("pkce"),
             Self::Device => Some("device"),
         }
@@ -316,6 +319,11 @@ fn is_plan_kind(kind: &str) -> bool {
 /// the preset documents. A sign-in-only provider offers no key. Anthropic
 /// uses official API keys only.
 pub fn add_methods(provider: &ProviderStatus, preset: Option<&ProviderPreset>) -> Vec<AddMethod> {
+    if provider.kind == "claude-agent-sdk" || preset.is_some_and(|p| p.kind == "claude-agent-sdk") {
+        // Browser sign-in is first (preferred), followed by 1-year Setup Token,
+        // and a separate Console API key tab.
+        return vec![AddMethod::Browser, AddMethod::SetupToken, AddMethod::Key];
+    }
     let mut methods = Vec::new();
     let sign_in_only = provider.auth == "oauth" || preset.is_some_and(|p| p.auth == "oauth");
     let takes_key = !sign_in_only && preset.is_none_or(|p| p.auth != "none");
@@ -361,7 +369,7 @@ pub fn risk_text(provider: &ProviderStatus, preset: Option<&ProviderPreset>) -> 
     }
     let sign_in_offered = add_methods(provider, preset)
         .iter()
-        .any(|method| *method != AddMethod::Key);
+        .any(|method| matches!(method, AddMethod::Browser | AddMethod::Device));
     let text = preset.map(|p| p.risk).filter(|text| !text.is_empty())?;
     sign_in_offered.then(|| text.to_owned())
 }
@@ -370,7 +378,9 @@ pub fn risk_text(provider: &ProviderStatus, preset: Option<&ProviderPreset>) -> 
 /// until it has an account and "Add account" after; a key provider says
 /// "Add account" (the sheet then asks for the key).
 pub fn add_button_label(methods: &[AddMethod], has_accounts: bool) -> &'static str {
-    let signs_in = methods.iter().any(|method| *method != AddMethod::Key);
+    let signs_in = methods
+        .iter()
+        .any(|method| matches!(method, AddMethod::Browser | AddMethod::Device));
     if signs_in && !has_accounts {
         "Sign in"
     } else {
@@ -380,8 +390,10 @@ pub fn add_button_label(methods: &[AddMethod], has_accounts: bool) -> &'static s
 
 /// The line on a card with no account yet.
 pub fn empty_card_text(methods: &[AddMethod]) -> &'static str {
-    let signs_in = methods.iter().any(|method| *method != AddMethod::Key);
-    let takes_key = methods.contains(&AddMethod::Key);
+    let signs_in = methods
+        .iter()
+        .any(|method| matches!(method, AddMethod::Browser | AddMethod::Device));
+    let takes_key = methods.contains(&AddMethod::Key) || methods.contains(&AddMethod::SetupToken);
     match (signs_in, takes_key) {
         (true, true) => "No account yet. Sign in, or add an API key.",
         (true, false) => "Not signed in yet. Sign in to use this provider.",
@@ -902,10 +914,19 @@ mod tests {
             add_methods(&provider("api_key", &["pkce"]), preset_for("anthropic")),
             [AddMethod::Key]
         );
+        // Claude Agent (Pro / Max / Ultra): Browser first, then SetupToken, then API Key.
+        assert_eq!(
+            add_methods(
+                &provider("api_key", &["pkce"]),
+                preset_for("claude-agent-sdk")
+            ),
+            [AddMethod::Browser, AddMethod::SetupToken, AddMethod::Key]
+        );
         // A local server needs nothing.
         assert!(add_methods(&provider("none", &[]), preset_for("ollama")).is_empty());
         assert_eq!(AddMethod::Device.flow(), Some("device"));
         assert_eq!(AddMethod::Key.flow(), None);
+        assert_eq!(AddMethod::SetupToken.flow(), None);
     }
 
     #[test]

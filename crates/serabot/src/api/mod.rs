@@ -404,6 +404,15 @@ impl ApiState {
         Ok(self)
     }
 
+    /// Share the Claude Agent SDK gateway supervisor with the runtime.
+    pub fn with_claude_gateway(
+        mut self,
+        supervisor: Arc<crate::claude_gateway_proc::ClaudeGatewaySupervisor>,
+    ) -> Self {
+        self.claude_gateway = supervisor;
+        self
+    }
+
     /// Replace the sign-in service (tests point providers at mock servers).
     pub fn with_signin(mut self, signin: Arc<crate::auth_flows::SignInService>) -> Self {
         self.signin = signin;

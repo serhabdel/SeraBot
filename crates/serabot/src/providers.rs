@@ -1349,6 +1349,11 @@ pub struct UserProviderCredentials {
     max_output_tokens: u32,
     /// Account reads, and the single-flight refresh every OAuth client uses.
     refresher: Arc<AccountRefresher>,
+    /// Optional Claude Agent SDK gateway supervisor for self-healing turns.
+    claude_gateway: Option<(
+        Arc<crate::claude_gateway_proc::ClaudeGatewaySupervisor>,
+        crate::config::ClaudeGatewayConfig,
+    )>,
 }
 
 impl std::fmt::Debug for UserProviderCredentials {
@@ -1375,6 +1380,7 @@ impl UserProviderCredentials {
             timeout_secs,
             max_output_tokens,
             refresher: Arc::new(AccountRefresher::new(accounts)),
+            claude_gateway: None,
         }
     }
 
@@ -1382,6 +1388,17 @@ impl UserProviderCredentials {
     /// token refreshed by a turn take the same lock.
     pub fn with_refresher(mut self, refresher: Arc<AccountRefresher>) -> Self {
         self.refresher = refresher;
+        self
+    }
+
+    /// Share the Claude Agent SDK gateway supervisor so turns auto-start or
+    /// revive the loopback gateway if it stopped.
+    pub fn with_claude_gateway(
+        mut self,
+        supervisor: Arc<crate::claude_gateway_proc::ClaudeGatewaySupervisor>,
+        cfg: crate::config::ClaudeGatewayConfig,
+    ) -> Self {
+        self.claude_gateway = Some((supervisor, cfg));
         self
     }
 
@@ -1422,6 +1439,15 @@ impl UserProviderCredentials {
         candidates.sort_by_key(|(_, status, _)| rank(*status));
         Ok(candidates.into_iter().next().map(|(_, _, id)| id))
     }
+
+    fn attach_claude_gateway(&self, client: LlmClient, profile: &ProviderConfig) -> LlmClient {
+        if profile.kind == "claude-agent-sdk"
+            && let Some((supervisor, cfg)) = &self.claude_gateway
+        {
+            return client.with_claude_gateway_supervisor(supervisor.clone(), cfg.clone());
+        }
+        client
+    }
 }
 
 impl ProviderCredentials for UserProviderCredentials {
@@ -1454,7 +1480,7 @@ impl ProviderCredentials for UserProviderCredentials {
                 ))
             })?;
         let credential = ProviderCredential::parse(&secret)?;
-        open_provider_client(
+        let client = open_provider_client(
             profile,
             &credential,
             &self.server_secrets,
@@ -1467,7 +1493,8 @@ impl ProviderCredentials for UserProviderCredentials {
                 account_id: DEFAULT_ACCOUNT,
                 refresher: Some(&self.refresher),
             },
-        )
+        )?;
+        Ok(self.attach_claude_gateway(client, profile))
     }
 
     fn client_for_account(
@@ -1486,7 +1513,7 @@ impl ProviderCredentials for UserProviderCredentials {
                     "no credential is configured for provider '{provider}'; add a key or ask the admin for a grant"
                 ))
             })?;
-        open_provider_client(
+        let client = open_provider_client(
             profile,
             &credential,
             &self.server_secrets,
@@ -1499,7 +1526,8 @@ impl ProviderCredentials for UserProviderCredentials {
                 account_id,
                 refresher: Some(&self.refresher),
             },
-        )
+        )?;
+        Ok(self.attach_claude_gateway(client, profile))
     }
 }
 

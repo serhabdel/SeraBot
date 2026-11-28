@@ -807,3 +807,13 @@ Plan: `docs/specs/0.74.15-proposal.md`. Version stays `0.74.14` until the batch 
 - [x] Desktop: **Claude token or API key** tab copy with `claude setup-token` instructions; preset note.
 - [x] Version `0.74.34`, mobile `0.74.34+108`, `docs/release-0.74.34.md`, spec, README.
 - [ ] Owner: verify once with a real Pro/Max `claude setup-token` token.
+
+## Release 0.74.35 — Claude Agent (Pro / Max / Ultra): Server Lifecycle, Live Verification & Browser-First UX
+
+- [x] **Always-on & self-healing server gateway (`main.rs`, `claude_gateway_proc.rs`, `llm/wire_calls.rs`, `providers.rs`, `api/mod.rs`)**: shared `Arc<ClaudeGatewaySupervisor>`, boot auto-start before model catalog refresh, turn-level connect recovery, authenticated `/v1/auth/status` check + stale supervised child restart on token rotation.
+- [x] **Gateway CLI discovery & live verification (`services/claude_gateway/server.py`)**: `_find_claude_cli()` checks `~/.local/bin`, `~/.claude/local`, `~/.npm-global/bin`, `/usr/local/bin`, and `claude_agent_sdk/_bundled/claude`; passes `cli_path` into `ClaudeAgentOptions`; `POST /v1/auth/verify` verifies setup-tokens, CLI logins, and API keys live; `claude-sonnet-4-6` / `claude-opus-4-6` first.
+- [x] **Credential routing & real account Test (`api/admin.rs`, `api/provider_accounts.rs`, `auth_flows/gateway.rs`)**: `POST /v1/admin/providers` never overwrites `claude_gateway_token` with `sk-ant-*` tokens; `test_provider_account` uses `gateway_auth_verify`.
+- [x] **Desktop UX & branding (`serabot-desktop`)**: renamed to **Claude Agent (Pro / Max / Ultra)**, `AddAccountSheet` puts **Sign in with browser** first with dedicated **Setup token** and **API key** tabs, un-hid remote `code#state` paste box, streamlined `GatewayStatusStrip`.
+- [x] Version `0.74.35`, mobile `0.74.35+109`, `docs/release-0.74.35.md`, `README.md`, `tasks/todo.md`.
+- [ ] Owner: verify end-to-end against a real Claude Pro / Max / Ultra account on the server.
+
