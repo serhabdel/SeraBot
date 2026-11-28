@@ -799,3 +799,11 @@ Plan: `docs/specs/0.74.15-proposal.md`. Version stays `0.74.14` until the batch 
 - [x] **Desktop (`provider_flow.rs`, `oauth.rs`, `api.rs`, `ui/account_views.rs`, `ui/providers.rs`, `assets/accounts.css`)**: opens the automatic URL; listens on the CLI's callback port when it is free (gateway on the server) and relays the redirect; folded "Browser shows a code, or cannot reach localhost?" fallback with **Open code page** + paste; the saved-provider **Sign in with browser** tile now starts the sign-in instead of an idle sheet.
 - [x] Verified against the real `claude` CLI 2.1.x (synthetic codes only: relay, re-prompt, pasted URL, refusal text). A full sign-in with a real Claude account is **not** verified here — the owner must run it once.
 - [x] Version bump `0.74.33` (`Cargo.toml`), mobile `0.74.33+107`, `docs/release-0.74.33.md`, `README.md`, `tasks/todo.md`, `docs/specs/claude-agent-sdk-gateway.md`.
+
+## Release 0.74.34 — Claude Agent SDK: plan token sign-in and plan-first billing
+
+- [x] Gateway `POST /v1/auth/token`: `claude setup-token` (`sk-ant-oat01-…`) or `sk-ant-api…` stored per profile (0600, never echoed); turns use `CLAUDE_CODE_OAUTH_TOKEN` for plan tokens with every API key removed; plan logins beat a host `ANTHROPIC_API_KEY`; named accounts never inherit the host OAuth token.
+- [x] Server: a pasted `sk-ant-…` on the `claude-agent-sdk` key tab goes to the gateway (hashed `tok_` profile, deduplicated) instead of being saved as the gateway bearer token.
+- [x] Desktop: **Claude token or API key** tab copy with `claude setup-token` instructions; preset note.
+- [x] Version `0.74.34`, mobile `0.74.34+108`, `docs/release-0.74.34.md`, spec, README.
+- [ ] Owner: verify once with a real Pro/Max `claude setup-token` token.

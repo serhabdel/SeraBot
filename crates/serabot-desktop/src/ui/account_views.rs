@@ -435,6 +435,7 @@ pub(super) fn AddAccountSheet(session: Signal<Session>, overlay: Signal<Overlay>
     let key_revealed = show_key() && !key.is_empty();
     let running = flow.as_ref().is_some_and(|f| !f.phase.is_final());
     let kind = provider.kind.clone();
+    let is_gateway = kind == "claude-agent-sdk";
     let pid = provider.id.clone();
     let close = move |_| {
         session.write().close_add_account();
@@ -508,7 +509,9 @@ pub(super) fn AddAccountSheet(session: Signal<Session>, overlay: Signal<Overlay>
                                 span { class: "hint", "{Session::account_label_hint()}" }
                             }
                             div { class: "field",
-                                label { class: "field-label", r#for: "account-key-input", "API key" }
+                                label { class: "field-label", r#for: "account-key-input",
+                                    if is_gateway { "Claude token or API key" } else { "API key" }
+                                }
                                 div { class: "secret-field",
                                     input {
                                         id: "account-key-input",
@@ -517,7 +520,7 @@ pub(super) fn AddAccountSheet(session: Signal<Session>, overlay: Signal<Overlay>
                                         autocomplete: "off",
                                         spellcheck: false,
                                         value: "{key}",
-                                        placeholder: "Paste the key",
+                                        placeholder: if is_gateway { "sk-ant-oat01-\u{2026} or sk-ant-api\u{2026}" } else { "Paste the key" },
                                         oninput: move |event| {
                                             let next = event.value();
                                             if next.is_empty() {
@@ -542,7 +545,13 @@ pub(super) fn AddAccountSheet(session: Signal<Session>, overlay: Signal<Overlay>
                                         Icon { name: if key_revealed { "eye-off".to_owned() } else { "eye".to_owned() }, size: 14 }
                                     }
                                 }
-                                span { class: "hint", "Saved to your account only, encrypted. It is never shown again." }
+                                if is_gateway {
+                                    span { class: "hint",
+                                        "Claude Pro or Max: run claude setup-token on any computer signed in to your plan and paste the sk-ant-oat01-\u{2026} token it prints. Usage counts against your plan's limits. An sk-ant-api\u{2026} key bills pay-as-you-go instead. The token is kept by the gateway, never shown again."
+                                    }
+                                } else {
+                                    span { class: "hint", "Saved to your account only, encrypted. It is never shown again." }
+                                }
                                 if let Some(url) = key_url {
                                     button {
                                         class: "btn ghost sm",

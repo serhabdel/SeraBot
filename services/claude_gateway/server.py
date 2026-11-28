@@ -53,7 +53,7 @@ from starlette.routing import Route
 
 logger = logging.getLogger("serabot.claude_gateway")
 
-GATEWAY_VERSION = "0.74.33"
+GATEWAY_VERSION = "0.74.34"
 TOKEN_ENV_VAR = "SERABOT_CLAUDE_GATEWAY_TOKEN"
 HOST_ENV_VAR = "SERABOT_CLAUDE_GATEWAY_HOST"
 STATE_DIR_ENV_VAR = "SERABOT_CLAUDE_GATEWAY_STATE_DIR"
@@ -226,7 +226,94 @@ def _clean_claude_env(
     if strip_api_key:
         env.pop("ANTHROPIC_API_KEY", None)
 
+    _apply_claude_credential(env, profile_dir)
     return env
+
+
+PROFILE_TOKEN_FILE = "serabot-claude-token.json"
+_CLAUDE_TOKEN_RE = re.compile(r"^sk-ant-(oat|api)[0-9]{2}-[A-Za-z0-9_-]{16,400}$")
+_PLAN_AUTH_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+
+
+def _claude_token_kind(token: str) -> str | None:
+    """``oauth_token`` for a ``claude setup-token`` token (``sk-ant-oat…``,
+    billed to the Claude plan), ``api_key`` for a Console key
+    (``sk-ant-api…``, billed pay-as-you-go), else ``None``."""
+    match = _CLAUDE_TOKEN_RE.match(token)
+    if match is None:
+        return None
+    return "oauth_token" if match.group(1) == "oat" else "api_key"
+
+
+def _read_profile_token(profile_dir: Path | None) -> tuple[str, str] | None:
+    """The Claude credential stored for one gateway account, if any."""
+    if profile_dir is None:
+        return None
+    try:
+        doc = json.loads((profile_dir / PROFILE_TOKEN_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    token = doc.get("token")
+    if not isinstance(token, str):
+        return None
+    kind = _claude_token_kind(token)
+    return (kind, token) if kind is not None else None
+
+
+def _store_profile_token(profile_dir: Path, token: str) -> str:
+    """Store a Claude credential for one account, owner-only (0600)."""
+    kind = _claude_token_kind(token)
+    if kind is None:
+        raise ValueError("not a Claude token")
+    target = profile_dir / PROFILE_TOKEN_FILE
+    tmp = profile_dir / (PROFILE_TOKEN_FILE + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump({"kind": kind, "token": token}, handle)
+    os.replace(tmp, target)
+    try:
+        os.chmod(target, 0o600)
+    except OSError:
+        pass
+    return kind
+
+
+def _has_plan_login(profile_dir: Path | None) -> bool:
+    base = profile_dir if profile_dir is not None else Path.home() / ".claude"
+    return (base / ".credentials.json").is_file()
+
+
+def _apply_claude_credential(env: dict[str, str], profile_dir: Path | None) -> None:
+    """Pick the Claude credential the CLI/SDK uses for one account.
+
+    - A stored ``claude setup-token`` token goes in ``CLAUDE_CODE_OAUTH_TOKEN``
+      and every API key is removed, so usage counts against the Claude plan.
+    - A stored Console key goes in ``ANTHROPIC_API_KEY`` (pay-as-you-go).
+    - Otherwise a plan login (``claude auth login`` or a host
+      ``CLAUDE_CODE_OAUTH_TOKEN``) wins: an ``ANTHROPIC_API_KEY`` left in the
+      environment would silently switch it to API billing.
+
+    A named account never inherits the host's OAuth token: it uses only its
+    own login.
+    """
+    if profile_dir is not None:
+        env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+    stored = _read_profile_token(profile_dir)
+    if stored is not None:
+        kind, token = stored
+        if kind == "oauth_token":
+            for name in _PLAN_AUTH_VARS:
+                env.pop(name, None)
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+        else:
+            env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+            env["ANTHROPIC_API_KEY"] = token
+        return
+    if env.get("CLAUDE_CODE_OAUTH_TOKEN") or _has_plan_login(profile_dir):
+        for name in _PLAN_AUTH_VARS:
+            env.pop(name, None)
 
 
 def _find_claude_cli() -> str | None:
@@ -340,6 +427,9 @@ def _format_resets_at(raw: Any) -> str | None:
 
 
 def _read_oauth_access_token(profile_dir: Path | None) -> str | None:
+    stored = _read_profile_token(profile_dir)
+    if stored is not None:
+        return stored[1] if stored[0] == "oauth_token" else None
     base_dir = profile_dir if profile_dir is not None else Path.home() / ".claude"
     creds_path = base_dir / ".credentials.json"
     try:
@@ -539,6 +629,16 @@ def _read_cli_status(profile_dir: Path | None) -> dict[str, Any] | None:
         except (OSError, ValueError, subprocess.SubprocessError):
             pass
 
+    stored = _read_profile_token(profile_dir)
+    if stored is not None:
+        return {
+            "loggedIn": True,
+            "authMethod": stored[0],
+            "email": None,
+            "orgId": None,
+            "orgName": None,
+            "subscriptionType": None,
+        }
     return _read_credentials_fallback(profile_dir)
 
 
@@ -1764,6 +1864,73 @@ async def auth_complete(request: Request) -> JSONResponse:
     )
 
 
+async def auth_token(request: Request) -> JSONResponse:
+    """Add an account from a pasted Claude credential.
+
+    ``claude setup-token`` (run on any computer signed in to the Claude plan)
+    prints a long-lived ``sk-ant-oat01-…`` token: turns then run on the
+    plan's usage limits. An ``sk-ant-api…`` Console key bills pay-as-you-go.
+    The credential stays in this gateway (owner-only file in the account's
+    profile); it is never returned or logged.
+    """
+    auth_error = _check_bearer_auth(request)
+    if auth_error is not None:
+        return auth_error
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "JSON body must be an object"}, status_code=400)
+    token = payload.get("token")
+    token = token.strip() if isinstance(token, str) else ""
+    kind = _claude_token_kind(token)
+    if kind is None:
+        return JSONResponse(
+            {
+                "error": "Paste the token `claude setup-token` prints (sk-ant-oat01-…) or an Anthropic API key (sk-ant-api…).",
+                "code": "invalid_token",
+            },
+            status_code=400,
+        )
+    raw_profile = payload.get("profile")
+    if raw_profile in (None, ""):
+        profile = f"acct_{secrets.token_hex(4)}"
+    elif not isinstance(raw_profile, str) or raw_profile == "default":
+        return JSONResponse(
+            {"error": "a token account needs its own profile", "code": "invalid_profile"},
+            status_code=400,
+        )
+    else:
+        try:
+            profile = _validate_profile_id(raw_profile)
+        except ValueError as exc:
+            return JSONResponse(
+                {"error": str(exc), "code": "invalid_profile"}, status_code=400
+            )
+    profile_name, profile_dir = _resolve_profile_dir(profile, create=True)
+    assert profile_dir is not None
+    try:
+        _store_profile_token(profile_dir, token)
+    except (OSError, ValueError) as exc:
+        logger.warning("could not store a Claude token: %s", type(exc).__name__)
+        return JSONResponse(
+            {"error": "could not store the token on the gateway", "code": "store_failed"},
+            status_code=500,
+        )
+    account = await asyncio.to_thread(_read_cli_status, profile_dir) or {}
+    account = {**account, "loggedIn": True, "authMethod": kind}
+    logger.info("token account stored profile=%s kind=%s", profile_name, kind)
+    return JSONResponse(
+        {
+            "ok": True,
+            "profile": profile_name,
+            "account": account,
+            "billing": "plan" if kind == "oauth_token" else "api",
+        }
+    )
+
+
 async def auth_import_cli(request: Request) -> JSONResponse:
     auth_error = _check_bearer_auth(request)
     if auth_error is not None:
@@ -1854,6 +2021,7 @@ app = Starlette(
         Route("/v1/auth/flow/{flow_id}", auth_flow_status, methods=["GET"]),
         Route("/v1/auth/complete", auth_complete, methods=["POST"]),
         Route("/v1/auth/import-cli", auth_import_cli, methods=["POST"]),
+        Route("/v1/auth/token", auth_token, methods=["POST"]),
         Route("/v1/auth/cancel", auth_cancel, methods=["POST"]),
         Route("/v1/auth/usage", auth_usage, methods=["GET"]),
     ],

@@ -1338,3 +1338,47 @@ async fn a_flow_the_gateway_forgot_reads_as_expired() {
         .unwrap();
     assert_eq!(status, FlowStatus::Expired);
 }
+
+#[tokio::test]
+async fn a_pasted_setup_token_becomes_one_plan_account_per_token() {
+    let harness = harness();
+    let user = member(&harness, "gw-token");
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "profile": "ignored-the-server-names-it",
+            "billing": "plan",
+            "account": {"loggedIn": true, "authMethod": "oauth_token"},
+        })))
+        .mount(&server)
+        .await;
+    let service = gateway_service(&harness);
+    let token = "sk-ant-oat01-synthetic-token-not-real-1111";
+    let first = service
+        .add_gateway_token_account(
+            &user,
+            "claude-agent-sdk",
+            &gateway_endpoint(&server),
+            token,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(first.created);
+    let again = service
+        .add_gateway_token_account(
+            &user,
+            "claude-agent-sdk",
+            &gateway_endpoint(&server),
+            token,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(!again.created, "the same token is the same account");
+    let accounts = harness.accounts.list(&user, "claude-agent-sdk").unwrap();
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].label, "Claude plan (setup-token)");
+}

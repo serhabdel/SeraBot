@@ -1227,6 +1227,34 @@ impl SignInService {
         self.store_account(user_id, provider_id, signed_in)
     }
 
+    /// Add an account from a pasted Claude credential, kept by the gateway
+    /// in its own profile. The stored account's credential is the gateway
+    /// bearer token, as for every gateway account.
+    pub async fn add_gateway_token_account(
+        &self,
+        user_id: &str,
+        provider_id: &str,
+        endpoint: &gateway::GatewayEndpoint,
+        token: &str,
+        label: Option<&str>,
+    ) -> Result<AddOutcome> {
+        let profile = gateway::token_profile(token);
+        let reply = gateway::gateway_auth_token(endpoint, token, &profile).await?;
+        let plan = reply.get("billing").and_then(Value::as_str) == Some("plan");
+        let default_label = if plan {
+            "Claude plan (setup-token)"
+        } else {
+            "Claude (API key)"
+        };
+        let mut signed_in =
+            gateway_signed_in(provider_id, endpoint, &reply, Some(&profile), default_label);
+        if signed_in.identity.get("email").is_none() {
+            signed_in.label = label.unwrap_or(default_label).to_owned();
+        }
+        signed_in.identity["billing"] = json!(if plan { "plan" } else { "api" });
+        self.store_account(user_id, provider_id, signed_in)
+    }
+
     /// Store a finished sign-in as the member's account.
     fn store_account(
         &self,

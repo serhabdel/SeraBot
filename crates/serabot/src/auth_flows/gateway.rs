@@ -344,6 +344,46 @@ pub async fn gateway_auth_complete(
     Ok(reply)
 }
 
+/// Hand the gateway a pasted Claude credential (`POST /v1/auth/token`): a
+/// `claude setup-token` token (`sk-ant-oat01-…`, billed to the Claude plan)
+/// or a Console key (`sk-ant-api…`). The gateway keeps it in the account's
+/// profile; SeraBot does not store it. `profile` is derived from the token's
+/// hash so pasting the same token twice lands on the same account.
+pub async fn gateway_auth_token(
+    endpoint: &GatewayEndpoint,
+    token: &str,
+    profile: &str,
+) -> Result<Value> {
+    let reply = endpoint
+        .post(
+            "/v1/auth/token",
+            json!({ "token": token, "profile": profile }),
+        )
+        .await?;
+    if reply.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(SeraError::External(
+            "the local gateway did not store the Claude token".into(),
+        ));
+    }
+    Ok(reply)
+}
+
+/// The gateway profile for a pasted Claude token: `tok_` and the first 12
+/// hex digits of its SHA-256 (not the token, and not reversible).
+pub fn token_profile(token: &str) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(token.trim().as_bytes());
+    let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    format!("tok_{hex}")
+}
+
+/// Whether a pasted key is a Claude credential for the gateway rather than
+/// the gateway's own bearer token.
+pub fn is_claude_token(key: &str) -> bool {
+    let key = key.trim();
+    key.starts_with("sk-ant-oat") || key.starts_with("sk-ant-api")
+}
+
 /// Import the existing `claude` CLI login into the gateway's `"default"` profile
 /// (`POST /v1/auth/import-cli`).
 pub async fn gateway_auth_import_cli(endpoint: &GatewayEndpoint) -> Result<Value> {
@@ -619,6 +659,40 @@ mod tests {
             } => assert!(message.contains('#'), "{message}"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_pasted_claude_token_goes_to_the_gateway_under_a_hashed_profile() {
+        use wiremock::matchers::body_partial_json;
+        let token = "sk-ant-oat01-synthetic-token-not-real-0000";
+        assert!(is_claude_token(token));
+        assert!(is_claude_token(" sk-ant-api03-synthetic "));
+        assert!(!is_claude_token("gw-bearer-token"));
+        let profile = token_profile(token);
+        assert!(
+            profile.starts_with("tok_") && profile.len() == 16,
+            "{profile}"
+        );
+        assert!(!profile.contains("synthetic"));
+        assert_eq!(profile, token_profile(&format!(" {token} ")));
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/token"))
+            .and(body_partial_json(
+                json!({"token": token, "profile": profile}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "profile": profile, "billing": "plan",
+                "account": {"authMethod": "oauth_token"},
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let reply = gateway_auth_token(&endpoint(&server), token, &profile)
+            .await
+            .unwrap();
+        assert_eq!(reply["billing"], "plan");
     }
 
     #[tokio::test]
