@@ -75,6 +75,7 @@ pub fn run_plugin_signin(
             user_code: None,
             interval: None,
             state: Some(started.state.clone()),
+            ..Default::default()
         },
         opened,
     });
@@ -166,6 +167,7 @@ fn device_flow(
         user_code: Some(started.user_code.clone()),
         interval: (started.interval > 0).then_some(started.interval),
         state: None,
+        ..Default::default()
     };
     let opened = open(&signin.url);
     report(FlowMsg::Started {

@@ -1500,7 +1500,7 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
             flow_id,
             code,
         } => client
-            .provider_signin_complete(provider, flow_id, code, None, "")
+            .provider_signin_complete_gateway(provider, flow_id, code, None)
             .map(|done| Reply::GatewaySigninCompleted {
                 provider: provider.clone(),
                 done,

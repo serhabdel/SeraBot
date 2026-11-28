@@ -1513,7 +1513,7 @@ pub struct AccountPatch {
 }
 
 /// First leg of `POST /v1/providers/{id}/signin/start`.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct SigninStarted {
     pub flow_id: String,
     /// `pkce` or `device`.
@@ -1528,6 +1528,17 @@ pub struct SigninStarted {
     pub interval: Option<u64>,
     #[serde(default)]
     pub state: Option<String>,
+    /// Claude Agent SDK gateway: the manual page, whose last step shows a
+    /// `code#state` to paste.
+    #[serde(default)]
+    pub manual_url: Option<String>,
+    /// Claude Agent SDK gateway: the loopback port and path `claude auth
+    /// login` redirects to, so the desktop can catch the redirect when the
+    /// gateway runs on another machine.
+    #[serde(default)]
+    pub callback_port: Option<u16>,
+    #[serde(default)]
+    pub callback_path: Option<String>,
 }
 
 /// Reply of `POST /v1/providers/{id}/signin/complete`.
@@ -7956,6 +7967,32 @@ impl ApiClient {
         }
         if !verifier.trim().is_empty() {
             body["verifier"] = serde_json::json!(verifier);
+        }
+        self.admin_request(
+            Method::POST,
+            &["v1", "providers", provider, "signin", "complete"],
+            &body,
+        )
+    }
+
+    /// Finish a Claude Agent SDK gateway sign-in: a pasted `code#state`
+    /// (`state` is `None`), or a browser redirect the desktop caught on the
+    /// CLI's callback port (`state` from that redirect).
+    pub fn provider_signin_complete_gateway(
+        &self,
+        provider: &str,
+        flow_id: &str,
+        code: &str,
+        state: Option<&str>,
+    ) -> Result<SigninDone, ApiError> {
+        check_id(provider)?;
+        check_id(flow_id)?;
+        let mut body = serde_json::json!({
+            "flow_id": flow_id,
+            "code": code,
+        });
+        if let Some(state) = state.map(str::trim).filter(|s| !s.is_empty()) {
+            body["state"] = serde_json::json!(state);
         }
         self.admin_request(
             Method::POST,

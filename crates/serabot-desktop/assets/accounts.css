@@ -389,3 +389,23 @@
 .root[data-motion="reduce"] .route-switch {
   animation: none;
 }
+
+/* Claude Agent SDK gateway: the paste fallback, folded until it is needed. */
+.gateway-paste {
+  display: grid;
+  gap: 8px;
+  margin-top: 4px;
+}
+.gateway-paste > summary {
+  cursor: pointer;
+  width: fit-content;
+  color: var(--muted, inherit);
+}
+.gateway-paste > summary:focus-visible {
+  outline: 2px solid var(--accent, currentColor);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+.gateway-paste[open] > summary {
+  margin-bottom: 4px;
+}

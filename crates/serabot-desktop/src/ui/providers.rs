@@ -1085,7 +1085,9 @@ fn PlanTile(session: Signal<Session>, overlay: Signal<Overlay>, preset: Provider
                     disabled: !can_write,
                     onclick: move |_| {
                         if let Some(existing_id) = existing_id.as_ref() {
-                            session.write().open_add_account(existing_id);
+                            // The button says "Sign in": open the sheet with
+                            // the sign-in already started, not an idle sheet.
+                            session.write().sign_in_now(existing_id);
                             overlay.set(Overlay::AddAccount);
                         } else {
                             let mut s = session.write();

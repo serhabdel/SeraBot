@@ -1060,3 +1060,281 @@ async fn a_provider_without_a_flow_refuses_it() {
     assert_eq!(SignInRegistry::standard().flows_for("openrouter"), ["pkce"]);
     assert!(SignInRegistry::standard().flows_for("openai").is_empty());
 }
+
+// ---- claude-agent-sdk gateway relay (synthetic gateway, no real CLI) ----
+
+fn gateway_service(harness: &Harness) -> Arc<SignInService> {
+    let mut registry = SignInRegistry::default();
+    registry.register("claude-agent-sdk", Arc::new(gateway::ClaudeGatewaySignIn));
+    Arc::new(
+        SignInService::new(harness.accounts.clone())
+            .unwrap()
+            .with_registry(registry),
+    )
+}
+
+fn gateway_endpoint(server: &MockServer) -> gateway::GatewayEndpoint {
+    gateway::GatewayEndpoint::validated(&server.uri(), Zeroizing::new("gw-token".into())).unwrap()
+}
+
+async fn mount_gateway_start(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/start"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "flow_id": "gw-flow",
+            "url": "https://claude.example/cai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A40123%2Fcallback&state=gw-state",
+            "manual_url": "https://claude.example/oauth/authorize?z-manual",
+            "profile": "acct_synthetic",
+            "expires_in": 600,
+            "mode": "callback",
+            "callback": {"port": 40123, "path": "/callback"},
+            "state": "gw-state",
+        })))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn a_gateway_start_hands_the_desktop_the_cli_callback_and_the_code_page() {
+    let harness = harness();
+    let user = member(&harness, "gw-a");
+    let server = MockServer::start().await;
+    mount_gateway_start(&server).await;
+    let service = gateway_service(&harness);
+    let started = service
+        .start_with_gateway(
+            &user,
+            "claude-agent-sdk",
+            "claude-agent-sdk",
+            StartRequest {
+                flow: Some(FlowKind::Pkce),
+                ..Default::default()
+            },
+            gateway_endpoint(&server),
+        )
+        .await
+        .unwrap();
+    assert!(
+        started
+            .url
+            .contains("redirect_uri=http%3A%2F%2Flocalhost%3A40123")
+    );
+    assert_eq!(
+        started.manual_url.as_deref(),
+        Some("https://claude.example/oauth/authorize?z-manual")
+    );
+    assert_eq!(started.callback_port, Some(40123));
+    assert_eq!(started.callback_path.as_deref(), Some("/callback"));
+    assert_eq!(started.state.as_deref(), Some("gw-state"));
+}
+
+#[tokio::test]
+async fn a_caught_redirect_is_relayed_with_its_state_and_polls_wait_meanwhile() {
+    let harness = harness();
+    let user = member(&harness, "gw-b");
+    let server = MockServer::start().await;
+    mount_gateway_start(&server).await;
+    // The relayed redirect must carry the state; a poll during the complete
+    // must not reach the gateway (the complete call owns the flow).
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/complete"))
+        .and(body_string_contains("\"state\":\"gw-state\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "profile": "acct_synthetic",
+            "account": {"email": "member@example.example", "subscriptionType": "max"},
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/auth/flow/gw-flow"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "pending"})))
+        .mount(&server)
+        .await;
+    let service = gateway_service(&harness);
+    let endpoint = gateway_endpoint(&server);
+    let started = service
+        .start_with_gateway(
+            &user,
+            "claude-agent-sdk",
+            "claude-agent-sdk",
+            StartRequest {
+                flow: Some(FlowKind::Pkce),
+                ..Default::default()
+            },
+            gateway_endpoint(&server),
+        )
+        .await
+        .unwrap();
+    let pending = service
+        .status_with_gateway(&user, "claude-agent-sdk", &started.flow_id, Some(&endpoint))
+        .await
+        .unwrap();
+    assert_eq!(pending, FlowStatus::Pending);
+
+    let outcome = service
+        .complete_with_gateway(
+            &user,
+            "claude-agent-sdk",
+            "claude-agent-sdk",
+            CompleteRequest {
+                flow_id: Some(started.flow_id.clone()),
+                code: "caught-code".into(),
+                redirect_uri: None,
+                verifier: None,
+            },
+            gateway_endpoint(&server),
+            Some("gw-state".into()),
+        )
+        .await
+        .unwrap();
+    assert!(outcome.created);
+    let done = service
+        .status_with_gateway(&user, "claude-agent-sdk", &started.flow_id, Some(&endpoint))
+        .await
+        .unwrap();
+    assert!(matches!(done, FlowStatus::Ok { .. }), "{done:?}");
+    // Its credential is the gateway token, never a Claude token.
+    let accounts = harness.accounts.list(&user, "claude-agent-sdk").unwrap();
+    assert_eq!(accounts.len(), 1);
+}
+
+#[tokio::test]
+async fn an_incomplete_paste_keeps_the_flow_open_and_a_refused_code_says_why() {
+    let harness = harness();
+    let user = member(&harness, "gw-c");
+    let server = MockServer::start().await;
+    mount_gateway_start(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/complete"))
+        .and(body_string_contains("half"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": "That doesn't look like the full code. Copy all of it, including the # in the middle.",
+            "code": "code_incomplete",
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/complete"))
+        .and(body_string_contains("wrong#state"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": "That code wasn't accepted. Sign in again to get a new code.",
+            "code": "auth_code_rejected",
+        })))
+        .mount(&server)
+        .await;
+    let service = gateway_service(&harness);
+    let started = service
+        .start_with_gateway(
+            &user,
+            "claude-agent-sdk",
+            "claude-agent-sdk",
+            StartRequest {
+                flow: Some(FlowKind::Pkce),
+                ..Default::default()
+            },
+            gateway_endpoint(&server),
+        )
+        .await
+        .unwrap();
+    let paste = |code: &str| CompleteRequest {
+        flow_id: Some(started.flow_id.clone()),
+        code: code.into(),
+        redirect_uri: None,
+        verifier: None,
+    };
+    let error = service
+        .complete_with_gateway(
+            &user,
+            "claude-agent-sdk",
+            "claude-agent-sdk",
+            paste("half"),
+            gateway_endpoint(&server),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SeraError::Rejected {
+                code: "code_incomplete",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        service
+            .status(&user, "claude-agent-sdk", &started.flow_id)
+            .unwrap(),
+        FlowStatus::Pending
+    );
+
+    // The flow was given back: a second paste goes through to the gateway.
+    let error = service
+        .complete_with_gateway(
+            &user,
+            "claude-agent-sdk",
+            "claude-agent-sdk",
+            paste("wrong#state"),
+            gateway_endpoint(&server),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SeraError::Rejected {
+                code: "code_rejected",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    match service
+        .status(&user, "claude-agent-sdk", &started.flow_id)
+        .unwrap()
+    {
+        FlowStatus::Denied { reason } => assert!(reason.contains("wasn't accepted"), "{reason}"),
+        other => panic!("expected denied, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_flow_the_gateway_forgot_reads_as_expired() {
+    let harness = harness();
+    let user = member(&harness, "gw-d");
+    let server = MockServer::start().await;
+    mount_gateway_start(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/v1/auth/flow/gw-flow"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": "unknown sign-in flow",
+            "code": "flow_not_found",
+        })))
+        .mount(&server)
+        .await;
+    let service = gateway_service(&harness);
+    let endpoint = gateway_endpoint(&server);
+    let started = service
+        .start_with_gateway(
+            &user,
+            "claude-agent-sdk",
+            "claude-agent-sdk",
+            StartRequest {
+                flow: Some(FlowKind::Pkce),
+                ..Default::default()
+            },
+            gateway_endpoint(&server),
+        )
+        .await
+        .unwrap();
+    let status = service
+        .status_with_gateway(&user, "claude-agent-sdk", &started.flow_id, Some(&endpoint))
+        .await
+        .unwrap();
+    assert_eq!(status, FlowStatus::Expired);
+}

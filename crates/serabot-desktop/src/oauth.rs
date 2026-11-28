@@ -140,6 +140,21 @@ pub fn bind_loopback_both(fixed: Option<u16>) -> Result<Loopback, OAuthError> {
     Ok(Loopback { listeners, port })
 }
 
+/// Bind `port` on whichever loopback addresses are free (IPv4, IPv6, both
+/// or neither). Used to catch a redirect aimed at another program's
+/// `localhost` listener: when that program runs on this computer it already
+/// holds the port and the browser reaches it directly, so an empty list is
+/// not an error.
+pub fn bind_loopback_free(port: u16) -> Vec<TcpListener> {
+    [
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+    ]
+    .into_iter()
+    .filter_map(|ip| TcpListener::bind((ip, port)).ok())
+    .collect()
+}
+
 /// Bind exactly `port` on loopback, with no fallback. Used when the redirect
 /// URI is fixed in a publicly served client metadata document (CIMD), so the
 /// consent response must arrive on that exact port.

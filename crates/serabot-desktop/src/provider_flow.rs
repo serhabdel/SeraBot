@@ -90,6 +90,9 @@ pub struct ProviderFlow {
     pub flow_id: Option<String>,
     /// The provider's page: opened for the member, and kept for "Open page".
     pub url: Option<String>,
+    /// Claude Agent SDK gateway: the page whose last step shows a code to
+    /// paste, for when the redirect to `localhost` cannot load.
+    pub manual_url: Option<String>,
     pub browser_opened: bool,
     /// The one-time code to type (device flow only).
     pub user_code: Option<String>,
@@ -107,6 +110,7 @@ impl ProviderFlow {
             phase: FlowPhase::Starting,
             flow_id: None,
             url: None,
+            manual_url: None,
             browser_opened: false,
             user_code: None,
             expires_in: 0,
@@ -122,6 +126,7 @@ impl ProviderFlow {
             FlowMsg::Started { started, opened } => {
                 self.flow_id = Some(started.flow_id);
                 self.url = Some(started.url);
+                self.manual_url = started.manual_url;
                 self.user_code = started.user_code;
                 self.expires_in = started.expires_in;
                 self.browser_opened = opened;
@@ -310,11 +315,21 @@ pub(crate) fn api_end(error: ApiError) -> FlowEnd {
     })
 }
 
-/// Run a gateway browser sign-in (`claude-agent-sdk`): no desktop loopback
-/// listener is bound; the server relays to the gateway, opens the returned
-/// `claude.ai` URL, and polls `signin/status/{flow_id}` every 2s so local
-/// gateways finish automatically while the UI also allows manual paste-code
-/// completion for remote gateways.
+/// Run a gateway browser sign-in (`claude-agent-sdk`).
+///
+/// The gateway runs `claude auth login`, which waits for the browser's
+/// redirect on its own `localhost` port and also takes a pasted `code#state`.
+/// The page opened here is the CLI's automatic one, so the member only has to
+/// approve:
+///
+/// - gateway on this computer: the CLI holds the port, the browser reaches it
+///   directly, and the status poll sees the sign-in finish;
+/// - gateway on another machine (the server's): the port is free here, so the
+///   desktop catches the redirect and hands it to the server, which relays it
+///   to the CLI's listener on the gateway host.
+///
+/// The paste box in the sheet stays available for a browser on a third
+/// machine.
 pub fn run_gateway_browser(
     client: &ApiClient,
     provider: &str,
@@ -327,6 +342,7 @@ pub fn run_gateway_browser(
             Ok(started) => started,
             Err(error) => return api_end(error),
         };
+    let catcher = RedirectCatcher::for_gateway(&started);
     let opened = open(&started.url);
     let flow_id = started.flow_id.clone();
     let mut poll_started = started.clone();
@@ -335,10 +351,92 @@ pub fn run_gateway_browser(
     poll_device(
         &poll_started,
         cancel,
-        &mut || client.provider_signin_status(provider, &flow_id),
+        &mut || match catcher.as_ref().and_then(RedirectCatcher::take) {
+            Some((code, state)) => Ok(relayed_status(client.provider_signin_complete_gateway(
+                provider,
+                &flow_id,
+                &code,
+                Some(&state),
+            ))),
+            None => client.provider_signin_status(provider, &flow_id),
+        },
         &mut std::thread::sleep,
         report,
     )
+}
+
+/// A relayed redirect's answer as a status: a code is single-use, so a
+/// refusal ends the sign-in with the server's reason.
+pub(crate) fn relayed_status(result: Result<crate::api::SigninDone, ApiError>) -> SigninStatus {
+    match result {
+        Ok(done) => SigninStatus {
+            status: "ok".to_owned(),
+            account_id: Some(done.account_id),
+            created: done.created,
+            reason: None,
+        },
+        Err(error) => SigninStatus {
+            status: "denied".to_owned(),
+            account_id: None,
+            created: false,
+            reason: Some(crate::provider_accounts::plain_api_error(&error)),
+        },
+    }
+}
+
+/// Listens for a browser redirect meant for `claude auth login`'s own
+/// `localhost` port, on this computer, while that port is free here.
+struct RedirectCatcher {
+    codes: std::sync::mpsc::Receiver<zeroize::Zeroizing<String>>,
+    state: String,
+    stop: std::sync::Arc<AtomicBool>,
+}
+
+impl RedirectCatcher {
+    fn for_gateway(started: &SigninStarted) -> Option<Self> {
+        let port = started.callback_port.filter(|port| *port >= 1024)?;
+        let path = started
+            .callback_path
+            .clone()
+            .filter(|path| path.starts_with('/'))?;
+        let state = started.state.clone().filter(|state| !state.is_empty())?;
+        // Taken by the CLI when the gateway runs here: then the browser
+        // reaches the CLI itself and there is nothing to catch.
+        let listeners = oauth::bind_loopback_free(port);
+        if listeners.is_empty() {
+            return None;
+        }
+        let (sender, codes) = std::sync::mpsc::channel();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let thread_stop = std::sync::Arc::clone(&stop);
+        let expected = state.clone();
+        let wait = Duration::from_secs(started.expires_in.clamp(30, 600));
+        std::thread::Builder::new()
+            .name("serabot-gateway-redirect".into())
+            .spawn(move || {
+                if let Ok(code) =
+                    oauth::wait_for_callback_any(&listeners, &expected, &path, wait, &thread_stop)
+                {
+                    let _ = sender.send(code);
+                }
+            })
+            .ok()?;
+        Some(Self { codes, state, stop })
+    }
+
+    fn take(&self) -> Option<(zeroize::Zeroizing<String>, String)> {
+        self.codes
+            .try_recv()
+            .ok()
+            .map(|code| (code, self.state.clone()))
+    }
+}
+
+impl Drop for RedirectCatcher {
+    fn drop(&mut self) {
+        // Closes the listener within a fraction of a second.
+        self.stop.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Run a browser sign-in: listen on loopback, get the page from the server,
@@ -522,6 +620,7 @@ mod tests {
             user_code: (kind == "device").then(|| "ABCD-1234".to_owned()),
             interval: (kind == "device").then_some(5),
             state: None,
+            ..Default::default()
         }
     }
 
@@ -804,5 +903,98 @@ mod tests {
         assert!(denied_text(None).contains("did not approve"));
         assert_eq!(FlowKind::Browser.flow_word(), "pkce");
         assert_eq!(FlowKind::Device.flow_word(), "device");
+    }
+
+    #[test]
+    fn a_gateway_redirect_on_a_free_port_is_caught_with_its_state() {
+        use std::io::{Read as _, Write as _};
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let started = SigninStarted {
+            callback_port: Some(port),
+            callback_path: Some("/callback".into()),
+            state: Some("st-1".into()),
+            expires_in: 60,
+            ..started("pkce")
+        };
+        let catcher = RedirectCatcher::for_gateway(&started).expect("port is free here");
+        assert!(catcher.take().is_none());
+        let mut browser = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        browser
+            .write_all(
+                format!(
+                    "GET /callback?code=the-code&state=st-1 HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let mut page = String::new();
+        let _ = browser.read_to_string(&mut page);
+        assert!(page.contains("Signed in"), "{page}");
+        let mut caught = None;
+        for _ in 0..100 {
+            caught = catcher.take();
+            if caught.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (code, state) = caught.expect("the redirect was caught");
+        assert_eq!(code.as_str(), "the-code");
+        assert_eq!(state, "st-1");
+    }
+
+    #[test]
+    fn a_gateway_start_without_a_safe_callback_catches_nothing() {
+        for started in [
+            SigninStarted {
+                callback_port: Some(80),
+                callback_path: Some("/callback".into()),
+                state: Some("s".into()),
+                ..started("pkce")
+            },
+            SigninStarted {
+                callback_port: Some(40999),
+                callback_path: Some("/callback".into()),
+                state: None,
+                ..started("pkce")
+            },
+        ] {
+            assert!(RedirectCatcher::for_gateway(&started).is_none());
+        }
+    }
+
+    #[test]
+    fn a_relayed_redirect_ends_the_flow_either_way() {
+        let ok = relayed_status(Ok(crate::api::SigninDone {
+            account_id: "acct-1".into(),
+            created: true,
+        }));
+        assert_eq!(ok.status, "ok");
+        assert_eq!(ok.account_id.as_deref(), Some("acct-1"));
+        let refused = relayed_status(Err(ApiError::Rejected(
+            "Claude did not accept the sign-in.".into(),
+        )));
+        assert_eq!(refused.status, "denied");
+        assert!(refused.reason.is_some());
+    }
+
+    #[test]
+    fn a_gateway_flow_keeps_the_code_page_for_the_paste_fallback() {
+        let mut flow = ProviderFlow::new("claude-agent-sdk", FlowKind::Browser);
+        flow.apply(FlowMsg::Started {
+            started: SigninStarted {
+                manual_url: Some("https://claude.example/oauth/authorize?z-1".into()),
+                ..started("pkce")
+            },
+            opened: true,
+        });
+        assert_eq!(
+            flow.manual_url.as_deref(),
+            Some("https://claude.example/oauth/authorize?z-1")
+        );
     }
 }
