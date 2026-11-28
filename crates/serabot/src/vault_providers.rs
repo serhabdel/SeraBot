@@ -35,8 +35,12 @@ use crate::vault::{self, VaultEntry, VaultField, VaultSource};
 
 /// How long one CLI call may run before it is killed.
 pub const CLI_TIMEOUT: Duration = Duration::from_secs(15);
-/// Largest stdout accepted from a CLI.
+/// How long a batch/sync CLI call may run before it is killed.
+pub const SYNC_CLI_TIMEOUT: Duration = Duration::from_secs(45);
+/// Largest stdout accepted from a single-item CLI read.
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+/// Largest stdout accepted from a vault/item list sync CLI call (16 MiB).
+const MAX_LIST_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 /// Largest stderr captured solely for safe error classification.
 const MAX_STDERR_BYTES: usize = 4 * 1024;
 const MAX_REFERENCE_CHARS: usize = 512;
@@ -281,7 +285,44 @@ pub trait SecretCommand: Send + Sync {
         }
         Ok(outputs)
     }
+
+    fn run_batch_with_limits(
+        &self,
+        program: &Path,
+        commands: &[Vec<String>],
+        env: &[(&str, &str)],
+        _timeout: Duration,
+        _max_bytes: usize,
+    ) -> Result<Vec<CommandOutput>> {
+        self.run_batch(program, commands, env)
+    }
+
+    fn run_in_session(
+        &self,
+        program: &Path,
+        env: &[(&str, &str)],
+        timeout: Duration,
+        max_bytes: usize,
+        f: &mut SessionBody<'_>,
+    ) -> Result<()> {
+        f(&mut |args| {
+            let mut results = self.run_batch_with_limits(
+                program,
+                std::slice::from_ref(&args.to_vec()),
+                env,
+                timeout,
+                max_bytes,
+            )?;
+            results.pop().ok_or_else(|| SeraError::Rejected {
+                code: "vault_cli_failed",
+                message: "the password manager returned no output".into(),
+            })
+        })
+    }
 }
+
+pub type SessionCmd<'a> = dyn FnMut(&[String]) -> Result<CommandOutput> + 'a;
+pub type SessionBody<'a> = dyn FnMut(&mut SessionCmd<'_>) -> Result<()> + 'a;
 
 /// Variables a CLI reads for its config, cache or data. Each one points at the
 /// call's private home, so nothing the CLI writes lands in the server's own
@@ -366,12 +407,24 @@ fn read_bounded_pipe<R: Read + Send + 'static>(
     receiver
 }
 
+#[cfg(test)]
 fn run_in_home(
     home: &Path,
     program: &Path,
     args: &[String],
     env: &[(&str, &str)],
     timeout: Duration,
+) -> Result<CommandOutput> {
+    run_in_home_capped(home, program, args, env, timeout, MAX_OUTPUT_BYTES)
+}
+
+fn run_in_home_capped(
+    home: &Path,
+    program: &Path,
+    args: &[String],
+    env: &[(&str, &str)],
+    timeout: Duration,
+    max_bytes: usize,
 ) -> Result<CommandOutput> {
     let mut command = Command::new(program);
     command
@@ -381,12 +434,13 @@ fn run_in_home(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(|_| {
-        SeraError::External("the password manager command could not be started".into())
+    let mut child = command.spawn().map_err(|_| SeraError::Rejected {
+        code: "vault_cli_missing",
+        message: "the password manager command could not be started".into(),
     })?;
     // Read stdout and stderr on their own threads so a full pipe cannot block
     // the wait. Buffers are sized up front and wiped on timeout or error.
-    let stdout_rx = read_bounded_pipe(child.stdout.take(), MAX_OUTPUT_BYTES);
+    let stdout_rx = read_bounded_pipe(child.stdout.take(), max_bytes);
     let stderr_rx = read_bounded_pipe(child.stderr.take(), MAX_STDERR_BYTES);
     let deadline = Instant::now() + timeout;
     let status = loop {
@@ -398,36 +452,43 @@ fn run_in_home(
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(SeraError::External(
-                    "the password manager did not answer in time".into(),
-                ));
+                return Err(SeraError::Rejected {
+                    code: "vault_cli_timeout",
+                    message: "the password manager did not answer in time".into(),
+                });
             }
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(SeraError::External(
-                    "the password manager command failed".into(),
-                ));
+                return Err(SeraError::Rejected {
+                    code: "vault_cli_failed",
+                    message: "the password manager command failed".into(),
+                });
             }
         }
     };
     let mut bytes = stdout_rx
         .recv_timeout(Duration::from_secs(2))
-        .map_err(|_| SeraError::External("the password manager output was lost".into()))?;
-    if bytes.len() > MAX_OUTPUT_BYTES {
+        .map_err(|_| SeraError::Rejected {
+            code: "vault_cli_failed",
+            message: "the password manager output was lost".into(),
+        })?;
+    if bytes.len() > max_bytes {
         bytes.zeroize();
-        return Err(SeraError::External(
-            "the password manager returned too much data".into(),
-        ));
+        return Err(SeraError::Rejected {
+            code: "vault_output_too_large",
+            message: "the password manager returned too much data".into(),
+        });
     }
     let stdout = match String::from_utf8(bytes) {
         Ok(text) => Zeroizing::new(text),
         Err(error) => {
             let mut bytes = error.into_bytes();
             bytes.zeroize();
-            return Err(SeraError::External(
-                "the password manager returned data that is not text".into(),
-            ));
+            return Err(SeraError::Rejected {
+                code: "vault_cli_failed",
+                message: "the password manager returned data that is not text".into(),
+            });
         }
     };
     let mut stderr_bytes = stderr_rx
@@ -466,9 +527,38 @@ impl SecretCommand for ProcessCommand {
         commands: &[Vec<String>],
         env: &[(&str, &str)],
     ) -> Result<Vec<CommandOutput>> {
+        self.run_batch_with_limits(program, commands, env, self.timeout, MAX_OUTPUT_BYTES)
+    }
+
+    fn run_batch_with_limits(
+        &self,
+        program: &Path,
+        commands: &[Vec<String>],
+        env: &[(&str, &str)],
+        timeout: Duration,
+        max_bytes: usize,
+    ) -> Result<Vec<CommandOutput>> {
         if commands.is_empty() {
             return Ok(Vec::new());
         }
+        let mut outputs = Vec::with_capacity(commands.len());
+        self.run_in_session(program, env, timeout, max_bytes, &mut |run_cmd| {
+            for args in commands {
+                outputs.push(run_cmd(args)?);
+            }
+            Ok(())
+        })?;
+        Ok(outputs)
+    }
+
+    fn run_in_session(
+        &self,
+        program: &Path,
+        env: &[(&str, &str)],
+        timeout: Duration,
+        max_bytes: usize,
+        f: &mut SessionBody<'_>,
+    ) -> Result<()> {
         let proton = is_proton_session(env);
         let _guard = if proton {
             Some(
@@ -481,36 +571,44 @@ impl SecretCommand for ProcessCommand {
         };
         // Private to this call and removed when it returns. The child has
         // exited by then on every path below.
-        let home = tempfile::TempDir::new().map_err(|_| {
-            SeraError::External("the password manager command could not be started".into())
+        let home = tempfile::TempDir::new().map_err(|_| SeraError::Rejected {
+            code: "vault_cli_failed",
+            message: "the password manager command could not be started".into(),
         })?;
         if proton {
-            let login_out = run_in_home(
+            let login_out = run_in_home_capped(
                 home.path(),
                 program,
                 &["login".to_owned()],
                 env,
-                self.timeout,
+                timeout,
+                MAX_OUTPUT_BYTES,
             )?;
             if login_out.status != Some(0) {
-                return Ok(vec![login_out]);
+                let msg = classify_cli_failure(Provider::ProtonPass, &login_out.stderr)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        format!("Proton Pass CLI exited with status {:?}", login_out.status)
+                    });
+                return Err(SeraError::Rejected {
+                    code: "vault_cli_failed",
+                    message: msg,
+                });
             }
         }
-        let mut outputs = Vec::with_capacity(commands.len());
-        for args in commands {
-            let out = run_in_home(home.path(), program, args, env, self.timeout)?;
-            outputs.push(out);
-        }
+        let result =
+            f(&mut |args| run_in_home_capped(home.path(), program, args, env, timeout, max_bytes));
         if proton {
-            let _ = run_in_home(
+            let _ = run_in_home_capped(
                 home.path(),
                 program,
                 &["logout".to_owned(), "--force".to_owned()],
                 env,
                 Duration::from_secs(3),
+                MAX_OUTPUT_BYTES,
             );
         }
-        Ok(outputs)
+        result
     }
 }
 
@@ -1173,17 +1271,23 @@ impl Providers {
             None => match self.ensure_cli(provider).await {
                 Ok(Some(path)) => path,
                 Ok(None) => {
-                    return Err(SeraError::External(format!(
-                        "the {} CLI is not installed on the server",
-                        provider.label()
-                    )));
+                    return Err(SeraError::Rejected {
+                        code: "vault_cli_missing",
+                        message: format!(
+                            "the {} CLI is not installed on the server",
+                            provider.label()
+                        ),
+                    });
                 }
                 Err(error) => {
                     tracing::warn!(provider = provider.id(), %error, "password manager CLI auto-install failed");
-                    return Err(SeraError::External(format!(
-                        "the {} CLI is not installed on the server",
-                        provider.label()
-                    )));
+                    return Err(SeraError::Rejected {
+                        code: "vault_cli_missing",
+                        message: format!(
+                            "the {} CLI is not installed on the server",
+                            provider.label()
+                        ),
+                    });
                 }
             },
         };
@@ -1416,14 +1520,56 @@ fn extract_domains_from_urls(raw_urls: &[String]) -> Vec<String> {
     out
 }
 
+fn looks_like_json_start(s: &str) -> bool {
+    if s.starts_with('{') {
+        return true;
+    }
+    let Some(rest) = s.strip_prefix('[') else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    matches!(
+        rest.as_bytes().first(),
+        Some(b'{' | b'[' | b']' | b'"' | b't' | b'f' | b'n' | b'-' | b'0'..=b'9')
+    )
+}
+
+/// Trim leading non-JSON lines/warnings before the first `[` or `{`.
+fn extract_json_payload(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if looks_like_json_start(trimmed) {
+        return trimmed;
+    }
+    for (idx, line) in trimmed.split_inclusive('\n').scan(0usize, |pos, line| {
+        let start = *pos;
+        *pos += line.len();
+        Some((start, line))
+    }) {
+        let line_trimmed = line.trim_start();
+        if looks_like_json_start(line_trimmed) {
+            let offset = line.len() - line_trimmed.len();
+            return &trimmed[idx + offset..];
+        }
+    }
+    match (trimmed.find('{'), trimmed.find('[')) {
+        (Some(a), Some(b)) => &trimmed[a.min(b)..],
+        (Some(a), None) => &trimmed[a..],
+        (None, Some(b)) => &trimmed[b..],
+        (None, None) => trimmed,
+    }
+}
+
 /// Parse `op item list --format json` output into reference-backed items.
 pub fn parse_onepassword_items(raw: &str) -> Result<Vec<ProviderVaultItem>> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
+    let payload = extract_json_payload(raw);
+    if payload.is_empty() {
         return Ok(Vec::new());
     }
-    let items: Vec<serde_json::Value> = serde_json::from_str(trimmed)
-        .map_err(|_| SeraError::External("1Password returned invalid JSON".into()))?;
+    let items: Vec<serde_json::Value> =
+        serde_json::from_str(payload).map_err(|_| SeraError::Rejected {
+            code: "vault_parse_failed",
+            message: "1Password returned invalid JSON".into(),
+        })?;
     let mut out = Vec::new();
     for item in items {
         let Some(id) = item
@@ -1507,16 +1653,23 @@ pub fn parse_onepassword_items(raw: &str) -> Result<Vec<ProviderVaultItem>> {
 
 /// Parse `pass-cli vault list --output json` output into `(share_id, name)` pairs.
 pub fn parse_protonpass_vaults(raw: &str) -> Result<Vec<(String, Option<String>)>> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
+    let payload = extract_json_payload(raw);
+    if payload.is_empty() {
         return Ok(Vec::new());
     }
-    let parsed: serde_json::Value = serde_json::from_str(trimmed)
-        .map_err(|_| SeraError::External("Proton Pass returned invalid vault JSON".into()))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(payload).map_err(|_| SeraError::Rejected {
+            code: "vault_parse_failed",
+            message: "Proton Pass returned invalid vault JSON".into(),
+        })?;
     let array = parsed
         .as_array()
         .or_else(|| parsed.get("vaults").and_then(serde_json::Value::as_array))
-        .ok_or_else(|| SeraError::External("Proton Pass vault list is not an array".into()))?;
+        .or_else(|| parsed.get("shares").and_then(serde_json::Value::as_array))
+        .ok_or_else(|| SeraError::Rejected {
+            code: "vault_parse_failed",
+            message: "Proton Pass vault list is not an array".into(),
+        })?;
     let mut vaults = Vec::new();
     for entry in array {
         let share_id = entry
@@ -1546,16 +1699,22 @@ pub fn parse_protonpass_items(
     share_id: &str,
     vault_name: Option<&str>,
 ) -> Result<Vec<ProviderVaultItem>> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
+    let payload = extract_json_payload(raw);
+    if payload.is_empty() {
         return Ok(Vec::new());
     }
-    let parsed: serde_json::Value = serde_json::from_str(trimmed)
-        .map_err(|_| SeraError::External("Proton Pass returned invalid item JSON".into()))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(payload).map_err(|_| SeraError::Rejected {
+            code: "vault_parse_failed",
+            message: "Proton Pass returned invalid item JSON".into(),
+        })?;
     let array = parsed
         .as_array()
         .or_else(|| parsed.get("items").and_then(serde_json::Value::as_array))
-        .ok_or_else(|| SeraError::External("Proton Pass item list is not an array".into()))?;
+        .ok_or_else(|| SeraError::Rejected {
+            code: "vault_parse_failed",
+            message: "Proton Pass item list is not an array".into(),
+        })?;
     let mut out = Vec::new();
     for item in array {
         let Some(id) = item
@@ -1638,74 +1797,68 @@ pub fn parse_protonpass_items(
     Ok(out)
 }
 
-async fn run_provider_cli_batch(
-    providers: &Providers,
-    provider: Provider,
-    commands: Vec<Vec<String>>,
-    token: &str,
-    reason: &str,
-) -> Result<Vec<Zeroizing<String>>> {
-    if commands.is_empty() {
-        return Ok(Vec::new());
-    }
-    let program = match program_for(provider, &providers.config) {
-        Some(path) => path,
+async fn resolve_provider_program(providers: &Providers, provider: Provider) -> Result<PathBuf> {
+    match program_for(provider, &providers.config) {
+        Some(path) => Ok(path),
         None => match providers.ensure_cli(provider).await {
-            Ok(Some(path)) => path,
-            Ok(None) | Err(_) => {
-                return Err(SeraError::External(format!(
+            Ok(Some(path)) => Ok(path),
+            Ok(None) | Err(_) => Err(SeraError::Rejected {
+                code: "vault_cli_missing",
+                message: format!(
                     "the {} CLI is not installed on the server",
                     provider.label()
-                )));
-            }
+                ),
+            }),
         },
-    };
-    let runner = providers.runner.clone();
-    let token = Zeroizing::new(token.to_owned());
-    let reason = sanitize_agent_reason(reason);
-    let outputs = tokio::task::spawn_blocking(move || {
-        let env = provider_env(provider, token.as_str(), reason.as_str());
-        runner.run_batch(&program, &commands, &env)
-    })
-    .await
-    .map_err(|_| SeraError::Internal("the password manager command failed".into()))??;
-    let mut stdouts = Vec::with_capacity(outputs.len());
-    for output in outputs {
-        if output.status != Some(0) {
-            let msg = classify_cli_failure(provider, &output.stderr)
-                .map(str::to_owned)
-                .unwrap_or_else(|| {
-                    format!(
-                        "{} CLI exited with status {:?}",
-                        provider.label(),
-                        output.status
-                    )
-                });
-            // A Rejected (422), not External (502): the classified sentence is
-            // server-authored and safe, and 422 bodies are shown by both
-            // clients — a 502 would only show a generic "server unavailable".
-            return Err(SeraError::Rejected {
-                code: "vault_cli_failed",
-                message: msg,
-            });
-        }
-        stdouts.push(output.stdout);
     }
-    Ok(stdouts)
 }
 
-async fn run_provider_cli(
+fn cli_exit_error(provider: Provider, output: &CommandOutput) -> SeraError {
+    let msg = classify_cli_failure(provider, &output.stderr)
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            format!(
+                "{} CLI exited with status {:?}",
+                provider.label(),
+                output.status
+            )
+        });
+    // A Rejected (422), not External (502): the classified sentence is
+    // server-authored and safe, and 422 bodies are shown by both
+    // clients — a 502 would only show a generic "server unavailable".
+    SeraError::Rejected {
+        code: "vault_cli_failed",
+        message: msg,
+    }
+}
+
+async fn run_provider_cli_with_limits(
     providers: &Providers,
     provider: Provider,
     args: Vec<String>,
     token: &str,
     reason: &str,
+    timeout: Duration,
+    max_bytes: usize,
 ) -> Result<Zeroizing<String>> {
-    let mut results =
-        run_provider_cli_batch(providers, provider, vec![args], token, reason).await?;
-    results
-        .pop()
-        .ok_or_else(|| SeraError::External(format!("{} returned no output", provider.label())))
+    let program = resolve_provider_program(providers, provider).await?;
+    let runner = providers.runner.clone();
+    let token = Zeroizing::new(token.to_owned());
+    let reason = sanitize_agent_reason(reason);
+    let mut outputs = tokio::task::spawn_blocking(move || {
+        let env = provider_env(provider, token.as_str(), reason.as_str());
+        runner.run_batch_with_limits(&program, &[args], &env, timeout, max_bytes)
+    })
+    .await
+    .map_err(|_| SeraError::Internal("the password manager command failed".into()))??;
+    let output = outputs.pop().ok_or_else(|| SeraError::Rejected {
+        code: "vault_cli_failed",
+        message: format!("{} returned no output", provider.label()),
+    })?;
+    if output.status != Some(0) {
+        return Err(cli_exit_error(provider, &output));
+    }
+    Ok(output.stdout)
 }
 
 /// List items from the user's connected 1Password or Proton Pass account using
@@ -1724,7 +1877,7 @@ pub async fn list_provider_items(
     let reason = "SeraBot vault metadata sync";
     match provider {
         Provider::OnePassword => {
-            let stdout = run_provider_cli(
+            let stdout = run_provider_cli_with_limits(
                 providers,
                 provider,
                 vec![
@@ -1735,52 +1888,64 @@ pub async fn list_provider_items(
                 ],
                 token,
                 reason,
+                SYNC_CLI_TIMEOUT,
+                MAX_LIST_OUTPUT_BYTES,
             )
             .await?;
             parse_onepassword_items(&stdout)
         }
         Provider::ProtonPass => {
-            let vaults_stdout = run_provider_cli(
-                providers,
-                provider,
-                vec![
-                    "vault".into(),
-                    "list".into(),
-                    "--output".into(),
-                    "json".into(),
-                ],
-                token,
-                reason,
-            )
-            .await?;
-            let vaults = parse_protonpass_vaults(&vaults_stdout)?;
-            if vaults.is_empty() {
-                return Ok(Vec::new());
-            }
-            let commands: Vec<Vec<String>> = vaults
-                .iter()
-                .map(|(share_id, _)| {
-                    vec![
-                        "item".into(),
-                        "list".into(),
-                        "--share-id".into(),
-                        share_id.clone(),
-                        "--output".into(),
-                        "json".into(),
-                    ]
-                })
-                .collect();
-            let item_outputs =
-                run_provider_cli_batch(providers, provider, commands, token, reason).await?;
-            let mut all = Vec::new();
-            for ((share_id, vault_name), items_stdout) in vaults.into_iter().zip(item_outputs) {
-                all.extend(parse_protonpass_items(
-                    &items_stdout,
-                    &share_id,
-                    vault_name.as_deref(),
-                )?);
-            }
-            Ok(all)
+            let program = resolve_provider_program(providers, provider).await?;
+            let runner = providers.runner.clone();
+            let token = Zeroizing::new(token.to_owned());
+            let reason = sanitize_agent_reason(reason);
+            tokio::task::spawn_blocking(move || {
+                let env = provider_env(provider, token.as_str(), reason.as_str());
+                let mut all = Vec::new();
+                runner.run_in_session(
+                    &program,
+                    &env,
+                    SYNC_CLI_TIMEOUT,
+                    MAX_LIST_OUTPUT_BYTES,
+                    &mut |run_cmd| {
+                        let vaults_out = run_cmd(&[
+                            "vault".into(),
+                            "list".into(),
+                            "--output".into(),
+                            "json".into(),
+                        ])?;
+                        if vaults_out.status != Some(0) {
+                            return Err(cli_exit_error(provider, &vaults_out));
+                        }
+                        let vaults = parse_protonpass_vaults(&vaults_out.stdout)?;
+                        if vaults.is_empty() {
+                            return Ok(());
+                        }
+                        for (share_id, vault_name) in vaults {
+                            let items_out = run_cmd(&[
+                                "item".into(),
+                                "list".into(),
+                                "--share-id".into(),
+                                share_id.clone(),
+                                "--output".into(),
+                                "json".into(),
+                            ])?;
+                            if items_out.status != Some(0) {
+                                return Err(cli_exit_error(provider, &items_out));
+                            }
+                            all.extend(parse_protonpass_items(
+                                &items_out.stdout,
+                                &share_id,
+                                vault_name.as_deref(),
+                            )?);
+                        }
+                        Ok(())
+                    },
+                )?;
+                Ok(all)
+            })
+            .await
+            .map_err(|_| SeraError::Internal("the password manager command failed".into()))?
         }
     }
 }
@@ -2926,5 +3091,242 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "login1");
         assert_eq!(items[0].reference, "pass://share1/login1/password");
+    }
+
+    #[test]
+    fn extract_json_payload_strips_leading_warnings_and_accepts_shares_alias() {
+        let raw_vaults = concat!(
+            "Warning: pass-cli is updating cache\n",
+            "[WARN] deprecated flag; see {docs}\n",
+            r#"{"shares":[{"share_id":"s1","name":"Personal"},{"shareId":"s2","title":"Work"}]}"#
+        );
+        let vaults = parse_protonpass_vaults(raw_vaults).unwrap();
+        assert_eq!(
+            vaults,
+            vec![
+                ("s1".to_owned(), Some("Personal".to_owned())),
+                ("s2".to_owned(), Some("Work".to_owned())),
+            ]
+        );
+
+        let raw_items = concat!(
+            "Notice: syncing vault s1\n",
+            r#"{"items":[{"item_id":"i1","content":{"title":"Example","content":{"Login":{"username":"u@example.com","urls":["https://example.com"]}}}}]}"#
+        );
+        let items = parse_protonpass_items(raw_items, "s1", Some("Personal")).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].reference, "pass://s1/i1/password");
+    }
+
+    #[test]
+    fn parse_failures_return_structured_vault_parse_failed_rejected_errors() {
+        for err in [
+            parse_onepassword_items("not json").unwrap_err(),
+            parse_protonpass_vaults("not json").unwrap_err(),
+            parse_protonpass_vaults(r#"{"unexpected":true}"#).unwrap_err(),
+            parse_protonpass_items("not json", "s1", None).unwrap_err(),
+            parse_protonpass_items(r#"{"unexpected":true}"#, "s1", None).unwrap_err(),
+        ] {
+            assert!(
+                matches!(&err, SeraError::Rejected { code, .. } if *code == "vault_parse_failed"),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn proton_pass_sync_runs_vault_and_item_lists_in_one_session_and_handles_large_json() {
+        struct SessionFake {
+            sessions: Mutex<usize>,
+            limits: Mutex<Vec<(Duration, usize)>>,
+            commands: Mutex<Vec<Vec<String>>>,
+            large_items_json: String,
+        }
+
+        impl SecretCommand for SessionFake {
+            fn run(
+                &self,
+                _program: &Path,
+                _args: &[String],
+                _env: &[(&str, &str)],
+            ) -> Result<CommandOutput> {
+                unreachable!("list_provider_items should use run_in_session")
+            }
+
+            fn run_in_session(
+                &self,
+                _program: &Path,
+                _env: &[(&str, &str)],
+                timeout: Duration,
+                max_bytes: usize,
+                f: &mut SessionBody<'_>,
+            ) -> Result<()> {
+                *self.sessions.lock().unwrap() += 1;
+                self.limits.lock().unwrap().push((timeout, max_bytes));
+                f(&mut |args| {
+                    self.commands.lock().unwrap().push(args.to_vec());
+                    let stdout = if args.first().map(String::as_str) == Some("vault") {
+                        r#"{"vaults":[{"share_id":"s1","name":"Personal"},{"share_id":"s2","name":"Large"}]}"#
+                            .to_owned()
+                    } else if args.iter().any(|a| a == "s1") {
+                        r#"{"items":[{"item_id":"i1","content":{"title":"Mail","content":{"Login":{"username":"a@example.com","urls":["https://example.com"]}}}}]}"#
+                            .to_owned()
+                    } else {
+                        self.large_items_json.clone()
+                    };
+                    Ok(CommandOutput {
+                        status: Some(0),
+                        stdout: Zeroizing::new(stdout),
+                        stderr: Zeroizing::new(String::new()),
+                    })
+                })
+            }
+        }
+
+        // Build > 256 KiB of valid Proton Pass item JSON to verify large sync payloads succeed.
+        let mut items_json = String::from(r#"{"items":["#);
+        for idx in 0..1600 {
+            if idx > 0 {
+                items_json.push(',');
+            }
+            items_json.push_str(&format!(
+                r#"{{"item_id":"item{idx}","content":{{"title":"Service {idx} with padding to exceed 256 KiB","content":{{"Login":{{"username":"user{idx}@example.com","urls":["https://service{idx}.example.com/login"]}}}}}}}}"#
+            ));
+        }
+        items_json.push_str("]}");
+        assert!(items_json.len() > MAX_OUTPUT_BYTES);
+
+        let runner = Arc::new(SessionFake {
+            sessions: Mutex::default(),
+            limits: Mutex::default(),
+            commands: Mutex::default(),
+            large_items_json: items_json,
+        });
+        let mut cfg = config();
+        cfg.protonpass_enabled = true;
+        cfg.pass_cli_path = std::env::current_exe().unwrap().display().to_string();
+        let providers = Providers::with_runner(&cfg, runner.clone());
+
+        let items = list_provider_items(&providers, Provider::ProtonPass, "pst_abc::key")
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1601);
+        assert_eq!(*runner.sessions.lock().unwrap(), 1);
+        assert_eq!(
+            *runner.limits.lock().unwrap(),
+            vec![(SYNC_CLI_TIMEOUT, MAX_LIST_OUTPUT_BYTES)]
+        );
+        let commands = runner.commands.lock().unwrap();
+        assert_eq!(commands.len(), 3);
+        assert_eq!(commands[0], ["vault", "list", "--output", "json"]);
+        assert_eq!(
+            commands[1],
+            ["item", "list", "--share-id", "s1", "--output", "json"]
+        );
+        assert_eq!(
+            commands[2],
+            ["item", "list", "--share-id", "s2", "--output", "json"]
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_missing_or_failing_cli_returns_rejected_422_errors() {
+        let mut missing_cfg = config();
+        missing_cfg.protonpass_enabled = true;
+        let missing = Providers::with_runner(&missing_cfg, fake(Some(0), ""));
+        let err = list_provider_items(&missing, Provider::ProtonPass, "pst_abc::key")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, SeraError::Rejected { code, .. } if *code == "vault_cli_missing"),
+            "{err:?}"
+        );
+
+        let mut fail_cfg = config();
+        fail_cfg.protonpass_enabled = true;
+        fail_cfg.pass_cli_path = std::env::current_exe().unwrap().display().to_string();
+        let failing = Providers::with_runner(&fail_cfg, fake(Some(1), ""));
+        let err = list_provider_items(&failing, Provider::ProtonPass, "pst_abc::key")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, SeraError::Rejected { code, .. } if *code == "vault_cli_failed"),
+            "{err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_in_home_capped_enforces_limit_timeout_and_missing_binary() {
+        let home = tempfile::TempDir::new().unwrap();
+
+        // Missing binary -> vault_cli_missing
+        let Err(missing) = run_in_home_capped(
+            home.path(),
+            Path::new("/nonexistent/serabot-missing-cli"),
+            &[],
+            &[],
+            Duration::from_secs(1),
+            MAX_OUTPUT_BYTES,
+        ) else {
+            panic!("expected missing binary error");
+        };
+        assert!(
+            matches!(&missing, SeraError::Rejected { code, .. } if *code == "vault_cli_missing"),
+            "{missing:?}"
+        );
+
+        // >256 KiB succeeds when capped at MAX_LIST_OUTPUT_BYTES, fails at MAX_OUTPUT_BYTES
+        let big_args = vec![
+            "-c".to_owned(),
+            "head -c 300000 /dev/zero | tr '\\0' 'a'".to_owned(),
+        ];
+        let ok = run_in_home_capped(
+            home.path(),
+            Path::new("sh"),
+            &big_args,
+            &[],
+            Duration::from_secs(5),
+            MAX_LIST_OUTPUT_BYTES,
+        )
+        .unwrap();
+        assert_eq!(ok.stdout.len(), 300_000);
+
+        let Err(too_large) = run_in_home_capped(
+            home.path(),
+            Path::new("sh"),
+            &big_args,
+            &[],
+            Duration::from_secs(5),
+            MAX_OUTPUT_BYTES,
+        ) else {
+            panic!("expected output too large error");
+        };
+        assert!(
+            matches!(
+                &too_large,
+                SeraError::Rejected { code, .. } if *code == "vault_output_too_large"
+            ),
+            "{too_large:?}"
+        );
+
+        // Timeout -> vault_cli_timeout
+        let Err(timeout) = run_in_home_capped(
+            home.path(),
+            Path::new("sh"),
+            &["-c".to_owned(), "sleep 2".to_owned()],
+            &[],
+            Duration::from_millis(50),
+            MAX_OUTPUT_BYTES,
+        ) else {
+            panic!("expected timeout error");
+        };
+        assert!(
+            matches!(
+                &timeout,
+                SeraError::Rejected { code, .. } if *code == "vault_cli_timeout"
+            ),
+            "{timeout:?}"
+        );
     }
 }

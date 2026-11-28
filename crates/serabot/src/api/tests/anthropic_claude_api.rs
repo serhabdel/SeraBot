@@ -637,7 +637,8 @@ async fn claude_agent_sdk_gateway_status_token_import_and_signin_flow() {
         .mount(&gw_server)
         .await;
 
-    // 1. Before token is set: gateway-status reports token_configured = false, signin/start returns gateway_token_missing.
+    // 1. Even before an explicit token is set, gateway-status auto-bootstraps
+    //    one in the age store and gateway-start reports already_running.
     let (status, gw_status) = send(
         OWNER.into(),
         "GET",
@@ -647,19 +648,21 @@ async fn claude_agent_sdk_gateway_status_token_import_and_signin_flow() {
     .await;
     assert_eq!(status, StatusCode::OK, "{gw_status}");
     assert_eq!(gw_status["reachable"], true);
-    assert_eq!(gw_status["token_configured"], false);
+    assert_eq!(gw_status["token_configured"], true);
     assert_eq!(gw_status["auth_ok"], false);
     assert_eq!(gw_status["cli_installed"], true);
+    assert!(gw_status["start_error"].is_null(), "{gw_status}");
 
-    let (status, missing) = send(
+    let (status, start_resp) = send(
         OWNER.into(),
         "POST",
-        "/v1/providers/claude-sdk/signin/start".into(),
-        Some(json!({})),
+        "/v1/providers/claude-sdk/gateway-start".into(),
+        None,
     )
     .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{missing}");
-    assert_eq!(missing["code"], "gateway_token_missing");
+    assert_eq!(status, StatusCode::OK, "{start_resp}");
+    assert_eq!(start_resp["ok"], true);
+    assert_eq!(start_resp["state"], "already_running");
 
     // 2. Non-admin cannot generate token; admin can.
     let (status, _) = send(

@@ -2839,7 +2839,7 @@ button:not(:disabled):active,
 
 .rail {
   position: relative;
-  z-index: 10;
+  z-index: 80;
   width: var(--rail-w);
   flex: 0 0 var(--rail-w);
   display: flex;
@@ -3014,12 +3014,21 @@ button:not(:disabled):active,
   font-size: var(--fs-caption);
 }
 
-/* The account menu opens to the right of the rail, growing from its corner. */
+/* The account menu floats fixed to the right of the rail above all panes. */
+.rail-menu-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 119;
+  background: transparent;
+}
+
 .menu.rail-menu {
-  top: auto;
-  bottom: 0;
-  left: calc(100% + 10px);
+  position: fixed;
+  left: 66px;
+  bottom: 12px;
   right: auto;
+  top: auto;
+  z-index: 120;
   transform: translateX(-8px) scale(0.97);
   transform-origin: bottom left;
 }

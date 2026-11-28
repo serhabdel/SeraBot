@@ -14,6 +14,7 @@ pub mod brief;
 pub mod browser;
 pub mod browser_profiles;
 pub mod cards;
+pub mod claude_gateway_proc;
 pub mod cloud_code;
 pub mod collaboration;
 pub mod composio;

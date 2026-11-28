@@ -1038,7 +1038,16 @@ fn SigninNotice(session: Signal<Session>, provider_id: String, blocker: SigninBl
 #[component]
 fn PlanTile(session: Signal<Session>, overlay: Signal<Overlay>, preset: ProviderPreset) -> Element {
     let mut overlay = overlay;
-    let can_write = session.read().can_admin();
+    let (can_write, existing_id) = {
+        let s = session.read();
+        let existing = s
+            .state
+            .providers
+            .iter()
+            .find(|p| provider_matches_preset(&p.id, &p.kind, &preset))
+            .map(|p| p.id.clone());
+        (s.can_admin(), existing)
+    };
     let takes_key = matches!(preset.auth, "api_key" | "oauth_or_key");
     let button_label = match preset.kind {
         "anthropic" => "Sign in with Claude",
@@ -1075,10 +1084,15 @@ fn PlanTile(session: Signal<Session>, overlay: Signal<Overlay>, preset: Provider
                     r#type: "button",
                     disabled: !can_write,
                     onclick: move |_| {
-                        let mut s = session.write();
-                        s.fill_provider_draft(&preset, None);
-                        // Saves the provider, then opens its sign-in at once.
-                        s.save_provider();
+                        if let Some(existing_id) = existing_id.as_ref() {
+                            session.write().open_add_account(existing_id);
+                            overlay.set(Overlay::AddAccount);
+                        } else {
+                            let mut s = session.write();
+                            s.fill_provider_draft(&preset, None);
+                            // Saves the provider, then opens its sign-in at once.
+                            s.save_provider();
+                        }
                     },
                     Icon { name: "external", size: 13 }
                     "{button_label}"

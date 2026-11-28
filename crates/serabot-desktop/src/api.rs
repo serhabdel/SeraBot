@@ -5977,6 +5977,22 @@ impl ApiClient {
         Ok(())
     }
 
+    /// `POST /v1/mail/scheduled/{id}/send-now`: bump a pending scheduled email
+    /// to send immediately (0.74.31).
+    pub fn mail_send_now(&self, id: &str) -> Result<(), ApiError> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(ApiError::Validation("Missing scheduled email ID."));
+        }
+        let _: serde_json::Value = self.request::<_, ()>(
+            Method::POST,
+            &["v1", "mail", "scheduled", id, "send-now"],
+            &[],
+            None,
+        )?;
+        Ok(())
+    }
+
     /// `POST /v1/mail/messages/{uid}/snooze`: hide a message until `wake_at` (0.74.14).
     pub fn mail_snooze(
         &self,

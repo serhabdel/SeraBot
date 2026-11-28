@@ -12,9 +12,11 @@ use serabot_desktop::mail_view::{
 };
 
 use crate::ui::Icon;
-use crate::ui_mail::{MailCtx, is_starred, is_unread, normalize_custom_datetime, open_message};
+use crate::ui_mail::{
+    MailCtx, is_starred, is_unread, normalize_custom_datetime, open_message, run_mail_job,
+};
 use crate::ui_mail_actions::{
-    archive_messages, delete_messages, run_undo, set_flags, settle, snooze_messages,
+    UndoKind, archive_messages, delete_messages, run_undo, set_flags, settle, snooze_messages,
 };
 
 /// Where a row sits inside a conversation.
@@ -407,9 +409,32 @@ pub(crate) fn UndoBar(ctx: MailCtx) -> Element {
     let Some(entry) = ctx.undo.read().clone() else {
         return rsx! {};
     };
+    let send_now_id = match &entry.kind {
+        UndoKind::Send { scheduled_id } => Some(scheduled_id.clone()),
+        _ => None,
+    };
     rsx! {
         div { class: "mail-undo", role: "status", "aria-live": "polite",
             span { class: "mail-undo-label", "{entry.label}" }
+            if let Some(sched_id) = send_now_id {
+                button {
+                    class: "btn primary sm mail-undo-btn",
+                    r#type: "button",
+                    onclick: move |_| {
+                        let id = sched_id.clone();
+                        settle(ctx);
+                        spawn(async move {
+                            let res = run_mail_job(ctx.session, move |c| c.mail_send_now(&id)).await;
+                            match res {
+                                Ok(()) => ctx.session.write().toast = Some("Sending email now\u{2026}".to_owned()),
+                                Err(err) => ctx.session.write().toast = Some(err),
+                            }
+                        });
+                    },
+                    Icon { name: "send", size: 13 }
+                    "Send now"
+                }
+            }
             button {
                 class: "btn ghost sm mail-undo-btn",
                 r#type: "button",

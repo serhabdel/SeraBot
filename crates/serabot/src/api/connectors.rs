@@ -194,6 +194,86 @@ pub(super) async fn list_providers(
             }
         }
     }
+    for (id, profile) in &llm.providers {
+        if providers
+            .iter()
+            .any(|p| p.get("id").and_then(Value::as_str) == Some(id.as_str()))
+        {
+            continue;
+        }
+        let kind = crate::providers::canonical_kind(&profile.kind)?;
+        let signin = signin_flows(&state, is_admin, id, &kind);
+        let risk = signin_risk(&kind, &signin);
+        let has_oauth_signin = !signin.is_empty();
+        let is_oauth = matches!(
+            crate::providers::auth_plan(&kind, &profile.auth)?,
+            crate::providers::AuthPlan::OAuth { .. }
+        );
+        let mut secrets = json!({
+            "api_key": visible_secret_status(&state.secrets, Some(profile.api_key_secret.as_str()), is_admin),
+        });
+        if is_oauth || has_oauth_signin || !profile.refresh_token_secret.is_empty() {
+            secrets["refresh_token"] = visible_secret_status(
+                &state.secrets,
+                Some(profile.refresh_token_secret.as_str()),
+                is_admin,
+            );
+        }
+        if is_oauth || has_oauth_signin || !profile.oauth_client_id_secret.is_empty() {
+            secrets["oauth_client_id"] = visible_secret_status(
+                &state.secrets,
+                Some(profile.oauth_client_id_secret.as_str()),
+                is_admin,
+            );
+        }
+        if is_oauth || has_oauth_signin || !profile.oauth_client_secret_secret.is_empty() {
+            secrets["oauth_client_secret"] = visible_secret_status(
+                &state.secrets,
+                Some(profile.oauth_client_secret_secret.as_str()),
+                is_admin,
+            );
+        }
+        let routing_classes = llm
+            .classes
+            .iter()
+            .filter(|(_, models)| {
+                models
+                    .iter()
+                    .any(|model| profile.models.iter().any(|advertised| advertised == model))
+            })
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        let managed = state
+            .admin
+            .as_ref()
+            .is_some_and(|admin| admin.manages_provider(id));
+        let mut view = json!({
+            "id": id,
+            "kind": profile.kind,
+            "auth": if is_oauth { "oauth" } else { "api_key" },
+            "base_url": profile.base_url,
+            "models": profile.models,
+            "routing_classes": routing_classes,
+            "data_egress_approved": profile.data_egress_approved,
+            "catalog_fetch": profile.catalog_fetch,
+            "catalog_verified": false,
+            "model_source": "fallback",
+            "status": "unchecked",
+            "health": "unknown",
+            "last_error": Value::Null,
+            "last_checked": Value::Null,
+            "model_count": profile.models.len(),
+            "managed": managed,
+            "secrets": secrets,
+            "credential": credential_view(&state, &user.id, id)?,
+            "accounts": provider_account_views(&state, &user.id, id)?,
+            "signin": signin,
+            "signin_risk": risk,
+        });
+        add_signin_status(&mut view, &state, is_admin, id, &kind);
+        providers.push(view);
+    }
+
     // A provider whose accounts are all disabled leaves the router's list;
     // keep it on the page so an account can be turned back on.
     let parked = parked_provider_views(&state, &user.id, is_admin, &providers)?;
@@ -1818,5 +1898,102 @@ mod tests {
             assert_eq!(admin_json["ok"], true);
             assert_eq!(admin_json["message"], "Signed in as alice@example.com.");
         }
+    }
+
+    #[tokio::test]
+    async fn list_providers_includes_configured_provider_with_zero_accounts() {
+        let dir = std::env::temp_dir().join(format!("serabot-conn-toml-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut config = Config::default();
+        config.api.enabled = true;
+        config.api.token_hash = sha256_hex("test-token-that-is-long-enough-123");
+        config.llm.model = "test".into();
+        config.llm.base_url = "https://example.com/v1".into();
+        config.base_dir = dir.clone();
+        config.llm.providers.insert(
+            "claude-sdk".into(),
+            ProviderConfig {
+                kind: "claude-agent-sdk".into(),
+                base_url: "http://127.0.0.1:8791".into(),
+                api_key_secret: "claude_gateway_token".into(),
+                models: vec!["claude-sonnet-4-5".into()],
+                data_egress_approved: true,
+                catalog_fetch: false,
+                ..Default::default()
+            },
+        );
+        let db_path = dir.join("serabot.db");
+        config.database.path = db_path.to_string_lossy().into_owned();
+        let config = Arc::new(config);
+        let store = Store::open(&db_path, 384, 5000).unwrap();
+        let gateway = Gateway::new(
+            store.clone(),
+            Arc::new(Policy::empty()),
+            ToolRegistry::default(),
+            1,
+            false,
+        );
+        let secrets =
+            SharedSecrets::new(crate::secrets::SecretStore::from_map(BTreeMap::from([(
+                config.llm.api_key_secret.clone(),
+                "synthetic-llm".into(),
+            )])));
+        let users = Arc::new(UserSecrets::with_master_key(store.clone(), [8u8; 32]).unwrap());
+        let credentials = Arc::new(crate::providers::UserProviderCredentials::new(
+            users.clone(),
+            secrets.clone(),
+            5,
+            64,
+        ));
+        let model_router =
+            crate::model_router::ModelRouter::with_credentials(&config.llm, credentials).unwrap();
+        let runtime = Runtime::new(
+            config.clone(),
+            store.clone(),
+            gateway,
+            model_router,
+            vec![crate::config::LoadedBot {
+                config: BotConfig {
+                    title: None,
+                    description: None,
+                    name: "main".into(),
+                    trigger: "command".into(),
+                    model: None,
+                    system_prompt: "prompts/main.txt".into(),
+                    skills: vec![],
+                    tools: vec![],
+                    require_approval: vec![],
+                    enabled: true,
+                    temperature: None,
+                    thinking: None,
+                    role: BotRole::Orchestrator,
+                    delegates: vec![],
+                    route: None,
+                    fallbacks: Vec::new(),
+                    failover: Default::default(),
+                    catalog_only: false,
+                },
+                prompt: "test prompt".into(),
+            }],
+            Arc::new(NullNotifier),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+        let artifacts = Arc::new(ArtifactStore::new(dir.join("artifacts")).unwrap());
+        let state = ApiState::new(runtime, store, config, artifacts, secrets, users, None).unwrap();
+        let app = crate::api::router(state);
+
+        let listed = get_json(&app, "test-token-that-is-long-enough-123", "/v1/providers").await;
+        let providers = listed["providers"].as_array().unwrap();
+        let sdk = providers
+            .iter()
+            .find(|p| p["id"] == "claude-sdk")
+            .expect("claude-sdk from serabot.toml must be listed even with 0 accounts");
+        assert_eq!(sdk["kind"], "claude-agent-sdk");
+        assert_eq!(sdk["accounts"], json!([]));
+        assert_eq!(sdk["status"], "unchecked");
+        assert_eq!(sdk["health"], "unknown");
+        assert_eq!(sdk["model_source"], "fallback");
     }
 }

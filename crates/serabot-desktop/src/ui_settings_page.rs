@@ -12,6 +12,28 @@ use serabot_desktop::theme::Tone;
 
 use crate::ui_widgets::{SecretField, StatusChip};
 
+/// Map each settings section to an inline SVG icon name from `crate::ui::Icon`.
+pub fn section_icon(section: SettingsSection) -> &'static str {
+    match section {
+        SettingsSection::Account => "user",
+        SettingsSection::Appearance => "theme",
+        SettingsSection::Notifications => "alert-circle",
+        SettingsSection::Chat => "chat",
+        SettingsSection::Voice => "mic",
+        SettingsSection::LocalFolders => "folder",
+        SettingsSection::Memory => "memory",
+        SettingsSection::Integrations => "connectors",
+        SettingsSection::Providers => "providers",
+        SettingsSection::Vault => "lock",
+        SettingsSection::Telegram => "send",
+        SettingsSection::WebSearch => "globe",
+        SettingsSection::Usage => "usage",
+        SettingsSection::Logs => "logs",
+        SettingsSection::Admin => "shield",
+        SettingsSection::About => "sparkles",
+    }
+}
+
 /// The list of sections on the left, grouped under Preferences, Connections &
 /// Data, and System. Admin only shows for admins.
 #[component]
@@ -45,64 +67,89 @@ pub fn SettingsNav(session: Signal<Session>) -> Element {
     rsx! {
         nav { class: "settings-nav", "aria-label": "Settings sections",
             div { class: "settings-search",
-                input {
-                    id: "settings-search",
-                    class: "input",
-                    r#type: "search",
-                    placeholder: "Search settings\u{2026}",
-                    "aria-label": "Search settings",
-                    value: "{query}",
-                    oninput: move |e| query.set(e.value()),
-                    onkeydown: move |e: KeyboardEvent| {
-                        if e.key() == Key::Escape {
-                            query.set(String::new());
-                        } else if e.key() == Key::Enter
-                            && let Some(first) = first_hit
-                        {
-                            query.set(String::new());
-                            session.write().open_settings_section(first);
+                div { class: "search-wrap settings-search-wrap",
+                    span { class: "search-glyph", Icon { name: "search", size: 14 } }
+                    input {
+                        id: "settings-search",
+                        class: "input",
+                        r#type: "search",
+                        placeholder: "Search settings\u{2026}",
+                        "aria-label": "Search settings",
+                        value: "{query}",
+                        oninput: move |e| query.set(e.value()),
+                        onkeydown: move |e: KeyboardEvent| {
+                            if e.key() == Key::Escape {
+                                query.set(String::new());
+                            } else if e.key() == Key::Enter
+                                && let Some(first) = first_hit
+                            {
+                                query.set(String::new());
+                                session.write().open_settings_section(first);
+                            }
+                        },
+                    }
+                    if !query().is_empty() {
+                        button {
+                            class: "icon-btn settings-search-clear",
+                            r#type: "button",
+                            title: "Clear search",
+                            "aria-label": "Clear search",
+                            onclick: move |_| query.set(String::new()),
+                            Icon { name: "x", size: 13 }
                         }
-                    },
+                    }
                 }
             }
-            if !needle.is_empty() {
-                div { class: "settings-nav-group", role: "list",
-                    if found.is_empty() {
-                        div { class: "settings-nav-empty muted", "No setting matches \"{needle}\"." }
-                    }
-                    for (_, section) in found.iter().copied() {
-                        button {
-                            key: "{section.label()}",
-                            class: if current == section { "settings-nav-item on" } else { "settings-nav-item" },
-                            "aria-current": if current == section { "page" } else { "false" },
-                            onclick: move |_| {
-                                query.set(String::new());
-                                session.write().open_settings_section(section);
-                            },
-                            span { class: "settings-nav-label", "{section.label()}" }
-                            span { class: "settings-nav-desc", "{section.description()}" }
+            div { class: "settings-nav-scroll",
+                if !needle.is_empty() {
+                    div { class: "settings-nav-group", role: "list",
+                        if found.is_empty() {
+                            div { class: "settings-nav-empty muted", "No setting matches \"{needle}\"." }
+                        }
+                        for (_, section) in found.iter().copied() {
+                            button {
+                                key: "{section.label()}",
+                                class: if current == section { "settings-nav-item on" } else { "settings-nav-item" },
+                                "aria-current": if current == section { "page" } else { "false" },
+                                onclick: move |_| {
+                                    query.set(String::new());
+                                    session.write().open_settings_section(section);
+                                },
+                                div { class: "settings-nav-ico",
+                                    Icon { name: section_icon(section), size: 15 }
+                                }
+                                div { class: "settings-nav-copy",
+                                    span { class: "settings-nav-label", "{section.label()}" }
+                                    span { class: "settings-nav-desc", "{section.description()}" }
+                                }
+                            }
                         }
                     }
-                }
-            } else {
-                for group in SettingsGroup::ALL {
-                    {
-                        let items: Vec<SettingsSection> = SettingsSection::ALL
-                            .into_iter()
-                            .filter(|s| s.group() == group && s.visible_with_memory(is_admin, mem0_available))
-                            .collect();
-                        rsx! {
-                            if !items.is_empty() {
-                                div { key: "{group.label()}", class: "settings-nav-group",
-                                    div { class: "settings-nav-group-label", "{group.label()}" }
-                                    for section in items {
-                                        button {
-                                            key: "{section.label()}",
-                                            class: if current == section { "settings-nav-item on" } else { "settings-nav-item" },
-                                            "aria-current": if current == section { "page" } else { "false" },
-                                            onclick: move |_| session.write().open_settings_section(section),
-                                            span { class: "settings-nav-label", "{section.label()}" }
-                                            span { class: "settings-nav-desc", "{section.description()}" }
+                } else {
+                    for group in SettingsGroup::ALL {
+                        {
+                            let items: Vec<SettingsSection> = SettingsSection::ALL
+                                .into_iter()
+                                .filter(|s| s.group() == group && s.visible_with_memory(is_admin, mem0_available))
+                                .collect();
+                            rsx! {
+                                if !items.is_empty() {
+                                    div { key: "{group.label()}", class: "settings-nav-group",
+                                        div { class: "settings-nav-group-label", "{group.label()}" }
+                                        for section in items {
+                                            button {
+                                                key: "{section.label()}",
+                                                class: if current == section { "settings-nav-item on" } else { "settings-nav-item" },
+                                                "aria-current": if current == section { "page" } else { "false" },
+                                                onclick: move |_| session.write().open_settings_section(section),
+                                                div { class: "settings-nav-ico",
+                                                    Icon { name: section_icon(section), size: 15 }
+                                                }
+                                                div { class: "settings-nav-copy",
+                                                    span { class: "settings-nav-label", "{section.label()}" }
+                                                    span { class: "settings-nav-desc", "{section.description()}" }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -1145,5 +1192,15 @@ mod tests {
             ("30".into(), "8".into())
         );
         assert!(validate_turn_limits_draft("10", "4", None).is_err());
+    }
+
+    #[test]
+    fn settings_sections_all_have_icons() {
+        for section in SettingsSection::ALL {
+            assert!(
+                !section_icon(section).is_empty(),
+                "missing icon for {section:?}"
+            );
+        }
     }
 }

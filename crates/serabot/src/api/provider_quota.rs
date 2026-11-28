@@ -27,6 +27,8 @@ const OPENCODE_GO_USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
 const COPILOT_QUOTA_URL: &str = "https://api.github.com/copilot_internal/user";
 /// Where ChatGPT (Codex) reports the plan's rate-limit windows.
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+/// Where AWS Kiro reports the subscription's usage limits.
+const KIRO_USAGE_URL: &str = "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST";
 
 /// The readers every server has, by provider kind.
 pub(super) fn standard_readers() -> HashMap<String, Arc<dyn QuotaReader>> {
@@ -58,6 +60,20 @@ pub(super) fn standard_readers() -> HashMap<String, Arc<dyn QuotaReader>> {
             Arc::new(CodexQuota {
                 http: http.clone(),
                 url: CODEX_USAGE_URL.into(),
+            }),
+        );
+        readers.insert(
+            "claude-agent-sdk".into(),
+            Arc::new(ClaudeGatewayQuota {
+                http: http.clone(),
+                default_base_url: None,
+            }),
+        );
+        readers.insert(
+            "kiro".into(),
+            Arc::new(KiroQuota {
+                http: http.clone(),
+                url: KIRO_USAGE_URL.into(),
             }),
         );
         if let Ok(origins) =
@@ -301,6 +317,23 @@ pub(super) struct AntigravityQuota {
     origins: Vec<String>,
 }
 
+fn client_with_relay(
+    default_client: &reqwest::Client,
+    user_id: &str,
+    kind: &str,
+) -> reqwest::Client {
+    if !user_id.is_empty()
+        && let Some(proxy) = crate::relay_net::proxy_for(user_id, kind)
+        && let Ok(proxied) = reqwest::Client::builder()
+            .proxy(proxy)
+            .timeout(Duration::from_secs(20))
+            .build()
+    {
+        return proxied;
+    }
+    default_client.clone()
+}
+
 #[async_trait::async_trait]
 impl QuotaReader for AntigravityQuota {
     async fn read(
@@ -308,13 +341,24 @@ impl QuotaReader for AntigravityQuota {
         credential: &ProviderCredential,
         identity: &Value,
     ) -> Result<Option<Value>> {
+        self.read_with_context(credential, identity, "", "").await
+    }
+
+    async fn read_with_context(
+        &self,
+        credential: &ProviderCredential,
+        identity: &Value,
+        user_id: &str,
+        _base_url: &str,
+    ) -> Result<Option<Value>> {
         let project = identity
             .get("project_id")
             .and_then(Value::as_str)
             .unwrap_or("");
         let version = crate::cloud_code::antigravity_version(None).await;
+        let http = client_with_relay(&self.http, user_id, "google-antigravity");
         Ok(crate::cloud_code::read_quota(
-            &self.http,
+            &http,
             &credential.api_key,
             project,
             &self.origins,
@@ -498,6 +542,211 @@ pub(super) fn parse_codex_usage(value: &Value) -> Option<Value> {
         json!({
             "sampled_at": sampled_at(),
             "source": "codex",
+            "state": "ok",
+            "windows": windows,
+        })
+    })
+}
+
+/// Claude Agent SDK loopback gateway: reads `/v1/auth/usage?profile=<profile>`
+/// with the gateway bearer token (`credential.api_key`).
+pub(super) struct ClaudeGatewayQuota {
+    http: reqwest::Client,
+    default_base_url: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl QuotaReader for ClaudeGatewayQuota {
+    async fn read(
+        &self,
+        credential: &ProviderCredential,
+        identity: &Value,
+    ) -> Result<Option<Value>> {
+        self.read_with_context(credential, identity, "", "").await
+    }
+
+    async fn read_with_context(
+        &self,
+        credential: &ProviderCredential,
+        identity: &Value,
+        _user_id: &str,
+        base_url: &str,
+    ) -> Result<Option<Value>> {
+        let token = credential.api_key.trim();
+        if token.is_empty() {
+            return Ok(None);
+        }
+        let raw_base = if !base_url.trim().is_empty() {
+            base_url
+        } else {
+            self.default_base_url.as_deref().unwrap_or_default()
+        };
+        let resolved = crate::providers::resolve_base_url("claude-agent-sdk", raw_base)?;
+        let normalized = crate::config::validate_loopback_gateway_url(&resolved)?;
+        let profile = identity
+            .get("profile")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .unwrap_or("default");
+        let mut url = url::Url::parse(&format!("{normalized}/v1/auth/usage"))
+            .map_err(|_| SeraError::Config("invalid claude_gateway url".into()))?;
+        url.query_pairs_mut().append_pair("profile", profile);
+
+        let response = self
+            .http
+            .get(url)
+            .header("accept", "application/json")
+            .timeout(Duration::from_secs(20))
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|_| SeraError::External("quota could not be read".into()))?;
+        let status = response.status();
+        let body = crate::auth_flows::read_capped(response).await?;
+        if !status.is_success() {
+            return Ok(None);
+        }
+        Ok(serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|value| parse_claude_gateway_usage(&value)))
+    }
+}
+
+/// Parse the gateway's `/v1/auth/usage` reply (`{"available": true, "quota": {...}}`).
+pub(super) fn parse_claude_gateway_usage(value: &Value) -> Option<Value> {
+    if value.get("available").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let quota = value.get("quota")?;
+    quota.is_object().then(|| quota.clone())
+}
+
+/// AWS Kiro: reads `getUsageLimits` with the member's access token
+/// (and desktop network relay when enabled).
+pub(super) struct KiroQuota {
+    http: reqwest::Client,
+    url: String,
+}
+
+#[async_trait::async_trait]
+impl QuotaReader for KiroQuota {
+    async fn read(
+        &self,
+        credential: &ProviderCredential,
+        identity: &Value,
+    ) -> Result<Option<Value>> {
+        self.read_with_context(credential, identity, "", "").await
+    }
+
+    async fn read_with_context(
+        &self,
+        credential: &ProviderCredential,
+        _identity: &Value,
+        user_id: &str,
+        _base_url: &str,
+    ) -> Result<Option<Value>> {
+        let token = credential.api_key.trim();
+        if token.is_empty() {
+            return Ok(None);
+        }
+        let http = client_with_relay(&self.http, user_id, "kiro");
+        let response = http
+            .get(&self.url)
+            .header("accept", "application/json")
+            .timeout(Duration::from_secs(20))
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|_| SeraError::External("quota could not be read".into()))?;
+        let status = response.status();
+        let body = crate::auth_flows::read_capped(response).await?;
+        if !status.is_success() {
+            return Ok(None);
+        }
+        Ok(serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|value| parse_kiro_usage(&value)))
+    }
+}
+
+/// Parse AWS Kiro's `getUsageLimits` payload into a quota snapshot.
+pub(super) fn parse_kiro_usage(value: &Value) -> Option<Value> {
+    let list = value.get("usageBreakdownList")?.as_array()?;
+    let top_reset = value.get("nextDateReset").and_then(reset_time);
+    let mut windows = Vec::new();
+    for entry in list {
+        let reset = entry
+            .get("nextDateReset")
+            .and_then(reset_time)
+            .or_else(|| top_reset.clone());
+        let label = entry
+            .get("displayName")
+            .or_else(|| entry.get("resourceType"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("credits");
+        let scope = entry
+            .get("resourceType")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("subscription");
+
+        if let (Some(used_raw), Some(limit)) = (
+            entry
+                .get("currentUsageWithPrecision")
+                .and_then(number)
+                .or_else(|| entry.get("currentUsage").and_then(number)),
+            entry
+                .get("usageLimitWithPrecision")
+                .and_then(number)
+                .or_else(|| entry.get("usageLimit").and_then(number)),
+        ) && limit > 0.0
+        {
+            let used = ((used_raw / limit) * 100.0).clamp(0.0, 100.0);
+            let used_rounded = (used * 10.0).round() / 10.0;
+            let remaining = ((100.0 - used) / 100.0 * 1000.0).round() / 1000.0;
+            windows.push(json!({
+                "scope": scope,
+                "label": label,
+                "used_percent": used_rounded,
+                "remaining": remaining,
+                "resets_at": reset,
+            }));
+        }
+
+        if let Some(trial) = entry.get("freeTrialInfo")
+            && trial.get("freeTrialStatus").and_then(Value::as_str) == Some("ACTIVE")
+            && let (Some(used_raw), Some(limit)) = (
+                trial
+                    .get("currentUsageWithPrecision")
+                    .and_then(number)
+                    .or_else(|| trial.get("currentUsage").and_then(number)),
+                trial
+                    .get("usageLimitWithPrecision")
+                    .and_then(number)
+                    .or_else(|| trial.get("usageLimit").and_then(number)),
+            )
+            && limit > 0.0
+        {
+            let used = ((used_raw / limit) * 100.0).clamp(0.0, 100.0);
+            let used_rounded = (used * 10.0).round() / 10.0;
+            let remaining = ((100.0 - used) / 100.0 * 1000.0).round() / 1000.0;
+            windows.push(json!({
+                "scope": "free_trial",
+                "label": format!("{label} (trial)"),
+                "used_percent": used_rounded,
+                "remaining": remaining,
+                "resets_at": trial.get("freeTrialExpiry").and_then(reset_time),
+            }));
+        }
+    }
+    (!windows.is_empty()).then(|| {
+        json!({
+            "sampled_at": sampled_at(),
+            "source": "kiro",
             "state": "ok",
             "windows": windows,
         })
@@ -807,6 +1056,8 @@ mod tests {
         assert!(readers.contains_key("opencode-go"));
         assert!(readers.contains_key("github-copilot"));
         assert!(readers.contains_key("openai-codex"));
+        assert!(readers.contains_key("claude-agent-sdk"));
+        assert!(readers.contains_key("kiro"));
         assert!(!readers.contains_key("opencode-zen"));
         assert!(!readers.contains_key("openai"));
     }
@@ -856,5 +1107,113 @@ mod tests {
         assert_eq!(windows.len(), 2);
         assert!((windows[0]["remaining"].as_f64().unwrap() - 0.75).abs() < 1e-6);
         assert!((windows[1]["remaining"].as_f64().unwrap() - 0.40).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn claude_gateway_quota_reads_usage_from_loopback_gateway() {
+        assert!(parse_claude_gateway_usage(&json!({"available": false})).is_none());
+        assert!(parse_claude_gateway_usage(&json!({"available": true})).is_none());
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/auth/usage"))
+            .and(wiremock::matchers::query_param("profile", "work"))
+            .and(header("authorization", "Bearer gw-token-123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "available": true,
+                "quota": {
+                    "sampled_at": "2026-11-27T00:00:00Z",
+                    "source": "claude",
+                    "state": "ok",
+                    "windows": [
+                        {"scope": "session", "label": "5h", "used_percent": 15.0, "remaining": 0.85, "resets_at": "2026-11-27T05:00:00Z"}
+                    ]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let reader = ClaudeGatewayQuota {
+            http: crate::auth_flows::http_client().unwrap(),
+            default_base_url: None,
+        };
+        let cred = ProviderCredential {
+            api_key: "gw-token-123".into(),
+            ..Default::default()
+        };
+        let reading = reader
+            .read_with_context(&cred, &json!({"profile": "work"}), "u1", &server.uri())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reading["source"], "claude");
+        assert_eq!(reading["windows"][0]["label"], "5h");
+        assert_eq!(reading["windows"][0]["remaining"], 0.85);
+    }
+
+    #[tokio::test]
+    async fn kiro_quota_parses_usage_breakdown_and_free_trial() {
+        let parsed = parse_kiro_usage(&json!({
+            "nextDateReset": 1_800_000_000,
+            "usageBreakdownList": [
+                {
+                    "displayName": "Credits",
+                    "resourceType": "CREDIT",
+                    "currentUsageWithPrecision": 25.0,
+                    "usageLimitWithPrecision": 100.0,
+                    "freeTrialInfo": {
+                        "freeTrialStatus": "ACTIVE",
+                        "currentUsage": 10,
+                        "usageLimit": 50,
+                        "freeTrialExpiry": 1_800_500_000
+                    }
+                }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(parsed["source"], "kiro");
+        assert_eq!(parsed["state"], "ok");
+        let windows = parsed["windows"].as_array().unwrap();
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0]["scope"], "CREDIT");
+        assert_eq!(windows[0]["label"], "Credits");
+        assert_eq!(windows[0]["used_percent"], 25.0);
+        assert_eq!(windows[0]["remaining"], 0.75);
+        assert_eq!(windows[1]["scope"], "free_trial");
+        assert_eq!(windows[1]["used_percent"], 20.0);
+        assert_eq!(windows[1]["remaining"], 0.8);
+
+        assert!(parse_kiro_usage(&json!({})).is_none());
+        assert!(parse_kiro_usage(&json!({"usageBreakdownList": []})).is_none());
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/getUsageLimits"))
+            .and(header("authorization", "Bearer kiro-tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "usageBreakdownList": [{
+                    "resourceType": "AGENTIC_REQUEST",
+                    "currentUsage": 40,
+                    "usageLimit": 200,
+                    "nextDateReset": "2026-12-01T00:00:00Z"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let reader = KiroQuota {
+            http: crate::auth_flows::http_client().unwrap(),
+            url: format!("{}/getUsageLimits", server.uri()),
+        };
+        let cred = ProviderCredential {
+            api_key: "kiro-tok".into(),
+            ..Default::default()
+        };
+        let reading = reader.read(&cred, &json!({})).await.unwrap().unwrap();
+        assert_eq!(reading["source"], "kiro");
+        assert_eq!(reading["windows"][0]["used_percent"], 20.0);
+        assert_eq!(reading["windows"][0]["remaining"], 0.8);
     }
 }

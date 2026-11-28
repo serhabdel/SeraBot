@@ -61,6 +61,7 @@ pub const MAX_SIGNATURE_HTML_CHARS: usize = 65536;
 const MAX_INLINE_ATTACHMENT_BYTES: usize = 512 * 1024;
 const MAX_INLINE_ATTACHMENTS_TOTAL: usize = 2 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+const DATA_IO_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_LINE: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1267,6 +1268,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
     }
 
     async fn read_line(&mut self) -> Result<String> {
+        self.read_line_with_timeout(IO_TIMEOUT).await
+    }
+
+    async fn read_line_with_timeout(&mut self, timeout: Duration) -> Result<String> {
         loop {
             if let Some(pos) = self.buf.iter().position(|b| *b == b'\n') {
                 let line: Vec<u8> = self.buf.drain(..=pos).collect();
@@ -1279,7 +1284,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
                 return Err(SeraError::External("server line too long".into()));
             }
             let mut chunk = [0u8; 4096];
-            let n = tokio::time::timeout(IO_TIMEOUT, self.stream.read(&mut chunk))
+            let n = tokio::time::timeout(timeout, self.stream.read(&mut chunk))
                 .await
                 .map_err(|_| SeraError::External("mail server read timed out".into()))?
                 .map_err(|e| SeraError::External(format!("mail server read: {e}")))?;
@@ -1377,6 +1382,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
     /// first 3 bytes, which can never match a 4+-byte `want` and so rejected
     /// every IMAP greeting ("* OK [CAPABILITY ...] Server ready.") and
     /// every tagged IMAP reply ("a1 OK ...").
+    #[allow(dead_code)]
     async fn expect(&mut self, want: &str) -> Result<String> {
         let line = self.read_logical_line().await?;
         if line.starts_with(want) {
@@ -1387,6 +1393,50 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
                 clip(&line, 200)
             )))
         }
+    }
+
+    /// Read a (possibly multi-line) SMTP reply (`220-...` / `250-...`) until
+    /// the final line (`<code> ` or bare `<code>`) arrives.
+    async fn read_smtp_reply(&mut self, expected_code: &str) -> Result<Vec<String>> {
+        self.read_smtp_reply_with_timeout(expected_code, IO_TIMEOUT)
+            .await
+    }
+
+    async fn read_smtp_reply_with_timeout(
+        &mut self,
+        expected_code: &str,
+        timeout: Duration,
+    ) -> Result<Vec<String>> {
+        const MAX_SMTP_REPLY_LINES: usize = 128;
+        let mut lines = Vec::new();
+        loop {
+            let line = self.read_line_with_timeout(timeout).await?;
+            if !line.starts_with(expected_code) {
+                return Err(SeraError::External(format!(
+                    "mail server replied unexpectedly: {}",
+                    clip(&line, 200)
+                )));
+            }
+            let rest = &line[expected_code.len()..];
+            let is_continuation = rest.starts_with('-');
+            let is_final = rest.is_empty() || rest.starts_with(' ');
+            if !is_continuation && !is_final {
+                return Err(SeraError::External(format!(
+                    "mail server replied unexpectedly: {}",
+                    clip(&line, 200)
+                )));
+            }
+            lines.push(line);
+            if is_final {
+                break;
+            }
+            if lines.len() >= MAX_SMTP_REPLY_LINES {
+                return Err(SeraError::External(
+                    "SMTP server reply exceeded maximum line count".into(),
+                ));
+            }
+        }
+        Ok(lines)
     }
 
     /// Read until the tagged reply for `tag` arrives; untagged lines are
@@ -1499,6 +1549,110 @@ async fn connect(host: &str, port: u16, security: Security) -> Result<Wire<MailS
 
 // ---------------------------------------------------------------- SMTP ----
 
+fn ehlo_supports_auth_plain(ehlo_lines: &[String]) -> bool {
+    ehlo_lines.iter().any(|line| {
+        let rest = line.get(4..).unwrap_or("").trim();
+        let upper = rest.to_ascii_uppercase();
+        if let Some(mechs) = upper
+            .strip_prefix("AUTH ")
+            .or_else(|| upper.strip_prefix("AUTH="))
+        {
+            mechs.split_ascii_whitespace().any(|m| m == "PLAIN")
+        } else {
+            false
+        }
+    })
+}
+
+async fn smtp_connect_and_ehlo(creds: &MailCredentials) -> Result<(Wire<MailStream>, Vec<String>)> {
+    let host = creds.smtp_host.trim().to_owned();
+    let mut wire = connect(&host, creds.smtp_port, creds.smtp_security).await?;
+    wire.read_smtp_reply("220").await?;
+    wire.send_line("EHLO serabot.local").await?;
+    let mut ehlo_lines = wire.read_smtp_reply("250").await?;
+    if creds.smtp_security == Security::StartTls {
+        wire.send_line("STARTTLS").await?;
+        wire.read_smtp_reply("220").await?;
+        let tcp = match wire.stream {
+            MailStream::Plain(tcp) => tcp,
+            _ => return Err(SeraError::Internal("STARTTLS on a TLS stream".into())),
+        };
+        let connector = tls_connector()?;
+        let domain = tokio_rustls::rustls::pki_types::ServerName::try_from(host)
+            .map_err(|_| SeraError::Validation("invalid TLS host name".into()))?;
+        let tls = tokio::time::timeout(IO_TIMEOUT, connector.connect(domain, tcp))
+            .await
+            .map_err(|_| SeraError::External("TLS handshake timed out".into()))?
+            .map_err(|e| SeraError::External(format!("TLS handshake: {e}")))?;
+        wire.stream = MailStream::Tls(Box::new(tls));
+        wire.send_line("EHLO serabot.local").await?;
+        ehlo_lines = wire.read_smtp_reply("250").await?;
+    }
+    Ok((wire, ehlo_lines))
+}
+
+async fn smtp_authenticate(
+    wire: &mut Wire<MailStream>,
+    creds: &MailCredentials,
+    ehlo_lines: &[String],
+) -> Result<()> {
+    if ehlo_supports_auth_plain(ehlo_lines) {
+        let mut plain_payload = Vec::with_capacity(2 + creds.username.len() + creds.password.len());
+        plain_payload.push(0);
+        plain_payload.extend_from_slice(creds.username.as_bytes());
+        plain_payload.push(0);
+        plain_payload.extend_from_slice(creds.password.as_bytes());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&plain_payload);
+        wire.send_line(&format!("AUTH PLAIN {encoded}")).await?;
+        wire.read_smtp_reply("235").await?;
+    } else {
+        wire.send_line("AUTH LOGIN").await?;
+        wire.read_smtp_reply("334").await?;
+        wire.send_line(
+            &base64::engine::general_purpose::STANDARD.encode(creds.username.as_bytes()),
+        )
+        .await?;
+        wire.read_smtp_reply("334").await?;
+        wire.send_line(
+            &base64::engine::general_purpose::STANDARD.encode(creds.password.as_bytes()),
+        )
+        .await?;
+        wire.read_smtp_reply("235").await?;
+    }
+    Ok(())
+}
+
+/// Normalize LF to CRLF and dot-stuff lines starting with `.` in a single pass.
+fn dot_stuff_crlf(message: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(message.len() + message.len() / 64 + 16);
+    let mut at_line_start = true;
+    let mut i = 0;
+    while i < message.len() {
+        let b = message[i];
+        if at_line_start && b == b'.' {
+            out.push(b'.');
+        }
+        if b == b'\r' && message.get(i + 1) == Some(&b'\n') {
+            out.extend_from_slice(b"\r\n");
+            at_line_start = true;
+            i += 2;
+        } else if b == b'\n' {
+            out.extend_from_slice(b"\r\n");
+            at_line_start = true;
+            i += 1;
+        } else {
+            out.push(b);
+            at_line_start = false;
+            i += 1;
+        }
+    }
+    if !at_line_start {
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b".\r\n");
+    out
+}
+
 /// Send one message. `security` drives plain/STARTTLS/implicit-TLS.
 pub async fn smtp_send(
     creds: &MailCredentials,
@@ -1511,130 +1665,57 @@ pub async fn smtp_send(
             "the message exceeds the 25 MiB cap".into(),
         ));
     }
-    let mut wire = connect(creds.smtp_host.trim(), creds.smtp_port, creds.smtp_security).await?;
-    wire.expect("220").await?;
-    let host = creds.smtp_host.trim().to_owned();
-    wire.send_line(&format!("EHLO {host}")).await?;
-    // multi-line 250- reply: keep reading until "250 " (space, not dash)
-    loop {
-        let line = wire.read_line().await?;
-        if line.starts_with("250 ") {
-            break;
-        }
-        if line.starts_with("250") && !line.starts_with("250-") {
-            break;
-        }
-    }
-    if creds.smtp_security == Security::StartTls {
-        wire.send_line("STARTTLS").await?;
-        wire.expect("220").await?;
-        let tcp = match wire.stream {
-            MailStream::Plain(tcp) => tcp,
-            _ => return Err(SeraError::Internal("STARTTLS on a TLS stream".into())),
-        };
-        let connector = tls_connector()?;
-        let domain = tokio_rustls::rustls::pki_types::ServerName::try_from(host.clone())
-            .map_err(|_| SeraError::Validation("invalid TLS host name".into()))?;
-        let tls = tokio::time::timeout(IO_TIMEOUT, connector.connect(domain, tcp))
-            .await
-            .map_err(|_| SeraError::External("TLS handshake timed out".into()))?
-            .map_err(|e| SeraError::External(format!("TLS handshake: {e}")))?;
-        wire.stream = MailStream::Tls(Box::new(tls));
-        wire.send_line(&format!("EHLO {host}")).await?;
-        loop {
-            let line = wire.read_line().await?;
-            if line.starts_with("250 ") {
-                break;
-            }
-            if line.starts_with("250") && !line.starts_with("250-") {
-                break;
-            }
-        }
-    }
-    wire.send_line("AUTH LOGIN").await?;
-    wire.expect("334").await?;
-    wire.send_line(&base64::engine::general_purpose::STANDARD.encode(creds.username.as_bytes()))
-        .await?;
-    wire.expect("334").await?;
-    wire.send_line(&base64::engine::general_purpose::STANDARD.encode(creds.password.as_bytes()))
-        .await?;
-    wire.expect("235").await?;
+    let total_start = std::time::Instant::now();
+    let (mut wire, ehlo_lines) = smtp_connect_and_ehlo(creds).await?;
+    let connect_ms = total_start.elapsed().as_millis() as u64;
+
+    let auth_start = std::time::Instant::now();
+    smtp_authenticate(&mut wire, creds, &ehlo_lines).await?;
+    let auth_ms = auth_start.elapsed().as_millis() as u64;
+
     wire.send_line(&format!("MAIL FROM:<{}>", extract_envelope_address(from)))
         .await?;
-    wire.expect("250").await?;
+    wire.read_smtp_reply("250").await?;
     for rcpt in to {
         wire.send_line(&format!("RCPT TO:<{}>", extract_envelope_address(rcpt)))
             .await?;
-        wire.expect("250").await?;
+        wire.read_smtp_reply("250").await?;
     }
     wire.send_line("DATA").await?;
-    wire.expect("354").await?;
-    // dot-stuff and normalize to CRLF
-    let text = String::from_utf8_lossy(message)
-        .replace("\r\n", "\n")
-        .replace('\n', "\r\n");
-    let mut stuffed = String::with_capacity(text.len() + 64);
-    for line in text.split("\r\n") {
-        if line.starts_with('.') {
-            stuffed.push('.');
-        }
-        stuffed.push_str(line);
-        stuffed.push_str("\r\n");
-    }
-    stuffed.push_str(".\r\n");
-    tokio::time::timeout(IO_TIMEOUT, wire.stream.write_all(stuffed.as_bytes()))
-        .await
-        .map_err(|_| SeraError::External("DATA write timed out".into()))?
-        .map_err(|e| SeraError::External(format!("DATA write: {e}")))?;
-    wire.stream.flush().await.ok();
-    wire.expect("250").await?;
+    wire.read_smtp_reply("354").await?;
+
+    let data_start = std::time::Instant::now();
+    let stuffed = dot_stuff_crlf(message);
+    let bytes = stuffed.len();
+    tokio::time::timeout(DATA_IO_TIMEOUT, async {
+        wire.stream.write_all(&stuffed).await?;
+        wire.stream.flush().await
+    })
+    .await
+    .map_err(|_| SeraError::External("DATA write timed out".into()))?
+    .map_err(|e| SeraError::External(format!("DATA write: {e}")))?;
+    wire.read_smtp_reply_with_timeout("250", DATA_IO_TIMEOUT)
+        .await?;
+    let data_ms = data_start.elapsed().as_millis() as u64;
+    let total_ms = total_start.elapsed().as_millis() as u64;
+
+    tracing::info!(
+        connect_ms,
+        auth_ms,
+        data_ms,
+        total_ms,
+        bytes,
+        "smtp_send completed"
+    );
+
     let _ = wire.send_line("QUIT").await;
     Ok(())
 }
 
 /// Connect + EHLO + AUTH + QUIT without sending (used by `POST /v1/mail/connect`).
 pub async fn smtp_test(creds: &MailCredentials) -> Result<()> {
-    let mut wire = connect(creds.smtp_host.trim(), creds.smtp_port, creds.smtp_security).await?;
-    wire.expect("220").await?;
-    let host = creds.smtp_host.trim().to_owned();
-    wire.send_line(&format!("EHLO {host}")).await?;
-    loop {
-        let line = wire.read_line().await?;
-        if line.starts_with("250 ") || (line.starts_with("250") && !line.starts_with("250-")) {
-            break;
-        }
-    }
-    if creds.smtp_security == Security::StartTls {
-        wire.send_line("STARTTLS").await?;
-        wire.expect("220").await?;
-        let tcp = match wire.stream {
-            MailStream::Plain(tcp) => tcp,
-            _ => return Err(SeraError::Internal("STARTTLS on a TLS stream".into())),
-        };
-        let connector = tls_connector()?;
-        let domain = tokio_rustls::rustls::pki_types::ServerName::try_from(host.clone())
-            .map_err(|_| SeraError::Validation("invalid TLS host name".into()))?;
-        let tls = tokio::time::timeout(IO_TIMEOUT, connector.connect(domain, tcp))
-            .await
-            .map_err(|_| SeraError::External("TLS handshake timed out".into()))?
-            .map_err(|e| SeraError::External(format!("TLS handshake: {e}")))?;
-        wire.stream = MailStream::Tls(Box::new(tls));
-        wire.send_line(&format!("EHLO {host}")).await?;
-        loop {
-            let line = wire.read_line().await?;
-            if line.starts_with("250 ") || (line.starts_with("250") && !line.starts_with("250-")) {
-                break;
-            }
-        }
-    }
-    wire.send_line("AUTH LOGIN").await?;
-    wire.expect("334").await?;
-    wire.send_line(&base64::engine::general_purpose::STANDARD.encode(creds.username.as_bytes()))
-        .await?;
-    wire.expect("334").await?;
-    wire.send_line(&base64::engine::general_purpose::STANDARD.encode(creds.password.as_bytes()))
-        .await?;
-    wire.expect("235").await?;
+    let (mut wire, ehlo_lines) = smtp_connect_and_ehlo(creds).await?;
+    smtp_authenticate(&mut wire, creds, &ehlo_lines).await?;
     let _ = wire.send_line("QUIT").await;
     Ok(())
 }
@@ -4994,6 +5075,117 @@ mod tests {
         );
         assert!(data.contains("Subject: Hi"));
         assert!(!data.contains("\r"), "server saw CRLF-normalized lines");
+    }
+
+    #[tokio::test]
+    async fn smtp_send_handles_multiline_greeting_ehlo_serabot_local_and_auth_plain() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected_plain =
+            base64::engine::general_purpose::STANDARD.encode(b"\0me@example.com\0app-password");
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            let mut saw_ehlo = None;
+            let mut saw_auth = None;
+            let mut data = String::new();
+            writer
+                .write_all(b"220-mail.hostinger.com ESMTP\r\n220 Ready\r\n")
+                .await
+                .unwrap();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.starts_with("EHLO") {
+                    saw_ehlo = Some(line);
+                    writer
+                        .write_all(b"250-fake\r\n250-PIPELINING\r\n250 AUTH PLAIN LOGIN\r\n")
+                        .await
+                        .unwrap();
+                } else if line.starts_with("AUTH PLAIN ") {
+                    saw_auth = Some(line);
+                    writer
+                        .write_all(b"235 Authentication succeeded\r\n")
+                        .await
+                        .unwrap();
+                } else if line.starts_with("MAIL FROM") || line.starts_with("RCPT TO") {
+                    writer.write_all(b"250 ok\r\n").await.unwrap();
+                } else if line == "DATA" {
+                    writer.write_all(b"354 go\r\n").await.unwrap();
+                    loop {
+                        let l = lines.next_line().await.unwrap().unwrap();
+                        if l == "." {
+                            break;
+                        }
+                        data.push_str(&l);
+                        data.push('\n');
+                    }
+                    writer.write_all(b"250-queued\r\n250 ok\r\n").await.unwrap();
+                } else if line == "QUIT" {
+                    writer.write_all(b"221 bye\r\n").await.unwrap();
+                    break;
+                } else {
+                    writer.write_all(b"500 unexpected\r\n").await.unwrap();
+                }
+            }
+            (saw_ehlo, saw_auth, data)
+        });
+        let mut c = creds(Security::None);
+        c.smtp_port = port;
+        let message = build_message(
+            "me@example.com",
+            &["you@example.com".to_owned()],
+            "Plain Auth",
+            "Body\n",
+            &[],
+        )
+        .unwrap();
+        smtp_send(
+            &c,
+            "me@example.com",
+            &["you@example.com".to_owned()],
+            &message,
+        )
+        .await
+        .unwrap();
+        let (saw_ehlo, saw_auth, data) = server.await.unwrap();
+        assert_eq!(saw_ehlo.as_deref(), Some("EHLO serabot.local"));
+        assert_eq!(
+            saw_auth.as_deref(),
+            Some(format!("AUTH PLAIN {expected_plain}").as_str())
+        );
+        assert!(data.contains("Subject: Plain Auth"));
+    }
+
+    #[tokio::test]
+    async fn smtp_test_handles_multiline_greeting_and_auth_plain() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected_plain =
+            base64::engine::general_purpose::STANDARD.encode(b"\0me@example.com\0app-password");
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            writer
+                .write_all(b"220-line1\r\n220-line2\r\n220 ready\r\n")
+                .await
+                .unwrap();
+            let ehlo = lines.next_line().await.unwrap().unwrap();
+            assert_eq!(ehlo, "EHLO serabot.local");
+            writer
+                .write_all(b"250-hello\r\n250 AUTH=LOGIN PLAIN\r\n")
+                .await
+                .unwrap();
+            let auth = lines.next_line().await.unwrap().unwrap();
+            assert_eq!(auth, format!("AUTH PLAIN {expected_plain}"));
+            writer.write_all(b"235 ok\r\n").await.unwrap();
+            let quit = lines.next_line().await.unwrap().unwrap();
+            assert_eq!(quit, "QUIT");
+        });
+        let mut c = creds(Security::None);
+        c.smtp_port = port;
+        smtp_test(&c).await.unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]

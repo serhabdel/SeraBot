@@ -17,11 +17,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 import hmac
 import inspect
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -31,6 +33,8 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any
+import urllib.error
+import urllib.request
 import uuid
 
 try:
@@ -104,6 +108,19 @@ _PRESERVED_CLAUDE_HOST_VARS = frozenset(
 
 # Pending CLI sign-in flows: flow_id -> flow state dict.
 _pending_auth_flows: dict[str, dict[str, Any]] = {}
+
+# Per-profile cached rate_limit_info from SDK turn messages/events.
+_last_rate_limits: dict[str, dict[str, Any]] = {}
+
+ANTHROPIC_OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+USAGE_TIMEOUT_SECS = 15.0
+USAGE_MAX_BODY_BYTES = 64 * 1024
+_USAGE_WINDOW_SPECS: tuple[tuple[str, str], ...] = (
+    ("five_hour", "5h"),
+    ("seven_day", "7d"),
+    ("seven_day_sonnet", "7d_sonnet"),
+    ("seven_day_opus", "7d_opus"),
+)
 
 SUPPORTED_MODELS: list[dict[str, str]] = [
     {"id": "claude-sonnet-4-5"},
@@ -287,6 +304,203 @@ def _read_credentials_fallback(profile_dir: Path | None) -> dict[str, Any] | Non
         }
 
     return None
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str
+    ) -> Any:
+        return None
+
+
+def _utc_rfc3339_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _format_resets_at(raw: Any) -> str | None:
+    if isinstance(raw, str):
+        cleaned = raw.strip()
+        return cleaned or None
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        if math.isfinite(raw):
+            try:
+                return datetime.fromtimestamp(float(raw), tz=timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                )
+            except (OSError, OverflowError, ValueError):
+                return None
+    return None
+
+
+def _read_oauth_access_token(profile_dir: Path | None) -> str | None:
+    base_dir = profile_dir if profile_dir is not None else Path.home() / ".claude"
+    creds_path = base_dir / ".credentials.json"
+    try:
+        with open(creds_path, "r", encoding="utf-8") as handle:
+            doc = json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+    if not isinstance(doc, dict):
+        return None
+    oauth = doc.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return None
+    token = oauth.get("accessToken")
+    if isinstance(token, str) and token.strip():
+        return token.strip()
+    return None
+
+
+def _parse_oauth_usage_snapshot(
+    data: dict[str, Any], *, sampled_at: str | None = None
+) -> dict[str, Any] | None:
+    windows: list[dict[str, Any]] = []
+    for key, label in _USAGE_WINDOW_SPECS:
+        entry = data.get(key)
+        if not isinstance(entry, dict):
+            continue
+        util = entry.get("utilization")
+        if isinstance(util, bool) or not isinstance(util, (int, float)):
+            continue
+        if not math.isfinite(util):
+            continue
+        used_percent = max(0.0, min(100.0, float(util)))
+        remaining = round(max(0.0, min(1.0, 1.0 - used_percent / 100.0)), 6)
+        win: dict[str, Any] = {
+            "scope": "subscription",
+            "label": label,
+            "used_percent": used_percent,
+            "remaining": remaining,
+        }
+        resets_at = _format_resets_at(entry.get("resets_at"))
+        if resets_at is not None:
+            win["resets_at"] = resets_at
+        windows.append(win)
+
+    if not windows:
+        return None
+
+    return {
+        "sampled_at": sampled_at or _utc_rfc3339_now(),
+        "source": "claude",
+        "state": "ok",
+        "windows": windows,
+    }
+
+
+def _fetch_oauth_usage(access_token: str) -> dict[str, Any] | None:
+    req = urllib.request.Request(
+        ANTHROPIC_OAUTH_USAGE_URL,
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "claude-code/2.0.0",
+            "Accept": "application/json",
+        },
+    )
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(req, timeout=USAGE_TIMEOUT_SECS) as resp:
+            status = getattr(resp, "status", 200)
+            if status != 200:
+                return None
+            raw = resp.read(USAGE_MAX_BODY_BYTES + 1)
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+        logger.debug("claude oauth usage request failed: %s", type(exc).__name__)
+        return None
+
+    if len(raw) > USAGE_MAX_BODY_BYTES:
+        logger.warning(
+            "claude oauth usage response exceeded %d bytes", USAGE_MAX_BODY_BYTES
+        )
+        return None
+
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+    if not isinstance(data, dict):
+        return None
+    return _parse_oauth_usage_snapshot(data)
+
+
+def _extract_rate_limit_info(msg: Any) -> dict[str, Any] | None:
+    raw: Any = None
+    if isinstance(msg, dict):
+        raw = msg.get("rate_limit_info")
+        if raw is None:
+            raw = msg.get("rate_limits")
+    else:
+        raw = getattr(msg, "rate_limit_info", None)
+        if raw is None:
+            raw = getattr(msg, "rate_limits", None)
+
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return dict(raw) if raw else None
+    if hasattr(raw, "__dict__"):
+        extracted = {k: v for k, v in vars(raw).items() if not k.startswith("_")}
+        return extracted if extracted else None
+    return None
+
+
+def _quota_snapshot_from_rate_limits(
+    info: dict[str, Any], *, sampled_at: str | None = None
+) -> dict[str, Any] | None:
+    direct = _parse_oauth_usage_snapshot(info, sampled_at=sampled_at)
+    if direct is not None:
+        return direct
+
+    rate_type = info.get("rateLimitType") or info.get("rate_limit_type")
+    label_map = dict(_USAGE_WINDOW_SPECS)
+    label = label_map.get(str(rate_type), str(rate_type)) if rate_type else "5h"
+
+    used_percent: float | None = None
+    raw_used = info.get("used_percent")
+    if (
+        not isinstance(raw_used, bool)
+        and isinstance(raw_used, (int, float))
+        and math.isfinite(raw_used)
+    ):
+        used_percent = max(0.0, min(100.0, float(raw_used)))
+    else:
+        raw_util = info.get("utilization")
+        if (
+            not isinstance(raw_util, bool)
+            and isinstance(raw_util, (int, float))
+            and math.isfinite(raw_util)
+        ):
+            val = float(raw_util)
+            if 0.0 <= val <= 1.0:
+                val *= 100.0
+            used_percent = max(0.0, min(100.0, val))
+        elif info.get("status") == "rejected":
+            used_percent = 100.0
+
+    if used_percent is None:
+        return None
+
+    remaining = round(max(0.0, min(1.0, 1.0 - used_percent / 100.0)), 6)
+    win: dict[str, Any] = {
+        "scope": "subscription",
+        "label": label,
+        "used_percent": used_percent,
+        "remaining": remaining,
+    }
+    resets_at = _format_resets_at(info.get("resets_at") or info.get("resetsAt"))
+    if resets_at is not None:
+        win["resets_at"] = resets_at
+
+    return {
+        "sampled_at": sampled_at or _utc_rfc3339_now(),
+        "source": "claude",
+        "state": "ok",
+        "windows": [win],
+    }
 
 
 def _read_cli_status(profile_dir: Path | None) -> dict[str, Any] | None:
@@ -539,8 +753,14 @@ async def _run_turn(
     payload: dict[str, Any],
     *,
     profile_dir: Path | None = None,
+    profile_key: str | None = None,
     effort: str | None = None,
 ) -> dict[str, Any]:
+    resolved_profile_key = (
+        profile_key
+        if profile_key is not None
+        else (profile_dir.name if profile_dir is not None else "default")
+    )
     sdk = _import_sdk()
 
     model = str(payload.get("model") or DEFAULT_MODEL)
@@ -630,6 +850,13 @@ async def _run_turn(
     stream = sdk.query(prompt=prompt, options=options)
     try:
         async for msg in stream:
+            rate_info = _extract_rate_limit_info(msg)
+            if rate_info is not None:
+                _last_rate_limits[resolved_profile_key] = {
+                    "sampled_at": _utc_rfc3339_now(),
+                    "info": rate_info,
+                }
+
             if _is_instance_or_attr(msg, assistant_msg_cls, "content"):
                 for block in getattr(msg, "content", []) or []:
                     is_tool_block = (
@@ -938,7 +1165,7 @@ async def turn(request: Request) -> JSONResponse:
             status_code=400,
         )
     try:
-        _, profile_dir = _resolve_profile_dir(raw_profile, create=False)
+        profile_key, profile_dir = _resolve_profile_dir(raw_profile, create=False)
     except ValueError as exc:
         return JSONResponse(
             {"error": str(exc), "code": "invalid_profile"}, status_code=400
@@ -957,7 +1184,7 @@ async def turn(request: Request) -> JSONResponse:
 
     try:
         result = await _run_turn(
-            payload, profile_dir=profile_dir, effort=effort
+            payload, profile_dir=profile_dir, profile_key=profile_key, effort=effort
         )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
@@ -1245,6 +1472,36 @@ async def auth_cancel(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+async def auth_usage(request: Request) -> JSONResponse:
+    auth_error = _check_bearer_auth(request)
+    if auth_error is not None:
+        return auth_error
+
+    raw_profile = request.query_params.get("profile")
+    try:
+        profile_key, profile_dir = _resolve_profile_dir(raw_profile, create=False)
+    except ValueError as exc:
+        return JSONResponse(
+            {"error": str(exc), "code": "invalid_profile"}, status_code=400
+        )
+
+    token = _read_oauth_access_token(profile_dir)
+    if token is not None:
+        snapshot = await asyncio.to_thread(_fetch_oauth_usage, token)
+        if snapshot is not None:
+            return JSONResponse({"available": True, "quota": snapshot})
+
+    cached = _last_rate_limits.get(profile_key)
+    if cached is not None:
+        snapshot = _quota_snapshot_from_rate_limits(
+            cached["info"], sampled_at=cached.get("sampled_at")
+        )
+        if snapshot is not None:
+            return JSONResponse({"available": True, "quota": snapshot})
+
+    return JSONResponse({"available": False, "quota": None})
+
+
 @asynccontextmanager
 async def lifespan(_app: Starlette):
     env_host = os.environ.get(HOST_ENV_VAR, DEFAULT_HOST)
@@ -1269,6 +1526,7 @@ app = Starlette(
         Route("/v1/auth/complete", auth_complete, methods=["POST"]),
         Route("/v1/auth/import-cli", auth_import_cli, methods=["POST"]),
         Route("/v1/auth/cancel", auth_cancel, methods=["POST"]),
+        Route("/v1/auth/usage", auth_usage, methods=["GET"]),
     ],
     lifespan=lifespan,
 )

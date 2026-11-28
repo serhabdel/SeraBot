@@ -25,8 +25,8 @@ use serde::Deserialize;
 use crate::ui::Icon;
 use crate::ui_files::{PastedFile, decode_pasted};
 use crate::ui_mail_actions::{
-    FAILED, SEND_HOLD_SECS, UndoEntry, UndoKind, announce, archive_messages, delete_messages,
-    queue_draft_delete, restore_failed, run_undo, set_flags, settle, sleep_ms,
+    FAILED, UndoEntry, UndoKind, announce, archive_messages, delete_messages, queue_draft_delete,
+    restore_failed, run_undo, set_flags, settle, sleep_ms,
 };
 use crate::ui_mail_compose::{
     AttachedFile, AttachmentTray, DroppedFile, MAIL_DROP_JS, RecipientField, attach, detach,
@@ -2755,6 +2755,7 @@ fn MailComposeModal(
     let mut loading_library = use_signal(|| false);
     let mut send_later_open = use_signal(|| false);
     let mut custom_send_at = use_signal(String::new);
+    let mut undo_delay_secs = use_signal(|| 5i64);
     let mut sending = use_signal(|| false);
     let mut send_error = use_signal(|| Option::<String>::None);
     let attached = use_signal(Vec::<AttachedFile>::new);
@@ -2819,26 +2820,29 @@ fn MailComposeModal(
         let subj = subject();
         let (plain_body, body_html) = compose_to_body_and_html(&body(), html_mode());
         let hashes: Vec<String> = selected_hashes().into_iter().collect();
-        let hold_at = now_unix_secs() as i64 + SEND_HOLD_SECS;
+        let delay_secs = undo_delay_secs();
         let acct_del = acct.clone();
         let old_draft = draft_uid().map(|uid| (draft_folder(), uid));
         spawn(async move {
             let res = run_mail_job(session, move |c| {
-                match c.mail_send_with_undo(
-                    acct.as_deref(),
-                    &recipients,
-                    &cc_list,
-                    &bcc_list,
-                    &subj,
-                    &plain_body,
-                    body_html.clone(),
-                    hold_at,
-                    &hashes,
-                ) {
-                    Ok(item) => return Ok(Some(item.id)),
-                    // A clock that disagrees with the server: send straight away.
-                    Err(e) if e.to_string().contains("hold") => {}
-                    Err(e) => return Err(e),
+                if delay_secs > 0 {
+                    let hold_at = now_unix_secs() as i64 + delay_secs;
+                    match c.mail_send_with_undo(
+                        acct.as_deref(),
+                        &recipients,
+                        &cc_list,
+                        &bcc_list,
+                        &subj,
+                        &plain_body,
+                        body_html.clone(),
+                        hold_at,
+                        &hashes,
+                    ) {
+                        Ok(item) => return Ok(Some(item.id)),
+                        // A clock that disagrees with the server: send straight away.
+                        Err(e) if e.to_string().contains("hold") => {}
+                        Err(e) => return Err(e),
+                    }
                 }
                 c.mail_send(
                     acct.as_deref(),
@@ -2862,7 +2866,7 @@ fn MailComposeModal(
                             ctx,
                             "Message sent".to_owned(),
                             UndoKind::Send { scheduled_id: id },
-                            ((SEND_HOLD_SECS - 1) * 1000) as u32,
+                            ((delay_secs - 1).max(1) * 1000) as u32,
                         ),
                         None => session.write().toast = Some("Email sent.".to_owned()),
                     }
@@ -3540,6 +3544,23 @@ fn MailComposeModal(
 
                 div { class: "card-actions mail-compose-actions",
                     span { class: "tiny muted mail-draft-state", role: "status", "{draft_state}" }
+                    label { class: "tiny muted mail-undo-delay",
+                        "Undo delay: "
+                        select {
+                            class: "select sm",
+                            "aria-label": "Undo delay",
+                            disabled: sending(),
+                            value: "{undo_delay_secs}",
+                            onchange: move |e| {
+                                if let Ok(v) = e.value().parse::<i64>() {
+                                    undo_delay_secs.set(v);
+                                }
+                            },
+                            option { value: "0", selected: undo_delay_secs() == 0, "Off" }
+                            option { value: "5", selected: undo_delay_secs() == 5, "5s" }
+                            option { value: "10", selected: undo_delay_secs() == 10, "10s" }
+                        }
+                    }
                     button {
                         class: "btn ghost",
                         r#type: "button",

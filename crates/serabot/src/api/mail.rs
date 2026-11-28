@@ -39,6 +39,7 @@ pub(super) fn routes() -> Router<Arc<ApiState>> {
             "/v1/mail/scheduled/{id}",
             patch(update_scheduled).delete(delete_scheduled),
         )
+        .route("/v1/mail/scheduled/{id}/send-now", post(send_now_scheduled))
 }
 
 #[derive(Deserialize)]
@@ -796,6 +797,7 @@ async fn schedule_message(
         &user.id,
         &[req.to.as_slice(), req.cc.as_slice(), req.bcc.as_slice()],
     );
+    crate::scheduler::scheduled_mail_wake().notify_one();
     let _ = state.store.record_audit(
         &user.id,
         "mail.schedule",
@@ -953,6 +955,41 @@ async fn delete_scheduled(
         Some(&json!({ "id": id })),
     );
     Ok(Json(json!({ "deleted": true })))
+}
+
+/// `POST /v1/mail/scheduled/{id}/send-now`: bump a pending scheduled email
+/// to `send_at = now` (UID-scoped) and wake the scheduler immediately.
+async fn send_now_scheduled(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    let now = chrono::Utc::now().timestamp();
+    let item = state.store.update_scheduled_mail(
+        &user.id,
+        &id,
+        crate::store::ScheduledMailPatch {
+            to: None,
+            cc: None,
+            bcc: None,
+            subject: None,
+            body: None,
+            body_html: None,
+            send_at: Some(now),
+        },
+    )?;
+    crate::scheduler::scheduled_mail_wake().notify_one();
+    let _ = state.store.record_audit(
+        &user.id,
+        "mail.schedule_send_now",
+        Some("mail"),
+        None,
+        None,
+        None,
+        None,
+        Some(&json!({ "id": id, "send_at": now })),
+    );
+    Ok(Json(json!({ "item": item })))
 }
 
 /// `GET /v1/mail/messages/{uid}/attachments/{index}?account=&folder=`: download one attachment.

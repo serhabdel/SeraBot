@@ -27,6 +27,16 @@ pub trait QuotaReader: Send + Sync {
         credential: &ProviderCredential,
         identity: &Value,
     ) -> Result<Option<Value>>;
+
+    async fn read_with_context(
+        &self,
+        credential: &ProviderCredential,
+        identity: &Value,
+        _user_id: &str,
+        _base_url: &str,
+    ) -> Result<Option<Value>> {
+        self.read(credential, identity).await
+    }
 }
 
 /// `p***@example.com`: enough to tell two accounts apart, not enough to mail.
@@ -675,7 +685,15 @@ pub(super) async fn provider_account_quota(
                     {
                         credential = fresh;
                     }
-                    match reader.read(&credential, &account.identity).await {
+                    match reader
+                        .read_with_context(
+                            &credential,
+                            &account.identity,
+                            &user.id,
+                            &profile.base_url,
+                        )
+                        .await
+                    {
                         Ok(Some(reading)) => {
                             if !account.is_default() {
                                 state.store.set_provider_account_quota(
@@ -713,12 +731,46 @@ pub(super) struct SigninStartRequest {
     state: Option<String>,
 }
 
+/// Ensures a bearer token exists for the `claude-agent-sdk` loopback gateway:
+/// uses the member's per-user `api_key` if set, else the server-level
+/// `[claude_gateway] token_secret` in the age store, or generates and persists
+/// a fresh 32-byte URL-safe random token when neither exists.
+fn ensure_gateway_token(
+    state: &ApiState,
+    user: &ActingUser,
+    id: &str,
+    _profile: &ProviderConfig,
+) -> Result<String> {
+    use base64::Engine as _;
+
+    if let Some((_, secret)) = state.users.resolve_with_owner(&user.id, id)? {
+        let credential = crate::user_secrets::ProviderCredential::parse(&secret)?;
+        if !credential.api_key.trim().is_empty() {
+            return Ok(credential.api_key);
+        }
+    }
+
+    let secret_name = state.config.claude_gateway.token_secret.trim();
+    let secret_name = if secret_name.is_empty() {
+        "claude_gateway_token"
+    } else {
+        secret_name
+    };
+    if let Some(existing) = state.secrets.get(secret_name)
+        && !existing.trim().is_empty()
+    {
+        return Ok(existing);
+    }
+
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    state.secrets.persist(&[(secret_name, token.as_str())])?;
+    Ok(token)
+}
+
 /// The loopback gateway a `claude-agent-sdk` sign-in is relayed to, with the
-/// gateway bearer token. The token comes from the provider's stored credential
-/// (the per-user key) when there is one, else from the server-level
-/// `[claude_gateway] token_secret` in the age store — so "Sign in with
-/// browser" works on a provider saved without a key. `None` for every other
-/// kind.
+/// gateway bearer token. `None` for every other kind.
 fn gateway_endpoint(
     state: &ApiState,
     user: &ActingUser,
@@ -731,24 +783,7 @@ fn gateway_endpoint(
         return Ok(None);
     }
     let base_url = crate::providers::resolve_base_url(kind, &profile.base_url)?;
-    let token = match state.users.resolve_with_owner(&user.id, id)? {
-        Some((_, secret)) => {
-            let credential = crate::user_secrets::ProviderCredential::parse(&secret)?;
-            if credential.api_key.trim().is_empty() {
-                None
-            } else {
-                Some(credential.api_key)
-            }
-        }
-        None => None,
-    };
-    let token = token.or_else(|| state.secrets.get(&state.config.claude_gateway.token_secret));
-    let Some(token) = token else {
-        return Err(SeraError::Rejected {
-            code: "gateway_token_missing",
-            message: "The Claude Agent SDK gateway token is not set yet. Generate or save a gateway token on this card first.".into(),
-        });
-    };
+    let token = ensure_gateway_token(state, user, id, profile)?;
     Ok(Some(GatewayEndpoint::validated(
         &base_url,
         zeroize::Zeroizing::new(token),
@@ -779,6 +814,16 @@ pub(super) async fn provider_signin_start(
     };
     let started = match gateway_endpoint(&state, &user, &id, &profile, &kind)? {
         Some(gateway) => {
+            if state.config.claude_gateway.auto_start {
+                state
+                    .claude_gateway
+                    .ensure_running(
+                        &gateway.base_url,
+                        gateway.token.as_str(),
+                        &state.config.claude_gateway,
+                    )
+                    .await?;
+            }
             state
                 .signin
                 .start_with_gateway(&user.id, &id, &kind, request, gateway)
@@ -869,8 +914,9 @@ pub(super) async fn provider_signin_status(
     Ok(Json(body))
 }
 
-/// `GET /v1/providers/{id}/gateway-status`: probes `/health` and, if token
-/// exists, `/v1/auth/status`.
+/// `GET /v1/providers/{id}/gateway-status`: auto-bootstraps the gateway token,
+/// auto-starts the loopback gateway when enabled, and probes `/health` and
+/// `/v1/auth/status`.
 pub(super) async fn provider_gateway_status(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
@@ -884,13 +930,26 @@ pub(super) async fn provider_gateway_status(
         });
     }
     let base_url = crate::providers::resolve_base_url(&kind, &profile.base_url)?;
+    let token = ensure_gateway_token(&state, &user, &id, &profile)?;
+    let start_error = if state.config.claude_gateway.auto_start {
+        state
+            .claude_gateway
+            .ensure_running(&base_url, &token, &state.config.claude_gateway)
+            .await
+            .err()
+            .map(|err| err.to_string())
+    } else {
+        None
+    };
     let health = crate::auth_flows::gateway::gateway_health(&base_url)
         .await
         .ok();
     let reachable = health.is_some();
-    let endpoint = gateway_endpoint(&state, &user, &id, &profile, &kind)
-        .ok()
-        .flatten();
+    let endpoint = crate::auth_flows::gateway::GatewayEndpoint::validated(
+        &base_url,
+        zeroize::Zeroizing::new(token),
+    )
+    .ok();
     let token_configured = endpoint.is_some();
     let auth_status = if let (true, Some(ep)) = (reachable, endpoint.as_ref()) {
         crate::auth_flows::gateway::gateway_auth_status(ep)
@@ -934,6 +993,37 @@ pub(super) async fn provider_gateway_status(
         "sdk_installed": pick_bool("sdk_installed"),
         "default_cli_login": default_cli_login,
         "profiles": profiles,
+        "start_error": start_error,
+    })))
+}
+
+/// `POST /v1/providers/{id}/gateway-start`: ensures the loopback gateway
+/// token exists and starts the local `claude-agent-sdk` gateway if needed.
+pub(super) async fn provider_gateway_start(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    let (profile, kind) = provider_context(&state, &id)?;
+    if kind != "claude-agent-sdk" {
+        return Err(SeraError::Rejected {
+            code: "not_gateway_provider",
+            message: "This provider is not a Claude Agent SDK gateway.".into(),
+        });
+    }
+    let base_url = crate::providers::resolve_base_url(&kind, &profile.base_url)?;
+    let token = ensure_gateway_token(&state, &user, &id, &profile)?;
+    let start_state = state
+        .claude_gateway
+        .ensure_running(&base_url, &token, &state.config.claude_gateway)
+        .await?;
+    let status_word = match start_state {
+        crate::claude_gateway_proc::GatewayStartState::AlreadyRunning => "already_running",
+        crate::claude_gateway_proc::GatewayStartState::Started => "started",
+    };
+    Ok(Json(json!({
+        "ok": true,
+        "state": status_word,
     })))
 }
 
@@ -1038,6 +1128,16 @@ pub(super) async fn provider_gateway_import_cli(
             message: "This provider is not a Claude Agent SDK gateway.".into(),
         }
     })?;
+    if state.config.claude_gateway.auto_start {
+        state
+            .claude_gateway
+            .ensure_running(
+                &endpoint.base_url,
+                endpoint.token.as_str(),
+                &state.config.claude_gateway,
+            )
+            .await?;
+    }
     let outcome = state
         .signin
         .import_gateway_cli_account(&user.id, &id, &endpoint)

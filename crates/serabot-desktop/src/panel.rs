@@ -845,6 +845,16 @@ fn composio_error_text(error: &ApiError) -> String {
     }
 }
 
+fn sync_provider_error_text(error: &ApiError) -> String {
+    match error {
+        ApiError::Coded { message, .. } | ApiError::Rejected(message) => message.clone(),
+        ApiError::Http(502..=504) => {
+            "Vault sync could not reach the password manager. Try again shortly.".into()
+        }
+        other => other.to_string(),
+    }
+}
+
 // --------------------------------------------------------------- browser --
 
 pub struct PanelState {
@@ -2197,7 +2207,7 @@ impl PanelState {
             }
             PanelKind::SyncProvider => {
                 self.vault.provider_syncing = None;
-                self.vault.provider_error = Some(message);
+                self.vault.provider_error = Some(sync_provider_error_text(&error));
             }
             PanelKind::ImportList => {
                 self.vault.import_loading = None;
@@ -3805,5 +3815,50 @@ mod tests {
             state.next_op(t0),
             Some(PanelOp::VaultList { domain: None })
         ));
+    }
+
+    #[test]
+    fn sync_provider_surfaces_coded_and_rejected_errors_cleanly() {
+        let t0 = Instant::now();
+        let mut state = PanelState::new();
+        state.vault.provider_syncing = Some("protonpass".into());
+
+        state.apply(
+            done(
+                &state,
+                PanelKind::SyncProvider,
+                Err(coded(
+                    "vault_cli_timeout",
+                    "the password manager did not answer in time",
+                )),
+            ),
+            t0,
+        );
+        assert!(state.vault.provider_syncing.is_none());
+        assert_eq!(
+            state.vault.provider_error.as_deref(),
+            Some("the password manager did not answer in time")
+        );
+
+        state.vault.provider_syncing = Some("protonpass".into());
+        state.apply(
+            done(
+                &state,
+                PanelKind::SyncProvider,
+                Err(ApiError::Rejected(
+                    "Proton Pass access token is invalid, expired, or revoked".into(),
+                )),
+            ),
+            t0,
+        );
+        assert_eq!(
+            state.vault.provider_error.as_deref(),
+            Some("Proton Pass access token is invalid, expired, or revoked")
+        );
+
+        assert_eq!(
+            sync_provider_error_text(&ApiError::Http(502)),
+            "Vault sync could not reach the password manager. Try again shortly."
+        );
     }
 }

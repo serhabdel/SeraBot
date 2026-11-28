@@ -503,9 +503,18 @@ pub fn primary_catalog_url(base: &str) -> Result<String> {
 pub fn catalog_urls(catalog_or_base: &str) -> Result<Vec<String>> {
     let parsed = url::Url::parse(catalog_or_base)
         .map_err(|_| SeraError::Config("invalid catalog base url".into()))?;
+    let host = parsed.host_str().unwrap_or("");
+    let is_enterprise = host.starts_with("businessaicode.");
     let origin = origin_string(&parsed);
     Ok(cloud_code_origins(&origin)?
         .into_iter()
+        .filter(|item| {
+            is_enterprise
+                || !url::Url::parse(item)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|h| h.starts_with("businessaicode.")))
+                    .unwrap_or(false)
+        })
         .map(|item| format!("{item}/v1internal:fetchAvailableModels"))
         .collect())
 }

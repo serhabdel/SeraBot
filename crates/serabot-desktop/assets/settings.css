@@ -11,25 +11,48 @@
 }
 
 .pane-body.settings-layout > .settings-nav {
-  flex: 0 0 236px;
+  flex: 0 0 256px;
   height: 100%;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  padding: 14px 12px 24px;
+  min-height: 0;
+  overflow: hidden;
+  padding: 0;
   border-right: 1px solid var(--hairline);
   position: static;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+}
+
+.pane-body.settings-layout > .settings-nav > .settings-search {
+  flex: 0 0 auto;
+  padding: 12px 12px 10px;
+  border-bottom: 1px solid var(--hairline);
+  background: var(--surface);
+}
+
+.pane-body.settings-layout > .settings-nav > .settings-nav-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 10px 10px 24px;
   display: flex;
   flex-direction: column;
   gap: 2px;
 }
 
-.pane-body.settings-layout > .settings-nav > .settings-search {
-  position: sticky;
-  top: 0;
-  z-index: 1;
-  margin: -14px -12px 8px;
-  padding: 14px 12px 10px;
-  background: var(--surface);
+.settings-search-wrap .input {
+  padding-left: 30px;
+  padding-right: 28px;
+}
+
+.settings-search-clear {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 22px;
+  height: 22px;
 }
 
 .settings-nav-item {
@@ -280,10 +303,9 @@
 
   .pane-body.settings-layout > .settings-nav {
     flex: 0 0 auto;
-    flex-direction: row;
-    flex-wrap: wrap;
+    flex-direction: column;
     height: auto;
-    max-height: 40%;
+    max-height: 44%;
     width: 100%;
     border-right: 0;
     border-bottom: 1px solid var(--hairline);
@@ -291,8 +313,7 @@
   }
 
   .pane-body.settings-layout > .settings-nav > .settings-search {
-    flex: 1 0 100%;
-    margin: -14px -12px 6px;
+    flex: 0 0 auto;
   }
 
   .pane-body.settings-layout > .settings-content {
