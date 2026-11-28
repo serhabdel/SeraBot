@@ -53,14 +53,14 @@ from starlette.routing import Route
 
 logger = logging.getLogger("serabot.claude_gateway")
 
-GATEWAY_VERSION = "0.74.34"
+GATEWAY_VERSION = "0.74.35"
 TOKEN_ENV_VAR = "SERABOT_CLAUDE_GATEWAY_TOKEN"
 HOST_ENV_VAR = "SERABOT_CLAUDE_GATEWAY_HOST"
 STATE_DIR_ENV_VAR = "SERABOT_CLAUDE_GATEWAY_STATE_DIR"
 CLI_PATH_ENV_VAR = "SERABOT_CLAUDE_CLI_PATH"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8791
-DEFAULT_MODEL = "claude-sonnet-4-5"
+DEFAULT_MODEL = "claude-sonnet-4-6"
 
 AUTH_FLOW_TTL_SECS = 600
 MAX_AUTH_FLOWS = 8
@@ -130,11 +130,11 @@ _USAGE_WINDOW_SPECS: tuple[tuple[str, str], ...] = (
 )
 
 SUPPORTED_MODELS: list[dict[str, str]] = [
+    {"id": "claude-sonnet-4-6"},
+    {"id": "claude-opus-4-6"},
     {"id": "claude-sonnet-4-5"},
     {"id": "claude-opus-4-5"},
     {"id": "claude-haiku-4-5"},
-    {"id": "claude-sonnet-4-6"},
-    {"id": "claude-opus-4-6"},
 ]
 
 MCP_SERVER_NAME = "serabot"
@@ -325,7 +325,37 @@ def _find_claude_cli() -> str | None:
         if os.path.isfile(cleaned):
             return cleaned
         return shutil.which(cleaned)
-    return shutil.which("claude")
+
+    which_cli = shutil.which("claude")
+    if which_cli:
+        return which_cli
+
+    exe_name = "claude.exe" if os.name == "nt" else "claude"
+    home = Path.home()
+    candidates: list[Path] = [
+        home / ".local" / "bin" / exe_name,
+        home / ".claude" / "local" / exe_name,
+        home / ".npm-global" / "bin" / exe_name,
+        Path("/usr/local/bin") / exe_name,
+    ]
+    # claude-agent-sdk bundles a native Claude Code binary under _bundled/.
+    try:
+        import importlib.util
+
+        spec = importlib.util.find_spec("claude_agent_sdk")
+        if spec is not None and spec.origin:
+            sdk_dir = Path(spec.origin).resolve().parent
+            candidates.append(sdk_dir / "_bundled" / exe_name)
+    except Exception:
+        pass
+
+    for candidate in candidates:
+        try:
+            if candidate.is_file() and (os.name == "nt" or os.access(candidate, os.X_OK)):
+                return str(candidate)
+        except OSError:
+            continue
+    return None
 
 
 def _cli_version(cli_path: str | None = None) -> str | None:
@@ -850,6 +880,9 @@ def _build_agent_options(
             kwargs["env"] = clean_env
         if effort is not None and (accepts_varkw or "effort" in params):
             kwargs["effort"] = effort
+        cli_path = _find_claude_cli()
+        if cli_path and (accepts_varkw or "cli_path" in params):
+            kwargs["cli_path"] = cli_path
     except (TypeError, ValueError):
         pass
 
@@ -1908,6 +1941,20 @@ async def auth_token(request: Request) -> JSONResponse:
             return JSONResponse(
                 {"error": str(exc), "code": "invalid_profile"}, status_code=400
             )
+    verify = bool(payload.get("verify", False))
+    quota = None
+    if verify:
+        ok, reject_code, quota = await asyncio.to_thread(_probe_anthropic_token, kind, token)
+        if not ok:
+            msg = (
+                "Anthropic rejected this API key. Check the key and try again."
+                if kind == "api_key"
+                else "Claude rejected this setup-token. Run `claude setup-token` again and paste the fresh token."
+            )
+            return JSONResponse(
+                {"error": msg, "code": reject_code or "invalid_token"},
+                status_code=401,
+            )
     profile_name, profile_dir = _resolve_profile_dir(profile, create=True)
     assert profile_dir is not None
     try:
@@ -1921,14 +1968,15 @@ async def auth_token(request: Request) -> JSONResponse:
     account = await asyncio.to_thread(_read_cli_status, profile_dir) or {}
     account = {**account, "loggedIn": True, "authMethod": kind}
     logger.info("token account stored profile=%s kind=%s", profile_name, kind)
-    return JSONResponse(
-        {
-            "ok": True,
-            "profile": profile_name,
-            "account": account,
-            "billing": "plan" if kind == "oauth_token" else "api",
-        }
-    )
+    body: dict[str, Any] = {
+        "ok": True,
+        "profile": profile_name,
+        "account": account,
+        "billing": "plan" if kind == "oauth_token" else "api",
+    }
+    if quota is not None:
+        body["quota"] = quota
+    return JSONResponse(body)
 
 
 async def auth_import_cli(request: Request) -> JSONResponse:
@@ -1998,6 +2046,159 @@ async def auth_usage(request: Request) -> JSONResponse:
     return JSONResponse({"available": False, "quota": None})
 
 
+def _probe_anthropic_token(kind: str, token: str) -> tuple[bool, str | None, dict[str, Any] | None]:
+    """Verify an Anthropic OAuth token or Console API key against Anthropic.
+
+    Returns ``(ok, reject_code, quota_snapshot)``.
+    - ``ok=True`` when Anthropic accepts the credential (HTTP 200) or when the
+      probe fails only due to transient network/unreachable errors (so offline
+      or rate-limited checks don't falsely mark a live session broken).
+    - ``ok=False`` with ``reject_code`` (``"needs_reauth"`` or
+      ``"credentials_rejected"``) when Anthropic explicitly returns 401/403.
+    """
+    opener = urllib.request.build_opener(_NoRedirect)
+    if kind == "api_key":
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/models",
+            method="GET",
+            headers={
+                "x-api-key": token,
+                "anthropic-version": "2023-06-01",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with opener.open(req, timeout=USAGE_TIMEOUT_SECS) as resp:
+                if getattr(resp, "status", 200) in (401, 403):
+                    return (False, "credentials_rejected", None)
+                return (True, None, None)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                return (False, "credentials_rejected", None)
+            return (True, None, None)
+        except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+            return (True, None, None)
+
+    req = urllib.request.Request(
+        ANTHROPIC_OAUTH_USAGE_URL,
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "claude-code/2.0.0",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with opener.open(req, timeout=USAGE_TIMEOUT_SECS) as resp:
+            raw = resp.read(USAGE_MAX_BODY_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return (False, "needs_reauth", None)
+        return (True, None, None)
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+        return (True, None, None)
+
+    if len(raw) > USAGE_MAX_BODY_BYTES:
+        return (True, None, None)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return (True, None, None)
+    snapshot = _parse_oauth_usage_snapshot(data) if isinstance(data, dict) else None
+    return (True, None, snapshot)
+
+
+async def auth_verify(request: Request) -> JSONResponse:
+    """Verify a stored profile's Claude subscription or API key against Anthropic."""
+    auth_error = _check_bearer_auth(request)
+    if auth_error is not None:
+        return auth_error
+
+    raw_profile: str | None = request.headers.get("x-claude-profile")
+    if raw_profile is None:
+        try:
+            body = await request.json()
+            if isinstance(body, dict) and isinstance(body.get("profile"), str):
+                raw_profile = body["profile"]
+        except Exception:
+            pass
+    try:
+        profile_key, profile_dir = _resolve_profile_dir(raw_profile, create=False)
+    except ValueError as exc:
+        return JSONResponse(
+            {"ok": False, "error": str(exc), "code": "invalid_profile"},
+            status_code=400,
+        )
+
+    stored = _read_profile_token(profile_dir)
+    if stored is not None:
+        kind, token = stored
+        ok, reject_code, quota = await asyncio.to_thread(
+            _probe_anthropic_token, kind, token
+        )
+        if not ok:
+            msg = (
+                "Anthropic rejected this API key."
+                if kind == "api_key"
+                else "Claude rejected this setup-token. Run `claude setup-token` again or sign in with your browser."
+            )
+            return JSONResponse(
+                {"ok": False, "profile": profile_key, "code": reject_code, "error": msg},
+                status_code=401,
+            )
+        return JSONResponse(
+            {
+                "ok": True,
+                "profile": profile_key,
+                "mode": kind,
+                "billing": "api" if kind == "api_key" else "plan",
+                "quota": quota,
+                "model_count": len(SUPPORTED_MODELS),
+            }
+        )
+
+    account = await asyncio.to_thread(_read_cli_status, profile_dir)
+    if account is None:
+        return JSONResponse(
+            {
+                "ok": False,
+                "profile": profile_key,
+                "code": "not_signed_in",
+                "error": "This Claude profile is not signed in yet.",
+            },
+            status_code=401,
+        )
+
+    oauth_token = _read_oauth_access_token(profile_dir)
+    quota = None
+    if oauth_token is not None:
+        ok, reject_code, quota = await asyncio.to_thread(
+            _probe_anthropic_token, "oauth_token", oauth_token
+        )
+        if not ok:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "profile": profile_key,
+                    "code": reject_code or "needs_reauth",
+                    "error": "Claude session expired. Sign in again.",
+                },
+                status_code=401,
+            )
+    return JSONResponse(
+        {
+            "ok": True,
+            "profile": profile_key,
+            "mode": "cli_login",
+            "billing": "plan",
+            "account": account,
+            "quota": quota,
+            "model_count": len(SUPPORTED_MODELS),
+        }
+    )
+
+
 @asynccontextmanager
 async def lifespan(_app: Starlette):
     env_host = os.environ.get(HOST_ENV_VAR, DEFAULT_HOST)
@@ -2022,6 +2223,7 @@ app = Starlette(
         Route("/v1/auth/complete", auth_complete, methods=["POST"]),
         Route("/v1/auth/import-cli", auth_import_cli, methods=["POST"]),
         Route("/v1/auth/token", auth_token, methods=["POST"]),
+        Route("/v1/auth/verify", auth_verify, methods=["POST"]),
         Route("/v1/auth/cancel", auth_cancel, methods=["POST"]),
         Route("/v1/auth/usage", auth_usage, methods=["GET"]),
     ],

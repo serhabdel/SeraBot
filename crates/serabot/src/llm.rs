@@ -183,6 +183,12 @@ pub struct LlmClient {
     /// The profile name for a `claude-agent-sdk` gateway account, sent as
     /// `X-Claude-Profile` and `"profile"`.
     claude_profile: Option<String>,
+    /// Optional process supervisor so a `claude-agent-sdk` turn can auto-start
+    /// or revive the loopback gateway if it stopped.
+    claude_gateway_supervisor: Option<(
+        Arc<crate::claude_gateway_proc::ClaudeGatewaySupervisor>,
+        crate::config::ClaudeGatewayConfig,
+    )>,
 }
 
 /// What a Codex request carries beyond the bearer: the ChatGPT workspace the
@@ -249,6 +255,7 @@ impl LlmClient {
             codex: None,
             copilot: false,
             claude_profile: None,
+            claude_gateway_supervisor: None,
         })
     }
 
@@ -316,6 +323,17 @@ impl LlmClient {
         if !trimmed.is_empty() {
             self.claude_profile = Some(trimmed.to_owned());
         }
+        self
+    }
+
+    /// Attach a gateway process supervisor so turns auto-start or revive the
+    /// loopback Claude Agent SDK gateway on connect failure.
+    pub fn with_claude_gateway_supervisor(
+        mut self,
+        supervisor: Arc<crate::claude_gateway_proc::ClaudeGatewaySupervisor>,
+        cfg: crate::config::ClaudeGatewayConfig,
+    ) -> Self {
+        self.claude_gateway_supervisor = Some((supervisor, cfg));
         self
     }
 

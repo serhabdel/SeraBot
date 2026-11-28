@@ -494,7 +494,9 @@ pub(super) fn AddAccountSheet(session: Signal<Session>, overlay: Signal<Overlay>
                     }
                 }
                 match method {
-                    Some(AddMethod::Key) => rsx! {
+                    Some(choice @ (AddMethod::Key | AddMethod::SetupToken)) => {
+                        let is_setup_token = choice == AddMethod::SetupToken;
+                        rsx! {
                         div { class: "form-grid",
                             div { class: "field",
                                 label { class: "field-label", r#for: "account-label-input", "Label" }
@@ -508,9 +510,35 @@ pub(super) fn AddAccountSheet(session: Signal<Session>, overlay: Signal<Overlay>
                                 }
                                 span { class: "hint", "{Session::account_label_hint()}" }
                             }
+                            if is_setup_token {
+                                div { class: "field",
+                                    span { class: "field-label", "1. Run on any computer signed in to Claude" }
+                                    div { class: "row",
+                                        code { class: "flow-link grow", "claude setup-token" }
+                                        button {
+                                            class: "btn ghost sm",
+                                            r#type: "button",
+                                            onclick: move |_| {
+                                                let _ = dioxus::document::eval(&copy_script("claude setup-token"));
+                                            },
+                                            Icon { name: "copy", size: 14 }
+                                            "Copy"
+                                        }
+                                    }
+                                    span { class: "hint",
+                                        "Creates a 1-year subscription token (best for remote servers without a browser). Counts against your Claude Pro, Max, or Ultra plan."
+                                    }
+                                }
+                            }
                             div { class: "field",
                                 label { class: "field-label", r#for: "account-key-input",
-                                    if is_gateway { "Claude token or API key" } else { "API key" }
+                                    if is_setup_token {
+                                        "2. Paste your setup-token"
+                                    } else if is_gateway {
+                                        "Anthropic Console API key"
+                                    } else {
+                                        "API key"
+                                    }
                                 }
                                 div { class: "secret-field",
                                     input {
@@ -520,7 +548,13 @@ pub(super) fn AddAccountSheet(session: Signal<Session>, overlay: Signal<Overlay>
                                         autocomplete: "off",
                                         spellcheck: false,
                                         value: "{key}",
-                                        placeholder: if is_gateway { "sk-ant-oat01-\u{2026} or sk-ant-api\u{2026}" } else { "Paste the key" },
+                                        placeholder: if is_setup_token {
+                                            "sk-ant-oat01-\u{2026}"
+                                        } else if is_gateway {
+                                            "sk-ant-api\u{2026}"
+                                        } else {
+                                            "Paste the key"
+                                        },
                                         oninput: move |event| {
                                             let next = event.value();
                                             if next.is_empty() {
@@ -545,25 +579,30 @@ pub(super) fn AddAccountSheet(session: Signal<Session>, overlay: Signal<Overlay>
                                         Icon { name: if key_revealed { "eye-off".to_owned() } else { "eye".to_owned() }, size: 14 }
                                     }
                                 }
-                                if is_gateway {
+                                if is_setup_token {
+                                    span { class: "hint", "Stored only in this gateway's isolated profile, never shown again." }
+                                } else if is_gateway {
                                     span { class: "hint",
-                                        "Claude Pro or Max: run claude setup-token on any computer signed in to your plan and paste the sk-ant-oat01-\u{2026} token it prints. Usage counts against your plan's limits. An sk-ant-api\u{2026} key bills pay-as-you-go instead. The token is kept by the gateway, never shown again."
+                                        "Pay-as-you-go Console API key (or monthly API credits from Max / Ultra / Team). Stored in an isolated profile, never shown again."
                                     }
                                 } else {
                                     span { class: "hint", "Saved to your account only, encrypted. It is never shown again." }
                                 }
-                                if let Some(url) = key_url {
-                                    button {
-                                        class: "btn ghost sm",
-                                        r#type: "button",
-                                        onclick: move |_| session.write().open_in_browser(url.to_owned()),
-                                        Icon { name: "external", size: 14 }
-                                        "Get a key"
+                                if !is_setup_token {
+                                    if let Some(url) = key_url {
+                                        button {
+                                            class: "btn ghost sm",
+                                            r#type: "button",
+                                            onclick: move |_| session.write().open_in_browser(url.to_owned()),
+                                            Icon { name: "external", size: 14 }
+                                            "Get a key"
+                                        }
                                     }
                                 }
                             }
                         }
-                    },
+                    }
+                    }
                     Some(choice @ (AddMethod::Browser | AddMethod::Device)) => rsx! {
                         FlowPanel {
                             session,
@@ -590,7 +629,7 @@ pub(super) fn AddAccountSheet(session: Signal<Session>, overlay: Signal<Overlay>
                     onclick: close,
                     if flow.as_ref().is_some_and(|f| f.phase.is_final()) { "Done" } else { "Cancel" }
                 }
-                if method == Some(AddMethod::Key) {
+                if matches!(method, Some(AddMethod::Key | AddMethod::SetupToken)) {
                     button {
                         class: "btn primary",
                         r#type: "button",
@@ -818,12 +857,12 @@ fn FlowPanel(
                         }
                     } else if is_gateway_pkce {
                         if let Some(flow_id) = flow.flow_id.clone() {
-                            details { class: "field gateway-paste",
-                                summary { class: "field-label",
-                                    "Browser shows a code, or cannot reach localhost?"
+                            div { class: "field gateway-paste",
+                                label { class: "field-label", r#for: "gateway-auth-code-input",
+                                    "On a remote server, or browser showed a code?"
                                 }
                                 p { class: "hint",
-                                    "Open the code page, approve, and paste the code it shows (it has a # in the middle). If the browser stopped on a localhost address instead, paste that whole address."
+                                    "If the page did not finish automatically, open the code page, approve, and paste the code#state it shows (or paste the whole localhost redirect URL)."
                                 }
                                 if let Some(manual) = flow.manual_url.clone() {
                                     div { class: "route-actions",

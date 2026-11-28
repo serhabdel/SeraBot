@@ -580,6 +580,84 @@ pub(super) async fn test_provider_account(
     if !profile.data_egress_approved {
         return Ok(reply(false, "egress_not_approved", 0));
     }
+    if kind == "claude-agent-sdk" {
+        let endpoint = gateway_endpoint(&state, &user, &id, &profile, &kind)?
+            .ok_or_else(|| SeraError::Internal("gateway provider without an endpoint".into()))?;
+        if state.config.claude_gateway.auto_start {
+            state
+                .claude_gateway
+                .ensure_running(
+                    &endpoint.base_url,
+                    endpoint.token.as_str(),
+                    &state.config.claude_gateway,
+                )
+                .await?;
+        }
+        let claude_profile = account
+            .identity
+            .get("profile")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
+        let (ok, status, models) = match crate::auth_flows::gateway::gateway_auth_verify(
+            &endpoint,
+            claude_profile,
+        )
+        .await
+        {
+            Ok(verify_reply) => {
+                if account.status == AccountStatus::NeedsReauth {
+                    state.accounts.set_status(
+                        &user.id,
+                        &id,
+                        &account_id,
+                        AccountStatus::Ok,
+                        None,
+                        None,
+                    )?;
+                }
+                if let Some(quota) = verify_reply.get("quota").filter(|v| v.is_object()) {
+                    let _ = state.accounts.store().set_provider_account_quota(
+                        &user.id,
+                        &id,
+                        &account_id,
+                        quota,
+                    );
+                }
+                let count = verify_reply
+                    .get("model_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(5) as usize;
+                (true, "ok", count)
+            }
+            Err(SeraError::Rejected {
+                code: "needs_reauth" | "credentials_rejected",
+                message,
+            }) => {
+                state.accounts.set_status(
+                    &user.id,
+                    &id,
+                    &account_id,
+                    AccountStatus::NeedsReauth,
+                    Some(&message),
+                    None,
+                )?;
+                (false, "needs_reauth", 0)
+            }
+            Err(SeraError::Rejected {
+                code: "gateway_unauthorized",
+                ..
+            }) => (false, "key_rejected", 0),
+            Err(_) => (false, "unreachable", 0),
+        };
+        audit_auth(
+            &state,
+            &user.id,
+            "provider.account_tested",
+            json!({"provider": id, "account": account_id, "status": status}),
+        )?;
+        return Ok(reply(ok, status, models));
+    }
     if !profile.catalog_fetch {
         return Ok(reply(false, "no_catalog", 0));
     }
@@ -769,7 +847,7 @@ pub(super) struct SigninStartRequest {
 /// uses the member's per-user `api_key` if set, else the server-level
 /// `[claude_gateway] token_secret` in the age store, or generates and persists
 /// a fresh 32-byte URL-safe random token when neither exists.
-fn ensure_gateway_token(
+pub(super) fn ensure_gateway_token(
     state: &ApiState,
     user: &ActingUser,
     id: &str,
@@ -779,7 +857,9 @@ fn ensure_gateway_token(
 
     if let Some((_, secret)) = state.users.resolve_with_owner(&user.id, id)? {
         let credential = crate::user_secrets::ProviderCredential::parse(&secret)?;
-        if !credential.api_key.trim().is_empty() {
+        if !credential.api_key.trim().is_empty()
+            && !crate::auth_flows::gateway::is_claude_token(&credential.api_key)
+        {
             return Ok(credential.api_key);
         }
     }
@@ -805,7 +885,7 @@ fn ensure_gateway_token(
 
 /// The loopback gateway a `claude-agent-sdk` sign-in is relayed to, with the
 /// gateway bearer token. `None` for every other kind.
-fn gateway_endpoint(
+pub(super) fn gateway_endpoint(
     state: &ApiState,
     user: &ActingUser,
     id: &str,

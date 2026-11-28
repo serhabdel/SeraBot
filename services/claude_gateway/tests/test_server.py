@@ -420,11 +420,11 @@ class TestClaudeGateway(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             model_ids,
             [
+                "claude-sonnet-4-6",
+                "claude-opus-4-6",
                 "claude-sonnet-4-5",
                 "claude-opus-4-5",
                 "claude-haiku-4-5",
-                "claude-sonnet-4-6",
-                "claude-opus-4-6",
             ],
         )
 
@@ -1225,6 +1225,90 @@ class TestClaudeGateway(unittest.IsolatedAsyncioTestCase):
             status, body = await _asgi_request("GET", "/v1/auth/usage", headers=headers)
         self.assertEqual(status, 200)
         self.assertEqual(body, {"available": False, "quota": None})
+
+
+    def test_find_claude_cli_discovers_user_and_bundled_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp)
+            local_bin = fake_home / ".local" / "bin"
+            local_bin.mkdir(parents=True)
+            cli_name = "claude.exe" if os.name == "nt" else "claude"
+            cli_file = local_bin / cli_name
+            cli_file.write_text("#!/bin/sh\necho 2.0.0\n", encoding="utf-8")
+            cli_file.chmod(0o755)
+            with (
+                patch.dict(os.environ, {}, clear=False),
+                patch.object(server.shutil, "which", return_value=None),
+                patch.object(server.Path, "home", return_value=fake_home),
+            ):
+                os.environ.pop(server.CLI_PATH_ENV_VAR, None)
+                self.assertEqual(server._find_claude_cli(), str(cli_file))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sdk_pkg = Path(tmp) / "claude_agent_sdk"
+            bundled = sdk_pkg / "_bundled"
+            bundled.mkdir(parents=True)
+            cli_name = "claude.exe" if os.name == "nt" else "claude"
+            bundled_cli = bundled / cli_name
+            bundled_cli.write_text("#!/bin/sh\necho 2.0.0\n", encoding="utf-8")
+            bundled_cli.chmod(0o755)
+            init_py = sdk_pkg / "__init__.py"
+            init_py.write_text("", encoding="utf-8")
+
+            fake_spec = type("Spec", (), {"origin": str(init_py)})()
+            with (
+                patch.dict(os.environ, {}, clear=False),
+                patch.object(server.shutil, "which", return_value=None),
+                patch.object(server.Path, "home", return_value=Path(tmp) / "no_home"),
+                patch("importlib.util.find_spec", return_value=fake_spec),
+            ):
+                os.environ.pop(server.CLI_PATH_ENV_VAR, None)
+                self.assertEqual(server._find_claude_cli(), str(bundled_cli))
+
+    async def test_auth_verify_checks_stored_credentials(self) -> None:
+        headers = {"Authorization": "Bearer test-secret-token-123"}
+        # Unauthenticated profile -> 401
+        with patch.object(server, "_read_cli_status", return_value=None):
+            status, body = await _asgi_request(
+                "POST",
+                "/v1/auth/verify",
+                headers={**headers, "X-Claude-Profile": "empty_prof"},
+            )
+        self.assertEqual(status, 401)
+        self.assertEqual(body["code"], "not_signed_in")
+
+        # Stored setup-token verified ok -> 200 with billing=plan
+        oat = "sk-ant-oat01-" + "D" * 40
+        _, prof_dir = server._resolve_profile_dir("acct_verify_ok", create=True)
+        assert prof_dir is not None
+        server._store_profile_token(prof_dir, oat)
+        with patch.object(
+            server,
+            "_probe_anthropic_token",
+            return_value=(True, None, {"source": "claude", "state": "ok", "windows": []}),
+        ):
+            status, body = await _asgi_request(
+                "POST",
+                "/v1/auth/verify",
+                headers={**headers, "X-Claude-Profile": "acct_verify_ok"},
+            )
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["billing"], "plan")
+
+        # Stored setup-token rejected -> 401 needs_reauth
+        with patch.object(
+            server,
+            "_probe_anthropic_token",
+            return_value=(False, "needs_reauth", None),
+        ):
+            status, body = await _asgi_request(
+                "POST",
+                "/v1/auth/verify",
+                headers={**headers, "X-Claude-Profile": "acct_verify_ok"},
+            )
+        self.assertEqual(status, 401)
+        self.assertEqual(body["code"], "needs_reauth")
 
 
 if __name__ == "__main__":

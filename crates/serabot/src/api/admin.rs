@@ -112,21 +112,80 @@ pub(super) async fn admin_add_provider(
     };
     let kind = profile.kind.clone();
     let catalog_fetch = profile.catalog_fetch;
+    let is_gateway = kind == "claude-agent-sdk";
+    let claude_token_for_account = is_gateway
+        .then(|| {
+            request
+                .api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|k| crate::auth_flows::gateway::is_claude_token(k))
+                .map(str::to_owned)
+        })
+        .flatten();
+    let admin_api_key = if claude_token_for_account.is_some() {
+        None
+    } else {
+        request.api_key.as_deref()
+    };
     admin
         .add_provider_with_secrets(
             &state.config,
             &state.secrets,
             &request.id,
-            profile,
+            profile.clone(),
             ProviderSecrets {
-                api_key: request.api_key.as_deref(),
+                api_key: admin_api_key,
                 refresh_token: request.refresh_token.as_deref(),
                 oauth_client_id: request.oauth_client_id.as_deref(),
                 oauth_client_secret: request.oauth_client_secret.as_deref(),
             },
         )
         .map_err(admin_error)?;
+    if is_gateway {
+        let _ =
+            super::provider_accounts::ensure_gateway_token(&state, &user, &request.id, &profile);
+    }
     let applied = apply_provider_change(&state);
+    if let Some(claude_key) = claude_token_for_account {
+        let endpoint =
+            super::provider_accounts::gateway_endpoint(&state, &user, &request.id, &profile, &kind)
+                .map_err(admin_error)?
+                .ok_or_else(|| {
+                    admin_error(SeraError::Internal(
+                        "gateway provider without an endpoint".into(),
+                    ))
+                })?;
+        if state.config.claude_gateway.auto_start {
+            state
+                .claude_gateway
+                .ensure_running(
+                    &endpoint.base_url,
+                    endpoint.token.as_str(),
+                    &state.config.claude_gateway,
+                )
+                .await
+                .map_err(admin_error)?;
+        }
+        let outcome = state
+            .signin
+            .add_gateway_token_account(&user.id, &request.id, &endpoint, &claude_key, None)
+            .await
+            .map_err(admin_error)?;
+        state.runtime.invalidate_model_credentials(Some(&user.id));
+        audit_config(
+            &state,
+            &user.id,
+            "config.provider_saved",
+            json!({"provider": request.id, "kind": kind, "catalog_fetch": catalog_fetch, "applied": applied, "account": outcome.account_id}),
+        )?;
+        return Ok((
+            StatusCode::CREATED,
+            Json(
+                json!({"saved": true, "restart_required": !applied, "account_id": outcome.account_id}),
+            ),
+        ));
+    }
     audit_config(
         &state,
         &user.id,

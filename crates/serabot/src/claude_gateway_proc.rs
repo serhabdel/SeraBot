@@ -46,10 +46,12 @@ impl ClaudeGatewaySupervisor {
         }
     }
 
-    /// Ensure the loopback gateway at `base_url` is reachable.
+    /// Ensure the loopback gateway at `base_url` is reachable and accepts `token`.
     ///
-    /// Probes `/health` first; if unreachable and `cfg.auto_start` is true,
-    /// locates `services/claude_gateway/server.py` and Python, spawns
+    /// Probes `/health` and `/v1/auth/status` first; if a supervised child
+    /// rejects `token` (e.g. after token rotation), it is restarted with the
+    /// new token. If unreachable and `cfg.auto_start` is true, locates
+    /// `services/claude_gateway/server.py` and Python, spawns
     /// `uvicorn server:app` on loopback, and polls `/health` until ready.
     pub async fn ensure_running(
         &self,
@@ -59,7 +61,16 @@ impl ClaudeGatewaySupervisor {
     ) -> Result<GatewayStartState> {
         let normalized = validate_loopback_gateway_url(base_url)?;
         if probe_health(&normalized).await {
-            return Ok(GatewayStartState::AlreadyRunning);
+            match probe_auth_status(&normalized, token).await {
+                AuthProbe::Ok | AuthProbe::Unreachable => {
+                    return Ok(GatewayStartState::AlreadyRunning);
+                }
+                AuthProbe::Unauthorized => {
+                    // Fall through into start_lock to check whether this
+                    // supervisor owns the child (stale token) or if it is an
+                    // unmanaged external process.
+                }
+            }
         }
         if !cfg.auto_start {
             return Err(SeraError::Rejected {
@@ -70,7 +81,26 @@ impl ClaudeGatewaySupervisor {
 
         let _guard = self.start_lock.lock().await;
         if probe_health(&normalized).await {
-            return Ok(GatewayStartState::AlreadyRunning);
+            match probe_auth_status(&normalized, token).await {
+                AuthProbe::Ok | AuthProbe::Unreachable => {
+                    return Ok(GatewayStartState::AlreadyRunning);
+                }
+                AuthProbe::Unauthorized => {
+                    let mut map = self
+                        .children
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Some(mut stale) = map.remove(&normalized) {
+                        let _ = stale.kill();
+                        let _ = stale.wait();
+                    } else {
+                        return Err(SeraError::Rejected {
+                            code: "gateway_unauthorized",
+                            message: "Another Claude Agent gateway process is already listening on this port with a different bearer token. Stop it or update the gateway token.".into(),
+                        });
+                    }
+                }
+            }
         }
 
         // Reap any previously tracked child for this URL if it already exited.
@@ -179,6 +209,66 @@ impl ClaudeGatewaySupervisor {
             tokio::time::sleep(STARTUP_POLL_INTERVAL).await;
         }
     }
+    /// Start any configured `claude-agent-sdk` gateways at server boot when
+    /// `[claude_gateway] auto_start = true` and a gateway token exists (or
+    /// generate the default token so boot catalog refresh succeeds right away).
+    pub async fn ensure_configured_gateways(
+        &self,
+        config: &crate::config::Config,
+        secrets: &crate::secrets::SharedSecrets,
+    ) {
+        if !config.claude_gateway.auto_start {
+            return;
+        }
+        let primary_secret = config.claude_gateway.token_secret.trim();
+        let primary_secret = if primary_secret.is_empty() {
+            "claude_gateway_token"
+        } else {
+            primary_secret
+        };
+        for (id, profile) in &config.llm.providers {
+            if profile.kind != "claude-agent-sdk" {
+                continue;
+            }
+            let Ok(base_url) = crate::providers::resolve_base_url(&profile.kind, &profile.base_url)
+            else {
+                continue;
+            };
+            let secret_name = if profile.api_key_secret.trim().is_empty() {
+                primary_secret
+            } else {
+                profile.api_key_secret.trim()
+            };
+            let token = match secrets.get(secret_name) {
+                Some(existing) if !existing.trim().is_empty() => existing,
+                _ => match secrets.get(primary_secret) {
+                    Some(existing) if !existing.trim().is_empty() => existing,
+                    _ => {
+                        let generated = format!("sgw_{}", uuid::Uuid::new_v4().simple());
+                        if let Err(err) = secrets.persist(&[(primary_secret, generated.as_str())]) {
+                            tracing::warn!(provider = %id, %err, "failed to persist initial claude gateway token");
+                            continue;
+                        }
+                        generated
+                    }
+                },
+            };
+            match self
+                .ensure_running(&base_url, &token, &config.claude_gateway)
+                .await
+            {
+                Ok(GatewayStartState::Started) => {
+                    tracing::info!(provider = %id, url = %base_url, "started Claude Agent SDK gateway at boot");
+                }
+                Ok(GatewayStartState::AlreadyRunning) => {
+                    tracing::debug!(provider = %id, url = %base_url, "Claude Agent SDK gateway already running");
+                }
+                Err(err) => {
+                    tracing::warn!(provider = %id, url = %base_url, %err, "Claude Agent SDK gateway did not start at boot");
+                }
+            }
+        }
+    }
 }
 
 impl Drop for ClaudeGatewaySupervisor {
@@ -191,6 +281,33 @@ impl Drop for ClaudeGatewaySupervisor {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthProbe {
+    Ok,
+    Unauthorized,
+    Unreachable,
+}
+
+async fn probe_auth_status(normalized_base_url: &str, token: &str) -> AuthProbe {
+    let root = normalized_base_url
+        .trim_end_matches('/')
+        .strip_suffix("/v1")
+        .unwrap_or(normalized_base_url.trim_end_matches('/'));
+    let url = format!("{root}/v1/auth/status");
+    let Ok(client) = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(HEALTH_PROBE_TIMEOUT)
+        .build()
+    else {
+        return AuthProbe::Unreachable;
+    };
+    match client.get(url).bearer_auth(token).send().await {
+        Ok(resp) if resp.status().as_u16() == 401 => AuthProbe::Unauthorized,
+        Ok(resp) if resp.status().is_success() => AuthProbe::Ok,
+        _ => AuthProbe::Unreachable,
     }
 }
 
@@ -278,6 +395,8 @@ fn locate_python(configured: &str, gateway_dir: &Path) -> Result<PathBuf> {
     let candidates = [
         gateway_dir.join(".venv/bin/python"),
         gateway_dir.join(".venv/Scripts/python.exe"),
+        gateway_dir.join("venv/bin/python"),
+        gateway_dir.join("venv/Scripts/python.exe"),
         PathBuf::from("python3"),
         PathBuf::from("python"),
     ];

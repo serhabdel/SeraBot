@@ -649,12 +649,19 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
             config.llm.api_key_secret
         );
     }
-    let credentials = Arc::new(serabot::providers::UserProviderCredentials::new(
-        users.clone(),
-        secrets.clone(),
-        config.llm.timeout_secs,
-        config.llm.max_output_tokens,
-    ));
+    let claude_gateway = Arc::new(serabot::claude_gateway_proc::ClaudeGatewaySupervisor::new());
+    claude_gateway
+        .ensure_configured_gateways(&config, &secrets)
+        .await;
+    let credentials = Arc::new(
+        serabot::providers::UserProviderCredentials::new(
+            users.clone(),
+            secrets.clone(),
+            config.llm.timeout_secs,
+            config.llm.max_output_tokens,
+        )
+        .with_claude_gateway(claude_gateway.clone(), config.claude_gateway.clone()),
+    );
     // The API and the model clients refresh account tokens through one
     // single-flight refresher, so a rotated token is never spent twice.
     let account_refresher = credentials.refresher().clone();
@@ -1177,7 +1184,8 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         .with_local_relay(local_relay.clone())
         .with_ops(ops_watch.clone())
         .with_elevenlabs(elevenlabs.clone())
-        .with_browser(browser_manager.clone());
+        .with_browser(browser_manager.clone())
+        .with_claude_gateway(claude_gateway.clone());
         #[cfg(feature = "whatsapp-link")]
         let state = state.with_whatsapp_link(whatsapp_link.clone());
         if let Some(manager) = &browser_manager {

@@ -95,12 +95,6 @@ fn gateway_unreachable_error() -> SeraError {
 }
 
 fn map_gateway_error(status: reqwest::StatusCode, bytes: &[u8]) -> SeraError {
-    if status.as_u16() == 401 {
-        return SeraError::Rejected {
-            code: "gateway_unauthorized",
-            message: "The Claude Agent SDK gateway rejected the bearer token.".into(),
-        };
-    }
     let value: Value = serde_json::from_slice(bytes).unwrap_or(Value::Null);
     let code = value.get("code").and_then(Value::as_str);
     let gateway_message = || {
@@ -109,6 +103,24 @@ fn map_gateway_error(status: reqwest::StatusCode, bytes: &[u8]) -> SeraError {
             .and_then(Value::as_str)
             .map(|m| m.chars().take(240).collect::<String>())
     };
+    if status.as_u16() == 401 {
+        return match code {
+            Some("needs_reauth" | "not_signed_in") => SeraError::Rejected {
+                code: "needs_reauth",
+                message: gateway_message()
+                    .unwrap_or_else(|| "Claude rejected this account. Sign in again.".into()),
+            },
+            Some("credentials_rejected") => SeraError::Rejected {
+                code: "credentials_rejected",
+                message: gateway_message()
+                    .unwrap_or_else(|| "Anthropic rejected this API key.".into()),
+            },
+            _ => SeraError::Rejected {
+                code: "gateway_unauthorized",
+                message: "The Claude Agent SDK gateway rejected the bearer token.".into(),
+            },
+        };
+    }
     match (status.as_u16(), code) {
         (404 | 410, Some("flow_not_found" | "flow_expired")) => {
             return SeraError::Rejected {
@@ -392,6 +404,30 @@ pub async fn gateway_auth_import_cli(endpoint: &GatewayEndpoint) -> Result<Value
         return Err(SeraError::External(
             "the local gateway could not import the Claude CLI login".into(),
         ));
+    }
+    Ok(reply)
+}
+
+/// Verify a gateway profile's stored Claude credential live against Anthropic
+/// (`POST /v1/auth/verify`).
+pub async fn gateway_auth_verify(
+    endpoint: &GatewayEndpoint,
+    profile: Option<&str>,
+) -> Result<Value> {
+    let body = match profile {
+        Some(p) if !p.trim().is_empty() => json!({ "profile": p.trim() }),
+        _ => json!({}),
+    };
+    let reply = endpoint.post("/v1/auth/verify", body).await?;
+    if reply.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(SeraError::Rejected {
+            code: "needs_reauth",
+            message: reply
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("Claude rejected this account.")
+                .to_owned(),
+        });
     }
     Ok(reply)
 }
@@ -712,5 +748,45 @@ mod tests {
             error.to_string().contains("token exchange failed"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn gateway_auth_verify_maps_ok_and_needs_reauth() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/verify"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "profile": "tok_abc123",
+                "billing": "plan",
+                "model_count": 5,
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        let reply = gateway_auth_verify(&endpoint(&server), Some("tok_abc123"))
+            .await
+            .unwrap();
+        assert_eq!(reply["model_count"], 5);
+
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/verify"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "ok": false,
+                "code": "needs_reauth",
+                "error": "Claude rejected this setup-token.",
+            })))
+            .mount(&server)
+            .await;
+        let err = gateway_auth_verify(&endpoint(&server), Some("tok_abc123"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SeraError::Rejected {
+                code: "needs_reauth",
+                ..
+            }
+        ));
     }
 }

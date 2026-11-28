@@ -605,7 +605,7 @@ const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "anthropic",
         label: "Anthropic (Claude)",
-        subtitle: "Claude models on the native Messages API using an official Anthropic Console API key (console.anthropic.com/settings/keys). For Claude subscription or CLI access, use Claude Agent SDK (Gateway) or Desktop ACP.",
+        subtitle: "Claude models on the native Messages API using an official Anthropic Console API key (console.anthropic.com/settings/keys). For Claude Pro, Max, or Ultra subscriptions, use Claude Agent (Pro / Max / Ultra) or Desktop ACP.",
         base_url: "https://api.anthropic.com/v1",
         kind: "anthropic",
         default_id: "anthropic",
@@ -632,7 +632,7 @@ const PRESETS: &[ProviderPreset] = &[
         catalog_fetch: true,
         auth: "api_key",
         badge: "API Key",
-        note: "Uses an official Anthropic Console API key (console.anthropic.com/settings/keys); for Claude subscription or CLI access, use Claude Agent SDK (Gateway) or Desktop ACP",
+        note: "Uses an official Anthropic Console API key (console.anthropic.com/settings/keys); for Claude Pro, Max, or Ultra subscriptions, use Claude Agent (Pro / Max / Ultra) or Desktop ACP",
         key_url: "https://console.anthropic.com/settings/keys",
         sign_in: "",
         risk: "",
@@ -750,8 +750,8 @@ const PRESETS: &[ProviderPreset] = &[
     },
     ProviderPreset {
         id: "claude-agent-sdk",
-        label: "Claude Agent SDK (Gateway)",
-        subtitle: "Official Claude Agent SDK via local loopback gateway (October 2026 compliant)",
+        label: "Claude Agent (Pro / Max / Ultra)",
+        subtitle: "Use your Claude Pro, Max, or Ultra subscription (browser sign-in or setup-token) or Console API key",
         base_url: "http://127.0.0.1:8791",
         kind: "claude-agent-sdk",
         default_id: "claude-agent-sdk",
@@ -765,9 +765,9 @@ const PRESETS: &[ProviderPreset] = &[
         secret_name: "claude_gateway_token",
         catalog_fetch: true,
         auth: "api_key",
-        badge: "Gateway",
-        note: "Claude Agent SDK through the local loopback gateway. Sign in with your browser, or paste the token `claude setup-token` prints (sk-ant-oat01-…): both use your Claude Pro/Max plan limits. An sk-ant-api… key bills pay-as-you-go. Each account gets its own gateway profile. See docs/specs/claude-agent-sdk-gateway.md",
-        key_url: "",
+        badge: "Claude Plan",
+        note: "Official Claude Agent SDK: sign in with your Claude Pro, Max, or Ultra browser session, paste a 1-year `claude setup-token` (sk-ant-oat01-…), or add a separate Console API key (sk-ant-api…). Supports multiple accounts.",
+        key_url: "https://console.anthropic.com/settings/keys",
         // "Sign in with browser": relayed to the gateway, which runs the
         // first-party claude.ai OAuth flow (the `claude auth login` client).
         sign_in: "pkce",
@@ -1049,7 +1049,11 @@ mod tests {
                 .subtitle
                 .contains("console.anthropic.com/settings/keys")
         );
-        assert!(anthropic.subtitle.contains("Claude Agent SDK (Gateway)"));
+        assert!(
+            anthropic
+                .subtitle
+                .contains("Claude Agent (Pro / Max / Ultra)")
+        );
         let go = preset_for("opencode-go").unwrap();
         assert_eq!(go.kind, "opencode-go");
         assert_eq!(go.base_url, "https://opencode.ai/zen/go/v1");
