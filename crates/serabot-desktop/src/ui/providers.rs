@@ -843,10 +843,10 @@ fn GatewayStatusStrip(session: Signal<Session>, provider_id: String, can_write: 
     let importing = busy == Some("import");
     let ready = status
         .as_ref()
-        .is_some_and(|st| st.reachable && st.token_configured && st.auth_ok);
+        .is_some_and(|st| st.reachable && st.token_configured);
     let needs_setup = status
         .as_ref()
-        .is_some_and(|st| !st.reachable || !st.token_configured || !st.auth_ok);
+        .is_some_and(|st| !st.reachable || !st.token_configured);
     let can_import_cli = status.as_ref().is_some_and(|st| st.default_cli_login);
     let pid_check = provider_id.clone();
     let pid_gen = provider_id.clone();
