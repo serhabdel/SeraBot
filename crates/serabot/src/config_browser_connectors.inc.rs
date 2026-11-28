@@ -34,6 +34,11 @@ pub struct BrowserConfig {
     /// bot may also ask per session with `browser_navigate{light:true}`.
     #[serde(default)]
     pub block_heavy_resources: bool,
+    /// Pass `--disable-blink-features=AutomationControlled` so sites see
+    /// `navigator.webdriver === false` and are less likely to serve a captcha
+    /// to the automated browser. On by default (0.74.36).
+    #[serde(default = "default_true")]
+    pub hide_automation: bool,
 }
 
 impl Default for BrowserConfig {
@@ -52,6 +57,7 @@ impl Default for BrowserConfig {
             no_sandbox: false,
             auto_dismiss_banners: true,
             block_heavy_resources: false,
+            hide_automation: true,
         }
     }
 }

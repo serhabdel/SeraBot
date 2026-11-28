@@ -259,7 +259,7 @@ fn which_available(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn chromium_args(profile: &Path, no_sandbox: bool) -> Vec<String> {
+pub fn chromium_args(profile: &Path, no_sandbox: bool, hide_automation: bool) -> Vec<String> {
     let mut args = vec![
         "--headless=new".to_owned(),
         "--remote-debugging-address=127.0.0.1".to_owned(),
@@ -285,6 +285,11 @@ pub fn chromium_args(profile: &Path, no_sandbox: bool) -> Vec<String> {
     ];
     if no_sandbox {
         args.insert(1, "--no-sandbox".to_owned());
+    }
+    if hide_automation {
+        // navigator.webdriver === false: sites are less likely to serve a
+        // captcha to this browser. We never bypass a captcha that is shown.
+        args.push("--disable-blink-features=AutomationControlled".to_owned());
     }
     args
 }
@@ -349,6 +354,7 @@ pub struct ChromiumLauncher {
     executable: String,
     base_dir: PathBuf,
     no_sandbox: bool,
+    hide_automation: bool,
     timeout: Duration,
     block_heavy: bool,
 }
@@ -360,6 +366,7 @@ impl ChromiumLauncher {
             executable: resolve_chromium_executable(&config.chromium_executable)?,
             base_dir,
             no_sandbox: config.no_sandbox,
+            hide_automation: config.hide_automation,
             timeout: Duration::from_secs(config.request_timeout_secs.clamp(5, 120)),
             block_heavy: config.block_heavy_resources,
         })
@@ -375,7 +382,11 @@ impl BrowserLauncher for ChromiumLauncher {
         let port_file = profile.join("DevToolsActivePort");
         let _ = std::fs::remove_file(&port_file);
         let mut child = Command::new(&self.executable)
-            .args(chromium_args(&profile, self.no_sandbox))
+            .args(chromium_args(
+                &profile,
+                self.no_sandbox,
+                self.hide_automation,
+            ))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -407,10 +418,18 @@ impl BrowserLauncher for ChromiumLauncher {
         };
         let outline: SharedOutline = Arc::default();
         let heavy = Arc::new(AtomicBool::new(self.block_heavy));
-        match ChromiumBackend::setup(port, &path, self.timeout, outline.clone(), heavy.clone())
-            .await
+        let (frames, _) = tokio::sync::broadcast::channel(4);
+        match ChromiumBackend::setup(
+            port,
+            &path,
+            self.timeout,
+            outline.clone(),
+            heavy.clone(),
+            frames,
+        )
+        .await
         {
-            Ok((cdp, tabs, tasks)) => Ok(Arc::new(ChromiumBackend {
+            Ok((cdp, tabs, tasks, frames)) => Ok(Arc::new(ChromiumBackend {
                 cdp,
                 tabs,
                 child: Mutex::new(Some(child)),
@@ -419,6 +438,7 @@ impl BrowserLauncher for ChromiumLauncher {
                 pointer: std::sync::Mutex::new(None),
                 pointer_seq: AtomicU64::new(0),
                 block_heavy: heavy,
+                frames,
                 temp_root: self.base_dir.join(".tmp").join(user_id),
             })),
             Err(error) => {
@@ -443,6 +463,8 @@ pub struct ChromiumBackend {
     pointer_seq: AtomicU64,
     /// Skip images, media and fonts (shared with the event loop).
     block_heavy: Arc<AtomicBool>,
+    /// Live screencast frames (0.74.36), fed by the event loop.
+    frames: tokio::sync::broadcast::Sender<Vec<u8>>,
     /// `<base>/.tmp/<user>`: where a download is saved before it is read.
     temp_root: PathBuf,
 }
@@ -454,7 +476,13 @@ impl ChromiumBackend {
         timeout: Duration,
         outline: SharedOutline,
         heavy: Arc<AtomicBool>,
-    ) -> Result<(Arc<CdpConnection>, SharedTabs, Vec<JoinHandle<()>>)> {
+        frames: tokio::sync::broadcast::Sender<Vec<u8>>,
+    ) -> Result<(
+        Arc<CdpConnection>,
+        SharedTabs,
+        Vec<JoinHandle<()>>,
+        tokio::sync::broadcast::Sender<Vec<u8>>,
+    )> {
         let cdp = Arc::new(CdpConnection::connect(port, path, timeout).await?);
         let targets = cdp.call(None, "Target.getTargets", json!({})).await?;
         let existing = targets["targetInfos"]
@@ -473,7 +501,7 @@ impl ChromiumBackend {
         };
         let tabs: SharedTabs = Arc::default();
         // Subscribe before enabling Fetch so no paused request is missed.
-        let events = spawn_event_loop(cdp.clone(), tabs.clone(), outline, heavy);
+        let events = spawn_event_loop(cdp.clone(), tabs.clone(), outline, heavy, frames.clone());
         let _ = cdp
             .call(
                 None,
@@ -499,7 +527,7 @@ impl ChromiumBackend {
             events.abort();
             return Err(error);
         }
-        Ok((cdp, tabs, vec![events]))
+        Ok((cdp, tabs, vec![events], frames))
     }
 
     /// Attach to a page, register it (so its requests are guarded from the
@@ -634,6 +662,7 @@ fn spawn_event_loop(
     tabs: SharedTabs,
     outline: SharedOutline,
     heavy: Arc<AtomicBool>,
+    frames: tokio::sync::broadcast::Sender<Vec<u8>>,
 ) -> JoinHandle<()> {
     let mut events = cdp.subscribe();
     let verdicts: Arc<std::sync::Mutex<HashMap<String, (Instant, bool)>>> = Arc::default();
@@ -644,7 +673,7 @@ fn spawn_event_loop(
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => break,
             };
-            handle_event(&cdp, &tabs, &outline, &verdicts, &heavy, event);
+            handle_event(&cdp, &tabs, &outline, &verdicts, &heavy, &frames, event);
         }
     })
 }
@@ -779,6 +808,7 @@ fn handle_event(
     outline: &SharedOutline,
     verdicts: &Arc<std::sync::Mutex<HashMap<String, (Instant, bool)>>>,
     heavy: &Arc<AtomicBool>,
+    frames: &tokio::sync::broadcast::Sender<Vec<u8>>,
     event: CdpEvent,
 ) {
     let known_session = event
@@ -863,6 +893,29 @@ fn handle_event(
                     }
                 });
             }
+        }
+        "Page.screencastFrame" if known_session.is_some() => {
+            // Live frame for the owner view (0.74.36): decode, cap, broadcast,
+            // then ack so Chromium sends the next one.
+            let cdp = cdp.clone();
+            let session_id = known_session.unwrap_or_default();
+            let frames = frames.clone();
+            tokio::spawn(async move {
+                let data = event.params["data"].as_str().unwrap_or_default();
+                let frame_id = event.params["sessionId"].as_str().unwrap_or_default();
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data)
+                    && bytes.len() <= MAX_SCREENSHOT_BYTES
+                {
+                    let _ = frames.send(bytes);
+                }
+                let _ = cdp
+                    .call(
+                        Some(&session_id),
+                        "Page.screencastFrameAck",
+                        json!({"sessionId": frame_id}),
+                    )
+                    .await;
+            });
         }
         "Page.javascriptDialogOpening" if known_session.is_some() => {
             let cdp = cdp.clone();
@@ -1076,6 +1129,64 @@ impl BrowserBackend for ChromiumBackend {
             }
         }
         Err(browser_error("screenshot exceeds the 512 KiB limit"))
+    }
+
+    async fn screenshot_jpeg_quality(&self, max_quality: u32) -> Result<Vec<u8>> {
+        let start = max_quality.clamp(20, 90);
+        let mut qualities = vec![start, 50, 35, 20];
+        qualities.retain(|q| *q <= start);
+        for quality in qualities {
+            let shot = self
+                .call(
+                    "Page.captureScreenshot",
+                    json!({"format": "jpeg", "quality": quality}),
+                )
+                .await?;
+            let data = shot["data"]
+                .as_str()
+                .ok_or_else(|| browser_error("screenshot returned no data"))?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .map_err(|_| browser_error("screenshot was not valid base64"))?;
+            if bytes.len() <= MAX_SCREENSHOT_BYTES {
+                return Ok(bytes);
+            }
+        }
+        Err(browser_error("screenshot exceeds the 512 KiB limit"))
+    }
+
+    async fn cookie_names(&self) -> Result<Vec<(String, String)>> {
+        // Browser-level: no session needed. Names and domains only; the
+        // values stay inside Chromium and are never read.
+        let result = self
+            .cdp
+            .call(None, "Network.getAllCookies", json!({}))
+            .await?;
+        let cookies = result["cookies"].as_array().cloned().unwrap_or_default();
+        Ok(cookies
+            .iter()
+            .filter_map(|cookie| {
+                Some((
+                    cookie["domain"].as_str()?.to_owned(),
+                    cookie["name"].as_str()?.to_owned(),
+                ))
+            })
+            .collect())
+    }
+
+    async fn frames(&self) -> Result<tokio::sync::broadcast::Receiver<Vec<u8>>> {
+        self.call(
+            "Page.startScreencast",
+            json!({
+                "format": "jpeg",
+                "quality": 60,
+                "maxWidth": VIEWPORT_WIDTH,
+                "maxHeight": VIEWPORT_HEIGHT,
+                "everyNthFrame": 1,
+            }),
+        )
+        .await?;
+        Ok(self.frames.subscribe())
     }
 
     async fn info(&self) -> Result<PageInfo> {
@@ -1352,6 +1463,7 @@ impl ChromiumBackend {
             let label = set.reserve("T1".into(), "S1".into());
             set.mark_ready(&label);
         }
+        let (frames, _) = tokio::sync::broadcast::channel(4);
         Self {
             cdp,
             tabs,
@@ -1361,6 +1473,7 @@ impl ChromiumBackend {
             pointer: std::sync::Mutex::new(None),
             pointer_seq: AtomicU64::new(0),
             block_heavy: Arc::default(),
+            frames,
             temp_root,
         }
     }
@@ -1390,7 +1503,7 @@ mod tests {
 
     #[test]
     fn args_are_loopback_headless_and_sandboxed_by_default() {
-        let args = chromium_args(Path::new("/var/lib/serabot/browser/u1"), false);
+        let args = chromium_args(Path::new("/var/lib/serabot/browser/u1"), false, true);
         assert!(args.contains(&"--headless=new".to_owned()));
         assert!(args.contains(&"--remote-debugging-address=127.0.0.1".to_owned()));
         assert!(args.contains(&"--remote-debugging-port=0".to_owned()));
@@ -1399,7 +1512,18 @@ mod tests {
                 .any(|a| a.starts_with("--user-data-dir=") && a.ends_with("u1"))
         );
         assert!(!args.iter().any(|a| a == "--no-sandbox"));
-        assert!(chromium_args(Path::new("/p"), true).contains(&"--no-sandbox".to_owned()));
+        assert!(chromium_args(Path::new("/p"), true, true).contains(&"--no-sandbox".to_owned()));
+    }
+
+    #[test]
+    fn hide_automation_adds_the_automation_controlled_flag() {
+        let on = chromium_args(Path::new("/p"), false, true);
+        assert!(
+            on.contains(&"--disable-blink-features=AutomationControlled".to_owned()),
+            "webdriver must read undefined by default (0.74.36)"
+        );
+        let off = chromium_args(Path::new("/p"), false, false);
+        assert!(!off.contains(&"--disable-blink-features=AutomationControlled".to_owned()));
     }
 
     #[test]
@@ -1502,7 +1626,7 @@ mod tests {
 
     #[test]
     fn chromium_args_turn_off_dns_prefetch_and_network_prediction() {
-        let args = chromium_args(Path::new("/p"), false);
+        let args = chromium_args(Path::new("/p"), false, true);
         assert!(args.contains(&"--dns-prefetch-disable".to_owned()));
         let features = args
             .iter()

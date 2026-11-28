@@ -202,6 +202,26 @@ banner with an "Open Connectors" button, and bot tool replies carry the refusal 
 Google connector (Connectors → Google) for Gmail, Drive and Calendar, or sign in from a regular
 browser on the owner's PC.
 
+## Accounts and anti-captcha (0.74.36)
+
+- `GET /v1/browser/sessions/{id}/accounts` and the bot tool `browser_account_status` report which
+  external accounts a profile is signed into (Google, YouTube, LinkedIn, Instagram, X, Facebook),
+  read from cookie **names and domains only — never values**. Audited as `browser.accounts`.
+- Google is now in the Social connect-in-browser flow (`POST /v1/browser/social/open`), so the
+  owner can complete one Google sign-in in the Browser tab. The refusal-page rule above is
+  unchanged: a shown captcha is never retried or bypassed.
+- `[browser] hide_automation = true` (default) adds `--disable-blink-features=AutomationControlled`
+  so `navigator.webdriver` reads undefined; this lowers captcha frequency without bypassing any.
+
+## Live view performance (0.74.36)
+
+- `GET /v1/browser/sessions/{id}/frames` streams live JPEG frames over SSE from a CDP
+  `Page.startScreencast` (≤ 512 KiB per frame). Polling clients keep using
+  `GET .../screenshot`, which now accepts `?q=` (20..=90) to cap the starting JPEG quality.
+- The desktop live view is adaptive: while the bot drives it polls every 1200 ms at quality 50;
+  while the owner holds control, every 220 ms at quality 70. Over a Cloudflare tunnel this cuts
+  live-view traffic several-fold during bot-driven browsing.
+
 ## Hide and idle sessions
 
 Hiding the Browser page or the dock never closes a browser: `Hide` only clears the focus view and

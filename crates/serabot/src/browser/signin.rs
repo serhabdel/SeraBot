@@ -35,7 +35,7 @@ const RULES: &[Rule] = &[
         host: "accounts.google.com",
         // Matches both `/signin/rejected` and `/v3/signin/rejected`.
         path_markers: &["/signin/rejected"],
-        message: "Google refused sign-in from this automated server browser. Use the Google connector (Connectors → Google) for Gmail/Drive/Calendar, or sign in from a regular browser on your PC.",
+        message: "Google refused sign-in from this automated server browser. Use the Google connector (Connectors → Google) for Gmail/Drive/Calendar, sign in from a regular browser on your PC, or try once in the Browser tab's Social profile (Browser → Social accounts) — if Google still refuses, stop and use the connector.",
         bot_note: "Google refused the sign-in from this automated browser (\"This browser or app may not be secure\"). Do not retry the login or look for another way past it. Tell the owner to use the Google connector (Connectors → Google) for Gmail, Drive and Calendar instead.",
     },
     Rule {

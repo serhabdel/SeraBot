@@ -210,6 +210,22 @@ pub trait BrowserBackend: Send + Sync {
     }
     /// Skip images, media and fonts for the rest of this session.
     fn set_block_heavy(&self, _on: bool) {}
+    /// `(domain, name)` pairs of the profile's cookies — never values. Used
+    /// only to report which accounts are signed in (0.74.36).
+    async fn cookie_names(&self) -> Result<Vec<(String, String)>> {
+        Err(unsupported("reading cookie names"))
+    }
+    /// Start a server-side screencast and return the live JPEG frame stream
+    /// (0.74.36). Frames are at most 1280 px wide and 512 KiB.
+    async fn frames(&self) -> Result<tokio::sync::broadcast::Receiver<Vec<u8>>> {
+        Err(unsupported("live frames"))
+    }
+    /// JPEG screenshot, at most `max_quality` (20..=90) as the starting
+    /// quality. Defaults to the plain screenshot.
+    async fn screenshot_jpeg_quality(&self, max_quality: u32) -> Result<Vec<u8>> {
+        let _ = max_quality;
+        self.screenshot_jpeg().await
+    }
 }
 
 #[async_trait]
@@ -697,11 +713,54 @@ impl BrowserManager {
     }
 
     pub async fn screenshot(&self, user_id: &str, profile_id: &str) -> Result<Vec<u8>> {
+        self.screenshot_quality(user_id, profile_id, 70).await
+    }
+
+    /// Screenshot with `max_quality` as the starting JPEG quality (20..=90),
+    /// so the owner view can trade size for speed over a slow link.
+    pub async fn screenshot_quality(
+        &self,
+        user_id: &str,
+        profile_id: &str,
+        max_quality: u32,
+    ) -> Result<Vec<u8>> {
         let session = self
             .live_session(user_id, profile_id)
             .await
             .ok_or_else(|| SeraError::NotFound("no browser session".into()))?;
-        session.backend.screenshot_jpeg().await
+        session
+            .backend
+            .screenshot_jpeg_quality(max_quality.clamp(20, 90))
+            .await
+    }
+
+    /// Which accounts this profile is signed into, from cookie names only
+    /// (never values). Read-only; no controller change.
+    pub async fn account_status(
+        &self,
+        user_id: &str,
+        profile_id: &str,
+    ) -> Result<Vec<super::accounts::AccountStatus>> {
+        let session = self
+            .live_session(user_id, profile_id)
+            .await
+            .ok_or_else(|| SeraError::NotFound("no browser session".into()))?;
+        let cookies = session.backend.cookie_names().await?;
+        Ok(super::accounts::account_statuses(&cookies))
+    }
+
+    /// Live JPEG frame stream of this profile's active tab (server-side
+    /// screencast). Read-only; no controller change.
+    pub async fn frames(
+        &self,
+        user_id: &str,
+        profile_id: &str,
+    ) -> Result<tokio::sync::broadcast::Receiver<Vec<u8>>> {
+        let session = self
+            .live_session(user_id, profile_id)
+            .await
+            .ok_or_else(|| SeraError::NotFound("no browser session".into()))?;
+        session.backend.frames().await
     }
 
     pub async fn set_controller(

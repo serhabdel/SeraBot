@@ -37,6 +37,8 @@ pub(crate) struct FakeBackend {
     pub uploaded: std::sync::Mutex<Vec<std::path::PathBuf>>,
     /// Optional override for `FakeBackend` download tests: `(filename, mime, bytes)`.
     pub fake_download: std::sync::Mutex<Option<(String, String, Vec<u8>)>>,
+    /// `(domain, name)` cookie pairs the profile appears to hold (names only).
+    pub cookies: std::sync::Mutex<Vec<(String, String)>>,
 }
 
 impl FakeBackend {
@@ -144,6 +146,9 @@ impl BrowserBackend for FakeBackend {
     async fn scroll(&self, dy: f64) -> Result<()> {
         self.record(format!("scroll {dy}"));
         Ok(())
+    }
+    async fn cookie_names(&self) -> Result<Vec<(String, String)>> {
+        Ok(self.cookies.lock().unwrap().clone())
     }
     async fn screenshot_jpeg(&self) -> Result<Vec<u8>> {
         // JPEG magic + the owning user, so isolation tests can tell sessions apart.
@@ -413,6 +418,14 @@ impl FakeLauncher {
             }
         }
     }
+    /// Set the `(domain, name)` cookie pairs every session of `user` appears to hold.
+    pub fn set_cookies(&self, user: &str, cookies: Vec<(String, String)>) {
+        for backend in self.backends.lock().unwrap().iter() {
+            if backend.user == user {
+                *backend.cookies.lock().unwrap() = cookies.clone();
+            }
+        }
+    }
     /// Set the next download response `(filename, mime, bytes)` for `user`.
     pub fn set_fake_download(&self, user: &str, filename: &str, mime: &str, bytes: Vec<u8>) {
         for backend in self.backends.lock().unwrap().iter() {
@@ -475,6 +488,7 @@ impl BrowserLauncher for FakeLauncher {
             fail_next: Default::default(),
             uploaded: Default::default(),
             fake_download: Default::default(),
+            cookies: Default::default(),
         });
         self.backends.lock().unwrap().push(backend.clone());
         Ok(backend)

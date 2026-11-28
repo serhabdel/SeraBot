@@ -7,6 +7,7 @@
 //! profile by its id.
 
 use super::*;
+use crate::browser::accounts::AccountStatus;
 use crate::browser::guard::{validate_navigation_url, validate_resolved};
 use crate::browser::manager::{BrowserBackend, PageInfo};
 use crate::browser::outline::key_def;
@@ -49,8 +50,22 @@ async fn status_for(state: &ApiState, user: &ActingUser, profile: &str) -> Resul
     }
 }
 
-async fn screenshot_for(state: &ApiState, user: &ActingUser, profile: &str) -> Result<Response> {
-    let bytes = manager(state)?.screenshot(&user.id, profile).await?;
+/// `?q=` caps the starting JPEG quality (20..=90) so the owner view can trade
+/// size for speed over a slow link (0.74.36).
+#[derive(Debug, Deserialize)]
+pub(super) struct ScreenshotQuery {
+    q: Option<u32>,
+}
+
+async fn screenshot_quality_for(
+    state: &ApiState,
+    user: &ActingUser,
+    profile: &str,
+    default_q: u32,
+) -> Result<Response> {
+    let bytes = manager(state)?
+        .screenshot_quality(&user.id, profile, default_q)
+        .await?;
     Ok((
         [
             (header::CONTENT_TYPE, "image/jpeg"),
@@ -113,11 +128,13 @@ pub(super) async fn browser_status(
 }
 
 /// `GET /v1/browser/screenshot` returns a JPEG (<= 1280 px wide, <= 512 KiB).
+/// `?q=` caps the starting JPEG quality (0.74.36).
 pub(super) async fn browser_screenshot(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
+    Query(query): Query<ScreenshotQuery>,
 ) -> Result<Response> {
-    screenshot_for(&state, &user, DEFAULT_PROFILE).await
+    screenshot_quality_for(&state, &user, DEFAULT_PROFILE, query.q.unwrap_or(70)).await
 }
 
 pub(super) async fn browser_takeover(
@@ -343,9 +360,62 @@ pub(super) async fn session_screenshot(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
+    Query(query): Query<ScreenshotQuery>,
 ) -> Result<Response> {
     existing_profile(&state, &user, &id)?;
-    screenshot_for(&state, &user, &id).await
+    screenshot_quality_for(&state, &user, &id, query.q.unwrap_or(70)).await
+}
+
+/// `GET /v1/browser/sessions/{id}/accounts` — which external accounts this
+/// profile is signed into, from cookie names only (never values). Read-only.
+pub(super) async fn session_accounts(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    existing_profile(&state, &user, &id)?;
+    let browser = manager(&state)?;
+    let accounts: Vec<AccountStatus> = browser.account_status(&user.id, &id).await?;
+    state.store.record_audit(
+        &user.id,
+        "browser.accounts",
+        None,
+        None,
+        None,
+        None,
+        Some(state.runtime.policy_version()),
+        Some(&json!({"profile": id, "signed_in": accounts.iter().filter(|a| a.signed_in).map(|a| a.id).collect::<Vec<_>>()})),
+    )?;
+    Ok(Json(json!({"profile": id, "accounts": accounts})))
+}
+
+/// `GET /v1/browser/sessions/{id}/frames` — SSE stream of live JPEG frames
+/// (base64 in `data:`), pushed by the server-side screencast (0.74.36).
+/// Clients that cannot stream fall back to polling `/screenshot`.
+pub(super) async fn session_frames(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Sse<impl futures::Stream<Item = std::result::Result<SseEvent, std::convert::Infallible>>>>
+{
+    existing_profile(&state, &user, &id)?;
+    let browser = manager(&state)?;
+    let rx = browser.frames(&user.id, &id).await?;
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        match rx.recv().await {
+            Ok(bytes) => {
+                let encoded =
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
+                Some((Ok(SseEvent::default().event("frame").data(encoded)), rx))
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                // A slow client misses frames; keep streaming.
+                Some((Ok(SseEvent::default().event("skip")), rx))
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+        }
+    });
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }
 
 pub(super) async fn session_takeover(
@@ -737,6 +807,12 @@ pub struct SocialPlatform {
 }
 
 pub const SOCIAL_PLATFORMS: &[SocialPlatform] = &[
+    SocialPlatform {
+        id: "google",
+        name: "Google",
+        login_url: "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fwww.google.com",
+        domain: "google.com",
+    },
     SocialPlatform {
         id: "linkedin",
         name: "LinkedIn",

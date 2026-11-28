@@ -40,8 +40,14 @@ pub const STATUS_EVERY: Duration = Duration::from_secs(2);
 pub const UNFOCUSED_STATUS_EVERY: Duration = Duration::from_secs(30);
 /// One live view (the dock or a focused browser): at most twice a second while bot drives.
 pub const SHOT_EVERY: Duration = Duration::from_millis(500);
+/// While the bot drives, the owner view is only a watch: poll slower and ask
+/// for a smaller JPEG, so frames cost less over a slow link (0.74.36).
+pub const BOT_SHOT_EVERY: Duration = Duration::from_millis(1200);
 /// Faster screenshot cadence while the human holds control.
 pub const HUMAN_SHOT_EVERY: Duration = Duration::from_millis(220);
+/// Starting JPEG quality for the live view: lighter while the bot drives.
+pub const BOT_SHOT_QUALITY: u32 = 50;
+pub const HUMAN_SHOT_QUALITY: u32 = 70;
 /// Immediate screenshot refresh delay after an input/navigation/autofill/tab action.
 pub const IMMEDIATE_SHOT_DELAY: Duration = Duration::from_millis(50);
 /// The Browser page grid shares this budget: each card is refreshed about
@@ -92,7 +98,8 @@ pub enum PanelOp {
     /// Create the reference entries for the picked logins, as (name, write).
     VaultImport(Vec<(String, VaultPut)>),
     Status,
-    Shot(String),
+    /// Live-view frame request: session id and starting JPEG quality (0.74.36).
+    Shot(String, u32),
     Takeover(String),
     Handback(String),
     Close(String),
@@ -189,7 +196,7 @@ impl PanelOp {
             Self::ImportList(_) => PanelKind::ImportList,
             Self::VaultImport(_) => PanelKind::VaultImport,
             Self::Status => PanelKind::Status,
-            Self::Shot(_) => PanelKind::Shot,
+            Self::Shot(..) => PanelKind::Shot,
             Self::Takeover(_) => PanelKind::Takeover,
             Self::Handback(_) => PanelKind::Handback,
             Self::Close(_) => PanelKind::Close,
@@ -406,8 +413,8 @@ fn execute(job: &PanelJob, cache: &mut Option<ApiClient>) -> Result<PanelReply, 
             Ok(PanelReply::VaultImported(written))
         }
         PanelOp::Status => client.browser_sessions().map(PanelReply::Sessions),
-        PanelOp::Shot(id) => client
-            .browser_session_screenshot(id)
+        PanelOp::Shot(id, quality) => client
+            .browser_session_screenshot_quality(id, *quality)
             .map(|bytes| PanelReply::Shot(id.clone(), bytes)),
         PanelOp::Takeover(id) => client.browser_session_takeover(id).map(PanelReply::Control),
         PanelOp::Handback(id) => client.browser_session_handback(id).map(PanelReply::Control),
@@ -786,11 +793,22 @@ fn shot_interval_for_control(targets: usize, grid: bool, human_control: bool) ->
         return if human_control {
             HUMAN_SHOT_EVERY
         } else {
-            SHOT_EVERY
+            // Bot drives: the owner is watching, not steering — cheaper frames.
+            BOT_SHOT_EVERY
         };
     }
     let n = u32::try_from(targets.max(1)).unwrap_or(u32::MAX);
     (GRID_SHOT_EVERY / n).max(GRID_SHOT_FLOOR)
+}
+
+/// The starting JPEG quality for the next shot: full while the human holds
+/// control, lighter while the bot drives (0.74.36).
+fn shot_quality_for_control(human_control: bool, grid: bool) -> u32 {
+    if grid || !human_control {
+        BOT_SHOT_QUALITY
+    } else {
+        HUMAN_SHOT_QUALITY
+    }
 }
 
 fn profile_error_text(error: &ApiError) -> String {
@@ -1823,13 +1841,11 @@ impl PanelState {
                 self.shot_cursor = self.shot_cursor.wrapping_add(1);
                 self.shot_inflight = true;
                 self.shot_inflight_id = Some(id.clone());
-                self.next_shot = now
-                    + shot_interval_for_control(
-                        targets.len(),
-                        self.page_open && self.focus.is_none(),
-                        self.user_in_control(),
-                    );
-                return Some(PanelOp::Shot(id));
+                let human = self.user_in_control();
+                let grid = self.page_open && self.focus.is_none();
+                self.next_shot = now + shot_interval_for_control(targets.len(), grid, human);
+                let quality = shot_quality_for_control(human, grid);
+                return Some(PanelOp::Shot(id, quality));
             }
         }
         None
@@ -2541,7 +2557,7 @@ mod tests {
         );
         assert!(state.open());
         let t1 = t0 + Duration::from_millis(700);
-        assert!(matches!(state.next_op(t1), Some(PanelOp::Shot(_))));
+        assert!(matches!(state.next_op(t1), Some(PanelOp::Shot(..))));
         assert!(state.next_op(t1 + Duration::from_millis(100)).is_none());
         state.apply(
             done(
@@ -2556,9 +2572,11 @@ mod tests {
         );
         assert!(state.dock_shot().is_some());
         assert!(state.next_op(t1 + Duration::from_millis(400)).is_none());
+        // 0.74.36: bot-driven cadence is BOT_SHOT_EVERY (1200 ms), not 500 ms.
+        assert!(state.next_op(t1 + Duration::from_millis(1199)).is_none());
         assert!(matches!(
-            state.next_op(t1 + Duration::from_millis(501)),
-            Some(PanelOp::Shot(_))
+            state.next_op(t1 + Duration::from_millis(1201)),
+            Some(PanelOp::Shot(..))
         ));
         // Blurred: no screenshots.
         state.apply(
@@ -2575,7 +2593,7 @@ mod tests {
         state.set_focused(false);
         assert!(!matches!(
             state.next_op(t1 + Duration::from_secs(30)),
-            Some(PanelOp::Shot(_))
+            Some(PanelOp::Shot(..))
         ));
     }
 
@@ -3215,7 +3233,7 @@ mod tests {
         // Two open browsers: one picture request at a time, alternating.
         let t1 = t0 + Duration::from_millis(10);
         let first = match state.next_op(t1) {
-            Some(PanelOp::Shot(id)) => id,
+            Some(PanelOp::Shot(id, _)) => id,
             _ => panic!("expected a shot"),
         };
         assert!(state.next_op(t1).is_none(), "one in flight at a time");
@@ -3228,7 +3246,7 @@ mod tests {
         // Not before the grid interval (1 s shared by 2 cards = 500 ms).
         assert!(state.next_op(t1 + Duration::from_millis(400)).is_none());
         let second = match state.next_op(t1 + Duration::from_millis(520)) {
-            Some(PanelOp::Shot(id)) => id,
+            Some(PanelOp::Shot(id, _)) => id,
             _ => panic!("expected the second card"),
         };
         assert_ne!(first, second);
@@ -3243,8 +3261,18 @@ mod tests {
         assert_eq!(shot_interval(1, true), GRID_SHOT_EVERY);
         assert_eq!(shot_interval(2, true), Duration::from_millis(500));
         assert_eq!(shot_interval(8, true), GRID_SHOT_FLOOR);
-        assert_eq!(shot_interval(1, false), SHOT_EVERY);
-        assert_eq!(shot_interval(8, false), SHOT_EVERY);
+        // 0.74.36: a single bot-driven live view polls at BOT_SHOT_EVERY.
+        assert_eq!(shot_interval(1, false), BOT_SHOT_EVERY);
+        assert_eq!(shot_interval(8, false), BOT_SHOT_EVERY);
+    }
+
+    #[test]
+    fn shot_quality_is_lighter_while_the_bot_drives() {
+        // 0.74.36: bot-driven and grid shots ask for a smaller JPEG.
+        assert_eq!(shot_quality_for_control(false, false), BOT_SHOT_QUALITY);
+        assert_eq!(shot_quality_for_control(false, true), BOT_SHOT_QUALITY);
+        assert_eq!(shot_quality_for_control(true, false), HUMAN_SHOT_QUALITY);
+        assert!(BOT_SHOT_QUALITY < HUMAN_SHOT_QUALITY);
     }
 
     #[test]
@@ -3264,7 +3292,7 @@ mod tests {
         assert!(state.shot_targets().is_empty());
         assert!(!matches!(
             state.next_op(t0 + Duration::from_secs(5)),
-            Some(PanelOp::Shot(_))
+            Some(PanelOp::Shot(..))
         ));
         state.set_focused(true);
         // Leaving the page: the dock (open, not hidden) takes over the picture.
@@ -3291,7 +3319,7 @@ mod tests {
             t0,
         );
         let t1 = t0 + Duration::from_millis(10);
-        assert!(matches!(state.next_op(t1), Some(PanelOp::Shot(_))));
+        assert!(matches!(state.next_op(t1), Some(PanelOp::Shot(..))));
         feed(&mut state, PanelKind::Shot, Err(ApiError::Http(429)), t1);
         state.ask_profiles();
         // Held: neither pictures nor the profile list nor a status poll go
@@ -3699,14 +3727,10 @@ mod tests {
 
     #[test]
     fn human_control_lowers_shot_interval_and_input_schedules_immediate_shot() {
-        assert_eq!(
-            shot_interval_for_control(1, false, true),
-            Duration::from_millis(220)
-        );
-        assert_eq!(
-            shot_interval_for_control(1, false, false),
-            Duration::from_millis(500)
-        );
+        assert_eq!(shot_interval_for_control(1, false, true), HUMAN_SHOT_EVERY);
+        // 0.74.36: bot-driven is slower and lighter than before (was 500 ms).
+        assert_eq!(shot_interval_for_control(1, false, false), BOT_SHOT_EVERY);
+        assert!(BOT_SHOT_EVERY > HUMAN_SHOT_EVERY);
 
         let t0 = Instant::now();
         let mut state = PanelState::new();
