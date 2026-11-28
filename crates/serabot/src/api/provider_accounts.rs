@@ -396,6 +396,40 @@ pub(super) async fn add_provider_account(
         }
         label => label,
     };
+    // On the Claude Agent SDK gateway a Claude credential (`claude
+    // setup-token` → `sk-ant-oat01-…`, or a Console `sk-ant-api…` key) is for
+    // the gateway's SDK, not the gateway's bearer token: hand it over.
+    if kind == "claude-agent-sdk" && crate::auth_flows::gateway::is_claude_token(key) {
+        let endpoint = gateway_endpoint(&state, &user, &id, &profile, &kind)?
+            .ok_or_else(|| SeraError::Internal("gateway provider without an endpoint".into()))?;
+        if state.config.claude_gateway.auto_start {
+            state
+                .claude_gateway
+                .ensure_running(
+                    &endpoint.base_url,
+                    endpoint.token.as_str(),
+                    &state.config.claude_gateway,
+                )
+                .await?;
+        }
+        let custom_label = (label != "API key").then_some(label);
+        let outcome = state
+            .signin
+            .add_gateway_token_account(&user.id, &id, &endpoint, key, custom_label)
+            .await?;
+        state.runtime.invalidate_model_credentials(Some(&user.id));
+        audit_auth(
+            &state,
+            &user.id,
+            "provider.account_added",
+            json!({"provider": id, "account": outcome.account_id, "created": outcome.created, "via": "gateway_token"}),
+        )?;
+        return Ok(Json(json!({
+            "id": outcome.account_id,
+            "created": outcome.created,
+            "verified": true,
+        })));
+    }
     let verified = verify_key(&state, &user.id, &id, &profile, key).await?;
     let outcome = state.accounts.add_api_key(&user.id, &id, label, key)?;
     state.runtime.invalidate_model_credentials(Some(&user.id));

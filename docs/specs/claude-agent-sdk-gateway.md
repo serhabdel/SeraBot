@@ -27,6 +27,32 @@ So the supported Claude paths are:
 - **Claude Code (Desktop ACP)** — Windows desktop only, pinned
   `@agentclientprotocol/claude-agent-acp`, per `docs/specs/claude-code-acp.md`.
 
+### Paste a `claude setup-token` token (0.74.34) — Pro/Max plan billing
+
+`claude setup-token`, run on any computer signed in to the Claude plan,
+prints a long-lived `sk-ant-oat01-…` token. Pasted in the gateway card's
+**Claude token or API key** tab, it is relayed to the gateway
+(`POST {gateway}/v1/auth/token {token, profile}`), which stores it in that
+account's profile (`serabot-claude-token.json`, mode 0600) and never returns
+or logs it. SeraBot does not store the Claude token: the account's credential
+stays the gateway bearer token, identity `{profile, billing}`. The profile is
+`tok_` + the first 12 hex digits of the token's SHA-256, so pasting the same
+token again lands on the same account.
+
+Which credential a turn uses (`_apply_claude_credential`):
+
+- stored `sk-ant-oat…` → `CLAUDE_CODE_OAUTH_TOKEN`, and `ANTHROPIC_API_KEY` /
+  `ANTHROPIC_AUTH_TOKEN` removed — usage counts against the plan's limits;
+- stored `sk-ant-api…` → `ANTHROPIC_API_KEY` (pay-as-you-go);
+- otherwise a plan login (`claude auth login` credentials in the profile, or a
+  host `CLAUDE_CODE_OAUTH_TOKEN` on the default account) removes any
+  `ANTHROPIC_API_KEY`, because the SDK would prefer it and silently bill the
+  API instead of the plan;
+- a named account never inherits the host's `CLAUDE_CODE_OAUTH_TOKEN`.
+
+Before 0.74.34 that tab saved whatever was pasted as the *gateway bearer
+token*, so a pasted Claude token only produced 401s from the gateway.
+
 ### "Sign in with browser" on the gateway card (0.74.28, reworked 0.74.33)
 
 The provider card offers **Sign in with browser**. It is *not* SeraBot doing

@@ -766,7 +766,7 @@ const PRESETS: &[ProviderPreset] = &[
         catalog_fetch: true,
         auth: "api_key",
         badge: "Gateway",
-        note: "Local loopback Claude Agent SDK gateway — requires a local gateway token. One gateway per Claude login on its own loopback port: add each as its own provider (edit the base URL, keep it loopback). See docs/specs/claude-agent-sdk-gateway.md",
+        note: "Claude Agent SDK through the local loopback gateway. Sign in with your browser, or paste the token `claude setup-token` prints (sk-ant-oat01-…): both use your Claude Pro/Max plan limits. An sk-ant-api… key bills pay-as-you-go. Each account gets its own gateway profile. See docs/specs/claude-agent-sdk-gateway.md",
         key_url: "",
         // "Sign in with browser": relayed to the gateway, which runs the
         // first-party claude.ai OAuth flow (the `claude auth login` client).

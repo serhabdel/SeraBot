@@ -319,7 +319,9 @@ class TestClaudeGateway(unittest.IsolatedAsyncioTestCase):
             "ANTHROPIC_API_KEY": "sk-ant-123",
             "CLAUDE_CONFIG_DIR": "/some/other/dir",
         }
-        with patch.dict(os.environ, dirty, clear=True):
+        with patch.dict(os.environ, dirty, clear=True), patch.object(
+            server, "_has_plan_login", return_value=False
+        ):
             env_default = server._clean_claude_env(None, strip_api_key=False)
             self.assertNotIn("CLAUDECODE", env_default)
             self.assertNotIn("CLAUDE_CODE_ENTRYPOINT", env_default)
@@ -969,6 +971,90 @@ class TestClaudeGateway(unittest.IsolatedAsyncioTestCase):
             ("c", "s"),
         )
         self.assertIsNone(server._parse_pasted_callback("c#s"))
+
+    def test_plan_login_and_stored_tokens_pick_the_billing(self) -> None:
+        oat = "sk-ant-oat01-" + "A" * 40
+        api = "sk-ant-api03-" + "B" * 40
+        host = {"PATH": "/usr/bin", "ANTHROPIC_API_KEY": api, "CLAUDE_CODE_OAUTH_TOKEN": oat}
+        root = Path(self._tmp_dir.name) / "profiles"
+        plan_dir = root / "plan"
+        key_dir = root / "key"
+        bare_dir = root / "bare"
+        for d in (plan_dir, key_dir, bare_dir):
+            d.mkdir(parents=True)
+        self.assertEqual(server._store_profile_token(plan_dir, oat), "oauth_token")
+        self.assertEqual(server._store_profile_token(key_dir, api), "api_key")
+        if os.name != "nt":
+            mode = stat.S_IMODE(os.stat(plan_dir / server.PROFILE_TOKEN_FILE).st_mode)
+            self.assertEqual(mode, 0o600)
+        with self.assertRaises(ValueError):
+            server._store_profile_token(bare_dir, "not-a-token")
+
+        with patch.dict(os.environ, host, clear=True):
+            # Default account with a host plan token: the API key would
+            # override the plan, so it is removed.
+            env = server._clean_claude_env(None)
+            self.assertEqual(env["CLAUDE_CODE_OAUTH_TOKEN"], oat)
+            self.assertNotIn("ANTHROPIC_API_KEY", env)
+
+            # A stored setup-token: plan billing, no API key anywhere.
+            env = server._clean_claude_env(plan_dir)
+            self.assertEqual(env["CLAUDE_CODE_OAUTH_TOKEN"], oat)
+            self.assertNotIn("ANTHROPIC_API_KEY", env)
+            self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
+
+            # A stored Console key: API billing, and the host plan token is
+            # not inherited.
+            env = server._clean_claude_env(key_dir, strip_api_key=True)
+            self.assertEqual(env["ANTHROPIC_API_KEY"], api)
+            self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)
+
+            # A named account with nothing stored never inherits host tokens.
+            env = server._clean_claude_env(bare_dir, strip_api_key=True)
+            self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)
+            self.assertNotIn("ANTHROPIC_API_KEY", env)
+
+        # A CLI plan login in the profile also beats a host API key.
+        (bare_dir / ".credentials.json").write_text("{}", encoding="utf-8")
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": api}, clear=True):
+            env = server._clean_claude_env(bare_dir)
+            self.assertNotIn("ANTHROPIC_API_KEY", env)
+
+    async def test_auth_token_adds_a_plan_account_without_echoing_it(self) -> None:
+        headers = {"Authorization": "Bearer test-secret-token-123"}
+        oat = "sk-ant-oat01-" + "C" * 40
+        status, body = await _asgi_request(
+            "POST", "/v1/auth/token", headers=headers, json_body={"token": "hello"}
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(body["code"], "invalid_token")
+        status, body = await _asgi_request(
+            "POST",
+            "/v1/auth/token",
+            headers=headers,
+            json_body={"token": oat, "profile": "default"},
+        )
+        self.assertEqual(status, 400)
+
+        status, body = await _asgi_request(
+            "POST", "/v1/auth/token", headers=headers, json_body={"token": oat}
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["billing"], "plan")
+        self.assertEqual(body["account"]["authMethod"], "oauth_token")
+        self.assertTrue(body["profile"].startswith("acct_"))
+        self.assertNotIn(oat, json.dumps(body))
+        profile_dir = Path(self._tmp_dir.name) / "profiles" / body["profile"]
+        self.assertEqual(server._read_profile_token(profile_dir), ("oauth_token", oat))
+        # It reads as signed in, and the usage probe uses the plan token.
+        status, info = await _asgi_request("GET", "/v1/auth/status", headers=headers)
+        listed = {p["profile"]: p for p in info["profiles"]}
+        self.assertTrue(listed[body["profile"]]["signed_in"])
+        self.assertEqual(server._read_oauth_access_token(profile_dir), oat)
+
+        status, _ = await _asgi_request("POST", "/v1/auth/token", json_body={"token": oat})
+        self.assertEqual(status, 401)
 
     async def test_auth_usage_live_oauth_and_validation(self) -> None:
         headers = {"Authorization": "Bearer test-secret-token-123"}
