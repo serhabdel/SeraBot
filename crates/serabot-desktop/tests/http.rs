@@ -1617,7 +1617,8 @@ fn screenshots_are_capped_jpeg_only_and_a_missing_session_is_a_404() {
     assert_eq!(client.browser_screenshot(), Err(ApiError::InvalidResponse));
     assert_eq!(client.browser_screenshot(), Err(ApiError::Http(404)));
     let requests = handle.join().unwrap();
-    assert!(requests[0].starts_with("GET /v1/browser/screenshot "));
+    // 0.74.36: the live view appends `?q=` to cap the starting JPEG quality.
+    assert!(requests[0].starts_with("GET /v1/browser/screenshot?q="));
 }
 
 #[test]
@@ -1781,7 +1782,7 @@ fn a_session_screenshot_is_jpeg_capped_and_per_session() {
         Err(ApiError::Http(404))
     );
     let requests = handle.join().unwrap();
-    assert!(requests[0].starts_with("GET /v1/browser/sessions/work/screenshot "));
+    assert!(requests[0].starts_with("GET /v1/browser/sessions/work/screenshot?q="));
 }
 
 #[test]

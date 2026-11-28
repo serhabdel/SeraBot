@@ -708,15 +708,27 @@ impl ApiClient {
     /// `GET /v1/browser/screenshot`: JPEG bytes, at most 512 KiB. `404`
     /// (no session) comes back as `ApiError::Http(404)`.
     pub fn browser_screenshot(&self) -> Result<Vec<u8>, ApiError> {
-        self.fetch_screenshot(&["v1", "browser", "screenshot"])
+        self.browser_screenshot_quality(70)
     }
 
-    pub(super) fn fetch_screenshot(&self, route: &[&str]) -> Result<Vec<u8>, ApiError> {
+    /// Same, with `?q=` capping the starting JPEG quality (0.74.36) so the
+    /// live view can trade sharpness for fewer bytes over a slow link.
+    pub fn browser_screenshot_quality(&self, quality: u32) -> Result<Vec<u8>, ApiError> {
+        self.fetch_screenshot_quality(&["v1", "browser", "screenshot"], quality)
+    }
+
+    pub(super) fn fetch_screenshot_quality(
+        &self,
+        route: &[&str],
+        quality: u32,
+    ) -> Result<Vec<u8>, ApiError> {
         let mut url = self.endpoint.clone();
         url.path_segments_mut()
             .map_err(|_| ApiError::InvalidResponse)?
             .clear()
             .extend(route);
+        url.query_pairs_mut()
+            .append_pair("q", &quality.clamp(20, 90).to_string());
         let response = self
             .client
             .get(url)

@@ -808,6 +808,16 @@ Plan: `docs/specs/0.74.15-proposal.md`. Version stays `0.74.14` until the batch 
 - [x] Version `0.74.34`, mobile `0.74.34+108`, `docs/release-0.74.34.md`, spec, README.
 - [ ] Owner: verify once with a real Pro/Max `claude setup-token` token.
 
+## Release 0.74.36 — Browser accounts & captcha reduction, faster live view
+
+- [x] Account sign-in status, cookie names only (`browser/accounts.rs`, `GET /v1/browser/sessions/{id}/accounts`, bot tool `browser_account_status`, audited).
+- [x] Google added to the Social connect-in-browser flow; refusal-page rule unchanged (never bypass a captcha).
+- [x] `[browser] hide_automation` (default on): `--disable-blink-features=AutomationControlled`.
+- [x] Server-push frames: CDP screencast + `GET /v1/browser/sessions/{id}/frames` SSE; screenshots accept `?q=`.
+- [x] Desktop live view adaptive: bot-driven 1200 ms @ q50, human 220 ms @ q70 (`panel.rs`).
+- [x] Version `0.74.36`, mobile `0.74.36+110`, `docs/release-0.74.36.md`, `README.md`, `tasks/todo.md`.
+- [ ] Owner: sign into Google once in the Social browser profile and confirm `browser_account_status` reports it; watch the live view cadence while a bot drives.
+
 ## Release 0.74.35 — Claude Agent (Pro / Max / Ultra): Server Lifecycle, Live Verification & Browser-First UX
 
 - [x] **Always-on & self-healing server gateway (`main.rs`, `claude_gateway_proc.rs`, `llm/wire_calls.rs`, `providers.rs`, `api/mod.rs`)**: shared `Arc<ClaudeGatewaySupervisor>`, boot auto-start before model catalog refresh, turn-level connect recovery, authenticated `/v1/auth/status` check + stale supervised child restart on token rotation.

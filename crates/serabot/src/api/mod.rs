@@ -508,6 +508,8 @@ pub fn router(state: ApiState) -> Router {
             "/v1/browser/sessions/{id}/screenshot",
             get(session_screenshot),
         )
+        .route("/v1/browser/sessions/{id}/accounts", get(session_accounts))
+        .route("/v1/browser/sessions/{id}/frames", get(session_frames))
         .route("/v1/browser/sessions/{id}/takeover", post(session_takeover))
         .route("/v1/browser/sessions/{id}/handback", post(session_handback))
         .route("/v1/browser/sessions/{id}/input", post(session_input))

@@ -84,6 +84,7 @@ pub fn register_browser_tools(
         Kind::Close,
         Kind::Tabs,
         Kind::NewTab,
+        Kind::Accounts,
     ] {
         registry.register(BrowserTool {
             kind,
@@ -106,6 +107,7 @@ enum Kind {
     Close,
     Tabs,
     NewTab,
+    Accounts,
 }
 
 struct BrowserTool {
@@ -307,6 +309,7 @@ impl BrowserTool {
             Kind::Close => "browser_close",
             Kind::Tabs => "browser_tabs",
             Kind::NewTab => "browser_new_tab",
+            Kind::Accounts => "browser_account_status",
         }
     }
 }
@@ -376,6 +379,11 @@ impl Tool for BrowserTool {
                 "Open a public http(s) URL in a new tab and make it the active tab (at most 8 tabs). Private, loopback and metadata addresses are refused.",
                 json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"],"additionalProperties":false}),
                 true,
+            ),
+            Kind::Accounts => (
+                "Which external accounts (Google, YouTube, LinkedIn, Instagram, X, Facebook) your browser profile is signed into, read from cookie names only. Read-only. Use it to know whether a task will hit a login wall or captcha before navigating.",
+                json!({"type":"object","properties":{},"additionalProperties":false}),
+                false,
             ),
         };
         ToolSpec {
@@ -808,6 +816,49 @@ impl Tool for BrowserTool {
                 Ok(ToolOutput {
                     content: json!({"closed": closed}).to_string(),
                     data: Some(json!({"closed": closed})),
+                    ..Default::default()
+                })
+            }
+            Kind::Accounts => {
+                // Read-only: cookie names only, never values. No session is
+                // started just to answer this.
+                let accounts = match manager.account_status(user, profile).await {
+                    Ok(accounts) => accounts,
+                    Err(SeraError::NotFound(_)) => {
+                        return Ok(ToolOutput {
+                            content: format!(
+                                "no browser session is open on profile '{profile}'; call browser_navigate first"
+                            ),
+                            ..Default::default()
+                        });
+                    }
+                    Err(error) => return Err(error),
+                };
+                let lines = accounts
+                    .iter()
+                    .map(|a| {
+                        format!(
+                            "{}: {}",
+                            a.name,
+                            if a.signed_in {
+                                "signed in"
+                            } else {
+                                "not signed in"
+                            }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let signed_in = accounts
+                    .iter()
+                    .filter(|a| a.signed_in)
+                    .map(|a| a.id)
+                    .collect::<Vec<_>>();
+                Ok(ToolOutput {
+                    content: format!(
+                        "browser profile '{profile}' accounts (cookie names only):\n{lines}"
+                    ),
+                    data: Some(json!({"profile": profile, "signed_in": signed_in})),
                     ..Default::default()
                 })
             }
@@ -1541,5 +1592,53 @@ mod tests {
         let (u, p) = find_credential_refs(&outline);
         assert_eq!(u.as_deref(), Some("e1"));
         assert_eq!(p.as_deref(), Some("e2"));
+    }
+
+    #[tokio::test]
+    async fn browser_account_status_is_read_only_and_reports_cookie_names_only() {
+        let h = harness();
+        let spec = h
+            .registry
+            .get("browser_account_status")
+            .expect("registered");
+        assert!(!spec.spec().external_effect, "account status is read-only");
+
+        // No session yet: friendly message, no launch.
+        let out = run(&h, "alice", "browser_account_status", json!({}))
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("no browser session"),
+            "{}",
+            out.content
+        );
+        assert!(h.launcher.launches().is_empty());
+
+        // Open a session, then give the profile a Google session cookie.
+        run(
+            &h,
+            "alice",
+            "browser_navigate",
+            json!({"url": "https://example.com"}),
+        )
+        .await
+        .unwrap();
+        h.launcher.set_cookies(
+            "alice",
+            vec![
+                (".google.com".into(), "SAPISID".into()),
+                (".x.com".into(), "guest".into()),
+            ],
+        );
+        let out = run(&h, "alice", "browser_account_status", json!({}))
+            .await
+            .unwrap();
+        assert!(out.content.contains("Google: signed in"), "{}", out.content);
+        assert!(out.content.contains("X: not signed in"), "{}", out.content);
+        assert!(
+            !out.content.contains("SAPISID"),
+            "cookie names of non-markers must not leak as values: {}",
+            out.content
+        );
     }
 }

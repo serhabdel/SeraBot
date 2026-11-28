@@ -464,8 +464,18 @@ impl ApiClient {
     /// `GET /v1/browser/sessions/{id}/screenshot`: JPEG, same caps as the
     /// single-session route.
     pub fn browser_session_screenshot(&self, id: &str) -> Result<Vec<u8>, ApiError> {
+        self.browser_session_screenshot_quality(id, 70)
+    }
+
+    /// Same, with `?q=` capping the starting JPEG quality (0.74.36): the live
+    /// view asks for a smaller frame while the bot drives and the link is slow.
+    pub fn browser_session_screenshot_quality(
+        &self,
+        id: &str,
+        quality: u32,
+    ) -> Result<Vec<u8>, ApiError> {
         session_id(id)?;
-        self.fetch_screenshot(&["v1", "browser", "sessions", id, "screenshot"])
+        self.fetch_screenshot_quality(&["v1", "browser", "sessions", id, "screenshot"], quality)
     }
 
     fn session_control(&self, id: &str, action: &str) -> Result<BrowserSessionInfo, ApiError> {
