@@ -3208,10 +3208,6 @@ html[data-reduce-transparency="true"] .sheet.sheet-palette {
   animation: pop-enter 170ms cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
-.scrim.open {
-  backdrop-filter: blur(4px);
-}
-
 .rail-btn,
 .settings-nav-item {
   position: relative;
